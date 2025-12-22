@@ -174,4 +174,79 @@ mod tests {
             Some(CompletionContext::PackageName { .. })
         ));
     }
+
+    #[test]
+    fn test_determine_completion_context_feature() {
+        let content = r#"serde = { version = "1.0", features = [""#;
+        let position = Position::new(0, 40);
+        let context = determine_completion_context(content, position);
+        assert!(matches!(context, Some(CompletionContext::Feature { .. })));
+    }
+
+    #[test]
+    fn test_determine_completion_context_no_match() {
+        let content = r#"# comment"#;
+        let position = Position::new(0, 5);
+        let context = determine_completion_context(content, position);
+        assert!(context.is_none());
+    }
+
+    #[test]
+    fn test_determine_completion_context_version_with_spaces() {
+        let content = r#"  serde  =  ""#;
+        let position = Position::new(0, 13);
+        let context = determine_completion_context(content, position);
+        assert!(matches!(context, Some(CompletionContext::Version { .. })));
+    }
+
+    #[test]
+    fn test_determine_completion_context_short_prefix() {
+        let content = "s";
+        let position = Position::new(0, 1);
+        let context = determine_completion_context(content, position);
+        if let Some(CompletionContext::PackageName { prefix }) = context {
+            assert_eq!(prefix, "s");
+        } else {
+            panic!("Expected PackageName context");
+        }
+    }
+
+    #[test]
+    fn test_determine_completion_context_hyphenated_name() {
+        let content = "tokio-util";
+        let position = Position::new(0, 10);
+        let context = determine_completion_context(content, position);
+        assert!(matches!(
+            context,
+            Some(CompletionContext::PackageName { .. })
+        ));
+    }
+
+    #[test]
+    fn test_determine_completion_context_underscored_name() {
+        let content = "tower_lsp";
+        let position = Position::new(0, 9);
+        let context = determine_completion_context(content, position);
+        assert!(matches!(
+            context,
+            Some(CompletionContext::PackageName { .. })
+        ));
+    }
+
+    #[test]
+    fn test_determine_completion_context_multiline_version() {
+        let content = "[dependencies]\nserde = \"";
+        let position = Position::new(1, 9);
+        let context = determine_completion_context(content, position);
+        assert!(matches!(context, Some(CompletionContext::Version { .. })));
+    }
+
+    #[test]
+    fn test_determine_completion_context_table_syntax() {
+        let content = r#"[dependencies.serde]
+version = ""#;
+        let position = Position::new(1, 11);
+        let context = determine_completion_context(content, position);
+        assert!(matches!(context, Some(CompletionContext::Version { .. })));
+    }
 }

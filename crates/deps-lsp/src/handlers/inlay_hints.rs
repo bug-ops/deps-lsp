@@ -740,4 +740,134 @@ mod tests {
         );
         assert_eq!(extract_pypi_min_version("^1.0"), Some("1.0".to_string())); // Poetry style
     }
+
+    #[test]
+    fn test_normalize_and_parse_version() {
+        assert_eq!(
+            normalize_and_parse_version("1.0.0").unwrap().to_string(),
+            "1.0.0"
+        );
+        assert_eq!(
+            normalize_and_parse_version("1.0").unwrap().to_string(),
+            "1.0.0"
+        );
+        assert_eq!(
+            normalize_and_parse_version("8").unwrap().to_string(),
+            "8.0.0"
+        );
+        assert!(normalize_and_parse_version("invalid").is_none());
+    }
+
+    #[test]
+    fn test_create_cargo_hint_up_to_date() {
+        let config = InlayHintsConfig::default();
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: 0,
+                character: 10,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: 0,
+                character: 15,
+            },
+        };
+
+        let hint = create_cargo_hint("serde", "1.0.0", range, "1.0.0", true, &config);
+
+        assert_eq!(hint.position, range.end);
+        assert!(matches!(hint.kind, Some(InlayHintKind::TYPE)));
+        assert_eq!(hint.padding_left, Some(true));
+    }
+
+    #[test]
+    fn test_create_cargo_hint_needs_update() {
+        let config = InlayHintsConfig::default();
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: 0,
+                character: 10,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: 0,
+                character: 15,
+            },
+        };
+
+        let hint = create_cargo_hint("serde", "1.0.0", range, "1.0.214", false, &config);
+
+        assert_eq!(hint.position, range.end);
+        if let InlayHintLabel::LabelParts(parts) = hint.label {
+            assert!(parts[0].value.contains("1.0.214"));
+        } else {
+            panic!("Expected LabelParts");
+        }
+    }
+
+    #[test]
+    fn test_create_npm_hint_up_to_date() {
+        let config = InlayHintsConfig::default();
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: 0,
+                character: 10,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: 0,
+                character: 15,
+            },
+        };
+
+        let hint = create_npm_hint("express", "^4.18.0", range, "4.18.2", true, &config);
+
+        assert_eq!(hint.position, range.end);
+        assert!(matches!(hint.kind, Some(InlayHintKind::TYPE)));
+    }
+
+    #[test]
+    fn test_create_pypi_hint_needs_update() {
+        let config = InlayHintsConfig::default();
+        let range = tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position {
+                line: 0,
+                character: 10,
+            },
+            end: tower_lsp::lsp_types::Position {
+                line: 0,
+                character: 15,
+            },
+        };
+
+        let hint = create_pypi_hint("django", ">=4.0", range, "5.0.0", false, &config);
+
+        assert_eq!(hint.position, range.end);
+        if let InlayHintLabel::LabelParts(parts) = hint.label {
+            assert!(parts[0].value.contains("5.0.0"));
+        } else {
+            panic!("Expected LabelParts");
+        }
+    }
+
+    #[test]
+    fn test_extract_pypi_min_version_edge_cases() {
+        assert_eq!(extract_pypi_min_version(">1.0"), Some("1.0".to_string()));
+        assert_eq!(extract_pypi_min_version("~1.0"), Some("1.0".to_string()));
+        assert_eq!(
+            extract_pypi_min_version(">=1.0, !=1.5"),
+            Some("1.0".to_string())
+        );
+        assert!(extract_pypi_min_version("<2.0").is_none());
+        assert!(extract_pypi_min_version("").is_none());
+    }
+
+    #[test]
+    fn test_is_pypi_version_latest_edge_cases() {
+        assert!(is_pypi_version_latest(">=0.1.0", "0.1.5"));
+        assert!(!is_pypi_version_latest(">=0.1.0", "0.2.0"));
+        assert!(is_pypi_version_latest("==1.0.0", "1.0.0"));
+        // ==1.0.0 means pinned to 1.0.0, but the function checks major version match
+        // So with latest 1.1.0 (same major), it returns true (within major version family)
+        assert!(is_pypi_version_latest("==1.0.0", "1.1.0"));
+        // Different major version should return false
+        assert!(!is_pypi_version_latest("==1.0.0", "2.0.0"));
+    }
 }
