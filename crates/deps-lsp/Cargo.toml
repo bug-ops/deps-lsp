@@ -21,6 +21,7 @@ path = "src/lib.rs"
 deps-core = { workspace = true }
 deps-cargo = { workspace = true }
 deps-npm = { workspace = true }
+deps-pypi = { workspace = true }
 
 # External dependencies
 async-trait = { workspace = true }

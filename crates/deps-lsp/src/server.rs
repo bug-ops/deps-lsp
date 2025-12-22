@@ -3,6 +3,7 @@ use crate::document::{DocumentState, Ecosystem, ServerState, UnifiedDependency, 
 use crate::handlers::{code_actions, completion, diagnostics, hover, inlay_hints};
 use deps_cargo::{CratesIoRegistry, DependencySource, parse_cargo_toml};
 use deps_npm::{NpmRegistry, parse_package_json};
+use deps_pypi::{PypiDependencySource, PypiParser, PypiRegistry};
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -199,6 +200,90 @@ impl Backend {
         }
     }
 
+    /// Handles opening a pyproject.toml file.
+    async fn handle_pypi_open(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+        let parser = PypiParser::new();
+        match parser.parse_content(&content) {
+            Ok(parse_result) => {
+                let deps = parse_result
+                    .dependencies
+                    .into_iter()
+                    .map(UnifiedDependency::Pypi)
+                    .collect();
+                let doc_state = DocumentState::new(Ecosystem::Pypi, content, deps);
+                self.state.update_document(uri.clone(), doc_state);
+
+                let state = Arc::clone(&self.state);
+                let client = self.client.clone();
+                let uri_clone = uri.clone();
+                let config = Arc::clone(&self.config);
+
+                let task = tokio::spawn(async move {
+                    let registry = PypiRegistry::new(Arc::clone(&state.cache));
+
+                    // Collect dependencies to fetch (avoid holding doc lock during fetch)
+                    let deps_to_fetch: Vec<_> = {
+                        let doc = match state.get_document(&uri_clone) {
+                            Some(d) => d,
+                            None => return,
+                        };
+
+                        doc.dependencies
+                            .iter()
+                            .filter_map(|dep| {
+                                if let UnifiedDependency::Pypi(pypi_dep) = dep
+                                    && matches!(pypi_dep.source, PypiDependencySource::PyPI)
+                                {
+                                    return Some(pypi_dep.name.clone());
+                                }
+                                None
+                            })
+                            .collect()
+                    };
+
+                    // Parallel fetch all versions
+                    let futures: Vec<_> = deps_to_fetch
+                        .into_iter()
+                        .map(|name| {
+                            let registry = registry.clone();
+                            async move {
+                                let versions = registry.get_versions(&name).await.ok()?;
+                                let latest = versions.first()?.clone();
+                                Some((name, UnifiedVersion::Pypi(latest)))
+                            }
+                        })
+                        .collect();
+
+                    let results = join_all(futures).await;
+                    let versions: HashMap<_, _> = results.into_iter().flatten().collect();
+
+                    // Update document with fetched versions
+                    if let Some(mut doc) = state.documents.get_mut(&uri_clone) {
+                        doc.update_versions(versions);
+                    }
+
+                    let config_read = config.read().await;
+                    let diags = diagnostics::handle_diagnostics(
+                        Arc::clone(&state),
+                        &uri_clone,
+                        &config_read.diagnostics,
+                    )
+                    .await;
+
+                    client.publish_diagnostics(uri_clone, diags, None).await;
+                });
+
+                self.state.spawn_background_task(uri, task).await;
+            }
+            Err(e) => {
+                tracing::error!("failed to parse pyproject.toml: {}", e);
+                self.client
+                    .log_message(MessageType::ERROR, format!("Parse error: {}", e))
+                    .await;
+            }
+        }
+    }
+
     /// Handles changes to a Cargo.toml file.
     async fn handle_cargo_change(&self, uri: tower_lsp::lsp_types::Url, content: String) {
         match parse_cargo_toml(&content, &uri) {
@@ -287,6 +372,51 @@ impl Backend {
         }
     }
 
+    /// Handles changes to a pyproject.toml file.
+    async fn handle_pypi_change(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+        let parser = PypiParser::new();
+        match parser.parse_content(&content) {
+            Ok(parse_result) => {
+                let deps = parse_result
+                    .dependencies
+                    .into_iter()
+                    .map(UnifiedDependency::Pypi)
+                    .collect();
+                let doc_state = DocumentState::new(Ecosystem::Pypi, content, deps);
+                self.state.update_document(uri.clone(), doc_state);
+
+                let state = Arc::clone(&self.state);
+                let client = self.client.clone();
+                let uri_clone = uri.clone();
+                let config = Arc::clone(&self.config);
+
+                let task = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                    let config_read = config.read().await;
+                    let diags = diagnostics::handle_diagnostics(
+                        Arc::clone(&state),
+                        &uri_clone,
+                        &config_read.diagnostics,
+                    )
+                    .await;
+
+                    client.publish_diagnostics(uri_clone, diags, None).await;
+
+                    // Request inlay hints refresh
+                    if let Err(e) = client.inlay_hint_refresh().await {
+                        tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+                    }
+                });
+
+                self.state.spawn_background_task(uri, task).await;
+            }
+            Err(e) => {
+                tracing::error!("failed to parse pyproject.toml: {}", e);
+            }
+        }
+    }
+
     fn server_capabilities() -> ServerCapabilities {
         ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -367,6 +497,7 @@ impl LanguageServer for Backend {
         match ecosystem {
             Ecosystem::Cargo => self.handle_cargo_open(uri, content).await,
             Ecosystem::Npm => self.handle_npm_open(uri, content).await,
+            Ecosystem::Pypi => self.handle_pypi_open(uri, content).await,
         }
     }
 
@@ -387,6 +518,7 @@ impl LanguageServer for Backend {
             match ecosystem {
                 Ecosystem::Cargo => self.handle_cargo_change(uri, content).await,
                 Ecosystem::Npm => self.handle_npm_change(uri, content).await,
+                Ecosystem::Pypi => self.handle_pypi_change(uri, content).await,
             }
         }
     }

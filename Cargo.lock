@@ -277,6 +277,7 @@ dependencies = [
  "deps-cargo",
  "deps-core",
  "deps-npm",
+ "deps-pypi",
  "futures",
  "insta",
  "mockito",

@@ -7,6 +7,7 @@
 use crate::document::{Ecosystem, ServerState, UnifiedDependency};
 use deps_cargo::{CratesIoRegistry, crate_url};
 use deps_npm::{NpmRegistry, package_url};
+use deps_pypi::PypiRegistry;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
     Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, Position, Range,
@@ -56,6 +57,7 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
     match ecosystem {
         Ecosystem::Cargo => handle_cargo_hover(state, uri, position, &dep).await,
         Ecosystem::Npm => handle_npm_hover(state, uri, position, &dep).await,
+        Ecosystem::Pypi => handle_pypi_hover(state, uri, position, &dep).await,
     }
 }
 
@@ -163,6 +165,53 @@ async fn handle_npm_hover(
             value: markdown,
         }),
         range: Some(npm_dep.name_range),
+    })
+}
+
+async fn handle_pypi_hover(
+    state: Arc<ServerState>,
+    _uri: &tower_lsp::lsp_types::Url,
+    _position: Position,
+    dep: &UnifiedDependency,
+) -> Option<Hover> {
+    let UnifiedDependency::Pypi(pypi_dep) = dep else {
+        return None;
+    };
+
+    let registry = PypiRegistry::new(Arc::clone(&state.cache));
+    let versions = registry.get_versions(&pypi_dep.name).await.ok()?;
+    let latest = versions.first()?;
+
+    let url = format!("https://pypi.org/project/{}/", pypi_dep.name);
+    let mut markdown = format!("# [{}]({})\n\n", pypi_dep.name, url);
+
+    if let Some(current) = &pypi_dep.version_req {
+        markdown.push_str(&format!("**Current**: `{}`\n\n", current));
+    }
+
+    if latest.yanked {
+        markdown.push_str("⚠️ **Warning**: This version has been yanked\n\n");
+    }
+
+    // Show version list
+    markdown.push_str("**Versions** *(use Cmd+. to update)*:\n");
+    for (i, version) in versions.iter().take(8).enumerate() {
+        if i == 0 {
+            markdown.push_str(&format!("- {} *(latest)*\n", version.version));
+        } else {
+            markdown.push_str(&format!("- {}\n", version.version));
+        }
+    }
+    if versions.len() > 8 {
+        markdown.push_str(&format!("- *...and {} more*\n", versions.len() - 8));
+    }
+
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: markdown,
+        }),
+        range: Some(pypi_dep.name_range),
     })
 }
 

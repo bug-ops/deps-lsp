@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use deps_cargo::{CargoVersion, ParsedDependency};
 use deps_core::HttpCache;
 use deps_npm::{NpmDependency, NpmVersion};
+use deps_pypi::{PypiDependency, PypiVersion};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +17,7 @@ use tower_lsp::lsp_types::Url;
 pub enum UnifiedDependency {
     Cargo(ParsedDependency),
     Npm(NpmDependency),
+    Pypi(PypiDependency),
 }
 
 impl UnifiedDependency {
@@ -24,6 +26,7 @@ impl UnifiedDependency {
         match self {
             UnifiedDependency::Cargo(dep) => &dep.name,
             UnifiedDependency::Npm(dep) => &dep.name,
+            UnifiedDependency::Pypi(dep) => &dep.name,
         }
     }
 
@@ -32,6 +35,7 @@ impl UnifiedDependency {
         match self {
             UnifiedDependency::Cargo(dep) => dep.name_range,
             UnifiedDependency::Npm(dep) => dep.name_range,
+            UnifiedDependency::Pypi(dep) => dep.name_range,
         }
     }
 
@@ -40,6 +44,7 @@ impl UnifiedDependency {
         match self {
             UnifiedDependency::Cargo(dep) => dep.version_req.as_deref(),
             UnifiedDependency::Npm(dep) => dep.version_req.as_deref(),
+            UnifiedDependency::Pypi(dep) => dep.version_req.as_deref(),
         }
     }
 
@@ -48,6 +53,7 @@ impl UnifiedDependency {
         match self {
             UnifiedDependency::Cargo(dep) => dep.version_range,
             UnifiedDependency::Npm(dep) => dep.version_range,
+            UnifiedDependency::Pypi(dep) => dep.version_range,
         }
     }
 
@@ -58,6 +64,9 @@ impl UnifiedDependency {
                 matches!(dep.source, deps_cargo::DependencySource::Registry)
             }
             UnifiedDependency::Npm(_) => true,
+            UnifiedDependency::Pypi(dep) => {
+                matches!(dep.source, deps_pypi::PypiDependencySource::PyPI)
+            }
         }
     }
 }
@@ -69,6 +78,7 @@ impl UnifiedDependency {
 pub enum UnifiedVersion {
     Cargo(CargoVersion),
     Npm(NpmVersion),
+    Pypi(PypiVersion),
 }
 
 impl UnifiedVersion {
@@ -77,6 +87,7 @@ impl UnifiedVersion {
         match self {
             UnifiedVersion::Cargo(v) => &v.num,
             UnifiedVersion::Npm(v) => &v.version,
+            UnifiedVersion::Pypi(v) => &v.version,
         }
     }
 
@@ -85,6 +96,7 @@ impl UnifiedVersion {
         match self {
             UnifiedVersion::Cargo(v) => v.yanked,
             UnifiedVersion::Npm(v) => v.deprecated,
+            UnifiedVersion::Pypi(v) => v.yanked,
         }
     }
 }
@@ -106,6 +118,9 @@ impl UnifiedVersion {
 /// let npm = Ecosystem::from_filename("package.json");
 /// assert_eq!(npm, Some(Ecosystem::Npm));
 ///
+/// let pypi = Ecosystem::from_filename("pyproject.toml");
+/// assert_eq!(pypi, Some(Ecosystem::Pypi));
+///
 /// let unknown = Ecosystem::from_filename("requirements.txt");
 /// assert_eq!(unknown, None);
 /// ```
@@ -115,6 +130,8 @@ pub enum Ecosystem {
     Cargo,
     /// JavaScript/TypeScript npm ecosystem (package.json)
     Npm,
+    /// Python PyPI ecosystem (pyproject.toml)
+    Pypi,
 }
 
 impl Ecosystem {
@@ -126,6 +143,7 @@ impl Ecosystem {
         match filename {
             "Cargo.toml" => Some(Self::Cargo),
             "package.json" => Some(Self::Npm),
+            "pyproject.toml" => Some(Self::Pypi),
             _ => None,
         }
     }
@@ -351,6 +369,10 @@ mod tests {
             Ecosystem::from_filename("package.json"),
             Some(Ecosystem::Npm)
         );
+        assert_eq!(
+            Ecosystem::from_filename("pyproject.toml"),
+            Some(Ecosystem::Pypi)
+        );
         assert_eq!(Ecosystem::from_filename("unknown.txt"), None);
     }
 
@@ -361,6 +383,9 @@ mod tests {
 
         let npm_uri = Url::parse("file:///path/to/package.json").unwrap();
         assert_eq!(Ecosystem::from_uri(&npm_uri), Some(Ecosystem::Npm));
+
+        let pypi_uri = Url::parse("file:///path/to/pyproject.toml").unwrap();
+        assert_eq!(Ecosystem::from_uri(&pypi_uri), Some(Ecosystem::Pypi));
 
         let unknown_uri = Url::parse("file:///path/to/README.md").unwrap();
         assert_eq!(Ecosystem::from_uri(&unknown_uri), None);

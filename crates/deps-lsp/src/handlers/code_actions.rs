@@ -7,6 +7,7 @@
 use crate::document::{Ecosystem, ServerState, UnifiedDependency};
 use deps_cargo::{CratesIoRegistry, DependencySource};
 use deps_npm::NpmRegistry;
+use deps_pypi::{PypiDependencySource, PypiRegistry};
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -65,6 +66,11 @@ pub async fn handle_code_actions(
                 UnifiedDependency::Npm(npm_dep) => {
                     (npm_dep.name.clone(), npm_dep.version_range?, true)
                 }
+                UnifiedDependency::Pypi(pypi_dep) => (
+                    pypi_dep.name.clone(),
+                    pypi_dep.version_range?,
+                    matches!(pypi_dep.source, PypiDependencySource::PyPI),
+                ),
             };
 
             if is_registry && ranges_overlap(version_range, range) {
@@ -80,6 +86,7 @@ pub async fn handle_code_actions(
     match ecosystem {
         Ecosystem::Cargo => handle_cargo_code_actions(state, uri, deps_to_check).await,
         Ecosystem::Npm => handle_npm_code_actions(state, uri, deps_to_check).await,
+        Ecosystem::Pypi => handle_pypi_code_actions(state, uri, deps_to_check).await,
     }
 }
 
@@ -184,6 +191,76 @@ async fn handle_npm_code_actions(
         for (i, version) in versions
             .iter()
             .filter(|v| !v.deprecated)
+            .take(5)
+            .enumerate()
+        {
+            let mut edits = HashMap::new();
+            edits.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: version_range,
+                    new_text: format!("\"{}\"", version.version),
+                }],
+            );
+
+            let title = if i == 0 {
+                format!("Update {} to {} (latest)", name, version.version)
+            } else {
+                format!("Update {} to {}", name, version.version)
+            };
+
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(edits),
+                    ..Default::default()
+                }),
+                is_preferred: Some(i == 0),
+                ..Default::default()
+            }));
+        }
+    }
+
+    actions
+}
+
+async fn handle_pypi_code_actions(
+    state: Arc<ServerState>,
+    uri: &Url,
+    deps: Vec<(String, Range)>,
+) -> Vec<CodeActionOrCommand> {
+    let registry = PypiRegistry::new(Arc::clone(&state.cache));
+
+    let futures: Vec<_> = deps
+        .iter()
+        .map(|(name, version_range)| {
+            let name = name.clone();
+            let version_range = *version_range;
+            let registry = registry.clone();
+            async move {
+                let versions = registry.get_versions(&name).await;
+                (name, version_range, versions)
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+
+    let mut actions = Vec::new();
+    for (name, version_range, versions_result) in results {
+        let versions = match versions_result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to fetch PyPI versions for {}: {}", name, e);
+                continue;
+            }
+        };
+
+        // Offer multiple version options (non-yanked, up to 5)
+        for (i, version) in versions
+            .iter()
+            .filter(|v| !v.yanked)
             .take(5)
             .enumerate()
         {

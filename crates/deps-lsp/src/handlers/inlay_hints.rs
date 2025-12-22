@@ -7,6 +7,7 @@ use crate::config::InlayHintsConfig;
 use crate::document::{Ecosystem, ServerState, UnifiedDependency, UnifiedVersion};
 use deps_cargo::{CratesIoRegistry, crate_url};
 use deps_npm::{NpmRegistry, package_url};
+use deps_pypi::PypiRegistry;
 use futures::future::join_all;
 use semver::Version;
 use std::collections::HashMap;
@@ -88,6 +89,9 @@ pub async fn handle_inlay_hints(
         }
         Ecosystem::Npm => {
             handle_npm_inlay_hints(state, deps_to_fetch, config, &cached_versions).await
+        }
+        Ecosystem::Pypi => {
+            handle_pypi_inlay_hints(state, deps_to_fetch, config, &cached_versions).await
         }
     };
 
@@ -376,6 +380,148 @@ fn create_npm_hint(
                 title: "Open on npmjs.com".into(),
                 command: "vscode.open".into(),
                 arguments: Some(vec![serde_json::json!(npm_url)]),
+            }),
+        }]),
+        kind: Some(InlayHintKind::TYPE),
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(true),
+        padding_right: None,
+        data: None,
+    }
+}
+
+async fn handle_pypi_inlay_hints(
+    state: Arc<ServerState>,
+    dependencies: Vec<UnifiedDependency>,
+    config: &InlayHintsConfig,
+    cached_versions: &HashMap<String, UnifiedVersion>,
+) -> Vec<InlayHint> {
+    let registry = PypiRegistry::new(Arc::clone(&state.cache));
+
+    // Separate deps into cached and needs-fetch
+    let mut cached_deps = Vec::new();
+    let mut fetch_deps = Vec::new();
+
+    for dep in &dependencies {
+        if let UnifiedDependency::Pypi(pypi_dep) = dep {
+            let Some(version_req) = pypi_dep.version_req.as_ref() else {
+                continue;
+            };
+            let Some(version_range) = pypi_dep.version_range else {
+                continue;
+            };
+
+            if let Some(cached) = cached_versions.get(&pypi_dep.name) {
+                cached_deps.push((
+                    pypi_dep.name.clone(),
+                    version_req.clone(),
+                    version_range,
+                    cached.version_string().to_string(),
+                    cached.is_yanked(),
+                ));
+            } else {
+                fetch_deps.push((pypi_dep.name.clone(), version_req.clone(), version_range));
+            }
+        }
+    }
+
+    // Fetch missing versions in parallel
+    let futures: Vec<_> = fetch_deps
+        .into_iter()
+        .map(|(name, version_req, version_range)| {
+            let registry = registry.clone();
+            async move {
+                let result = registry.get_versions(&name).await;
+                (name, version_req, version_range, result)
+            }
+        })
+        .collect();
+
+    let fetch_results = join_all(futures).await;
+
+    let mut hints = Vec::new();
+
+    // Process cached deps
+    for (name, version_req, version_range, latest_version, is_yanked) in cached_deps {
+        if is_yanked {
+            continue;
+        }
+        let is_latest = is_version_latest(&version_req, &latest_version);
+        hints.push(create_pypi_hint(
+            &name,
+            &version_req,
+            version_range,
+            &latest_version,
+            is_latest,
+            config,
+        ));
+    }
+
+    // Process fetched deps
+    for (name, version_req, version_range, result) in fetch_results {
+        let versions = match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to fetch PyPI versions for {}: {}", name, e);
+                continue;
+            }
+        };
+
+        let latest = match versions.iter().find(|v| !v.yanked) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let is_latest = is_version_latest(&version_req, &latest.version);
+        hints.push(create_pypi_hint(
+            &name,
+            &version_req,
+            version_range,
+            &latest.version,
+            is_latest,
+            config,
+        ));
+    }
+
+    hints
+}
+
+fn create_pypi_hint(
+    name: &str,
+    _version_req: &str,
+    version_range: tower_lsp::lsp_types::Range,
+    latest_version: &str,
+    is_latest: bool,
+    config: &InlayHintsConfig,
+) -> InlayHint {
+    let label_text = if is_latest {
+        config.up_to_date_text.clone()
+    } else {
+        config.needs_update_text.replace("{}", latest_version)
+    };
+
+    let pypi_url = format!("https://pypi.org/project/{}/", name);
+    let tooltip_content = format!(
+        "[{}]({}) - {}\n\nLatest: **{}**",
+        name, pypi_url, pypi_url, latest_version
+    );
+
+    InlayHint {
+        position: version_range.end,
+        label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
+            value: label_text,
+            tooltip: Some(
+                tower_lsp::lsp_types::InlayHintLabelPartTooltip::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: tooltip_content,
+                }),
+            ),
+            location: None,
+            command: Some(tower_lsp::lsp_types::Command {
+                title: "Open on PyPI".into(),
+                command: "vscode.open".into(),
+                arguments: Some(vec![serde_json::json!(pypi_url)]),
             }),
         }]),
         kind: Some(InlayHintKind::TYPE),
