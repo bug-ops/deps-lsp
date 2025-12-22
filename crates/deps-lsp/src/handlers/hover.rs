@@ -4,14 +4,11 @@
 //! name or version string. Shows crate metadata, latest version, features,
 //! and links to documentation/repository.
 
-use crate::document::{Ecosystem, ServerState, UnifiedDependency};
-use deps_cargo::{CratesIoRegistry, crate_url};
-use deps_npm::{NpmRegistry, package_url};
-use deps_pypi::PypiRegistry;
+use crate::document::{Ecosystem, ServerState};
+use crate::handlers::{CargoHandlerImpl, NpmHandlerImpl, PyPiHandlerImpl};
+use deps_core::{EcosystemHandler, generate_hover};
 use std::sync::Arc;
-use tower_lsp::lsp_types::{
-    Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, Position, Range,
-};
+use tower_lsp::lsp_types::{Hover, HoverParams, Position, Range};
 
 /// Handles hover requests.
 ///
@@ -55,164 +52,19 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
     drop(doc);
 
     match ecosystem {
-        Ecosystem::Cargo => handle_cargo_hover(state, uri, position, &dep).await,
-        Ecosystem::Npm => handle_npm_hover(state, uri, position, &dep).await,
-        Ecosystem::Pypi => handle_pypi_hover(state, uri, position, &dep).await,
-    }
-}
-
-async fn handle_cargo_hover(
-    state: Arc<ServerState>,
-    _uri: &tower_lsp::lsp_types::Url,
-    _position: Position,
-    dep: &UnifiedDependency,
-) -> Option<Hover> {
-    let UnifiedDependency::Cargo(cargo_dep) = dep else {
-        return None;
-    };
-
-    let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
-    let versions = registry.get_versions(&cargo_dep.name).await.ok()?;
-    let latest = versions.first()?;
-
-    let url = crate_url(&cargo_dep.name);
-    let mut markdown = format!("# [{}]({})\n\n", cargo_dep.name, url);
-
-    if let Some(current) = &cargo_dep.version_req {
-        markdown.push_str(&format!("**Current**: `{}`\n\n", current));
-    }
-
-    if latest.yanked {
-        markdown.push_str("⚠️ **Warning**: This version has been yanked\n\n");
-    }
-
-    // Show version list
-    markdown.push_str("**Versions** *(use Cmd+. to update)*:\n");
-    for (i, version) in versions.iter().take(8).enumerate() {
-        if i == 0 {
-            // Latest version with docs.rs link
-            let docs_url = format!("https://docs.rs/{}/{}", cargo_dep.name, version.num);
-            markdown.push_str(&format!("- {} [(docs)]({})\n", version.num, docs_url));
-        } else {
-            markdown.push_str(&format!("- {}\n", version.num));
+        Ecosystem::Cargo => {
+            let handler = CargoHandlerImpl::new(Arc::clone(&state.cache));
+            generate_hover(&handler, &dep).await
+        }
+        Ecosystem::Npm => {
+            let handler = NpmHandlerImpl::new(Arc::clone(&state.cache));
+            generate_hover(&handler, &dep).await
+        }
+        Ecosystem::Pypi => {
+            let handler = PyPiHandlerImpl::new(Arc::clone(&state.cache));
+            generate_hover(&handler, &dep).await
         }
     }
-    if versions.len() > 8 {
-        markdown.push_str(&format!("- *...and {} more*\n", versions.len() - 8));
-    }
-
-    // Show features if available
-    if !latest.features.is_empty() {
-        markdown.push_str("\n**Features**:\n");
-        for feature in latest.features.keys().take(10) {
-            markdown.push_str(&format!("- `{}`\n", feature));
-        }
-        if latest.features.len() > 10 {
-            markdown.push_str(&format!("- *...and {} more*\n", latest.features.len() - 10));
-        }
-    }
-
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: markdown,
-        }),
-        range: Some(cargo_dep.name_range),
-    })
-}
-
-async fn handle_npm_hover(
-    state: Arc<ServerState>,
-    _uri: &tower_lsp::lsp_types::Url,
-    _position: Position,
-    dep: &UnifiedDependency,
-) -> Option<Hover> {
-    let UnifiedDependency::Npm(npm_dep) = dep else {
-        return None;
-    };
-
-    let registry = NpmRegistry::new(Arc::clone(&state.cache));
-    let versions = registry.get_versions(&npm_dep.name).await.ok()?;
-    let latest = versions.first()?;
-
-    let url = package_url(&npm_dep.name);
-    let mut markdown = format!("# [{}]({})\n\n", npm_dep.name, url);
-
-    if let Some(current) = &npm_dep.version_req {
-        markdown.push_str(&format!("**Current**: `{}`\n\n", current));
-    }
-
-    if latest.deprecated {
-        markdown.push_str("⚠️ **Warning**: This package is deprecated\n\n");
-    }
-
-    // Show version list
-    markdown.push_str("**Versions** *(use Cmd+. to update)*:\n");
-    for (i, version) in versions.iter().take(8).enumerate() {
-        if i == 0 {
-            markdown.push_str(&format!("- {} *(latest)*\n", version.version));
-        } else {
-            markdown.push_str(&format!("- {}\n", version.version));
-        }
-    }
-    if versions.len() > 8 {
-        markdown.push_str(&format!("- *...and {} more*\n", versions.len() - 8));
-    }
-
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: markdown,
-        }),
-        range: Some(npm_dep.name_range),
-    })
-}
-
-async fn handle_pypi_hover(
-    state: Arc<ServerState>,
-    _uri: &tower_lsp::lsp_types::Url,
-    _position: Position,
-    dep: &UnifiedDependency,
-) -> Option<Hover> {
-    let UnifiedDependency::Pypi(pypi_dep) = dep else {
-        return None;
-    };
-
-    let registry = PypiRegistry::new(Arc::clone(&state.cache));
-    let versions = registry.get_versions(&pypi_dep.name).await.ok()?;
-    let latest = versions.first()?;
-
-    let url = format!("https://pypi.org/project/{}/", pypi_dep.name);
-    let mut markdown = format!("# [{}]({})\n\n", pypi_dep.name, url);
-
-    if let Some(current) = &pypi_dep.version_req {
-        markdown.push_str(&format!("**Current**: `{}`\n\n", current));
-    }
-
-    if latest.yanked {
-        markdown.push_str("⚠️ **Warning**: This version has been yanked\n\n");
-    }
-
-    // Show version list
-    markdown.push_str("**Versions** *(use Cmd+. to update)*:\n");
-    for (i, version) in versions.iter().take(8).enumerate() {
-        if i == 0 {
-            markdown.push_str(&format!("- {} *(latest)*\n", version.version));
-        } else {
-            markdown.push_str(&format!("- {}\n", version.version));
-        }
-    }
-    if versions.len() > 8 {
-        markdown.push_str(&format!("- *...and {} more*\n", versions.len() - 8));
-    }
-
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: markdown,
-        }),
-        range: Some(pypi_dep.name_range),
-    })
 }
 
 /// Checks if a position is within a range.

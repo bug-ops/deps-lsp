@@ -3,7 +3,7 @@
 //! Implements the EcosystemHandler trait for Cargo/crates.io,
 //! enabling generic LSP operations (inlay hints, hover, etc.).
 
-use crate::{CratesIoRegistry, crate_url, ParsedDependency};
+use crate::{CratesIoRegistry, ParsedDependency, crate_url};
 use async_trait::async_trait;
 use deps_core::{EcosystemHandler, HttpCache, SemverMatcher, VersionRequirementMatcher};
 use std::sync::Arc;

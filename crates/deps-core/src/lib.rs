@@ -100,12 +100,12 @@ pub mod version_matcher;
 pub use cache::{CachedResponse, HttpCache};
 pub use error::{DepsError, Result};
 pub use handler::{
-    generate_hover, generate_inlay_hints, EcosystemHandler, InlayHintsConfig, VersionStringGetter,
-    YankedChecker,
+    EcosystemHandler, InlayHintsConfig, VersionStringGetter, YankedChecker, generate_hover,
+    generate_inlay_hints,
 };
 pub use parser::{DependencyInfo, DependencySource, ManifestParser, ParseResultInfo};
 pub use registry::{PackageMetadata, PackageRegistry, VersionInfo};
 pub use version_matcher::{
-    extract_pypi_min_version, normalize_and_parse_version, Pep440Matcher, SemverMatcher,
-    VersionRequirementMatcher,
+    Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
+    normalize_and_parse_version,
 };

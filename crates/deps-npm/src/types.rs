@@ -114,6 +114,30 @@ pub struct NpmPackage {
 
 // Implement deps_core traits
 
+impl deps_core::DependencyInfo for NpmDependency {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&str> {
+        self.version_req.as_deref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::parser::DependencySource {
+        // npm dependencies are always from registry
+        // (git/file/workspace dependencies are not tracked with positions)
+        deps_core::parser::DependencySource::Registry
+    }
+}
+
 impl deps_core::VersionInfo for NpmVersion {
     fn version_string(&self) -> &str {
         &self.version

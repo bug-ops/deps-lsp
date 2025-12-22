@@ -3,16 +3,15 @@
 //! Provides traits and generic functions for implementing LSP operations
 //! (inlay hints, hover, etc.) across different package ecosystems.
 
+use crate::HttpCache;
 use crate::parser::DependencyInfo;
 use crate::registry::{PackageRegistry, VersionInfo};
-use crate::HttpCache;
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
-    InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, MarkupContent, MarkupKind,
-    Range,
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, MarkupContent, MarkupKind, Range,
 };
 
 /// Generic handler for LSP operations across ecosystems.
