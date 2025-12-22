@@ -1,8 +1,8 @@
 //! crates.io registry client.
 //!
 //! Provides access to crates.io via:
-//! - Sparse index protocol (https://index.crates.io) for version lookups
-//! - REST API (https://crates.io/api/v1) for search
+//! - Sparse index protocol (<https://index.crates.io>) for version lookups
+//! - REST API (<https://crates.io/api/v1>) for search
 //!
 //! All HTTP requests are cached aggressively using ETag/Last-Modified headers.
 //!
