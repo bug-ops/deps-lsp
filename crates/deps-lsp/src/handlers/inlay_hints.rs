@@ -31,11 +31,21 @@ pub async fn handle_inlay_hints(
     params: InlayHintParams,
     config: &InlayHintsConfig,
 ) -> Vec<InlayHint> {
+    let uri = &params.text_document.uri;
+
+    tracing::info!(
+        "inlay_hint request: uri={}, range={}:{}-{}:{}",
+        uri,
+        params.range.start.line,
+        params.range.start.character,
+        params.range.end.line,
+        params.range.end.character
+    );
+
     if !config.enabled {
+        tracing::debug!("inlay hints disabled in config");
         return vec![];
     }
-
-    let uri = &params.text_document.uri;
 
     let doc = match state.get_document(uri) {
         Some(d) => d,
@@ -55,12 +65,21 @@ pub async fn handle_inlay_hints(
         .cloned()
         .collect();
 
+    tracing::info!(
+        "inlay hints: found {} dependencies to fetch (total {} in doc)",
+        deps_to_fetch.len(),
+        doc.dependencies.len()
+    );
+
     drop(doc);
 
-    match ecosystem {
+    let hints = match ecosystem {
         Ecosystem::Cargo => handle_cargo_inlay_hints(state, deps_to_fetch, config).await,
         Ecosystem::Npm => handle_npm_inlay_hints(state, deps_to_fetch, config).await,
-    }
+    };
+
+    tracing::info!("returning {} inlay hints", hints.len());
+    hints
 }
 
 async fn handle_cargo_inlay_hints(
