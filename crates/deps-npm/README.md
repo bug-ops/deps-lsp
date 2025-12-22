@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deps-npm)](https://crates.io/crates/deps-npm)
 [![docs.rs](https://img.shields.io/docsrs/deps-npm)](https://docs.rs/deps-npm)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-npm)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 npm/package.json support for deps-lsp.

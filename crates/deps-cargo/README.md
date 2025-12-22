@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deps-cargo)](https://crates.io/crates/deps-cargo)
 [![docs.rs](https://img.shields.io/docsrs/deps-cargo)](https://docs.rs/deps-cargo)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-cargo)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Cargo.toml support for deps-lsp.

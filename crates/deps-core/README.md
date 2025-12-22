@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deps-core)](https://crates.io/crates/deps-core)
 [![docs.rs](https://img.shields.io/docsrs/deps-core)](https://docs.rs/deps-core)
+[![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-core)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Core abstractions for deps-lsp: caching, errors, and traits.
