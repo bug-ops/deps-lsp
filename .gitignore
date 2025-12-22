@@ -1,7 +1,8 @@
 # Rust
-/target
+target
 **/*.rs.bk
 *.pdb
+*.wasm
 
 # IDE
 .vscode/

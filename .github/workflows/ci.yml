@@ -126,7 +126,7 @@ jobs:
 
   # Cross-platform tests with matrix
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}${{ matrix.target && format(' / {0}', matrix.target) || '' }})
     needs: [changes, fmt, check]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ${{ matrix.os }}
@@ -140,6 +140,11 @@ jobs:
           # Test on beta channel on Linux only
           - os: ubuntu-latest
             rust: beta
+          # Cross-compile check for Windows ARM64
+          - os: windows-latest
+            rust: stable
+            target: aarch64-pc-windows-msvc
+            cross: true
 
     steps:
       - uses: actions/checkout@v6
@@ -148,6 +153,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
+          targets: ${{ matrix.target }}
 
       # Platform-specific setup
       - name: Install dependencies (Ubuntu)
@@ -159,17 +165,24 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "test-${{ matrix.os }}"
+          shared-key: "test-${{ matrix.os }}${{ matrix.target && format('-{0}', matrix.target) || '' }}"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install nextest
+        if: ${{ !matrix.cross }}
         uses: taiki-e/install-action@nextest
 
       - name: Run tests
+        if: ${{ !matrix.cross }}
         run: cargo nextest run --workspace --all-features --no-fail-fast
 
       - name: Run doctests
+        if: ${{ !matrix.cross }}
         run: cargo test --workspace --doc --all-features
+
+      - name: Build for cross-compile target
+        if: ${{ matrix.cross }}
+        run: cargo build --workspace --target ${{ matrix.target }}
 
   # Code coverage (Linux only for speed)
   coverage:

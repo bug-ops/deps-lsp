@@ -4,9 +4,8 @@
 //! including TOML parsing, dependency extraction, and crates.io registry
 //! integration via the sparse index protocol.
 //!
-//! # Phase 1 Implementation
+//! # Features
 //!
-//! The initial implementation focuses on:
 //! - Parsing `Cargo.toml` dependencies with position tracking
 //! - Fetching version data from crates.io sparse index
 //! - Supporting registry, git, and path dependencies
@@ -21,7 +20,11 @@
 //! let _deps: Vec<ParsedDependency> = vec![];
 //! ```
 
+pub mod parser;
+pub mod registry;
 pub mod types;
 
 // Re-export commonly used types
+pub use parser::{ParseResult, parse_cargo_toml};
+pub use registry::CratesIoRegistry;
 pub use types::ParsedDependency;

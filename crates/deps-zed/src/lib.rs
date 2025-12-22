@@ -1,7 +1,7 @@
 use zed_extension_api::{self as zed, Result};
 
 struct DepsExtension {
-    #[allow(dead_code)] // Will be used in Phase 1 Week 4
+    #[allow(dead_code)] // Used for binary caching
     cached_binary_path: Option<String>,
 }
 
@@ -29,9 +29,7 @@ impl zed::Extension for DepsExtension {
 
 impl DepsExtension {
     fn ensure_binary_installed(&mut self) -> Result<String> {
-        // Placeholder implementation
-        // Binary download logic will be implemented in Phase 1 Week 4
-        // For now, return error asking user to install manually
+        // TODO: implement binary download from GitHub releases
         Err(
             "deps-lsp binary not found. Please install manually with: cargo install deps-lsp"
                 .into(),

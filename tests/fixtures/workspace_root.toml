@@ -3,4 +3,4 @@ members = ["crates/*"]
 
 [workspace.dependencies]
 serde = "1.0"
-tokio = "1"
+tokio = { version = "1.0", features = ["full"] }

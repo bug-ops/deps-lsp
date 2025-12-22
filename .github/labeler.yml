@@ -61,23 +61,6 @@
       - '**/*_test.rs'
       - '**/benches/**/*'
 
-# Size labels (applied by GitHub automatically, but we can customize)
-'size/small':
-  - changed-files:
-    - count: 1..5
-
-'size/medium':
-  - changed-files:
-    - count: 6..20
-
-'size/large':
-  - changed-files:
-    - count: 21..100
-
-'size/x-large':
-  - changed-files:
-    - count: 101..500
-
 # Type labels (based on conventional commits in title)
 'type/feature':
   - title: '^feat(\(.*\))?:'
