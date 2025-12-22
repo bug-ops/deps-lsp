@@ -163,6 +163,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -175,13 +177,14 @@ jobs:
           shared-key: "wasm-release"
 
       - name: Build Zed extension
-        run: cargo build --package deps-zed --target wasm32-wasip1 --release
+        working-directory: crates/deps-zed
+        run: cargo build --target wasm32-wasip1 --release
 
       - name: Create WASM archive
         run: |
-          cd target/wasm32-wasip1/release
-          tar czf ../../../deps-zed.wasm.tar.gz deps_zed.wasm
-          cd ../../..
+          cd crates/deps-zed/target/wasm32-wasip1/release
+          tar czf ../../../../../deps-zed.wasm.tar.gz deps_zed.wasm
+          cd ../../../../..
           shasum -a 256 deps-zed.wasm.tar.gz > deps-zed.wasm.tar.gz.sha256
 
       - name: Upload WASM archive
@@ -214,16 +217,32 @@ jobs:
             exit 1
           fi
 
-      - name: Publish deps-lsp to crates.io
-        run: cargo publish --package deps-lsp --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish deps-core to crates.io
+        run: cargo publish --package deps-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         continue-on-error: true
 
       - name: Wait for crates.io propagation
         run: sleep 30
 
-      - name: Publish deps-zed to crates.io
-        run: cargo publish --package deps-zed --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Publish deps-cargo to crates.io
+        run: cargo publish --package deps-cargo --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         continue-on-error: true
+
+      - name: Wait for crates.io propagation
+        run: sleep 30
+
+      - name: Publish deps-npm to crates.io
+        run: cargo publish --package deps-npm --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: true
+
+      - name: Wait for crates.io propagation
+        run: sleep 30
+
+      - name: Publish deps-lsp to crates.io
+        run: cargo publish --package deps-lsp --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: true
+
+      # Note: deps-zed is now in a separate repository and published from there
 
   # Update release notes with installation instructions
   update-release-notes:

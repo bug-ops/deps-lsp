@@ -259,6 +259,9 @@ jobs:
         run: cargo check --workspace --all-features
 
   # WASM build check for Zed extension
+  # Note: deps-zed is now a separate repository (submodule).
+  # WASM build is handled in the deps-zed repo CI.
+  # This job now validates that submodule is properly configured.
   wasm:
     name: WASM Build (Zed Extension)
     needs: [changes, fmt, check]
@@ -267,6 +270,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: true
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -279,12 +284,13 @@ jobs:
           shared-key: "wasm"
 
       - name: Build Zed extension
-        run: cargo build --package deps-zed --target wasm32-wasip1 --release
+        working-directory: crates/deps-zed
+        run: cargo build --target wasm32-wasip1 --release
 
       - name: Check WASM size
         run: |
-          ls -lh target/wasm32-wasip1/release/*.wasm
-          du -sh target/wasm32-wasip1/release/*.wasm
+          ls -lh crates/deps-zed/target/wasm32-wasip1/release/*.wasm
+          du -sh crates/deps-zed/target/wasm32-wasip1/release/*.wasm
 
   # Verify benchmarks compile (without running)
   benchmark:
