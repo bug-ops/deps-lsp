@@ -157,9 +157,8 @@ fn parse_dependency_section(
 
 /// Finds the position of a dependency name and version in the source text.
 ///
-/// This is a simplified implementation that searches for the first occurrence
-/// of the dependency name in quotes. A more robust implementation would use
-/// a JSON parser that preserves position information.
+/// Searches for the dependency as a JSON key-value pair to avoid false matches
+/// when the name appears elsewhere in the file (e.g., in scripts).
 fn find_dependency_positions(
     content: &str,
     name: &str,
@@ -169,26 +168,50 @@ fn find_dependency_positions(
     let mut name_range = Range::default();
     let mut version_range = None;
 
-    let search_pattern = format!("\"{}\"", name);
+    let name_pattern = format!("\"{}\"", name);
 
-    if let Some(name_start_idx) = content.find(&search_pattern) {
+    // Find all occurrences of the name pattern and check which one is a dependency key
+    let mut search_start = 0;
+    while let Some(rel_idx) = content[search_start..].find(&name_pattern) {
+        let name_start_idx = search_start + rel_idx;
+        let after_name = &content[name_start_idx + name_pattern.len()..];
+
+        // Check if this is a JSON key (followed by optional whitespace and colon)
+        let trimmed = after_name.trim_start();
+        if !trimmed.starts_with(':') {
+            // Not a key, continue searching
+            search_start = name_start_idx + name_pattern.len();
+            continue;
+        }
+
+        // Found a valid key, calculate position
         let name_start = line_table.position_from_offset(name_start_idx + 1);
         let name_end = line_table.position_from_offset(name_start_idx + 1 + name.len());
         name_range = Range::new(name_start, name_end);
 
-        // Find version position (after the name)
+        // Find version position (after the colon)
         if let Some(version) = version_req {
-            let search_after_name = &content[name_start_idx..];
             let version_search = format!("\"{}\"", version);
+            // Search for version only in the portion after the colon
+            let colon_offset =
+                name_start_idx + name_pattern.len() + (after_name.len() - trimmed.len());
+            let after_colon = &content[colon_offset..];
 
-            if let Some(rel_idx) = search_after_name.find(&version_search) {
-                let version_start_idx = name_start_idx + rel_idx + 1;
+            // Limit search to the next 100 chars to stay within this key-value pair
+            let search_limit = after_colon.len().min(100 + version.len());
+            let search_area = &after_colon[..search_limit];
+
+            if let Some(ver_rel_idx) = search_area.find(&version_search) {
+                let version_start_idx = colon_offset + ver_rel_idx + 1;
                 let version_start = line_table.position_from_offset(version_start_idx);
                 let version_end =
                     line_table.position_from_offset(version_start_idx + version.len());
                 version_range = Some(Range::new(version_start, version_end));
             }
         }
+
+        // Found valid dependency, stop searching
+        break;
     }
 
     (name_range, version_range)
@@ -401,6 +424,98 @@ mod tests {
         assert_eq!(
             result.dependencies[0].version_req,
             Some("file:../local-package".into())
+        );
+    }
+
+    #[test]
+    fn test_scoped_package() {
+        let json = r#"{
+  "devDependencies": {
+    "@vitest/coverage-v8": "^3.1.4"
+  }
+}"#;
+
+        let result = parse_package_json(json).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "@vitest/coverage-v8");
+        assert_eq!(result.dependencies[0].version_req, Some("^3.1.4".into()));
+        assert!(result.dependencies[0].version_range.is_some());
+    }
+
+    #[test]
+    fn test_package_name_in_scripts_not_confused() {
+        // Regression test: "vitest" appears in scripts as a value,
+        // but should only be found as a dependency key
+        let json = r#"{
+  "scripts": {
+    "test": "vitest",
+    "coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "vitest": "^3.1.4"
+  }
+}"#;
+
+        let result = parse_package_json(json).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let vitest = &result.dependencies[0];
+        assert_eq!(vitest.name, "vitest");
+        assert_eq!(vitest.version_req, Some("^3.1.4".into()));
+        // Verify version_range is found (this was the bug)
+        assert!(
+            vitest.version_range.is_some(),
+            "vitest should have a version_range"
+        );
+        // Verify position is in devDependencies, not scripts
+        // devDependencies starts at line 6
+        assert!(
+            vitest.name_range.start.line >= 5,
+            "vitest should be found in devDependencies, not scripts"
+        );
+    }
+
+    #[test]
+    fn test_multiple_packages_same_version() {
+        // Both packages have the same version - each should have distinct positions
+        let json = r#"{
+  "devDependencies": {
+    "@vitest/coverage-v8": "^3.1.4",
+    "vitest": "^3.1.4"
+  }
+}"#;
+
+        let result = parse_package_json(json).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        // Find both dependencies
+        let coverage = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "@vitest/coverage-v8")
+            .expect("@vitest/coverage-v8 should be parsed");
+        let vitest = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "vitest")
+            .expect("vitest should be parsed");
+
+        // Both should have version ranges
+        assert!(
+            coverage.version_range.is_some(),
+            "@vitest/coverage-v8 should have version_range"
+        );
+        assert!(
+            vitest.version_range.is_some(),
+            "vitest should have version_range"
+        );
+
+        // Positions should be different
+        let coverage_pos = coverage.version_range.unwrap();
+        let vitest_pos = vitest.version_range.unwrap();
+        assert_ne!(
+            coverage_pos.start.line, vitest_pos.start.line,
+            "version positions should be on different lines"
         );
     }
 }
