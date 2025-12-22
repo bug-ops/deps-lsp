@@ -43,6 +43,7 @@ jobs:
               - '**/Cargo.toml'
               - '**/Cargo.lock'
               - 'rust-toolchain.toml'
+              - 'deny.toml'
             workflows:
               - '.github/workflows/**'
 
@@ -376,19 +377,38 @@ jobs:
   # All checks passed
   ci-success:
     name: CI Success
-    needs: [check, security, test, coverage, msrv, wasm]
+    needs: [changes, check, security, test, coverage, msrv, wasm]
     runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Check all jobs
         run: |
-          # Check if any required job failed
-          if [[ "${{ needs.check.result }}" != "success" ]] || \
-             [[ "${{ needs.security.result }}" != "success" ]] || \
-             [[ "${{ needs.test.result }}" != "success" ]] || \
-             [[ "${{ needs.coverage.result }}" != "success" ]] || \
-             [[ "${{ needs.msrv.result }}" != "success" ]] || \
-             [[ "${{ needs.wasm.result }}" != "success" ]]; then
+          # If no relevant changes, all skipped jobs are OK
+          if [[ "${{ needs.changes.outputs.rust }}" != "true" && "${{ needs.changes.outputs.workflows }}" != "true" ]]; then
+            echo "No relevant changes - skipped jobs are OK"
+            exit 0
+          fi
+
+          # Check if any required job failed (skipped is OK for conditional jobs)
+          check_job() {
+            local result="$1"
+            local name="$2"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "Job $name failed: $result"
+              return 1
+            fi
+            return 0
+          }
+
+          failed=0
+          check_job "${{ needs.check.result }}" "check" || failed=1
+          check_job "${{ needs.security.result }}" "security" || failed=1
+          check_job "${{ needs.test.result }}" "test" || failed=1
+          check_job "${{ needs.coverage.result }}" "coverage" || failed=1
+          check_job "${{ needs.msrv.result }}" "msrv" || failed=1
+          check_job "${{ needs.wasm.result }}" "wasm" || failed=1
+
+          if [[ $failed -eq 1 ]]; then
             echo "One or more jobs failed"
             exit 1
           fi
