@@ -10,7 +10,7 @@ use tower_lsp::lsp_types::Range;
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::{ParsedDependency, DependencySource, DependencySection};
+/// use deps_cargo::types::{ParsedDependency, DependencySource, DependencySection};
 /// use tower_lsp::lsp_types::{Position, Range};
 ///
 /// let dep = ParsedDependency {
@@ -50,7 +50,7 @@ pub struct ParsedDependency {
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::DependencySource;
+/// use deps_cargo::types::DependencySource;
 ///
 /// let registry = DependencySource::Registry;
 /// let git = DependencySource::Git {
@@ -81,7 +81,7 @@ pub enum DependencySource {
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::DependencySection;
+/// use deps_cargo::types::DependencySection;
 ///
 /// let section = DependencySection::Dependencies;
 /// assert!(matches!(section, DependencySection::Dependencies));
@@ -104,7 +104,7 @@ pub enum DependencySection {
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::CargoVersion;
+/// use deps_cargo::types::CargoVersion;
 /// use std::collections::HashMap;
 ///
 /// let version = CargoVersion {
@@ -135,7 +135,7 @@ pub struct CargoVersion {
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::CrateInfo;
+/// use deps_cargo::types::CrateInfo;
 ///
 /// let info = CrateInfo {
 ///     name: "serde".into(),

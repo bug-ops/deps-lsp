@@ -1,6 +1,6 @@
 //! Cargo.toml parsing and crates.io integration.
 //!
-//! This module provides Cargo-specific functionality for the LSP server,
+//! This crate provides Cargo-specific functionality for the deps-lsp server,
 //! including TOML parsing, dependency extraction, and crates.io registry
 //! integration via the sparse index protocol.
 //!
@@ -10,11 +10,12 @@
 //! - Fetching version data from crates.io sparse index
 //! - Supporting registry, git, and path dependencies
 //! - Workspace inheritance (`workspace = true`)
+//! - Implementing deps-core traits for generic LSP handlers
 //!
 //! # Examples
 //!
 //! ```
-//! use deps_lsp::cargo::ParsedDependency;
+//! use deps_cargo::{ParsedDependency, CratesIoRegistry};
 //!
 //! // Types are re-exported for convenience
 //! let _deps: Vec<ParsedDependency> = vec![];
@@ -25,6 +26,6 @@ pub mod registry;
 pub mod types;
 
 // Re-export commonly used types
-pub use parser::{ParseResult, parse_cargo_toml};
+pub use parser::{CargoParser, ParseResult, parse_cargo_toml};
 pub use registry::CratesIoRegistry;
-pub use types::ParsedDependency;
+pub use types::{CargoVersion, CrateInfo, DependencySection, DependencySource, ParsedDependency};

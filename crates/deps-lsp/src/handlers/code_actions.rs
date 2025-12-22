@@ -4,9 +4,8 @@
 //! - "Update to latest version" for outdated dependencies
 //! - "Add missing feature" for feature suggestions
 
-use crate::cargo::registry::CratesIoRegistry;
-use crate::cargo::types::DependencySource;
-use crate::document::ServerState;
+use crate::document::{Ecosystem, ServerState, UnifiedDependency};
+use deps_cargo::{CratesIoRegistry, DependencySource, ParsedDependency};
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,21 +33,32 @@ pub async fn handle_code_actions(
         }
     };
 
+    // TODO: Add npm support in code actions
+    if doc.ecosystem != Ecosystem::Cargo {
+        tracing::debug!("Code actions not yet implemented for {:?}", doc.ecosystem);
+        return vec![];
+    }
+
     let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
 
-    let deps_in_range: Vec<_> = doc
+    let cargo_deps: Vec<&ParsedDependency> = doc
         .dependencies
         .iter()
-        .filter(|dep| {
-            matches!(dep.source, DependencySource::Registry)
-                && dep
-                    .version_range
-                    .map(|r| ranges_overlap(r, range))
-                    .unwrap_or(false)
+        .filter_map(|dep| {
+            if let UnifiedDependency::Cargo(cargo_dep) = dep {
+                if matches!(cargo_dep.source, DependencySource::Registry) {
+                    if let Some(version_range) = cargo_dep.version_range {
+                        if ranges_overlap(version_range, range) {
+                            return Some(cargo_dep);
+                        }
+                    }
+                }
+            }
+            None
         })
         .collect();
 
-    let futures: Vec<_> = deps_in_range
+    let futures: Vec<_> = cargo_deps
         .iter()
         .map(|dep| {
             let name = dep.name.clone();
@@ -78,19 +88,20 @@ pub async fn handle_code_actions(
             None => continue,
         };
 
-        let edit = TextEdit {
-            range: version_range,
-            new_text: format!(r#""{}""#, latest.num),
-        };
-
-        let mut changes = HashMap::new();
-        changes.insert(uri.clone(), vec![edit]);
+        let mut edits = HashMap::new();
+        edits.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: version_range,
+                new_text: format!("\"{}\"", latest.num),
+            }],
+        );
 
         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!("Update to latest version ({})", latest.num),
+            title: format!("Update {} to {}", name, latest.num),
             kind: Some(CodeActionKind::QUICKFIX),
             edit: Some(WorkspaceEdit {
-                changes: Some(changes),
+                changes: Some(edits),
                 ..Default::default()
             }),
             ..Default::default()
@@ -102,7 +113,10 @@ pub async fn handle_code_actions(
 
 /// Checks if two ranges overlap.
 fn ranges_overlap(a: Range, b: Range) -> bool {
-    !(a.end.line < b.start.line || b.end.line < a.start.line)
+    !(a.end.line < b.start.line
+        || (a.end.line == b.start.line && a.end.character < b.start.character)
+        || b.end.line < a.start.line
+        || (b.end.line == a.start.line && b.end.character < a.start.character))
 }
 
 #[cfg(test)]
@@ -112,19 +126,11 @@ mod tests {
 
     #[test]
     fn test_ranges_overlap() {
-        let r1 = Range::new(Position::new(1, 0), Position::new(1, 10));
-        let r2 = Range::new(Position::new(1, 5), Position::new(1, 15));
-        assert!(ranges_overlap(r1, r2));
+        let range1 = Range::new(Position::new(1, 5), Position::new(1, 10));
+        let range2 = Range::new(Position::new(1, 7), Position::new(1, 12));
+        assert!(ranges_overlap(range1, range2));
 
-        let r3 = Range::new(Position::new(1, 0), Position::new(1, 10));
-        let r4 = Range::new(Position::new(2, 0), Position::new(2, 10));
-        assert!(!ranges_overlap(r3, r4));
-    }
-
-    #[test]
-    fn test_ranges_overlap_same_line() {
-        let r1 = Range::new(Position::new(1, 0), Position::new(1, 10));
-        let r2 = Range::new(Position::new(1, 10), Position::new(1, 20));
-        assert!(ranges_overlap(r1, r2));
+        let range3 = Range::new(Position::new(1, 0), Position::new(1, 4));
+        assert!(!ranges_overlap(range1, range3));
     }
 }

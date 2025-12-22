@@ -3,10 +3,10 @@
 //! Displays inline version annotations next to dependency version strings.
 //! Shows "✓" for up-to-date dependencies and "↑ X.Y.Z" for outdated ones.
 
-use crate::cargo::registry::CratesIoRegistry;
-use crate::cargo::types::DependencySource;
 use crate::config::InlayHintsConfig;
-use crate::document::ServerState;
+use crate::document::{Ecosystem, ServerState, UnifiedDependency};
+use deps_cargo::CratesIoRegistry;
+use deps_npm::NpmRegistry;
 use futures::future::join_all;
 use semver::Version;
 use std::sync::Arc;
@@ -45,28 +45,45 @@ pub async fn handle_inlay_hints(
         }
     };
 
-    let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
-
+    let ecosystem = doc.ecosystem;
     let deps_to_fetch: Vec<_> = doc
         .dependencies
         .iter()
         .filter(|dep| {
-            matches!(dep.source, DependencySource::Registry)
-                && dep.version_range.is_some()
-                && dep.version_req.is_some()
+            dep.is_registry() && dep.version_range().is_some() && dep.version_req().is_some()
         })
+        .cloned()
         .collect();
 
-    let futures: Vec<_> = deps_to_fetch
+    drop(doc);
+
+    match ecosystem {
+        Ecosystem::Cargo => handle_cargo_inlay_hints(state, deps_to_fetch, config).await,
+        Ecosystem::Npm => handle_npm_inlay_hints(state, deps_to_fetch, config).await,
+    }
+}
+
+async fn handle_cargo_inlay_hints(
+    state: Arc<ServerState>,
+    dependencies: Vec<UnifiedDependency>,
+    config: &InlayHintsConfig,
+) -> Vec<InlayHint> {
+    let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
+
+    let futures: Vec<_> = dependencies
         .iter()
-        .map(|dep| {
-            let name = dep.name.clone();
-            let version_req = dep.version_req.as_ref().unwrap().clone();
-            let version_range = dep.version_range.unwrap();
-            let registry = registry.clone();
-            async move {
-                let result = registry.get_latest_matching(&name, &version_req).await;
-                (name, version_req, version_range, result)
+        .filter_map(|dep| {
+            if let UnifiedDependency::Cargo(cargo_dep) = dep {
+                let name = cargo_dep.name.clone();
+                let version_req = cargo_dep.version_req.as_ref()?.clone();
+                let version_range = cargo_dep.version_range?;
+                let registry = registry.clone();
+                Some(async move {
+                    let result = registry.get_latest_matching(&name, &version_req).await;
+                    (name, version_req, version_range, result)
+                })
+            } else {
+                None
             }
         })
         .collect();
@@ -93,6 +110,74 @@ pub async fn handle_inlay_hints(
             config.up_to_date_text.clone()
         } else {
             config.needs_update_text.replace("{}", &latest.num)
+        };
+
+        hints.push(InlayHint {
+            position: version_range.end,
+            label: InlayHintLabel::String(label),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(true),
+            padding_right: None,
+            data: None,
+        });
+    }
+
+    hints
+}
+
+async fn handle_npm_inlay_hints(
+    state: Arc<ServerState>,
+    dependencies: Vec<UnifiedDependency>,
+    config: &InlayHintsConfig,
+) -> Vec<InlayHint> {
+    let registry = NpmRegistry::new(Arc::clone(&state.cache));
+
+    let futures: Vec<_> = dependencies
+        .iter()
+        .filter_map(|dep| {
+            if let UnifiedDependency::Npm(npm_dep) = dep {
+                let name = npm_dep.name.clone();
+                let version_req = npm_dep.version_req.as_ref()?.clone();
+                let version_range = npm_dep.version_range?;
+                let registry = registry.clone();
+                Some(async move {
+                    let result = registry.get_versions(&name).await;
+                    (name, version_req, version_range, result)
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+
+    let mut hints = Vec::new();
+    for (name, version_req, version_range, result) in results {
+        let versions = match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to fetch versions for {}: {}", name, e);
+                continue;
+            }
+        };
+
+        let latest = match versions.first() {
+            Some(v) => v,
+            None => {
+                tracing::debug!("No matching version found for {}: {}", name, version_req);
+                continue;
+            }
+        };
+
+        let is_latest = is_version_latest(&version_req, &latest.version);
+
+        let label = if is_latest {
+            config.up_to_date_text.clone()
+        } else {
+            config.needs_update_text.replace("{}", &latest.version)
         };
 
         hints.push(InlayHint {

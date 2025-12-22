@@ -4,6 +4,9 @@ use reqwest::{Client, StatusCode, header};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Maximum number of cached entries to prevent unbounded memory growth.
+const MAX_CACHE_ENTRIES: usize = 1000;
+
 /// Cached HTTP response with validation headers.
 ///
 /// Stores response body and cache validation headers (ETag, Last-Modified)
@@ -13,7 +16,7 @@ use std::time::Instant;
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cache::CachedResponse;
+/// use deps_core::cache::CachedResponse;
 /// use std::sync::Arc;
 /// use std::time::Instant;
 ///
@@ -49,9 +52,9 @@ pub struct CachedResponse {
 /// # Examples
 ///
 /// ```no_run
-/// use deps_lsp::cache::HttpCache;
+/// use deps_core::cache::HttpCache;
 ///
-/// # async fn example() -> deps_lsp::error::Result<()> {
+/// # async fn example() -> deps_core::error::Result<()> {
 /// let cache = HttpCache::new();
 ///
 /// // First request - fetches from network
@@ -113,8 +116,8 @@ impl HttpCache {
     /// # Examples
     ///
     /// ```no_run
-    /// # use deps_lsp::cache::HttpCache;
-    /// # async fn example() -> deps_lsp::error::Result<()> {
+    /// # use deps_core::cache::HttpCache;
+    /// # async fn example() -> deps_core::error::Result<()> {
     /// let cache = HttpCache::new();
     /// let data = cache.get_cached("https://example.com/api/data").await?;
     /// println!("Fetched {} bytes", data.len());
@@ -122,6 +125,11 @@ impl HttpCache {
     /// # }
     /// ```
     pub async fn get_cached(&self, url: &str) -> Result<Arc<Vec<u8>>> {
+        // Evict old entries if cache is at capacity
+        if self.entries.len() >= MAX_CACHE_ENTRIES {
+            self.evict_entries();
+        }
+
         if let Some(cached) = self.entries.get(url) {
             // Attempt conditional request with cached headers
             match self.conditional_request(url, &cached).await {
@@ -298,6 +306,36 @@ impl HttpCache {
     /// Returns `true` if the cache contains no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Evicts approximately 10% of cache entries when capacity is reached.
+    ///
+    /// Uses a simple random eviction strategy. In a production system,
+    /// this could be replaced with LRU or TTL-based eviction.
+    fn evict_entries(&self) {
+        let target_removals = MAX_CACHE_ENTRIES / 10;
+        let mut removed = 0;
+
+        // Simple eviction: remove oldest entries by fetched_at timestamp
+        let mut entries_to_remove = Vec::new();
+
+        for entry in self.entries.iter() {
+            entries_to_remove.push((entry.key().clone(), entry.value().fetched_at));
+            if entries_to_remove.len() >= MAX_CACHE_ENTRIES {
+                break;
+            }
+        }
+
+        // Sort by age (oldest first)
+        entries_to_remove.sort_by_key(|(_, time)| *time);
+
+        // Remove oldest entries
+        for (url, _) in entries_to_remove.iter().take(target_removals) {
+            self.entries.remove(url);
+            removed += 1;
+        }
+
+        tracing::debug!("evicted {} cache entries", removed);
     }
 }
 

@@ -1,22 +1,26 @@
 use thiserror::Error;
 
-/// Error types for the deps-lsp server.
+/// Core error types for deps-lsp.
 ///
-/// All errors in the application are represented by this enum, which provides
-/// structured error handling with source error tracking via `thiserror`.
+/// Extended from Phase 1 to support multiple ecosystems (Cargo, npm, PyPI).
+/// All errors provide structured error handling with source error tracking.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::error::{DepsError, Result};
+/// use deps_core::error::{DepsError, Result};
 ///
-/// fn parse_file(path: &str) -> Result<()> {
+/// fn parse_file(content: &str, file_type: &str) -> Result<()> {
 ///     // Parsing errors are automatically wrapped
-///     let _doc = "invalid toml".parse::<toml_edit::DocumentMut>()
-///         .map_err(|e| DepsError::ParseError {
-///             file_type: "Cargo.toml".into(),
-///             source: e,
-///         })?;
+///     if content.is_empty() {
+///         return Err(DepsError::ParseError {
+///             file_type: file_type.into(),
+///             source: Box::new(std::io::Error::new(
+///                 std::io::ErrorKind::InvalidData,
+///                 "empty content"
+///             )),
+///         });
+///     }
 ///     Ok(())
 /// }
 /// ```
@@ -26,7 +30,7 @@ pub enum DepsError {
     ParseError {
         file_type: String,
         #[source]
-        source: toml_edit::TomlError,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[error("registry request failed for {package}: {source}")]
@@ -48,8 +52,11 @@ pub enum DepsError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("semver parse error: {0}")]
-    SemverParse(#[from] semver::Error),
+    #[error("unsupported ecosystem: {0}")]
+    UnsupportedEcosystem(String),
+
+    #[error("ambiguous ecosystem detection for file: {0}")]
+    AmbiguousEcosystem(String),
 }
 
 /// Convenience type alias for `Result<T, DepsError>`.
@@ -60,11 +67,11 @@ pub enum DepsError {
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::error::Result;
+/// use deps_core::error::Result;
 ///
 /// fn get_version(name: &str) -> Result<String> {
 ///     if name.is_empty() {
-///         return Err(deps_lsp::error::DepsError::CacheError("empty name".into()));
+///         return Err(deps_core::error::DepsError::CacheError("empty name".into()));
 ///     }
 ///     Ok("1.0.0".into())
 /// }
@@ -89,12 +96,10 @@ mod tests {
 
     #[test]
     fn test_parse_error() {
-        let toml_err = "invalid toml"
-            .parse::<toml_edit::DocumentMut>()
-            .unwrap_err();
+        let io_err = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad data");
         let error = DepsError::ParseError {
             file_type: "Cargo.toml".into(),
-            source: toml_err,
+            source: Box::new(io_err),
         };
         assert!(error.to_string().contains("failed to parse Cargo.toml"));
     }
@@ -104,5 +109,20 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let error: DepsError = io_err.into();
         assert!(error.to_string().contains("I/O error"));
+    }
+
+    #[test]
+    fn test_unsupported_ecosystem() {
+        let error = DepsError::UnsupportedEcosystem("unknown".into());
+        assert_eq!(error.to_string(), "unsupported ecosystem: unknown");
+    }
+
+    #[test]
+    fn test_ambiguous_ecosystem() {
+        let error = DepsError::AmbiguousEcosystem("file.txt".into());
+        assert_eq!(
+            error.to_string(),
+            "ambiguous ecosystem detection for file: file.txt"
+        );
     }
 }

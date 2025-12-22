@@ -14,7 +14,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use deps_lsp::cargo::parser::parse_cargo_toml;
+//! use deps_cargo::parse_cargo_toml;
 //! use tower_lsp::lsp_types::Url;
 //!
 //! let toml = r#"
@@ -28,8 +28,8 @@
 //! assert_eq!(result.dependencies[0].name, "serde");
 //! ```
 
-use crate::cargo::types::{DependencySection, DependencySource, ParsedDependency};
-use crate::error::{DepsError, Result};
+use crate::types::{DependencySection, DependencySource, ParsedDependency};
+use deps_core::{DepsError, Result};
 use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, Table, Value};
 use tower_lsp::lsp_types::{Position, Range, Url};
@@ -89,7 +89,7 @@ impl LineOffsetTable {
 /// # Examples
 ///
 /// ```no_run
-/// use deps_lsp::cargo::parser::parse_cargo_toml;
+/// use deps_cargo::parse_cargo_toml;
 /// use tower_lsp::lsp_types::Url;
 ///
 /// let toml = r#"
@@ -107,7 +107,7 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<ParseResult> {
         .parse::<DocumentMut>()
         .map_err(|e| DepsError::ParseError {
             file_type: "Cargo.toml".into(),
-            source: e,
+            source: Box::new(e),
         })?;
 
     let line_table = LineOffsetTable::new(content);
@@ -410,6 +410,67 @@ fn find_workspace_root(doc_uri: &Url) -> Result<Option<PathBuf>> {
     }
 
     Ok(None)
+}
+
+/// Parser for Cargo.toml manifests implementing the deps-core traits.
+pub struct CargoParser;
+
+impl deps_core::ManifestParser for CargoParser {
+    type Dependency = ParsedDependency;
+    type ParseResult = ParseResult;
+
+    fn parse(&self, content: &str, doc_uri: &Url) -> Result<Self::ParseResult> {
+        parse_cargo_toml(content, doc_uri)
+    }
+}
+
+// Implement DependencyInfo trait for ParsedDependency
+impl deps_core::DependencyInfo for ParsedDependency {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&str> {
+        self.version_req.as_deref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::DependencySource {
+        match &self.source {
+            DependencySource::Registry => deps_core::DependencySource::Registry,
+            DependencySource::Git { url, rev } => deps_core::DependencySource::Git {
+                url: url.clone(),
+                rev: rev.clone(),
+            },
+            DependencySource::Path { path } => {
+                deps_core::DependencySource::Path { path: path.clone() }
+            }
+        }
+    }
+
+    fn features(&self) -> &[String] {
+        &self.features
+    }
+}
+
+// Implement ParseResultInfo trait for ParseResult
+impl deps_core::ParseResultInfo for ParseResult {
+    type Dependency = ParsedDependency;
+
+    fn dependencies(&self) -> &[Self::Dependency] {
+        &self.dependencies
+    }
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.workspace_root.as_deref()
+    }
 }
 
 #[cfg(test)]

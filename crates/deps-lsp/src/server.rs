@@ -1,7 +1,10 @@
-use crate::cargo::{CratesIoRegistry, parse_cargo_toml};
 use crate::config::DepsConfig;
-use crate::document::{DocumentState, ServerState};
+use crate::document::{DocumentState, Ecosystem, ServerState, UnifiedDependency, UnifiedVersion};
 use crate::handlers::{code_actions, completion, diagnostics, hover, inlay_hints};
+use deps_cargo::{CratesIoRegistry, DependencySource, parse_cargo_toml};
+use deps_npm::{NpmRegistry, parse_package_json};
+use futures::future::join_all;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp::lsp_types::{
@@ -26,6 +29,248 @@ impl Backend {
             client,
             state: Arc::new(ServerState::new()),
             config: Arc::new(RwLock::new(DepsConfig::default())),
+        }
+    }
+
+    /// Handles opening a Cargo.toml file.
+    async fn handle_cargo_open(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+        match parse_cargo_toml(&content, &uri) {
+            Ok(parse_result) => {
+                let deps = parse_result
+                    .dependencies
+                    .into_iter()
+                    .map(UnifiedDependency::Cargo)
+                    .collect();
+                let doc_state = DocumentState::new(Ecosystem::Cargo, content, deps);
+                self.state.update_document(uri.clone(), doc_state);
+
+                let state = Arc::clone(&self.state);
+                let client = self.client.clone();
+                let uri_clone = uri.clone();
+                let config = Arc::clone(&self.config);
+
+                let task = tokio::spawn(async move {
+                    let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
+
+                    // Collect dependencies to fetch (avoid holding doc lock during fetch)
+                    let deps_to_fetch: Vec<_> = {
+                        let doc = match state.get_document(&uri_clone) {
+                            Some(d) => d,
+                            None => return,
+                        };
+
+                        doc.dependencies
+                            .iter()
+                            .filter_map(|dep| {
+                                if let UnifiedDependency::Cargo(cargo_dep) = dep {
+                                    if matches!(cargo_dep.source, DependencySource::Registry) {
+                                        return Some(cargo_dep.name.clone());
+                                    }
+                                }
+                                None
+                            })
+                            .collect()
+                    };
+
+                    // Parallel fetch all versions
+                    let futures: Vec<_> = deps_to_fetch
+                        .into_iter()
+                        .map(|name| {
+                            let registry = registry.clone();
+                            async move {
+                                let versions = registry.get_versions(&name).await.ok()?;
+                                let latest = versions.first()?.clone();
+                                Some((name, UnifiedVersion::Cargo(latest)))
+                            }
+                        })
+                        .collect();
+
+                    let results = join_all(futures).await;
+                    let versions: HashMap<_, _> = results.into_iter().flatten().collect();
+
+                    // Update document with fetched versions
+                    if let Some(mut doc) = state.documents.get_mut(&uri_clone) {
+                        doc.update_versions(versions);
+                    }
+
+                    let config_read = config.read().await;
+                    let diags = diagnostics::handle_diagnostics(
+                        Arc::clone(&state),
+                        &uri_clone,
+                        &config_read.diagnostics,
+                    )
+                    .await;
+
+                    client.publish_diagnostics(uri_clone, diags, None).await;
+                });
+
+                self.state.spawn_background_task(uri, task).await;
+            }
+            Err(e) => {
+                tracing::error!("failed to parse Cargo.toml: {}", e);
+                self.client
+                    .log_message(MessageType::ERROR, format!("Parse error: {}", e))
+                    .await;
+            }
+        }
+    }
+
+    /// Handles opening a package.json file.
+    async fn handle_npm_open(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+        match parse_package_json(&content) {
+            Ok(parse_result) => {
+                let deps = parse_result
+                    .dependencies
+                    .into_iter()
+                    .map(UnifiedDependency::Npm)
+                    .collect();
+                let doc_state = DocumentState::new(Ecosystem::Npm, content, deps);
+                self.state.update_document(uri.clone(), doc_state);
+
+                let state = Arc::clone(&self.state);
+                let client = self.client.clone();
+                let uri_clone = uri.clone();
+                let config = Arc::clone(&self.config);
+
+                let task = tokio::spawn(async move {
+                    let registry = NpmRegistry::new(Arc::clone(&state.cache));
+
+                    // Collect dependencies to fetch (avoid holding doc lock during fetch)
+                    let deps_to_fetch: Vec<_> = {
+                        let doc = match state.get_document(&uri_clone) {
+                            Some(d) => d,
+                            None => return,
+                        };
+
+                        doc.dependencies
+                            .iter()
+                            .filter_map(|dep| {
+                                if let UnifiedDependency::Npm(npm_dep) = dep {
+                                    return Some(npm_dep.name.clone());
+                                }
+                                None
+                            })
+                            .collect()
+                    };
+
+                    // Parallel fetch all versions
+                    let futures: Vec<_> = deps_to_fetch
+                        .into_iter()
+                        .map(|name| {
+                            let registry = registry.clone();
+                            async move {
+                                let versions = registry.get_versions(&name).await.ok()?;
+                                let latest = versions.first()?.clone();
+                                Some((name, UnifiedVersion::Npm(latest)))
+                            }
+                        })
+                        .collect();
+
+                    let results = join_all(futures).await;
+                    let versions: HashMap<_, _> = results.into_iter().flatten().collect();
+
+                    // Update document with fetched versions
+                    if let Some(mut doc) = state.documents.get_mut(&uri_clone) {
+                        doc.update_versions(versions);
+                    }
+
+                    let config_read = config.read().await;
+                    let diags = diagnostics::handle_diagnostics(
+                        Arc::clone(&state),
+                        &uri_clone,
+                        &config_read.diagnostics,
+                    )
+                    .await;
+
+                    client.publish_diagnostics(uri_clone, diags, None).await;
+                });
+
+                self.state.spawn_background_task(uri, task).await;
+            }
+            Err(e) => {
+                tracing::error!("failed to parse package.json: {}", e);
+                self.client
+                    .log_message(MessageType::ERROR, format!("Parse error: {}", e))
+                    .await;
+            }
+        }
+    }
+
+    /// Handles changes to a Cargo.toml file.
+    async fn handle_cargo_change(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+        match parse_cargo_toml(&content, &uri) {
+            Ok(parse_result) => {
+                let deps = parse_result
+                    .dependencies
+                    .into_iter()
+                    .map(UnifiedDependency::Cargo)
+                    .collect();
+                let doc_state = DocumentState::new(Ecosystem::Cargo, content, deps);
+                self.state.update_document(uri.clone(), doc_state);
+
+                let state = Arc::clone(&self.state);
+                let client = self.client.clone();
+                let uri_clone = uri.clone();
+                let config = Arc::clone(&self.config);
+
+                let task = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                    let config_read = config.read().await;
+                    let diags = diagnostics::handle_diagnostics(
+                        Arc::clone(&state),
+                        &uri_clone,
+                        &config_read.diagnostics,
+                    )
+                    .await;
+
+                    client.publish_diagnostics(uri_clone, diags, None).await;
+                });
+
+                self.state.spawn_background_task(uri, task).await;
+            }
+            Err(e) => {
+                tracing::error!("failed to parse Cargo.toml: {}", e);
+            }
+        }
+    }
+
+    /// Handles changes to a package.json file.
+    async fn handle_npm_change(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+        match parse_package_json(&content) {
+            Ok(parse_result) => {
+                let deps = parse_result
+                    .dependencies
+                    .into_iter()
+                    .map(UnifiedDependency::Npm)
+                    .collect();
+                let doc_state = DocumentState::new(Ecosystem::Npm, content, deps);
+                self.state.update_document(uri.clone(), doc_state);
+
+                let state = Arc::clone(&self.state);
+                let client = self.client.clone();
+                let uri_clone = uri.clone();
+                let config = Arc::clone(&self.config);
+
+                let task = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                    let config_read = config.read().await;
+                    let diags = diagnostics::handle_diagnostics(
+                        Arc::clone(&state),
+                        &uri_clone,
+                        &config_read.diagnostics,
+                    )
+                    .await;
+
+                    client.publish_diagnostics(uri_clone, diags, None).await;
+                });
+
+                self.state.spawn_background_task(uri, task).await;
+            }
+            Err(e) => {
+                tracing::error!("failed to parse package.json: {}", e);
+            }
         }
     }
 
@@ -96,61 +341,17 @@ impl LanguageServer for Backend {
 
         tracing::info!("document opened: {}", uri);
 
-        match parse_cargo_toml(&content, &uri) {
-            Ok(parse_result) => {
-                let doc_state =
-                    DocumentState::new(content.clone(), parse_result.dependencies.clone());
-                self.state.update_document(uri.clone(), doc_state);
-
-                let state = Arc::clone(&self.state);
-                let client = self.client.clone();
-                let uri_clone = uri.clone();
-                let config = Arc::clone(&self.config);
-
-                let task = tokio::spawn(async move {
-                    let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
-                    let mut versions = std::collections::HashMap::new();
-
-                    let doc = match state.get_document(&uri_clone) {
-                        Some(d) => d,
-                        None => return,
-                    };
-
-                    for dep in &doc.dependencies {
-                        if let crate::cargo::types::DependencySource::Registry = dep.source {
-                            if let Ok(vers) = registry.get_versions(&dep.name).await {
-                                if let Some(latest) = vers.first() {
-                                    versions.insert(dep.name.clone(), latest.clone());
-                                }
-                            }
-                        }
-                    }
-
-                    drop(doc);
-
-                    if let Some(mut doc) = state.documents.get_mut(&uri_clone) {
-                        doc.update_versions(versions);
-                    }
-
-                    let config_read = config.read().await;
-                    let diags = diagnostics::handle_diagnostics(
-                        Arc::clone(&state),
-                        &uri_clone,
-                        &config_read.diagnostics,
-                    )
-                    .await;
-
-                    client.publish_diagnostics(uri_clone, diags, None).await;
-                });
-
-                self.state.spawn_background_task(uri, task).await;
+        let ecosystem = match Ecosystem::from_uri(&uri) {
+            Some(eco) => eco,
+            None => {
+                tracing::debug!("unsupported file type: {}", uri);
+                return;
             }
-            Err(e) => {
-                tracing::error!("failed to parse Cargo.toml: {}", e);
-                self.client
-                    .log_message(MessageType::ERROR, format!("Parse error: {}", e))
-                    .await;
-            }
+        };
+
+        match ecosystem {
+            Ecosystem::Cargo => self.handle_cargo_open(uri, content).await,
+            Ecosystem::Npm => self.handle_npm_open(uri, content).await,
         }
     }
 
@@ -158,38 +359,19 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
 
         if let Some(change) = params.content_changes.first() {
-            let content = &change.text;
+            let content = change.text.clone();
 
-            match parse_cargo_toml(content, &uri) {
-                Ok(parse_result) => {
-                    let doc_state =
-                        DocumentState::new(content.clone(), parse_result.dependencies.clone());
-                    self.state.update_document(uri.clone(), doc_state);
-
-                    let state = Arc::clone(&self.state);
-                    let client = self.client.clone();
-                    let uri_clone = uri.clone();
-                    let config = Arc::clone(&self.config);
-
-                    let task = tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                        let config_read = config.read().await;
-                        let diags = diagnostics::handle_diagnostics(
-                            Arc::clone(&state),
-                            &uri_clone,
-                            &config_read.diagnostics,
-                        )
-                        .await;
-
-                        client.publish_diagnostics(uri_clone, diags, None).await;
-                    });
-
-                    self.state.spawn_background_task(uri, task).await;
+            let ecosystem = match Ecosystem::from_uri(&uri) {
+                Some(eco) => eco,
+                None => {
+                    tracing::debug!("unsupported file type: {}", uri);
+                    return;
                 }
-                Err(e) => {
-                    tracing::error!("failed to parse Cargo.toml: {}", e);
-                }
+            };
+
+            match ecosystem {
+                Ecosystem::Cargo => self.handle_cargo_change(uri, content).await,
+                Ecosystem::Npm => self.handle_npm_change(uri, content).await,
             }
         }
     }

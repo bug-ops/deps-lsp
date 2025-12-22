@@ -6,10 +6,9 @@
 //! - Outdated versions
 //! - Invalid semver requirements
 
-use crate::cargo::registry::CratesIoRegistry;
-use crate::cargo::types::DependencySource;
 use crate::config::DiagnosticsConfig;
-use crate::document::ServerState;
+use crate::document::{Ecosystem, ServerState, UnifiedDependency};
+use deps_cargo::{CratesIoRegistry, DependencySource, ParsedDependency};
 use futures::future::join_all;
 use semver::VersionReq;
 use std::sync::Arc;
@@ -32,15 +31,28 @@ pub async fn handle_diagnostics(
         }
     };
 
+    // TODO: Add npm support in diagnostics
+    if doc.ecosystem != Ecosystem::Cargo {
+        tracing::debug!("Diagnostics not yet implemented for {:?}", doc.ecosystem);
+        return vec![];
+    }
+
     let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
 
-    let deps_to_check: Vec<_> = doc
+    let cargo_deps: Vec<&ParsedDependency> = doc
         .dependencies
         .iter()
-        .filter(|dep| matches!(dep.source, DependencySource::Registry))
+        .filter_map(|dep| {
+            if let UnifiedDependency::Cargo(cargo_dep) = dep {
+                if matches!(cargo_dep.source, DependencySource::Registry) {
+                    return Some(cargo_dep);
+                }
+            }
+            None
+        })
         .collect();
 
-    let futures: Vec<_> = deps_to_check
+    let futures: Vec<_> = cargo_deps
         .iter()
         .map(|dep| {
             let name = dep.name.clone();
@@ -56,7 +68,7 @@ pub async fn handle_diagnostics(
 
     let mut diagnostics = Vec::new();
 
-    for (i, dep) in deps_to_check.iter().enumerate() {
+    for (i, dep) in cargo_deps.iter().enumerate() {
         let (name, version_result) = &version_results[i];
 
         let versions = match version_result {

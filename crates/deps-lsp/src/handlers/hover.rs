@@ -4,9 +4,9 @@
 //! name or version string. Shows crate metadata, latest version, features,
 //! and links to documentation/repository.
 
-use crate::cargo::registry::CratesIoRegistry;
-use crate::cargo::types::DependencySource;
-use crate::document::ServerState;
+use crate::document::{Ecosystem, ServerState, UnifiedDependency};
+use deps_cargo::CratesIoRegistry;
+use deps_npm::NpmRegistry;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
     Hover, HoverContents, HoverParams, MarkupContent, MarkupKind, Position, Range,
@@ -40,22 +40,42 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
     let doc = state.get_document(uri)?;
 
     let dep = doc.dependencies.iter().find(|d| {
-        position_in_range(position, d.name_range)
-            || d.version_range
+        position_in_range(position, d.name_range())
+            || d.version_range()
                 .is_some_and(|r| position_in_range(position, r))
     })?;
 
-    if !matches!(dep.source, DependencySource::Registry) {
+    if !dep.is_registry() {
         return None;
     }
 
+    let ecosystem = doc.ecosystem;
+    let dep = dep.clone();
+    drop(doc);
+
+    match ecosystem {
+        Ecosystem::Cargo => handle_cargo_hover(state, uri, position, &dep).await,
+        Ecosystem::Npm => handle_npm_hover(state, uri, position, &dep).await,
+    }
+}
+
+async fn handle_cargo_hover(
+    state: Arc<ServerState>,
+    _uri: &tower_lsp::lsp_types::Url,
+    _position: Position,
+    dep: &UnifiedDependency,
+) -> Option<Hover> {
+    let UnifiedDependency::Cargo(cargo_dep) = dep else {
+        return None;
+    };
+
     let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
-    let versions = registry.get_versions(&dep.name).await.ok()?;
+    let versions = registry.get_versions(&cargo_dep.name).await.ok()?;
     let latest = versions.first()?;
 
-    let mut markdown = format!("# {}\n\n", dep.name);
+    let mut markdown = format!("# {}\n\n", cargo_dep.name);
 
-    if let Some(current) = &dep.version_req {
+    if let Some(current) = &cargo_dep.version_req {
         markdown.push_str(&format!("**Current**: `{}`\n", current));
     }
     markdown.push_str(&format!("**Latest**: `{}`\n\n", latest.num));
@@ -79,7 +99,41 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
             kind: MarkupKind::Markdown,
             value: markdown,
         }),
-        range: Some(dep.name_range),
+        range: Some(cargo_dep.name_range),
+    })
+}
+
+async fn handle_npm_hover(
+    state: Arc<ServerState>,
+    _uri: &tower_lsp::lsp_types::Url,
+    _position: Position,
+    dep: &UnifiedDependency,
+) -> Option<Hover> {
+    let UnifiedDependency::Npm(npm_dep) = dep else {
+        return None;
+    };
+
+    let registry = NpmRegistry::new(Arc::clone(&state.cache));
+    let versions = registry.get_versions(&npm_dep.name).await.ok()?;
+    let latest = versions.first()?;
+
+    let mut markdown = format!("# {}\n\n", npm_dep.name);
+
+    if let Some(current) = &npm_dep.version_req {
+        markdown.push_str(&format!("**Current**: `{}`\n", current));
+    }
+    markdown.push_str(&format!("**Latest**: `{}`\n\n", latest.version));
+
+    if latest.deprecated {
+        markdown.push_str("⚠️ **Warning**: This package is deprecated\n\n");
+    }
+
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: markdown,
+        }),
+        range: Some(npm_dep.name_range),
     })
 }
 
