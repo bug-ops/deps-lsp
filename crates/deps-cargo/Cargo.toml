@@ -9,7 +9,7 @@ repository.workspace = true
 description = "Cargo.toml support for deps-lsp"
 
 [dependencies]
-deps-core = { path = "../deps-core" }
+deps-core = { workspace = true }
 async-trait = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
