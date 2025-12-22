@@ -205,7 +205,11 @@ impl Backend {
         let parser = PypiParser::new();
         match parser.parse_content(&content) {
             Ok(parse_result) => {
-                let deps = parse_result
+                tracing::debug!(
+                    "parsed {} PyPI dependencies",
+                    parse_result.dependencies.len()
+                );
+                let deps: Vec<_> = parse_result
                     .dependencies
                     .into_iter()
                     .map(UnifiedDependency::Pypi)
@@ -276,9 +280,12 @@ impl Backend {
                 self.state.spawn_background_task(uri, task).await;
             }
             Err(e) => {
-                tracing::error!("failed to parse pyproject.toml: {}", e);
+                tracing::warn!("failed to parse pyproject.toml: {}", e);
+                // Store empty document so subsequent requests don't fail completely
+                let doc_state = DocumentState::new(Ecosystem::Pypi, content, vec![]);
+                self.state.update_document(uri.clone(), doc_state);
                 self.client
-                    .log_message(MessageType::ERROR, format!("Parse error: {}", e))
+                    .log_message(MessageType::WARNING, format!("Parse error: {}", e))
                     .await;
             }
         }
@@ -413,6 +420,9 @@ impl Backend {
             }
             Err(e) => {
                 tracing::error!("failed to parse pyproject.toml: {}", e);
+                // Store empty document so subsequent requests don't fail completely
+                let doc_state = DocumentState::new(Ecosystem::Pypi, content, vec![]);
+                self.state.update_document(uri, doc_state);
             }
         }
     }
