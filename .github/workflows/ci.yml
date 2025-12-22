@@ -285,13 +285,13 @@ jobs:
           ls -lh target/wasm32-wasip1/release/*.wasm
           du -sh target/wasm32-wasip1/release/*.wasm
 
-  # Benchmarks (on main branch only)
+  # Verify benchmarks compile (without running)
   benchmark:
-    name: Benchmark
-    if: github.ref == 'refs/heads/main'
-    needs: [test]
+    name: Check Benchmarks
+    needs: [changes, fmt, check]
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
 
@@ -302,16 +302,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "bench"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Run benchmarks
-        run: cargo bench --workspace --no-fail-fast
-
-      - name: Archive benchmark results
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-results
-          path: target/criterion/
-          retention-days: 30
+      - name: Build benchmarks
+        run: cargo build --workspace --benches
 
   # Release build check
   release-check:
@@ -341,7 +335,7 @@ jobs:
   # All checks passed
   ci-success:
     name: CI Success
-    needs: [changes, fmt, check, security, test, coverage, msrv, wasm]
+    needs: [changes, fmt, check, security, test, coverage, msrv, wasm, benchmark]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -372,6 +366,7 @@ jobs:
           check_job "${{ needs.coverage.result }}" "coverage" || failed=1
           check_job "${{ needs.msrv.result }}" "msrv" || failed=1
           check_job "${{ needs.wasm.result }}" "wasm" || failed=1
+          check_job "${{ needs.benchmark.result }}" "benchmark" || failed=1
 
           if [[ $failed -eq 1 ]]; then
             echo "One or more jobs failed"
