@@ -109,10 +109,10 @@ impl PypiParser {
 
         let mut dependencies = Vec::new();
 
-        for (idx, value) in deps_array.iter().enumerate() {
+        for value in deps_array.iter() {
             if let Some(dep_str) = value.as_str() {
-                let position =
-                    self.find_array_element_position(content, "project.dependencies", idx);
+                // Find exact position of this dependency string in content
+                let position = self.find_dependency_string_position(content, dep_str);
 
                 match self.parse_pep508_requirement(dep_str, position) {
                     Ok(mut dep) => {
@@ -147,11 +147,10 @@ impl PypiParser {
 
         for (group_name, group_item) in opt_deps_table.iter() {
             if let Some(group_array) = group_item.as_array() {
-                for (idx, value) in group_array.iter().enumerate() {
+                for value in group_array.iter() {
                     if let Some(dep_str) = value.as_str() {
-                        let section_name = format!("project.optional-dependencies.{}", group_name);
-                        let position =
-                            self.find_array_element_position(content, &section_name, idx);
+                        // Find exact position of this dependency string in content
+                        let position = self.find_dependency_string_position(content, dep_str);
 
                         match self.parse_pep508_requirement(dep_str, position) {
                             Ok(mut dep) => {
@@ -190,11 +189,10 @@ impl PypiParser {
 
         for (group_name, group_item) in dep_groups.iter() {
             if let Some(group_array) = group_item.as_array() {
-                for (idx, value) in group_array.iter().enumerate() {
+                for value in group_array.iter() {
                     if let Some(dep_str) = value.as_str() {
-                        let section_name = format!("dependency-groups.{}", group_name);
-                        let position =
-                            self.find_array_element_position(content, &section_name, idx);
+                        // Find exact position of this dependency string in content
+                        let position = self.find_dependency_string_position(content, dep_str);
 
                         match self.parse_pep508_requirement(dep_str, position) {
                             Ok(mut dep) => {
@@ -321,7 +319,22 @@ impl PypiParser {
         let (version_req, version_range, source) = match requirement.version_or_url {
             Some(VersionOrUrl::VersionSpecifier(specs)) => {
                 let version_str = specs.to_string();
-                let start_offset = name.len() + requirement.extras.len();
+                // Calculate offset from name start to version specifier
+                // For "package>=1.0": offset = len("package") = 7
+                // For "package[extra]>=1.0": offset = len("package[extra]") = 14
+                let extras_str_len = if requirement.extras.is_empty() {
+                    0
+                } else {
+                    // Format: "[extra1,extra2]"
+                    let extras_joined = requirement
+                        .extras
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    extras_joined.len() + 2 // +2 for [ and ]
+                };
+                let start_offset = name.len() + extras_str_len;
                 let version_range = base_position.map(|pos| {
                     Range::new(
                         Position::new(pos.line, pos.character + start_offset as u32),
@@ -492,37 +505,28 @@ impl PypiParser {
         )))
     }
 
-    /// Find position of array element in source content by searching for the string.
-    ///
-    /// This is a basic implementation that searches for quoted strings in the content
-    /// after finding the section header. For more accurate results, we should use
-    /// toml_edit spans, but this works for most cases.
-    fn find_array_element_position(
-        &self,
-        content: &str,
-        section: &str,
-        _index: usize,
-    ) -> Option<Position> {
-        // Find the section header
-        let section_patterns: Vec<String> = if section.contains('.') {
-            // For nested sections like "dependency-groups.dev", try both formats
-            let parts: Vec<&str> = section.split('.').collect();
-            if parts.len() == 2 {
-                vec![format!("[{}]", section), format!("{} = [", parts[1])]
-            } else {
-                vec![format!("[{}]", section)]
-            }
-        } else {
-            vec![format!("[{}]", section)]
-        };
+    /// Find the exact position of a dependency string in the content.
+    /// Returns the position at the START of the package name (for name_range)
+    /// and can be used to calculate version_range.
+    fn find_dependency_string_position(&self, content: &str, dep_str: &str) -> Option<Position> {
+        // Search for the quoted dependency string
+        let quoted = format!("\"{}\"", dep_str);
+        if let Some(pos) = content.find(&quoted) {
+            let before = &content[..pos + 1]; // +1 to skip opening quote
+            let line = before.chars().filter(|&c| c == '\n').count() as u32;
+            let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let character = (pos + 1 - last_newline) as u32; // +1 to skip opening quote
+            return Some(Position::new(line, character));
+        }
 
-        for pattern in section_patterns {
-            if let Some(section_pos) = content.find(&pattern) {
-                // Found the section, return position after section header
-                let before_section = &content[..section_pos];
-                let line = before_section.chars().filter(|&c| c == '\n').count() as u32;
-                return Some(Position::new(line + 1, 0));
-            }
+        // Try single quotes
+        let single_quoted = format!("'{}'", dep_str);
+        if let Some(pos) = content.find(&single_quoted) {
+            let before = &content[..pos + 1];
+            let line = before.chars().filter(|&c| c == '\n').count() as u32;
+            let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+            let character = (pos + 1 - last_newline) as u32;
+            return Some(Position::new(line, character));
         }
 
         None
@@ -834,5 +838,70 @@ name = "test"
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 0);
+    }
+
+    #[test]
+    fn test_position_tracking_pep735() {
+        // Test that position tracking works correctly for PEP 735 dependency-groups
+        let content = r#"[dependency-groups]
+dev = ["pytest>=8.0", "mypy>=1.0"]
+"#;
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 2);
+
+        // Check pytest>=8.0 position
+        let pytest = deps.iter().find(|d| d.name == "pytest").unwrap();
+        // Line 1 (0-indexed), character should be at 'p' (position 8 after `dev = ["`)
+        assert_eq!(pytest.name_range.start.line, 1);
+        assert_eq!(pytest.name_range.start.character, 8);
+        // Version range should point to >=8.0
+        assert!(pytest.version_range.is_some());
+        let version_range = pytest.version_range.unwrap();
+        assert_eq!(version_range.start.line, 1);
+        // pytest is 6 chars, so version starts at 8 + 6 = 14
+        assert_eq!(version_range.start.character, 14);
+        // >=8.0 is 5 chars, so version ends at 14 + 5 = 19
+        assert_eq!(version_range.end.character, 19);
+
+        // Check mypy>=1.0 position
+        let mypy = deps.iter().find(|d| d.name == "mypy").unwrap();
+        assert_eq!(mypy.name_range.start.line, 1);
+        // mypy starts after `dev = ["pytest>=8.0", "` = position 23
+        // dev = ["pytest>=8.0", " = 22 chars, then position 22 is ", position 23 is m
+        assert_eq!(mypy.name_range.start.character, 23);
+        assert!(mypy.version_range.is_some());
+        let version_range = mypy.version_range.unwrap();
+        // mypy is 4 chars, so version starts at 23 + 4 = 27
+        assert_eq!(version_range.start.character, 27);
+        // >=1.0 is 5 chars, so version ends at 27 + 5 = 32
+        assert_eq!(version_range.end.character, 32);
+    }
+
+    #[test]
+    fn test_position_tracking_with_extras() {
+        let content = r#"[project]
+dependencies = ["flask[async]>=3.0"]
+"#;
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+
+        let flask = &deps[0];
+        assert_eq!(flask.name, "flask");
+        assert_eq!(flask.extras, vec!["async"]);
+
+        // Version range should account for extras
+        assert!(flask.version_range.is_some());
+        let version_range = flask.version_range.unwrap();
+        // dependencies = [" is 17 chars, flask starts at char 17
+        // flask is 5 chars, [async] is 7 chars, so version starts at 17 + 5 + 7 = 29
+        assert_eq!(version_range.start.character, 29);
     }
 }
