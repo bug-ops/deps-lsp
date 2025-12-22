@@ -27,5 +27,5 @@ pub mod types;
 
 // Re-export commonly used types
 pub use parser::{CargoParser, ParseResult, parse_cargo_toml};
-pub use registry::CratesIoRegistry;
+pub use registry::{CratesIoRegistry, crate_url};
 pub use types::{CargoVersion, CrateInfo, DependencySection, DependencySource, ParsedDependency};

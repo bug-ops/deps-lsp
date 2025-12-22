@@ -33,6 +33,14 @@ use std::sync::Arc;
 const SPARSE_INDEX_BASE: &str = "https://index.crates.io";
 const SEARCH_API_BASE: &str = "https://crates.io/api/v1";
 
+/// Base URL for crate pages on crates.io
+pub const CRATES_IO_URL: &str = "https://crates.io/crates";
+
+/// Returns the URL for a crate's page on crates.io.
+pub fn crate_url(name: &str) -> String {
+    format!("{}/{}", CRATES_IO_URL, name)
+}
+
 /// Client for interacting with crates.io registry.
 ///
 /// Uses the sparse index protocol for fast version lookups and the REST API

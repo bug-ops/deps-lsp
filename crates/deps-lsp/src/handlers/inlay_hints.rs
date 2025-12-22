@@ -5,12 +5,15 @@
 
 use crate::config::InlayHintsConfig;
 use crate::document::{Ecosystem, ServerState, UnifiedDependency};
-use deps_cargo::CratesIoRegistry;
-use deps_npm::NpmRegistry;
+use deps_cargo::{CratesIoRegistry, crate_url};
+use deps_npm::{NpmRegistry, package_url};
 use futures::future::join_all;
 use semver::Version;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams};
+use tower_lsp::lsp_types::{
+    InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, InlayHintParams, MarkupContent,
+    MarkupKind,
+};
 
 /// Handles inlay hint requests.
 ///
@@ -126,15 +129,36 @@ async fn handle_cargo_inlay_hints(
 
         let is_latest = is_version_latest(&version_req, &latest.num);
 
-        let label = if is_latest {
+        let label_text = if is_latest {
             config.up_to_date_text.clone()
         } else {
             config.needs_update_text.replace("{}", &latest.num)
         };
 
+        // Create clickable label with link to crates.io
+        let crates_io_url = crate_url(&name);
+        let tooltip_content = format!(
+            "[{}]({}) - {}\n\nLatest: **{}**",
+            name, crates_io_url, crates_io_url, latest.num
+        );
+
         hints.push(InlayHint {
             position: version_range.end,
-            label: InlayHintLabel::String(label),
+            label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
+                value: label_text,
+                tooltip: Some(tower_lsp::lsp_types::InlayHintLabelPartTooltip::MarkupContent(
+                    MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: tooltip_content,
+                    },
+                )),
+                location: None,
+                command: Some(tower_lsp::lsp_types::Command {
+                    title: "Open on crates.io".into(),
+                    command: "vscode.open".into(),
+                    arguments: Some(vec![serde_json::json!(crates_io_url)]),
+                }),
+            }]),
             kind: Some(InlayHintKind::TYPE),
             text_edits: None,
             tooltip: None,
@@ -194,15 +218,36 @@ async fn handle_npm_inlay_hints(
 
         let is_latest = is_version_latest(&version_req, &latest.version);
 
-        let label = if is_latest {
+        let label_text = if is_latest {
             config.up_to_date_text.clone()
         } else {
             config.needs_update_text.replace("{}", &latest.version)
         };
 
+        // Create clickable label with link to npmjs.com
+        let npm_url = package_url(&name);
+        let tooltip_content = format!(
+            "[{}]({}) - {}\n\nLatest: **{}**",
+            name, npm_url, npm_url, latest.version
+        );
+
         hints.push(InlayHint {
             position: version_range.end,
-            label: InlayHintLabel::String(label),
+            label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
+                value: label_text,
+                tooltip: Some(tower_lsp::lsp_types::InlayHintLabelPartTooltip::MarkupContent(
+                    MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: tooltip_content,
+                    },
+                )),
+                location: None,
+                command: Some(tower_lsp::lsp_types::Command {
+                    title: "Open on npmjs.com".into(),
+                    command: "vscode.open".into(),
+                    arguments: Some(vec![serde_json::json!(npm_url)]),
+                }),
+            }]),
             kind: Some(InlayHintKind::TYPE),
             text_edits: None,
             tooltip: None,

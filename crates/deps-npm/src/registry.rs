@@ -13,6 +13,14 @@ use std::sync::Arc;
 
 const REGISTRY_BASE: &str = "https://registry.npmjs.org";
 
+/// Base URL for package pages on npmjs.com
+pub const NPMJS_URL: &str = "https://www.npmjs.com/package";
+
+/// Returns the URL for a package's page on npmjs.com.
+pub fn package_url(name: &str) -> String {
+    format!("{}/{}", NPMJS_URL, name)
+}
+
 /// Client for interacting with the npm registry.
 ///
 /// Uses the npm registry API for package metadata and search.

@@ -8,5 +8,5 @@ pub mod registry;
 pub mod types;
 
 pub use parser::{NpmParseResult, parse_package_json};
-pub use registry::NpmRegistry;
+pub use registry::{NpmRegistry, package_url};
 pub use types::{NpmDependency, NpmDependencySection, NpmPackage, NpmVersion};
