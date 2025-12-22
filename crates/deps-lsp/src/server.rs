@@ -10,9 +10,11 @@ use tokio::sync::RwLock;
 use tower_lsp::lsp_types::{
     CodeActionOptions, CodeActionParams, CodeActionProviderCapability, CompletionOptions,
     CompletionParams, CompletionResponse, DiagnosticOptions, DiagnosticServerCapabilities,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Hover,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHint, InlayHintParams, MessageType, OneOf, ServerCapabilities, ServerInfo,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
+    FullDocumentDiagnosticReport, Hover, HoverParams, HoverProviderCapability, InitializeParams,
+    InitializeResult, InitializedParams, InlayHint, InlayHintParams, MessageType, OneOf,
+    RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo,
     TextDocumentSyncCapability, TextDocumentSyncKind,
 };
 use tower_lsp::{Client, LanguageServer, jsonrpc::Result};
@@ -406,6 +408,28 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<tower_lsp::lsp_types::CodeActionOrCommand>>> {
         Ok(Some(
             code_actions::handle_code_actions(Arc::clone(&self.state), params).await,
+        ))
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+        let config = self.config.read().await;
+
+        let items =
+            diagnostics::handle_diagnostics(Arc::clone(&self.state), &uri, &config.diagnostics)
+                .await;
+
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items,
+                },
+            }),
         ))
     }
 }
