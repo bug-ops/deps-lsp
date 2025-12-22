@@ -313,10 +313,7 @@ fn parse_package_metadata(package_name: &str, data: &[u8]) -> Result<Vec<PypiVer
     versions_with_parsed.sort_by(|a, b| b.1.cmp(&a.1));
 
     // Extract sorted versions, discarding parsed data
-    let versions: Vec<PypiVersion> = versions_with_parsed
-        .into_iter()
-        .map(|(v, _)| v)
-        .collect();
+    let versions: Vec<PypiVersion> = versions_with_parsed.into_iter().map(|(v, _)| v).collect();
 
     Ok(versions)
 }
