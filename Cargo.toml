@@ -4,7 +4,7 @@ exclude = ["crates/deps-zed"]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Andrei G"]
@@ -15,10 +15,10 @@ repository = "https://github.com/bug-ops/deps-lsp"
 async-trait = "0.1"
 criterion = "0.8"
 dashmap = "6.1"
-deps-core = { version = "0.2.0", path = "crates/deps-core" }
-deps-cargo = { version = "0.2.0", path = "crates/deps-cargo" }
-deps-npm = { version = "0.2.0", path = "crates/deps-npm" }
-deps-lsp = { version = "0.2.0", path = "crates/deps-lsp" }
+deps-core = { version = "0.2.1", path = "crates/deps-core" }
+deps-cargo = { version = "0.2.1", path = "crates/deps-cargo" }
+deps-npm = { version = "0.2.1", path = "crates/deps-npm" }
+deps-lsp = { version = "0.2.1", path = "crates/deps-lsp" }
 futures = "0.3"
 insta = "1"
 mockito = "1"
