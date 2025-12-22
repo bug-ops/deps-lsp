@@ -128,8 +128,8 @@ jobs:
           fi
         shell: bash
 
-      - name: Strip binary (Linux/macOS)
-        if: matrix.os != 'windows-latest'
+      - name: Strip binary (Linux/macOS, native only)
+        if: matrix.os != 'windows-latest' && !matrix.use_cross
         run: strip target/${{ matrix.target }}/release/${{ steps.binary.outputs.name }}
 
       - name: Create archive (Unix)
