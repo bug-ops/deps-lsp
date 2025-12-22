@@ -492,28 +492,60 @@ impl PypiParser {
         )))
     }
 
-    /// Find position of array element in source content.
+    /// Find position of array element in source content by searching for the string.
+    ///
+    /// This is a basic implementation that searches for quoted strings in the content
+    /// after finding the section header. For more accurate results, we should use
+    /// toml_edit spans, but this works for most cases.
     fn find_array_element_position(
         &self,
-        _content: &str,
-        _section: &str,
+        content: &str,
+        section: &str,
         _index: usize,
     ) -> Option<Position> {
-        // TODO: Implement actual position tracking using toml_edit spans
-        // For now, return None - positions will be default
+        // Find the section header
+        let section_patterns: Vec<String> = if section.contains('.') {
+            // For nested sections like "dependency-groups.dev", try both formats
+            let parts: Vec<&str> = section.split('.').collect();
+            if parts.len() == 2 {
+                vec![format!("[{}]", section), format!("{} = [", parts[1])]
+            } else {
+                vec![format!("[{}]", section)]
+            }
+        } else {
+            vec![format!("[{}]", section)]
+        };
+
+        for pattern in section_patterns {
+            if let Some(section_pos) = content.find(&pattern) {
+                // Found the section, return position after section header
+                let before_section = &content[..section_pos];
+                let line = before_section.chars().filter(|&c| c == '\n').count() as u32;
+                return Some(Position::new(line + 1, 0));
+            }
+        }
+
         None
     }
 
     /// Find position of table key in source content.
-    fn find_table_key_position(
-        &self,
-        _content: &str,
-        _section: &str,
-        _key: &str,
-    ) -> Option<Position> {
-        // TODO: Implement actual position tracking using toml_edit spans
-        // For now, return None - positions will be default
-        None
+    fn find_table_key_position(&self, content: &str, section: &str, key: &str) -> Option<Position> {
+        // Find section first
+        let section_marker = format!("[{}]", section);
+        let section_start = content.find(&section_marker)?;
+
+        // Find the key after the section
+        let after_section = &content[section_start..];
+        let key_pattern = format!("{} = ", key);
+        let key_pos = after_section.find(&key_pattern)?;
+
+        let total_offset = section_start + key_pos;
+        let before_key = &content[..total_offset];
+        let line = before_key.chars().filter(|&c| c == '\n').count() as u32;
+        let last_newline = before_key.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let character = (total_offset - last_newline) as u32;
+
+        Some(Position::new(line, character))
     }
 }
 
