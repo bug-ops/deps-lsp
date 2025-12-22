@@ -14,6 +14,15 @@ use tower_lsp::lsp_types::{
     InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, MarkupContent, MarkupKind, Range,
 };
 
+/// Maximum number of versions to display in hover tooltips.
+const MAX_VERSIONS_IN_HOVER: usize = 8;
+
+/// Maximum number of features to display in hover tooltips.
+const MAX_FEATURES_IN_HOVER: usize = 10;
+
+/// Maximum number of versions to offer in code action suggestions.
+const MAX_CODE_ACTION_VERSIONS: usize = 5;
+
 /// Generic handler for LSP operations across ecosystems.
 ///
 /// This trait uses Generic Associated Types (GATs) to provide
@@ -431,26 +440,32 @@ where
     }
 
     markdown.push_str("**Versions** *(use Cmd+. to update)*:\n");
-    for (i, version) in versions.iter().take(8).enumerate() {
+    for (i, version) in versions.iter().take(MAX_VERSIONS_IN_HOVER).enumerate() {
         if i == 0 {
             markdown.push_str(&format!("- {} *(latest)*\n", version.version_string()));
         } else {
             markdown.push_str(&format!("- {}\n", version.version_string()));
         }
     }
-    if versions.len() > 8 {
-        markdown.push_str(&format!("- *...and {} more*\n", versions.len() - 8));
+    if versions.len() > MAX_VERSIONS_IN_HOVER {
+        markdown.push_str(&format!(
+            "- *...and {} more*\n",
+            versions.len() - MAX_VERSIONS_IN_HOVER
+        ));
     }
 
     // Features (if supported by ecosystem)
     let features = latest.features();
     if !features.is_empty() {
         markdown.push_str("\n**Features**:\n");
-        for feature in features.iter().take(10) {
+        for feature in features.iter().take(MAX_FEATURES_IN_HOVER) {
             markdown.push_str(&format!("- `{}`\n", feature));
         }
-        if features.len() > 10 {
-            markdown.push_str(&format!("- *...and {} more*\n", features.len() - 10));
+        if features.len() > MAX_FEATURES_IN_HOVER {
+            markdown.push_str(&format!(
+                "- *...and {} more*\n",
+                features.len() - MAX_FEATURES_IN_HOVER
+            ));
         }
     }
 
@@ -562,11 +577,11 @@ where
             continue;
         };
 
-        // Offer up to 5 non-deprecated versions
+        // Offer up to MAX_CODE_ACTION_VERSIONS non-deprecated versions
         for (i, version) in versions
             .iter()
             .filter(|v| !H::is_deprecated(v))
-            .take(5)
+            .take(MAX_CODE_ACTION_VERSIONS)
             .enumerate()
         {
             let new_text = H::format_version_for_edit(dep, version.version_string());

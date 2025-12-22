@@ -7,6 +7,12 @@ use std::time::Instant;
 /// Maximum number of cached entries to prevent unbounded memory growth.
 const MAX_CACHE_ENTRIES: usize = 1000;
 
+/// HTTP request timeout in seconds.
+const HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Percentage of cache entries to evict when capacity is reached.
+const CACHE_EVICTION_PERCENTAGE: usize = 10;
+
 /// Validates that a URL uses HTTPS protocol.
 ///
 /// Returns an error if the URL doesn't start with "https://".
@@ -96,12 +102,12 @@ pub struct HttpCache {
 impl HttpCache {
     /// Creates a new HTTP cache with default configuration.
     ///
-    /// The cache uses a 30-second timeout for all requests and identifies
-    /// itself with a `deps-lsp/0.1.0` user agent.
+    /// The cache uses a configurable timeout for all requests and identifies
+    /// itself with an auto-versioned user agent.
     pub fn new() -> Self {
         let client = Client::builder()
-            .user_agent("deps-lsp/0.1.0")
-            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(format!("deps-lsp/{}", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
             .build()
             .expect("failed to create HTTP client");
 
@@ -330,12 +336,12 @@ impl HttpCache {
         self.entries.is_empty()
     }
 
-    /// Evicts approximately 10% of cache entries when capacity is reached.
+    /// Evicts approximately `CACHE_EVICTION_PERCENTAGE`% of cache entries when capacity is reached.
     ///
     /// Uses a simple random eviction strategy. In a production system,
     /// this could be replaced with LRU or TTL-based eviction.
     fn evict_entries(&self) {
-        let target_removals = MAX_CACHE_ENTRIES / 10;
+        let target_removals = MAX_CACHE_ENTRIES / CACHE_EVICTION_PERCENTAGE;
         let mut removed = 0;
 
         // Simple eviction: remove oldest entries by fetched_at timestamp

@@ -18,6 +18,12 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{Client, LanguageServer, jsonrpc::Result};
 
+/// LSP command identifiers.
+mod commands {
+    /// Command to update a dependency version.
+    pub const UPDATE_VERSION: &str = "deps-lsp.updateVersion";
+}
+
 pub struct Backend {
     client: Client,
     state: Arc<ServerState>,
@@ -191,7 +197,7 @@ impl Backend {
                 ..Default::default()
             })),
             execute_command_provider: Some(ExecuteCommandOptions {
-                commands: vec!["deps-lsp.updateVersion".into()],
+                commands: vec![commands::UPDATE_VERSION.into()],
                 ..Default::default()
             }),
             ..Default::default()
@@ -341,7 +347,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<serde_json::Value>> {
         tracing::info!("execute_command: {:?}", params.command);
 
-        if params.command == "deps-lsp.updateVersion"
+        if params.command == commands::UPDATE_VERSION
             && let Some(args) = params.arguments.first()
             && let Ok(update_args) = serde_json::from_value::<UpdateVersionArgs>(args.clone())
         {
