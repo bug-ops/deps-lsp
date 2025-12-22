@@ -257,8 +257,10 @@ version = "0.2.1"
 dependencies = [
  "async-trait",
  "dashmap 6.1.0",
+ "futures",
  "mockito",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.17",

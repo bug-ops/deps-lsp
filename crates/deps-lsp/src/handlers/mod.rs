@@ -32,8 +32,15 @@
 //! // Handlers use state.get_document() to access parsed dependencies
 //! ```
 
+pub mod cargo_handler_impl;
 pub mod code_actions;
 pub mod completion;
 pub mod diagnostics;
 pub mod hover;
 pub mod inlay_hints;
+pub mod npm_handler_impl;
+pub mod pypi_handler_impl;
+
+pub use cargo_handler_impl::CargoHandlerImpl;
+pub use npm_handler_impl::NpmHandlerImpl;
+pub use pypi_handler_impl::PyPiHandlerImpl;
