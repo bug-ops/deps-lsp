@@ -5,6 +5,12 @@
 //! and links to documentation/repository.
 
 use crate::document::{Ecosystem, ServerState, UnifiedDependency};
+
+/// Maximum number of versions to show in hover tooltip.
+const MAX_VERSIONS_IN_HOVER: usize = 8;
+
+/// Maximum number of features to show in hover tooltip.
+const MAX_FEATURES_IN_HOVER: usize = 10;
 use deps_cargo::{CratesIoRegistry, crate_url};
 use deps_npm::{NpmRegistry, package_url};
 use deps_pypi::PypiRegistry;
@@ -88,7 +94,7 @@ async fn handle_cargo_hover(
 
     // Show version list
     markdown.push_str("**Versions** *(use Cmd+. to update)*:\n");
-    for (i, version) in versions.iter().take(8).enumerate() {
+    for (i, version) in versions.iter().take(MAX_VERSIONS_IN_HOVER).enumerate() {
         if i == 0 {
             // Latest version with docs.rs link
             let docs_url = format!("https://docs.rs/{}/{}", cargo_dep.name, version.num);
@@ -97,18 +103,24 @@ async fn handle_cargo_hover(
             markdown.push_str(&format!("- {}\n", version.num));
         }
     }
-    if versions.len() > 8 {
-        markdown.push_str(&format!("- *...and {} more*\n", versions.len() - 8));
+    if versions.len() > MAX_VERSIONS_IN_HOVER {
+        markdown.push_str(&format!(
+            "- *...and {} more*\n",
+            versions.len() - MAX_VERSIONS_IN_HOVER
+        ));
     }
 
     // Show features if available
     if !latest.features.is_empty() {
         markdown.push_str("\n**Features**:\n");
-        for feature in latest.features.keys().take(10) {
+        for feature in latest.features.keys().take(MAX_FEATURES_IN_HOVER) {
             markdown.push_str(&format!("- `{}`\n", feature));
         }
-        if latest.features.len() > 10 {
-            markdown.push_str(&format!("- *...and {} more*\n", latest.features.len() - 10));
+        if latest.features.len() > MAX_FEATURES_IN_HOVER {
+            markdown.push_str(&format!(
+                "- *...and {} more*\n",
+                latest.features.len() - MAX_FEATURES_IN_HOVER
+            ));
         }
     }
 
@@ -148,15 +160,18 @@ async fn handle_npm_hover(
 
     // Show version list
     markdown.push_str("**Versions** *(use Cmd+. to update)*:\n");
-    for (i, version) in versions.iter().take(8).enumerate() {
+    for (i, version) in versions.iter().take(MAX_VERSIONS_IN_HOVER).enumerate() {
         if i == 0 {
             markdown.push_str(&format!("- {} *(latest)*\n", version.version));
         } else {
             markdown.push_str(&format!("- {}\n", version.version));
         }
     }
-    if versions.len() > 8 {
-        markdown.push_str(&format!("- *...and {} more*\n", versions.len() - 8));
+    if versions.len() > MAX_VERSIONS_IN_HOVER {
+        markdown.push_str(&format!(
+            "- *...and {} more*\n",
+            versions.len() - MAX_VERSIONS_IN_HOVER
+        ));
     }
 
     Some(Hover {
@@ -195,15 +210,18 @@ async fn handle_pypi_hover(
 
     // Show version list
     markdown.push_str("**Versions** *(use Cmd+. to update)*:\n");
-    for (i, version) in versions.iter().take(8).enumerate() {
+    for (i, version) in versions.iter().take(MAX_VERSIONS_IN_HOVER).enumerate() {
         if i == 0 {
             markdown.push_str(&format!("- {} *(latest)*\n", version.version));
         } else {
             markdown.push_str(&format!("- {}\n", version.version));
         }
     }
-    if versions.len() > 8 {
-        markdown.push_str(&format!("- *...and {} more*\n", versions.len() - 8));
+    if versions.len() > MAX_VERSIONS_IN_HOVER {
+        markdown.push_str(&format!(
+            "- *...and {} more*\n",
+            versions.len() - MAX_VERSIONS_IN_HOVER
+        ));
     }
 
     Some(Hover {

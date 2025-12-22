@@ -5,6 +5,9 @@
 //! - "Add missing feature" for feature suggestions
 
 use crate::document::{Ecosystem, ServerState, UnifiedDependency};
+
+/// Maximum number of version update options to offer in code actions.
+const MAX_CODE_ACTION_VERSIONS: usize = 5;
 use deps_cargo::{CratesIoRegistry, DependencySource};
 use deps_npm::NpmRegistry;
 use deps_pypi::{PypiDependencySource, PypiRegistry};
@@ -122,8 +125,13 @@ async fn handle_cargo_code_actions(
             }
         };
 
-        // Offer multiple version options (non-yanked, up to 5)
-        for (i, version) in versions.iter().filter(|v| !v.yanked).take(5).enumerate() {
+        // Offer multiple version options (non-yanked, up to MAX_CODE_ACTION_VERSIONS)
+        for (i, version) in versions
+            .iter()
+            .filter(|v| !v.yanked)
+            .take(MAX_CODE_ACTION_VERSIONS)
+            .enumerate()
+        {
             let mut edits = HashMap::new();
             edits.insert(
                 uri.clone(),
@@ -187,11 +195,11 @@ async fn handle_npm_code_actions(
             }
         };
 
-        // Offer multiple version options (non-deprecated, up to 5)
+        // Offer multiple version options (non-deprecated, up to MAX_CODE_ACTION_VERSIONS)
         for (i, version) in versions
             .iter()
             .filter(|v| !v.deprecated)
-            .take(5)
+            .take(MAX_CODE_ACTION_VERSIONS)
             .enumerate()
         {
             let mut edits = HashMap::new();
@@ -287,8 +295,13 @@ async fn handle_pypi_code_actions(
             }
         };
 
-        // Offer multiple version options (non-yanked, up to 5)
-        for (i, version) in versions.iter().filter(|v| !v.yanked).take(5).enumerate() {
+        // Offer multiple version options (non-yanked, up to MAX_CODE_ACTION_VERSIONS)
+        for (i, version) in versions
+            .iter()
+            .filter(|v| !v.yanked)
+            .take(MAX_CODE_ACTION_VERSIONS)
+            .enumerate()
+        {
             // Format the new version text based on the dependency section
             // PEP 621 uses array format: ["package>=version"]
             // Poetry uses table format: package = "^version" or { version = "^version" }
