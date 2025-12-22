@@ -398,9 +398,635 @@ pub async fn pypi_change(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_module_compiles() {
-        // Smoke test to ensure module compiles
-        // Integration tests in server.rs will test actual functionality
+    use super::*;
+    use crate::config::DepsConfig;
+    use crate::document::{
+        DocumentState, Ecosystem, ServerState, UnifiedDependency, UnifiedVersion,
+    };
+    use deps_cargo::{DependencySection, DependencySource, ParsedDependency};
+    use deps_core::registry::{PackageMetadata, PackageRegistry, VersionInfo};
+    use deps_core::{DepsError, EcosystemHandler, HttpCache};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tower_lsp::Client;
+    use tower_lsp::lsp_types::{Position, Range, Url};
+
+    // Mock types for testing
+    #[derive(Clone)]
+    struct MockVersion {
+        version: String,
+        yanked: bool,
+    }
+
+    impl VersionInfo for MockVersion {
+        fn version_string(&self) -> &str {
+            &self.version
+        }
+
+        fn is_yanked(&self) -> bool {
+            self.yanked
+        }
+
+        fn features(&self) -> Vec<String> {
+            vec![]
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockMetadata {
+        name: String,
+    }
+
+    impl PackageMetadata for MockMetadata {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> Option<&str> {
+            None
+        }
+
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+
+        fn latest_version(&self) -> &str {
+            "1.0.0"
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockRegistry {
+        versions: HashMap<String, Vec<MockVersion>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PackageRegistry for MockRegistry {
+        type Version = MockVersion;
+        type Metadata = MockMetadata;
+        type VersionReq = String;
+
+        async fn get_versions(&self, name: &str) -> deps_core::error::Result<Vec<Self::Version>> {
+            self.versions.get(name).cloned().ok_or_else(|| {
+                use std::io::{Error as IoError, ErrorKind};
+                DepsError::Io(IoError::new(ErrorKind::NotFound, "package not found"))
+            })
+        }
+
+        async fn get_latest_matching(
+            &self,
+            name: &str,
+            _req: &Self::VersionReq,
+        ) -> deps_core::error::Result<Option<Self::Version>> {
+            Ok(self.versions.get(name).and_then(|v| v.first().cloned()))
+        }
+
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> deps_core::error::Result<Vec<Self::Metadata>> {
+            Ok(vec![])
+        }
+    }
+
+    struct MockHandler {
+        registry: MockRegistry,
+    }
+
+    #[async_trait::async_trait]
+    impl EcosystemHandler for MockHandler {
+        type Registry = MockRegistry;
+        type Dependency = ParsedDependency;
+        type UnifiedDep = UnifiedDependency;
+
+        fn new(_cache: Arc<HttpCache>) -> Self {
+            let mut versions = HashMap::new();
+            versions.insert(
+                "test-pkg".to_string(),
+                vec![MockVersion {
+                    version: "1.0.0".to_string(),
+                    yanked: false,
+                }],
+            );
+
+            Self {
+                registry: MockRegistry { versions },
+            }
+        }
+
+        fn registry(&self) -> &Self::Registry {
+            &self.registry
+        }
+
+        fn extract_dependency(dep: &Self::UnifiedDep) -> Option<&Self::Dependency> {
+            match dep {
+                UnifiedDependency::Cargo(d) => Some(d),
+                _ => None,
+            }
+        }
+
+        fn package_url(name: &str) -> String {
+            format!("https://test.io/{}", name)
+        }
+
+        fn ecosystem_display_name() -> &'static str {
+            "Test"
+        }
+
+        fn is_version_latest(_version_req: &str, _latest: &str) -> bool {
+            true
+        }
+
+        fn format_version_for_edit(_dep: &Self::Dependency, version: &str) -> String {
+            format!("\"{}\"", version)
+        }
+
+        fn is_deprecated(_version: &MockVersion) -> bool {
+            false
+        }
+
+        fn is_valid_version_syntax(_version_req: &str) -> bool {
+            true
+        }
+
+        fn parse_version_req(version_req: &str) -> Option<String> {
+            Some(version_req.to_string())
+        }
+    }
+
+    // Mock LSP Client
+    fn mock_client() -> Client {
+        // Create a mock client using tower-lsp's testing utilities
+        // For unit tests, we can use a mock that doesn't actually send messages
+        let (service, _socket) =
+            tower_lsp::LspService::build(|client| MockLanguageServer { client }).finish();
+        service.inner().client.clone()
+    }
+
+    struct MockLanguageServer {
+        client: Client,
+    }
+
+    #[tower_lsp::async_trait]
+    impl tower_lsp::LanguageServer for MockLanguageServer {
+        async fn initialize(
+            &self,
+            _: tower_lsp::lsp_types::InitializeParams,
+        ) -> tower_lsp::jsonrpc::Result<tower_lsp::lsp_types::InitializeResult> {
+            Ok(tower_lsp::lsp_types::InitializeResult::default())
+        }
+
+        async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn create_test_dependency(name: &str, version: &str) -> ParsedDependency {
+        ParsedDependency {
+            name: name.to_string(),
+            name_range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: name.len() as u32,
+                },
+            },
+            version_req: Some(version.to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 15,
+                },
+            }),
+            features: vec![],
+            features_range: None,
+            source: DependencySource::Registry,
+            workspace_inherited: false,
+            section: DependencySection::Dependencies,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_document_open_empty_dependencies() {
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let content = "[dependencies]\n".to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let parse_fn = |_content: &str,
+                        _uri: &Url|
+         -> deps_core::error::Result<Vec<ParsedDependency>> { Ok(vec![]) };
+
+        let wrap_ver_fn = |_v: MockVersion| -> UnifiedVersion {
+            UnifiedVersion::Cargo(deps_cargo::CargoVersion {
+                num: "1.0.0".to_string(),
+                yanked: false,
+                features: HashMap::new(),
+            })
+        };
+
+        let result = handle_document_open::<MockHandler, _, _, _, _, _>(
+            uri.clone(),
+            content.clone(),
+            state.clone(),
+            client,
+            config,
+            parse_fn,
+            UnifiedDependency::Cargo,
+            wrap_ver_fn,
+            Ecosystem::Cargo,
+            |_| true,
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        // Verify document was stored
+        let doc = state.get_document(&uri);
+        assert!(doc.is_some());
+        let doc = doc.unwrap();
+        assert_eq!(doc.content, content);
+        assert_eq!(doc.dependencies.len(), 0);
+        assert_eq!(doc.ecosystem, Ecosystem::Cargo);
+    }
+
+    #[tokio::test]
+    async fn test_handle_document_open_with_dependencies() {
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let content = "[dependencies]\ntest-pkg = \"1.0.0\"\n".to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let parse_fn =
+            |_content: &str, _uri: &Url| -> deps_core::error::Result<Vec<ParsedDependency>> {
+                Ok(vec![create_test_dependency("test-pkg", "1.0.0")])
+            };
+
+        let wrap_ver_fn = |_v: MockVersion| -> UnifiedVersion {
+            UnifiedVersion::Cargo(deps_cargo::CargoVersion {
+                num: "1.0.0".to_string(),
+                yanked: false,
+                features: HashMap::new(),
+            })
+        };
+
+        let result = handle_document_open::<MockHandler, _, _, _, _, _>(
+            uri.clone(),
+            content.clone(),
+            state.clone(),
+            client,
+            config,
+            parse_fn,
+            UnifiedDependency::Cargo,
+            wrap_ver_fn,
+            Ecosystem::Cargo,
+            |dep| matches!(dep.source, DependencySource::Registry),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let task = result.unwrap();
+
+        // Wait for background task to complete
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+
+        // Verify document was stored
+        let doc = state.get_document(&uri);
+        assert!(doc.is_some());
+        let doc = doc.unwrap();
+        assert_eq!(doc.dependencies.len(), 1);
+        assert_eq!(doc.dependencies[0].name(), "test-pkg");
+    }
+
+    #[tokio::test]
+    async fn test_handle_document_open_parse_error() {
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let content = "invalid toml content".to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let parse_fn =
+            |_content: &str, _uri: &Url| -> deps_core::error::Result<Vec<ParsedDependency>> {
+                Err(DepsError::ParseError {
+                    file_type: "Cargo.toml".to_string(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid toml",
+                    )),
+                })
+            };
+
+        let wrap_ver_fn = |_v: MockVersion| -> UnifiedVersion {
+            UnifiedVersion::Cargo(deps_cargo::CargoVersion {
+                num: "1.0.0".to_string(),
+                yanked: false,
+                features: HashMap::new(),
+            })
+        };
+
+        let result = handle_document_open::<MockHandler, _, _, _, _, _>(
+            uri.clone(),
+            content,
+            state.clone(),
+            client,
+            config,
+            parse_fn,
+            UnifiedDependency::Cargo,
+            wrap_ver_fn,
+            Ecosystem::Cargo,
+            |_| true,
+        )
+        .await;
+
+        assert!(result.is_err());
+
+        // Document should not be stored on parse error
+        let doc = state.get_document(&uri);
+        assert!(doc.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_document_change_updates_state() {
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        // Initial document
+        let initial_content = "[dependencies]\nold-pkg = \"1.0.0\"\n".to_string();
+        let initial_doc = DocumentState::new(
+            Ecosystem::Cargo,
+            initial_content,
+            vec![UnifiedDependency::Cargo(create_test_dependency(
+                "old-pkg", "1.0.0",
+            ))],
+        );
+        state.update_document(uri.clone(), initial_doc);
+
+        // Update document
+        let new_content = "[dependencies]\nnew-pkg = \"2.0.0\"\n".to_string();
+
+        let parse_fn =
+            |_content: &str, _uri: &Url| -> deps_core::error::Result<Vec<ParsedDependency>> {
+                Ok(vec![create_test_dependency("new-pkg", "2.0.0")])
+            };
+
+        let result = handle_document_change::<MockHandler, _, _, _>(
+            uri.clone(),
+            new_content.clone(),
+            state.clone(),
+            client,
+            config,
+            parse_fn,
+            UnifiedDependency::Cargo,
+            Ecosystem::Cargo,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let task = result.unwrap();
+
+        // Wait for debounced task
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), task).await;
+
+        // Verify document was updated
+        let doc = state.get_document(&uri);
+        assert!(doc.is_some());
+        let doc = doc.unwrap();
+        assert_eq!(doc.content, new_content);
+        assert_eq!(doc.dependencies.len(), 1);
+        assert_eq!(doc.dependencies[0].name(), "new-pkg");
+    }
+
+    #[tokio::test]
+    async fn test_handle_document_change_parse_error_graceful() {
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        // Initial valid document
+        let initial_doc = DocumentState::new(
+            Ecosystem::Cargo,
+            "[dependencies]\nvalid = \"1.0.0\"\n".to_string(),
+            vec![],
+        );
+        state.update_document(uri.clone(), initial_doc);
+
+        // Try to update with invalid content
+        let invalid_content = "invalid toml".to_string();
+
+        let parse_fn =
+            |_content: &str, _uri: &Url| -> deps_core::error::Result<Vec<ParsedDependency>> {
+                Err(DepsError::ParseError {
+                    file_type: "Cargo.toml".to_string(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "parse error",
+                    )),
+                })
+            };
+
+        let result = handle_document_change::<MockHandler, _, _, _>(
+            uri.clone(),
+            invalid_content,
+            state.clone(),
+            client,
+            config,
+            parse_fn,
+            UnifiedDependency::Cargo,
+            Ecosystem::Cargo,
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_document_change_empty_content() {
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let empty_content = "".to_string();
+
+        let parse_fn = |_content: &str,
+                        _uri: &Url|
+         -> deps_core::error::Result<Vec<ParsedDependency>> { Ok(vec![]) };
+
+        let result = handle_document_change::<MockHandler, _, _, _>(
+            uri.clone(),
+            empty_content.clone(),
+            state.clone(),
+            client,
+            config,
+            parse_fn,
+            UnifiedDependency::Cargo,
+            Ecosystem::Cargo,
+        )
+        .await;
+
+        assert!(result.is_ok());
+
+        // Verify empty content is stored
+        let doc = state.get_document(&uri);
+        assert!(doc.is_some());
+        let doc = doc.unwrap();
+        assert_eq!(doc.content, empty_content);
+        assert_eq!(doc.dependencies.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_document_open_filters_non_registry_deps() {
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let content = "[dependencies]\ntest-pkg = \"1.0.0\"\n".to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let parse_fn =
+            |_content: &str, _uri: &Url| -> deps_core::error::Result<Vec<ParsedDependency>> {
+                let mut dep = create_test_dependency("test-pkg", "1.0.0");
+                dep.source = DependencySource::Git {
+                    url: "https://github.com/test/test".to_string(),
+                    rev: None,
+                };
+                Ok(vec![dep])
+            };
+
+        let wrap_ver_fn = |_v: MockVersion| -> UnifiedVersion {
+            UnifiedVersion::Cargo(deps_cargo::CargoVersion {
+                num: "1.0.0".to_string(),
+                yanked: false,
+                features: HashMap::new(),
+            })
+        };
+
+        let result = handle_document_open::<MockHandler, _, _, _, _, _>(
+            uri.clone(),
+            content,
+            state.clone(),
+            client,
+            config,
+            parse_fn,
+            UnifiedDependency::Cargo,
+            wrap_ver_fn,
+            Ecosystem::Cargo,
+            |dep| matches!(dep.source, DependencySource::Registry),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let task = result.unwrap();
+
+        // Wait for background task
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
+
+        // Document should have dependency, but no version fetch for git deps
+        let doc = state.get_document(&uri);
+        assert!(doc.is_some());
+        let doc = doc.unwrap();
+        assert_eq!(doc.dependencies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cargo_open_wrapper() {
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let result = cargo_open(uri.clone(), content, state.clone(), client, config).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cargo_change_wrapper() {
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let result = cargo_change(uri.clone(), content, state.clone(), client, config).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_npm_open_wrapper() {
+        let uri = Url::parse("file:///test/package.json").unwrap();
+        let content = r#"{"dependencies": {"react": "^18.0.0"}}"#.to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let result = npm_open(uri.clone(), content, state.clone(), client, config).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_npm_change_wrapper() {
+        let uri = Url::parse("file:///test/package.json").unwrap();
+        let content = r#"{"dependencies": {"react": "^18.0.0"}}"#.to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let result = npm_change(uri.clone(), content, state.clone(), client, config).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pypi_open_wrapper() {
+        let uri = Url::parse("file:///test/pyproject.toml").unwrap();
+        let content = r#"[project]
+dependencies = ["requests>=2.28.0"]
+"#
+        .to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let result = pypi_open(uri.clone(), content, state.clone(), client, config).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pypi_change_wrapper() {
+        let uri = Url::parse("file:///test/pyproject.toml").unwrap();
+        let content = r#"[project]
+dependencies = ["requests>=2.28.0"]
+"#
+        .to_string();
+        let state = Arc::new(ServerState::new());
+        let client = mock_client();
+        let config = Arc::new(RwLock::new(DepsConfig::default()));
+
+        let result = pypi_change(uri.clone(), content, state.clone(), client, config).await;
+
+        assert!(result.is_ok());
     }
 }
