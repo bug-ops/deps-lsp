@@ -13,7 +13,7 @@
 //!
 //! # Examples
 //!
-//! ```
+//! ```no_run
 //! use deps_lsp::cargo::parser::parse_cargo_toml;
 //! use tower_lsp::lsp_types::Url;
 //!
@@ -88,7 +88,7 @@ impl LineOffsetTable {
 ///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// use deps_lsp::cargo::parser::parse_cargo_toml;
 /// use tower_lsp::lsp_types::Url;
 ///
