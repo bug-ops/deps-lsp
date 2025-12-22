@@ -31,7 +31,7 @@
 use crate::types::{DependencySection, DependencySource, ParsedDependency};
 use deps_core::{DepsError, Result};
 use std::path::PathBuf;
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{Document, DocumentMut, Item, Table, Value};
 use tower_lsp::lsp_types::{Position, Range, Url};
 
 /// Result of parsing a Cargo.toml file.
@@ -103,12 +103,11 @@ impl LineOffsetTable {
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
 pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<ParseResult> {
-    let doc = content
-        .parse::<DocumentMut>()
-        .map_err(|e| DepsError::ParseError {
-            file_type: "Cargo.toml".into(),
-            source: Box::new(e),
-        })?;
+    // Use Document (not DocumentMut) to preserve span information
+    let doc: Document<&str> = Document::parse(content).map_err(|e| DepsError::ParseError {
+        file_type: "Cargo.toml".into(),
+        source: Box::new(e),
+    })?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
@@ -682,12 +681,24 @@ tokio = { version = "1.0", features = ["full"] }
 
         let serde = result.dependencies.iter().find(|d| d.name == "serde");
         assert!(serde.is_some());
-        assert_eq!(serde.unwrap().version_req, Some("1.0".into()));
+        let serde = serde.unwrap();
+        assert_eq!(serde.version_req, Some("1.0".into()));
+        // version_range should be set for inlay hints
+        assert!(
+            serde.version_range.is_some(),
+            "version_range should be set for serde"
+        );
 
         let tokio = result.dependencies.iter().find(|d| d.name == "tokio");
         assert!(tokio.is_some());
-        assert_eq!(tokio.unwrap().version_req, Some("1.0".into()));
-        assert_eq!(tokio.unwrap().features, vec!["full"]);
+        let tokio = tokio.unwrap();
+        assert_eq!(tokio.version_req, Some("1.0".into()));
+        assert_eq!(tokio.features, vec!["full"]);
+        // version_range should be set for inlay hints
+        assert!(
+            tokio.version_range.is_some(),
+            "version_range should be set for tokio"
+        );
     }
 
     #[test]

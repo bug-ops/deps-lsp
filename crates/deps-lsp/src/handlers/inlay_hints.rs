@@ -56,6 +56,7 @@ pub async fn handle_inlay_hints(
     };
 
     let ecosystem = doc.ecosystem;
+
     let deps_to_fetch: Vec<_> = doc
         .dependencies
         .iter()
