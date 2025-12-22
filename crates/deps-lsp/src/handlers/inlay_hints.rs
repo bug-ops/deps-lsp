@@ -447,7 +447,7 @@ async fn handle_pypi_inlay_hints(
         if is_yanked {
             continue;
         }
-        let is_latest = is_version_latest(&version_req, &latest_version);
+        let is_latest = is_pypi_version_latest(&version_req, &latest_version);
         hints.push(create_pypi_hint(
             &name,
             &version_req,
@@ -473,7 +473,7 @@ async fn handle_pypi_inlay_hints(
             None => continue,
         };
 
-        let is_latest = is_version_latest(&version_req, &latest.version);
+        let is_latest = is_pypi_version_latest(&version_req, &latest.version);
         hints.push(create_pypi_hint(
             &name,
             &version_req,
@@ -533,7 +533,7 @@ fn create_pypi_hint(
     }
 }
 
-/// Checks if the latest version satisfies the version requirement.
+/// Checks if the latest version satisfies the version requirement (for Cargo/npm).
 ///
 /// Returns true if the latest available version matches the requirement,
 /// meaning the dependency is effectively up-to-date within its constraint.
@@ -564,6 +564,99 @@ fn is_version_latest(version_req: &str, latest: &str) -> bool {
 
     // Fallback: string comparison
     version_req == latest
+}
+
+/// Checks if the version requirement specifies the latest version (for PyPI).
+///
+/// For PyPI dependencies, we extract the minimum version from the requirement
+/// and check if its major.minor matches the latest version's major.minor.
+///
+/// For example:
+/// - `">=8.0"` with latest `"8.3.5"` → true (same major version 8.x)
+/// - `">=8.0"` with latest `"9.0.2"` → false (new major version 9.x available)
+/// - `">=1.0,<2.0"` with latest `"1.5.0"` → true (within constraint)
+fn is_pypi_version_latest(version_req: &str, latest: &str) -> bool {
+    // Parse the latest version (normalize to three parts if needed)
+    let latest_ver = match normalize_and_parse_version(latest) {
+        Some(v) => v,
+        None => return version_req == latest,
+    };
+
+    // Extract the minimum version from the requirement
+    // Common patterns: ">=1.0", ">=1.0,<2.0", "~=1.0", "==1.0"
+    let min_version = extract_pypi_min_version(version_req);
+
+    let min_ver = match min_version.and_then(|v| normalize_and_parse_version(&v)) {
+        Some(v) => v,
+        None => return version_req == latest,
+    };
+
+    // Check if major versions match (for major version 0, also check minor)
+    if min_ver.major == 0 {
+        // For 0.x versions, both major and minor must match
+        min_ver.major == latest_ver.major && min_ver.minor == latest_ver.minor
+    } else {
+        // For 1.x+, just major version must match
+        min_ver.major == latest_ver.major
+    }
+}
+
+/// Normalize a version string and parse it as semver.
+/// Adds missing patch version if needed (e.g., "8.0" → "8.0.0").
+fn normalize_and_parse_version(version: &str) -> Option<Version> {
+    // Try parsing directly first
+    if let Ok(v) = version.parse::<Version>() {
+        return Some(v);
+    }
+
+    // Count dots to see if we need to add patch version
+    let dot_count = version.chars().filter(|&c| c == '.').count();
+
+    let normalized = match dot_count {
+        0 => format!("{}.0.0", version), // "8" → "8.0.0"
+        1 => format!("{}.0", version),   // "8.0" → "8.0.0"
+        _ => version.to_string(),
+    };
+
+    normalized.parse::<Version>().ok()
+}
+
+/// Extract the minimum version number from a PEP 440 version specifier.
+///
+/// Examples:
+/// - `">=8.0"` → Some("8.0")
+/// - `">=1.0,<2.0"` → Some("1.0")
+/// - `"~=1.4.2"` → Some("1.4.2")
+/// - `"==2.0.0"` → Some("2.0.0")
+fn extract_pypi_min_version(version_req: &str) -> Option<String> {
+    // Split by comma and look for >= or ~= or == specifiers
+    for part in version_req.split(',') {
+        let trimmed = part.trim();
+
+        // Handle different operators
+        if let Some(ver) = trimmed.strip_prefix(">=") {
+            return Some(ver.trim().to_string());
+        }
+        if let Some(ver) = trimmed.strip_prefix("~=") {
+            return Some(ver.trim().to_string());
+        }
+        if let Some(ver) = trimmed.strip_prefix("==") {
+            return Some(ver.trim().to_string());
+        }
+        if let Some(ver) = trimmed.strip_prefix('>') {
+            // > means strictly greater, but we use this as approximation
+            return Some(ver.trim().to_string());
+        }
+    }
+
+    // If no operator found, try parsing the whole string as a version
+    // (handles Poetry's "^1.0" style by stripping the ^)
+    let stripped = version_req.trim_start_matches('^').trim_start_matches('~');
+    if stripped.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return Some(stripped.to_string());
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -605,5 +698,46 @@ mod tests {
     fn test_is_version_latest_invalid_versions() {
         assert!(!is_version_latest("invalid", "1.0.0"));
         assert!(!is_version_latest("1.0.0", "invalid")); // Invalid latest, fallback to string compare
+    }
+
+    #[test]
+    fn test_is_pypi_version_latest_same_major() {
+        // Same major version = up to date
+        assert!(is_pypi_version_latest(">=8.0", "8.3.5")); // 8.x matches 8.x
+        assert!(is_pypi_version_latest(">=1.0", "1.5.0")); // 1.x matches 1.x
+        assert!(is_pypi_version_latest(">=1.0,<2.0", "1.9.0")); // constrained but same major
+    }
+
+    #[test]
+    fn test_is_pypi_version_latest_new_major() {
+        // New major version available = needs update
+        assert!(!is_pypi_version_latest(">=8.0", "9.0.2")); // 8.x vs 9.x
+        assert!(!is_pypi_version_latest(">=1.0", "2.0.0")); // 1.x vs 2.x
+        assert!(!is_pypi_version_latest(">=4.0,<8.0", "8.0.0")); // 4.x vs 8.x
+    }
+
+    #[test]
+    fn test_is_pypi_version_latest_zero_version() {
+        // For 0.x versions, minor must also match
+        assert!(is_pypi_version_latest(">=0.8", "0.8.5")); // 0.8.x matches 0.8.x
+        assert!(!is_pypi_version_latest(">=0.8", "0.9.0")); // 0.8.x vs 0.9.x
+    }
+
+    #[test]
+    fn test_extract_pypi_min_version() {
+        assert_eq!(extract_pypi_min_version(">=8.0"), Some("8.0".to_string()));
+        assert_eq!(
+            extract_pypi_min_version(">=1.0,<2.0"),
+            Some("1.0".to_string())
+        );
+        assert_eq!(
+            extract_pypi_min_version("~=1.4.2"),
+            Some("1.4.2".to_string())
+        );
+        assert_eq!(
+            extract_pypi_min_version("==2.0.0"),
+            Some("2.0.0".to_string())
+        );
+        assert_eq!(extract_pypi_min_version("^1.0"), Some("1.0".to_string())); // Poetry style
     }
 }
