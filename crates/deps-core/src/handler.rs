@@ -70,6 +70,7 @@ use tower_lsp::lsp_types::{
 /// impl EcosystemHandler for MyHandler {
 ///     type Registry = MyRegistry;
 ///     type Dependency = MyDependency;
+///     type UnifiedDep = MyDependency; // In real implementation, this would be UnifiedDependency enum
 ///
 ///     fn new(_cache: Arc<HttpCache>) -> Self {
 ///         Self {
@@ -81,9 +82,9 @@ use tower_lsp::lsp_types::{
 ///         &self.registry
 ///     }
 ///
-///     fn extract_dependency<'a, UnifiedDep>(_dep: &'a UnifiedDep) -> Option<&'a Self::Dependency> {
+///     fn extract_dependency(dep: &Self::UnifiedDep) -> Option<&Self::Dependency> {
 ///         // In real implementation, match on the enum variant
-///         None
+///         Some(dep)
 ///     }
 ///
 ///     fn package_url(name: &str) -> String {
@@ -107,6 +108,12 @@ pub trait EcosystemHandler: Send + Sync + Sized {
     /// Dependency type for this ecosystem.
     type Dependency: DependencyInfo;
 
+    /// Unified dependency type (typically deps_lsp::document::UnifiedDependency).
+    ///
+    /// This is an associated type to avoid unsafe transmute when extracting
+    /// ecosystem-specific dependencies from the unified enum.
+    type UnifiedDep;
+
     /// Create a new handler with the given cache.
     fn new(cache: Arc<HttpCache>) -> Self;
 
@@ -117,11 +124,8 @@ pub trait EcosystemHandler: Send + Sync + Sized {
     ///
     /// Returns Some if the unified dependency matches this handler's ecosystem,
     /// None otherwise.
-    ///
-    /// NOTE: UnifiedDep is typically deps_lsp::document::UnifiedDependency.
-    /// We use a generic type here to avoid circular dependency between
-    /// deps-core and deps-lsp.
-    fn extract_dependency<'a, UnifiedDep>(dep: &'a UnifiedDep) -> Option<&'a Self::Dependency>;
+    fn extract_dependency(dep: &Self::UnifiedDep) -> Option<&Self::Dependency>;
+
     /// Package URL for this ecosystem (e.g., crates.io, npmjs.com).
     ///
     /// Used in inlay hint commands and hover tooltips.
@@ -182,7 +186,6 @@ pub trait YankedChecker {
 /// # Type Parameters
 ///
 /// * `H` - Ecosystem handler type
-/// * `UnifiedDep` - Unified dependency enum (typically UnifiedDependency from deps-lsp)
 /// * `UnifiedVer` - Unified version enum (typically UnifiedVersion from deps-lsp)
 ///
 /// # Arguments
@@ -195,9 +198,9 @@ pub trait YankedChecker {
 /// # Returns
 ///
 /// Vector of inlay hints for the LSP client.
-pub async fn generate_inlay_hints<H, UnifiedDep, UnifiedVer>(
+pub async fn generate_inlay_hints<H, UnifiedVer>(
     handler: &H,
-    dependencies: &[UnifiedDep],
+    dependencies: &[H::UnifiedDep],
     cached_versions: &HashMap<String, UnifiedVer>,
     config: &InlayHintsConfig,
 ) -> Vec<InlayHint>
@@ -205,8 +208,8 @@ where
     H: EcosystemHandler,
     UnifiedVer: VersionStringGetter + YankedChecker,
 {
-    let mut cached_deps = Vec::new();
-    let mut fetch_deps = Vec::new();
+    let mut cached_deps = Vec::with_capacity(dependencies.len());
+    let mut fetch_deps = Vec::with_capacity(dependencies.len());
 
     // Separate deps into cached and needs-fetch
     for dep in dependencies {
@@ -305,6 +308,7 @@ where
 /// Generic hint creation.
 ///
 /// Uses ecosystem-specific URL and display name from the handler trait.
+#[inline]
 fn create_hint<H: EcosystemHandler>(
     name: &str,
     version_range: Range,
@@ -358,10 +362,9 @@ fn create_hint<H: EcosystemHandler>(
 /// # Type Parameters
 ///
 /// * `H` - Ecosystem handler type
-/// * `UnifiedDep` - Unified dependency enum (typically UnifiedDependency from deps-lsp)
-pub async fn generate_hover<H, UnifiedDep>(
+pub async fn generate_hover<H>(
     handler: &H,
-    dep: &UnifiedDep,
+    dep: &H::UnifiedDep,
 ) -> Option<tower_lsp::lsp_types::Hover>
 where
     H: EcosystemHandler,
@@ -416,4 +419,543 @@ where
         }),
         range: Some(typed_dep.name_range()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::PackageMetadata;
+    use tower_lsp::lsp_types::{Position, Range};
+
+    #[derive(Clone)]
+    struct MockVersion {
+        version: String,
+        yanked: bool,
+        features: Vec<String>,
+    }
+
+    impl VersionInfo for MockVersion {
+        fn version_string(&self) -> &str {
+            &self.version
+        }
+
+        fn is_yanked(&self) -> bool {
+            self.yanked
+        }
+
+        fn features(&self) -> Vec<String> {
+            self.features.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockMetadata {
+        name: String,
+        description: Option<String>,
+        latest: String,
+    }
+
+    impl PackageMetadata for MockMetadata {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> Option<&str> {
+            self.description.as_deref()
+        }
+
+        fn repository(&self) -> Option<&str> {
+            None
+        }
+
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+
+        fn latest_version(&self) -> &str {
+            &self.latest
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockDependency {
+        name: String,
+        version_req: Option<String>,
+        version_range: Option<Range>,
+        name_range: Range,
+    }
+
+    impl crate::parser::DependencyInfo for MockDependency {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn name_range(&self) -> Range {
+            self.name_range
+        }
+
+        fn version_requirement(&self) -> Option<&str> {
+            self.version_req.as_deref()
+        }
+
+        fn version_range(&self) -> Option<Range> {
+            self.version_range
+        }
+
+        fn source(&self) -> crate::parser::DependencySource {
+            crate::parser::DependencySource::Registry
+        }
+    }
+
+    struct MockRegistry {
+        versions: std::collections::HashMap<String, Vec<MockVersion>>,
+    }
+
+    impl Clone for MockRegistry {
+        fn clone(&self) -> Self {
+            Self {
+                versions: self.versions.clone(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::registry::PackageRegistry for MockRegistry {
+        type Version = MockVersion;
+        type Metadata = MockMetadata;
+        type VersionReq = String;
+
+        async fn get_versions(&self, name: &str) -> crate::error::Result<Vec<Self::Version>> {
+            self.versions.get(name).cloned().ok_or_else(|| {
+                use std::io::{Error as IoError, ErrorKind};
+                crate::DepsError::Io(IoError::new(ErrorKind::NotFound, "package not found"))
+            })
+        }
+
+        async fn get_latest_matching(
+            &self,
+            name: &str,
+            _req: &Self::VersionReq,
+        ) -> crate::error::Result<Option<Self::Version>> {
+            Ok(self.versions.get(name).and_then(|v| v.first().cloned()))
+        }
+
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> crate::error::Result<Vec<Self::Metadata>> {
+            Ok(vec![])
+        }
+    }
+
+    struct MockHandler {
+        registry: MockRegistry,
+    }
+
+    #[async_trait]
+    impl EcosystemHandler for MockHandler {
+        type Registry = MockRegistry;
+        type Dependency = MockDependency;
+        type UnifiedDep = MockDependency;
+
+        fn new(_cache: Arc<HttpCache>) -> Self {
+            let mut versions = std::collections::HashMap::new();
+            versions.insert(
+                "serde".to_string(),
+                vec![
+                    MockVersion {
+                        version: "1.0.195".to_string(),
+                        yanked: false,
+                        features: vec!["derive".to_string(), "alloc".to_string()],
+                    },
+                    MockVersion {
+                        version: "1.0.194".to_string(),
+                        yanked: false,
+                        features: vec![],
+                    },
+                ],
+            );
+            versions.insert(
+                "yanked-pkg".to_string(),
+                vec![MockVersion {
+                    version: "1.0.0".to_string(),
+                    yanked: true,
+                    features: vec![],
+                }],
+            );
+
+            Self {
+                registry: MockRegistry { versions },
+            }
+        }
+
+        fn registry(&self) -> &Self::Registry {
+            &self.registry
+        }
+
+        fn extract_dependency(dep: &Self::UnifiedDep) -> Option<&Self::Dependency> {
+            Some(dep)
+        }
+
+        fn package_url(name: &str) -> String {
+            format!("https://test.io/pkg/{}", name)
+        }
+
+        fn ecosystem_display_name() -> &'static str {
+            "Test Registry"
+        }
+
+        fn is_version_latest(version_req: &str, latest: &str) -> bool {
+            version_req == latest
+        }
+    }
+
+    impl VersionStringGetter for MockVersion {
+        fn version_string(&self) -> &str {
+            &self.version
+        }
+    }
+
+    impl YankedChecker for MockVersion {
+        fn is_yanked(&self) -> bool {
+            self.yanked
+        }
+    }
+
+    #[test]
+    fn test_inlay_hints_config_default() {
+        let config = InlayHintsConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.up_to_date_text, "✅");
+        assert_eq!(config.needs_update_text, "❌ {}");
+    }
+
+    #[tokio::test]
+    async fn test_generate_inlay_hints_cached() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.195".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".to_string(),
+            MockVersion {
+                version: "1.0.195".to_string(),
+                yanked: false,
+                features: vec![],
+            },
+        );
+
+        let config = InlayHintsConfig::default();
+        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].position.line, 0);
+        assert_eq!(hints[0].position.character, 20);
+    }
+
+    #[tokio::test]
+    async fn test_generate_inlay_hints_fetch() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let cached_versions: HashMap<String, MockVersion> = HashMap::new();
+        let config = InlayHintsConfig::default();
+        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+
+        assert_eq!(hints.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_generate_inlay_hints_skips_yanked() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.195".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".to_string(),
+            MockVersion {
+                version: "1.0.195".to_string(),
+                yanked: true,
+                features: vec![],
+            },
+        );
+
+        let config = InlayHintsConfig::default();
+        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+
+        assert_eq!(hints.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_inlay_hints_no_version_range() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.195".to_string()),
+            version_range: None,
+            name_range: Range::default(),
+        }];
+
+        let cached_versions: HashMap<String, MockVersion> = HashMap::new();
+        let config = InlayHintsConfig::default();
+        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+
+        assert_eq!(hints.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_inlay_hints_no_version_req() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: None,
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let cached_versions: HashMap<String, MockVersion> = HashMap::new();
+        let config = InlayHintsConfig::default();
+        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+
+        assert_eq!(hints.len(), 0);
+    }
+
+    #[test]
+    fn test_create_hint_up_to_date() {
+        let config = InlayHintsConfig::default();
+        let range = Range {
+            start: Position {
+                line: 5,
+                character: 10,
+            },
+            end: Position {
+                line: 5,
+                character: 20,
+            },
+        };
+
+        let hint = create_hint::<MockHandler>("serde", range, "1.0.195", true, &config);
+
+        assert_eq!(hint.position, range.end);
+        if let InlayHintLabel::LabelParts(parts) = hint.label {
+            assert_eq!(parts[0].value, "✅");
+        } else {
+            panic!("Expected LabelParts");
+        }
+    }
+
+    #[test]
+    fn test_create_hint_needs_update() {
+        let config = InlayHintsConfig::default();
+        let range = Range {
+            start: Position {
+                line: 5,
+                character: 10,
+            },
+            end: Position {
+                line: 5,
+                character: 20,
+            },
+        };
+
+        let hint = create_hint::<MockHandler>("serde", range, "1.0.200", false, &config);
+
+        assert_eq!(hint.position, range.end);
+        if let InlayHintLabel::LabelParts(parts) = hint.label {
+            assert_eq!(parts[0].value, "❌ 1.0.200");
+        } else {
+            panic!("Expected LabelParts");
+        }
+    }
+
+    #[test]
+    fn test_create_hint_custom_config() {
+        let config = InlayHintsConfig {
+            enabled: true,
+            up_to_date_text: "OK".to_string(),
+            needs_update_text: "UPDATE: {}".to_string(),
+        };
+        let range = Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 10,
+            },
+        };
+
+        let hint = create_hint::<MockHandler>("test", range, "2.0.0", false, &config);
+
+        if let InlayHintLabel::LabelParts(parts) = hint.label {
+            assert_eq!(parts[0].value, "UPDATE: 2.0.0");
+        } else {
+            panic!("Expected LabelParts");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let dep = MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range::default()),
+            name_range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+        };
+
+        let hover = generate_hover(&handler, &dep).await;
+
+        assert!(hover.is_some());
+        let hover = hover.unwrap();
+
+        if let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents {
+            assert!(content.value.contains("serde"));
+            assert!(content.value.contains("1.0.195"));
+            assert!(content.value.contains("Current"));
+            assert!(content.value.contains("Features"));
+            assert!(content.value.contains("derive"));
+        } else {
+            panic!("Expected Markup content");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_yanked_version() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let dep = MockDependency {
+            name: "yanked-pkg".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range::default()),
+            name_range: Range::default(),
+        };
+
+        let hover = generate_hover(&handler, &dep).await;
+
+        assert!(hover.is_some());
+        let hover = hover.unwrap();
+
+        if let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents {
+            assert!(content.value.contains("Warning"));
+            assert!(content.value.contains("yanked"));
+        } else {
+            panic!("Expected Markup content");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_no_versions() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let dep = MockDependency {
+            name: "nonexistent".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range::default()),
+            name_range: Range::default(),
+        };
+
+        let hover = generate_hover(&handler, &dep).await;
+        assert!(hover.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_no_version_req() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let dep = MockDependency {
+            name: "serde".to_string(),
+            version_req: None,
+            version_range: Some(Range::default()),
+            name_range: Range::default(),
+        };
+
+        let hover = generate_hover(&handler, &dep).await;
+
+        assert!(hover.is_some());
+        let hover = hover.unwrap();
+
+        if let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents {
+            assert!(!content.value.contains("Current"));
+        } else {
+            panic!("Expected Markup content");
+        }
+    }
 }

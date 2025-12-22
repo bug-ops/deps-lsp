@@ -21,6 +21,7 @@ pub struct CargoHandlerImpl {
 impl EcosystemHandler for CargoHandlerImpl {
     type Registry = CratesIoRegistry;
     type Dependency = ParsedDependency;
+    type UnifiedDep = UnifiedDependency;
 
     fn new(cache: Arc<HttpCache>) -> Self {
         Self {
@@ -32,11 +33,8 @@ impl EcosystemHandler for CargoHandlerImpl {
         &self.registry
     }
 
-    fn extract_dependency<'a, UnifiedDep>(dep: &'a UnifiedDep) -> Option<&'a Self::Dependency> {
-        // SAFETY: UnifiedDep must be UnifiedDependency when this is called.
-        // We use transmute to convert the reference.
-        let unified = unsafe { &*(dep as *const UnifiedDep as *const UnifiedDependency) };
-        match unified {
+    fn extract_dependency(dep: &Self::UnifiedDep) -> Option<&Self::Dependency> {
+        match dep {
             UnifiedDependency::Cargo(cargo_dep) => Some(cargo_dep),
             _ => None,
         }
