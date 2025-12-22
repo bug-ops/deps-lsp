@@ -15,7 +15,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Hover Information** — Package descriptions, links to documentation
 - **Code Actions** — Quick fixes to update dependencies
 
-![deps-lsp in action](crates/deps-zed/assets/img.png)
+![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
 
 ## Supported Ecosystems
 
