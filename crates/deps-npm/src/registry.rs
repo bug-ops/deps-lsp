@@ -46,7 +46,7 @@ impl NpmRegistry {
     /// # use deps_npm::NpmRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::test]
+    /// # #[tokio::main]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = NpmRegistry::new(cache);
@@ -78,7 +78,7 @@ impl NpmRegistry {
     /// # use deps_npm::NpmRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::test]
+    /// # #[tokio::main]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = NpmRegistry::new(cache);
@@ -120,7 +120,7 @@ impl NpmRegistry {
     /// # use deps_npm::NpmRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::test]
+    /// # #[tokio::main]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = NpmRegistry::new(cache);

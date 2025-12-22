@@ -13,7 +13,7 @@
 //! use deps_core::HttpCache;
 //! use std::sync::Arc;
 //!
-//! #[tokio::test]
+//! #[tokio::main]
 //! async fn main() {
 //!     let cache = Arc::new(HttpCache::new());
 //!     let registry = CratesIoRegistry::new(cache);
@@ -65,7 +65,7 @@ impl CratesIoRegistry {
     /// # use deps_cargo::CratesIoRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::test]
+    /// # #[tokio::main]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = CratesIoRegistry::new(cache);
@@ -99,7 +99,7 @@ impl CratesIoRegistry {
     /// # use deps_cargo::CratesIoRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::test]
+    /// # #[tokio::main]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = CratesIoRegistry::new(cache);
@@ -141,7 +141,7 @@ impl CratesIoRegistry {
     /// # use deps_cargo::CratesIoRegistry;
     /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
-    /// # #[tokio::test]
+    /// # #[tokio::main]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = CratesIoRegistry::new(cache);

@@ -21,4 +21,4 @@ urlencoding = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
