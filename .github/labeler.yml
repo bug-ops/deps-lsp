@@ -1,0 +1,117 @@
+# PR auto-labeler configuration
+# Labels are applied based on changed files
+
+# Language/Technology labels
+'rust':
+  - changed-files:
+    - any-glob-to-any-file: ['**/*.rs', '**/Cargo.toml', '**/Cargo.lock']
+
+'wasm':
+  - changed-files:
+    - any-glob-to-any-file: ['crates/deps-zed/**/*']
+
+# Area labels
+'lsp':
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'crates/deps-lsp/src/handlers/**/*'
+      - 'crates/deps-lsp/src/server.rs'
+
+'cargo-support':
+  - changed-files:
+    - any-glob-to-any-file: ['crates/deps-lsp/src/cargo/**/*']
+
+'caching':
+  - changed-files:
+    - any-glob-to-any-file: ['crates/deps-lsp/src/cache.rs']
+
+'parser':
+  - changed-files:
+    - any-glob-to-any-file: ['**/parser.rs', '**/parsing/**/*']
+
+# Documentation labels
+'documentation':
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*.md'
+      - 'docs/**/*'
+
+# CI/CD labels
+'ci':
+  - changed-files:
+    - any-glob-to-any-file:
+      - '.github/workflows/**/*'
+      - '.github/dependabot.yml'
+      - '.github/labeler.yml'
+
+# Configuration labels
+'config':
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'deny.toml'
+      - 'codecov.yml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**/*'
+
+# Test labels
+'tests':
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/tests/**/*'
+      - '**/*_test.rs'
+      - '**/benches/**/*'
+
+# Size labels (applied by GitHub automatically, but we can customize)
+'size/small':
+  - changed-files:
+    - count: 1..5
+
+'size/medium':
+  - changed-files:
+    - count: 6..20
+
+'size/large':
+  - changed-files:
+    - count: 21..100
+
+'size/x-large':
+  - changed-files:
+    - count: 101..500
+
+# Type labels (based on conventional commits in title)
+'type/feature':
+  - title: '^feat(\(.*\))?:'
+
+'type/fix':
+  - title: '^fix(\(.*\))?:'
+
+'type/refactor':
+  - title: '^refactor(\(.*\))?:'
+
+'type/docs':
+  - title: '^docs(\(.*\))?:'
+
+'type/chore':
+  - title: '^chore(\(.*\))?:'
+
+'type/test':
+  - title: '^test(\(.*\))?:'
+
+'type/perf':
+  - title: '^perf(\(.*\))?:'
+
+# Priority labels (can be manually adjusted, but auto-detected for certain patterns)
+'priority/critical':
+  - title: '(security|critical|urgent|hotfix)'
+
+'priority/high':
+  - title: '(important|blocking)'
+
+# Special labels
+'breaking-change':
+  - body: '(BREAKING CHANGE|breaking change)'
+  - title: '!:'
+
+'needs-review':
+  - changed-files:
+    - any-glob-to-any-file: ['**/*']

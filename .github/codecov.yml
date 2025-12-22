@@ -1,0 +1,55 @@
+# Codecov configuration
+# Documentation: https://docs.codecov.com/docs/codecov-yaml
+
+coverage:
+  status:
+    # Overall project coverage
+    project:
+      default:
+        target: 70%        # Minimum coverage target
+        threshold: 2%      # Allow 2% drop without failing
+        informational: false
+
+    # Coverage for new code in PR
+    patch:
+      default:
+        target: 80%        # New code should be well-tested
+        threshold: 1%
+        informational: false
+
+  # Precision of coverage percentage
+  precision: 2
+  round: down
+
+  # Range of coverage percentage colors
+  range: 60..90
+
+# Comment on PRs with coverage details
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
+  require_changes: false
+  require_base: false
+  require_head: true
+
+# Ignore these paths from coverage
+ignore:
+  - "tests/"
+  - "benches/"
+  - "examples/"
+  - "**/main.rs"
+  - "crates/deps-zed/**/*"  # WASM extension has limited testing
+
+# Flags for different test types
+flags:
+  unittests:
+    paths:
+      - crates/deps-lsp/src/
+    carryforward: true
+
+# Codecov will wait this long for coverage reports
+codecov:
+  max_report_age: off
+  require_ci_to_pass: true
+  notify:
+    wait_for_ci: true
