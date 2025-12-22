@@ -416,11 +416,15 @@ impl LanguageServer for Backend {
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
         let uri = params.text_document.uri;
+        tracing::info!("diagnostic request for: {}", uri);
+
         let config = self.config.read().await;
 
         let items =
             diagnostics::handle_diagnostics(Arc::clone(&self.state), &uri, &config.diagnostics)
                 .await;
+
+        tracing::info!("returning {} diagnostics", items.len());
 
         Ok(DocumentDiagnosticReportResult::Report(
             DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {

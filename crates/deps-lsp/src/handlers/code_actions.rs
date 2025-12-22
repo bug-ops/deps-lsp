@@ -25,6 +25,15 @@ pub async fn handle_code_actions(
     let uri = &params.text_document.uri;
     let range = params.range;
 
+    tracing::info!(
+        "code_action request: uri={}, range={}:{}-{}:{}",
+        uri,
+        range.start.line,
+        range.start.character,
+        range.end.line,
+        range.end.character
+    );
+
     let doc = match state.get_document(uri) {
         Some(d) => d,
         None => {
@@ -32,6 +41,12 @@ pub async fn handle_code_actions(
             return vec![];
         }
     };
+
+    tracing::info!(
+        "found document with {} dependencies, ecosystem={:?}",
+        doc.dependencies.len(),
+        doc.ecosystem
+    );
 
     // TODO: Add npm support in code actions
     if doc.ecosystem != Ecosystem::Cargo {

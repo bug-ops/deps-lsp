@@ -73,10 +73,11 @@ pub enum DependencySource {
 
 /// Section in Cargo.toml where a dependency is declared.
 ///
-/// Cargo.toml has three dependency sections with different build-time behavior:
+/// Cargo.toml has four dependency sections with different purposes:
 /// - `[dependencies]`: Runtime dependencies
 /// - `[dev-dependencies]`: Test and example dependencies
 /// - `[build-dependencies]`: Build script dependencies
+/// - `[workspace.dependencies]`: Workspace-wide dependency definitions
 ///
 /// # Examples
 ///
@@ -94,6 +95,8 @@ pub enum DependencySection {
     DevDependencies,
     /// Build script dependencies (`[build-dependencies]`)
     BuildDependencies,
+    /// Workspace-wide dependency definitions (`[workspace.dependencies]`)
+    WorkspaceDependencies,
 }
 
 /// Version information for a crate from crates.io.
@@ -181,10 +184,15 @@ mod tests {
         let deps = DependencySection::Dependencies;
         let dev_deps = DependencySection::DevDependencies;
         let build_deps = DependencySection::BuildDependencies;
+        let workspace_deps = DependencySection::WorkspaceDependencies;
 
         assert!(matches!(deps, DependencySection::Dependencies));
         assert!(matches!(dev_deps, DependencySection::DevDependencies));
         assert!(matches!(build_deps, DependencySection::BuildDependencies));
+        assert!(matches!(
+            workspace_deps,
+            DependencySection::WorkspaceDependencies
+        ));
     }
 
     #[test]

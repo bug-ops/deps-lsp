@@ -146,6 +146,22 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<ParseResult> {
         }
     }
 
+    // Parse workspace dependencies (for workspace root Cargo.toml)
+    if let Some(workspace_item) = doc.get("workspace") {
+        if let Some(workspace_table) = workspace_item.as_table() {
+            if let Some(workspace_deps_item) = workspace_table.get("dependencies") {
+                if let Some(workspace_deps) = workspace_deps_item.as_table() {
+                    dependencies.extend(parse_dependencies_section(
+                        workspace_deps,
+                        content,
+                        &line_table,
+                        DependencySection::WorkspaceDependencies,
+                    )?);
+                }
+            }
+        }
+    }
+
     let workspace_root = find_workspace_root(doc_uri)?;
 
     Ok(ParseResult {
@@ -642,5 +658,65 @@ tokio = { version = "1.0", features = ["full"] }"#;
                 dep.name
             );
         }
+    }
+
+    #[test]
+    fn test_parse_workspace_dependencies() {
+        let toml = r#"
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+serde = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        for dep in &result.dependencies {
+            assert!(matches!(
+                dep.section,
+                DependencySection::WorkspaceDependencies
+            ));
+        }
+
+        let serde = result.dependencies.iter().find(|d| d.name == "serde");
+        assert!(serde.is_some());
+        assert_eq!(serde.unwrap().version_req, Some("1.0".into()));
+
+        let tokio = result.dependencies.iter().find(|d| d.name == "tokio");
+        assert!(tokio.is_some());
+        assert_eq!(tokio.unwrap().version_req, Some("1.0".into()));
+        assert_eq!(tokio.unwrap().features, vec!["full"]);
+    }
+
+    #[test]
+    fn test_parse_workspace_and_regular_dependencies() {
+        let toml = r#"
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+serde = "1.0"
+
+[dependencies]
+tokio = "1.0"
+"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        let serde = result.dependencies.iter().find(|d| d.name == "serde");
+        assert!(serde.is_some());
+        assert!(matches!(
+            serde.unwrap().section,
+            DependencySection::WorkspaceDependencies
+        ));
+
+        let tokio = result.dependencies.iter().find(|d| d.name == "tokio");
+        assert!(tokio.is_some());
+        assert!(matches!(
+            tokio.unwrap().section,
+            DependencySection::Dependencies
+        ));
     }
 }
