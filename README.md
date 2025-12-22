@@ -21,8 +21,8 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 
 | Ecosystem | Manifest File | Status |
 |-----------|---------------|--------|
-| Rust/Cargo | `Cargo.toml` | In Development |
-| npm | `package.json` | Planned |
+| Rust/Cargo | `Cargo.toml` | Supported |
+| npm | `package.json` | Supported |
 | Python/PyPI | `pyproject.toml` | Planned |
 
 ## Installation
@@ -148,10 +148,13 @@ cargo deny check
 ```
 deps-lsp/
 ├── crates/
+│   ├── deps-core/      # Shared types, cache, error handling
+│   ├── deps-cargo/     # Cargo.toml parser + crates.io registry
+│   ├── deps-npm/       # package.json parser + npm registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration
-└── .local/             # Development artifacts
+└── .github/            # CI/CD workflows
 ```
 
 ## License
