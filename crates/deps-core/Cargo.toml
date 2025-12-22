@@ -1,0 +1,25 @@
+[package]
+name = "deps-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core abstractions for deps-lsp: caching, errors, and traits"
+
+[dependencies]
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+reqwest = { workspace = true, features = ["json", "gzip", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+tower-lsp = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+mockito = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+tokio-test = { workspace = true }

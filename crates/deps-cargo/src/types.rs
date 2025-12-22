@@ -10,7 +10,7 @@ use tower_lsp::lsp_types::Range;
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::{ParsedDependency, DependencySource, DependencySection};
+/// use deps_cargo::types::{ParsedDependency, DependencySource, DependencySection};
 /// use tower_lsp::lsp_types::{Position, Range};
 ///
 /// let dep = ParsedDependency {
@@ -50,7 +50,7 @@ pub struct ParsedDependency {
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::DependencySource;
+/// use deps_cargo::types::DependencySource;
 ///
 /// let registry = DependencySource::Registry;
 /// let git = DependencySource::Git {
@@ -73,15 +73,16 @@ pub enum DependencySource {
 
 /// Section in Cargo.toml where a dependency is declared.
 ///
-/// Cargo.toml has three dependency sections with different build-time behavior:
+/// Cargo.toml has four dependency sections with different purposes:
 /// - `[dependencies]`: Runtime dependencies
 /// - `[dev-dependencies]`: Test and example dependencies
 /// - `[build-dependencies]`: Build script dependencies
+/// - `[workspace.dependencies]`: Workspace-wide dependency definitions
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::DependencySection;
+/// use deps_cargo::types::DependencySection;
 ///
 /// let section = DependencySection::Dependencies;
 /// assert!(matches!(section, DependencySection::Dependencies));
@@ -94,6 +95,8 @@ pub enum DependencySection {
     DevDependencies,
     /// Build script dependencies (`[build-dependencies]`)
     BuildDependencies,
+    /// Workspace-wide dependency definitions (`[workspace.dependencies]`)
+    WorkspaceDependencies,
 }
 
 /// Version information for a crate from crates.io.
@@ -104,7 +107,7 @@ pub enum DependencySection {
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::CargoVersion;
+/// use deps_cargo::types::CargoVersion;
 /// use std::collections::HashMap;
 ///
 /// let version = CargoVersion {
@@ -135,7 +138,7 @@ pub struct CargoVersion {
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::cargo::types::CrateInfo;
+/// use deps_cargo::types::CrateInfo;
 ///
 /// let info = CrateInfo {
 ///     name: "serde".into(),
@@ -181,10 +184,15 @@ mod tests {
         let deps = DependencySection::Dependencies;
         let dev_deps = DependencySection::DevDependencies;
         let build_deps = DependencySection::BuildDependencies;
+        let workspace_deps = DependencySection::WorkspaceDependencies;
 
         assert!(matches!(deps, DependencySection::Dependencies));
         assert!(matches!(dev_deps, DependencySection::DevDependencies));
         assert!(matches!(build_deps, DependencySection::BuildDependencies));
+        assert!(matches!(
+            workspace_deps,
+            DependencySection::WorkspaceDependencies
+        ));
     }
 
     #[test]

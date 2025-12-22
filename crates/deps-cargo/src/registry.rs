@@ -9,8 +9,8 @@
 //! # Examples
 //!
 //! ```no_run
-//! use deps_lsp::cargo::registry::CratesIoRegistry;
-//! use deps_lsp::cache::HttpCache;
+//! use deps_cargo::CratesIoRegistry;
+//! use deps_core::HttpCache;
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
@@ -23,9 +23,8 @@
 //! }
 //! ```
 
-use crate::cache::HttpCache;
-use crate::cargo::types::{CargoVersion, CrateInfo};
-use crate::error::{DepsError, Result};
+use crate::types::{CargoVersion, CrateInfo};
+use deps_core::{DepsError, HttpCache, Result};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -33,6 +32,14 @@ use std::sync::Arc;
 
 const SPARSE_INDEX_BASE: &str = "https://index.crates.io";
 const SEARCH_API_BASE: &str = "https://crates.io/api/v1";
+
+/// Base URL for crate pages on crates.io
+pub const CRATES_IO_URL: &str = "https://crates.io/crates";
+
+/// Returns the URL for a crate's page on crates.io.
+pub fn crate_url(name: &str) -> String {
+    format!("{}/{}", CRATES_IO_URL, name)
+}
 
 /// Client for interacting with crates.io registry.
 ///
@@ -63,8 +70,8 @@ impl CratesIoRegistry {
     /// # Examples
     ///
     /// ```no_run
-    /// # use deps_lsp::cargo::registry::CratesIoRegistry;
-    /// # use deps_lsp::cache::HttpCache;
+    /// # use deps_cargo::CratesIoRegistry;
+    /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
     /// # #[tokio::main]
     /// # async fn main() {
@@ -97,8 +104,8 @@ impl CratesIoRegistry {
     /// # Examples
     ///
     /// ```no_run
-    /// # use deps_lsp::cargo::registry::CratesIoRegistry;
-    /// # use deps_lsp::cache::HttpCache;
+    /// # use deps_cargo::CratesIoRegistry;
+    /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
     /// # #[tokio::main]
     /// # async fn main() {
@@ -139,8 +146,8 @@ impl CratesIoRegistry {
     /// # Examples
     ///
     /// ```no_run
-    /// # use deps_lsp::cargo::registry::CratesIoRegistry;
-    /// # use deps_lsp::cache::HttpCache;
+    /// # use deps_cargo::CratesIoRegistry;
+    /// # use deps_core::HttpCache;
     /// # use std::sync::Arc;
     /// # #[tokio::main]
     /// # async fn main() {
@@ -256,6 +263,68 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<CrateInfo>> {
             max_version: c.max_version,
         })
         .collect())
+}
+
+// Implement PackageRegistry trait for CratesIoRegistry
+#[async_trait::async_trait]
+impl deps_core::PackageRegistry for CratesIoRegistry {
+    type Version = CargoVersion;
+    type Metadata = CrateInfo;
+    type VersionReq = VersionReq;
+
+    async fn get_versions(&self, name: &str) -> Result<Vec<Self::Version>> {
+        self.get_versions(name).await
+    }
+
+    async fn get_latest_matching(
+        &self,
+        name: &str,
+        req: &Self::VersionReq,
+    ) -> Result<Option<Self::Version>> {
+        self.get_latest_matching(name, &req.to_string()).await
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Self::Metadata>> {
+        self.search(query, limit).await
+    }
+}
+
+// Implement VersionInfo trait for CargoVersion
+impl deps_core::VersionInfo for CargoVersion {
+    fn version_string(&self) -> &str {
+        &self.num
+    }
+
+    fn is_yanked(&self) -> bool {
+        self.yanked
+    }
+
+    fn features(&self) -> Vec<String> {
+        self.features.keys().cloned().collect()
+    }
+}
+
+// Implement PackageMetadata trait for CrateInfo
+impl deps_core::PackageMetadata for CrateInfo {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    fn repository(&self) -> Option<&str> {
+        self.repository.as_deref()
+    }
+
+    fn documentation(&self) -> Option<&str> {
+        self.documentation.as_deref()
+    }
+
+    fn latest_version(&self) -> &str {
+        &self.max_version
+    }
 }
 
 #[cfg(test)]

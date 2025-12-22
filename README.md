@@ -2,7 +2,7 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/bug-ops/deps-lsp/ci.yml?branch=main)](https://github.com/bug-ops/deps-lsp/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
 A universal Language Server Protocol (LSP) server for dependency management across multiple package ecosystems.
@@ -14,6 +14,8 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
 - **Hover Information** — Package descriptions, links to documentation
 - **Code Actions** — Quick fixes to update dependencies
+
+![deps-lsp in action](crates/deps-zed/assets/img.png)
 
 ## Supported Ecosystems
 
@@ -90,8 +92,8 @@ Configure via LSP initialization options:
 {
   "inlay_hints": {
     "enabled": true,
-    "up_to_date_text": "✓",
-    "needs_update_text": "↑ {}"
+    "up_to_date_text": "✅",
+    "needs_update_text": "❌ {}"
   },
   "diagnostics": {
     "outdated_severity": "hint",
@@ -107,7 +109,7 @@ Configure via LSP initialization options:
 ## Development
 
 > [!IMPORTANT]
-> Requires Rust 1.85+ (Edition 2024).
+> Requires Rust 1.89+ (Edition 2024).
 
 ### Build
 

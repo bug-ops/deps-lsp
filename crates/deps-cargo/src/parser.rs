@@ -14,7 +14,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use deps_lsp::cargo::parser::parse_cargo_toml;
+//! use deps_cargo::parse_cargo_toml;
 //! use tower_lsp::lsp_types::Url;
 //!
 //! let toml = r#"
@@ -28,10 +28,10 @@
 //! assert_eq!(result.dependencies[0].name, "serde");
 //! ```
 
-use crate::cargo::types::{DependencySection, DependencySource, ParsedDependency};
-use crate::error::{DepsError, Result};
+use crate::types::{DependencySection, DependencySource, ParsedDependency};
+use deps_core::{DepsError, Result};
 use std::path::PathBuf;
-use toml_edit::{DocumentMut, Item, Table, Value};
+use toml_edit::{Document, DocumentMut, Item, Table, Value};
 use tower_lsp::lsp_types::{Position, Range, Url};
 
 /// Result of parsing a Cargo.toml file.
@@ -89,7 +89,7 @@ impl LineOffsetTable {
 /// # Examples
 ///
 /// ```no_run
-/// use deps_lsp::cargo::parser::parse_cargo_toml;
+/// use deps_cargo::parse_cargo_toml;
 /// use tower_lsp::lsp_types::Url;
 ///
 /// let toml = r#"
@@ -103,47 +103,60 @@ impl LineOffsetTable {
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
 pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<ParseResult> {
-    let doc = content
-        .parse::<DocumentMut>()
-        .map_err(|e| DepsError::ParseError {
-            file_type: "Cargo.toml".into(),
-            source: e,
-        })?;
+    // Use Document (not DocumentMut) to preserve span information
+    let doc: Document<&str> = Document::parse(content).map_err(|e| DepsError::ParseError {
+        file_type: "Cargo.toml".into(),
+        source: Box::new(e),
+    })?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
 
-    if let Some(deps_item) = doc.get("dependencies") {
-        if let Some(deps) = deps_item.as_table() {
-            dependencies.extend(parse_dependencies_section(
-                deps,
-                content,
-                &line_table,
-                DependencySection::Dependencies,
-            )?);
-        }
+    if let Some(deps_item) = doc.get("dependencies")
+        && let Some(deps) = deps_item.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            deps,
+            content,
+            &line_table,
+            DependencySection::Dependencies,
+        )?);
     }
 
-    if let Some(dev_deps_item) = doc.get("dev-dependencies") {
-        if let Some(dev_deps) = dev_deps_item.as_table() {
-            dependencies.extend(parse_dependencies_section(
-                dev_deps,
-                content,
-                &line_table,
-                DependencySection::DevDependencies,
-            )?);
-        }
+    if let Some(dev_deps_item) = doc.get("dev-dependencies")
+        && let Some(dev_deps) = dev_deps_item.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            dev_deps,
+            content,
+            &line_table,
+            DependencySection::DevDependencies,
+        )?);
     }
 
-    if let Some(build_deps_item) = doc.get("build-dependencies") {
-        if let Some(build_deps) = build_deps_item.as_table() {
-            dependencies.extend(parse_dependencies_section(
-                build_deps,
-                content,
-                &line_table,
-                DependencySection::BuildDependencies,
-            )?);
-        }
+    if let Some(build_deps_item) = doc.get("build-dependencies")
+        && let Some(build_deps) = build_deps_item.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            build_deps,
+            content,
+            &line_table,
+            DependencySection::BuildDependencies,
+        )?);
+    }
+
+    // Parse workspace dependencies (for workspace root Cargo.toml)
+    if let Some(workspace_item) = doc.get("workspace")
+        && let Some(workspace_table) = workspace_item.as_table()
+        && let Some(workspace_deps_item) = workspace_table.get("dependencies")
+        && let Some(workspace_deps) = workspace_deps_item.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            workspace_deps,
+            content,
+            &line_table,
+            DependencySection::WorkspaceDependencies,
+        )?);
     }
 
     let workspace_root = find_workspace_root(doc_uri)?;
@@ -280,10 +293,8 @@ fn parse_inline_table_dependency(
                     }
                 }
             }
-            "workspace" => {
-                if value.as_bool() == Some(true) {
-                    dep.workspace_inherited = true;
-                }
+            "workspace" if value.as_bool() == Some(true) => {
+                dep.workspace_inherited = true;
             }
             "git" => {
                 if let Some(url) = value.as_str() {
@@ -315,9 +326,8 @@ fn parse_table_dependency(
     line_table: &LineOffsetTable,
 ) -> Result<()> {
     for (key, item) in table.iter() {
-        let value = match item {
-            Item::Value(v) => v,
-            _ => continue,
+        let Item::Value(value) = item else {
+            continue;
         };
 
         match key {
@@ -344,10 +354,8 @@ fn parse_table_dependency(
                     }
                 }
             }
-            "workspace" => {
-                if value.as_bool() == Some(true) {
-                    dep.workspace_inherited = true;
-                }
+            "workspace" if value.as_bool() == Some(true) => {
+                dep.workspace_inherited = true;
             }
             "git" => {
                 if let Some(url) = value.as_str() {
@@ -396,20 +404,79 @@ fn find_workspace_root(doc_uri: &Url) -> Result<Option<PathBuf>> {
     while let Some(dir) = current {
         let workspace_toml = dir.join("Cargo.toml");
 
-        if workspace_toml.exists() {
-            if let Ok(content) = std::fs::read_to_string(&workspace_toml) {
-                if let Ok(doc) = content.parse::<DocumentMut>() {
-                    if doc.get("workspace").is_some() {
-                        return Ok(Some(dir.to_path_buf()));
-                    }
-                }
-            }
+        if workspace_toml.exists()
+            && let Ok(content) = std::fs::read_to_string(&workspace_toml)
+            && let Ok(doc) = content.parse::<DocumentMut>()
+            && doc.get("workspace").is_some()
+        {
+            return Ok(Some(dir.to_path_buf()));
         }
 
         current = dir.parent();
     }
 
     Ok(None)
+}
+
+/// Parser for Cargo.toml manifests implementing the deps-core traits.
+pub struct CargoParser;
+
+impl deps_core::ManifestParser for CargoParser {
+    type Dependency = ParsedDependency;
+    type ParseResult = ParseResult;
+
+    fn parse(&self, content: &str, doc_uri: &Url) -> Result<Self::ParseResult> {
+        parse_cargo_toml(content, doc_uri)
+    }
+}
+
+// Implement DependencyInfo trait for ParsedDependency
+impl deps_core::DependencyInfo for ParsedDependency {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&str> {
+        self.version_req.as_deref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::DependencySource {
+        match &self.source {
+            DependencySource::Registry => deps_core::DependencySource::Registry,
+            DependencySource::Git { url, rev } => deps_core::DependencySource::Git {
+                url: url.clone(),
+                rev: rev.clone(),
+            },
+            DependencySource::Path { path } => {
+                deps_core::DependencySource::Path { path: path.clone() }
+            }
+        }
+    }
+
+    fn features(&self) -> &[String] {
+        &self.features
+    }
+}
+
+// Implement ParseResultInfo trait for ParseResult
+impl deps_core::ParseResultInfo for ParseResult {
+    type Dependency = ParsedDependency;
+
+    fn dependencies(&self) -> &[Self::Dependency] {
+        &self.dependencies
+    }
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.workspace_root.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -581,5 +648,77 @@ tokio = { version = "1.0", features = ["full"] }"#;
                 dep.name
             );
         }
+    }
+
+    #[test]
+    fn test_parse_workspace_dependencies() {
+        let toml = r#"
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+serde = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        for dep in &result.dependencies {
+            assert!(matches!(
+                dep.section,
+                DependencySection::WorkspaceDependencies
+            ));
+        }
+
+        let serde = result.dependencies.iter().find(|d| d.name == "serde");
+        assert!(serde.is_some());
+        let serde = serde.unwrap();
+        assert_eq!(serde.version_req, Some("1.0".into()));
+        // version_range should be set for inlay hints
+        assert!(
+            serde.version_range.is_some(),
+            "version_range should be set for serde"
+        );
+
+        let tokio = result.dependencies.iter().find(|d| d.name == "tokio");
+        assert!(tokio.is_some());
+        let tokio = tokio.unwrap();
+        assert_eq!(tokio.version_req, Some("1.0".into()));
+        assert_eq!(tokio.features, vec!["full"]);
+        // version_range should be set for inlay hints
+        assert!(
+            tokio.version_range.is_some(),
+            "version_range should be set for tokio"
+        );
+    }
+
+    #[test]
+    fn test_parse_workspace_and_regular_dependencies() {
+        let toml = r#"
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+serde = "1.0"
+
+[dependencies]
+tokio = "1.0"
+"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        let serde = result.dependencies.iter().find(|d| d.name == "serde");
+        assert!(serde.is_some());
+        assert!(matches!(
+            serde.unwrap().section,
+            DependencySection::WorkspaceDependencies
+        ));
+
+        let tokio = result.dependencies.iter().find(|d| d.name == "tokio");
+        assert!(tokio.is_some());
+        assert!(matches!(
+            tokio.unwrap().section,
+            DependencySection::Dependencies
+        ));
     }
 }

@@ -1,0 +1,24 @@
+[package]
+name = "deps-cargo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cargo.toml support for deps-lsp"
+
+[dependencies]
+deps-core = { path = "../deps-core" }
+async-trait = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+toml_edit = { workspace = true }
+tower-lsp = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true, features = ["json"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

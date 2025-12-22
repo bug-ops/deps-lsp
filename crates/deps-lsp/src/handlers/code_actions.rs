@@ -4,14 +4,14 @@
 //! - "Update to latest version" for outdated dependencies
 //! - "Add missing feature" for feature suggestions
 
-use crate::cargo::registry::CratesIoRegistry;
-use crate::cargo::types::DependencySource;
-use crate::document::ServerState;
+use crate::document::{Ecosystem, ServerState, UnifiedDependency};
+use deps_cargo::{CratesIoRegistry, DependencySource};
+use deps_npm::NpmRegistry;
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Range, TextEdit,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Range, TextEdit, Url,
     WorkspaceEdit,
 };
 
@@ -26,6 +26,15 @@ pub async fn handle_code_actions(
     let uri = &params.text_document.uri;
     let range = params.range;
 
+    tracing::info!(
+        "code_action request: uri={}, range={}:{}-{}:{}",
+        uri,
+        range.start.line,
+        range.start.character,
+        range.end.line,
+        range.end.character
+    );
+
     let doc = match state.get_document(uri) {
         Some(d) => d,
         None => {
@@ -34,25 +43,58 @@ pub async fn handle_code_actions(
         }
     };
 
-    let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
+    tracing::info!(
+        "found document with {} dependencies, ecosystem={:?}",
+        doc.dependencies.len(),
+        doc.ecosystem
+    );
 
-    let deps_in_range: Vec<_> = doc
+    let ecosystem = doc.ecosystem;
+
+    // Collect dependencies that overlap with the cursor range
+    let deps_to_check: Vec<(String, Range)> = doc
         .dependencies
         .iter()
-        .filter(|dep| {
-            matches!(dep.source, DependencySource::Registry)
-                && dep
-                    .version_range
-                    .map(|r| ranges_overlap(r, range))
-                    .unwrap_or(false)
+        .filter_map(|dep| {
+            let (name, version_range, is_registry) = match dep {
+                UnifiedDependency::Cargo(cargo_dep) => (
+                    cargo_dep.name.clone(),
+                    cargo_dep.version_range?,
+                    matches!(cargo_dep.source, DependencySource::Registry),
+                ),
+                UnifiedDependency::Npm(npm_dep) => {
+                    (npm_dep.name.clone(), npm_dep.version_range?, true)
+                }
+            };
+
+            if is_registry && ranges_overlap(version_range, range) {
+                Some((name, version_range))
+            } else {
+                None
+            }
         })
         .collect();
 
-    let futures: Vec<_> = deps_in_range
+    drop(doc);
+
+    match ecosystem {
+        Ecosystem::Cargo => handle_cargo_code_actions(state, uri, deps_to_check).await,
+        Ecosystem::Npm => handle_npm_code_actions(state, uri, deps_to_check).await,
+    }
+}
+
+async fn handle_cargo_code_actions(
+    state: Arc<ServerState>,
+    uri: &Url,
+    deps: Vec<(String, Range)>,
+) -> Vec<CodeActionOrCommand> {
+    let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
+
+    let futures: Vec<_> = deps
         .iter()
-        .map(|dep| {
-            let name = dep.name.clone();
-            let version_range = dep.version_range.unwrap();
+        .map(|(name, version_range)| {
+            let name = name.clone();
+            let version_range = *version_range;
             let registry = registry.clone();
             async move {
                 let versions = registry.get_versions(&name).await;
@@ -73,28 +115,104 @@ pub async fn handle_code_actions(
             }
         };
 
-        let latest = match versions.iter().find(|v| !v.yanked) {
-            Some(v) => v,
-            None => continue,
-        };
+        // Offer multiple version options (non-yanked, up to 5)
+        for (i, version) in versions.iter().filter(|v| !v.yanked).take(5).enumerate() {
+            let mut edits = HashMap::new();
+            edits.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: version_range,
+                    new_text: format!("\"{}\"", version.num),
+                }],
+            );
 
-        let edit = TextEdit {
-            range: version_range,
-            new_text: format!(r#""{}""#, latest.num),
-        };
+            let title = if i == 0 {
+                format!("Update {} to {} (latest)", name, version.num)
+            } else {
+                format!("Update {} to {}", name, version.num)
+            };
 
-        let mut changes = HashMap::new();
-        changes.insert(uri.clone(), vec![edit]);
-
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!("Update to latest version ({})", latest.num),
-            kind: Some(CodeActionKind::QUICKFIX),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(edits),
+                    ..Default::default()
+                }),
+                is_preferred: Some(i == 0),
                 ..Default::default()
-            }),
-            ..Default::default()
-        }));
+            }));
+        }
+    }
+
+    actions
+}
+
+async fn handle_npm_code_actions(
+    state: Arc<ServerState>,
+    uri: &Url,
+    deps: Vec<(String, Range)>,
+) -> Vec<CodeActionOrCommand> {
+    let registry = NpmRegistry::new(Arc::clone(&state.cache));
+
+    let futures: Vec<_> = deps
+        .iter()
+        .map(|(name, version_range)| {
+            let name = name.clone();
+            let version_range = *version_range;
+            let registry = registry.clone();
+            async move {
+                let versions = registry.get_versions(&name).await;
+                (name, version_range, versions)
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+
+    let mut actions = Vec::new();
+    for (name, version_range, versions_result) in results {
+        let versions = match versions_result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to fetch npm versions for {}: {}", name, e);
+                continue;
+            }
+        };
+
+        // Offer multiple version options (non-deprecated, up to 5)
+        for (i, version) in versions
+            .iter()
+            .filter(|v| !v.deprecated)
+            .take(5)
+            .enumerate()
+        {
+            let mut edits = HashMap::new();
+            edits.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: version_range,
+                    new_text: format!("\"{}\"", version.version),
+                }],
+            );
+
+            let title = if i == 0 {
+                format!("Update {} to {} (latest)", name, version.version)
+            } else {
+                format!("Update {} to {}", name, version.version)
+            };
+
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(edits),
+                    ..Default::default()
+                }),
+                is_preferred: Some(i == 0),
+                ..Default::default()
+            }));
+        }
     }
 
     actions
@@ -102,7 +220,10 @@ pub async fn handle_code_actions(
 
 /// Checks if two ranges overlap.
 fn ranges_overlap(a: Range, b: Range) -> bool {
-    !(a.end.line < b.start.line || b.end.line < a.start.line)
+    !(a.end.line < b.start.line
+        || (a.end.line == b.start.line && a.end.character < b.start.character)
+        || b.end.line < a.start.line
+        || (b.end.line == a.start.line && b.end.character < a.start.character))
 }
 
 #[cfg(test)]
@@ -112,19 +233,11 @@ mod tests {
 
     #[test]
     fn test_ranges_overlap() {
-        let r1 = Range::new(Position::new(1, 0), Position::new(1, 10));
-        let r2 = Range::new(Position::new(1, 5), Position::new(1, 15));
-        assert!(ranges_overlap(r1, r2));
+        let range1 = Range::new(Position::new(1, 5), Position::new(1, 10));
+        let range2 = Range::new(Position::new(1, 7), Position::new(1, 12));
+        assert!(ranges_overlap(range1, range2));
 
-        let r3 = Range::new(Position::new(1, 0), Position::new(1, 10));
-        let r4 = Range::new(Position::new(2, 0), Position::new(2, 10));
-        assert!(!ranges_overlap(r3, r4));
-    }
-
-    #[test]
-    fn test_ranges_overlap_same_line() {
-        let r1 = Range::new(Position::new(1, 0), Position::new(1, 10));
-        let r2 = Range::new(Position::new(1, 10), Position::new(1, 20));
-        assert!(ranges_overlap(r1, r2));
+        let range3 = Range::new(Position::new(1, 0), Position::new(1, 4));
+        assert!(!ranges_overlap(range1, range3));
     }
 }

@@ -4,9 +4,11 @@
 //! - Package names (from crates.io search)
 //! - Version strings (from sparse index)
 //! - Feature flags (from crate metadata)
+//!
+//! TODO: Add npm-specific completion logic for package.json
 
-use crate::cargo::registry::CratesIoRegistry;
 use crate::document::ServerState;
+use deps_cargo::CratesIoRegistry;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, Documentation,

@@ -6,10 +6,9 @@
 //! - Outdated versions
 //! - Invalid semver requirements
 
-use crate::cargo::registry::CratesIoRegistry;
-use crate::cargo::types::DependencySource;
 use crate::config::DiagnosticsConfig;
-use crate::document::ServerState;
+use crate::document::{Ecosystem, ServerState, UnifiedDependency};
+use deps_cargo::{CratesIoRegistry, DependencySource, ParsedDependency};
 use futures::future::join_all;
 use semver::VersionReq;
 use std::sync::Arc;
@@ -32,15 +31,28 @@ pub async fn handle_diagnostics(
         }
     };
 
+    // TODO: Add npm support in diagnostics
+    if doc.ecosystem != Ecosystem::Cargo {
+        tracing::debug!("Diagnostics not yet implemented for {:?}", doc.ecosystem);
+        return vec![];
+    }
+
     let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
 
-    let deps_to_check: Vec<_> = doc
+    let cargo_deps: Vec<&ParsedDependency> = doc
         .dependencies
         .iter()
-        .filter(|dep| matches!(dep.source, DependencySource::Registry))
+        .filter_map(|dep| {
+            if let UnifiedDependency::Cargo(cargo_dep) = dep
+                && matches!(cargo_dep.source, DependencySource::Registry)
+            {
+                return Some(cargo_dep);
+            }
+            None
+        })
         .collect();
 
-    let futures: Vec<_> = deps_to_check
+    let futures: Vec<_> = cargo_deps
         .iter()
         .map(|dep| {
             let name = dep.name.clone();
@@ -56,7 +68,7 @@ pub async fn handle_diagnostics(
 
     let mut diagnostics = Vec::new();
 
-    for (i, dep) in deps_to_check.iter().enumerate() {
+    for (i, dep) in cargo_deps.iter().enumerate() {
         let (name, version_result) = &version_results[i];
 
         let versions = match version_result {
@@ -73,49 +85,49 @@ pub async fn handle_diagnostics(
             }
         };
 
-        if let Some(version_req) = &dep.version_req {
-            if let Some(version_range) = dep.version_range {
-                if version_req.parse::<VersionReq>().is_err() {
-                    diagnostics.push(Diagnostic {
-                        range: version_range,
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!("Invalid version requirement '{}'", version_req),
-                        source: Some("deps-lsp".into()),
-                        ..Default::default()
-                    });
-                    continue;
-                }
+        if let Some(version_req) = &dep.version_req
+            && let Some(version_range) = dep.version_range
+        {
+            if version_req.parse::<VersionReq>().is_err() {
+                diagnostics.push(Diagnostic {
+                    range: version_range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!("Invalid version requirement '{}'", version_req),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+                continue;
+            }
 
-                let matching = registry
-                    .get_latest_matching(&dep.name, version_req)
-                    .await
-                    .ok()
-                    .flatten();
+            let matching = registry
+                .get_latest_matching(&dep.name, version_req)
+                .await
+                .ok()
+                .flatten();
 
-                if let Some(current) = &matching {
-                    if current.yanked {
-                        diagnostics.push(Diagnostic {
-                            range: version_range,
-                            severity: Some(config.yanked_severity),
-                            message: "This version has been yanked".into(),
-                            source: Some("deps-lsp".into()),
-                            ..Default::default()
-                        });
-                    }
-                }
+            if let Some(current) = &matching
+                && current.yanked
+            {
+                diagnostics.push(Diagnostic {
+                    range: version_range,
+                    severity: Some(config.yanked_severity),
+                    message: "This version has been yanked".into(),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+            }
 
-                let latest = versions.iter().find(|v| !v.yanked);
-                if let (Some(latest), Some(current)) = (latest, &matching) {
-                    if latest.num != current.num {
-                        diagnostics.push(Diagnostic {
-                            range: version_range,
-                            severity: Some(config.outdated_severity),
-                            message: format!("Newer version available: {}", latest.num),
-                            source: Some("deps-lsp".into()),
-                            ..Default::default()
-                        });
-                    }
-                }
+            let latest = versions.iter().find(|v| !v.yanked);
+            if let (Some(latest), Some(current)) = (latest, &matching)
+                && latest.num != current.num
+            {
+                diagnostics.push(Diagnostic {
+                    range: version_range,
+                    severity: Some(config.outdated_severity),
+                    message: format!("Newer version available: {}", latest.num),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
             }
         }
     }
