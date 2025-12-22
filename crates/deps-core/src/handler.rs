@@ -861,9 +861,11 @@ mod tests {
         async fn get_latest_matching(
             &self,
             name: &str,
-            _req: &Self::VersionReq,
+            req: &Self::VersionReq,
         ) -> crate::error::Result<Option<Self::Version>> {
-            Ok(self.versions.get(name).and_then(|v| v.first().cloned()))
+            Ok(self.versions.get(name).and_then(|versions| {
+                versions.iter().find(|v| v.version == *req).cloned()
+            }))
         }
 
         async fn search(
@@ -1299,5 +1301,440 @@ mod tests {
         } else {
             panic!("Expected Markup content");
         }
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_empty_when_up_to_date() {
+        use tower_lsp::lsp_types::Url;
+
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.195".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let selected_range = Range {
+            start: Position {
+                line: 0,
+                character: 15,
+            },
+            end: Position {
+                line: 0,
+                character: 15,
+            },
+        };
+
+        let actions = generate_code_actions(&handler, &deps, &uri, selected_range).await;
+
+        assert!(!actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_update_outdated() {
+        use tower_lsp::lsp_types::{CodeActionOrCommand, Url};
+
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let selected_range = Range {
+            start: Position {
+                line: 0,
+                character: 15,
+            },
+            end: Position {
+                line: 0,
+                character: 15,
+            },
+        };
+
+        let actions = generate_code_actions(&handler, &deps, &uri, selected_range).await;
+
+        assert!(!actions.is_empty());
+        assert!(actions.len() <= 5);
+
+        if let CodeActionOrCommand::CodeAction(action) = &actions[0] {
+            assert!(action.title.contains("1.0.195"));
+            assert!(action.title.contains("latest"));
+            assert_eq!(action.is_preferred, Some(true));
+        } else {
+            panic!("Expected CodeAction");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_missing_version_range() {
+        use tower_lsp::lsp_types::Url;
+
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: None,
+            name_range: Range::default(),
+        }];
+
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let selected_range = Range {
+            start: Position {
+                line: 0,
+                character: 15,
+            },
+            end: Position {
+                line: 0,
+                character: 15,
+            },
+        };
+
+        let actions = generate_code_actions(&handler, &deps, &uri, selected_range).await;
+
+        assert_eq!(actions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_no_overlap() {
+        use tower_lsp::lsp_types::Url;
+
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let selected_range = Range {
+            start: Position {
+                line: 5,
+                character: 0,
+            },
+            end: Position {
+                line: 5,
+                character: 10,
+            },
+        };
+
+        let actions = generate_code_actions(&handler, &deps, &uri, selected_range).await;
+
+        assert_eq!(actions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_filters_deprecated() {
+        use tower_lsp::lsp_types::{CodeActionOrCommand, Url};
+
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "yanked-pkg".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let selected_range = Range {
+            start: Position {
+                line: 0,
+                character: 15,
+            },
+            end: Position {
+                line: 0,
+                character: 15,
+            },
+        };
+
+        let actions = generate_code_actions(&handler, &deps, &uri, selected_range).await;
+
+        assert_eq!(actions.len(), 0);
+
+        for action in actions {
+            if let CodeActionOrCommand::CodeAction(a) = action {
+                assert!(!a.title.contains("1.0.0"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_ranges_overlap_basic() {
+        let range_a = Range {
+            start: Position {
+                line: 0,
+                character: 10,
+            },
+            end: Position {
+                line: 0,
+                character: 20,
+            },
+        };
+
+        let range_b = Range {
+            start: Position {
+                line: 0,
+                character: 15,
+            },
+            end: Position {
+                line: 0,
+                character: 25,
+            },
+        };
+
+        assert!(ranges_overlap(range_a, range_b));
+    }
+
+    #[test]
+    fn test_ranges_no_overlap() {
+        let range_a = Range {
+            start: Position {
+                line: 0,
+                character: 10,
+            },
+            end: Position {
+                line: 0,
+                character: 20,
+            },
+        };
+
+        let range_b = Range {
+            start: Position {
+                line: 0,
+                character: 25,
+            },
+            end: Position {
+                line: 0,
+                character: 30,
+            },
+        };
+
+        assert!(!ranges_overlap(range_a, range_b));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_valid_version() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0.195".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let config = DiagnosticsConfig::default();
+        let diagnostics = generate_diagnostics(&handler, &deps, &config).await;
+
+        assert_eq!(diagnostics.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_deprecated_version() {
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "yanked-pkg".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let config = DiagnosticsConfig::default();
+        let diagnostics = generate_diagnostics(&handler, &deps, &config).await;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diagnostics[0].message.contains("yanked"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_unknown_package() {
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "nonexistent".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 10,
+                },
+            },
+        }];
+
+        let config = DiagnosticsConfig::default();
+        let diagnostics = generate_diagnostics(&handler, &deps, &config).await;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diagnostics[0].message.contains("Unknown package"));
+        assert!(diagnostics[0].message.contains("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_missing_version() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let deps = vec![MockDependency {
+            name: "serde".to_string(),
+            version_req: None,
+            version_range: None,
+            name_range: Range::default(),
+        }];
+
+        let config = DiagnosticsConfig::default();
+        let diagnostics = generate_diagnostics(&handler, &deps, &config).await;
+
+        assert_eq!(diagnostics.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_outdated_version() {
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        let cache = Arc::new(HttpCache::new());
+        let mut handler = MockHandler::new(cache);
+
+        handler.registry.versions.insert(
+            "outdated-pkg".to_string(),
+            vec![
+                MockVersion {
+                    version: "2.0.0".to_string(),
+                    yanked: false,
+                    features: vec![],
+                },
+                MockVersion {
+                    version: "1.0.0".to_string(),
+                    yanked: false,
+                    features: vec![],
+                },
+            ],
+        );
+
+        let deps = vec![MockDependency {
+            name: "outdated-pkg".to_string(),
+            version_req: Some("1.0.0".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let config = DiagnosticsConfig::default();
+        let diagnostics = generate_diagnostics(&handler, &deps, &config).await;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
+        assert!(diagnostics[0].message.contains("Newer version available"));
+        assert!(diagnostics[0].message.contains("2.0.0"));
+    }
+
+    #[test]
+    fn test_diagnostics_config_default() {
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+
+        let config = DiagnosticsConfig::default();
+        assert_eq!(config.unknown_severity, DiagnosticSeverity::WARNING);
+        assert_eq!(config.yanked_severity, DiagnosticSeverity::WARNING);
+        assert_eq!(config.outdated_severity, DiagnosticSeverity::HINT);
     }
 }
