@@ -20,9 +20,33 @@ const PYPI_BASE: &str = "https://pypi.org/pypi";
 /// Base URL for package pages on pypi.org
 pub const PYPI_URL: &str = "https://pypi.org/project";
 
+/// Normalize package name according to PEP 503.
+///
+/// Converts package name to lowercase and replaces underscores/dots with hyphens,
+/// then filters out consecutive hyphens. This ensures consistent package lookups
+/// regardless of how the package name is written.
+///
+/// # Examples
+///
+/// ```
+/// # use deps_pypi::registry::normalize_package_name;
+/// assert_eq!(normalize_package_name("Flask"), "flask");
+/// assert_eq!(normalize_package_name("django_rest_framework"), "django-rest-framework");
+/// assert_eq!(normalize_package_name("Pillow.Image"), "pillow-image");
+/// assert_eq!(normalize_package_name("my__package"), "my-package");
+/// ```
+pub fn normalize_package_name(name: &str) -> String {
+    name.to_lowercase()
+        .replace(&['_', '.'][..], "-")
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Returns the URL for a package's page on pypi.org.
 pub fn package_url(name: &str) -> String {
-    format!("{}/{}", PYPI_URL, name)
+    format!("{}/{}", PYPI_URL, normalize_package_name(name))
 }
 
 /// Client for interacting with the PyPI registry.
@@ -84,7 +108,8 @@ impl PypiRegistry {
     /// # }
     /// ```
     pub async fn get_versions(&self, name: &str) -> Result<Vec<PypiVersion>> {
-        let url = format!("{}/{}/json", PYPI_BASE, name);
+        let normalized = normalize_package_name(name);
+        let url = format!("{}/{}/json", PYPI_BASE, normalized);
         let data = self.cache.get_cached(&url).await.map_err(|e| {
             if e.to_string().contains("404") {
                 PypiError::PackageNotFound {
@@ -188,7 +213,8 @@ impl PypiRegistry {
     /// - Package does not exist
     /// - JSON parsing fails
     pub async fn get_package_metadata(&self, name: &str) -> Result<PypiPackage> {
-        let url = format!("{}/{}/json", PYPI_BASE, name);
+        let normalized = normalize_package_name(name);
+        let url = format!("{}/{}/json", PYPI_BASE, normalized);
         let data = self.cache.get_cached(&url).await.map_err(|e| {
             if e.to_string().contains("404") {
                 PypiError::PackageNotFound {
@@ -262,7 +288,8 @@ fn parse_package_metadata(package_name: &str, data: &[u8]) -> Result<Vec<PypiVer
     let response: PypiResponse =
         serde_json::from_slice(data).map_err(|e| PypiError::api_response_error(package_name, e))?;
 
-    let mut versions: Vec<PypiVersion> = response
+    // Parse versions once and cache with the parsed Version for sorting
+    let mut versions_with_parsed: Vec<(PypiVersion, Version)> = response
         .releases
         .into_iter()
         .filter_map(|(version_str, releases)| {
@@ -270,22 +297,26 @@ fn parse_package_metadata(package_name: &str, data: &[u8]) -> Result<Vec<PypiVer
             let yanked = releases.iter().any(|r| r.yanked.unwrap_or(false));
 
             // Parse version to validate it's a valid PEP 440 version
-            Version::from_str(&version_str).ok().map(|_| PypiVersion {
-                version: version_str,
-                yanked,
+            Version::from_str(&version_str).ok().map(|parsed| {
+                (
+                    PypiVersion {
+                        version: version_str,
+                        yanked,
+                    },
+                    parsed,
+                )
             })
         })
         .collect();
 
-    // Sort by version (newest first)
-    versions.sort_by(
-        |a, b| match (Version::from_str(&a.version), Version::from_str(&b.version)) {
-            (Ok(va), Ok(vb)) => vb.cmp(&va),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Err(_)) => a.version.cmp(&b.version).reverse(),
-        },
-    );
+    // Sort by version (newest first) using pre-parsed versions
+    versions_with_parsed.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Extract sorted versions, discarding parsed data
+    let versions: Vec<PypiVersion> = versions_with_parsed
+        .into_iter()
+        .map(|(v, _)| v)
+        .collect();
 
     Ok(versions)
 }

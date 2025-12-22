@@ -143,7 +143,7 @@ pub struct PypiVersion {
 impl PypiVersion {
     /// Check if this version is a prerelease (alpha, beta, rc).
     ///
-    /// Detects prereleases by checking for common prerelease markers in the version string.
+    /// Uses PEP 440 version parsing for accurate prerelease detection.
     ///
     /// # Examples
     ///
@@ -161,11 +161,12 @@ impl PypiVersion {
     /// assert!(rc.is_prerelease());
     /// ```
     pub fn is_prerelease(&self) -> bool {
-        self.version.contains('a')
-            || self.version.contains('b')
-            || self.version.contains("rc")
-            || self.version.contains("alpha")
-            || self.version.contains("beta")
+        use pep440_rs::Version;
+        use std::str::FromStr;
+
+        Version::from_str(&self.version)
+            .map(|v| v.is_pre())
+            .unwrap_or(false)
     }
 }
 

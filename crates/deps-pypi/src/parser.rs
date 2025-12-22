@@ -3,7 +3,18 @@ use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
 use pep508_rs::{Requirement, VersionOrUrl};
 use std::str::FromStr;
 use toml_edit::{DocumentMut, Item, Table};
-use tower_lsp::lsp_types::{Position, Range};
+use tower_lsp::lsp_types::{Position, Range, Url};
+
+/// Parse result containing all dependencies from pyproject.toml.
+///
+/// Stores dependencies and optional workspace information for LSP operations.
+#[derive(Debug, Clone)]
+pub struct ParseResult {
+    /// All dependencies found in the manifest
+    pub dependencies: Vec<PypiDependency>,
+    /// Workspace root path (None for Python - no workspace concept like Cargo)
+    pub workspace_root: Option<std::path::PathBuf>,
+}
 
 /// Parser for Python pyproject.toml files.
 ///
@@ -48,9 +59,9 @@ impl PypiParser {
     /// # use deps_pypi::parser::PypiParser;
     /// let parser = PypiParser::new();
     /// let content = std::fs::read_to_string("pyproject.toml").unwrap();
-    /// let dependencies = parser.parse(&content).unwrap();
+    /// let result = parser.parse_content(&content).unwrap();
     /// ```
-    pub fn parse(&self, content: &str) -> Result<Vec<PypiDependency>> {
+    pub fn parse_content(&self, content: &str) -> Result<ParseResult> {
         let doc = content
             .parse::<DocumentMut>()
             .map_err(|e| PypiError::TomlParseError { source: e })?;
@@ -71,7 +82,10 @@ impl PypiParser {
             dependencies.extend(self.parse_poetry_groups(poetry, content)?);
         }
 
-        Ok(dependencies)
+        Ok(ParseResult {
+            dependencies,
+            workspace_root: None,
+        })
     }
 
     /// Parse PEP 621 `[project.dependencies]` array.
@@ -456,6 +470,70 @@ impl Default for PypiParser {
     }
 }
 
+// Implement deps_core traits for interoperability with LSP server
+
+impl deps_core::ManifestParser for PypiParser {
+    type Dependency = PypiDependency;
+    type ParseResult = ParseResult;
+
+    fn parse(&self, content: &str, _doc_uri: &Url) -> deps_core::error::Result<Self::ParseResult> {
+        self.parse_content(content)
+            .map_err(|e| deps_core::error::DepsError::ParseError {
+                file_type: "pyproject.toml".to_string(),
+                source: Box::new(e),
+            })
+    }
+}
+
+impl deps_core::DependencyInfo for PypiDependency {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&str> {
+        self.version_req.as_deref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::DependencySource {
+        match &self.source {
+            PypiDependencySource::PyPI => deps_core::DependencySource::Registry,
+            PypiDependencySource::Git { url, rev } => deps_core::DependencySource::Git {
+                url: url.clone(),
+                rev: rev.clone(),
+            },
+            PypiDependencySource::Path { path } => {
+                deps_core::DependencySource::Path { path: path.clone() }
+            }
+            // URL dependencies are treated as Registry since they're still remote packages
+            PypiDependencySource::Url { .. } => deps_core::DependencySource::Registry,
+        }
+    }
+
+    fn features(&self) -> &[String] {
+        &self.extras
+    }
+}
+
+impl deps_core::ParseResultInfo for ParseResult {
+    type Dependency = PypiDependency;
+
+    fn dependencies(&self) -> &[Self::Dependency] {
+        &self.dependencies
+    }
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.workspace_root.as_deref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,7 +549,8 @@ dependencies = [
 "#;
 
         let parser = PypiParser::new();
-        let deps = parser.parse(content).unwrap();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].name, "requests");
@@ -494,7 +573,8 @@ docs = ["sphinx>=5.0"]
 "#;
 
         let parser = PypiParser::new();
-        let deps = parser.parse(content).unwrap();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 3);
 
@@ -518,7 +598,8 @@ requests = "^2.28.0"
 "#;
 
         let parser = PypiParser::new();
-        let deps = parser.parse(content).unwrap();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
 
         // Should skip "python"
         assert_eq!(deps.len(), 1);
@@ -541,7 +622,8 @@ sphinx = "^5.0"
 "#;
 
         let parser = PypiParser::new();
-        let deps = parser.parse(content).unwrap();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 3);
 
@@ -566,7 +648,8 @@ dependencies = [
 "#;
 
         let parser = PypiParser::new();
-        let deps = parser.parse(content).unwrap();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "numpy");
@@ -587,7 +670,8 @@ flask = "^3.0"
 "#;
 
         let parser = PypiParser::new();
-        let deps = parser.parse(content).unwrap();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 2);
 
@@ -608,7 +692,7 @@ flask = "^3.0"
     fn test_parse_invalid_toml() {
         let content = "invalid toml {{{";
         let parser = PypiParser::new();
-        let result = parser.parse(content);
+        let result = parser.parse_content(content);
 
         assert!(result.is_err());
         assert!(matches!(
@@ -625,7 +709,8 @@ name = "test"
 "#;
 
         let parser = PypiParser::new();
-        let deps = parser.parse(content).unwrap();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 0);
     }
