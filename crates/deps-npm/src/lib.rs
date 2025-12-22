@@ -10,3 +10,5 @@ pub mod types;
 pub use parser::{NpmParseResult, parse_package_json};
 pub use registry::{NpmRegistry, package_url};
 pub use types::{NpmDependency, NpmDependencySection, NpmPackage, NpmVersion};
+
+pub type NpmVersionReq = node_semver::Range;

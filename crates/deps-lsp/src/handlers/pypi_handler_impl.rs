@@ -51,4 +51,30 @@ impl EcosystemHandler for PyPiHandlerImpl {
     fn is_version_latest(version_req: &str, latest: &str) -> bool {
         Pep440Matcher.is_latest_satisfying(version_req, latest)
     }
+
+    fn format_version_for_edit(dep: &Self::Dependency, version: &str) -> String {
+        match &dep.section {
+            deps_pypi::PypiDependencySection::Dependencies
+            | deps_pypi::PypiDependencySection::OptionalDependencies { .. }
+            | deps_pypi::PypiDependencySection::DependencyGroup { .. } => {
+                format!(">={}", version)
+            }
+            deps_pypi::PypiDependencySection::PoetryDependencies
+            | deps_pypi::PypiDependencySection::PoetryGroup { .. } => {
+                format!("\"^{}\"", version)
+            }
+        }
+    }
+
+    fn is_deprecated(version: &deps_pypi::PypiVersion) -> bool {
+        version.yanked
+    }
+
+    fn is_valid_version_syntax(_version_req: &str) -> bool {
+        true
+    }
+
+    fn parse_version_req(version_req: &str) -> Option<String> {
+        Some(version_req.to_string())
+    }
 }

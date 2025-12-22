@@ -51,4 +51,20 @@ impl EcosystemHandler for NpmHandlerImpl {
     fn is_version_latest(version_req: &str, latest: &str) -> bool {
         SemverMatcher.is_latest_satisfying(version_req, latest)
     }
+
+    fn format_version_for_edit(_dep: &Self::Dependency, version: &str) -> String {
+        format!("\"{}\"", version)
+    }
+
+    fn is_deprecated(version: &deps_npm::NpmVersion) -> bool {
+        version.deprecated
+    }
+
+    fn is_valid_version_syntax(_version_req: &str) -> bool {
+        true
+    }
+
+    fn parse_version_req(version_req: &str) -> Option<deps_npm::NpmVersionReq> {
+        version_req.parse().ok()
+    }
 }

@@ -51,4 +51,20 @@ impl EcosystemHandler for CargoHandlerImpl {
     fn is_version_latest(version_req: &str, latest: &str) -> bool {
         SemverMatcher.is_latest_satisfying(version_req, latest)
     }
+
+    fn format_version_for_edit(_dep: &Self::Dependency, version: &str) -> String {
+        format!("\"{}\"", version)
+    }
+
+    fn is_deprecated(version: &deps_cargo::CargoVersion) -> bool {
+        version.yanked
+    }
+
+    fn is_valid_version_syntax(version_req: &str) -> bool {
+        version_req.parse::<semver::VersionReq>().is_ok()
+    }
+
+    fn parse_version_req(version_req: &str) -> Option<semver::VersionReq> {
+        version_req.parse().ok()
+    }
 }

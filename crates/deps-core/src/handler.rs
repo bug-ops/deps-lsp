@@ -30,10 +30,10 @@ use tower_lsp::lsp_types::{
 /// use async_trait::async_trait;
 /// use std::sync::Arc;
 ///
-/// # #[derive(Clone)] struct MyVersion { version: String }
+/// # #[derive(Clone)] struct MyVersion { version: String, yanked: bool }
 /// # impl deps_core::VersionInfo for MyVersion {
 /// #     fn version_string(&self) -> &str { &self.version }
-/// #     fn is_yanked(&self) -> bool { false }
+/// #     fn is_yanked(&self) -> bool { self.yanked }
 /// # }
 /// # #[derive(Clone)] struct MyMetadata { name: String }
 /// # impl deps_core::PackageMetadata for MyMetadata {
@@ -97,6 +97,22 @@ use tower_lsp::lsp_types::{
 ///     fn is_version_latest(version_req: &str, latest: &str) -> bool {
 ///         version_req == latest
 ///     }
+///
+///     fn format_version_for_edit(_dep: &Self::Dependency, version: &str) -> String {
+///         format!("\"{}\"", version)
+///     }
+///
+///     fn is_deprecated(version: &MyVersion) -> bool {
+///         version.yanked
+///     }
+///
+///     fn is_valid_version_syntax(_version_req: &str) -> bool {
+///         true
+///     }
+///
+///     fn parse_version_req(version_req: &str) -> Option<String> {
+///         Some(version_req.to_string())
+///     }
 /// }
 /// ```
 #[async_trait]
@@ -140,6 +156,33 @@ pub trait EcosystemHandler: Send + Sync + Sized {
     /// Returns true if the latest version satisfies the version requirement,
     /// meaning the dependency is up-to-date within its constraint.
     fn is_version_latest(version_req: &str, latest: &str) -> bool;
+
+    /// Format a version string for editing in the manifest.
+    ///
+    /// Different ecosystems have different formatting conventions:
+    /// - Cargo: `"1.0.0"` (bare semver)
+    /// - npm: `"1.0.0"` (bare version, caret added by package manager)
+    /// - PyPI PEP 621: `>=1.0.0` (no quotes in array)
+    /// - PyPI Poetry: `"^1.0.0"` (caret in quotes)
+    fn format_version_for_edit(dep: &Self::Dependency, version: &str) -> String;
+
+    /// Check if a version is deprecated/yanked.
+    ///
+    /// Returns true if the version should be filtered out from suggestions.
+    fn is_deprecated(version: &<Self::Registry as PackageRegistry>::Version) -> bool;
+
+    /// Validate version requirement syntax.
+    ///
+    /// Returns true if the version requirement is valid for this ecosystem.
+    /// Used for diagnostic validation (semver for Cargo, PEP 440 for PyPI, etc.)
+    fn is_valid_version_syntax(version_req: &str) -> bool;
+
+    /// Parse a version requirement string into the registry's VersionReq type.
+    ///
+    /// Returns None if the version requirement is invalid.
+    fn parse_version_req(
+        version_req: &str,
+    ) -> Option<<Self::Registry as PackageRegistry>::VersionReq>;
 }
 
 /// Configuration for inlay hint display.
@@ -420,6 +463,290 @@ where
     })
 }
 
+/// Configuration for diagnostics display.
+///
+/// This is a simplified version to avoid circular dependencies.
+pub struct DiagnosticsConfig {
+    pub unknown_severity: tower_lsp::lsp_types::DiagnosticSeverity,
+    pub yanked_severity: tower_lsp::lsp_types::DiagnosticSeverity,
+    pub outdated_severity: tower_lsp::lsp_types::DiagnosticSeverity,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        use tower_lsp::lsp_types::DiagnosticSeverity;
+        Self {
+            unknown_severity: DiagnosticSeverity::WARNING,
+            yanked_severity: DiagnosticSeverity::WARNING,
+            outdated_severity: DiagnosticSeverity::HINT,
+        }
+    }
+}
+
+/// Generic code actions generator.
+///
+/// Fetches available versions and generates "Update to version X" quick fixes.
+///
+/// # Type Parameters
+///
+/// * `H` - Ecosystem handler type
+///
+/// # Arguments
+///
+/// * `handler` - Ecosystem-specific handler instance
+/// * `dependencies` - List of dependencies with version ranges
+/// * `uri` - Document URI
+/// * `selected_range` - Range selected by user for code actions
+///
+/// # Returns
+///
+/// Vector of code actions (quick fixes) for the LSP client.
+pub async fn generate_code_actions<H>(
+    handler: &H,
+    dependencies: &[H::UnifiedDep],
+    uri: &tower_lsp::lsp_types::Url,
+    selected_range: Range,
+) -> Vec<tower_lsp::lsp_types::CodeActionOrCommand>
+where
+    H: EcosystemHandler,
+{
+    use tower_lsp::lsp_types::{
+        CodeAction, CodeActionKind, CodeActionOrCommand, TextEdit, WorkspaceEdit,
+    };
+
+    // Extract dependencies overlapping with selected range
+    let mut deps_to_check = Vec::new();
+    for dep in dependencies {
+        let Some(typed_dep) = H::extract_dependency(dep) else {
+            continue;
+        };
+
+        let Some(version_range) = typed_dep.version_range() else {
+            continue;
+        };
+
+        // Check if this dependency's version range overlaps with cursor position
+        if !ranges_overlap(version_range, selected_range) {
+            continue;
+        }
+
+        deps_to_check.push((typed_dep, version_range));
+    }
+
+    if deps_to_check.is_empty() {
+        return vec![];
+    }
+
+    // Fetch versions in parallel
+    let registry = handler.registry().clone();
+    let futures: Vec<_> = deps_to_check
+        .iter()
+        .map(|(dep, version_range)| {
+            let name = dep.name().to_string();
+            let version_range = *version_range;
+            let registry = registry.clone();
+            async move {
+                let versions = registry.get_versions(&name).await;
+                (name, dep, version_range, versions)
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+
+    // Generate actions
+    let mut actions = Vec::new();
+    for (name, dep, version_range, versions_result) in results {
+        let Ok(versions) = versions_result else {
+            tracing::warn!("Failed to fetch versions for {}", name);
+            continue;
+        };
+
+        // Offer up to 5 non-deprecated versions
+        for (i, version) in versions
+            .iter()
+            .filter(|v| !H::is_deprecated(v))
+            .take(5)
+            .enumerate()
+        {
+            let new_text = H::format_version_for_edit(dep, version.version_string());
+
+            let mut edits = std::collections::HashMap::new();
+            edits.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: version_range,
+                    new_text,
+                }],
+            );
+
+            let title = if i == 0 {
+                format!("Update {} to {} (latest)", name, version.version_string())
+            } else {
+                format!("Update {} to {}", name, version.version_string())
+            };
+
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(edits),
+                    ..Default::default()
+                }),
+                is_preferred: Some(i == 0),
+                ..Default::default()
+            }));
+        }
+    }
+
+    actions
+}
+
+/// Helper: Check if two ranges overlap.
+fn ranges_overlap(a: Range, b: Range) -> bool {
+    !(a.end.line < b.start.line
+        || (a.end.line == b.start.line && a.end.character < b.start.character)
+        || b.end.line < a.start.line
+        || (b.end.line == a.start.line && b.end.character < a.start.character))
+}
+
+/// Generic diagnostics generator.
+///
+/// Checks dependencies for issues:
+/// - Unknown packages (not found in registry)
+/// - Invalid version syntax
+/// - Yanked/deprecated versions
+/// - Outdated versions
+///
+/// # Type Parameters
+///
+/// * `H` - Ecosystem handler type
+///
+/// # Arguments
+///
+/// * `handler` - Ecosystem-specific handler instance
+/// * `dependencies` - List of dependencies to check
+/// * `config` - Diagnostic severity configuration
+///
+/// # Returns
+///
+/// Vector of LSP diagnostics.
+pub async fn generate_diagnostics<H>(
+    handler: &H,
+    dependencies: &[H::UnifiedDep],
+    config: &DiagnosticsConfig,
+) -> Vec<tower_lsp::lsp_types::Diagnostic>
+where
+    H: EcosystemHandler,
+{
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+
+    // Extract typed dependencies
+    let mut deps_to_check = Vec::new();
+    for dep in dependencies {
+        let Some(typed_dep) = H::extract_dependency(dep) else {
+            continue;
+        };
+        deps_to_check.push(typed_dep);
+    }
+
+    if deps_to_check.is_empty() {
+        return vec![];
+    }
+
+    // Fetch versions in parallel
+    let registry = handler.registry().clone();
+    let futures: Vec<_> = deps_to_check
+        .iter()
+        .map(|dep| {
+            let name = dep.name().to_string();
+            let registry = registry.clone();
+            async move {
+                let versions = registry.get_versions(&name).await;
+                (name, versions)
+            }
+        })
+        .collect();
+
+    let version_results = join_all(futures).await;
+
+    // Generate diagnostics
+    let mut diagnostics = Vec::new();
+
+    for (i, dep) in deps_to_check.iter().enumerate() {
+        let (name, version_result) = &version_results[i];
+
+        // Check for unknown package
+        let versions = match version_result {
+            Ok(v) => v,
+            Err(_) => {
+                diagnostics.push(Diagnostic {
+                    range: dep.name_range(),
+                    severity: Some(config.unknown_severity),
+                    message: format!("Unknown package '{}'", name),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+                continue;
+            }
+        };
+
+        // Check version requirement if present
+        if let Some(version_req) = dep.version_requirement()
+            && let Some(version_range) = dep.version_range()
+        {
+            // Parse version requirement
+            let Some(parsed_version_req) = H::parse_version_req(version_req) else {
+                diagnostics.push(Diagnostic {
+                    range: version_range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!("Invalid version requirement '{}'", version_req),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+                continue;
+            };
+
+            // Get matching version (skip if registry call fails)
+            let matching = handler
+                .registry()
+                .get_latest_matching(name, &parsed_version_req)
+                .await
+                .ok()
+                .flatten();
+
+            // Check for yanked/deprecated version
+            if let Some(current) = &matching
+                && H::is_deprecated(current)
+            {
+                diagnostics.push(Diagnostic {
+                    range: version_range,
+                    severity: Some(config.yanked_severity),
+                    message: "This version has been yanked".into(),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+            }
+
+            // Check for outdated version
+            let latest = versions.iter().find(|v| !H::is_deprecated(v));
+            if let (Some(latest), Some(current)) = (latest, &matching)
+                && latest.version_string() != current.version_string()
+            {
+                diagnostics.push(Diagnostic {
+                    range: version_range,
+                    severity: Some(config.outdated_severity),
+                    message: format!("Newer version available: {}", latest.version_string()),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    diagnostics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +934,22 @@ mod tests {
 
         fn is_version_latest(version_req: &str, latest: &str) -> bool {
             version_req == latest
+        }
+
+        fn format_version_for_edit(_dep: &Self::Dependency, version: &str) -> String {
+            format!("\"{}\"", version)
+        }
+
+        fn is_deprecated(version: &MockVersion) -> bool {
+            version.yanked
+        }
+
+        fn is_valid_version_syntax(_version_req: &str) -> bool {
+            true
+        }
+
+        fn parse_version_req(version_req: &str) -> Option<String> {
+            Some(version_req.to_string())
         }
     }
 
