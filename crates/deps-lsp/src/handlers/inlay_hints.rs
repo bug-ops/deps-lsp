@@ -179,7 +179,7 @@ async fn handle_cargo_inlay_hints(
         let versions = match result {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to fetch versions for {}: {}", name, e);
+                tracing::warn!("Failed to fetch versions for {}: {}", name, e);
                 continue;
             }
         };
@@ -321,7 +321,7 @@ async fn handle_npm_inlay_hints(
         let versions = match result {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to fetch npm versions for {}: {}", name, e);
+                tracing::warn!("Failed to fetch npm versions for {}: {}", name, e);
                 continue;
             }
         };
@@ -463,7 +463,7 @@ async fn handle_pypi_inlay_hints(
         let versions = match result {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to fetch PyPI versions for {}: {}", name, e);
+                tracing::warn!("Failed to fetch PyPI versions for {}: {}", name, e);
                 continue;
             }
         };

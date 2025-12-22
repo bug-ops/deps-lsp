@@ -117,7 +117,7 @@ async fn handle_cargo_code_actions(
         let versions = match versions_result {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to fetch versions for {}: {}", name, e);
+                tracing::warn!("Failed to fetch versions for {}: {}", name, e);
                 continue;
             }
         };
@@ -182,7 +182,7 @@ async fn handle_npm_code_actions(
         let versions = match versions_result {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to fetch npm versions for {}: {}", name, e);
+                tracing::warn!("Failed to fetch npm versions for {}: {}", name, e);
                 continue;
             }
         };
@@ -232,44 +232,84 @@ async fn handle_pypi_code_actions(
 ) -> Vec<CodeActionOrCommand> {
     let registry = PypiRegistry::new(Arc::clone(&state.cache));
 
+    // Get document to access dependency details for format detection
+    let doc = match state.get_document(uri) {
+        Some(d) => d,
+        None => {
+            tracing::warn!("Document not found for PyPI code actions: {}", uri);
+            return vec![];
+        }
+    };
+
     let futures: Vec<_> = deps
         .iter()
         .map(|(name, version_range)| {
             let name = name.clone();
             let version_range = *version_range;
             let registry = registry.clone();
+
+            // Find the dependency to get section info
+            let dep = doc.dependencies.iter().find_map(|d| {
+                if let UnifiedDependency::Pypi(pypi_dep) = d
+                    && pypi_dep.name == name && pypi_dep.version_range == Some(version_range)
+                {
+                    return Some(pypi_dep.clone());
+                }
+                None
+            });
+
             async move {
                 let versions = registry.get_versions(&name).await;
-                (name, version_range, versions)
+                (name, version_range, dep, versions)
             }
         })
         .collect();
 
+    drop(doc);
     let results = join_all(futures).await;
 
     let mut actions = Vec::new();
-    for (name, version_range, versions_result) in results {
+    for (name, version_range, dep_opt, versions_result) in results {
         let versions = match versions_result {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Failed to fetch PyPI versions for {}: {}", name, e);
+                tracing::warn!("Failed to fetch PyPI versions for {}: {}", name, e);
+                continue;
+            }
+        };
+
+        let dep = match dep_opt {
+            Some(d) => d,
+            None => {
+                tracing::warn!("Could not find dependency {} for code action", name);
                 continue;
             }
         };
 
         // Offer multiple version options (non-yanked, up to 5)
-        for (i, version) in versions
-            .iter()
-            .filter(|v| !v.yanked)
-            .take(5)
-            .enumerate()
-        {
+        for (i, version) in versions.iter().filter(|v| !v.yanked).take(5).enumerate() {
+            // Format the new version text based on the dependency section
+            // PEP 621 uses array format: ["package>=version"]
+            // Poetry uses table format: package = "^version" or { version = "^version" }
+            let new_text = match &dep.section {
+                deps_pypi::PypiDependencySection::Dependencies
+                | deps_pypi::PypiDependencySection::OptionalDependencies { .. } => {
+                    // PEP 621 format - replace just the version specifier part
+                    format!(">={}", version.version)
+                }
+                deps_pypi::PypiDependencySection::PoetryDependencies
+                | deps_pypi::PypiDependencySection::PoetryGroup { .. } => {
+                    // Poetry format - quoted version with caret
+                    format!("\"^{}\"", version.version)
+                }
+            };
+
             let mut edits = HashMap::new();
             edits.insert(
                 uri.clone(),
                 vec![TextEdit {
                     range: version_range,
-                    new_text: format!("\"{}\"", version.version),
+                    new_text,
                 }],
             );
 
