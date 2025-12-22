@@ -7,7 +7,13 @@
 
 Language Server Protocol implementation for dependency management.
 
-See the [main repository](https://github.com/bug-ops/deps-lsp) for full documentation.
+## Features
+
+- **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml
+- **Inlay Hints** — Show latest versions inline
+- **Hover Info** — Package descriptions and version lists
+- **Code Actions** — Quick fixes to update dependencies
+- **Diagnostics** — Warnings for outdated/yanked packages
 
 ## Installation
 
@@ -20,6 +26,14 @@ cargo install deps-lsp
 ```bash
 deps-lsp --stdio
 ```
+
+## Supported Editors
+
+- **Zed** — Install "Deps" extension
+- **Neovim** — Configure with lspconfig
+- **Helix** — Add to languages.toml
+
+See the [main repository](https://github.com/bug-ops/deps-lsp) for full documentation.
 
 ## License
 

@@ -24,9 +24,12 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 
 | Ecosystem | Manifest File | Status |
 |-----------|---------------|--------|
-| Rust/Cargo | `Cargo.toml` | Supported |
-| npm | `package.json` | Supported |
-| Python/PyPI | `pyproject.toml` | Planned |
+| Rust/Cargo | `Cargo.toml` | ✅ Supported |
+| npm | `package.json` | ✅ Supported |
+| Python/PyPI | `pyproject.toml` | ✅ Supported |
+
+> [!NOTE]
+> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats.
 
 ## Installation
 
@@ -155,14 +158,42 @@ cargo deny check
 ```
 deps-lsp/
 ├── crates/
-│   ├── deps-core/      # Shared types, cache, error handling
+│   ├── deps-core/      # Shared traits, cache, generic handlers
 │   ├── deps-cargo/     # Cargo.toml parser + crates.io registry
 │   ├── deps-npm/       # package.json parser + npm registry
+│   ├── deps-pypi/      # pyproject.toml parser + PyPI registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration
 └── .github/            # CI/CD workflows
 ```
+
+### Architecture
+
+The codebase uses a trait-based architecture with the `EcosystemHandler` trait providing a unified interface for all package ecosystems:
+
+```rust
+// Each ecosystem implements EcosystemHandler
+impl EcosystemHandler for CargoHandler { ... }
+impl EcosystemHandler for NpmHandler { ... }
+impl EcosystemHandler for PyPiHandler { ... }
+
+// Generic LSP handlers work with any ecosystem
+generate_inlay_hints::<H: EcosystemHandler>(...);
+generate_hover_info::<H: EcosystemHandler>(...);
+generate_code_actions::<H: EcosystemHandler>(...);
+generate_diagnostics::<H: EcosystemHandler>(...);
+```
+
+### Benchmarks
+
+Run performance benchmarks with criterion:
+
+```bash
+cargo bench --workspace
+```
+
+View HTML report: `open target/criterion/report/index.html`
 
 ## License
 

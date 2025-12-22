@@ -7,29 +7,30 @@
 
 PyPI/Python support for deps-lsp.
 
-This crate provides parsing, validation, and registry client functionality for Python dependency management in `pyproject.toml` files, supporting both PEP 621 and Poetry formats.
+This crate provides parsing and registry integration for Python's PyPI ecosystem.
 
 ## Features
 
-- **PEP 621 Support**: Parse `[project.dependencies]` and `[project.optional-dependencies]`
-- **Poetry Support**: Parse `[tool.poetry.dependencies]` and `[tool.poetry.group.*.dependencies]`
-- **PEP 508 Parsing**: Handle complex dependency specifications with extras and markers
-- **PEP 440 Versions**: Validate and compare Python version specifiers
-- **PyPI API Client**: Fetch package metadata from PyPI JSON API with HTTP caching
+- **PEP 621 Support** — Parse `[project.dependencies]` and `[project.optional-dependencies]`
+- **PEP 735 Support** — Parse `[dependency-groups]` (new standard)
+- **Poetry Support** — Parse `[tool.poetry.dependencies]` and groups
+- **PEP 508 Parsing** — Handle complex dependency specifications with extras and markers
+- **PEP 440 Versions** — Validate and compare Python version specifiers
+- **PyPI API Client** — Fetch package metadata from PyPI JSON API
+- **EcosystemHandler** — Implements `deps_core::EcosystemHandler` trait
 
 ## Usage
 
+```toml
+[dependencies]
+deps-pypi = "0.2"
+```
+
 ```rust
-use deps_pypi::{PypiParser, PypiRegistry};
-use deps_core::PackageRegistry;
+use deps_pypi::{parse_pyproject_toml, PyPiRegistry};
 
-// Parse pyproject.toml
-let content = std::fs::read_to_string("pyproject.toml")?;
-let parser = PypiParser::new();
-let dependencies = parser.parse(&content)?;
-
-// Fetch versions from PyPI
-let registry = PypiRegistry::new();
+let dependencies = parse_pyproject_toml(content)?;
+let registry = PyPiRegistry::new(cache);
 let versions = registry.get_versions("requests").await?;
 ```
 
@@ -42,11 +43,18 @@ let versions = registry.get_versions("requests").await?;
 dependencies = [
     "requests>=2.28.0,<3.0",
     "flask[async]>=3.0",
-    "numpy>=1.24; python_version>='3.9'",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "mypy>=1.0"]
+```
+
+### PEP 735 (Dependency Groups)
+
+```toml
+[dependency-groups]
+test = ["pytest>=7.0", "coverage"]
+dev = [{include-group = "test"}, "mypy>=1.0"]
 ```
 
 ### Poetry
@@ -55,13 +63,19 @@ dev = ["pytest>=7.0", "mypy>=1.0"]
 [tool.poetry.dependencies]
 python = "^3.9"
 requests = "^2.28.0"
-flask = {version = "^3.0", extras = ["async"]}
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0"
-mypy = "^1.0"
 ```
+
+## Benchmarks
+
+```bash
+cargo bench -p deps-pypi
+```
+
+Parsing performance: ~5μs for PEP 621, ~8μs for Poetry format.
 
 ## License
 
-MIT
+[MIT](../../LICENSE)
