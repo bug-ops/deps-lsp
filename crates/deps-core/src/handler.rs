@@ -863,9 +863,10 @@ mod tests {
             name: &str,
             req: &Self::VersionReq,
         ) -> crate::error::Result<Option<Self::Version>> {
-            Ok(self.versions.get(name).and_then(|versions| {
-                versions.iter().find(|v| v.version == *req).cloned()
-            }))
+            Ok(self
+                .versions
+                .get(name)
+                .and_then(|versions| versions.iter().find(|v| v.version == *req).cloned()))
         }
 
         async fn search(
