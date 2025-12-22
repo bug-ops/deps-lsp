@@ -43,10 +43,10 @@ pub async fn handle_diagnostics(
         .dependencies
         .iter()
         .filter_map(|dep| {
-            if let UnifiedDependency::Cargo(cargo_dep) = dep {
-                if matches!(cargo_dep.source, DependencySource::Registry) {
-                    return Some(cargo_dep);
-                }
+            if let UnifiedDependency::Cargo(cargo_dep) = dep
+                && matches!(cargo_dep.source, DependencySource::Registry)
+            {
+                return Some(cargo_dep);
             }
             None
         })
@@ -85,49 +85,49 @@ pub async fn handle_diagnostics(
             }
         };
 
-        if let Some(version_req) = &dep.version_req {
-            if let Some(version_range) = dep.version_range {
-                if version_req.parse::<VersionReq>().is_err() {
-                    diagnostics.push(Diagnostic {
-                        range: version_range,
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!("Invalid version requirement '{}'", version_req),
-                        source: Some("deps-lsp".into()),
-                        ..Default::default()
-                    });
-                    continue;
-                }
+        if let Some(version_req) = &dep.version_req
+            && let Some(version_range) = dep.version_range
+        {
+            if version_req.parse::<VersionReq>().is_err() {
+                diagnostics.push(Diagnostic {
+                    range: version_range,
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    message: format!("Invalid version requirement '{}'", version_req),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+                continue;
+            }
 
-                let matching = registry
-                    .get_latest_matching(&dep.name, version_req)
-                    .await
-                    .ok()
-                    .flatten();
+            let matching = registry
+                .get_latest_matching(&dep.name, version_req)
+                .await
+                .ok()
+                .flatten();
 
-                if let Some(current) = &matching {
-                    if current.yanked {
-                        diagnostics.push(Diagnostic {
-                            range: version_range,
-                            severity: Some(config.yanked_severity),
-                            message: "This version has been yanked".into(),
-                            source: Some("deps-lsp".into()),
-                            ..Default::default()
-                        });
-                    }
-                }
+            if let Some(current) = &matching
+                && current.yanked
+            {
+                diagnostics.push(Diagnostic {
+                    range: version_range,
+                    severity: Some(config.yanked_severity),
+                    message: "This version has been yanked".into(),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+            }
 
-                let latest = versions.iter().find(|v| !v.yanked);
-                if let (Some(latest), Some(current)) = (latest, &matching) {
-                    if latest.num != current.num {
-                        diagnostics.push(Diagnostic {
-                            range: version_range,
-                            severity: Some(config.outdated_severity),
-                            message: format!("Newer version available: {}", latest.num),
-                            source: Some("deps-lsp".into()),
-                            ..Default::default()
-                        });
-                    }
-                }
+            let latest = versions.iter().find(|v| !v.yanked);
+            if let (Some(latest), Some(current)) = (latest, &matching)
+                && latest.num != current.num
+            {
+                diagnostics.push(Diagnostic {
+                    range: version_range,
+                    severity: Some(config.outdated_severity),
+                    message: format!("Newer version available: {}", latest.num),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
             }
         }
     }

@@ -65,10 +65,10 @@ impl Backend {
                         doc.dependencies
                             .iter()
                             .filter_map(|dep| {
-                                if let UnifiedDependency::Cargo(cargo_dep) = dep {
-                                    if matches!(cargo_dep.source, DependencySource::Registry) {
-                                        return Some(cargo_dep.name.clone());
-                                    }
+                                if let UnifiedDependency::Cargo(cargo_dep) = dep
+                                    && matches!(cargo_dep.source, DependencySource::Registry)
+                                {
+                                    return Some(cargo_dep.name.clone());
                                 }
                                 None
                             })
@@ -456,27 +456,26 @@ impl LanguageServer for Backend {
     ) -> Result<Option<serde_json::Value>> {
         tracing::info!("execute_command: {:?}", params.command);
 
-        if params.command == "deps-lsp.updateVersion" {
-            if let Some(args) = params.arguments.first() {
-                if let Ok(update_args) = serde_json::from_value::<UpdateVersionArgs>(args.clone()) {
-                    let mut edits = HashMap::new();
-                    edits.insert(
-                        update_args.uri.clone(),
-                        vec![TextEdit {
-                            range: update_args.range,
-                            new_text: format!("\"{}\"", update_args.version),
-                        }],
-                    );
+        if params.command == "deps-lsp.updateVersion"
+            && let Some(args) = params.arguments.first()
+            && let Ok(update_args) = serde_json::from_value::<UpdateVersionArgs>(args.clone())
+        {
+            let mut edits = HashMap::new();
+            edits.insert(
+                update_args.uri.clone(),
+                vec![TextEdit {
+                    range: update_args.range,
+                    new_text: format!("\"{}\"", update_args.version),
+                }],
+            );
 
-                    let edit = WorkspaceEdit {
-                        changes: Some(edits),
-                        ..Default::default()
-                    };
+            let edit = WorkspaceEdit {
+                changes: Some(edits),
+                ..Default::default()
+            };
 
-                    if let Err(e) = self.client.apply_edit(edit).await {
-                        tracing::error!("Failed to apply edit: {:?}", e);
-                    }
-                }
+            if let Err(e) = self.client.apply_edit(edit).await {
+                tracing::error!("Failed to apply edit: {:?}", e);
             }
         }
 
