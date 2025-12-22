@@ -90,11 +90,22 @@
 
 pub mod cache;
 pub mod error;
+pub mod handler;
+pub mod macros;
 pub mod parser;
 pub mod registry;
+pub mod version_matcher;
 
 // Re-export commonly used types
 pub use cache::{CachedResponse, HttpCache};
 pub use error::{DepsError, Result};
+pub use handler::{
+    generate_hover, generate_inlay_hints, EcosystemHandler, InlayHintsConfig, VersionStringGetter,
+    YankedChecker,
+};
 pub use parser::{DependencyInfo, DependencySource, ManifestParser, ParseResultInfo};
 pub use registry::{PackageMetadata, PackageRegistry, VersionInfo};
+pub use version_matcher::{
+    extract_pypi_min_version, normalize_and_parse_version, Pep440Matcher, SemverMatcher,
+    VersionRequirementMatcher,
+};
