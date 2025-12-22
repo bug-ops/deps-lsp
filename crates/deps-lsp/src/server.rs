@@ -309,11 +309,11 @@ impl LanguageServer for Backend {
         tracing::info!("initializing deps-lsp server");
 
         // Parse initialization options
-        if let Some(init_options) = params.initialization_options {
-            if let Ok(config) = serde_json::from_value::<DepsConfig>(init_options) {
-                tracing::debug!("loaded configuration: {:?}", config);
-                *self.config.write().await = config;
-            }
+        if let Some(init_options) = params.initialization_options
+            && let Ok(config) = serde_json::from_value::<DepsConfig>(init_options)
+        {
+            tracing::debug!("loaded configuration: {:?}", config);
+            *self.config.write().await = config;
         }
 
         Ok(InitializeResult {

@@ -112,53 +112,51 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<ParseResult> {
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
 
-    if let Some(deps_item) = doc.get("dependencies") {
-        if let Some(deps) = deps_item.as_table() {
-            dependencies.extend(parse_dependencies_section(
-                deps,
-                content,
-                &line_table,
-                DependencySection::Dependencies,
-            )?);
-        }
+    if let Some(deps_item) = doc.get("dependencies")
+        && let Some(deps) = deps_item.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            deps,
+            content,
+            &line_table,
+            DependencySection::Dependencies,
+        )?);
     }
 
-    if let Some(dev_deps_item) = doc.get("dev-dependencies") {
-        if let Some(dev_deps) = dev_deps_item.as_table() {
-            dependencies.extend(parse_dependencies_section(
-                dev_deps,
-                content,
-                &line_table,
-                DependencySection::DevDependencies,
-            )?);
-        }
+    if let Some(dev_deps_item) = doc.get("dev-dependencies")
+        && let Some(dev_deps) = dev_deps_item.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            dev_deps,
+            content,
+            &line_table,
+            DependencySection::DevDependencies,
+        )?);
     }
 
-    if let Some(build_deps_item) = doc.get("build-dependencies") {
-        if let Some(build_deps) = build_deps_item.as_table() {
-            dependencies.extend(parse_dependencies_section(
-                build_deps,
-                content,
-                &line_table,
-                DependencySection::BuildDependencies,
-            )?);
-        }
+    if let Some(build_deps_item) = doc.get("build-dependencies")
+        && let Some(build_deps) = build_deps_item.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            build_deps,
+            content,
+            &line_table,
+            DependencySection::BuildDependencies,
+        )?);
     }
 
     // Parse workspace dependencies (for workspace root Cargo.toml)
-    if let Some(workspace_item) = doc.get("workspace") {
-        if let Some(workspace_table) = workspace_item.as_table() {
-            if let Some(workspace_deps_item) = workspace_table.get("dependencies") {
-                if let Some(workspace_deps) = workspace_deps_item.as_table() {
-                    dependencies.extend(parse_dependencies_section(
-                        workspace_deps,
-                        content,
-                        &line_table,
-                        DependencySection::WorkspaceDependencies,
-                    )?);
-                }
-            }
-        }
+    if let Some(workspace_item) = doc.get("workspace")
+        && let Some(workspace_table) = workspace_item.as_table()
+        && let Some(workspace_deps_item) = workspace_table.get("dependencies")
+        && let Some(workspace_deps) = workspace_deps_item.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            workspace_deps,
+            content,
+            &line_table,
+            DependencySection::WorkspaceDependencies,
+        )?);
     }
 
     let workspace_root = find_workspace_root(doc_uri)?;
@@ -295,10 +293,8 @@ fn parse_inline_table_dependency(
                     }
                 }
             }
-            "workspace" => {
-                if value.as_bool() == Some(true) {
-                    dep.workspace_inherited = true;
-                }
+            "workspace" if value.as_bool() == Some(true) => {
+                dep.workspace_inherited = true;
             }
             "git" => {
                 if let Some(url) = value.as_str() {
@@ -330,9 +326,8 @@ fn parse_table_dependency(
     line_table: &LineOffsetTable,
 ) -> Result<()> {
     for (key, item) in table.iter() {
-        let value = match item {
-            Item::Value(v) => v,
-            _ => continue,
+        let Item::Value(value) = item else {
+            continue;
         };
 
         match key {
@@ -359,10 +354,8 @@ fn parse_table_dependency(
                     }
                 }
             }
-            "workspace" => {
-                if value.as_bool() == Some(true) {
-                    dep.workspace_inherited = true;
-                }
+            "workspace" if value.as_bool() == Some(true) => {
+                dep.workspace_inherited = true;
             }
             "git" => {
                 if let Some(url) = value.as_str() {
@@ -411,14 +404,12 @@ fn find_workspace_root(doc_uri: &Url) -> Result<Option<PathBuf>> {
     while let Some(dir) = current {
         let workspace_toml = dir.join("Cargo.toml");
 
-        if workspace_toml.exists() {
-            if let Ok(content) = std::fs::read_to_string(&workspace_toml) {
-                if let Ok(doc) = content.parse::<DocumentMut>() {
-                    if doc.get("workspace").is_some() {
-                        return Ok(Some(dir.to_path_buf()));
-                    }
-                }
-            }
+        if workspace_toml.exists()
+            && let Ok(content) = std::fs::read_to_string(&workspace_toml)
+            && let Ok(doc) = content.parse::<DocumentMut>()
+            && doc.get("workspace").is_some()
+        {
+            return Ok(Some(dir.to_path_buf()));
         }
 
         current = dir.parent();
