@@ -32,6 +32,7 @@
 //! // Handlers use state.get_document() to access parsed dependencies
 //! ```
 
+pub mod cargo_handler_impl;
 pub mod code_actions;
 pub mod completion;
 pub mod diagnostics;

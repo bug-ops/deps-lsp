@@ -101,6 +101,19 @@ impl UnifiedVersion {
     }
 }
 
+// Implement helper traits from deps-core for generic handler support
+impl deps_core::VersionStringGetter for UnifiedVersion {
+    fn version_string(&self) -> &str {
+        self.version_string()
+    }
+}
+
+impl deps_core::YankedChecker for UnifiedVersion {
+    fn is_yanked(&self) -> bool {
+        self.is_yanked()
+    }
+}
+
 /// Package ecosystem type.
 ///
 /// Identifies which package manager and manifest file format

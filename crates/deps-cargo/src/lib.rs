@@ -21,11 +21,13 @@
 //! let _deps: Vec<ParsedDependency> = vec![];
 //! ```
 
+pub mod handler;
 pub mod parser;
 pub mod registry;
 pub mod types;
 
 // Re-export commonly used types
+pub use handler::CargoHandler;
 pub use parser::{CargoParser, ParseResult, parse_cargo_toml};
 pub use registry::{CratesIoRegistry, crate_url};
 pub use types::{CargoVersion, CrateInfo, DependencySection, DependencySource, ParsedDependency};

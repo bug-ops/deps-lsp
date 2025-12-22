@@ -5,7 +5,9 @@
 
 use crate::config::InlayHintsConfig;
 use crate::document::{Ecosystem, ServerState, UnifiedDependency, UnifiedVersion};
+use crate::handlers::cargo_handler_impl::CargoHandlerImpl;
 use deps_cargo::{CratesIoRegistry, crate_url};
+use deps_core::{EcosystemHandler, generate_inlay_hints};
 use deps_npm::{NpmRegistry, package_url};
 use deps_pypi::PypiRegistry;
 use futures::future::join_all;
@@ -85,7 +87,14 @@ pub async fn handle_inlay_hints(
 
     let hints = match ecosystem {
         Ecosystem::Cargo => {
-            handle_cargo_inlay_hints(state, deps_to_fetch, config, &cached_versions).await
+            // Use generic handler implementation
+            let handler = CargoHandlerImpl::new(Arc::clone(&state.cache));
+            let core_config = deps_core::InlayHintsConfig {
+                enabled: config.enabled,
+                up_to_date_text: config.up_to_date_text.clone(),
+                needs_update_text: config.needs_update_text.clone(),
+            };
+            generate_inlay_hints(&handler, &deps_to_fetch, &cached_versions, &core_config).await
         }
         Ecosystem::Npm => {
             handle_npm_inlay_hints(state, deps_to_fetch, config, &cached_versions).await
