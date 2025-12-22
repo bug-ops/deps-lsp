@@ -193,12 +193,16 @@ jobs:
           files: |
             deps-zed.wasm.*
 
-  # Publish to crates.io
+  # Publish to crates.io using Trusted Publishing (OIDC)
+  # See: https://doc.rust-lang.org/cargo/reference/registry-authentication.html
   publish-crates:
     name: Publish to crates.io
     needs: [create-release, build-binaries]
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
 
@@ -217,29 +221,33 @@ jobs:
             exit 1
           fi
 
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
+
       - name: Publish deps-core to crates.io
-        run: cargo publish --package deps-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package deps-core --token ${{ steps.crates-io-auth.outputs.token }}
         continue-on-error: true
 
       - name: Wait for crates.io propagation
         run: sleep 30
 
       - name: Publish deps-cargo to crates.io
-        run: cargo publish --package deps-cargo --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package deps-cargo --token ${{ steps.crates-io-auth.outputs.token }}
         continue-on-error: true
 
       - name: Wait for crates.io propagation
         run: sleep 30
 
       - name: Publish deps-npm to crates.io
-        run: cargo publish --package deps-npm --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package deps-npm --token ${{ steps.crates-io-auth.outputs.token }}
         continue-on-error: true
 
       - name: Wait for crates.io propagation
         run: sleep 30
 
       - name: Publish deps-lsp to crates.io
-        run: cargo publish --package deps-lsp --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --package deps-lsp --token ${{ steps.crates-io-auth.outputs.token }}
         continue-on-error: true
 
       # Note: deps-zed is now in a separate repository and published from there
