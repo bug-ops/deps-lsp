@@ -20,5 +20,10 @@ tracing = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
 insta = { workspace = true, features = ["json"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "cargo_benchmarks"
+harness = false

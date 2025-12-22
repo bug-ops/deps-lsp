@@ -21,6 +21,11 @@ toml_edit = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "pypi_benchmarks"
+harness = false

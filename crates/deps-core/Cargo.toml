@@ -22,6 +22,11 @@ tower-lsp = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
 mockito = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tokio-test = { workspace = true }
+
+[[bench]]
+name = "core_benchmarks"
+harness = false

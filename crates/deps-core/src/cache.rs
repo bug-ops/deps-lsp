@@ -365,6 +365,18 @@ impl HttpCache {
 
         tracing::debug!("evicted {} cache entries", removed);
     }
+
+    /// Benchmark-only helper: Direct cache lookup without network requests.
+    #[doc(hidden)]
+    pub fn get_for_bench(&self, url: &str) -> Option<Arc<Vec<u8>>> {
+        self.entries.get(url).map(|entry| Arc::clone(&entry.body))
+    }
+
+    /// Benchmark-only helper: Direct cache insertion.
+    #[doc(hidden)]
+    pub fn insert_for_bench(&self, url: String, response: CachedResponse) {
+        self.entries.insert(url, response);
+    }
 }
 
 impl Default for HttpCache {
