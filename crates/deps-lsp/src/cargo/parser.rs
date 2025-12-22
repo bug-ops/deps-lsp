@@ -417,7 +417,11 @@ mod tests {
     use super::*;
 
     fn test_url() -> Url {
-        Url::parse("file:///test/Cargo.toml").unwrap()
+        #[cfg(windows)]
+        let url = "file:///C:/test/Cargo.toml";
+        #[cfg(not(windows))]
+        let url = "file:///test/Cargo.toml";
+        Url::parse(url).unwrap()
     }
 
     #[test]
