@@ -8,4 +8,4 @@ repository = "https://github.com/bug-ops/deps-lsp"
 
 [language_servers.deps-lsp]
 name = "Deps LSP"
-languages = ["TOML"]
+languages = ["TOML", "JSON"]
