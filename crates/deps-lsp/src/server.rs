@@ -113,16 +113,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_backend_creation() {
-        let (_service, _socket) =
-            tower_lsp::LspService::build(|client| Backend::new(client)).finish();
+        let (_service, _socket) = tower_lsp::LspService::build(Backend::new).finish();
         // Backend should be created successfully
         // This is a minimal smoke test
     }
 
     #[tokio::test]
     async fn test_initialize_without_options() {
-        let (_service, _socket) =
-            tower_lsp::LspService::build(|client| Backend::new(client)).finish();
+        let (_service, _socket) = tower_lsp::LspService::build(Backend::new).finish();
         // Should initialize successfully with default config
         // Integration tests will test actual LSP protocol
     }
