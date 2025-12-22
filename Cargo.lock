@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "deps-cargo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "deps-core",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "deps-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "dashmap 6.1.0",
@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "deps-lsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "dashmap 6.1.0",
@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "deps-npm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "deps-core",
