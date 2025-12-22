@@ -14,6 +14,7 @@ use tower_lsp::lsp_types::Url;
 /// Wraps ecosystem-specific dependency types to allow storing
 /// dependencies from different ecosystems in the same document state.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum UnifiedDependency {
     Cargo(ParsedDependency),
     Npm(NpmDependency),
@@ -75,6 +76,7 @@ impl UnifiedDependency {
 ///
 /// Wraps ecosystem-specific version types.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum UnifiedVersion {
     Cargo(CargoVersion),
     Npm(NpmVersion),
@@ -138,6 +140,7 @@ impl deps_core::YankedChecker for UnifiedVersion {
 /// assert_eq!(unknown, None);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Ecosystem {
     /// Rust Cargo ecosystem (Cargo.toml)
     Cargo,

@@ -69,6 +69,7 @@ pub struct PypiDependency {
 /// assert!(matches!(section, PypiDependencySection::Dependencies));
 /// ```
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum PypiDependencySection {
     /// PEP 621 runtime dependencies (`[project.dependencies]`)
     Dependencies,

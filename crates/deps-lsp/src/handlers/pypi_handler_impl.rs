@@ -63,6 +63,8 @@ impl EcosystemHandler for PyPiHandlerImpl {
             | deps_pypi::PypiDependencySection::PoetryGroup { .. } => {
                 format!("\"^{}\"", version)
             }
+            // Future sections default to PEP 508 format
+            _ => format!(">={}", version),
         }
     }
 
