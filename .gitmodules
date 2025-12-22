@@ -1,0 +1,3 @@
+[submodule "crates/deps-zed"]
+	path = crates/deps-zed
+	url = git@github.com:bug-ops/deps-zed.git
