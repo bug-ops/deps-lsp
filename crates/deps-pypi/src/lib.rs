@@ -36,11 +36,11 @@
 //! "#;
 //!
 //! let parser = PypiParser::new();
-//! let dependencies = parser.parse(content).unwrap();
+//! let result = parser.parse_content(content).unwrap();
 //!
-//! assert_eq!(dependencies.len(), 2);
-//! assert_eq!(dependencies[0].name, "requests");
-//! assert_eq!(dependencies[1].extras, vec!["async"]);
+//! assert_eq!(result.dependencies.len(), 2);
+//! assert_eq!(result.dependencies[0].name, "requests");
+//! assert_eq!(result.dependencies[1].extras, vec!["async"]);
 //! ```
 //!
 //! ## Fetching versions from PyPI

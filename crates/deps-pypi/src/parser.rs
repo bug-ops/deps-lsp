@@ -32,8 +32,8 @@ pub struct ParseResult {
 /// "#;
 ///
 /// let parser = PypiParser::new();
-/// let dependencies = parser.parse(content).unwrap();
-/// assert_eq!(dependencies.len(), 2);
+/// let result = parser.parse_content(content).unwrap();
+/// assert_eq!(result.dependencies.len(), 2);
 /// ```
 pub struct PypiParser;
 
