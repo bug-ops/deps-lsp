@@ -251,7 +251,8 @@ async fn handle_pypi_code_actions(
             // Find the dependency to get section info
             let dep = doc.dependencies.iter().find_map(|d| {
                 if let UnifiedDependency::Pypi(pypi_dep) = d
-                    && pypi_dep.name == name && pypi_dep.version_range == Some(version_range)
+                    && pypi_dep.name == name
+                    && pypi_dep.version_range == Some(version_range)
                 {
                     return Some(pypi_dep.clone());
                 }
