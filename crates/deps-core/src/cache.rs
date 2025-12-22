@@ -7,6 +7,26 @@ use std::time::Instant;
 /// Maximum number of cached entries to prevent unbounded memory growth.
 const MAX_CACHE_ENTRIES: usize = 1000;
 
+/// Validates that a URL uses HTTPS protocol.
+///
+/// Returns an error if the URL doesn't start with "https://".
+/// This ensures all network requests are encrypted.
+///
+/// In test mode, HTTP URLs are allowed for mockito compatibility.
+#[inline]
+fn ensure_https(url: &str) -> Result<()> {
+    #[cfg(not(test))]
+    if !url.starts_with("https://") {
+        return Err(DepsError::CacheError(format!(
+            "URL must use HTTPS: {}",
+            url
+        )));
+    }
+    #[cfg(test)]
+    let _ = url; // Silence unused warning in tests
+    Ok(())
+}
+
 /// Cached HTTP response with validation headers.
 ///
 /// Stores response body and cache validation headers (ETag, Last-Modified)
@@ -168,6 +188,7 @@ impl HttpCache {
         url: &str,
         cached: &CachedResponse,
     ) -> Result<Option<Arc<Vec<u8>>>> {
+        ensure_https(url)?;
         let mut request = self.client.get(url);
 
         if let Some(etag) = &cached.etag {
@@ -235,6 +256,7 @@ impl HttpCache {
     /// Returns `DepsError::CacheError` if the server returns a non-2xx status code,
     /// or `DepsError::RegistryError` if the network request fails.
     pub(crate) async fn fetch_and_store(&self, url: &str) -> Result<Arc<Vec<u8>>> {
+        ensure_https(url)?;
         tracing::debug!("fetching fresh: {}", url);
 
         let response = self
