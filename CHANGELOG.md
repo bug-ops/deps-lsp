@@ -28,9 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - FULL document sync for immediate file change detection
   - Parallel version fetching
 
+### Fixed
+- npm parser: Correct position finding for dependencies sharing version string (e.g., vitest)
+
 ### Changed
 - MSRV bumped to 1.89 for let-chains support
 - Refactored handlers to use let-chains for cleaner code
+- Extracted deps-zed to [separate repository](https://github.com/bug-ops/deps-zed) as git submodule
 
 ## [0.1.0] - 2024-12-22
 

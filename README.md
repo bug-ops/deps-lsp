@@ -67,7 +67,7 @@ Install the **Deps** extension from Zed Extensions marketplace.
 ```lua
 require('lspconfig').deps_lsp.setup({
   cmd = { "deps-lsp", "--stdio" },
-  filetypes = { "toml" },
+  filetypes = { "toml", "json" },
 })
 ```
 
@@ -77,6 +77,10 @@ require('lspconfig').deps_lsp.setup({
 # ~/.config/helix/languages.toml
 [[language]]
 name = "toml"
+language-servers = ["deps-lsp"]
+
+[[language]]
+name = "json"
 language-servers = ["deps-lsp"]
 
 [language-server.deps-lsp]
