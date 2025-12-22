@@ -215,23 +215,37 @@ async fn handle_npm_inlay_hints(
     hints
 }
 
-/// Checks if the current version requirement is satisfied by the latest version.
+/// Checks if the latest version satisfies the version requirement.
 ///
-/// Compares the version requirement string (after stripping prefixes like ^, ~)
-/// with the latest version. Returns true if they're semantically equivalent.
+/// Returns true if the latest available version matches the requirement,
+/// meaning the dependency is effectively up-to-date within its constraint.
+///
+/// For example:
+/// - `"0.1"` with latest `"0.1.83"` → true (0.1.83 satisfies ^0.1)
+/// - `"1.0.0"` with latest `"1.0.5"` → true (1.0.5 satisfies ^1.0.0)
+/// - `"1.0.0"` with latest `"2.0.0"` → false (2.0.0 doesn't satisfy ^1.0.0)
 fn is_version_latest(version_req: &str, latest: &str) -> bool {
-    let cleaned_req = version_req
-        .trim_start_matches('^')
-        .trim_start_matches('~')
-        .trim_start_matches('=');
+    use semver::VersionReq;
 
-    if let (Ok(req_ver), Ok(latest_ver)) =
-        (cleaned_req.parse::<Version>(), latest.parse::<Version>())
-    {
-        req_ver == latest_ver
-    } else {
-        cleaned_req == latest
+    // Parse the latest version
+    let latest_ver = match latest.parse::<Version>() {
+        Ok(v) => v,
+        Err(_) => return version_req == latest,
+    };
+
+    // Try to parse as a semver requirement (handles ^, ~, =, etc.)
+    if let Ok(req) = version_req.parse::<VersionReq>() {
+        return req.matches(&latest_ver);
     }
+
+    // If not a valid requirement, try treating it as a caret requirement
+    // (Cargo's default: "1.0" means "^1.0")
+    if let Ok(req) = format!("^{}", version_req).parse::<VersionReq>() {
+        return req.matches(&latest_ver);
+    }
+
+    // Fallback: string comparison
+    version_req == latest
 }
 
 #[cfg(test)]
@@ -239,25 +253,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_version_latest() {
+    fn test_is_version_latest_exact_match() {
+        // Exact version matches
         assert!(is_version_latest("1.0.0", "1.0.0"));
         assert!(is_version_latest("^1.0.0", "1.0.0"));
         assert!(is_version_latest("~1.0.0", "1.0.0"));
         assert!(is_version_latest("=1.0.0", "1.0.0"));
+    }
 
-        assert!(!is_version_latest("1.0.0", "1.0.1"));
-        assert!(!is_version_latest("^1.0.0", "1.0.1"));
+    #[test]
+    fn test_is_version_latest_compatible_versions() {
+        // Latest version satisfies the requirement (up-to-date)
+        assert!(is_version_latest("1.0.0", "1.0.5")); // ^1.0.0 allows 1.0.5
+        assert!(is_version_latest("^1.0.0", "1.5.0")); // ^1.0.0 allows 1.5.0
+        assert!(is_version_latest("0.1", "0.1.83")); // ^0.1 allows 0.1.83
+        assert!(is_version_latest("1", "1.5.0")); // ^1 allows 1.5.0
+    }
+
+    #[test]
+    fn test_is_version_latest_incompatible_versions() {
+        // Latest version doesn't satisfy requirement (new major available)
+        assert!(!is_version_latest("1.0.0", "2.0.0")); // 2.0.0 breaks ^1.0.0
+        assert!(!is_version_latest("0.1", "0.2.0")); // 0.2.0 breaks ^0.1
+        assert!(!is_version_latest("~1.0.0", "1.1.0")); // ~1.0.0 doesn't allow 1.1.0
     }
 
     #[test]
     fn test_is_version_latest_with_prerelease() {
         assert!(is_version_latest("1.0.0-alpha.1", "1.0.0-alpha.1"));
-        assert!(!is_version_latest("1.0.0-alpha.1", "1.0.0-alpha.2"));
     }
 
     #[test]
     fn test_is_version_latest_invalid_versions() {
         assert!(!is_version_latest("invalid", "1.0.0"));
-        assert!(!is_version_latest("1.0.0", "invalid"));
+        assert!(!is_version_latest("1.0.0", "invalid")); // Invalid latest, fallback to string compare
     }
 }
