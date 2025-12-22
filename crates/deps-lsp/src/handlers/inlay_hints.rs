@@ -1,14 +1,15 @@
 //! Inlay hints handler implementation.
 //!
 //! Displays inline version annotations next to dependency version strings.
-//! Shows "✓" for up-to-date dependencies and "↑ X.Y.Z" for outdated ones.
+//! Shows "✅" for up-to-date dependencies and "❌ X.Y.Z" for outdated ones.
 
 use crate::config::InlayHintsConfig;
-use crate::document::{Ecosystem, ServerState, UnifiedDependency};
+use crate::document::{Ecosystem, ServerState, UnifiedDependency, UnifiedVersion};
 use deps_cargo::{CratesIoRegistry, crate_url};
 use deps_npm::{NpmRegistry, package_url};
 use futures::future::join_all;
 use semver::Version;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
     InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, InlayHintParams, MarkupContent,
@@ -27,8 +28,8 @@ use tower_lsp::lsp_types::{
 /// serde = "1.0.100"
 /// ```
 ///
-/// Shows: `serde = "1.0.100" ↑ 1.0.214` if outdated
-/// Or: `serde = "1.0.214" ✓` if up-to-date
+/// Shows: `serde = "1.0.100" ❌ 1.0.214` if outdated
+/// Or: `serde = "1.0.214" ✅` if up-to-date
 pub async fn handle_inlay_hints(
     state: Arc<ServerState>,
     params: InlayHintParams,
@@ -69,17 +70,25 @@ pub async fn handle_inlay_hints(
         .cloned()
         .collect();
 
+    // Get cached versions before dropping doc
+    let cached_versions = doc.versions.clone();
+
     tracing::info!(
-        "inlay hints: found {} dependencies to fetch (total {} in doc)",
+        "inlay hints: found {} dependencies to fetch (total {} in doc, {} cached)",
         deps_to_fetch.len(),
-        doc.dependencies.len()
+        doc.dependencies.len(),
+        cached_versions.len()
     );
 
     drop(doc);
 
     let hints = match ecosystem {
-        Ecosystem::Cargo => handle_cargo_inlay_hints(state, deps_to_fetch, config).await,
-        Ecosystem::Npm => handle_npm_inlay_hints(state, deps_to_fetch, config).await,
+        Ecosystem::Cargo => {
+            handle_cargo_inlay_hints(state, deps_to_fetch, config, &cached_versions).await
+        }
+        Ecosystem::Npm => {
+            handle_npm_inlay_hints(state, deps_to_fetch, config, &cached_versions).await
+        }
     };
 
     tracing::info!("returning {} inlay hints", hints.len());
@@ -90,116 +99,79 @@ async fn handle_cargo_inlay_hints(
     state: Arc<ServerState>,
     dependencies: Vec<UnifiedDependency>,
     config: &InlayHintsConfig,
+    cached_versions: &HashMap<String, UnifiedVersion>,
 ) -> Vec<InlayHint> {
     let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
 
-    let futures: Vec<_> = dependencies
-        .iter()
-        .filter_map(|dep| {
-            if let UnifiedDependency::Cargo(cargo_dep) = dep {
-                let name = cargo_dep.name.clone();
-                let version_req = cargo_dep.version_req.as_ref()?.clone();
-                let version_range = cargo_dep.version_range?;
-                let registry = registry.clone();
-                Some(async move {
-                    let result = registry.get_latest_matching(&name, &version_req).await;
-                    (name, version_req, version_range, result)
-                })
+    // Separate deps into cached and needs-fetch
+    let mut cached_deps = Vec::new();
+    let mut fetch_deps = Vec::new();
+
+    for dep in &dependencies {
+        if let UnifiedDependency::Cargo(cargo_dep) = dep {
+            let Some(version_req) = cargo_dep.version_req.as_ref() else {
+                continue;
+            };
+            let Some(version_range) = cargo_dep.version_range else {
+                continue;
+            };
+
+            if let Some(cached) = cached_versions.get(&cargo_dep.name) {
+                // Use cached version
+                cached_deps.push((
+                    cargo_dep.name.clone(),
+                    version_req.clone(),
+                    version_range,
+                    cached.version_string().to_string(),
+                    cached.is_yanked(),
+                ));
             } else {
-                None
+                // Need to fetch
+                fetch_deps.push((cargo_dep.name.clone(), version_req.clone(), version_range));
             }
-        })
-        .collect();
-
-    let results = join_all(futures).await;
-
-    let mut hints = Vec::new();
-    for (name, version_req, version_range, result) in results {
-        let latest = match result {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                tracing::debug!("No matching version found for {}: {}", name, version_req);
-                continue;
-            }
-            Err(e) => {
-                tracing::error!("Failed to fetch versions for {}: {}", name, e);
-                continue;
-            }
-        };
-
-        let is_latest = is_version_latest(&version_req, &latest.num);
-
-        let label_text = if is_latest {
-            config.up_to_date_text.clone()
-        } else {
-            config.needs_update_text.replace("{}", &latest.num)
-        };
-
-        // Create clickable label with link to crates.io
-        let crates_io_url = crate_url(&name);
-        let tooltip_content = format!(
-            "[{}]({}) - {}\n\nLatest: **{}**",
-            name, crates_io_url, crates_io_url, latest.num
-        );
-
-        hints.push(InlayHint {
-            position: version_range.end,
-            label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
-                value: label_text,
-                tooltip: Some(tower_lsp::lsp_types::InlayHintLabelPartTooltip::MarkupContent(
-                    MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: tooltip_content,
-                    },
-                )),
-                location: None,
-                command: Some(tower_lsp::lsp_types::Command {
-                    title: "Open on crates.io".into(),
-                    command: "vscode.open".into(),
-                    arguments: Some(vec![serde_json::json!(crates_io_url)]),
-                }),
-            }]),
-            kind: Some(InlayHintKind::TYPE),
-            text_edits: None,
-            tooltip: None,
-            padding_left: Some(true),
-            padding_right: None,
-            data: None,
-        });
+        }
     }
 
-    hints
-}
+    tracing::debug!(
+        "inlay hints: {} cached, {} to fetch",
+        cached_deps.len(),
+        fetch_deps.len()
+    );
 
-async fn handle_npm_inlay_hints(
-    state: Arc<ServerState>,
-    dependencies: Vec<UnifiedDependency>,
-    config: &InlayHintsConfig,
-) -> Vec<InlayHint> {
-    let registry = NpmRegistry::new(Arc::clone(&state.cache));
-
-    let futures: Vec<_> = dependencies
-        .iter()
-        .filter_map(|dep| {
-            if let UnifiedDependency::Npm(npm_dep) = dep {
-                let name = npm_dep.name.clone();
-                let version_req = npm_dep.version_req.as_ref()?.clone();
-                let version_range = npm_dep.version_range?;
-                let registry = registry.clone();
-                Some(async move {
-                    let result = registry.get_versions(&name).await;
-                    (name, version_req, version_range, result)
-                })
-            } else {
-                None
+    // Fetch missing versions in parallel
+    let futures: Vec<_> = fetch_deps
+        .into_iter()
+        .map(|(name, version_req, version_range)| {
+            let registry = registry.clone();
+            async move {
+                let result = registry.get_versions(&name).await;
+                (name, version_req, version_range, result)
             }
         })
         .collect();
 
-    let results = join_all(futures).await;
+    let fetch_results = join_all(futures).await;
 
     let mut hints = Vec::new();
-    for (name, version_req, version_range, result) in results {
+
+    // Process cached deps
+    for (name, version_req, version_range, latest_version, is_yanked) in cached_deps {
+        if is_yanked {
+            continue;
+        }
+        let is_latest = is_version_latest(&version_req, &latest_version);
+        hints.push(create_cargo_hint(
+            &name,
+            &version_req,
+            version_range,
+            &latest_version,
+            is_latest,
+            config,
+        ));
+    }
+
+    // Process fetched deps
+    for (name, version_req, version_range, result) in fetch_results {
         let versions = match result {
             Ok(v) => v,
             Err(e) => {
@@ -208,56 +180,211 @@ async fn handle_npm_inlay_hints(
             }
         };
 
-        let latest = match versions.first() {
+        let latest = match versions.iter().find(|v| !v.yanked) {
             Some(v) => v,
-            None => {
-                tracing::debug!("No matching version found for {}: {}", name, version_req);
+            None => continue,
+        };
+
+        let is_latest = is_version_latest(&version_req, &latest.num);
+        hints.push(create_cargo_hint(
+            &name,
+            &version_req,
+            version_range,
+            &latest.num,
+            is_latest,
+            config,
+        ));
+    }
+
+    hints
+}
+
+fn create_cargo_hint(
+    name: &str,
+    _version_req: &str,
+    version_range: tower_lsp::lsp_types::Range,
+    latest_version: &str,
+    is_latest: bool,
+    config: &InlayHintsConfig,
+) -> InlayHint {
+    let label_text = if is_latest {
+        config.up_to_date_text.clone()
+    } else {
+        config.needs_update_text.replace("{}", latest_version)
+    };
+
+    let crates_io_url = crate_url(name);
+    let tooltip_content = format!(
+        "[{}]({}) - {}\n\nLatest: **{}**",
+        name, crates_io_url, crates_io_url, latest_version
+    );
+
+    InlayHint {
+        position: version_range.end,
+        label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
+            value: label_text,
+            tooltip: Some(
+                tower_lsp::lsp_types::InlayHintLabelPartTooltip::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: tooltip_content,
+                }),
+            ),
+            location: None,
+            command: Some(tower_lsp::lsp_types::Command {
+                title: "Open on crates.io".into(),
+                command: "vscode.open".into(),
+                arguments: Some(vec![serde_json::json!(crates_io_url)]),
+            }),
+        }]),
+        kind: Some(InlayHintKind::TYPE),
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(true),
+        padding_right: None,
+        data: None,
+    }
+}
+
+async fn handle_npm_inlay_hints(
+    state: Arc<ServerState>,
+    dependencies: Vec<UnifiedDependency>,
+    config: &InlayHintsConfig,
+    cached_versions: &HashMap<String, UnifiedVersion>,
+) -> Vec<InlayHint> {
+    let registry = NpmRegistry::new(Arc::clone(&state.cache));
+
+    // Separate deps into cached and needs-fetch
+    let mut cached_deps = Vec::new();
+    let mut fetch_deps = Vec::new();
+
+    for dep in &dependencies {
+        if let UnifiedDependency::Npm(npm_dep) = dep {
+            let Some(version_req) = npm_dep.version_req.as_ref() else {
+                continue;
+            };
+            let Some(version_range) = npm_dep.version_range else {
+                continue;
+            };
+
+            if let Some(cached) = cached_versions.get(&npm_dep.name) {
+                cached_deps.push((
+                    npm_dep.name.clone(),
+                    version_req.clone(),
+                    version_range,
+                    cached.version_string().to_string(),
+                    cached.is_yanked(),
+                ));
+            } else {
+                fetch_deps.push((npm_dep.name.clone(), version_req.clone(), version_range));
+            }
+        }
+    }
+
+    // Fetch missing versions in parallel
+    let futures: Vec<_> = fetch_deps
+        .into_iter()
+        .map(|(name, version_req, version_range)| {
+            let registry = registry.clone();
+            async move {
+                let result = registry.get_versions(&name).await;
+                (name, version_req, version_range, result)
+            }
+        })
+        .collect();
+
+    let fetch_results = join_all(futures).await;
+
+    let mut hints = Vec::new();
+
+    // Process cached deps
+    for (name, version_req, version_range, latest_version, is_deprecated) in cached_deps {
+        if is_deprecated {
+            continue;
+        }
+        let is_latest = is_version_latest(&version_req, &latest_version);
+        hints.push(create_npm_hint(
+            &name,
+            &version_req,
+            version_range,
+            &latest_version,
+            is_latest,
+            config,
+        ));
+    }
+
+    // Process fetched deps
+    for (name, version_req, version_range, result) in fetch_results {
+        let versions = match result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to fetch npm versions for {}: {}", name, e);
                 continue;
             }
         };
 
-        let is_latest = is_version_latest(&version_req, &latest.version);
-
-        let label_text = if is_latest {
-            config.up_to_date_text.clone()
-        } else {
-            config.needs_update_text.replace("{}", &latest.version)
+        let latest = match versions.iter().find(|v| !v.deprecated) {
+            Some(v) => v,
+            None => continue,
         };
 
-        // Create clickable label with link to npmjs.com
-        let npm_url = package_url(&name);
-        let tooltip_content = format!(
-            "[{}]({}) - {}\n\nLatest: **{}**",
-            name, npm_url, npm_url, latest.version
-        );
-
-        hints.push(InlayHint {
-            position: version_range.end,
-            label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
-                value: label_text,
-                tooltip: Some(tower_lsp::lsp_types::InlayHintLabelPartTooltip::MarkupContent(
-                    MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: tooltip_content,
-                    },
-                )),
-                location: None,
-                command: Some(tower_lsp::lsp_types::Command {
-                    title: "Open on npmjs.com".into(),
-                    command: "vscode.open".into(),
-                    arguments: Some(vec![serde_json::json!(npm_url)]),
-                }),
-            }]),
-            kind: Some(InlayHintKind::TYPE),
-            text_edits: None,
-            tooltip: None,
-            padding_left: Some(true),
-            padding_right: None,
-            data: None,
-        });
+        let is_latest = is_version_latest(&version_req, &latest.version);
+        hints.push(create_npm_hint(
+            &name,
+            &version_req,
+            version_range,
+            &latest.version,
+            is_latest,
+            config,
+        ));
     }
 
     hints
+}
+
+fn create_npm_hint(
+    name: &str,
+    _version_req: &str,
+    version_range: tower_lsp::lsp_types::Range,
+    latest_version: &str,
+    is_latest: bool,
+    config: &InlayHintsConfig,
+) -> InlayHint {
+    let label_text = if is_latest {
+        config.up_to_date_text.clone()
+    } else {
+        config.needs_update_text.replace("{}", latest_version)
+    };
+
+    let npm_url = package_url(name);
+    let tooltip_content = format!(
+        "[{}]({}) - {}\n\nLatest: **{}**",
+        name, npm_url, npm_url, latest_version
+    );
+
+    InlayHint {
+        position: version_range.end,
+        label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
+            value: label_text,
+            tooltip: Some(
+                tower_lsp::lsp_types::InlayHintLabelPartTooltip::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: tooltip_content,
+                }),
+            ),
+            location: None,
+            command: Some(tower_lsp::lsp_types::Command {
+                title: "Open on npmjs.com".into(),
+                command: "vscode.open".into(),
+                arguments: Some(vec![serde_json::json!(npm_url)]),
+            }),
+        }]),
+        kind: Some(InlayHintKind::TYPE),
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(true),
+        padding_right: None,
+        data: None,
+    }
 }
 
 /// Checks if the latest version satisfies the version requirement.

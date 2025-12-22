@@ -14,8 +14,8 @@ use tower_lsp::lsp_types::DiagnosticSeverity;
 /// let json = r#"{
 ///     "inlay_hints": {
 ///         "enabled": true,
-///         "up_to_date_text": "✓",
-///         "needs_update_text": "↑ {}"
+///         "up_to_date_text": "✅",
+///         "needs_update_text": "❌ {}"
 ///     }
 /// }"#;
 ///
@@ -40,8 +40,8 @@ pub struct DepsConfig {
 /// # Defaults
 ///
 /// - `enabled`: `true`
-/// - `up_to_date_text`: `"✓"`
-/// - `needs_update_text`: `"↑ {}"` (where `{}` is replaced with the latest version)
+/// - `up_to_date_text`: `"✅"`
+/// - `needs_update_text`: `"❌ {}"` (where `{}` is replaced with the latest version)
 ///
 /// # Examples
 ///
@@ -166,11 +166,11 @@ fn default_true() -> bool {
 }
 
 fn default_up_to_date() -> String {
-    "✓".to_string()
+    "✅".to_string()
 }
 
 fn default_needs_update() -> String {
-    "↑ {}".to_string()
+    "❌ {}".to_string()
 }
 
 fn default_outdated_severity() -> DiagnosticSeverity {
@@ -197,8 +197,8 @@ mod tests {
     fn test_default_config() {
         let config = DepsConfig::default();
         assert!(config.inlay_hints.enabled);
-        assert_eq!(config.inlay_hints.up_to_date_text, "✓");
-        assert_eq!(config.inlay_hints.needs_update_text, "↑ {}");
+        assert_eq!(config.inlay_hints.up_to_date_text, "✅");
+        assert_eq!(config.inlay_hints.needs_update_text, "❌ {}");
     }
 
     #[test]
@@ -246,8 +246,8 @@ mod tests {
         let json = r#"{
             "inlay_hints": {
                 "enabled": true,
-                "up_to_date_text": "✓",
-                "needs_update_text": "↑ {}"
+                "up_to_date_text": "✅",
+                "needs_update_text": "❌ {}"
             },
             "diagnostics": {
                 "outdated_severity": 4,
@@ -280,7 +280,7 @@ mod tests {
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         assert!(!config.inlay_hints.enabled);
         // Other fields should use defaults
-        assert_eq!(config.inlay_hints.up_to_date_text, "✓");
+        assert_eq!(config.inlay_hints.up_to_date_text, "✅");
         assert_eq!(
             config.diagnostics.outdated_severity,
             DiagnosticSeverity::HINT

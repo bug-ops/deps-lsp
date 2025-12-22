@@ -15,6 +15,8 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Hover Information** — Package descriptions, links to documentation
 - **Code Actions** — Quick fixes to update dependencies
 
+![deps-lsp in action](crates/deps-zed/assets/img.png)
+
 ## Supported Ecosystems
 
 | Ecosystem | Manifest File | Status |
@@ -90,8 +92,8 @@ Configure via LSP initialization options:
 {
   "inlay_hints": {
     "enabled": true,
-    "up_to_date_text": "✓",
-    "needs_update_text": "↑ {}"
+    "up_to_date_text": "✅",
+    "needs_update_text": "❌ {}"
   },
   "diagnostics": {
     "outdated_severity": "hint",

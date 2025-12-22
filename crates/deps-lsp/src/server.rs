@@ -12,10 +12,11 @@ use tower_lsp::lsp_types::{
     CompletionParams, CompletionResponse, DiagnosticOptions, DiagnosticServerCapabilities,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
-    FullDocumentDiagnosticReport, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, InlayHint, InlayHintParams, MessageType, OneOf,
-    RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind,
+    ExecuteCommandOptions, ExecuteCommandParams, FullDocumentDiagnosticReport, Hover, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, InlayHint,
+    InlayHintParams, MessageType, OneOf, Range, RelatedFullDocumentDiagnosticReport,
+    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
+    Url, WorkspaceEdit,
 };
 use tower_lsp::{Client, LanguageServer, jsonrpc::Result};
 
@@ -227,6 +228,11 @@ impl Backend {
                     .await;
 
                     client.publish_diagnostics(uri_clone, diags, None).await;
+
+                    // Request inlay hints refresh
+                    if let Err(e) = client.inlay_hint_refresh().await {
+                        tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+                    }
                 });
 
                 self.state.spawn_background_task(uri, task).await;
@@ -266,6 +272,11 @@ impl Backend {
                     .await;
 
                     client.publish_diagnostics(uri_clone, diags, None).await;
+
+                    // Request inlay hints refresh
+                    if let Err(e) = client.inlay_hint_refresh().await {
+                        tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+                    }
                 });
 
                 self.state.spawn_background_task(uri, task).await;
@@ -278,9 +289,7 @@ impl Backend {
 
     fn server_capabilities() -> ServerCapabilities {
         ServerCapabilities {
-            text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                TextDocumentSyncKind::INCREMENTAL,
-            )),
+            text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             completion_provider: Some(CompletionOptions {
                 trigger_characters: Some(vec!["\"".into(), "=".into(), ".".into()]),
                 resolve_provider: Some(true),
@@ -298,6 +307,10 @@ impl Backend {
                 workspace_diagnostics: false,
                 ..Default::default()
             })),
+            execute_command_provider: Some(ExecuteCommandOptions {
+                commands: vec!["deps-lsp.updateVersion".into()],
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -436,6 +449,46 @@ impl LanguageServer for Backend {
             }),
         ))
     }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> Result<Option<serde_json::Value>> {
+        tracing::info!("execute_command: {:?}", params.command);
+
+        if params.command == "deps-lsp.updateVersion" {
+            if let Some(args) = params.arguments.first() {
+                if let Ok(update_args) = serde_json::from_value::<UpdateVersionArgs>(args.clone()) {
+                    let mut edits = HashMap::new();
+                    edits.insert(
+                        update_args.uri.clone(),
+                        vec![TextEdit {
+                            range: update_args.range,
+                            new_text: format!("\"{}\"", update_args.version),
+                        }],
+                    );
+
+                    let edit = WorkspaceEdit {
+                        changes: Some(edits),
+                        ..Default::default()
+                    };
+
+                    if let Err(e) = self.client.apply_edit(edit).await {
+                        tracing::error!("Failed to apply edit: {:?}", e);
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateVersionArgs {
+    uri: Url,
+    range: Range,
+    version: String,
 }
 
 #[cfg(test)]

@@ -5,12 +5,13 @@
 //! - "Add missing feature" for feature suggestions
 
 use crate::document::{Ecosystem, ServerState, UnifiedDependency};
-use deps_cargo::{CratesIoRegistry, DependencySource, ParsedDependency};
+use deps_cargo::{CratesIoRegistry, DependencySource};
+use deps_npm::NpmRegistry;
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Range, TextEdit,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Range, TextEdit, Url,
     WorkspaceEdit,
 };
 
@@ -48,36 +49,52 @@ pub async fn handle_code_actions(
         doc.ecosystem
     );
 
-    // TODO: Add npm support in code actions
-    if doc.ecosystem != Ecosystem::Cargo {
-        tracing::debug!("Code actions not yet implemented for {:?}", doc.ecosystem);
-        return vec![];
-    }
+    let ecosystem = doc.ecosystem;
 
-    let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
-
-    let cargo_deps: Vec<&ParsedDependency> = doc
+    // Collect dependencies that overlap with the cursor range
+    let deps_to_check: Vec<(String, Range)> = doc
         .dependencies
         .iter()
         .filter_map(|dep| {
-            if let UnifiedDependency::Cargo(cargo_dep) = dep {
-                if matches!(cargo_dep.source, DependencySource::Registry) {
-                    if let Some(version_range) = cargo_dep.version_range {
-                        if ranges_overlap(version_range, range) {
-                            return Some(cargo_dep);
-                        }
-                    }
+            let (name, version_range, is_registry) = match dep {
+                UnifiedDependency::Cargo(cargo_dep) => (
+                    cargo_dep.name.clone(),
+                    cargo_dep.version_range?,
+                    matches!(cargo_dep.source, DependencySource::Registry),
+                ),
+                UnifiedDependency::Npm(npm_dep) => {
+                    (npm_dep.name.clone(), npm_dep.version_range?, true)
                 }
+            };
+
+            if is_registry && ranges_overlap(version_range, range) {
+                Some((name, version_range))
+            } else {
+                None
             }
-            None
         })
         .collect();
 
-    let futures: Vec<_> = cargo_deps
+    drop(doc);
+
+    match ecosystem {
+        Ecosystem::Cargo => handle_cargo_code_actions(state, uri, deps_to_check).await,
+        Ecosystem::Npm => handle_npm_code_actions(state, uri, deps_to_check).await,
+    }
+}
+
+async fn handle_cargo_code_actions(
+    state: Arc<ServerState>,
+    uri: &Url,
+    deps: Vec<(String, Range)>,
+) -> Vec<CodeActionOrCommand> {
+    let registry = CratesIoRegistry::new(Arc::clone(&state.cache));
+
+    let futures: Vec<_> = deps
         .iter()
-        .map(|dep| {
-            let name = dep.name.clone();
-            let version_range = dep.version_range.unwrap();
+        .map(|(name, version_range)| {
+            let name = name.clone();
+            let version_range = *version_range;
             let registry = registry.clone();
             async move {
                 let versions = registry.get_versions(&name).await;
@@ -98,29 +115,104 @@ pub async fn handle_code_actions(
             }
         };
 
-        let latest = match versions.iter().find(|v| !v.yanked) {
-            Some(v) => v,
-            None => continue,
+        // Offer multiple version options (non-yanked, up to 5)
+        for (i, version) in versions.iter().filter(|v| !v.yanked).take(5).enumerate() {
+            let mut edits = HashMap::new();
+            edits.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: version_range,
+                    new_text: format!("\"{}\"", version.num),
+                }],
+            );
+
+            let title = if i == 0 {
+                format!("Update {} to {} (latest)", name, version.num)
+            } else {
+                format!("Update {} to {}", name, version.num)
+            };
+
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(edits),
+                    ..Default::default()
+                }),
+                is_preferred: Some(i == 0),
+                ..Default::default()
+            }));
+        }
+    }
+
+    actions
+}
+
+async fn handle_npm_code_actions(
+    state: Arc<ServerState>,
+    uri: &Url,
+    deps: Vec<(String, Range)>,
+) -> Vec<CodeActionOrCommand> {
+    let registry = NpmRegistry::new(Arc::clone(&state.cache));
+
+    let futures: Vec<_> = deps
+        .iter()
+        .map(|(name, version_range)| {
+            let name = name.clone();
+            let version_range = *version_range;
+            let registry = registry.clone();
+            async move {
+                let versions = registry.get_versions(&name).await;
+                (name, version_range, versions)
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+
+    let mut actions = Vec::new();
+    for (name, version_range, versions_result) in results {
+        let versions = match versions_result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to fetch npm versions for {}: {}", name, e);
+                continue;
+            }
         };
 
-        let mut edits = HashMap::new();
-        edits.insert(
-            uri.clone(),
-            vec![TextEdit {
-                range: version_range,
-                new_text: format!("\"{}\"", latest.num),
-            }],
-        );
+        // Offer multiple version options (non-deprecated, up to 5)
+        for (i, version) in versions
+            .iter()
+            .filter(|v| !v.deprecated)
+            .take(5)
+            .enumerate()
+        {
+            let mut edits = HashMap::new();
+            edits.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: version_range,
+                    new_text: format!("\"{}\"", version.version),
+                }],
+            );
 
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!("Update {} to {}", name, latest.num),
-            kind: Some(CodeActionKind::QUICKFIX),
-            edit: Some(WorkspaceEdit {
-                changes: Some(edits),
+            let title = if i == 0 {
+                format!("Update {} to {} (latest)", name, version.version)
+            } else {
+                format!("Update {} to {}", name, version.version)
+            };
+
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title,
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(edits),
+                    ..Default::default()
+                }),
+                is_preferred: Some(i == 0),
                 ..Default::default()
-            }),
-            ..Default::default()
-        }));
+            }));
+        }
     }
 
     actions
