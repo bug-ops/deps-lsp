@@ -2,7 +2,7 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/bug-ops/deps-lsp/ci.yml?branch=main)](https://github.com/bug-ops/deps-lsp/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.86-blue)](https://blog.rust-lang.org/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
 A universal Language Server Protocol (LSP) server for dependency management across multiple package ecosystems.
@@ -109,7 +109,7 @@ Configure via LSP initialization options:
 ## Development
 
 > [!IMPORTANT]
-> Requires Rust 1.86+ (Edition 2024).
+> Requires Rust 1.89+ (Edition 2024).
 
 ### Build
 
