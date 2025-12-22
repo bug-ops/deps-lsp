@@ -66,7 +66,6 @@ pub async fn handle_code_actions(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tower_lsp::lsp_types::{Position, Range};
 
     /// Helper function for tests - checks if two ranges overlap.
