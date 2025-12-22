@@ -294,8 +294,9 @@ async fn handle_pypi_code_actions(
             // Poetry uses table format: package = "^version" or { version = "^version" }
             let new_text = match &dep.section {
                 deps_pypi::PypiDependencySection::Dependencies
-                | deps_pypi::PypiDependencySection::OptionalDependencies { .. } => {
-                    // PEP 621 format - replace just the version specifier part
+                | deps_pypi::PypiDependencySection::OptionalDependencies { .. }
+                | deps_pypi::PypiDependencySection::DependencyGroup { .. } => {
+                    // PEP 621/735 format - replace just the version specifier part
                     format!(">={}", version.version)
                 }
                 deps_pypi::PypiDependencySection::PoetryDependencies

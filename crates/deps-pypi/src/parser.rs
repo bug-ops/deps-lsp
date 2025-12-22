@@ -74,6 +74,11 @@ impl PypiParser {
             dependencies.extend(self.parse_pep621_optional_dependencies(project, content)?);
         }
 
+        // Parse PEP 735 dependency-groups format
+        if let Some(dep_groups) = doc.get("dependency-groups").and_then(|i| i.as_table()) {
+            dependencies.extend(self.parse_dependency_groups(dep_groups, content)?);
+        }
+
         // Parse Poetry format
         if let Some(tool) = doc.get("tool").and_then(|i| i.as_table())
             && let Some(poetry) = tool.get("poetry").and_then(|i| i.as_table())
@@ -157,6 +162,54 @@ impl PypiParser {
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to parse dependency '{}': {}", dep_str, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(dependencies)
+    }
+
+    /// Parse PEP 735 `[dependency-groups]` tables.
+    ///
+    /// Format: `[dependency-groups]` with named groups containing arrays of PEP 508 requirements.
+    /// Example:
+    /// ```toml
+    /// [dependency-groups]
+    /// dev = ["pytest>=8.0", "mypy>=1.0"]
+    /// test = ["pytest>=8.0", "pytest-cov>=4.0"]
+    /// ```
+    fn parse_dependency_groups(
+        &self,
+        dep_groups: &Table,
+        content: &str,
+    ) -> Result<Vec<PypiDependency>> {
+        let mut dependencies = Vec::new();
+
+        for (group_name, group_item) in dep_groups.iter() {
+            if let Some(group_array) = group_item.as_array() {
+                for (idx, value) in group_array.iter().enumerate() {
+                    if let Some(dep_str) = value.as_str() {
+                        let section_name = format!("dependency-groups.{}", group_name);
+                        let position =
+                            self.find_array_element_position(content, &section_name, idx);
+
+                        match self.parse_pep508_requirement(dep_str, position) {
+                            Ok(mut dep) => {
+                                dep.section = PypiDependencySection::DependencyGroup {
+                                    group: group_name.to_string(),
+                                };
+                                dependencies.push(dep);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to parse dependency group '{}' item '{}': {}",
+                                    group_name,
+                                    dep_str,
+                                    e
+                                );
                             }
                         }
                     }
@@ -636,6 +689,42 @@ sphinx = "^5.0"
             matches!(&d.section, PypiDependencySection::PoetryGroup { group } if group == "docs")
         }).collect();
         assert_eq!(docs_deps.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_pep735_dependency_groups() {
+        let content = r#"
+[dependency-groups]
+dev = ["pytest>=8.0", "mypy>=1.0", "ruff>=0.8"]
+test = ["pytest>=8.0", "pytest-cov>=4.0"]
+"#;
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 5);
+
+        let dev_deps: Vec<_> = deps
+            .iter()
+            .filter(|d| {
+                matches!(&d.section, PypiDependencySection::DependencyGroup { group } if group == "dev")
+            })
+            .collect();
+        assert_eq!(dev_deps.len(), 3);
+
+        let test_deps: Vec<_> = deps
+            .iter()
+            .filter(|d| {
+                matches!(&d.section, PypiDependencySection::DependencyGroup { group } if group == "test")
+            })
+            .collect();
+        assert_eq!(test_deps.len(), 2);
+
+        // Verify package names
+        assert!(dev_deps.iter().any(|d| d.name == "pytest"));
+        assert!(dev_deps.iter().any(|d| d.name == "mypy"));
+        assert!(dev_deps.iter().any(|d| d.name == "ruff"));
     }
 
     #[test]

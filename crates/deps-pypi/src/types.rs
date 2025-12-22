@@ -74,6 +74,8 @@ pub enum PypiDependencySection {
     Dependencies,
     /// PEP 621 optional dependency group (`[project.optional-dependencies.{group}]`)
     OptionalDependencies { group: String },
+    /// PEP 735 dependency group (`[dependency-groups.{group}]`)
+    DependencyGroup { group: String },
     /// Poetry runtime dependencies (`[tool.poetry.dependencies]`)
     PoetryDependencies,
     /// Poetry dependency group (`[tool.poetry.group.{group}.dependencies]`)
@@ -284,6 +286,9 @@ mod tests {
         let opt_deps = PypiDependencySection::OptionalDependencies {
             group: "dev".into(),
         };
+        let dep_group = PypiDependencySection::DependencyGroup {
+            group: "dev".into(),
+        };
         let poetry_deps = PypiDependencySection::PoetryDependencies;
         let poetry_group = PypiDependencySection::PoetryGroup {
             group: "test".into(),
@@ -293,6 +298,10 @@ mod tests {
         assert!(matches!(
             opt_deps,
             PypiDependencySection::OptionalDependencies { .. }
+        ));
+        assert!(matches!(
+            dep_group,
+            PypiDependencySection::DependencyGroup { .. }
         ));
         assert!(matches!(
             poetry_deps,
