@@ -40,9 +40,29 @@ ignore:
   - "**/main.rs"
   - "crates/deps-zed/**/*"  # WASM extension has limited testing
 
-# Flags for different test types
+# Per-crate flags for detailed coverage tracking
 flags:
-  unittests:
+  deps-core:
+    paths:
+      - crates/deps-core/src/
+    carryforward: true
+
+  deps-cargo:
+    paths:
+      - crates/deps-cargo/src/
+    carryforward: true
+
+  deps-npm:
+    paths:
+      - crates/deps-npm/src/
+    carryforward: true
+
+  deps-pypi:
+    paths:
+      - crates/deps-pypi/src/
+    carryforward: true
+
+  deps-lsp:
     paths:
       - crates/deps-lsp/src/
     carryforward: true

@@ -207,26 +207,73 @@ jobs:
         with:
           shared-key: "coverage"
 
-      - name: Generate coverage
+      - name: Generate overall coverage
         run: |
           cargo llvm-cov --all-features --workspace --lcov \
             --output-path lcov.info nextest
 
-      - name: Upload to codecov
+      - name: Generate per-crate coverage
+        run: |
+          # Generate coverage for each crate separately
+          for crate in deps-core deps-cargo deps-npm deps-pypi deps-lsp; do
+            echo "Generating coverage for $crate..."
+            cargo llvm-cov --all-features --package "$crate" --lcov \
+              --output-path "lcov-$crate.info" nextest 2>/dev/null || true
+          done
+
+      - name: Upload overall coverage
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           fail_ci_if_error: false
           verbose: true
-          flags: unittests
-          name: codecov-umbrella
 
-      - name: Archive coverage report
+      - name: Upload deps-core coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov-deps-core.info
+          flags: deps-core
+          fail_ci_if_error: false
+
+      - name: Upload deps-cargo coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov-deps-cargo.info
+          flags: deps-cargo
+          fail_ci_if_error: false
+
+      - name: Upload deps-npm coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov-deps-npm.info
+          flags: deps-npm
+          fail_ci_if_error: false
+
+      - name: Upload deps-pypi coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov-deps-pypi.info
+          flags: deps-pypi
+          fail_ci_if_error: false
+
+      - name: Upload deps-lsp coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov-deps-lsp.info
+          flags: deps-lsp
+          fail_ci_if_error: false
+
+      - name: Archive coverage reports
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
-          path: lcov.info
+          name: coverage-reports
+          path: lcov*.info
           retention-days: 30
 
   # MSRV check
