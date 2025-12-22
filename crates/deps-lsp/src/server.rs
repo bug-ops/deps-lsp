@@ -253,6 +253,7 @@ impl Backend {
                             async move {
                                 let versions = registry.get_versions(&name).await.ok()?;
                                 let latest = versions.first()?.clone();
+                                tracing::debug!("PyPI: fetched {} => {}", name, latest.version);
                                 Some((name, UnifiedVersion::Pypi(latest)))
                             }
                         })
@@ -260,6 +261,12 @@ impl Backend {
 
                     let results = join_all(futures).await;
                     let versions: HashMap<_, _> = results.into_iter().flatten().collect();
+
+                    tracing::info!(
+                        "PyPI: fetched {} package versions for {}",
+                        versions.len(),
+                        uri_clone
+                    );
 
                     // Update document with fetched versions
                     if let Some(mut doc) = state.documents.get_mut(&uri_clone) {
@@ -275,6 +282,11 @@ impl Backend {
                     .await;
 
                     client.publish_diagnostics(uri_clone, diags, None).await;
+
+                    // Request inlay hints refresh
+                    if let Err(e) = client.inlay_hint_refresh().await {
+                        tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+                    }
                 });
 
                 self.state.spawn_background_task(uri, task).await;
