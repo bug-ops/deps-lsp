@@ -19,6 +19,7 @@ path = "src/lib.rs"
 [dependencies]
 async-trait = { workspace = true }
 dashmap = { workspace = true }
+futures = { workspace = true }
 reqwest = { workspace = true, features = ["json", "gzip", "rustls-tls"] }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -29,6 +30,7 @@ toml_edit = { workspace = true }
 tower-lsp = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
