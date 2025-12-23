@@ -12,6 +12,7 @@ This crate provides parsing and registry integration for the npm ecosystem.
 ## Features
 
 - **JSON Parsing** — Parse `package.json` with position tracking
+- **Lock File Parsing** — Extract resolved versions from `package-lock.json` (v2/v3)
 - **npm Registry** — Client for npm registry API
 - **Version Resolution** — Node semver-aware version matching (`^`, `~`, ranges)
 - **Scoped Packages** — Support for `@scope/package` format

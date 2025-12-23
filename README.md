@@ -14,8 +14,9 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 
 - **Intelligent Autocomplete** — Package names, versions, and feature flags
 - **Version Hints** — Inlay hints showing latest available versions
+- **Lock File Support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
-- **Hover Information** — Package descriptions, links to documentation
+- **Hover Information** — Package descriptions with resolved version from lock file
 - **Code Actions** — Quick fixes to update dependencies
 
 ![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
