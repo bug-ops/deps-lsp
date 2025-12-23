@@ -713,7 +713,8 @@ serde = "1.0"
             .block_on(ecosystem.parse_manifest(&content, &uri))
             .unwrap();
 
-        let doc_state = DocumentState::new_from_parse_result("cargo", content.clone(), parse_result);
+        let doc_state =
+            DocumentState::new_from_parse_result("cargo", content.clone(), parse_result);
 
         assert_eq!(doc_state.ecosystem_id, "cargo");
         assert_eq!(doc_state.content, content);
@@ -732,7 +733,10 @@ serde = "1.0"
 
         state.update_resolved_versions(resolved);
         assert_eq!(state.resolved_versions.len(), 1);
-        assert_eq!(state.resolved_versions.get("serde"), Some(&"1.0.195".into()));
+        assert_eq!(
+            state.resolved_versions.get("serde"),
+            Some(&"1.0.195".into())
+        );
     }
 
     #[test]

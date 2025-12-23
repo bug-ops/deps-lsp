@@ -252,7 +252,11 @@ serde = "1.0"
         let parse_result = ecosystem.parse_manifest(content, &uri).await;
         assert!(parse_result.is_ok());
 
-        let doc_state = DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result.unwrap());
+        let doc_state = DocumentState::new_from_parse_result(
+            "cargo",
+            content.to_string(),
+            parse_result.unwrap(),
+        );
         state.update_document(uri.clone(), doc_state);
 
         assert_eq!(state.document_count(), 1);
@@ -274,7 +278,8 @@ serde = "1.0"
         let parse_result = ecosystem.parse_manifest(content, &uri).await;
         assert!(parse_result.is_ok());
 
-        let doc_state = DocumentState::new_from_parse_result("npm", content.to_string(), parse_result.unwrap());
+        let doc_state =
+            DocumentState::new_from_parse_result("npm", content.to_string(), parse_result.unwrap());
         state.update_document(uri.clone(), doc_state);
 
         let doc = state.get_document(&uri).unwrap();
@@ -297,7 +302,11 @@ dependencies = ["requests>=2.0.0"]
         let parse_result = ecosystem.parse_manifest(content, &uri).await;
         assert!(parse_result.is_ok());
 
-        let doc_state = DocumentState::new_from_parse_result("pypi", content.to_string(), parse_result.unwrap());
+        let doc_state = DocumentState::new_from_parse_result(
+            "pypi",
+            content.to_string(),
+            parse_result.unwrap(),
+        );
         state.update_document(uri.clone(), doc_state);
 
         let doc = state.get_document(&uri).unwrap();
