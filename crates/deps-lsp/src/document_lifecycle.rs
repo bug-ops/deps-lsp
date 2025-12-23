@@ -214,3 +214,93 @@ pub async fn handle_document_change(
 
     Ok(task)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ecosystem_registry_lookup() {
+        let state = ServerState::new();
+
+        let cargo_uri = tower_lsp::lsp_types::Url::parse("file:///test/Cargo.toml").unwrap();
+        assert!(state.ecosystem_registry.get_for_uri(&cargo_uri).is_some());
+
+        let npm_uri = tower_lsp::lsp_types::Url::parse("file:///test/package.json").unwrap();
+        assert!(state.ecosystem_registry.get_for_uri(&npm_uri).is_some());
+
+        let pypi_uri = tower_lsp::lsp_types::Url::parse("file:///test/pyproject.toml").unwrap();
+        assert!(state.ecosystem_registry.get_for_uri(&pypi_uri).is_some());
+
+        let unknown_uri = tower_lsp::lsp_types::Url::parse("file:///test/unknown.txt").unwrap();
+        assert!(state.ecosystem_registry.get_for_uri(&unknown_uri).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_document_parsing_cargo() {
+        let state = Arc::new(ServerState::new());
+        let uri = tower_lsp::lsp_types::Url::parse("file:///test/Cargo.toml").unwrap();
+        let content = r#"[dependencies]
+serde = "1.0"
+"#;
+
+        let ecosystem = state
+            .ecosystem_registry
+            .get_for_uri(&uri)
+            .expect("Cargo ecosystem not found");
+
+        let parse_result = ecosystem.parse_manifest(content, &uri).await;
+        assert!(parse_result.is_ok());
+
+        let doc_state = DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result.unwrap());
+        state.update_document(uri.clone(), doc_state);
+
+        assert_eq!(state.document_count(), 1);
+        let doc = state.get_document(&uri).unwrap();
+        assert_eq!(doc.ecosystem_id, "cargo");
+    }
+
+    #[tokio::test]
+    async fn test_document_parsing_npm() {
+        let state = Arc::new(ServerState::new());
+        let uri = tower_lsp::lsp_types::Url::parse("file:///test/package.json").unwrap();
+        let content = r#"{"dependencies": {"express": "^4.18.0"}}"#;
+
+        let ecosystem = state
+            .ecosystem_registry
+            .get_for_uri(&uri)
+            .expect("npm ecosystem not found");
+
+        let parse_result = ecosystem.parse_manifest(content, &uri).await;
+        assert!(parse_result.is_ok());
+
+        let doc_state = DocumentState::new_from_parse_result("npm", content.to_string(), parse_result.unwrap());
+        state.update_document(uri.clone(), doc_state);
+
+        let doc = state.get_document(&uri).unwrap();
+        assert_eq!(doc.ecosystem_id, "npm");
+    }
+
+    #[tokio::test]
+    async fn test_document_parsing_pypi() {
+        let state = Arc::new(ServerState::new());
+        let uri = tower_lsp::lsp_types::Url::parse("file:///test/pyproject.toml").unwrap();
+        let content = r#"[project]
+dependencies = ["requests>=2.0.0"]
+"#;
+
+        let ecosystem = state
+            .ecosystem_registry
+            .get_for_uri(&uri)
+            .expect("pypi ecosystem not found");
+
+        let parse_result = ecosystem.parse_manifest(content, &uri).await;
+        assert!(parse_result.is_ok());
+
+        let doc_state = DocumentState::new_from_parse_result("pypi", content.to_string(), parse_result.unwrap());
+        state.update_document(uri.clone(), doc_state);
+
+        let doc = state.get_document(&uri).unwrap();
+        assert_eq!(doc.ecosystem_id, "pypi");
+    }
+}

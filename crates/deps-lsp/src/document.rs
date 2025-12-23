@@ -599,4 +599,235 @@ mod tests {
         // Cancel task
         state.cancel_background_task(&uri).await;
     }
+
+    #[test]
+    fn test_unified_dependency_name() {
+        use deps_cargo::{DependencySection, DependencySource};
+        use tower_lsp::lsp_types::{Position, Range};
+
+        let cargo_dep = UnifiedDependency::Cargo(ParsedDependency {
+            name: "serde".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            version_req: Some("1.0".into()),
+            version_range: Some(Range::new(Position::new(0, 9), Position::new(0, 14))),
+            features: vec![],
+            features_range: None,
+            source: DependencySource::Registry,
+            workspace_inherited: false,
+            section: DependencySection::Dependencies,
+        });
+
+        assert_eq!(cargo_dep.name(), "serde");
+        assert_eq!(cargo_dep.version_req(), Some("1.0"));
+        assert!(cargo_dep.is_registry());
+    }
+
+    #[test]
+    fn test_unified_dependency_npm() {
+        use deps_npm::{NpmDependency, NpmDependencySection};
+        use tower_lsp::lsp_types::{Position, Range};
+
+        let npm_dep = UnifiedDependency::Npm(NpmDependency {
+            name: "express".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+            version_req: Some("^4.0.0".into()),
+            version_range: Some(Range::new(Position::new(0, 11), Position::new(0, 18))),
+            section: NpmDependencySection::Dependencies,
+        });
+
+        assert_eq!(npm_dep.name(), "express");
+        assert_eq!(npm_dep.version_req(), Some("^4.0.0"));
+        assert!(npm_dep.is_registry());
+    }
+
+    #[test]
+    fn test_unified_dependency_pypi() {
+        use deps_pypi::{PypiDependency, PypiDependencySection, PypiDependencySource};
+        use tower_lsp::lsp_types::{Position, Range};
+
+        let pypi_dep = UnifiedDependency::Pypi(PypiDependency {
+            name: "requests".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+            version_req: Some(">=2.0.0".into()),
+            version_range: Some(Range::new(Position::new(0, 10), Position::new(0, 18))),
+            extras: vec![],
+            extras_range: None,
+            markers: None,
+            markers_range: None,
+            source: PypiDependencySource::PyPI,
+            section: PypiDependencySection::Dependencies,
+        });
+
+        assert_eq!(pypi_dep.name(), "requests");
+        assert_eq!(pypi_dep.version_req(), Some(">=2.0.0"));
+        assert!(pypi_dep.is_registry());
+    }
+
+    #[test]
+    fn test_unified_version_cargo() {
+        let version = UnifiedVersion::Cargo(CargoVersion {
+            num: "1.0.0".into(),
+            yanked: false,
+            features: HashMap::new(),
+        });
+
+        assert_eq!(version.version_string(), "1.0.0");
+        assert!(!version.is_yanked());
+    }
+
+    #[test]
+    fn test_unified_version_npm() {
+        let version = UnifiedVersion::Npm(deps_npm::NpmVersion {
+            version: "4.18.2".into(),
+            deprecated: false,
+        });
+
+        assert_eq!(version.version_string(), "4.18.2");
+        assert!(!version.is_yanked());
+    }
+
+    #[test]
+    fn test_unified_version_pypi() {
+        let version = UnifiedVersion::Pypi(deps_pypi::PypiVersion {
+            version: "2.31.0".into(),
+            yanked: true,
+        });
+
+        assert_eq!(version.version_string(), "2.31.0");
+        assert!(version.is_yanked());
+    }
+
+    #[test]
+    fn test_document_state_new_from_parse_result() {
+        let state = ServerState::new();
+        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+
+        let content = r#"[dependencies]
+serde = "1.0"
+"#
+        .to_string();
+
+        let parse_result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(ecosystem.parse_manifest(&content, &uri))
+            .unwrap();
+
+        let doc_state = DocumentState::new_from_parse_result("cargo", content.clone(), parse_result);
+
+        assert_eq!(doc_state.ecosystem_id, "cargo");
+        assert_eq!(doc_state.content, content);
+        assert!(doc_state.parse_result.is_some());
+        assert!(doc_state.versions.is_empty());
+        assert!(doc_state.cached_versions.is_empty());
+    }
+
+    #[test]
+    fn test_document_state_update_resolved_versions() {
+        let deps = vec![create_test_cargo_dependency()];
+        let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+
+        let mut resolved = HashMap::new();
+        resolved.insert("serde".into(), "1.0.195".into());
+
+        state.update_resolved_versions(resolved);
+        assert_eq!(state.resolved_versions.len(), 1);
+        assert_eq!(state.resolved_versions.get("serde"), Some(&"1.0.195".into()));
+    }
+
+    #[test]
+    fn test_document_state_parse_result_accessor() {
+        let deps = vec![create_test_cargo_dependency()];
+        let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+
+        assert!(state.parse_result().is_none());
+    }
+
+    #[test]
+    fn test_ecosystem_from_filename_edge_cases() {
+        assert_eq!(Ecosystem::from_filename(""), None);
+        assert_eq!(Ecosystem::from_filename("cargo.toml"), None);
+        assert_eq!(Ecosystem::from_filename("CARGO.TOML"), None);
+        assert_eq!(Ecosystem::from_filename("requirements.txt"), None);
+    }
+
+    #[test]
+    fn test_server_state_default() {
+        let state = ServerState::default();
+        assert_eq!(state.document_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_background_task_cancels_previous() {
+        let state = ServerState::new();
+        let uri = Url::parse("file:///test.toml").unwrap();
+
+        let task1 = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        state.spawn_background_task(uri.clone(), task1).await;
+
+        let task2 = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+
+        state.spawn_background_task(uri.clone(), task2).await;
+
+        state.cancel_background_task(&uri).await;
+    }
+
+    #[tokio::test]
+    async fn test_cancel_background_task_nonexistent() {
+        let state = ServerState::new();
+        let uri = Url::parse("file:///test.toml").unwrap();
+
+        state.cancel_background_task(&uri).await;
+    }
+
+    #[test]
+    fn test_document_state_clone() {
+        let deps = vec![create_test_cargo_dependency()];
+        let state = DocumentState::new(Ecosystem::Cargo, "test content".into(), deps);
+
+        let cloned = state.clone();
+
+        assert_eq!(cloned.ecosystem, state.ecosystem);
+        assert_eq!(cloned.content, state.content);
+        assert_eq!(cloned.dependencies.len(), state.dependencies.len());
+        assert!(cloned.parse_result.is_none());
+    }
+
+    #[test]
+    fn test_document_state_debug() {
+        let deps = vec![create_test_cargo_dependency()];
+        let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+
+        let debug_str = format!("{:?}", state);
+        assert!(debug_str.contains("DocumentState"));
+        assert!(debug_str.contains("ecosystem"));
+    }
+
+    #[test]
+    fn test_unified_dependency_git_source() {
+        use deps_cargo::{DependencySection, DependencySource};
+        use tower_lsp::lsp_types::{Position, Range};
+
+        let git_dep = UnifiedDependency::Cargo(ParsedDependency {
+            name: "custom".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 6)),
+            version_req: None,
+            version_range: None,
+            features: vec![],
+            features_range: None,
+            source: DependencySource::Git {
+                url: "https://github.com/user/repo".into(),
+                rev: None,
+            },
+            workspace_inherited: false,
+            section: DependencySection::Dependencies,
+        });
+
+        assert!(!git_dep.is_registry());
+    }
 }
