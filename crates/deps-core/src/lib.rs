@@ -89,6 +89,8 @@
 //! ```
 
 pub mod cache;
+pub mod ecosystem;
+pub mod ecosystem_registry;
 pub mod error;
 pub mod handler;
 pub mod lockfile;
@@ -99,6 +101,8 @@ pub mod version_matcher;
 
 // Re-export commonly used types
 pub use cache::{CachedResponse, HttpCache};
+pub use ecosystem::{Dependency, Ecosystem, EcosystemConfig, ParseResult};
+pub use ecosystem_registry::EcosystemRegistry;
 pub use error::{DepsError, Result};
 pub use handler::{
     DiagnosticsConfig, EcosystemHandler, InlayHintsConfig, VersionStringGetter, YankedChecker,
@@ -106,7 +110,7 @@ pub use handler::{
 };
 pub use lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
 pub use parser::{DependencyInfo, DependencySource, ManifestParser, ParseResultInfo};
-pub use registry::{PackageMetadata, PackageRegistry, VersionInfo};
+pub use registry::{Metadata, PackageMetadata, PackageRegistry, Registry, Version, VersionInfo};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version,

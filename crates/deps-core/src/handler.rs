@@ -2,6 +2,12 @@
 //!
 //! Provides traits and generic functions for implementing LSP operations
 //! (inlay hints, hover, etc.) across different package ecosystems.
+//!
+//! # Deprecation Notice
+//!
+//! This module is being phased out in favor of the new `Ecosystem` trait.
+//! The `EcosystemHandler` trait will be removed in a future version.
+//! New implementations should use `crate::ecosystem::Ecosystem` instead.
 
 use crate::HttpCache;
 use crate::parser::DependencyInfo;
