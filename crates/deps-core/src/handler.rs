@@ -356,10 +356,17 @@ where
             continue;
         };
 
+        tracing::debug!(
+            "inlay hints: fetched {} versions for '{}', looking for non-yanked",
+            versions.len(),
+            name
+        );
+
         let Some(latest) = versions
             .iter()
             .find(|v: &&<H::Registry as PackageRegistry>::Version| !v.is_yanked())
         else {
+            tracing::warn!("No non-yanked versions found for '{}'", name);
             continue;
         };
 

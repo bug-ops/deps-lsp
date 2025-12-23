@@ -59,7 +59,19 @@ pub async fn handle_inlay_hints(
         .dependencies
         .iter()
         .filter(|dep| {
-            dep.is_registry() && dep.version_range().is_some() && dep.version_req().is_some()
+            let passes = dep.is_registry()
+                && dep.version_range().is_some()
+                && dep.version_req().is_some();
+            if !passes {
+                tracing::debug!(
+                    "inlay hints: filtering out '{}' - is_registry={}, version_range={:?}, version_req={:?}",
+                    dep.name(),
+                    dep.is_registry(),
+                    dep.version_range(),
+                    dep.version_req()
+                );
+            }
+            passes
         })
         .cloned()
         .collect();

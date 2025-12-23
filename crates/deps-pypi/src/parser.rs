@@ -882,6 +882,36 @@ dev = ["pytest>=8.0", "mypy>=1.0"]
     }
 
     #[test]
+    fn test_position_tracking_multiline_array() {
+        // Test multiline array format like maturin uses
+        let content = r#"[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "maturin>=1.7,<2.0",
+]
+"#;
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(content).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 2);
+
+        // Check maturin - key test case
+        let maturin = deps.iter().find(|d| d.name == "maturin").unwrap();
+        assert!(
+            maturin.version_range.is_some(),
+            "maturin version_range should be Some, got None"
+        );
+        // Note: pep508 normalizes version spec with space after comma
+        assert_eq!(
+            maturin.version_req.as_deref(),
+            Some(">=1.7, <2.0"),
+            "maturin version_req mismatch"
+        );
+    }
+
+    #[test]
     fn test_position_tracking_with_extras() {
         let content = r#"[project]
 dependencies = ["flask[async]>=3.0"]
