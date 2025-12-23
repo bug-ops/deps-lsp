@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use deps_core::{HttpCache, PackageRegistry};
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
+use std::any::Any;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -45,8 +46,11 @@ pub fn normalize_package_name(name: &str) -> String {
 }
 
 /// Returns the URL for a package's page on pypi.org.
+///
+/// Package names are normalized and URL-encoded to prevent path traversal attacks.
 pub fn package_url(name: &str) -> String {
-    format!("{}/{}", PYPI_URL, normalize_package_name(name))
+    let normalized = normalize_package_name(name);
+    format!("{}/{}", PYPI_URL, urlencoding::encode(&normalized))
 }
 
 /// Client for interacting with the PyPI registry.
@@ -259,6 +263,49 @@ impl PackageRegistry for PypiRegistry {
         PypiRegistry::search(self, query, limit)
             .await
             .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))
+    }
+}
+
+// Implement Registry trait for PypiRegistry
+#[async_trait]
+impl deps_core::Registry for PypiRegistry {
+    async fn get_versions(&self, name: &str) -> deps_core::error::Result<Vec<Box<dyn deps_core::Version>>> {
+        let versions = PypiRegistry::get_versions(self, name)
+            .await
+            .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
+        Ok(versions
+            .into_iter()
+            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+            .collect())
+    }
+
+    async fn get_latest_matching(
+        &self,
+        name: &str,
+        req: &str,
+    ) -> deps_core::error::Result<Option<Box<dyn deps_core::Version>>> {
+        let version = PypiRegistry::get_latest_matching(self, name, req)
+            .await
+            .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
+        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>> {
+        let packages = PypiRegistry::search(self, query, limit)
+            .await
+            .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
+        Ok(packages
+            .into_iter()
+            .map(|p| Box::new(p) as Box<dyn deps_core::Metadata>)
+            .collect())
+    }
+
+    fn package_url(&self, name: &str) -> String {
+        package_url(name)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

@@ -21,6 +21,7 @@ tokio = { workspace = true }
 tower-lsp = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
+urlencoding = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }

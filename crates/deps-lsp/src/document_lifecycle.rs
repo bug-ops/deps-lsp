@@ -345,7 +345,7 @@ pub async fn npm_open(
         state,
         client,
         config,
-        |content, _uri| parse_package_json(content).map(|r| r.dependencies),
+        |content, uri| parse_package_json(content, uri).map(|r| r.dependencies),
         UnifiedDependency::Npm,
         UnifiedVersion::Npm,
         Ecosystem::Npm,
@@ -371,7 +371,7 @@ pub async fn npm_change(
         state,
         client,
         config,
-        |content, _uri| parse_package_json(content).map(|r| r.dependencies),
+        |content, uri| parse_package_json(content, uri).map(|r| r.dependencies),
         UnifiedDependency::Npm,
         Ecosystem::Npm,
     )
@@ -395,10 +395,10 @@ pub async fn pypi_open(
         state,
         client,
         config,
-        |content, _uri| {
+        |content, uri| {
             let parser = PypiParser::new();
             parser
-                .parse_content(content)
+                .parse_content(content, uri)
                 .map(|r| r.dependencies)
                 .map_err(|e| deps_core::DepsError::ParseError {
                     file_type: "pyproject.toml".into(),
@@ -430,10 +430,10 @@ pub async fn pypi_change(
         state,
         client,
         config,
-        |content, _uri| {
+        |content, uri| {
             let parser = PypiParser::new();
             parser
-                .parse_content(content)
+                .parse_content(content, uri)
                 .map(|r| r.dependencies)
                 .map_err(|e| deps_core::DepsError::ParseError {
                     file_type: "pyproject.toml".into(),

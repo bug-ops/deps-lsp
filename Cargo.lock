@@ -392,6 +392,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.17",
  "tokio",
  "tokio-test",
  "toml_edit",
@@ -455,6 +456,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.17",
  "tokio",
  "tower-lsp",
  "tracing",
@@ -480,6 +482,7 @@ dependencies = [
  "toml_edit",
  "tower-lsp",
  "tracing",
+ "urlencoding",
 ]
 
 [[package]]

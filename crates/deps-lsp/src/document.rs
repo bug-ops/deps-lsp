@@ -387,7 +387,13 @@ impl ServerState {
         let cargo_ecosystem = Arc::new(deps_cargo::CargoEcosystem::new(Arc::clone(&cache)));
         ecosystem_registry.register(cargo_ecosystem);
 
-        // TODO: Register npm and pypi ecosystems in Phase 4
+        // Register npm ecosystem
+        let npm_ecosystem = Arc::new(deps_npm::NpmEcosystem::new(Arc::clone(&cache)));
+        ecosystem_registry.register(npm_ecosystem);
+
+        // Register PyPI ecosystem
+        let pypi_ecosystem = Arc::new(deps_pypi::PypiEcosystem::new(Arc::clone(&cache)));
+        ecosystem_registry.register(pypi_ecosystem);
 
         Self {
             documents: DashMap::new(),

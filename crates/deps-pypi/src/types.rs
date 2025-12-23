@@ -1,3 +1,4 @@
+use std::any::Any;
 use tower_lsp::lsp_types::Range;
 
 /// Parsed dependency from pyproject.toml with position tracking.
@@ -209,6 +210,42 @@ pub struct PypiPackage {
 
 // Implement deps_core traits
 
+impl deps_core::Dependency for PypiDependency {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&str> {
+        self.version_req.as_deref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::parser::DependencySource {
+        match &self.source {
+            PypiDependencySource::PyPI => deps_core::parser::DependencySource::Registry,
+            PypiDependencySource::Git { url, rev } => deps_core::parser::DependencySource::Git {
+                url: url.clone(),
+                rev: rev.clone(),
+            },
+            PypiDependencySource::Path { path } => deps_core::parser::DependencySource::Path {
+                path: path.clone(),
+            },
+            PypiDependencySource::Url { .. } => deps_core::parser::DependencySource::Registry,
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 impl deps_core::VersionInfo for PypiVersion {
     fn version_string(&self) -> &str {
         &self.version
@@ -216,6 +253,20 @@ impl deps_core::VersionInfo for PypiVersion {
 
     fn is_yanked(&self) -> bool {
         self.yanked
+    }
+}
+
+impl deps_core::Version for PypiVersion {
+    fn version_string(&self) -> &str {
+        &self.version
+    }
+
+    fn is_yanked(&self) -> bool {
+        self.yanked
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -252,6 +303,46 @@ impl deps_core::PackageMetadata for PypiPackage {
 
     fn latest_version(&self) -> &str {
         &self.latest_version
+    }
+}
+
+impl deps_core::Metadata for PypiPackage {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.summary.as_deref()
+    }
+
+    fn repository(&self) -> Option<&str> {
+        self.project_urls
+            .iter()
+            .find(|(key, _)| {
+                key.eq_ignore_ascii_case("repository")
+                    || key.eq_ignore_ascii_case("source")
+                    || key.eq_ignore_ascii_case("code")
+            })
+            .map(|(_, url)| url.as_str())
+    }
+
+    fn documentation(&self) -> Option<&str> {
+        self.project_urls
+            .iter()
+            .find(|(key, _)| {
+                key.eq_ignore_ascii_case("documentation")
+                    || key.eq_ignore_ascii_case("docs")
+                    || key.eq_ignore_ascii_case("homepage")
+            })
+            .map(|(_, url)| url.as_str())
+    }
+
+    fn latest_version(&self) -> &str {
+        &self.latest_version
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

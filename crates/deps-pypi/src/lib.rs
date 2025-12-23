@@ -26,6 +26,7 @@
 //!
 //! ```no_run
 //! use deps_pypi::PypiParser;
+//! use tower_lsp::lsp_types::Url;
 //!
 //! let content = r#"
 //! [project]
@@ -36,7 +37,8 @@
 //! "#;
 //!
 //! let parser = PypiParser::new();
-//! let result = parser.parse_content(content).unwrap();
+//! let uri = Url::parse("file:///project/pyproject.toml").unwrap();
+//! let result = parser.parse_content(content, &uri).unwrap();
 //!
 //! assert_eq!(result.dependencies.len(), 2);
 //! assert_eq!(result.dependencies[0].name, "requests");
@@ -95,6 +97,7 @@
 //! mypy = "^1.0"
 //! ```
 
+pub mod ecosystem;
 pub mod error;
 pub mod lockfile;
 pub mod parser;
@@ -102,6 +105,7 @@ pub mod registry;
 pub mod types;
 
 // Re-export commonly used types
+pub use ecosystem::PypiEcosystem;
 pub use error::{PypiError, Result};
 pub use lockfile::PypiLockParser;
 pub use parser::PypiParser;

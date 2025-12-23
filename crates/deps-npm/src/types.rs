@@ -1,3 +1,4 @@
+use std::any::Any;
 use tower_lsp::lsp_types::Range;
 
 /// Parsed dependency from package.json with position tracking.
@@ -138,6 +139,32 @@ impl deps_core::DependencyInfo for NpmDependency {
     }
 }
 
+impl deps_core::Dependency for NpmDependency {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&str> {
+        self.version_req.as_deref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::parser::DependencySource {
+        deps_core::parser::DependencySource::Registry
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 impl deps_core::VersionInfo for NpmVersion {
     fn version_string(&self) -> &str {
         &self.version
@@ -145,6 +172,20 @@ impl deps_core::VersionInfo for NpmVersion {
 
     fn is_yanked(&self) -> bool {
         self.deprecated
+    }
+}
+
+impl deps_core::Version for NpmVersion {
+    fn version_string(&self) -> &str {
+        &self.version
+    }
+
+    fn is_yanked(&self) -> bool {
+        self.deprecated
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -167,6 +208,32 @@ impl deps_core::PackageMetadata for NpmPackage {
 
     fn latest_version(&self) -> &str {
         &self.latest_version
+    }
+}
+
+impl deps_core::Metadata for NpmPackage {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    fn repository(&self) -> Option<&str> {
+        self.repository.as_deref()
+    }
+
+    fn documentation(&self) -> Option<&str> {
+        self.homepage.as_deref()
+    }
+
+    fn latest_version(&self) -> &str {
+        &self.latest_version
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

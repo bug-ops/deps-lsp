@@ -1,6 +1,7 @@
 use crate::error::{PypiError, Result};
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
 use pep508_rs::{Requirement, VersionOrUrl};
+use std::any::Any;
 use std::str::FromStr;
 use toml_edit::{DocumentMut, Item, Table};
 use tower_lsp::lsp_types::{Position, Range, Url};
@@ -14,6 +15,29 @@ pub struct ParseResult {
     pub dependencies: Vec<PypiDependency>,
     /// Workspace root path (None for Python - no workspace concept like Cargo)
     pub workspace_root: Option<std::path::PathBuf>,
+    /// URI of the parsed file
+    pub uri: Url,
+}
+
+impl deps_core::ParseResult for ParseResult {
+    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+        self.dependencies
+            .iter()
+            .map(|d| d as &dyn deps_core::Dependency)
+            .collect()
+    }
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.workspace_root.as_deref()
+    }
+
+    fn uri(&self) -> &Url {
+        &self.uri
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// Parser for Python pyproject.toml files.
@@ -25,6 +49,7 @@ pub struct ParseResult {
 ///
 /// ```no_run
 /// use deps_pypi::parser::PypiParser;
+/// use tower_lsp::lsp_types::Url;
 ///
 /// let content = r#"
 /// [project]
@@ -32,7 +57,8 @@ pub struct ParseResult {
 /// "#;
 ///
 /// let parser = PypiParser::new();
-/// let result = parser.parse_content(content).unwrap();
+/// let uri = Url::parse("file:///test/pyproject.toml").unwrap();
+/// let result = parser.parse_content(content, &uri).unwrap();
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
 pub struct PypiParser;
@@ -57,11 +83,13 @@ impl PypiParser {
     ///
     /// ```no_run
     /// # use deps_pypi::parser::PypiParser;
+    /// # use tower_lsp::lsp_types::Url;
     /// let parser = PypiParser::new();
     /// let content = std::fs::read_to_string("pyproject.toml").unwrap();
-    /// let result = parser.parse_content(&content).unwrap();
+    /// let uri = Url::parse("file:///project/pyproject.toml").unwrap();
+    /// let result = parser.parse_content(&content, &uri).unwrap();
     /// ```
-    pub fn parse_content(&self, content: &str) -> Result<ParseResult> {
+    pub fn parse_content(&self, content: &str, uri: &Url) -> Result<ParseResult> {
         let doc = content
             .parse::<DocumentMut>()
             .map_err(|e| PypiError::TomlParseError { source: e })?;
@@ -90,6 +118,7 @@ impl PypiParser {
         Ok(ParseResult {
             dependencies,
             workspace_root: None,
+            uri: uri.clone(),
         })
     }
 
@@ -571,8 +600,8 @@ impl deps_core::ManifestParser for PypiParser {
     type Dependency = PypiDependency;
     type ParseResult = ParseResult;
 
-    fn parse(&self, content: &str, _doc_uri: &Url) -> deps_core::error::Result<Self::ParseResult> {
-        self.parse_content(content)
+    fn parse(&self, content: &str, doc_uri: &Url) -> deps_core::error::Result<Self::ParseResult> {
+        self.parse_content(content, doc_uri)
             .map_err(|e| deps_core::error::DepsError::ParseError {
                 file_type: "pyproject.toml".to_string(),
                 source: Box::new(e),
@@ -633,6 +662,10 @@ impl deps_core::ParseResultInfo for ParseResult {
 mod tests {
     use super::*;
 
+    fn test_uri() -> Url {
+        Url::parse("file:///test/pyproject.toml").unwrap()
+    }
+
     #[test]
     fn test_parse_pep621_dependencies() {
         let content = r#"
@@ -644,7 +677,7 @@ dependencies = [
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 2);
@@ -668,7 +701,7 @@ docs = ["sphinx>=5.0"]
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 3);
@@ -693,7 +726,7 @@ requests = "^2.28.0"
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         // Should skip "python"
@@ -717,7 +750,7 @@ sphinx = "^5.0"
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 3);
@@ -742,7 +775,7 @@ test = ["pytest>=8.0", "pytest-cov>=4.0"]
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 5);
@@ -779,7 +812,7 @@ dependencies = [
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 1);
@@ -801,7 +834,7 @@ flask = "^3.0"
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 2);
@@ -823,7 +856,7 @@ flask = "^3.0"
     fn test_parse_invalid_toml() {
         let content = "invalid toml {{{";
         let parser = PypiParser::new();
-        let result = parser.parse_content(content);
+        let result = parser.parse_content(content, &test_uri());
 
         assert!(result.is_err());
         assert!(matches!(
@@ -840,7 +873,7 @@ name = "test"
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 0);
@@ -854,7 +887,7 @@ dev = ["pytest>=8.0", "mypy>=1.0"]
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 2);
@@ -903,7 +936,7 @@ dev = [
         //             5    12        22 (end of version, before closing quote)
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let maturin = &result.dependencies[0];
 
         let version_range = maturin.version_range.unwrap();
@@ -924,7 +957,7 @@ dev = [
         // ">=1.7, <2.0" = 11 chars, end at 12 + 11 = 23
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let maturin = &result.dependencies[0];
 
         let version_range = maturin.version_range.unwrap();
@@ -939,7 +972,7 @@ dependencies = ["flask[async]>=3.0"]
 "#;
 
         let parser = PypiParser::new();
-        let result = parser.parse_content(content).unwrap();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 1);
@@ -968,7 +1001,7 @@ dependencies = [
 ]
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].name, "django");
@@ -986,7 +1019,7 @@ python = "^3.9"
 django = "^4.0"
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "django");
@@ -1002,7 +1035,7 @@ dependencies = [
 ]
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].name, "pywin32");
@@ -1016,7 +1049,7 @@ dependencies = [
 django = { version = "^4.0", python = "^3.9" }
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         // Poetry table-style with python constraints may not be fully parsed yet
         if !deps.is_empty() {
@@ -1035,7 +1068,7 @@ dependencies = [
 ]
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].name, "mylib");
@@ -1052,7 +1085,7 @@ dependencies = ["django>=4.0"]
 [project.optional-dependencies]
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "django");
@@ -1069,7 +1102,7 @@ dependencies = [
 ]
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 2);
     }
@@ -1083,7 +1116,7 @@ dependencies = [
 ]
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].version_req.as_deref(), Some("==4.*"));
@@ -1097,7 +1130,7 @@ mylib = { path = "../mylib" }
 django = "^4.0"
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         // Poetry path dependencies may not be fully parsed yet
         let django_dep = deps.iter().find(|d| d.name == "django");
@@ -1117,7 +1150,7 @@ dev = [
 ]
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert!(deps.len() >= 2);
         assert!(deps.iter().any(|d| d.name == "pytest"));
@@ -1133,7 +1166,7 @@ dependencies = [
 ]
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "django");
@@ -1148,7 +1181,7 @@ dependencies = [
 requires = ["setuptools"]
 "#;
         let parser = PypiParser::new();
-        let result = parser.parse_content(toml).unwrap();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 0);
     }
