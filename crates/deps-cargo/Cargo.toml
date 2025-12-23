@@ -24,8 +24,10 @@ urlencoding = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 insta = { workspace = true, features = ["json"] }
+once_cell = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test = { workspace = true }
 
 [[bench]]
 name = "cargo_benchmarks"
