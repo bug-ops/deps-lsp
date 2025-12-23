@@ -14,6 +14,7 @@ This crate provides parsing and registry integration for Python's PyPI ecosystem
 - **PEP 621 Support** — Parse `[project.dependencies]` and `[project.optional-dependencies]`
 - **PEP 735 Support** — Parse `[dependency-groups]` (new standard)
 - **Poetry Support** — Parse `[tool.poetry.dependencies]` and groups
+- **Lock File Parsing** — Extract resolved versions from `poetry.lock` and `uv.lock`
 - **PEP 508 Parsing** — Handle complex dependency specifications with extras and markers
 - **PEP 440 Versions** — Validate and compare Python version specifiers
 - **PyPI API Client** — Fetch package metadata from PyPI JSON API

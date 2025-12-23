@@ -12,7 +12,8 @@ This crate provides the shared infrastructure used by ecosystem-specific crates 
 ## Features
 
 - **EcosystemHandler Trait** — Unified interface for all package ecosystems
-- **Generic LSP Handlers** — `generate_inlay_hints`, `generate_hover_info`, `generate_code_actions`, `generate_diagnostics`
+- **LockFileProvider Trait** — Abstract lock file parsing for resolved versions
+- **Generic LSP Handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics`
 - **HTTP Cache** — ETag/Last-Modified caching for registry requests
 - **Version Matchers** — Semver and PEP 440 version matching
 - **Error Types** — Unified error handling with `thiserror`
