@@ -279,7 +279,6 @@ where
     let mut cached_deps = Vec::with_capacity(dependencies.len());
     let mut fetch_deps = Vec::with_capacity(dependencies.len());
 
-    // Separate deps into cached and needs-fetch
     for dep in dependencies {
         let Some(typed_dep) = H::extract_dependency(dep) else {
             continue;
@@ -312,7 +311,6 @@ where
         fetch_deps.len()
     );
 
-    // Fetch missing versions in parallel
     let registry = handler.registry().clone();
     let futures: Vec<_> = fetch_deps
         .into_iter()
@@ -329,7 +327,6 @@ where
 
     let mut hints = Vec::new();
 
-    // Process cached deps
     for (name, version_req, version_range, latest_version, is_yanked) in cached_deps {
         if is_yanked {
             continue;
@@ -344,7 +341,6 @@ where
         ));
     }
 
-    // Process fetched deps
     for (name, version_req, version_range, result) in fetch_results {
         let Ok(versions): std::result::Result<Vec<<H::Registry as PackageRegistry>::Version>, _> =
             result
@@ -373,9 +369,6 @@ where
     hints
 }
 
-/// Generic hint creation.
-///
-/// Uses ecosystem-specific URL and display name from the handler trait.
 #[inline]
 fn create_hint<H: EcosystemHandler>(
     name: &str,
@@ -455,7 +448,6 @@ where
     let url = H::package_url(typed_dep.name());
     let mut markdown = format!("# [{}]({})\n\n", typed_dep.name(), url);
 
-    // Prefer resolved version from lock file, fallback to manifest version requirement
     if let Some(version) = resolved_version.or(typed_dep.version_requirement()) {
         markdown.push_str(&format!("**Current**: `{}`\n\n", version));
     }
@@ -479,7 +471,6 @@ where
         ));
     }
 
-    // Features (if supported by ecosystem)
     let features = latest.features();
     if !features.is_empty() {
         markdown.push_str("\n**Features**:\n");
@@ -554,7 +545,6 @@ where
         CodeAction, CodeActionKind, CodeActionOrCommand, TextEdit, WorkspaceEdit,
     };
 
-    // Extract dependencies overlapping with selected range
     let mut deps_to_check = Vec::new();
     for dep in dependencies {
         let Some(typed_dep) = H::extract_dependency(dep) else {
@@ -577,7 +567,6 @@ where
         return vec![];
     }
 
-    // Fetch versions in parallel
     let registry = handler.registry().clone();
     let futures: Vec<_> = deps_to_check
         .iter()
@@ -594,7 +583,6 @@ where
 
     let results = join_all(futures).await;
 
-    // Generate actions
     let mut actions = Vec::new();
     for (name, dep, version_range, versions_result) in results {
         let Ok(versions) = versions_result else {
@@ -602,7 +590,6 @@ where
             continue;
         };
 
-        // Offer up to MAX_CODE_ACTION_VERSIONS non-deprecated versions
         for (i, version) in versions
             .iter()
             .filter(|v| !H::is_deprecated(v))
@@ -642,7 +629,6 @@ where
     actions
 }
 
-/// Helper: Check if two ranges overlap.
 fn ranges_overlap(a: Range, b: Range) -> bool {
     !(a.end.line < b.start.line
         || (a.end.line == b.start.line && a.end.character < b.start.character)
@@ -681,7 +667,6 @@ where
 {
     use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-    // Extract typed dependencies
     let mut deps_to_check = Vec::new();
     for dep in dependencies {
         let Some(typed_dep) = H::extract_dependency(dep) else {
@@ -694,7 +679,6 @@ where
         return vec![];
     }
 
-    // Fetch versions in parallel
     let registry = handler.registry().clone();
     let futures: Vec<_> = deps_to_check
         .iter()
@@ -710,13 +694,11 @@ where
 
     let version_results = join_all(futures).await;
 
-    // Generate diagnostics
     let mut diagnostics = Vec::new();
 
     for (i, dep) in deps_to_check.iter().enumerate() {
         let (name, version_result) = &version_results[i];
 
-        // Check for unknown package
         let versions = match version_result {
             Ok(v) => v,
             Err(_) => {
@@ -731,11 +713,9 @@ where
             }
         };
 
-        // Check version requirement if present
         if let Some(version_req) = dep.version_requirement()
             && let Some(version_range) = dep.version_range()
         {
-            // Parse version requirement
             let Some(parsed_version_req) = H::parse_version_req(version_req) else {
                 diagnostics.push(Diagnostic {
                     range: version_range,
@@ -747,7 +727,6 @@ where
                 continue;
             };
 
-            // Get matching version (skip if registry call fails)
             let matching = handler
                 .registry()
                 .get_latest_matching(name, &parsed_version_req)
@@ -755,7 +734,6 @@ where
                 .ok()
                 .flatten();
 
-            // Check for yanked/deprecated version
             if let Some(current) = &matching
                 && H::is_deprecated(current)
             {
@@ -768,7 +746,6 @@ where
                 });
             }
 
-            // Check for outdated version
             let latest = versions.iter().find(|v| !H::is_deprecated(v));
             if let (Some(latest), Some(current)) = (latest, &matching)
                 && latest.version_string() != current.version_string()

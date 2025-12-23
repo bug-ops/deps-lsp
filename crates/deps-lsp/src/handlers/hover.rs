@@ -49,7 +49,6 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
 
     let ecosystem = doc.ecosystem;
     let dep = dep.clone();
-    // Get resolved version from lock file if available
     let resolved_version = doc.resolved_versions.get(dep.name()).cloned();
     drop(doc);
 
@@ -69,7 +68,6 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
     }
 }
 
-/// Checks if a position is within a range.
 fn position_in_range(pos: Position, range: Range) -> bool {
     (pos.line > range.start.line
         || (pos.line == range.start.line && pos.character >= range.start.character))

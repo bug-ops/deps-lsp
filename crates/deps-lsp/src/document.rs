@@ -221,9 +221,9 @@ pub struct DocumentState {
     pub content: String,
     /// Parsed dependencies with positions
     pub dependencies: Vec<UnifiedDependency>,
-    /// Cached latest version information from registry (for inlay hints)
+    /// Cached latest version information from registry
     pub versions: HashMap<String, UnifiedVersion>,
-    /// Resolved versions from lock file (for hover "Current" display)
+    /// Resolved versions from lock file
     pub resolved_versions: HashMap<String, String>,
     /// Last successful parse time
     pub parsed_at: Instant,
@@ -250,17 +250,11 @@ impl DocumentState {
     }
 
     /// Updates the cached latest version information for dependencies.
-    ///
-    /// This is called after fetching version data from the registry.
-    /// Used for inlay hints to show latest available version.
     pub fn update_versions(&mut self, versions: HashMap<String, UnifiedVersion>) {
         self.versions = versions;
     }
 
     /// Updates the resolved versions from lock file.
-    ///
-    /// This is called after parsing the lock file.
-    /// Used for hover to show actual installed version.
     pub fn update_resolved_versions(&mut self, versions: HashMap<String, String>) {
         self.resolved_versions = versions;
     }
