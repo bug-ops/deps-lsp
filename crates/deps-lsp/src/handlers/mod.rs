@@ -34,10 +34,14 @@
 
 pub mod cargo_handler_impl;
 pub mod code_actions;
+pub mod code_actions_new; // Phase 3: New trait-based implementation
 pub mod completion;
 pub mod diagnostics;
+pub mod diagnostics_new; // Phase 3: New trait-based implementation
 pub mod hover;
+pub mod hover_new; // Phase 3: New trait-based implementation
 pub mod inlay_hints;
+pub mod inlay_hints_new; // Phase 3: New trait-based implementation
 pub mod npm_handler_impl;
 pub mod pypi_handler_impl;
 
