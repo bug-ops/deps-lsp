@@ -1287,10 +1287,10 @@ build-backend = "setuptools.build_meta"
         let deps = &result.dependencies;
 
         assert_eq!(deps.len(), 3);
-        assert!(deps.iter().all(|d| matches!(
-            d.section,
-            PypiDependencySection::BuildSystem
-        )));
+        assert!(
+            deps.iter()
+                .all(|d| matches!(d.section, PypiDependencySection::BuildSystem))
+        );
 
         let setuptools = deps.iter().find(|d| d.name == "setuptools").unwrap();
         assert_eq!(setuptools.version_req, Some(">=61.0".to_string()));

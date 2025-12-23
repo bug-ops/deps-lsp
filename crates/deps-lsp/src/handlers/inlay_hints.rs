@@ -64,7 +64,12 @@ pub async fn handle_inlay_hints(
     };
 
     let hints = ecosystem
-        .generate_inlay_hints(parse_result, &cached_versions, &resolved_versions, &ecosystem_config)
+        .generate_inlay_hints(
+            parse_result,
+            &cached_versions,
+            &resolved_versions,
+            &ecosystem_config,
+        )
         .await;
     drop(doc);
     hints

@@ -99,6 +99,7 @@
 
 pub mod ecosystem;
 pub mod error;
+pub mod formatter;
 pub mod lockfile;
 pub mod parser;
 pub mod registry;
@@ -107,6 +108,7 @@ pub mod types;
 // Re-export commonly used types
 pub use ecosystem::PypiEcosystem;
 pub use error::{PypiError, Result};
+pub use formatter::PypiFormatter;
 pub use lockfile::PypiLockParser;
 pub use parser::PypiParser;
 pub use registry::PypiRegistry;

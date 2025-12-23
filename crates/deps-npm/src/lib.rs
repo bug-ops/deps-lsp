@@ -5,6 +5,7 @@
 
 pub mod ecosystem;
 pub mod error;
+pub mod formatter;
 pub mod lockfile;
 pub mod parser;
 pub mod registry;
@@ -12,6 +13,7 @@ pub mod types;
 
 pub use ecosystem::NpmEcosystem;
 pub use error::{NpmError, Result};
+pub use formatter::NpmFormatter;
 pub use lockfile::NpmLockParser;
 pub use parser::{NpmParseResult, parse_package_json};
 pub use registry::{NpmRegistry, package_url};

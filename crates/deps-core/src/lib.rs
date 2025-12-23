@@ -94,6 +94,7 @@ pub mod ecosystem_registry;
 pub mod error;
 pub mod handler;
 pub mod lockfile;
+pub mod lsp_helpers;
 pub mod macros;
 pub mod parser;
 pub mod registry;
@@ -109,6 +110,11 @@ pub use handler::{
     generate_code_actions, generate_diagnostics, generate_hover, generate_inlay_hints,
 };
 pub use lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
+pub use lsp_helpers::{
+    EcosystemFormatter, generate_code_actions as lsp_generate_code_actions,
+    generate_diagnostics as lsp_generate_diagnostics, generate_hover as lsp_generate_hover,
+    generate_inlay_hints as lsp_generate_inlay_hints, is_same_major_minor, ranges_overlap,
+};
 pub use parser::{DependencyInfo, DependencySource, ManifestParser, ParseResultInfo};
 pub use registry::{Metadata, PackageMetadata, PackageRegistry, Registry, Version, VersionInfo};
 pub use version_matcher::{
