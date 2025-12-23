@@ -628,7 +628,7 @@ where
 
             actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                 title,
-                kind: Some(CodeActionKind::QUICKFIX),
+                kind: Some(CodeActionKind::REFACTOR),
                 edit: Some(WorkspaceEdit {
                     changes: Some(edits),
                     ..Default::default()

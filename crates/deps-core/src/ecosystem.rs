@@ -129,8 +129,10 @@ impl Default for EcosystemConfig {
 ///         &self,
 ///         parse_result: &dyn ParseResult,
 ///         cached_versions: &std::collections::HashMap<String, String>,
+///         resolved_versions: &std::collections::HashMap<String, String>,
 ///         config: &EcosystemConfig,
 ///     ) -> Vec<InlayHint> {
+///         let _ = resolved_versions; // Use resolved versions for lock file support
 ///         vec![]
 ///     }
 ///
@@ -139,7 +141,9 @@ impl Default for EcosystemConfig {
 ///         parse_result: &dyn ParseResult,
 ///         position: Position,
 ///         cached_versions: &std::collections::HashMap<String, String>,
+///         resolved_versions: &std::collections::HashMap<String, String>,
 ///     ) -> Option<Hover> {
+///         let _ = resolved_versions; // Use resolved versions for lock file support
 ///         None
 ///     }
 ///
@@ -215,6 +219,14 @@ pub trait Ecosystem: Send + Sync {
     /// The registry provides version lookup and package search capabilities.
     fn registry(&self) -> Arc<dyn Registry>;
 
+    /// Get the lock file provider for this ecosystem.
+    ///
+    /// Returns `None` if the ecosystem doesn't support lock files.
+    /// Lock files provide resolved dependency versions without network requests.
+    fn lockfile_provider(&self) -> Option<Arc<dyn crate::lockfile::LockFileProvider>> {
+        None
+    }
+
     /// Generate inlay hints for the document
     ///
     /// Inlay hints show additional version information inline in the editor.
@@ -222,12 +234,14 @@ pub trait Ecosystem: Send + Sync {
     /// # Arguments
     ///
     /// * `parse_result` - Parsed dependencies from manifest
-    /// * `cached_versions` - Pre-fetched version information (name -> latest version)
+    /// * `cached_versions` - Pre-fetched version information (name -> latest version from registry)
+    /// * `resolved_versions` - Resolved versions from lock file (name -> locked version)
     /// * `config` - User configuration for hint display
     async fn generate_inlay_hints(
         &self,
         parse_result: &dyn ParseResult,
         cached_versions: &std::collections::HashMap<String, String>,
+        resolved_versions: &std::collections::HashMap<String, String>,
         config: &EcosystemConfig,
     ) -> Vec<InlayHint>;
 
@@ -239,12 +253,14 @@ pub trait Ecosystem: Send + Sync {
     ///
     /// * `parse_result` - Parsed dependencies from manifest
     /// * `position` - Cursor position in document
-    /// * `cached_versions` - Pre-fetched version information
+    /// * `cached_versions` - Pre-fetched latest version information from registry
+    /// * `resolved_versions` - Resolved versions from lock file (takes precedence for "Current" display)
     async fn generate_hover(
         &self,
         parse_result: &dyn ParseResult,
         position: Position,
         cached_versions: &std::collections::HashMap<String, String>,
+        resolved_versions: &std::collections::HashMap<String, String>,
     ) -> Option<Hover>;
 
     /// Generate code actions for a position

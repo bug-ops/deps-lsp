@@ -64,10 +64,15 @@ impl Ecosystem for NpmEcosystem {
         self.registry.clone() as Arc<dyn Registry>
     }
 
+    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
+        Some(Arc::new(crate::lockfile::NpmLockParser))
+    }
+
     async fn generate_inlay_hints(
         &self,
         parse_result: &dyn ParseResultTrait,
         cached_versions: &HashMap<String, String>,
+        resolved_versions: &HashMap<String, String>,
         config: &EcosystemConfig,
     ) -> Vec<InlayHint> {
         let mut hints = Vec::new();
@@ -77,25 +82,52 @@ impl Ecosystem for NpmEcosystem {
                 continue;
             };
 
-            let Some(latest_version) = cached_versions.get(dep.name()) else {
-                continue;
+            let latest_version = cached_versions.get(dep.name());
+            let resolved_version = resolved_versions.get(dep.name());
+
+            // Determine if dependency is up-to-date
+            let (is_up_to_date, display_version) = match (resolved_version, latest_version) {
+                // Have both: compare resolved with latest
+                (Some(resolved), Some(latest)) => {
+                    let is_same = resolved == latest
+                        || is_same_major_minor(resolved, latest);
+                    (is_same, Some(latest.as_str()))
+                }
+                // Only latest: fall back to comparing requirement with latest
+                (None, Some(latest)) => {
+                    let version_req = dep.version_requirement().unwrap_or("");
+                    // Strip caret/tilde prefix if present for comparison
+                    let req_normalized = version_req
+                        .strip_prefix('^')
+                        .or_else(|| version_req.strip_prefix('~'))
+                        .unwrap_or(version_req);
+                    // Check if it's a partial version (1 or 2 parts) vs full version (3+ parts)
+                    let req_parts: Vec<&str> = req_normalized.split('.').collect();
+                    let is_partial_version = req_parts.len() <= 2;
+                    let is_match = latest == version_req
+                        || (is_partial_version && is_same_major_minor(req_normalized, latest))
+                        || (is_partial_version && latest.starts_with(req_normalized));
+                    (is_match, Some(latest.as_str()))
+                }
+                // Only resolved: show as up-to-date with resolved version
+                (Some(resolved), None) => (true, Some(resolved.as_str())),
+                // Neither: skip this dependency
+                (None, None) => continue,
             };
 
-            let version_req = dep.version_requirement().unwrap_or("");
-            let is_latest = latest_version == version_req
-                || (version_req.starts_with('^')
-                    && version_req.len() > 1
-                    && latest_version
-                        .starts_with(version_req[1..].split('.').next().unwrap_or("")));
-
-            let label_text = if is_latest {
+            let label_text = if is_up_to_date {
                 if config.show_up_to_date_hints {
-                    config.up_to_date_text.clone()
+                    if let Some(resolved) = resolved_version {
+                        format!("{} {}", config.up_to_date_text, resolved)
+                    } else {
+                        config.up_to_date_text.clone()
+                    }
                 } else {
                     continue;
                 }
             } else {
-                config.needs_update_text.replace("{}", latest_version)
+                let version = display_version.unwrap_or("unknown");
+                config.needs_update_text.replace("{}", version)
             };
 
             hints.push(InlayHint {
@@ -118,19 +150,27 @@ impl Ecosystem for NpmEcosystem {
         parse_result: &dyn ParseResultTrait,
         position: Position,
         cached_versions: &HashMap<String, String>,
+        resolved_versions: &HashMap<String, String>,
     ) -> Option<Hover> {
         let dep = parse_result
             .dependencies()
             .into_iter()
-            .find(|d| ranges_overlap(d.name_range(), position))?;
+            .find(|d| {
+                let on_name = ranges_overlap(d.name_range(), position);
+                let on_version = d.version_range().is_some_and(|r| ranges_overlap(r, position));
+                on_name || on_version
+            })?;
 
         let versions = self.registry.get_versions(dep.name()).await.ok()?;
 
         let url = crate::registry::package_url(dep.name());
         let mut markdown = format!("# [{}]({})\n\n", dep.name(), url);
 
-        if let Some(version_req) = dep.version_requirement() {
-            markdown.push_str(&format!("**Current**: `{}`\n\n", version_req));
+        // Show resolved version from lock file if available, otherwise show manifest requirement
+        if let Some(resolved) = resolved_versions.get(dep.name()) {
+            markdown.push_str(&format!("**Current**: `{}`\n\n", resolved));
+        } else if let Some(version_req) = dep.version_requirement() {
+            markdown.push_str(&format!("**Requirement**: `{}`\n\n", version_req));
         }
 
         if let Some(latest) = cached_versions.get(dep.name()) {
@@ -147,6 +187,8 @@ impl Ecosystem for NpmEcosystem {
                 markdown.push_str(&format!("- {}\n", version.version_string()));
             }
         }
+
+        markdown.push_str("\n---\n⌨️ **Press `Cmd+.` to update version**");
 
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -208,7 +250,7 @@ impl Ecosystem for NpmEcosystem {
 
             actions.push(CodeAction {
                 title,
-                kind: Some(CodeActionKind::QUICKFIX),
+                kind: Some(CodeActionKind::REFACTOR),
                 edit: Some(WorkspaceEdit {
                     changes: Some(edits),
                     ..Default::default()
@@ -306,6 +348,20 @@ fn ranges_overlap(range: tower_lsp::lsp_types::Range, position: Position) -> boo
         || (range.end.line == position.line && range.end.character < position.character)
         || position.line < range.start.line
         || (position.line == range.start.line && position.character < range.start.character))
+}
+
+/// Checks if two version strings have the same major and minor version.
+fn is_same_major_minor(v1: &str, v2: &str) -> bool {
+    let parts1: Vec<&str> = v1.split('.').collect();
+    let parts2: Vec<&str> = v2.split('.').collect();
+
+    if parts1.len() >= 2 && parts2.len() >= 2 {
+        parts1[0] == parts2[0] && parts1[1] == parts2[1]
+    } else if !parts1.is_empty() && !parts2.is_empty() {
+        parts1[0] == parts2[0]
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]

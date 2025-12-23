@@ -6,6 +6,7 @@
 use crate::config::DepsConfig;
 use crate::document::{DocumentState, ServerState};
 use crate::handlers::diagnostics;
+use deps_core::Ecosystem;
 use deps_core::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,6 +59,19 @@ pub async fn handle_document_open(
     let client_clone = client.clone();
 
     let task = tokio::spawn(async move {
+        // Load resolved versions from lock file first (instant, no network)
+        let resolved_versions =
+            load_resolved_versions(&uri_clone, &state_clone, ecosystem_clone.as_ref()).await;
+
+        // Update document state with resolved versions immediately
+        if !resolved_versions.is_empty()
+            && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
+        {
+            doc.update_resolved_versions(resolved_versions.clone());
+            // Use resolved versions as cached versions for instant display
+            doc.update_cached_versions(resolved_versions.clone());
+        }
+
         let doc = match state_clone.get_document(&uri_clone) {
             Some(d) => d,
             None => return,
@@ -77,7 +91,7 @@ pub async fn handle_document_open(
 
         drop(doc); // Release guard before async operations
 
-        // Fetch versions for all dependencies
+        // Fetch latest versions from registry (for update hints)
         let registry = ecosystem_clone.registry();
         let mut cached_versions = HashMap::new();
 
@@ -89,7 +103,7 @@ pub async fn handle_document_open(
             }
         }
 
-        // Update document state with cached versions
+        // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.update_cached_versions(cached_versions);
         }
@@ -157,6 +171,19 @@ pub async fn handle_document_change(
         // Small debounce delay
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+        // Load resolved versions from lock file first (instant, no network)
+        let resolved_versions =
+            load_resolved_versions(&uri_clone, &state_clone, ecosystem_clone.as_ref()).await;
+
+        // Update document state with resolved versions immediately
+        if !resolved_versions.is_empty()
+            && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
+        {
+            doc.update_resolved_versions(resolved_versions.clone());
+            // Use resolved versions as cached versions for instant display
+            doc.update_cached_versions(resolved_versions.clone());
+        }
+
         let doc = match state_clone.get_document(&uri_clone) {
             Some(d) => d,
             None => return,
@@ -176,7 +203,7 @@ pub async fn handle_document_change(
 
         drop(doc);
 
-        // Fetch versions for all dependencies
+        // Fetch latest versions from registry (for update hints)
         let registry = ecosystem_clone.registry();
         let mut cached_versions = HashMap::new();
 
@@ -188,7 +215,7 @@ pub async fn handle_document_change(
             }
         }
 
-        // Update document state with cached versions
+        // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.update_cached_versions(cached_versions);
         }
@@ -213,6 +240,55 @@ pub async fn handle_document_change(
     });
 
     Ok(task)
+}
+
+/// Loads resolved versions from lock file for a given manifest URI.
+///
+/// Uses the ecosystem's lockfile provider to parse the lock file.
+/// Returns a HashMap mapping package names to their resolved versions.
+/// Returns an empty HashMap if no lock file is found or parsing fails.
+async fn load_resolved_versions(
+    uri: &Url,
+    state: &ServerState,
+    ecosystem: &dyn Ecosystem,
+) -> HashMap<String, String> {
+    let lock_provider = match ecosystem.lockfile_provider() {
+        Some(p) => p,
+        None => {
+            tracing::debug!("No lock file provider for ecosystem {}", ecosystem.id());
+            return HashMap::new();
+        }
+    };
+
+    let lockfile_path = match lock_provider.locate_lockfile(uri) {
+        Some(path) => path,
+        None => {
+            tracing::debug!("No lock file found for {}", uri);
+            return HashMap::new();
+        }
+    };
+
+    match state
+        .lockfile_cache
+        .get_or_parse(lock_provider.as_ref(), &lockfile_path)
+        .await
+    {
+        Ok(resolved) => {
+            tracing::info!(
+                "Loaded {} resolved versions from {}",
+                resolved.len(),
+                lockfile_path.display()
+            );
+            resolved
+                .iter()
+                .map(|(name, pkg)| (name.clone(), pkg.version.clone()))
+                .collect()
+        }
+        Err(e) => {
+            tracing::warn!("Failed to parse lock file: {}", e);
+            HashMap::new()
+        }
+    }
 }
 
 #[cfg(test)]

@@ -95,16 +95,39 @@ impl PypiParser {
             .map_err(|e| PypiError::TomlParseError { source: e })?;
 
         let mut dependencies = Vec::new();
+        // Track used positions to handle duplicate dependency strings across sections
+        let mut used_positions = std::collections::HashSet::new();
+
+        // Parse build-system requires (PEP 517/518)
+        if let Some(build_system) = doc.get("build-system").and_then(|i| i.as_table()) {
+            dependencies.extend(self.parse_build_system_requires(
+                build_system,
+                content,
+                &mut used_positions,
+            )?);
+        }
 
         // Parse PEP 621 format
         if let Some(project) = doc.get("project").and_then(|i| i.as_table()) {
-            dependencies.extend(self.parse_pep621_dependencies(project, content)?);
-            dependencies.extend(self.parse_pep621_optional_dependencies(project, content)?);
+            dependencies.extend(self.parse_pep621_dependencies(
+                project,
+                content,
+                &mut used_positions,
+            )?);
+            dependencies.extend(self.parse_pep621_optional_dependencies(
+                project,
+                content,
+                &mut used_positions,
+            )?);
         }
 
         // Parse PEP 735 dependency-groups format
         if let Some(dep_groups) = doc.get("dependency-groups").and_then(|i| i.as_table()) {
-            dependencies.extend(self.parse_dependency_groups(dep_groups, content)?);
+            dependencies.extend(self.parse_dependency_groups(
+                dep_groups,
+                content,
+                &mut used_positions,
+            )?);
         }
 
         // Parse Poetry format
@@ -122,11 +145,51 @@ impl PypiParser {
         })
     }
 
+    /// Parse PEP 517/518 `[build-system]` requires array.
+    fn parse_build_system_requires(
+        &self,
+        build_system: &Table,
+        content: &str,
+        used_positions: &mut std::collections::HashSet<usize>,
+    ) -> Result<Vec<PypiDependency>> {
+        let Some(requires_item) = build_system.get("requires") else {
+            return Ok(Vec::new());
+        };
+
+        let Some(requires_array) = requires_item.as_array() else {
+            return Ok(Vec::new());
+        };
+
+        let mut dependencies = Vec::new();
+
+        for value in requires_array.iter() {
+            if let Some(dep_str) = value.as_str() {
+                // Find exact position of this dependency string in content
+                let position = self
+                    .find_dependency_string_position(content, dep_str, used_positions)
+                    .map(|(p, _)| p);
+
+                match self.parse_pep508_requirement(dep_str, position) {
+                    Ok(mut dep) => {
+                        dep.section = PypiDependencySection::BuildSystem;
+                        dependencies.push(dep);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse build-system require '{}': {}", dep_str, e);
+                    }
+                }
+            }
+        }
+
+        Ok(dependencies)
+    }
+
     /// Parse PEP 621 `[project.dependencies]` array.
     fn parse_pep621_dependencies(
         &self,
         project: &Table,
         content: &str,
+        used_positions: &mut std::collections::HashSet<usize>,
     ) -> Result<Vec<PypiDependency>> {
         let Some(deps_item) = project.get("dependencies") else {
             return Ok(Vec::new());
@@ -141,7 +204,9 @@ impl PypiParser {
         for value in deps_array.iter() {
             if let Some(dep_str) = value.as_str() {
                 // Find exact position of this dependency string in content
-                let position = self.find_dependency_string_position(content, dep_str);
+                let position = self
+                    .find_dependency_string_position(content, dep_str, used_positions)
+                    .map(|(p, _)| p);
 
                 match self.parse_pep508_requirement(dep_str, position) {
                     Ok(mut dep) => {
@@ -163,6 +228,7 @@ impl PypiParser {
         &self,
         project: &Table,
         content: &str,
+        used_positions: &mut std::collections::HashSet<usize>,
     ) -> Result<Vec<PypiDependency>> {
         let Some(opt_deps_item) = project.get("optional-dependencies") else {
             return Ok(Vec::new());
@@ -179,7 +245,9 @@ impl PypiParser {
                 for value in group_array.iter() {
                     if let Some(dep_str) = value.as_str() {
                         // Find exact position of this dependency string in content
-                        let position = self.find_dependency_string_position(content, dep_str);
+                        let position = self
+                            .find_dependency_string_position(content, dep_str, used_positions)
+                            .map(|(p, _)| p);
 
                         match self.parse_pep508_requirement(dep_str, position) {
                             Ok(mut dep) => {
@@ -213,6 +281,7 @@ impl PypiParser {
         &self,
         dep_groups: &Table,
         content: &str,
+        used_positions: &mut std::collections::HashSet<usize>,
     ) -> Result<Vec<PypiDependency>> {
         let mut dependencies = Vec::new();
 
@@ -221,7 +290,9 @@ impl PypiParser {
                 for value in group_array.iter() {
                     if let Some(dep_str) = value.as_str() {
                         // Find exact position of this dependency string in content
-                        let position = self.find_dependency_string_position(content, dep_str);
+                        let position = self
+                            .find_dependency_string_position(content, dep_str, used_positions)
+                            .map(|(p, _)| p);
 
                         match self.parse_pep508_requirement(dep_str, position) {
                             Ok(mut dep) => {
@@ -543,25 +614,43 @@ impl PypiParser {
     /// Find the exact position of a dependency string in the content.
     /// Returns the position at the START of the package name (for name_range)
     /// and can be used to calculate version_range.
-    fn find_dependency_string_position(&self, content: &str, dep_str: &str) -> Option<Position> {
+    ///
+    /// `used_positions` tracks byte offsets that have already been used,
+    /// allowing us to find duplicate strings at different positions.
+    /// Returns `(position, byte_offset)` where `byte_offset` is added to
+    /// `used_positions` to track this occurrence.
+    fn find_dependency_string_position(
+        &self,
+        content: &str,
+        dep_str: &str,
+        used_positions: &mut std::collections::HashSet<usize>,
+    ) -> Option<(Position, usize)> {
         // Search for the quoted dependency string
         let quoted = format!("\"{}\"", dep_str);
-        if let Some(pos) = content.find(&quoted) {
+        for (pos, _) in content.match_indices(&quoted) {
+            if used_positions.contains(&pos) {
+                continue;
+            }
             let before = &content[..pos + 1]; // +1 to skip opening quote
             let line = before.chars().filter(|&c| c == '\n').count() as u32;
             let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
             let character = (pos + 1 - last_newline) as u32; // +1 to skip opening quote
-            return Some(Position::new(line, character));
+            used_positions.insert(pos);
+            return Some((Position::new(line, character), pos));
         }
 
         // Try single quotes
         let single_quoted = format!("'{}'", dep_str);
-        if let Some(pos) = content.find(&single_quoted) {
+        for (pos, _) in content.match_indices(&single_quoted) {
+            if used_positions.contains(&pos) {
+                continue;
+            }
             let before = &content[..pos + 1];
             let line = before.chars().filter(|&c| c == '\n').count() as u32;
             let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
             let character = (pos + 1 - last_newline) as u32;
-            return Some(Position::new(line, character));
+            used_positions.insert(pos);
+            return Some((Position::new(line, character), pos));
         }
 
         None
@@ -1177,12 +1266,151 @@ dependencies = [
     #[test]
     fn test_parse_no_project_section() {
         let toml = r#"
-[build-system]
-requires = ["setuptools"]
+[tool.my-custom-tool]
+config = "value"
 "#;
         let parser = PypiParser::new();
         let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_build_system_requires() {
+        let toml = r#"
+[build-system]
+requires = ["setuptools>=61.0", "wheel", "maturin>=1.7,<2.0"]
+build-backend = "setuptools.build_meta"
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 3);
+        assert!(deps.iter().all(|d| matches!(
+            d.section,
+            PypiDependencySection::BuildSystem
+        )));
+
+        let setuptools = deps.iter().find(|d| d.name == "setuptools").unwrap();
+        assert_eq!(setuptools.version_req, Some(">=61.0".to_string()));
+
+        let maturin = deps.iter().find(|d| d.name == "maturin").unwrap();
+        assert_eq!(maturin.version_req, Some(">=1.7, <2.0".to_string()));
+
+        // wheel has no version constraint
+        let wheel = deps.iter().find(|d| d.name == "wheel").unwrap();
+        assert_eq!(wheel.version_req, None);
+    }
+
+    #[test]
+    fn test_parse_duplicate_dependency_positions() {
+        // Test that duplicate dependency strings get correct positions
+        let toml = r#"[build-system]
+requires = ["maturin>=1.7,<2.0"]
+
+[dependency-groups]
+dev = ["maturin>=1.7,<2.0"]
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 2);
+
+        // First maturin in [build-system] should be on line 1
+        let build_system_maturin = deps
+            .iter()
+            .find(|d| matches!(d.section, PypiDependencySection::BuildSystem))
+            .unwrap();
+        assert_eq!(build_system_maturin.name_range.start.line, 1);
+
+        // Second maturin in [dependency-groups] should be on line 4
+        let dep_group_maturin = deps
+            .iter()
+            .find(|d| matches!(d.section, PypiDependencySection::DependencyGroup { .. }))
+            .unwrap();
+        assert_eq!(dep_group_maturin.name_range.start.line, 4);
+    }
+
+    #[test]
+    fn test_version_range_for_code_actions() {
+        // Test that version_range correctly covers the version specifier for code actions
+        let toml = r#"[dependency-groups]
+dev = ["pytest-cov>=4.0,<8.0"]
+"#;
+        // Line 0: [dependency-groups]
+        // Line 1: dev = ["pytest-cov>=4.0,<8.0"]
+        //               ^          ^         ^
+        //               8          18        28 (positions)
+        //               name_start version_start version_end
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+
+        assert_eq!(dep.name, "pytest-cov");
+        assert_eq!(dep.name_range.start.line, 1);
+        assert_eq!(dep.name_range.start.character, 8); // after `dev = ["`
+
+        // Version range should cover >=4.0,<8.0
+        let version_range = dep.version_range.expect("version_range should be set");
+        assert_eq!(version_range.start.line, 1);
+        // pytest-cov is 10 chars, so version starts at 8 + 10 = 18
+        assert_eq!(version_range.start.character, 18);
+        // >=4.0,<8.0 is 10 chars, so version ends at 18 + 10 = 28
+        assert_eq!(version_range.end.character, 28);
+
+        // Verify that cursor at position 20 (on '4') is within version_range
+        let cursor_on_version = Position::new(1, 20);
+        assert!(
+            cursor_on_version.character >= version_range.start.character
+                && cursor_on_version.character < version_range.end.character,
+            "cursor at {} should be within version_range {}..{}",
+            cursor_on_version.character,
+            version_range.start.character,
+            version_range.end.character
+        );
+    }
+
+    #[test]
+    fn test_version_range_with_space_before_specifier() {
+        // Test version_range when there's a space between name and version specifier
+        let toml = r#"[dependency-groups]
+dev = ["pytest-cov >=4.0,<8.0"]
+"#;
+        // Line 1: dev = ["pytest-cov >=4.0,<8.0"]
+        //               ^          ^          ^
+        //               8          18         29 (positions)
+        //               name_start space+ver  version_end
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+
+        // Version range should cover " >=4.0,<8.0" (with leading space)
+        let version_range = dep.version_range.expect("version_range should be set");
+        assert_eq!(version_range.start.line, 1);
+        // pytest-cov is 10 chars, so version_range starts at 8 + 10 = 18 (the space)
+        assert_eq!(version_range.start.character, 18);
+        // " >=4.0,<8.0" is 11 chars, so version ends at 18 + 11 = 29
+        assert_eq!(version_range.end.character, 29);
+
+        // Verify that cursor at position 21 (on '>') is within version_range
+        let cursor_on_version = Position::new(1, 21);
+        assert!(
+            cursor_on_version.character >= version_range.start.character
+                && cursor_on_version.character < version_range.end.character,
+            "cursor at {} should be within version_range {}..{}",
+            cursor_on_version.character,
+            version_range.start.character,
+            version_range.end.character
+        );
     }
 }

@@ -251,6 +251,7 @@ mod tests {
             &self,
             _parse_result: &dyn ParseResult,
             _cached_versions: &std::collections::HashMap<String, String>,
+            _resolved_versions: &std::collections::HashMap<String, String>,
             _config: &EcosystemConfig,
         ) -> Vec<InlayHint> {
             vec![]
@@ -261,6 +262,7 @@ mod tests {
             _parse_result: &dyn ParseResult,
             _position: Position,
             _cached_versions: &std::collections::HashMap<String, String>,
+            _resolved_versions: &std::collections::HashMap<String, String>,
         ) -> Option<Hover> {
             None
         }

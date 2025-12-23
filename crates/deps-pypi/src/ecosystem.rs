@@ -72,10 +72,15 @@ impl Ecosystem for PypiEcosystem {
         self.registry.clone() as Arc<dyn Registry>
     }
 
+    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
+        Some(Arc::new(crate::lockfile::PypiLockParser))
+    }
+
     async fn generate_inlay_hints(
         &self,
         parse_result: &dyn ParseResultTrait,
         cached_versions: &HashMap<String, String>,
+        resolved_versions: &HashMap<String, String>,
         config: &EcosystemConfig,
     ) -> Vec<InlayHint> {
         let mut hints = Vec::new();
@@ -85,25 +90,48 @@ impl Ecosystem for PypiEcosystem {
                 continue;
             };
 
-            let Some(latest_version) = cached_versions.get(dep.name()) else {
-                continue;
+            // Normalize package name for lookup (PyPI names are case-insensitive, - == _)
+            let normalized_name = normalize_pypi_name(dep.name());
+            let latest_version = cached_versions
+                .get(&normalized_name)
+                .or_else(|| cached_versions.get(dep.name()));
+            let resolved_version = resolved_versions
+                .get(&normalized_name)
+                .or_else(|| resolved_versions.get(dep.name()));
+
+            // Determine if dependency is up-to-date
+            let (is_up_to_date, display_version) = match (resolved_version, latest_version) {
+                // Have both: compare resolved with latest
+                (Some(resolved), Some(latest)) => {
+                    let is_same = resolved == latest
+                        || is_same_major_minor(resolved, latest);
+                    (is_same, Some(latest.as_str()))
+                }
+                // Only latest: fall back to checking if latest satisfies requirement
+                (None, Some(latest)) => {
+                    let version_req = dep.version_requirement().unwrap_or("");
+                    let is_match = version_satisfies_pep440(latest, version_req);
+                    (is_match, Some(latest.as_str()))
+                }
+                // Only resolved: show as up-to-date with resolved version
+                (Some(resolved), None) => (true, Some(resolved.as_str())),
+                // Neither: skip this dependency
+                (None, None) => continue,
             };
 
-            let version_req = dep.version_requirement().unwrap_or("");
-
-            // Simple version comparison for Python
-            let is_latest = latest_version == version_req
-                || version_req.contains(&format!("=={}", latest_version))
-                || (version_req.starts_with(">=") && version_req.contains(latest_version));
-
-            let label_text = if is_latest {
+            let label_text = if is_up_to_date {
                 if config.show_up_to_date_hints {
-                    config.up_to_date_text.clone()
+                    if let Some(resolved) = resolved_version {
+                        format!("{} {}", config.up_to_date_text, resolved)
+                    } else {
+                        config.up_to_date_text.clone()
+                    }
                 } else {
                     continue;
                 }
             } else {
-                config.needs_update_text.replace("{}", latest_version)
+                let version = display_version.unwrap_or("unknown");
+                config.needs_update_text.replace("{}", version)
             };
 
             hints.push(InlayHint {
@@ -126,23 +154,40 @@ impl Ecosystem for PypiEcosystem {
         parse_result: &dyn ParseResultTrait,
         position: Position,
         cached_versions: &HashMap<String, String>,
+        resolved_versions: &HashMap<String, String>,
     ) -> Option<Hover> {
         let dep = parse_result
             .dependencies()
             .into_iter()
-            .find(|d| ranges_overlap(d.name_range(), position))?;
+            .find(|d| {
+                let on_name = ranges_overlap(d.name_range(), position);
+                let on_version = d.version_range().is_some_and(|r| ranges_overlap(r, position));
+                on_name || on_version
+            })?;
 
         let versions = self.registry.get_versions(dep.name()).await.ok()?;
 
         let url = crate::registry::package_url(dep.name());
         let mut markdown = format!("# [{}]({})\n\n", dep.name(), url);
 
-        if let Some(version_req) = dep.version_requirement() {
-            markdown.push_str(&format!("**Current**: `{}`\n\n", version_req));
+        // Normalize package name for lookup (PyPI names are case-insensitive, - == _)
+        let normalized_name = normalize_pypi_name(dep.name());
+
+        // Show resolved version from lock file if available, otherwise show manifest requirement
+        let resolved = resolved_versions
+            .get(&normalized_name)
+            .or_else(|| resolved_versions.get(dep.name()));
+        if let Some(resolved_ver) = resolved {
+            markdown.push_str(&format!("**Current**: `{}`\n\n", resolved_ver));
+        } else if let Some(version_req) = dep.version_requirement() {
+            markdown.push_str(&format!("**Requirement**: `{}`\n\n", version_req));
         }
 
-        if let Some(latest) = cached_versions.get(dep.name()) {
-            markdown.push_str(&format!("**Latest**: `{}`\n\n", latest));
+        let latest = cached_versions
+            .get(&normalized_name)
+            .or_else(|| cached_versions.get(dep.name()));
+        if let Some(latest_ver) = latest {
+            markdown.push_str(&format!("**Latest**: `{}`\n\n", latest_ver));
         }
 
         markdown.push_str("**Recent versions**:\n");
@@ -155,6 +200,8 @@ impl Ecosystem for PypiEcosystem {
                 markdown.push_str(&format!("- {}\n", version.version_string()));
             }
         }
+
+        markdown.push_str("\n---\n⌨️ **Press `Cmd+.` to update version**");
 
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -174,14 +221,46 @@ impl Ecosystem for PypiEcosystem {
     ) -> Vec<CodeAction> {
         let mut actions = Vec::new();
 
+        // Find dependency where cursor is anywhere on the dependency line
+        // (from start of name to end of version, or just on name line if no version)
         let Some(dep) = parse_result.dependencies().into_iter().find(|d| {
-            d.version_range()
-                .is_some_and(|r| ranges_overlap(r, position))
+            let name_range = d.name_range();
+            // Check if cursor is on the same line as the dependency
+            if position.line != name_range.start.line {
+                return false;
+            }
+            // Create extended range: from start of name to end of version (or end of name)
+            let end_char = d
+                .version_range()
+                .map(|r| r.end.character)
+                .unwrap_or(name_range.end.character);
+            // Add some padding for quotes and surrounding characters
+            let start_char = name_range.start.character.saturating_sub(2);
+            let end_char = end_char.saturating_add(2);
+            let in_range = position.character >= start_char && position.character <= end_char;
+            tracing::debug!(
+                "code_action check: dep={}, pos={}:{}, range={}..{}, in_range={}",
+                d.name(),
+                position.line,
+                position.character,
+                start_char,
+                end_char,
+                in_range
+            );
+            in_range
         }) else {
+            tracing::debug!(
+                "code_action: no dependency found at position {}:{}",
+                position.line,
+                position.character
+            );
             return actions;
         };
 
-        let version_range = dep.version_range().unwrap();
+        let Some(version_range) = dep.version_range() else {
+            tracing::debug!("code_action: dependency {} has no version_range", dep.name());
+            return actions;
+        };
 
         let Ok(versions) = self.registry.get_versions(dep.name()).await else {
             return actions;
@@ -202,7 +281,8 @@ impl Ecosystem for PypiEcosystem {
                 .and_then(|v| v.checked_add(1))
                 .unwrap_or(1);
 
-            let new_text = format!("\">={},<{}\"", version.version_string(), next_major);
+            // version_range does NOT include quotes (unlike Cargo), so new_text shouldn't either
+            let new_text = format!(">={},<{}", version.version_string(), next_major);
 
             let mut edits = HashMap::new();
             edits.insert(
@@ -225,7 +305,7 @@ impl Ecosystem for PypiEcosystem {
 
             actions.push(CodeAction {
                 title,
-                kind: Some(CodeActionKind::QUICKFIX),
+                kind: Some(CodeActionKind::REFACTOR),
                 edit: Some(WorkspaceEdit {
                     changes: Some(edits),
                     ..Default::default()
@@ -323,6 +403,44 @@ fn ranges_overlap(range: tower_lsp::lsp_types::Range, position: Position) -> boo
         || (range.end.line == position.line && range.end.character < position.character)
         || position.line < range.start.line
         || (position.line == range.start.line && position.character < range.start.character))
+}
+
+/// Normalizes a PyPI package name for comparison.
+/// PyPI names are case-insensitive and treat hyphens and underscores as equivalent.
+fn normalize_pypi_name(name: &str) -> String {
+    name.to_lowercase().replace('-', "_")
+}
+
+/// Checks if two version strings have the same major and minor version.
+fn is_same_major_minor(v1: &str, v2: &str) -> bool {
+    let parts1: Vec<&str> = v1.split('.').collect();
+    let parts2: Vec<&str> = v2.split('.').collect();
+
+    if parts1.len() >= 2 && parts2.len() >= 2 {
+        parts1[0] == parts2[0] && parts1[1] == parts2[1]
+    } else if !parts1.is_empty() && !parts2.is_empty() {
+        parts1[0] == parts2[0]
+    } else {
+        false
+    }
+}
+
+/// Checks if a version satisfies a PEP 440 specifier using pep440_rs.
+fn version_satisfies_pep440(version: &str, specifier: &str) -> bool {
+    use pep440_rs::{Version, VersionSpecifiers};
+    use std::str::FromStr;
+
+    let ver = match Version::from_str(version) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let specs = match VersionSpecifiers::from_str(specifier) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    specs.contains(&ver)
 }
 
 #[cfg(test)]

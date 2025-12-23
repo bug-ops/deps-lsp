@@ -72,6 +72,8 @@ pub struct PypiDependency {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum PypiDependencySection {
+    /// PEP 517/518 build system requires (`[build-system.requires]`)
+    BuildSystem,
     /// PEP 621 runtime dependencies (`[project.dependencies]`)
     Dependencies,
     /// PEP 621 optional dependency group (`[project.optional-dependencies.{group}]`)

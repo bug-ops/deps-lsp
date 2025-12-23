@@ -93,7 +93,7 @@ impl Backend {
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             inlay_hint_provider: Some(OneOf::Left(true)),
             code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
-                code_action_kinds: Some(vec![tower_lsp::lsp_types::CodeActionKind::QUICKFIX]),
+                code_action_kinds: Some(vec![tower_lsp::lsp_types::CodeActionKind::REFACTOR]),
                 ..Default::default()
             })),
             diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
@@ -204,9 +204,14 @@ impl LanguageServer for Backend {
         &self,
         params: CodeActionParams,
     ) -> Result<Option<Vec<tower_lsp::lsp_types::CodeActionOrCommand>>> {
-        Ok(Some(
-            code_actions::handle_code_actions(Arc::clone(&self.state), params).await,
-        ))
+        tracing::info!(
+            "code_action request: uri={}, range={:?}",
+            params.text_document.uri,
+            params.range
+        );
+        let actions = code_actions::handle_code_actions(Arc::clone(&self.state), params).await;
+        tracing::info!("code_action response: {} actions", actions.len());
+        Ok(Some(actions))
     }
 
     async fn diagnostic(

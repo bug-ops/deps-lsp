@@ -24,7 +24,7 @@ pub async fn handle_inlay_hints(
 
     let uri = &params.text_document.uri;
 
-    let (ecosystem_id, cached_versions) = {
+    let (ecosystem_id, cached_versions, resolved_versions) = {
         let doc = match state.get_document(uri) {
             Some(d) => d,
             None => {
@@ -32,7 +32,11 @@ pub async fn handle_inlay_hints(
                 return vec![];
             }
         };
-        (doc.ecosystem_id, doc.cached_versions.clone())
+        (
+            doc.ecosystem_id,
+            doc.cached_versions.clone(),
+            doc.resolved_versions.clone(),
+        )
     };
 
     let doc = match state.get_document(uri) {
@@ -60,7 +64,7 @@ pub async fn handle_inlay_hints(
     };
 
     let hints = ecosystem
-        .generate_inlay_hints(parse_result, &cached_versions, &ecosystem_config)
+        .generate_inlay_hints(parse_result, &cached_versions, &resolved_versions, &ecosystem_config)
         .await;
     drop(doc);
     hints

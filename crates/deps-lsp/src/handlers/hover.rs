@@ -9,9 +9,13 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
     let uri = &params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
 
-    let (ecosystem_id, cached_versions) = {
+    let (ecosystem_id, cached_versions, resolved_versions) = {
         let doc = state.get_document(uri)?;
-        (doc.ecosystem_id, doc.cached_versions.clone())
+        (
+            doc.ecosystem_id,
+            doc.cached_versions.clone(),
+            doc.resolved_versions.clone(),
+        )
     };
 
     let doc = state.get_document(uri)?;
@@ -19,7 +23,7 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
     let parse_result = doc.parse_result()?;
 
     let hover = ecosystem
-        .generate_hover(parse_result, position, &cached_versions)
+        .generate_hover(parse_result, position, &cached_versions, &resolved_versions)
         .await;
     drop(doc);
     hover
