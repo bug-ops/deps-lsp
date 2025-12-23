@@ -1,32 +1,30 @@
-//! {ECOSYSTEM_DISPLAY} ecosystem implementation for deps-lsp.
-
 use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{
-    CodeAction, CodeActionKind, CompletionItem, Diagnostic, DiagnosticSeverity, Hover,
-    HoverContents, InlayHint, InlayHintKind, InlayHintLabel, MarkupContent, MarkupKind, Position,
-    TextEdit, Url, WorkspaceEdit,
+    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Url,
 };
 
 use deps_core::{
     Ecosystem, EcosystemConfig, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
+    lsp_helpers,
 };
 
+use crate::formatter::{ECOSYSTEM_PASCAL}Formatter;
 use crate::parser::parse_{ECOSYSTEM_SNAKE};
 use crate::registry::{ECOSYSTEM_PASCAL}Registry;
 
-/// {ECOSYSTEM_DISPLAY} ecosystem implementation.
 pub struct {ECOSYSTEM_PASCAL}Ecosystem {
     registry: Arc<{ECOSYSTEM_PASCAL}Registry>,
+    formatter: {ECOSYSTEM_PASCAL}Formatter,
 }
 
 impl {ECOSYSTEM_PASCAL}Ecosystem {
-    /// Create a new ecosystem with shared HTTP cache.
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self {
             registry: Arc::new({ECOSYSTEM_PASCAL}Registry::new(cache)),
+            formatter: {ECOSYSTEM_PASCAL}Formatter,
         }
     }
 }
@@ -62,47 +60,16 @@ impl Ecosystem for {ECOSYSTEM_PASCAL}Ecosystem {
         &self,
         parse_result: &dyn ParseResultTrait,
         cached_versions: &HashMap<String, String>,
+        resolved_versions: &HashMap<String, String>,
         config: &EcosystemConfig,
     ) -> Vec<InlayHint> {
-        let mut hints = Vec::new();
-
-        for dep in parse_result.dependencies() {
-            let Some(version_range) = dep.version_range() else {
-                continue;
-            };
-
-            let Some(latest) = cached_versions.get(dep.name()) else {
-                continue;
-            };
-
-            let current = dep.version_requirement().unwrap_or("");
-
-            // TODO: Implement proper version comparison for this ecosystem
-            let is_up_to_date = current == latest;
-
-            let label = if is_up_to_date {
-                if config.show_up_to_date_hints {
-                    config.up_to_date_text.clone()
-                } else {
-                    continue;
-                }
-            } else {
-                config.needs_update_text.replace("{}", latest)
-            };
-
-            hints.push(InlayHint {
-                position: version_range.end,
-                label: InlayHintLabel::String(label),
-                kind: Some(InlayHintKind::TYPE),
-                padding_left: Some(true),
-                padding_right: None,
-                text_edits: None,
-                tooltip: None,
-                data: None,
-            });
-        }
-
-        hints
+        lsp_helpers::generate_inlay_hints(
+            parse_result,
+            cached_versions,
+            resolved_versions,
+            config,
+            &self.formatter,
+        )
     }
 
     async fn generate_hover(
@@ -110,43 +77,17 @@ impl Ecosystem for {ECOSYSTEM_PASCAL}Ecosystem {
         parse_result: &dyn ParseResultTrait,
         position: Position,
         cached_versions: &HashMap<String, String>,
+        resolved_versions: &HashMap<String, String>,
     ) -> Option<Hover> {
-        let dep = parse_result
-            .dependencies()
-            .into_iter()
-            .find(|d| ranges_overlap(d.name_range(), position))?;
-
-        let versions = self.registry.get_versions(dep.name()).await.ok()?;
-
-        let url = crate::registry::package_url(dep.name());
-        let mut markdown = format!("# [{}]({})\n\n", dep.name(), url);
-
-        if let Some(req) = dep.version_requirement() {
-            markdown.push_str(&format!("**Current**: `{}`\n\n", req));
-        }
-
-        if let Some(latest) = cached_versions.get(dep.name()) {
-            markdown.push_str(&format!("**Latest**: `{}`\n\n", latest));
-        }
-
-        markdown.push_str("**Recent versions**:\n");
-        for (i, version) in versions.iter().take(8).enumerate() {
-            if i == 0 {
-                markdown.push_str(&format!("- {} *(latest)*\n", version.version_string()));
-            } else if version.is_yanked() {
-                markdown.push_str(&format!("- {} *(yanked)*\n", version.version_string()));
-            } else {
-                markdown.push_str(&format!("- {}\n", version.version_string()));
-            }
-        }
-
-        Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: markdown,
-            }),
-            range: Some(dep.name_range()),
-        })
+        lsp_helpers::generate_hover(
+            parse_result,
+            position,
+            cached_versions,
+            resolved_versions,
+            self.registry.as_ref(),
+            &self.formatter,
+        )
+        .await
     }
 
     async fn generate_code_actions(
@@ -156,62 +97,14 @@ impl Ecosystem for {ECOSYSTEM_PASCAL}Ecosystem {
         _cached_versions: &HashMap<String, String>,
         uri: &Url,
     ) -> Vec<CodeAction> {
-        let mut actions = Vec::new();
-
-        let Some(dep) = parse_result.dependencies().into_iter().find(|d| {
-            d.version_range()
-                .is_some_and(|r| ranges_overlap(r, position))
-        }) else {
-            return actions;
-        };
-
-        let version_range = dep.version_range().unwrap();
-
-        let Ok(versions) = self.registry.get_versions(dep.name()).await else {
-            return actions;
-        };
-
-        for (i, version) in versions
-            .iter()
-            .filter(|v| !v.is_yanked())
-            .take(5)
-            .enumerate()
-        {
-            // TODO: Format version string according to ecosystem conventions
-            let new_text = format!("\"{}\"", version.version_string());
-
-            let mut edits = HashMap::new();
-            edits.insert(
-                uri.clone(),
-                vec![TextEdit {
-                    range: version_range,
-                    new_text,
-                }],
-            );
-
-            let title = if i == 0 {
-                format!(
-                    "Update {} to {} (latest)",
-                    dep.name(),
-                    version.version_string()
-                )
-            } else {
-                format!("Update {} to {}", dep.name(), version.version_string())
-            };
-
-            actions.push(CodeAction {
-                title,
-                kind: Some(CodeActionKind::QUICKFIX),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(edits),
-                    ..Default::default()
-                }),
-                is_preferred: Some(i == 0),
-                ..Default::default()
-            });
-        }
-
-        actions
+        lsp_helpers::generate_code_actions(
+            parse_result,
+            position,
+            uri,
+            self.registry.as_ref(),
+            &self.formatter,
+        )
+        .await
     }
 
     async fn generate_diagnostics(
@@ -220,45 +113,8 @@ impl Ecosystem for {ECOSYSTEM_PASCAL}Ecosystem {
         _cached_versions: &HashMap<String, String>,
         _uri: &Url,
     ) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-
-        for dep in parse_result.dependencies() {
-            // Check if package exists
-            let versions = match self.registry.get_versions(dep.name()).await {
-                Ok(v) => v,
-                Err(_) => {
-                    diagnostics.push(Diagnostic {
-                        range: dep.name_range(),
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        message: format!("Unknown package '{}'", dep.name()),
-                        source: Some("deps-lsp".into()),
-                        ..Default::default()
-                    });
-                    continue;
-                }
-            };
-
-            let Some(version_range) = dep.version_range() else {
-                continue;
-            };
-
-            // Check for newer versions
-            let latest = versions.iter().find(|v| !v.is_yanked());
-            if let Some(latest) = latest
-                && let Some(current) = dep.version_requirement()
-                && latest.version_string() != current
-            {
-                diagnostics.push(Diagnostic {
-                    range: version_range,
-                    severity: Some(DiagnosticSeverity::HINT),
-                    message: format!("Newer version available: {}", latest.version_string()),
-                    source: Some("deps-lsp".into()),
-                    ..Default::default()
-                });
-            }
-        }
-
-        diagnostics
+        lsp_helpers::generate_diagnostics(parse_result, self.registry.as_ref(), &self.formatter)
+            .await
     }
 
     async fn generate_completions(
@@ -267,21 +123,12 @@ impl Ecosystem for {ECOSYSTEM_PASCAL}Ecosystem {
         _position: Position,
         _content: &str,
     ) -> Vec<CompletionItem> {
-        // TODO: Implement completions for package names and versions
         vec![]
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
-}
-
-/// Check if a position is within a range.
-fn ranges_overlap(range: tower_lsp::lsp_types::Range, position: Position) -> bool {
-    !(range.end.line < position.line
-        || (range.end.line == position.line && range.end.character < position.character)
-        || position.line < range.start.line
-        || (position.line == range.start.line && position.character < range.start.character))
 }
 
 #[cfg(test)]
@@ -307,21 +154,6 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let ecosystem = {ECOSYSTEM_PASCAL}Ecosystem::new(cache);
         assert!(ecosystem.manifest_filenames().contains(&"{MANIFEST_FILE}"));
-    }
-
-    #[test]
-    fn test_ranges_overlap_inside() {
-        let range =
-            tower_lsp::lsp_types::Range::new(Position::new(5, 10), Position::new(5, 20));
-        assert!(ranges_overlap(range, Position::new(5, 15)));
-    }
-
-    #[test]
-    fn test_ranges_overlap_outside() {
-        let range =
-            tower_lsp::lsp_types::Range::new(Position::new(5, 10), Position::new(5, 20));
-        assert!(!ranges_overlap(range, Position::new(5, 5)));
-        assert!(!ranges_overlap(range, Position::new(5, 25)));
     }
 
     #[test]

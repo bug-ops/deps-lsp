@@ -1,0 +1,35 @@
+use deps_core::lsp_helpers::EcosystemFormatter;
+
+pub struct {ECOSYSTEM_PASCAL}Formatter;
+
+impl EcosystemFormatter for {ECOSYSTEM_PASCAL}Formatter {
+    fn format_version_for_code_action(&self, version: &str) -> String {
+        // TODO: Format version according to ecosystem conventions
+        format!("\"{}\"", version)
+    }
+
+    fn package_url(&self, name: &str) -> String {
+        // TODO: Return package URL for this ecosystem
+        format!("https://example.com/packages/{}", name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_version() {
+        let formatter = {ECOSYSTEM_PASCAL}Formatter;
+        assert_eq!(
+            formatter.format_version_for_code_action("1.0.0"),
+            "\"1.0.0\""
+        );
+    }
+
+    #[test]
+    fn test_package_url() {
+        let formatter = {ECOSYSTEM_PASCAL}Formatter;
+        assert!(formatter.package_url("test-pkg").contains("test-pkg"));
+    }
+}
