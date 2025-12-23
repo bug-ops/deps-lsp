@@ -178,7 +178,12 @@ where
         )
         .await;
 
-        client.publish_diagnostics(uri_clone, diags, None).await;
+        client.publish_diagnostics(uri_clone.clone(), diags, None).await;
+
+        // Refresh inlay hints after versions are fetched
+        if let Err(e) = client.inlay_hint_refresh().await {
+            tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+        }
     });
 
     Ok(task)
