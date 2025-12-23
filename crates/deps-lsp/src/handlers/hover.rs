@@ -49,20 +49,25 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
 
     let ecosystem = doc.ecosystem;
     let dep = dep.clone();
+    // Get resolved version from lock file if available
+    let resolved_version = doc
+        .versions
+        .get(dep.name())
+        .map(|v| v.version_string().to_string());
     drop(doc);
 
     match ecosystem {
         Ecosystem::Cargo => {
             let handler = CargoHandlerImpl::new(Arc::clone(&state.cache));
-            generate_hover(&handler, &dep).await
+            generate_hover(&handler, &dep, resolved_version.as_deref()).await
         }
         Ecosystem::Npm => {
             let handler = NpmHandlerImpl::new(Arc::clone(&state.cache));
-            generate_hover(&handler, &dep).await
+            generate_hover(&handler, &dep, resolved_version.as_deref()).await
         }
         Ecosystem::Pypi => {
             let handler = PyPiHandlerImpl::new(Arc::clone(&state.cache));
-            generate_hover(&handler, &dep).await
+            generate_hover(&handler, &dep, resolved_version.as_deref()).await
         }
     }
 }

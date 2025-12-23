@@ -430,9 +430,16 @@ fn create_hint<H: EcosystemHandler>(
 /// # Type Parameters
 ///
 /// * `H` - Ecosystem handler type
+///
+/// # Arguments
+///
+/// * `handler` - Ecosystem handler instance
+/// * `dep` - Dependency to generate hover for
+/// * `resolved_version` - Optional resolved version from lock file (preferred over manifest version)
 pub async fn generate_hover<H>(
     handler: &H,
     dep: &H::UnifiedDep,
+    resolved_version: Option<&str>,
 ) -> Option<tower_lsp::lsp_types::Hover>
 where
     H: EcosystemHandler,
@@ -448,8 +455,9 @@ where
     let url = H::package_url(typed_dep.name());
     let mut markdown = format!("# [{}]({})\n\n", typed_dep.name(), url);
 
-    if let Some(current) = typed_dep.version_requirement() {
-        markdown.push_str(&format!("**Current**: `{}`\n\n", current));
+    // Prefer resolved version from lock file, fallback to manifest version requirement
+    if let Some(version) = resolved_version.or(typed_dep.version_requirement()) {
+        markdown.push_str(&format!("**Current**: `{}`\n\n", version));
     }
 
     if latest.is_yanked() {
@@ -1255,7 +1263,7 @@ mod tests {
             },
         };
 
-        let hover = generate_hover(&handler, &dep).await;
+        let hover = generate_hover(&handler, &dep, None).await;
 
         assert!(hover.is_some());
         let hover = hover.unwrap();
@@ -1283,7 +1291,7 @@ mod tests {
             name_range: Range::default(),
         };
 
-        let hover = generate_hover(&handler, &dep).await;
+        let hover = generate_hover(&handler, &dep, None).await;
 
         assert!(hover.is_some());
         let hover = hover.unwrap();
@@ -1308,7 +1316,7 @@ mod tests {
             name_range: Range::default(),
         };
 
-        let hover = generate_hover(&handler, &dep).await;
+        let hover = generate_hover(&handler, &dep, None).await;
         assert!(hover.is_none());
     }
 
@@ -1324,13 +1332,49 @@ mod tests {
             name_range: Range::default(),
         };
 
-        let hover = generate_hover(&handler, &dep).await;
+        let hover = generate_hover(&handler, &dep, None).await;
 
         assert!(hover.is_some());
         let hover = hover.unwrap();
 
         if let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents {
             assert!(!content.value.contains("Current"));
+        } else {
+            panic!("Expected Markup content");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_with_resolved_version() {
+        let cache = Arc::new(HttpCache::new());
+        let handler = MockHandler::new(cache);
+
+        let dep = MockDependency {
+            name: "serde".to_string(),
+            version_req: Some("1.0".to_string()), // Manifest has short version
+            version_range: Some(Range::default()),
+            name_range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+        };
+
+        // Pass resolved version from lock file (full version)
+        let hover = generate_hover(&handler, &dep, Some("1.0.195")).await;
+
+        assert!(hover.is_some());
+        let hover = hover.unwrap();
+
+        if let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents {
+            // Should show the resolved version (1.0.195) not manifest version (1.0)
+            assert!(content.value.contains("**Current**: `1.0.195`"));
+            assert!(!content.value.contains("**Current**: `1.0`"));
         } else {
             panic!("Expected Markup content");
         }
