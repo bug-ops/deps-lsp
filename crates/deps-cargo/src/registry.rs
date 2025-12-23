@@ -27,6 +27,7 @@ use crate::types::{CargoVersion, CrateInfo};
 use deps_core::{DepsError, HttpCache, Result};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -324,6 +325,43 @@ impl deps_core::PackageMetadata for CrateInfo {
 
     fn latest_version(&self) -> &str {
         &self.max_version
+    }
+}
+
+// Implement new Registry trait for trait object support
+#[async_trait::async_trait]
+impl deps_core::Registry for CratesIoRegistry {
+    async fn get_versions(&self, name: &str) -> Result<Vec<Box<dyn deps_core::Version>>> {
+        let versions = self.get_versions(name).await?;
+        Ok(versions
+            .into_iter()
+            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+            .collect())
+    }
+
+    async fn get_latest_matching(
+        &self,
+        name: &str,
+        req: &str,
+    ) -> Result<Option<Box<dyn deps_core::Version>>> {
+        let version = self.get_latest_matching(name, req).await?;
+        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn deps_core::Metadata>>> {
+        let results = self.search(query, limit).await?;
+        Ok(results
+            .into_iter()
+            .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
+            .collect())
+    }
+
+    fn package_url(&self, name: &str) -> String {
+        crate_url(name)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

@@ -21,6 +21,7 @@
 //! let _deps: Vec<ParsedDependency> = vec![];
 //! ```
 
+pub mod ecosystem;
 pub mod handler;
 pub mod lockfile;
 pub mod parser;
@@ -28,6 +29,7 @@ pub mod registry;
 pub mod types;
 
 // Re-export commonly used types
+pub use ecosystem::CargoEcosystem;
 pub use handler::CargoHandler;
 pub use lockfile::CargoLockParser;
 pub use parser::{CargoParser, ParseResult, parse_cargo_toml};

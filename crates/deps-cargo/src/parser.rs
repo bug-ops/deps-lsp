@@ -30,6 +30,7 @@
 
 use crate::types::{DependencySection, DependencySource, ParsedDependency};
 use deps_core::{DepsError, Result};
+use std::any::Any;
 use std::path::PathBuf;
 use toml_edit::{Document, DocumentMut, Item, Table, Value};
 use tower_lsp::lsp_types::{Position, Range, Url};
@@ -44,6 +45,8 @@ pub struct ParseResult {
     pub dependencies: Vec<ParsedDependency>,
     /// Workspace root path if this is a workspace member
     pub workspace_root: Option<PathBuf>,
+    /// Document URI
+    pub uri: Url,
 }
 
 /// Pre-computed line start byte offsets for O(1) position lookups.
@@ -164,6 +167,7 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<ParseResult> {
     Ok(ParseResult {
         dependencies,
         workspace_root,
+        uri: doc_uri.clone(),
     })
 }
 
@@ -466,7 +470,7 @@ impl deps_core::DependencyInfo for ParsedDependency {
     }
 }
 
-// Implement ParseResultInfo trait for ParseResult
+// Implement ParseResultInfo trait for ParseResult (legacy)
 impl deps_core::ParseResultInfo for ParseResult {
     type Dependency = ParsedDependency;
 
@@ -476,6 +480,28 @@ impl deps_core::ParseResultInfo for ParseResult {
 
     fn workspace_root(&self) -> Option<&std::path::Path> {
         self.workspace_root.as_deref()
+    }
+}
+
+// Implement new ParseResult trait for trait object support
+impl deps_core::ParseResult for ParseResult {
+    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+        self.dependencies
+            .iter()
+            .map(|d| d as &dyn deps_core::Dependency)
+            .collect()
+    }
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        self.workspace_root.as_deref()
+    }
+
+    fn uri(&self) -> &Url {
+        &self.uri
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

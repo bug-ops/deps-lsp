@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use tower_lsp::lsp_types::Range;
 
@@ -206,5 +207,90 @@ mod tests {
         assert_eq!(version.num, "1.0.0");
         assert!(!version.yanked);
         assert!(version.features.is_empty());
+    }
+}
+
+// Trait implementations for deps-core integration
+
+impl deps_core::Dependency for ParsedDependency {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&str> {
+        self.version_req.as_deref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::parser::DependencySource {
+        match &self.source {
+            DependencySource::Registry => deps_core::parser::DependencySource::Registry,
+            DependencySource::Git { url, rev } => deps_core::parser::DependencySource::Git {
+                url: url.clone(),
+                rev: rev.clone(),
+            },
+            DependencySource::Path { path } => deps_core::parser::DependencySource::Path {
+                path: path.clone(),
+            },
+        }
+    }
+
+    fn features(&self) -> &[String] {
+        &self.features
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl deps_core::Version for CargoVersion {
+    fn version_string(&self) -> &str {
+        &self.num
+    }
+
+    fn is_yanked(&self) -> bool {
+        self.yanked
+    }
+
+    fn features(&self) -> Vec<String> {
+        self.features.keys().cloned().collect()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl deps_core::Metadata for CrateInfo {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    fn repository(&self) -> Option<&str> {
+        self.repository.as_deref()
+    }
+
+    fn documentation(&self) -> Option<&str> {
+        self.documentation.as_deref()
+    }
+
+    fn latest_version(&self) -> &str {
+        &self.max_version
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
