@@ -261,6 +261,7 @@ pub trait YankedChecker {
 /// * `handler` - Ecosystem-specific handler instance
 /// * `dependencies` - List of dependencies to process
 /// * `cached_versions` - Previously cached version information
+/// * `resolved_versions` - Resolved versions from lock file
 /// * `config` - Display configuration
 ///
 /// # Returns
@@ -270,6 +271,7 @@ pub async fn generate_inlay_hints<H, UnifiedVer>(
     handler: &H,
     dependencies: &[H::UnifiedDep],
     cached_versions: &HashMap<String, UnifiedVer>,
+    resolved_versions: &HashMap<String, String>,
     config: &InlayHintsConfig,
 ) -> Vec<InlayHint>
 where
@@ -331,7 +333,12 @@ where
         if is_yanked {
             continue;
         }
-        let is_latest = H::is_version_latest(&version_req, &latest_version);
+        // Use resolved version from lock file if available, otherwise fall back to requirement
+        let version_to_compare = resolved_versions
+            .get(&name)
+            .map(String::as_str)
+            .unwrap_or(&version_req);
+        let is_latest = H::is_version_latest(version_to_compare, &latest_version);
         hints.push(create_hint::<H>(
             &name,
             version_range,
@@ -356,7 +363,12 @@ where
             continue;
         };
 
-        let is_latest = H::is_version_latest(&version_req, latest.version_string());
+        // Use resolved version from lock file if available, otherwise fall back to requirement
+        let version_to_compare = resolved_versions
+            .get(&name)
+            .map(String::as_str)
+            .unwrap_or(&version_req);
+        let is_latest = H::is_version_latest(version_to_compare, latest.version_string());
         hints.push(create_hint::<H>(
             &name,
             version_range,
@@ -1025,7 +1037,15 @@ mod tests {
         );
 
         let config = InlayHintsConfig::default();
-        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+        let resolved_versions: HashMap<String, String> = HashMap::new();
+        let hints = generate_inlay_hints(
+            &handler,
+            &deps,
+            &cached_versions,
+            &resolved_versions,
+            &config,
+        )
+        .await;
 
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].position.line, 0);
@@ -1055,7 +1075,15 @@ mod tests {
 
         let cached_versions: HashMap<String, MockVersion> = HashMap::new();
         let config = InlayHintsConfig::default();
-        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+        let resolved_versions: HashMap<String, String> = HashMap::new();
+        let hints = generate_inlay_hints(
+            &handler,
+            &deps,
+            &cached_versions,
+            &resolved_versions,
+            &config,
+        )
+        .await;
 
         assert_eq!(hints.len(), 1);
     }
@@ -1092,7 +1120,15 @@ mod tests {
         );
 
         let config = InlayHintsConfig::default();
-        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+        let resolved_versions: HashMap<String, String> = HashMap::new();
+        let hints = generate_inlay_hints(
+            &handler,
+            &deps,
+            &cached_versions,
+            &resolved_versions,
+            &config,
+        )
+        .await;
 
         assert_eq!(hints.len(), 0);
     }
@@ -1111,7 +1147,15 @@ mod tests {
 
         let cached_versions: HashMap<String, MockVersion> = HashMap::new();
         let config = InlayHintsConfig::default();
-        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+        let resolved_versions: HashMap<String, String> = HashMap::new();
+        let hints = generate_inlay_hints(
+            &handler,
+            &deps,
+            &cached_versions,
+            &resolved_versions,
+            &config,
+        )
+        .await;
 
         assert_eq!(hints.len(), 0);
     }
@@ -1139,7 +1183,15 @@ mod tests {
 
         let cached_versions: HashMap<String, MockVersion> = HashMap::new();
         let config = InlayHintsConfig::default();
-        let hints = generate_inlay_hints(&handler, &deps, &cached_versions, &config).await;
+        let resolved_versions: HashMap<String, String> = HashMap::new();
+        let hints = generate_inlay_hints(
+            &handler,
+            &deps,
+            &cached_versions,
+            &resolved_versions,
+            &config,
+        )
+        .await;
 
         assert_eq!(hints.len(), 0);
     }
