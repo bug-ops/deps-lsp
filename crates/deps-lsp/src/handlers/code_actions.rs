@@ -45,12 +45,3 @@ pub async fn handle_code_actions(
         .map(CodeActionOrCommand::CodeAction)
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_code_actions_placeholder() {
-        // Placeholder test
-        assert!(true);
-    }
-}

@@ -311,7 +311,7 @@ mod tests {
 
         let boxed: Box<dyn Version> = Box::new(version);
         assert_eq!(boxed.version_string(), "1.2.3");
-        assert_eq!(boxed.is_yanked(), false);
+        assert!(!boxed.is_yanked());
     }
 
     #[test]

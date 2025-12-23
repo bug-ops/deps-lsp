@@ -214,12 +214,3 @@ pub async fn handle_document_change(
 
     Ok(task)
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_lifecycle_placeholder() {
-        // Placeholder test
-        assert!(true);
-    }
-}

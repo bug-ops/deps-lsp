@@ -174,6 +174,12 @@ impl PypiVersion {
     }
 }
 
+// Use macro to implement VersionInfo and Version traits
+deps_core::impl_version!(PypiVersion {
+    version: version,
+    yanked: yanked,
+});
+
 /// Package metadata from PyPI.
 ///
 /// Contains basic information about a PyPI package for display in completion
@@ -239,30 +245,6 @@ impl deps_core::Dependency for PypiDependency {
             }
             PypiDependencySource::Url { .. } => deps_core::parser::DependencySource::Registry,
         }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl deps_core::VersionInfo for PypiVersion {
-    fn version_string(&self) -> &str {
-        &self.version
-    }
-
-    fn is_yanked(&self) -> bool {
-        self.yanked
-    }
-}
-
-impl deps_core::Version for PypiVersion {
-    fn version_string(&self) -> &str {
-        &self.version
-    }
-
-    fn is_yanked(&self) -> bool {
-        self.yanked
     }
 
     fn as_any(&self) -> &dyn Any {

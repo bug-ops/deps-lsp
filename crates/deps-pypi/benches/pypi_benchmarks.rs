@@ -10,6 +10,11 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_pypi::parser::PypiParser;
 use std::hint::black_box;
+use tower_lsp::lsp_types::Url;
+
+fn bench_uri() -> Url {
+    Url::parse("file:///bench/pyproject.toml").unwrap()
+}
 
 /// Small pyproject.toml with PEP 621 format.
 const SMALL_PEP621: &str = r#"
@@ -153,26 +158,27 @@ test = ["pytest>=8.0", "coverage>=7.0"]
 fn bench_pypi_parsing(c: &mut Criterion) {
     let parser = PypiParser::new();
     let mut group = c.benchmark_group("pypi_parsing");
+    let uri = bench_uri();
 
     group.bench_function("pep621_small_5_deps", |b| {
-        b.iter(|| parser.parse_content(black_box(SMALL_PEP621)))
+        b.iter(|| parser.parse_content(black_box(SMALL_PEP621), &uri))
     });
 
     group.bench_function("pep621_medium_25_deps", |b| {
-        b.iter(|| parser.parse_content(black_box(MEDIUM_PEP621)))
+        b.iter(|| parser.parse_content(black_box(MEDIUM_PEP621), &uri))
     });
 
     let large_poetry = generate_large_poetry();
     group.bench_function("poetry_large_100_deps", |b| {
-        b.iter(|| parser.parse_content(black_box(&large_poetry)))
+        b.iter(|| parser.parse_content(black_box(&large_poetry), &uri))
     });
 
     group.bench_function("pep735_format", |b| {
-        b.iter(|| parser.parse_content(black_box(PEP735_FORMAT)))
+        b.iter(|| parser.parse_content(black_box(PEP735_FORMAT), &uri))
     });
 
     group.bench_function("mixed_format", |b| {
-        b.iter(|| parser.parse_content(black_box(MIXED_FORMAT)))
+        b.iter(|| parser.parse_content(black_box(MIXED_FORMAT), &uri))
     });
 
     group.finish();
@@ -265,6 +271,7 @@ fn bench_pep440_version_matching(c: &mut Criterion) {
 fn bench_position_tracking(c: &mut Criterion) {
     let parser = PypiParser::new();
     let mut group = c.benchmark_group("position_tracking");
+    let uri = bench_uri();
 
     // Simple dependency
     let simple = r#"
@@ -285,15 +292,15 @@ dependencies = ["numpy>=1.24; python_version>='3.9'"]
 "#;
 
     group.bench_function("simple_dependency", |b| {
-        b.iter(|| parser.parse_content(black_box(simple)))
+        b.iter(|| parser.parse_content(black_box(simple), &uri))
     });
 
     group.bench_function("with_extras", |b| {
-        b.iter(|| parser.parse_content(black_box(with_extras)))
+        b.iter(|| parser.parse_content(black_box(with_extras), &uri))
     });
 
     group.bench_function("with_markers", |b| {
-        b.iter(|| parser.parse_content(black_box(with_markers)))
+        b.iter(|| parser.parse_content(black_box(with_markers), &uri))
     });
 
     group.finish();
@@ -303,6 +310,7 @@ dependencies = ["numpy>=1.24; python_version>='3.9'"]
 fn bench_dependency_sources(c: &mut Criterion) {
     let parser = PypiParser::new();
     let mut group = c.benchmark_group("dependency_sources");
+    let uri = bench_uri();
 
     let sources = [
         (
@@ -339,7 +347,7 @@ package = { url = "https://example.com/package.whl" }"#,
 
     for (name, content) in sources {
         group.bench_with_input(BenchmarkId::from_parameter(name), &content, |b, content| {
-            b.iter(|| parser.parse_content(black_box(content)))
+            b.iter(|| parser.parse_content(black_box(content), &uri))
         });
     }
 
@@ -349,6 +357,7 @@ package = { url = "https://example.com/package.whl" }"#,
 /// Benchmark parsing with comments and whitespace.
 fn bench_with_comments(c: &mut Criterion) {
     let parser = PypiParser::new();
+    let uri = bench_uri();
 
     let with_comments = r#"
 [project]
@@ -369,13 +378,14 @@ dev = [
 "#;
 
     c.bench_function("parsing_with_comments", |b| {
-        b.iter(|| parser.parse_content(black_box(with_comments)))
+        b.iter(|| parser.parse_content(black_box(with_comments), &uri))
     });
 }
 
 /// Benchmark Unicode handling in dependencies.
 fn bench_unicode_parsing(c: &mut Criterion) {
     let parser = PypiParser::new();
+    let uri = bench_uri();
 
     let unicode_toml = r#"
 [project]
@@ -388,7 +398,7 @@ dependencies = [
 "#;
 
     c.bench_function("unicode_parsing", |b| {
-        b.iter(|| parser.parse_content(black_box(unicode_toml)))
+        b.iter(|| parser.parse_content(black_box(unicode_toml), &uri))
     });
 }
 
@@ -396,6 +406,7 @@ dependencies = [
 fn bench_poetry_constraints(c: &mut Criterion) {
     let parser = PypiParser::new();
     let mut group = c.benchmark_group("poetry_constraints");
+    let uri = bench_uri();
 
     let constraints = [
         (
@@ -427,7 +438,7 @@ django = ">=4.0,<5.0""#,
 
     for (name, content) in constraints {
         group.bench_with_input(BenchmarkId::from_parameter(name), &content, |b, content| {
-            b.iter(|| parser.parse_content(black_box(content)))
+            b.iter(|| parser.parse_content(black_box(content), &uri))
         });
     }
 

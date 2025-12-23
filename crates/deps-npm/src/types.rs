@@ -1,4 +1,3 @@
-use std::any::Any;
 use tower_lsp::lsp_types::Range;
 
 /// Parsed dependency from package.json with position tracking.
@@ -32,6 +31,14 @@ pub struct NpmDependency {
     pub version_range: Option<Range>,
     pub section: NpmDependencySection,
 }
+
+// Use macro to implement DependencyInfo and Dependency traits
+deps_core::impl_dependency!(NpmDependency {
+    name: name,
+    name_range: name_range,
+    version: version_req,
+    version_range: version_range,
+});
 
 /// Section in package.json where a dependency is declared.
 ///
@@ -84,6 +91,12 @@ pub struct NpmVersion {
     pub deprecated: bool,
 }
 
+// Use macro to implement VersionInfo and Version traits
+deps_core::impl_version!(NpmVersion {
+    version: version,
+    yanked: deprecated,
+});
+
 /// Package metadata from npm registry.
 ///
 /// Contains basic information about an npm package for display in completion
@@ -113,129 +126,14 @@ pub struct NpmPackage {
     pub latest_version: String,
 }
 
-// Implement deps_core traits
-
-impl deps_core::DependencyInfo for NpmDependency {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> deps_core::parser::DependencySource {
-        // npm dependencies are always from registry
-        // (git/file/workspace dependencies are not tracked with positions)
-        deps_core::parser::DependencySource::Registry
-    }
-}
-
-impl deps_core::Dependency for NpmDependency {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> deps_core::parser::DependencySource {
-        deps_core::parser::DependencySource::Registry
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl deps_core::VersionInfo for NpmVersion {
-    fn version_string(&self) -> &str {
-        &self.version
-    }
-
-    fn is_yanked(&self) -> bool {
-        self.deprecated
-    }
-}
-
-impl deps_core::Version for NpmVersion {
-    fn version_string(&self) -> &str {
-        &self.version
-    }
-
-    fn is_yanked(&self) -> bool {
-        self.deprecated
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl deps_core::PackageMetadata for NpmPackage {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
-    }
-
-    fn repository(&self) -> Option<&str> {
-        self.repository.as_deref()
-    }
-
-    fn documentation(&self) -> Option<&str> {
-        self.homepage.as_deref()
-    }
-
-    fn latest_version(&self) -> &str {
-        &self.latest_version
-    }
-}
-
-impl deps_core::Metadata for NpmPackage {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
-    }
-
-    fn repository(&self) -> Option<&str> {
-        self.repository.as_deref()
-    }
-
-    fn documentation(&self) -> Option<&str> {
-        self.homepage.as_deref()
-    }
-
-    fn latest_version(&self) -> &str {
-        &self.latest_version
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
+// Use macro to implement PackageMetadata and Metadata traits
+deps_core::impl_metadata!(NpmPackage {
+    name: name,
+    description: description,
+    repository: repository,
+    documentation: homepage,
+    latest_version: latest_version,
+});
 
 #[cfg(test)]
 mod tests {

@@ -24,12 +24,3 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
     drop(doc);
     hover
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_hover_placeholder() {
-        // Placeholder test
-        assert!(true);
-    }
-}

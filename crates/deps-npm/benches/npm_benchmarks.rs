@@ -10,6 +10,11 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_npm::parser::parse_package_json;
 use std::hint::black_box;
+use tower_lsp::lsp_types::Url;
+
+fn bench_uri() -> Url {
+    Url::parse("file:///bench/package.json").unwrap()
+}
 
 /// Small package.json with 5 dependencies.
 const SMALL_PACKAGE_JSON: &str = r#"{
@@ -167,22 +172,23 @@ const NPM_REGISTRY_RESPONSE: &str = r#"{
 /// Benchmark package.json parsing with different file sizes.
 fn bench_npm_parsing(c: &mut Criterion) {
     let mut group = c.benchmark_group("npm_parsing");
+    let uri = bench_uri();
 
     group.bench_function("small_5_deps", |b| {
-        b.iter(|| parse_package_json(black_box(SMALL_PACKAGE_JSON)))
+        b.iter(|| parse_package_json(black_box(SMALL_PACKAGE_JSON), &uri))
     });
 
     group.bench_function("medium_25_deps", |b| {
-        b.iter(|| parse_package_json(black_box(MEDIUM_PACKAGE_JSON)))
+        b.iter(|| parse_package_json(black_box(MEDIUM_PACKAGE_JSON), &uri))
     });
 
     let large_json = generate_large_package_json();
     group.bench_function("large_100_deps", |b| {
-        b.iter(|| parse_package_json(black_box(&large_json)))
+        b.iter(|| parse_package_json(black_box(&large_json), &uri))
     });
 
     group.bench_function("monorepo_all_sections", |b| {
-        b.iter(|| parse_package_json(black_box(MONOREPO_PACKAGE_JSON)))
+        b.iter(|| parse_package_json(black_box(MONOREPO_PACKAGE_JSON), &uri))
     });
 
     group.finish();
@@ -193,6 +199,7 @@ fn bench_npm_parsing(c: &mut Criterion) {
 /// Tests accuracy and performance of line/character position calculation.
 fn bench_position_tracking(c: &mut Criterion) {
     let mut group = c.benchmark_group("position_tracking");
+    let uri = bench_uri();
 
     // Single dependency
     let single = r#"{
@@ -210,11 +217,11 @@ fn bench_position_tracking(c: &mut Criterion) {
 }"#;
 
     group.bench_function("single_dependency", |b| {
-        b.iter(|| parse_package_json(black_box(single)))
+        b.iter(|| parse_package_json(black_box(single), &uri))
     });
 
     group.bench_function("scoped_packages", |b| {
-        b.iter(|| parse_package_json(black_box(scoped)))
+        b.iter(|| parse_package_json(black_box(scoped), &uri))
     });
 
     group.finish();
@@ -325,9 +332,10 @@ fn bench_version_specifiers(c: &mut Criterion) {
         ("tag", r#"{"dependencies": {"pkg": "latest"}}"#),
     ];
 
+    let uri = bench_uri();
     for (name, content) in specifiers {
         group.bench_with_input(BenchmarkId::from_parameter(name), &content, |b, content| {
-            b.iter(|| parse_package_json(black_box(content)))
+            b.iter(|| parse_package_json(black_box(content), &uri))
         });
     }
 
@@ -338,6 +346,7 @@ fn bench_version_specifiers(c: &mut Criterion) {
 ///
 /// Regression test for package names appearing in scripts.
 fn bench_name_collision(c: &mut Criterion) {
+    let uri = bench_uri();
     let collision_json = r#"{
   "name": "collision-test",
   "scripts": {
@@ -351,12 +360,13 @@ fn bench_name_collision(c: &mut Criterion) {
 }"#;
 
     c.bench_function("name_collision_in_scripts", |b| {
-        b.iter(|| parse_package_json(black_box(collision_json)))
+        b.iter(|| parse_package_json(black_box(collision_json), &uri))
     });
 }
 
 /// Benchmark parsing with Unicode package names and versions.
 fn bench_unicode_parsing(c: &mut Criterion) {
+    let uri = bench_uri();
     let unicode_json = r#"{
   "name": "unicode-project",
   "description": "Project with Unicode: 日本語 🦀",
@@ -367,7 +377,7 @@ fn bench_unicode_parsing(c: &mut Criterion) {
 }"#;
 
     c.bench_function("unicode_parsing", |b| {
-        b.iter(|| parse_package_json(black_box(unicode_json)))
+        b.iter(|| parse_package_json(black_box(unicode_json), &uri))
     });
 }
 

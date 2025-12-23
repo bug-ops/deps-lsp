@@ -160,56 +160,6 @@ pub struct CrateInfo {
     pub max_version: String,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_dependency_source_variants() {
-        let registry = DependencySource::Registry;
-        let git = DependencySource::Git {
-            url: "https://github.com/user/repo".into(),
-            rev: Some("main".into()),
-        };
-        let path = DependencySource::Path {
-            path: "../local".into(),
-        };
-
-        assert!(matches!(registry, DependencySource::Registry));
-        assert!(matches!(git, DependencySource::Git { .. }));
-        assert!(matches!(path, DependencySource::Path { .. }));
-    }
-
-    #[test]
-    fn test_dependency_section_variants() {
-        let deps = DependencySection::Dependencies;
-        let dev_deps = DependencySection::DevDependencies;
-        let build_deps = DependencySection::BuildDependencies;
-        let workspace_deps = DependencySection::WorkspaceDependencies;
-
-        assert!(matches!(deps, DependencySection::Dependencies));
-        assert!(matches!(dev_deps, DependencySection::DevDependencies));
-        assert!(matches!(build_deps, DependencySection::BuildDependencies));
-        assert!(matches!(
-            workspace_deps,
-            DependencySection::WorkspaceDependencies
-        ));
-    }
-
-    #[test]
-    fn test_cargo_version_creation() {
-        let version = CargoVersion {
-            num: "1.0.0".into(),
-            yanked: false,
-            features: HashMap::new(),
-        };
-
-        assert_eq!(version.num, "1.0.0");
-        assert!(!version.yanked);
-        assert!(version.features.is_empty());
-    }
-}
-
 // Trait implementations for deps-core integration
 
 impl deps_core::Dependency for ParsedDependency {
@@ -292,5 +242,55 @@ impl deps_core::Metadata for CrateInfo {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dependency_source_variants() {
+        let registry = DependencySource::Registry;
+        let git = DependencySource::Git {
+            url: "https://github.com/user/repo".into(),
+            rev: Some("main".into()),
+        };
+        let path = DependencySource::Path {
+            path: "../local".into(),
+        };
+
+        assert!(matches!(registry, DependencySource::Registry));
+        assert!(matches!(git, DependencySource::Git { .. }));
+        assert!(matches!(path, DependencySource::Path { .. }));
+    }
+
+    #[test]
+    fn test_dependency_section_variants() {
+        let deps = DependencySection::Dependencies;
+        let dev_deps = DependencySection::DevDependencies;
+        let build_deps = DependencySection::BuildDependencies;
+        let workspace_deps = DependencySection::WorkspaceDependencies;
+
+        assert!(matches!(deps, DependencySection::Dependencies));
+        assert!(matches!(dev_deps, DependencySection::DevDependencies));
+        assert!(matches!(build_deps, DependencySection::BuildDependencies));
+        assert!(matches!(
+            workspace_deps,
+            DependencySection::WorkspaceDependencies
+        ));
+    }
+
+    #[test]
+    fn test_cargo_version_creation() {
+        let version = CargoVersion {
+            num: "1.0.0".into(),
+            yanked: false,
+            features: HashMap::new(),
+        };
+
+        assert_eq!(version.num, "1.0.0");
+        assert!(!version.yanked);
+        assert!(version.features.is_empty());
     }
 }

@@ -46,12 +46,3 @@ pub async fn handle_diagnostics(
     drop(doc);
     diags
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_diagnostics_placeholder() {
-        // Placeholder test
-        assert!(true);
-    }
-}

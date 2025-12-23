@@ -418,10 +418,13 @@ mod tests {
         latest_version: latest_version,
     });
 
-    impl_parse_result!(TestParseResult, TestDependency {
-        dependencies: dependencies,
-        uri: uri,
-    });
+    impl_parse_result!(
+        TestParseResult,
+        TestDependency {
+            dependencies: dependencies,
+            uri: uri,
+        }
+    );
 
     #[test]
     fn test_impl_dependency_macro() {

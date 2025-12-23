@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn test_ecosystem_config_default() {
         let config = EcosystemConfig::default();
-        assert_eq!(config.show_up_to_date_hints, true);
+        assert!(config.show_up_to_date_hints);
         assert_eq!(config.up_to_date_text, "✓");
         assert_eq!(config.needs_update_text, "→ {}");
     }
@@ -322,7 +322,7 @@ mod tests {
             up_to_date_text: "OK".to_string(),
             needs_update_text: "Update to {}".to_string(),
         };
-        assert_eq!(config.show_up_to_date_hints, false);
+        assert!(!config.show_up_to_date_hints);
         assert_eq!(config.up_to_date_text, "OK");
         assert_eq!(config.needs_update_text, "Update to {}");
     }
