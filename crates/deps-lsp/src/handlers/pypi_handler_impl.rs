@@ -5,7 +5,9 @@
 
 use crate::document::UnifiedDependency;
 use async_trait::async_trait;
-use deps_core::{EcosystemHandler, HttpCache, LockFileProvider, Pep440Matcher, VersionRequirementMatcher};
+use deps_core::{
+    EcosystemHandler, HttpCache, LockFileProvider, Pep440Matcher, VersionRequirementMatcher,
+};
 use deps_pypi::{PypiDependency, PypiLockParser, PypiRegistry};
 use std::sync::Arc;
 

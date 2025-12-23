@@ -5,7 +5,9 @@
 
 use crate::document::UnifiedDependency;
 use async_trait::async_trait;
-use deps_core::{EcosystemHandler, HttpCache, LockFileProvider, SemverMatcher, VersionRequirementMatcher};
+use deps_core::{
+    EcosystemHandler, HttpCache, LockFileProvider, SemverMatcher, VersionRequirementMatcher,
+};
 use deps_npm::{NpmDependency, NpmLockParser, NpmRegistry, package_url};
 use std::sync::Arc;
 

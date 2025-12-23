@@ -57,7 +57,11 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
         doc.resolved_versions.keys().take(5).collect::<Vec<_>>()
     );
     let resolved_version = doc.resolved_versions.get(dep_name).cloned();
-    tracing::debug!("Hover: resolved_version for '{}' = {:?}", dep_name, resolved_version);
+    tracing::debug!(
+        "Hover: resolved_version for '{}' = {:?}",
+        dep_name,
+        resolved_version
+    );
     drop(doc);
 
     match ecosystem {

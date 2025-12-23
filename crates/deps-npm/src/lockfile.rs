@@ -197,9 +197,7 @@ impl LockFileProvider for NpmLockParser {
 /// - `"node_modules/express/node_modules/debug"` → `"debug"`
 fn extract_package_name(key: &str) -> &str {
     // Find the last occurrence of "node_modules/"
-    key.rsplit("node_modules/")
-        .next()
-        .unwrap_or(key)
+    key.rsplit("node_modules/").next().unwrap_or(key)
 }
 
 /// Parses npm source information into ResolvedSource.
@@ -325,7 +323,10 @@ mod tests {
 
         match source {
             ResolvedSource::Registry { url, checksum } => {
-                assert_eq!(url, "https://registry.npmjs.org/express/-/express-4.18.2.tgz");
+                assert_eq!(
+                    url,
+                    "https://registry.npmjs.org/express/-/express-4.18.2.tgz"
+                );
                 assert_eq!(checksum, "sha512-abc123");
             }
             _ => panic!("Expected Registry source"),
@@ -365,8 +366,7 @@ mod tests {
 
     #[test]
     fn test_parse_git_source_tarball() {
-        let source =
-            parse_git_source("https://github.com/user/repo/tarball/abc123");
+        let source = parse_git_source("https://github.com/user/repo/tarball/abc123");
 
         match source {
             ResolvedSource::Git { url, rev } => {
@@ -650,8 +650,7 @@ mod tests {
         std::fs::write(&lockfile_path, r#"{"lockfileVersion": 3}"#).unwrap();
 
         // Use a time far in the future
-        let future_time =
-            std::time::SystemTime::now() + std::time::Duration::from_secs(86400); // +1 day
+        let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(86400); // +1 day
         let parser = NpmLockParser;
 
         assert!(
