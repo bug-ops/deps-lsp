@@ -141,7 +141,7 @@ pub trait Registry: Send + Sync {
     /// Returns error if network request or parsing fails.
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn Metadata>>>;
 
-    /// Package URL for ecosystem (e.g., https://crates.io/crates/serde)
+    /// Package URL for ecosystem (e.g., <https://crates.io/crates/serde>)
     ///
     /// Returns a URL that links to the package page on the registry website.
     fn package_url(&self, name: &str) -> String;
