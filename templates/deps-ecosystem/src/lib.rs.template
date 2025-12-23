@@ -1,0 +1,15 @@
+//! {ECOSYSTEM_DISPLAY} support for deps-lsp.
+//!
+//! This crate provides parsing and registry integration for {ECOSYSTEM_DISPLAY} projects.
+
+pub mod ecosystem;
+pub mod error;
+pub mod parser;
+pub mod registry;
+pub mod types;
+
+pub use ecosystem::{ECOSYSTEM_PASCAL}Ecosystem;
+pub use error::{ECOSYSTEM_PASCAL}Error, Result;
+pub use parser::parse_{ECOSYSTEM_SNAKE};
+pub use registry::{ECOSYSTEM_PASCAL}Registry;
+pub use types::{ECOSYSTEM_PASCAL}Dependency, {ECOSYSTEM_PASCAL}Version;

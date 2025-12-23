@@ -1,0 +1,136 @@
+//! {REGISTRY_NAME} API client with HTTP caching.
+
+use crate::error::{ECOSYSTEM_PASCAL}Error, Result;
+use crate::types::{ECOSYSTEM_PASCAL}Version;
+use deps_core::HttpCache;
+use std::sync::Arc;
+
+/// Base URL for the package registry.
+const REGISTRY_URL: &str = "{REGISTRY_URL}";
+
+/// Generate package URL for documentation links.
+pub fn package_url(name: &str) -> String {
+    format!("{}/{}", REGISTRY_URL, urlencoding::encode(name))
+}
+
+/// {REGISTRY_NAME} API client.
+pub struct {ECOSYSTEM_PASCAL}Registry {
+    cache: Arc<HttpCache>,
+}
+
+impl {ECOSYSTEM_PASCAL}Registry {
+    /// Create a new registry client with shared HTTP cache.
+    pub fn new(cache: Arc<HttpCache>) -> Self {
+        Self { cache }
+    }
+
+    /// Fetch all versions for a package.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use deps_{ECOSYSTEM_SNAKE}::{ECOSYSTEM_PASCAL}Registry;
+    /// use deps_core::HttpCache;
+    /// use std::sync::Arc;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let cache = Arc::new(HttpCache::new());
+    /// let registry = {ECOSYSTEM_PASCAL}Registry::new(cache);
+    /// let versions = registry.get_versions("package-name").await.unwrap();
+    /// # }
+    /// ```
+    pub async fn get_versions(&self, name: &str) -> Result<Vec<{ECOSYSTEM_PASCAL}Version>> {
+        let url = format!("{}/{}", REGISTRY_URL, urlencoding::encode(name));
+
+        let data = self
+            .cache
+            .get_cached(&url)
+            .await
+            .map_err(|e| {ECOSYSTEM_PASCAL}Error::CacheError(e.to_string()))?;
+
+        // TODO: Parse the response based on registry API format
+        // Example for JSON response:
+        // let response: RegistryResponse = serde_json::from_slice(&data)
+        //     .map_err(|e| {ECOSYSTEM_PASCAL}Error::RegistryError {
+        //         package: name.into(),
+        //         source: Box::new(e),
+        //     })?;
+
+        let _ = data; // Remove when implementing
+
+        Ok(vec![])
+    }
+
+    /// Get latest version matching a requirement.
+    pub async fn get_latest_matching(
+        &self,
+        name: &str,
+        version_req: &str,
+    ) -> Result<Option<{ECOSYSTEM_PASCAL}Version>> {
+        let versions = self.get_versions(name).await?;
+
+        // TODO: Implement version matching based on ecosystem's versioning scheme
+        // Most ecosystems use semver or similar
+
+        let _ = version_req; // Remove when implementing
+
+        Ok(versions.into_iter().find(|v| !v.yanked))
+    }
+
+    /// Search for packages by query.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<String>> {
+        // TODO: Implement search if registry supports it
+        let _ = (query, limit);
+        Ok(vec![])
+    }
+}
+
+#[async_trait::async_trait]
+impl deps_core::Registry for {ECOSYSTEM_PASCAL}Registry {
+    async fn get_versions(
+        &self,
+        name: &str,
+    ) -> deps_core::Result<Vec<Box<dyn deps_core::Version>>> {
+        let versions = self.get_versions(name).await?;
+        Ok(versions
+            .into_iter()
+            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+            .collect())
+    }
+
+    async fn get_latest_matching(
+        &self,
+        name: &str,
+        version_req: &str,
+    ) -> deps_core::Result<Option<Box<dyn deps_core::Version>>> {
+        let version = self.get_latest_matching(name, version_req).await?;
+        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_package_url() {
+        let url = package_url("my-package");
+        assert!(url.contains("my-package"));
+    }
+
+    #[test]
+    fn test_package_url_escapes_special_chars() {
+        let url = package_url("@scope/package");
+        assert!(url.contains("%40scope"));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network
+    async fn test_get_versions() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = {ECOSYSTEM_PASCAL}Registry::new(cache);
+        let versions = registry.get_versions("popular-package").await.unwrap();
+        assert!(!versions.is_empty());
+    }
+}

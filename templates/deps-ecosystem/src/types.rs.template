@@ -1,0 +1,116 @@
+//! Types for {ECOSYSTEM_DISPLAY} dependency management.
+
+use std::any::Any;
+use tower_lsp::lsp_types::Range;
+
+/// A dependency from the manifest file.
+#[derive(Debug, Clone)]
+pub struct {ECOSYSTEM_PASCAL}Dependency {
+    /// Package name
+    pub name: String,
+    /// LSP range of the name in source
+    pub name_range: Range,
+    /// Version requirement
+    pub version_req: Option<String>,
+    /// LSP range of version in source
+    pub version_range: Option<Range>,
+    /// Dependency section
+    pub section: {ECOSYSTEM_PASCAL}DependencySection,
+}
+
+/// Dependency section types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum {ECOSYSTEM_PASCAL}DependencySection {
+    Dependencies,
+    DevDependencies,
+    // TODO: Add ecosystem-specific sections
+}
+
+/// Version information from the registry.
+#[derive(Debug, Clone)]
+pub struct {ECOSYSTEM_PASCAL}Version {
+    pub version: String,
+    pub yanked: bool,
+}
+
+impl deps_core::Dependency for {ECOSYSTEM_PASCAL}Dependency {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&str> {
+        self.version_req.as_deref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn is_workspace_inherited(&self) -> bool {
+        false
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl deps_core::Version for {ECOSYSTEM_PASCAL}Version {
+    fn version_string(&self) -> &str {
+        &self.version
+    }
+
+    fn is_yanked(&self) -> bool {
+        self.yanked
+    }
+
+    fn is_prerelease(&self) -> bool {
+        self.version.contains('-')
+            || self.version.contains("alpha")
+            || self.version.contains("beta")
+            || self.version.contains("rc")
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower_lsp::lsp_types::Position;
+
+    #[test]
+    fn test_dependency_trait() {
+        let dep = {ECOSYSTEM_PASCAL}Dependency {
+            name: "test-pkg".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+            version_req: Some("1.0.0".into()),
+            version_range: Some(Range::new(Position::new(0, 10), Position::new(0, 15))),
+            section: {ECOSYSTEM_PASCAL}DependencySection::Dependencies,
+        };
+
+        assert_eq!(deps_core::Dependency::name(&dep), "test-pkg");
+        assert_eq!(deps_core::Dependency::version_requirement(&dep), Some("1.0.0"));
+    }
+
+    #[test]
+    fn test_version_prerelease() {
+        let stable = {ECOSYSTEM_PASCAL}Version {
+            version: "1.0.0".into(),
+            yanked: false,
+        };
+        assert!(!deps_core::Version::is_prerelease(&stable));
+
+        let pre = {ECOSYSTEM_PASCAL}Version {
+            version: "1.0.0-beta.1".into(),
+            yanked: false,
+        };
+        assert!(deps_core::Version::is_prerelease(&pre));
+    }
+}

@@ -1,0 +1,106 @@
+//! Errors specific to {ECOSYSTEM_DISPLAY} dependency handling.
+
+use thiserror::Error;
+
+/// Errors specific to {ECOSYSTEM_DISPLAY} dependency handling.
+#[derive(Error, Debug)]
+pub enum {ECOSYSTEM_PASCAL}Error {
+    /// Failed to parse manifest file
+    #[error("Failed to parse {MANIFEST_FILE}: {source}")]
+    ParseError {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Invalid version specifier
+    #[error("Invalid version specifier '{specifier}': {message}")]
+    InvalidVersionSpecifier { specifier: String, message: String },
+
+    /// Package not found
+    #[error("Package '{package}' not found")]
+    PackageNotFound { package: String },
+
+    /// Registry request failed
+    #[error("Registry request failed for '{package}': {source}")]
+    RegistryError {
+        package: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// Cache error
+    #[error("Cache error: {0}")]
+    CacheError(String),
+
+    /// I/O error
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Result type alias for {ECOSYSTEM_DISPLAY} operations.
+pub type Result<T> = std::result::Result<T, {ECOSYSTEM_PASCAL}Error>;
+
+impl {ECOSYSTEM_PASCAL}Error {
+    pub fn registry_error(
+        package: impl Into<String>,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::RegistryError {
+            package: package.into(),
+            source: Box::new(error),
+        }
+    }
+
+    pub fn invalid_version(specifier: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::InvalidVersionSpecifier {
+            specifier: specifier.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl From<{ECOSYSTEM_PASCAL}Error> for deps_core::DepsError {
+    fn from(err: {ECOSYSTEM_PASCAL}Error) -> Self {
+        match err {
+            {ECOSYSTEM_PASCAL}Error::ParseError { source } => deps_core::DepsError::ParseError {
+                file_type: "{MANIFEST_FILE}".into(),
+                source,
+            },
+            {ECOSYSTEM_PASCAL}Error::InvalidVersionSpecifier { message, .. } => {
+                deps_core::DepsError::InvalidVersionReq(message)
+            }
+            {ECOSYSTEM_PASCAL}Error::PackageNotFound { package } => {
+                deps_core::DepsError::CacheError(format!("Package '{}' not found", package))
+            }
+            {ECOSYSTEM_PASCAL}Error::RegistryError { package, source } => {
+                deps_core::DepsError::ParseError {
+                    file_type: format!("registry for {}", package),
+                    source,
+                }
+            }
+            {ECOSYSTEM_PASCAL}Error::CacheError(msg) => deps_core::DepsError::CacheError(msg),
+            {ECOSYSTEM_PASCAL}Error::Io(e) => deps_core::DepsError::Io(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_display() {
+        let err = {ECOSYSTEM_PASCAL}Error::PackageNotFound {
+            package: "test-pkg".into(),
+        };
+        assert!(err.to_string().contains("test-pkg"));
+    }
+
+    #[test]
+    fn test_conversion_to_deps_error() {
+        let err = {ECOSYSTEM_PASCAL}Error::PackageNotFound {
+            package: "test".into(),
+        };
+        let _: deps_core::DepsError = err.into();
+    }
+}

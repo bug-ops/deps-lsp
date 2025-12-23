@@ -1,0 +1,140 @@
+//! {MANIFEST_FILE} parser with position tracking.
+
+use crate::error::Result;
+use crate::types::{ECOSYSTEM_PASCAL}Dependency, {ECOSYSTEM_PASCAL}DependencySection;
+use std::any::Any;
+use tower_lsp::lsp_types::{Position, Range, Url};
+
+/// Parse result containing dependencies and metadata.
+#[derive(Debug)]
+pub struct {ECOSYSTEM_PASCAL}ParseResult {
+    pub dependencies: Vec<{ECOSYSTEM_PASCAL}Dependency>,
+    pub uri: Url,
+}
+
+impl deps_core::ParseResult for {ECOSYSTEM_PASCAL}ParseResult {
+    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+        self.dependencies
+            .iter()
+            .map(|d| d as &dyn deps_core::Dependency)
+            .collect()
+    }
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    fn uri(&self) -> &Url {
+        &self.uri
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Line offset table for O(log n) position lookups.
+struct LineOffsetTable {
+    offsets: Vec<usize>,
+}
+
+impl LineOffsetTable {
+    fn new(content: &str) -> Self {
+        let mut offsets = vec![0];
+        for (i, c) in content.char_indices() {
+            if c == '\n' {
+                offsets.push(i + 1);
+            }
+        }
+        Self { offsets }
+    }
+
+    fn position_from_offset(&self, offset: usize) -> Position {
+        let line = match self.offsets.binary_search(&offset) {
+            Ok(line) => line,
+            Err(line) => line.saturating_sub(1),
+        };
+        let character = (offset - self.offsets[line]) as u32;
+        Position::new(line as u32, character)
+    }
+
+    fn range_from_offsets(&self, start: usize, end: usize) -> Range {
+        Range::new(
+            self.position_from_offset(start),
+            self.position_from_offset(end),
+        )
+    }
+}
+
+/// Parse manifest file and extract dependencies with positions.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_{ECOSYSTEM_SNAKE}::parse_{ECOSYSTEM_SNAKE};
+/// use tower_lsp::lsp_types::Url;
+///
+/// let content = r#"..."#;
+/// let uri = Url::parse("file:///project/{MANIFEST_FILE}").unwrap();
+/// let result = parse_{ECOSYSTEM_SNAKE}(content, &uri).unwrap();
+/// ```
+pub fn parse_{ECOSYSTEM_SNAKE}(content: &str, uri: &Url) -> Result<{ECOSYSTEM_PASCAL}ParseResult> {
+    let _line_table = LineOffsetTable::new(content);
+
+    // TODO: Implement actual parsing logic
+    //
+    // Key requirements:
+    // 1. Parse the manifest file format (JSON, TOML, YAML, etc.)
+    // 2. Extract dependency names and version requirements
+    // 3. Track byte offsets for every dependency name and version
+    // 4. Convert offsets to LSP Range using LineOffsetTable
+    // 5. Handle all dependency sections
+    //
+    // Example pattern for finding positions:
+    // ```
+    // if let Some(offset) = content.find(&name) {
+    //     let name_range = line_table.range_from_offsets(offset, offset + name.len());
+    // }
+    // ```
+
+    Ok({ECOSYSTEM_PASCAL}ParseResult {
+        dependencies: vec![],
+        uri: uri.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_uri() -> Url {
+        Url::parse("file:///test/{MANIFEST_FILE}").unwrap()
+    }
+
+    #[test]
+    fn test_parse_empty() {
+        let content = "";
+        let result = parse_{ECOSYSTEM_SNAKE}(content, &test_uri()).unwrap();
+        assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_line_offset_table() {
+        let content = "line0\nline1\nline2";
+        let table = LineOffsetTable::new(content);
+
+        let pos0 = table.position_from_offset(0);
+        assert_eq!(pos0.line, 0);
+        assert_eq!(pos0.character, 0);
+
+        let pos6 = table.position_from_offset(6);
+        assert_eq!(pos6.line, 1);
+        assert_eq!(pos6.character, 0);
+    }
+
+    // TODO: Add more tests for:
+    // - Simple dependencies
+    // - Multiple dependency sections
+    // - Position tracking accuracy
+    // - Edge cases and error handling
+}
