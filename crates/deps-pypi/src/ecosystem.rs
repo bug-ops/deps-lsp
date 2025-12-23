@@ -58,18 +58,13 @@ impl Ecosystem for PypiEcosystem {
         &["pyproject.toml"]
     }
 
-    async fn parse_manifest(
-        &self,
-        content: &str,
-        uri: &Url,
-    ) -> Result<Box<dyn ParseResultTrait>> {
-        let result = self
-            .parser
-            .parse_content(content, uri)
-            .map_err(|e| deps_core::DepsError::ParseError {
+    async fn parse_manifest(&self, content: &str, uri: &Url) -> Result<Box<dyn ParseResultTrait>> {
+        let result = self.parser.parse_content(content, uri).map_err(|e| {
+            deps_core::DepsError::ParseError {
                 file_type: "pyproject.toml".into(),
                 source: Box::new(e),
-            })?;
+            }
+        })?;
         Ok(Box::new(result))
     }
 
@@ -99,8 +94,7 @@ impl Ecosystem for PypiEcosystem {
             // Simple version comparison for Python
             let is_latest = latest_version == version_req
                 || version_req.contains(&format!("=={}", latest_version))
-                || (version_req.starts_with(">=")
-                    && version_req.contains(latest_version));
+                || (version_req.starts_with(">=") && version_req.contains(latest_version));
 
             let label_text = if is_latest {
                 if config.show_up_to_date_hints {
@@ -180,14 +174,10 @@ impl Ecosystem for PypiEcosystem {
     ) -> Vec<CodeAction> {
         let mut actions = Vec::new();
 
-        let Some(dep) = parse_result
-            .dependencies()
-            .into_iter()
-            .find(|d| {
-                d.version_range()
-                    .is_some_and(|r| ranges_overlap(r, position))
-            })
-        else {
+        let Some(dep) = parse_result.dependencies().into_iter().find(|d| {
+            d.version_range()
+                .is_some_and(|r| ranges_overlap(r, position))
+        }) else {
             return actions;
         };
 
@@ -204,7 +194,8 @@ impl Ecosystem for PypiEcosystem {
             .enumerate()
         {
             // Calculate next major version with overflow protection
-            let next_major = version.version_string()
+            let next_major = version
+                .version_string()
                 .split('.')
                 .next()
                 .and_then(|s| s.parse::<u32>().ok())
@@ -223,7 +214,11 @@ impl Ecosystem for PypiEcosystem {
             );
 
             let title = if i == 0 {
-                format!("Update {} to {} (latest)", dep.name(), version.version_string())
+                format!(
+                    "Update {} to {} (latest)",
+                    dep.name(),
+                    version.version_string()
+                )
             } else {
                 format!("Update {} to {}", dep.name(), version.version_string())
             };

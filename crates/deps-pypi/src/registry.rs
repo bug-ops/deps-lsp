@@ -269,7 +269,10 @@ impl PackageRegistry for PypiRegistry {
 // Implement Registry trait for PypiRegistry
 #[async_trait]
 impl deps_core::Registry for PypiRegistry {
-    async fn get_versions(&self, name: &str) -> deps_core::error::Result<Vec<Box<dyn deps_core::Version>>> {
+    async fn get_versions(
+        &self,
+        name: &str,
+    ) -> deps_core::error::Result<Vec<Box<dyn deps_core::Version>>> {
         let versions = PypiRegistry::get_versions(self, name)
             .await
             .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
@@ -290,7 +293,11 @@ impl deps_core::Registry for PypiRegistry {
         Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
     }
 
-    async fn search(&self, query: &str, limit: usize) -> deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>> {
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>> {
         let packages = PypiRegistry::search(self, query, limit)
             .await
             .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;

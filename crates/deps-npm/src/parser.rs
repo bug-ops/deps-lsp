@@ -3,8 +3,8 @@
 //! Parses package.json files and extracts dependency information with precise
 //! source positions for LSP operations.
 
+use crate::error::{NpmError, Result};
 use crate::types::{NpmDependency, NpmDependencySection};
-use deps_core::{DepsError, Result};
 use serde_json::Value;
 use std::any::Any;
 use tower_lsp::lsp_types::{Position, Range, Url};
@@ -102,10 +102,8 @@ impl deps_core::ParseResult for NpmParseResult {
 /// assert_eq!(result.dependencies[0].name, "express");
 /// ```
 pub fn parse_package_json(content: &str, uri: &Url) -> Result<NpmParseResult> {
-    let root: Value = serde_json::from_str(content).map_err(|e| DepsError::ParseError {
-        file_type: "package.json".into(),
-        source: Box::new(e),
-    })?;
+    let root: Value =
+        serde_json::from_str(content).map_err(|e| NpmError::JsonParseError { source: e })?;
 
     // Build line offset table once for O(log n) position lookups
     let line_table = LineOffsetTable::new(content);
@@ -119,7 +117,7 @@ pub fn parse_package_json(content: &str, uri: &Url) -> Result<NpmParseResult> {
             deps,
             NpmDependencySection::Dependencies,
             &line_table,
-        )?);
+        ));
     }
 
     if let Some(deps) = root.get("devDependencies").and_then(|v| v.as_object()) {
@@ -128,7 +126,7 @@ pub fn parse_package_json(content: &str, uri: &Url) -> Result<NpmParseResult> {
             deps,
             NpmDependencySection::DevDependencies,
             &line_table,
-        )?);
+        ));
     }
 
     if let Some(deps) = root.get("peerDependencies").and_then(|v| v.as_object()) {
@@ -137,7 +135,7 @@ pub fn parse_package_json(content: &str, uri: &Url) -> Result<NpmParseResult> {
             deps,
             NpmDependencySection::PeerDependencies,
             &line_table,
-        )?);
+        ));
     }
 
     if let Some(deps) = root.get("optionalDependencies").and_then(|v| v.as_object()) {
@@ -146,7 +144,7 @@ pub fn parse_package_json(content: &str, uri: &Url) -> Result<NpmParseResult> {
             deps,
             NpmDependencySection::OptionalDependencies,
             &line_table,
-        )?);
+        ));
     }
 
     Ok(NpmParseResult {
@@ -161,7 +159,7 @@ fn parse_dependency_section(
     deps: &serde_json::Map<String, Value>,
     section: NpmDependencySection,
     line_table: &LineOffsetTable,
-) -> Result<Vec<NpmDependency>> {
+) -> Vec<NpmDependency> {
     let mut result = Vec::new();
 
     for (name, value) in deps {
@@ -180,7 +178,7 @@ fn parse_dependency_section(
         });
     }
 
-    Ok(result)
+    result
 }
 
 /// Finds the position of a dependency name and version in the source text.

@@ -218,10 +218,8 @@ mod tests {
 
     #[test]
     fn test_error_construction() {
-        let err = CargoError::registry_error(
-            "serde",
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-        );
+        let err =
+            CargoError::registry_error("serde", std::io::Error::from(std::io::ErrorKind::NotFound));
         assert!(matches!(err, CargoError::RegistryError { .. }));
 
         let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();

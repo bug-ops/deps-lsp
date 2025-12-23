@@ -102,7 +102,10 @@ impl NpmError {
     }
 
     /// Create an invalid version specifier error.
-    pub fn invalid_version_specifier(specifier: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn invalid_version_specifier(
+        specifier: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::InvalidVersionSpecifier {
             specifier: specifier.into(),
             message: message.into(),

@@ -1,7 +1,6 @@
 pub mod config;
 pub mod document;
 pub mod document_lifecycle;
-pub mod document_lifecycle_new; // Phase 3: New trait-based implementation
 pub mod handlers;
 pub mod server;
 

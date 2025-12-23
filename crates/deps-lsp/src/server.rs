@@ -1,5 +1,5 @@
 use crate::config::DepsConfig;
-use crate::document::{Ecosystem, ServerState};
+use crate::document::ServerState;
 use crate::document_lifecycle;
 use crate::handlers::{code_actions, completion, diagnostics, hover, inlay_hints};
 use std::collections::HashMap;
@@ -39,9 +39,9 @@ impl Backend {
         }
     }
 
-    /// Handles opening a Cargo.toml file.
-    async fn handle_cargo_open(&self, uri: tower_lsp::lsp_types::Url, content: String) {
-        match document_lifecycle::cargo_open(
+    /// Handles opening a document using unified ecosystem registry.
+    async fn handle_open(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+        match document_lifecycle::handle_document_open(
             uri.clone(),
             content,
             Arc::clone(&self.state),
@@ -54,7 +54,7 @@ impl Backend {
                 self.state.spawn_background_task(uri, task).await;
             }
             Err(e) => {
-                tracing::error!("failed to parse Cargo.toml: {}", e);
+                tracing::error!("failed to open document {}: {}", uri, e);
                 self.client
                     .log_message(MessageType::ERROR, format!("Parse error: {}", e))
                     .await;
@@ -62,9 +62,9 @@ impl Backend {
         }
     }
 
-    /// Handles opening a package.json file.
-    async fn handle_npm_open(&self, uri: tower_lsp::lsp_types::Url, content: String) {
-        match document_lifecycle::npm_open(
+    /// Handles changes to a document using unified ecosystem registry.
+    async fn handle_change(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+        match document_lifecycle::handle_document_change(
             uri.clone(),
             content,
             Arc::clone(&self.state),
@@ -77,101 +77,7 @@ impl Backend {
                 self.state.spawn_background_task(uri, task).await;
             }
             Err(e) => {
-                tracing::error!("failed to parse package.json: {}", e);
-                self.client
-                    .log_message(MessageType::ERROR, format!("Parse error: {}", e))
-                    .await;
-            }
-        }
-    }
-
-    /// Handles opening a pyproject.toml file.
-    async fn handle_pypi_open(&self, uri: tower_lsp::lsp_types::Url, content: String) {
-        match document_lifecycle::pypi_open(
-            uri.clone(),
-            content.clone(),
-            Arc::clone(&self.state),
-            self.client.clone(),
-            Arc::clone(&self.config),
-        )
-        .await
-        {
-            Ok(task) => {
-                self.state.spawn_background_task(uri, task).await;
-            }
-            Err(e) => {
-                tracing::warn!("failed to parse pyproject.toml: {}", e);
-                // Graceful degradation: create empty document
-                use crate::document::{DocumentState, Ecosystem};
-                let doc_state = DocumentState::new(Ecosystem::Pypi, content, vec![]);
-                self.state.update_document(uri.clone(), doc_state);
-                self.client
-                    .log_message(MessageType::WARNING, format!("Parse error: {}", e))
-                    .await;
-            }
-        }
-    }
-
-    /// Handles changes to a Cargo.toml file.
-    async fn handle_cargo_change(&self, uri: tower_lsp::lsp_types::Url, content: String) {
-        match document_lifecycle::cargo_change(
-            uri.clone(),
-            content,
-            Arc::clone(&self.state),
-            self.client.clone(),
-            Arc::clone(&self.config),
-        )
-        .await
-        {
-            Ok(task) => {
-                self.state.spawn_background_task(uri, task).await;
-            }
-            Err(e) => {
-                tracing::error!("failed to parse Cargo.toml: {}", e);
-            }
-        }
-    }
-
-    /// Handles changes to a package.json file.
-    async fn handle_npm_change(&self, uri: tower_lsp::lsp_types::Url, content: String) {
-        match document_lifecycle::npm_change(
-            uri.clone(),
-            content,
-            Arc::clone(&self.state),
-            self.client.clone(),
-            Arc::clone(&self.config),
-        )
-        .await
-        {
-            Ok(task) => {
-                self.state.spawn_background_task(uri, task).await;
-            }
-            Err(e) => {
-                tracing::error!("failed to parse package.json: {}", e);
-            }
-        }
-    }
-
-    /// Handles changes to a pyproject.toml file.
-    async fn handle_pypi_change(&self, uri: tower_lsp::lsp_types::Url, content: String) {
-        match document_lifecycle::pypi_change(
-            uri.clone(),
-            content.clone(),
-            Arc::clone(&self.state),
-            self.client.clone(),
-            Arc::clone(&self.config),
-        )
-        .await
-        {
-            Ok(task) => {
-                self.state.spawn_background_task(uri, task).await;
-            }
-            Err(e) => {
-                tracing::error!("failed to parse pyproject.toml: {}", e);
-                // Graceful degradation: create empty document
-                use crate::document::{DocumentState, Ecosystem};
-                let doc_state = DocumentState::new(Ecosystem::Pypi, content, vec![]);
-                self.state.update_document(uri, doc_state);
+                tracing::error!("failed to process document change {}: {}", uri, e);
             }
         }
     }
@@ -245,19 +151,13 @@ impl LanguageServer for Backend {
 
         tracing::info!("document opened: {}", uri);
 
-        let ecosystem = match Ecosystem::from_uri(&uri) {
-            Some(eco) => eco,
-            None => {
-                tracing::debug!("unsupported file type: {}", uri);
-                return;
-            }
-        };
-
-        match ecosystem {
-            Ecosystem::Cargo => self.handle_cargo_open(uri, content).await,
-            Ecosystem::Npm => self.handle_npm_open(uri, content).await,
-            Ecosystem::Pypi => self.handle_pypi_open(uri, content).await,
+        // Use ecosystem registry to check if we support this file type
+        if self.state.ecosystem_registry.get_for_uri(&uri).is_none() {
+            tracing::debug!("unsupported file type: {}", uri);
+            return;
         }
+
+        self.handle_open(uri, content).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -266,19 +166,13 @@ impl LanguageServer for Backend {
         if let Some(change) = params.content_changes.first() {
             let content = change.text.clone();
 
-            let ecosystem = match Ecosystem::from_uri(&uri) {
-                Some(eco) => eco,
-                None => {
-                    tracing::debug!("unsupported file type: {}", uri);
-                    return;
-                }
-            };
-
-            match ecosystem {
-                Ecosystem::Cargo => self.handle_cargo_change(uri, content).await,
-                Ecosystem::Npm => self.handle_npm_change(uri, content).await,
-                Ecosystem::Pypi => self.handle_pypi_change(uri, content).await,
+            // Use ecosystem registry to check if we support this file type
+            if self.state.ecosystem_registry.get_for_uri(&uri).is_none() {
+                tracing::debug!("unsupported file type: {}", uri);
+                return;
             }
+
+            self.handle_change(uri, content).await;
         }
     }
 

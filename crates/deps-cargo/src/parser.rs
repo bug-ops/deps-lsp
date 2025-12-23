@@ -28,8 +28,8 @@
 //! assert_eq!(result.dependencies[0].name, "serde");
 //! ```
 
+use crate::error::{CargoError, Result};
 use crate::types::{DependencySection, DependencySource, ParsedDependency};
-use deps_core::{DepsError, Result};
 use std::any::Any;
 use std::path::PathBuf;
 use toml_edit::{Document, DocumentMut, Item, Table, Value};
@@ -107,10 +107,8 @@ impl LineOffsetTable {
 /// ```
 pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<ParseResult> {
     // Use Document (not DocumentMut) to preserve span information
-    let doc: Document<&str> = Document::parse(content).map_err(|e| DepsError::ParseError {
-        file_type: "Cargo.toml".into(),
-        source: Box::new(e),
-    })?;
+    let doc: Document<&str> =
+        Document::parse(content).map_err(|e| CargoError::TomlParseError { source: e })?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
@@ -401,7 +399,7 @@ fn span_to_range_with_table(
 fn find_workspace_root(doc_uri: &Url) -> Result<Option<PathBuf>> {
     let path = doc_uri
         .to_file_path()
-        .map_err(|_| DepsError::CacheError("Invalid file URI".into()))?;
+        .map_err(|_| CargoError::invalid_uri(doc_uri.to_string()))?;
 
     let mut current = path.parent();
 
@@ -429,8 +427,8 @@ impl deps_core::ManifestParser for CargoParser {
     type Dependency = ParsedDependency;
     type ParseResult = ParseResult;
 
-    fn parse(&self, content: &str, doc_uri: &Url) -> Result<Self::ParseResult> {
-        parse_cargo_toml(content, doc_uri)
+    fn parse(&self, content: &str, doc_uri: &Url) -> deps_core::Result<Self::ParseResult> {
+        parse_cargo_toml(content, doc_uri).map_err(Into::into)
     }
 }
 

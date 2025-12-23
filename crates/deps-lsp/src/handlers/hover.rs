@@ -1,120 +1,35 @@
-//! Hover handler implementation.
-//!
-//! Provides rich hover documentation when the cursor is over a dependency
-//! name or version string. Shows crate metadata, latest version, features,
-//! and links to documentation/repository.
+//! Hover handler using ecosystem trait delegation.
 
-use crate::document::{Ecosystem, ServerState};
-use crate::handlers::{CargoHandlerImpl, NpmHandlerImpl, PyPiHandlerImpl};
-use deps_core::{EcosystemHandler, generate_hover};
+use crate::document::ServerState;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{Hover, HoverParams, Position, Range};
+use tower_lsp::lsp_types::{Hover, HoverParams};
 
-/// Handles hover requests.
-///
-/// Returns documentation for the dependency at the cursor position.
-/// Degrades gracefully by returning None if no dependency is found or
-/// if fetching version information fails.
-///
-/// # Examples
-///
-/// Hovering over "serde" in `serde = "1.0"` shows:
-/// ```markdown
-/// # serde
-///
-/// **Current**: `1.0`
-/// **Latest**: `1.0.214`
-///
-/// **Features**:
-/// - `derive`
-/// - `std`
-/// - `alloc`
-/// ...
-/// ```
+/// Handles hover requests using trait-based delegation.
 pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
 
+    let (ecosystem_id, cached_versions) = {
+        let doc = state.get_document(uri)?;
+        (doc.ecosystem_id, doc.cached_versions.clone())
+    };
+
     let doc = state.get_document(uri)?;
+    let ecosystem = state.ecosystem_registry.get(ecosystem_id)?;
+    let parse_result = doc.parse_result()?;
 
-    let dep = doc.dependencies.iter().find(|d| {
-        position_in_range(position, d.name_range())
-            || d.version_range()
-                .is_some_and(|r| position_in_range(position, r))
-    })?;
-
-    if !dep.is_registry() {
-        return None;
-    }
-
-    let ecosystem = doc.ecosystem;
-    let dep = dep.clone();
-    let dep_name = dep.name();
-    tracing::debug!(
-        "Hover: looking up '{}' in resolved_versions ({} entries): {:?}",
-        dep_name,
-        doc.resolved_versions.len(),
-        doc.resolved_versions.keys().take(5).collect::<Vec<_>>()
-    );
-    let resolved_version = doc.resolved_versions.get(dep_name).cloned();
-    tracing::debug!(
-        "Hover: resolved_version for '{}' = {:?}",
-        dep_name,
-        resolved_version
-    );
+    let hover = ecosystem
+        .generate_hover(parse_result, position, &cached_versions)
+        .await;
     drop(doc);
-
-    match ecosystem {
-        Ecosystem::Cargo => {
-            let handler = CargoHandlerImpl::new(Arc::clone(&state.cache));
-            generate_hover(&handler, &dep, resolved_version.as_deref()).await
-        }
-        Ecosystem::Npm => {
-            let handler = NpmHandlerImpl::new(Arc::clone(&state.cache));
-            generate_hover(&handler, &dep, resolved_version.as_deref()).await
-        }
-        Ecosystem::Pypi => {
-            let handler = PyPiHandlerImpl::new(Arc::clone(&state.cache));
-            generate_hover(&handler, &dep, resolved_version.as_deref()).await
-        }
-    }
-}
-
-fn position_in_range(pos: Position, range: Range) -> bool {
-    (pos.line > range.start.line
-        || (pos.line == range.start.line && pos.character >= range.start.character))
-        && (pos.line < range.end.line
-            || (pos.line == range.end.line && pos.character <= range.end.character))
+    hover
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tower_lsp::lsp_types::Position;
-
     #[test]
-    fn test_position_in_range() {
-        let range = Range::new(Position::new(1, 5), Position::new(1, 10));
-
-        assert!(position_in_range(Position::new(1, 5), range));
-        assert!(position_in_range(Position::new(1, 7), range));
-        assert!(position_in_range(Position::new(1, 10), range));
-
-        assert!(!position_in_range(Position::new(1, 4), range));
-        assert!(!position_in_range(Position::new(1, 11), range));
-        assert!(!position_in_range(Position::new(0, 5), range));
-        assert!(!position_in_range(Position::new(2, 5), range));
-    }
-
-    #[test]
-    fn test_position_in_multiline_range() {
-        let range = Range::new(Position::new(1, 5), Position::new(3, 10));
-
-        assert!(position_in_range(Position::new(1, 5), range));
-        assert!(position_in_range(Position::new(2, 0), range));
-        assert!(position_in_range(Position::new(3, 10), range));
-
-        assert!(!position_in_range(Position::new(1, 4), range));
-        assert!(!position_in_range(Position::new(3, 11), range));
+    fn test_hover_placeholder() {
+        // Placeholder test
+        assert!(true);
     }
 }

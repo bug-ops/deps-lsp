@@ -11,40 +11,28 @@
 //!
 //! # Handler Architecture
 //!
-//! All handlers follow the same pattern:
-//! 1. Extract document state from `ServerState`
-//! 2. Compute response from parsed dependencies and cached versions
+//! Handlers delegate to ecosystem-specific implementations via the
+//! `Ecosystem` trait. Each ecosystem (Cargo, npm, PyPI) provides its own
+//! implementation of LSP features.
+//!
+//! The general flow is:
+//! 1. Extract document state and ecosystem from `ServerState`
+//! 2. Delegate to `ecosystem.generate_*()` methods
 //! 3. Return LSP-compliant response types
 //! 4. Gracefully degrade on errors (never panic)
-//!
-//! Handlers are pure functions that don't perform I/O directly. Network
-//! requests are handled by background tasks spawned on document open/change.
 //!
 //! # Examples
 //!
 //! ```no_run
-//! // Handler functions are called by tower-lsp backend
-//! // They receive ServerState via Arc and LSP request parameters
 //! use deps_lsp::document::ServerState;
 //! use std::sync::Arc;
 //!
 //! let state = Arc::new(ServerState::new());
-//! // Handlers use state.get_document() to access parsed dependencies
+//! // Handlers use state.get_document() and ecosystem_registry
 //! ```
 
-pub mod cargo_handler_impl;
 pub mod code_actions;
-pub mod code_actions_new; // Phase 3: New trait-based implementation
 pub mod completion;
 pub mod diagnostics;
-pub mod diagnostics_new; // Phase 3: New trait-based implementation
 pub mod hover;
-pub mod hover_new; // Phase 3: New trait-based implementation
 pub mod inlay_hints;
-pub mod inlay_hints_new; // Phase 3: New trait-based implementation
-pub mod npm_handler_impl;
-pub mod pypi_handler_impl;
-
-pub use cargo_handler_impl::CargoHandlerImpl;
-pub use npm_handler_impl::NpmHandlerImpl;
-pub use pypi_handler_impl::PyPiHandlerImpl;

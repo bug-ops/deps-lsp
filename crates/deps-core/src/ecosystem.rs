@@ -332,10 +332,7 @@ mod tests {
         let config1 = EcosystemConfig::default();
         let config2 = config1.clone();
         assert_eq!(config1.up_to_date_text, config2.up_to_date_text);
-        assert_eq!(
-            config1.show_up_to_date_hints,
-            config2.show_up_to_date_hints
-        );
+        assert_eq!(config1.show_up_to_date_hints, config2.show_up_to_date_hints);
         assert_eq!(config1.needs_update_text, config2.needs_update_text);
     }
 

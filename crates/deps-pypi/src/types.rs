@@ -234,9 +234,9 @@ impl deps_core::Dependency for PypiDependency {
                 url: url.clone(),
                 rev: rev.clone(),
             },
-            PypiDependencySource::Path { path } => deps_core::parser::DependencySource::Path {
-                path: path.clone(),
-            },
+            PypiDependencySource::Path { path } => {
+                deps_core::parser::DependencySource::Path { path: path.clone() }
+            }
             PypiDependencySource::Url { .. } => deps_core::parser::DependencySource::Registry,
         }
     }

@@ -236,9 +236,9 @@ impl deps_core::Dependency for ParsedDependency {
                 url: url.clone(),
                 rev: rev.clone(),
             },
-            DependencySource::Path { path } => deps_core::parser::DependencySource::Path {
-                path: path.clone(),
-            },
+            DependencySource::Path { path } => {
+                deps_core::parser::DependencySource::Path { path: path.clone() }
+            }
         }
     }
 

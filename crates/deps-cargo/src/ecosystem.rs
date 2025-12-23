@@ -55,11 +55,7 @@ impl Ecosystem for CargoEcosystem {
         &["Cargo.toml"]
     }
 
-    async fn parse_manifest(
-        &self,
-        content: &str,
-        uri: &Url,
-    ) -> Result<Box<dyn ParseResultTrait>> {
+    async fn parse_manifest(&self, content: &str, uri: &Url) -> Result<Box<dyn ParseResultTrait>> {
         let result = crate::parser::parse_cargo_toml(content, uri)?;
         Ok(Box::new(result))
     }
@@ -89,9 +85,8 @@ impl Ecosystem for CargoEcosystem {
             let is_latest = latest_version == version_req
                 || (version_req.starts_with('^')
                     && version_req.len() > 1
-                    && latest_version.starts_with(
-                        version_req[1..].split('.').next().unwrap_or(""),
-                    ));
+                    && latest_version
+                        .starts_with(version_req[1..].split('.').next().unwrap_or("")));
 
             let label_text = if is_latest {
                 if config.show_up_to_date_hints {
@@ -171,14 +166,10 @@ impl Ecosystem for CargoEcosystem {
     ) -> Vec<CodeAction> {
         let mut actions = Vec::new();
 
-        let Some(dep) = parse_result
-            .dependencies()
-            .into_iter()
-            .find(|d| {
-                d.version_range()
-                    .is_some_and(|r| ranges_overlap(r, position))
-            })
-        else {
+        let Some(dep) = parse_result.dependencies().into_iter().find(|d| {
+            d.version_range()
+                .is_some_and(|r| ranges_overlap(r, position))
+        }) else {
             return actions;
         };
 
@@ -206,7 +197,11 @@ impl Ecosystem for CargoEcosystem {
             );
 
             let title = if i == 0 {
-                format!("Update {} to {} (latest)", dep.name(), version.version_string())
+                format!(
+                    "Update {} to {} (latest)",
+                    dep.name(),
+                    version.version_string()
+                )
             } else {
                 format!("Update {} to {}", dep.name(), version.version_string())
             };
@@ -366,9 +361,8 @@ mod tests {
         }
 
         fn uri(&self) -> &Url {
-            static URI: once_cell::sync::Lazy<Url> = once_cell::sync::Lazy::new(|| {
-                Url::parse("file:///test/Cargo.toml").unwrap()
-            });
+            static URI: once_cell::sync::Lazy<Url> =
+                once_cell::sync::Lazy::new(|| Url::parse("file:///test/Cargo.toml").unwrap());
             &URI
         }
 
