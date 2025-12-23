@@ -307,12 +307,6 @@ where
         }
     }
 
-    tracing::debug!(
-        "inlay hints: {} cached, {} to fetch",
-        cached_deps.len(),
-        fetch_deps.len()
-    );
-
     let registry = handler.registry().clone();
     let futures: Vec<_> = fetch_deps
         .into_iter()
@@ -355,12 +349,6 @@ where
             tracing::warn!("Failed to fetch versions for {}", name);
             continue;
         };
-
-        tracing::debug!(
-            "inlay hints: fetched {} versions for '{}', looking for non-yanked",
-            versions.len(),
-            name
-        );
 
         let Some(latest) = versions
             .iter()

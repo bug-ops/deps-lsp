@@ -31,26 +31,12 @@ pub async fn handle_inlay_hints(
 ) -> Vec<InlayHint> {
     let uri = &params.text_document.uri;
 
-    tracing::info!(
-        "inlay_hint request: uri={}, range={}:{}-{}:{}",
-        uri,
-        params.range.start.line,
-        params.range.start.character,
-        params.range.end.line,
-        params.range.end.character
-    );
-
     if !config.enabled {
-        tracing::debug!("inlay hints disabled in config");
         return vec![];
     }
 
-    let doc = match state.get_document(uri) {
-        Some(d) => d,
-        None => {
-            tracing::warn!("Document not found for inlay hints: {}", uri);
-            return vec![];
-        }
+    let Some(doc) = state.get_document(uri) else {
+        return vec![];
     };
 
     let ecosystem = doc.ecosystem;
@@ -59,35 +45,13 @@ pub async fn handle_inlay_hints(
         .dependencies
         .iter()
         .filter(|dep| {
-            let passes = dep.is_registry()
-                && dep.version_range().is_some()
-                && dep.version_req().is_some();
-            if !passes {
-                tracing::debug!(
-                    "inlay hints: filtering out '{}' - is_registry={}, version_range={:?}, version_req={:?}",
-                    dep.name(),
-                    dep.is_registry(),
-                    dep.version_range(),
-                    dep.version_req()
-                );
-            }
-            passes
+            dep.is_registry() && dep.version_range().is_some() && dep.version_req().is_some()
         })
         .cloned()
         .collect();
 
-    // Get cached and resolved versions before dropping doc
     let cached_versions = doc.versions.clone();
     let resolved_versions = doc.resolved_versions.clone();
-
-    tracing::info!(
-        "inlay hints: found {} dependencies to fetch (total {} in doc, {} cached, {} resolved)",
-        deps_to_fetch.len(),
-        doc.dependencies.len(),
-        cached_versions.len(),
-        resolved_versions.len()
-    );
-
     drop(doc);
 
     let core_config = deps_core::InlayHintsConfig {
@@ -96,7 +60,7 @@ pub async fn handle_inlay_hints(
         needs_update_text: config.needs_update_text.clone(),
     };
 
-    let hints = match ecosystem {
+    match ecosystem {
         Ecosystem::Cargo => {
             let handler = CargoHandlerImpl::new(Arc::clone(&state.cache));
             generate_inlay_hints(
@@ -130,10 +94,7 @@ pub async fn handle_inlay_hints(
             )
             .await
         }
-    };
-
-    tracing::info!("returning {} inlay hints", hints.len());
-    hints
+    }
 }
 
 #[cfg(test)]

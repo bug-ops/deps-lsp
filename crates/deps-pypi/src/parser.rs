@@ -335,12 +335,18 @@ impl PypiParser {
                     extras_joined.len() + 2 // +2 for [ and ]
                 };
                 let start_offset = name.len() + extras_str_len;
+
+                // Calculate original version length from requirement_str
+                // pep508 normalizes version specifiers (e.g., ">=1.7,<2.0" -> ">=1.7, <2.0")
+                // We need the original length for correct position tracking
+                let original_version_len = requirement_str.len() - start_offset;
+
                 let version_range = base_position.map(|pos| {
                     Range::new(
                         Position::new(pos.line, pos.character + start_offset as u32),
                         Position::new(
                             pos.line,
-                            pos.character + start_offset as u32 + version_str.len() as u32,
+                            pos.character + start_offset as u32 + original_version_len as u32,
                         ),
                     )
                 });
@@ -882,33 +888,48 @@ dev = ["pytest>=8.0", "mypy>=1.0"]
     }
 
     #[test]
-    fn test_position_tracking_multiline_array() {
-        // Test multiline array format like maturin uses
+    fn test_version_range_position_without_space() {
+        // Bug: pep508 normalizes ">=1.7,<2.0" to ">=1.7, <2.0" (adds space)
+        // Version range end must use original string length, not normalized
         let content = r#"[dependency-groups]
 dev = [
-    "pytest>=8.0",
     "maturin>=1.7,<2.0",
 ]
 "#;
+        // Line 0: [dependency-groups]
+        // Line 1: dev = [
+        // Line 2:     "maturin>=1.7,<2.0",
+        //             ^    ^         ^
+        //             5    12        22 (end of version, before closing quote)
 
         let parser = PypiParser::new();
         let result = parser.parse_content(content).unwrap();
-        let deps = &result.dependencies;
+        let maturin = &result.dependencies[0];
 
-        assert_eq!(deps.len(), 2);
+        let version_range = maturin.version_range.unwrap();
+        assert_eq!(version_range.start.line, 2);
+        assert_eq!(version_range.start.character, 12); // after "maturin"
+        assert_eq!(version_range.end.line, 2);
+        assert_eq!(version_range.end.character, 22); // ">=1.7,<2.0" = 10 chars
+    }
 
-        // Check maturin - key test case
-        let maturin = deps.iter().find(|d| d.name == "maturin").unwrap();
-        assert!(
-            maturin.version_range.is_some(),
-            "maturin version_range should be Some, got None"
-        );
-        // Note: pep508 normalizes version spec with space after comma
-        assert_eq!(
-            maturin.version_req.as_deref(),
-            Some(">=1.7, <2.0"),
-            "maturin version_req mismatch"
-        );
+    #[test]
+    fn test_version_range_position_with_space() {
+        // With space in original - should also work correctly
+        let content = r#"[dependency-groups]
+dev = [
+    "maturin>=1.7, <2.0",
+]
+"#;
+        // ">=1.7, <2.0" = 11 chars, end at 12 + 11 = 23
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(content).unwrap();
+        let maturin = &result.dependencies[0];
+
+        let version_range = maturin.version_range.unwrap();
+        assert_eq!(version_range.start.character, 12);
+        assert_eq!(version_range.end.character, 23);
     }
 
     #[test]
