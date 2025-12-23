@@ -91,6 +91,7 @@
 pub mod cache;
 pub mod error;
 pub mod handler;
+pub mod lockfile;
 pub mod macros;
 pub mod parser;
 pub mod registry;
@@ -103,6 +104,7 @@ pub use handler::{
     DiagnosticsConfig, EcosystemHandler, InlayHintsConfig, VersionStringGetter, YankedChecker,
     generate_code_actions, generate_diagnostics, generate_hover, generate_inlay_hints,
 };
+pub use lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
 pub use parser::{DependencyInfo, DependencySource, ManifestParser, ParseResultInfo};
 pub use registry::{PackageMetadata, PackageRegistry, VersionInfo};
 pub use version_matcher::{

@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use deps_cargo::{CargoVersion, ParsedDependency};
 use deps_core::HttpCache;
+use deps_core::lockfile::LockFileCache;
 use deps_npm::{NpmDependency, NpmVersion};
 use deps_pypi::{PypiDependency, PypiVersion};
 use std::collections::HashMap;
@@ -255,9 +256,10 @@ impl DocumentState {
 
 /// Global LSP server state.
 ///
-/// Manages all open documents, HTTP cache, and background tasks for the server.
-/// This state is shared across all LSP handlers via `Arc` and uses concurrent
-/// data structures (`DashMap`, `RwLock`) for thread-safe access.
+/// Manages all open documents, HTTP cache, lock file cache, and background
+/// tasks for the server. This state is shared across all LSP handlers via
+/// `Arc` and uses concurrent data structures (`DashMap`, `RwLock`) for
+/// thread-safe access.
 ///
 /// # Examples
 ///
@@ -273,6 +275,8 @@ pub struct ServerState {
     pub documents: DashMap<Url, DocumentState>,
     /// HTTP cache for registry requests
     pub cache: Arc<HttpCache>,
+    /// Lock file cache for parsed lock files
+    pub lockfile_cache: Arc<LockFileCache>,
     /// Background task handles
     tasks: tokio::sync::RwLock<HashMap<Url, JoinHandle<()>>>,
 }
@@ -283,6 +287,7 @@ impl ServerState {
         Self {
             documents: DashMap::new(),
             cache: Arc::new(HttpCache::new()),
+            lockfile_cache: Arc::new(LockFileCache::new()),
             tasks: tokio::sync::RwLock::new(HashMap::new()),
         }
     }

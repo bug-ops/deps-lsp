@@ -192,6 +192,23 @@ pub trait EcosystemHandler: Send + Sync + Sized {
     fn parse_version_req(
         version_req: &str,
     ) -> Option<<Self::Registry as PackageRegistry>::VersionReq>;
+
+    /// Get lock file provider for this ecosystem.
+    ///
+    /// Returns `None` if the ecosystem doesn't support lock files.
+    /// Default implementation returns `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Override in handler implementation:
+    /// fn lockfile_provider(&self) -> Option<Arc<dyn LockFileProvider>> {
+    ///     Some(Arc::new(MyLockParser))
+    /// }
+    /// ```
+    fn lockfile_provider(&self) -> Option<Arc<dyn crate::lockfile::LockFileProvider>> {
+        None
+    }
 }
 
 /// Configuration for inlay hint display.

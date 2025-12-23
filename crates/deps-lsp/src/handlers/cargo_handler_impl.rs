@@ -5,8 +5,10 @@
 
 use crate::document::UnifiedDependency;
 use async_trait::async_trait;
-use deps_cargo::{CratesIoRegistry, ParsedDependency, crate_url};
-use deps_core::{EcosystemHandler, HttpCache, SemverMatcher, VersionRequirementMatcher};
+use deps_cargo::{CargoLockParser, CratesIoRegistry, ParsedDependency, crate_url};
+use deps_core::{
+    EcosystemHandler, HttpCache, LockFileProvider, SemverMatcher, VersionRequirementMatcher,
+};
 use std::sync::Arc;
 
 /// Cargo ecosystem handler with UnifiedDependency support.
@@ -66,5 +68,9 @@ impl EcosystemHandler for CargoHandlerImpl {
 
     fn parse_version_req(version_req: &str) -> Option<semver::VersionReq> {
         version_req.parse().ok()
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn LockFileProvider>> {
+        Some(Arc::new(CargoLockParser))
     }
 }

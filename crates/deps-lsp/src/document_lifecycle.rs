@@ -77,11 +77,73 @@ where
     // Step 2: Wrap dependencies
     let unified_deps: Vec<UnifiedDependency> = dependencies.into_iter().map(wrap_dep_fn).collect();
 
-    // Step 3: Create document state
-    let doc_state = DocumentState::new(ecosystem, content, unified_deps);
+    // Step 3: Try to parse lock file for instant version display
+    let lockfile_versions = {
+        let cache = Arc::clone(&state.cache);
+        let handler = H::new(cache);
+
+        if let Some(provider) = handler.lockfile_provider() {
+            if let Some(lockfile_path) = provider.locate_lockfile(&uri) {
+                match state
+                    .lockfile_cache
+                    .get_or_parse(provider.as_ref(), &lockfile_path)
+                    .await
+                {
+                    Ok(resolved) => {
+                        tracing::info!(
+                            "Loaded lock file: {} packages from {}",
+                            resolved.len(),
+                            lockfile_path.display()
+                        );
+                        Some(resolved)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse lock file: {}", e);
+                        None
+                    }
+                }
+            } else {
+                tracing::debug!("No lock file found for {}", uri);
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    // Step 4: Create document state with lock file versions if available
+    let mut doc_state = DocumentState::new(ecosystem, content, unified_deps);
+    if let Some(resolved) = lockfile_versions {
+        let lock_versions: HashMap<String, UnifiedVersion> = resolved
+            .iter()
+            .map(|(name, pkg)| {
+                // Create UnifiedVersion from lock file version string
+                let unified_version = match ecosystem {
+                    Ecosystem::Cargo => UnifiedVersion::Cargo(deps_cargo::CargoVersion {
+                        num: pkg.version.clone(),
+                        yanked: false,
+                        features: HashMap::new(),
+                    }),
+                    Ecosystem::Npm => UnifiedVersion::Npm(deps_npm::NpmVersion {
+                        version: pkg.version.clone(),
+                        deprecated: false,
+                    }),
+                    Ecosystem::Pypi => UnifiedVersion::Pypi(deps_pypi::PypiVersion {
+                        version: pkg.version.clone(),
+                        yanked: false,
+                    }),
+                };
+                (name.clone(), unified_version)
+            })
+            .collect();
+
+        tracing::info!("Populated {} versions from lock file", lock_versions.len());
+        doc_state.update_versions(lock_versions);
+    }
+
     state.update_document(uri.clone(), doc_state);
 
-    // Step 4: Spawn background version fetch task
+    // Step 5: Spawn background version fetch task
     let uri_clone = uri.clone();
     let task = tokio::spawn(async move {
         let cache = Arc::clone(&state.cache);

@@ -14,6 +14,7 @@ async-trait = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 toml_edit = { workspace = true }
 tower-lsp = { workspace = true }
 tracing = { workspace = true }
@@ -22,6 +23,7 @@ urlencoding = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 insta = { workspace = true, features = ["json"] }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bench]]

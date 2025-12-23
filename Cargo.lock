@@ -390,6 +390,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml_edit",
  "tower-lsp",
