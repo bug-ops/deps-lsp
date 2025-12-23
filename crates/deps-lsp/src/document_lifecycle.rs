@@ -115,10 +115,13 @@ where
             .collect();
 
         tracing::info!(
-            "Populated {} resolved versions from lock file",
-            resolved_versions.len()
+            "Populated {} resolved versions from lock file: {:?}",
+            resolved_versions.len(),
+            resolved_versions.keys().take(10).collect::<Vec<_>>()
         );
         doc_state.update_resolved_versions(resolved_versions);
+    } else {
+        tracing::warn!("No lock file versions found for {}", uri);
     }
 
     state.update_document(uri.clone(), doc_state);
@@ -229,7 +232,16 @@ where
 
     let unified_deps: Vec<UnifiedDependency> = dependencies.into_iter().map(wrap_dep_fn).collect();
 
-    let doc_state = DocumentState::new(ecosystem, content, unified_deps);
+    // Preserve existing resolved_versions from lock file when updating
+    let existing_resolved = state
+        .get_document(&uri)
+        .map(|doc| doc.resolved_versions.clone())
+        .unwrap_or_default();
+
+    let mut doc_state = DocumentState::new(ecosystem, content, unified_deps);
+    if !existing_resolved.is_empty() {
+        doc_state.update_resolved_versions(existing_resolved);
+    }
     state.update_document(uri.clone(), doc_state);
 
     let uri_clone = uri.clone();
