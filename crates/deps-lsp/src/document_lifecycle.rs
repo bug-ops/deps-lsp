@@ -114,31 +114,17 @@ where
     // Step 4: Create document state with lock file versions if available
     let mut doc_state = DocumentState::new(ecosystem, content, unified_deps);
     if let Some(resolved) = lockfile_versions {
-        let lock_versions: HashMap<String, UnifiedVersion> = resolved
+        // Store resolved versions as simple strings for hover display
+        let resolved_versions: HashMap<String, String> = resolved
             .iter()
-            .map(|(name, pkg)| {
-                // Create UnifiedVersion from lock file version string
-                let unified_version = match ecosystem {
-                    Ecosystem::Cargo => UnifiedVersion::Cargo(deps_cargo::CargoVersion {
-                        num: pkg.version.clone(),
-                        yanked: false,
-                        features: HashMap::new(),
-                    }),
-                    Ecosystem::Npm => UnifiedVersion::Npm(deps_npm::NpmVersion {
-                        version: pkg.version.clone(),
-                        deprecated: false,
-                    }),
-                    Ecosystem::Pypi => UnifiedVersion::Pypi(deps_pypi::PypiVersion {
-                        version: pkg.version.clone(),
-                        yanked: false,
-                    }),
-                };
-                (name.clone(), unified_version)
-            })
+            .map(|(name, pkg)| (name.clone(), pkg.version.clone()))
             .collect();
 
-        tracing::info!("Populated {} versions from lock file", lock_versions.len());
-        doc_state.update_versions(lock_versions);
+        tracing::info!(
+            "Populated {} resolved versions from lock file",
+            resolved_versions.len()
+        );
+        doc_state.update_resolved_versions(resolved_versions);
     }
 
     state.update_document(uri.clone(), doc_state);

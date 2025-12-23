@@ -50,10 +50,7 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
     let ecosystem = doc.ecosystem;
     let dep = dep.clone();
     // Get resolved version from lock file if available
-    let resolved_version = doc
-        .versions
-        .get(dep.name())
-        .map(|v| v.version_string().to_string());
+    let resolved_version = doc.resolved_versions.get(dep.name()).cloned();
     drop(doc);
 
     match ecosystem {
