@@ -145,6 +145,11 @@ jobs:
             rust: stable
             target: aarch64-pc-windows-msvc
             cross: true
+          # Test Windows x86 (32-bit)
+          - os: windows-latest
+            rust: stable
+            target: i686-pc-windows-msvc
+            cross: false
 
     steps:
       - uses: actions/checkout@v6

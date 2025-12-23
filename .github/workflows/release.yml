@@ -75,6 +75,12 @@ jobs:
             archive: zip
             use_cross: false
 
+          # Windows x86 (32-bit)
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            archive: zip
+            use_cross: false
+
           # Windows aarch64 (ARM64)
           - os: windows-latest
             target: aarch64-pc-windows-msvc
@@ -281,6 +287,7 @@ jobs:
             - **macOS x86_64**: `deps-lsp-x86_64-apple-darwin.tar.gz`
             - **macOS ARM64**: `deps-lsp-aarch64-apple-darwin.tar.gz`
             - **Windows x64**: `deps-lsp-x86_64-pc-windows-msvc.zip`
+            - **Windows x86**: `deps-lsp-i686-pc-windows-msvc.zip`
             - **Windows ARM64**: `deps-lsp-aarch64-pc-windows-msvc.zip`
 
             Extract and add to your PATH:
