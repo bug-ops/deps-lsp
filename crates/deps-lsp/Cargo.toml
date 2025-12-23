@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Language Server Protocol implementation for dependency management"
+publish = true
 
 [[bin]]
 name = "deps-lsp"
