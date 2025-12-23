@@ -5,8 +5,8 @@
 
 use crate::document::UnifiedDependency;
 use async_trait::async_trait;
-use deps_core::{EcosystemHandler, HttpCache, SemverMatcher, VersionRequirementMatcher};
-use deps_npm::{NpmDependency, NpmRegistry, package_url};
+use deps_core::{EcosystemHandler, HttpCache, LockFileProvider, SemverMatcher, VersionRequirementMatcher};
+use deps_npm::{NpmDependency, NpmLockParser, NpmRegistry, package_url};
 use std::sync::Arc;
 
 /// npm ecosystem handler with UnifiedDependency support.
@@ -66,5 +66,9 @@ impl EcosystemHandler for NpmHandlerImpl {
 
     fn parse_version_req(version_req: &str) -> Option<deps_npm::NpmVersionReq> {
         version_req.parse().ok()
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn LockFileProvider>> {
+        Some(Arc::new(NpmLockParser))
     }
 }

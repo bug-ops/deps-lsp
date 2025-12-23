@@ -5,8 +5,8 @@
 
 use crate::document::UnifiedDependency;
 use async_trait::async_trait;
-use deps_core::{EcosystemHandler, HttpCache, Pep440Matcher, VersionRequirementMatcher};
-use deps_pypi::{PypiDependency, PypiRegistry};
+use deps_core::{EcosystemHandler, HttpCache, LockFileProvider, Pep440Matcher, VersionRequirementMatcher};
+use deps_pypi::{PypiDependency, PypiLockParser, PypiRegistry};
 use std::sync::Arc;
 
 /// PyPI ecosystem handler with UnifiedDependency support.
@@ -78,5 +78,9 @@ impl EcosystemHandler for PyPiHandlerImpl {
 
     fn parse_version_req(version_req: &str) -> Option<String> {
         Some(version_req.to_string())
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn LockFileProvider>> {
+        Some(Arc::new(PypiLockParser))
     }
 }
