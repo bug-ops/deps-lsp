@@ -160,6 +160,21 @@ pub trait Version: Send + Sync {
     /// Whether this version is yanked/deprecated.
     fn is_yanked(&self) -> bool;
 
+    /// Whether this version is a pre-release (alpha, beta, rc, etc.).
+    ///
+    /// Default implementation checks for common pre-release patterns.
+    fn is_prerelease(&self) -> bool {
+        let v = self.version_string().to_lowercase();
+        v.contains("-alpha")
+            || v.contains("-beta")
+            || v.contains("-rc")
+            || v.contains("-dev")
+            || v.contains("-pre")
+            || v.contains("-snapshot")
+            || v.contains("-canary")
+            || v.contains("-nightly")
+    }
+
     /// Available feature flags (empty if not supported by ecosystem).
     fn features(&self) -> Vec<String> {
         vec![]
@@ -240,6 +255,21 @@ pub trait VersionInfo {
 
     /// Whether this version is yanked/deprecated.
     fn is_yanked(&self) -> bool;
+
+    /// Whether this version is a pre-release (alpha, beta, rc, etc.).
+    ///
+    /// Default implementation checks for common pre-release patterns.
+    fn is_prerelease(&self) -> bool {
+        let v = self.version_string().to_lowercase();
+        v.contains("-alpha")
+            || v.contains("-beta")
+            || v.contains("-rc")
+            || v.contains("-dev")
+            || v.contains("-pre")
+            || v.contains("-snapshot")
+            || v.contains("-canary")
+            || v.contains("-nightly")
+    }
 
     /// Available feature flags (empty if not supported by ecosystem).
     fn features(&self) -> Vec<String> {
@@ -415,5 +445,83 @@ mod tests {
         assert_eq!(meta.description(), Some("Serialization framework"));
         assert_eq!(meta.repository(), Some("https://github.com/serde-rs/serde"));
         assert_eq!(meta.documentation(), Some("https://docs.rs/serde"));
+    }
+
+    struct MockVersionInfo {
+        version: String,
+    }
+
+    impl VersionInfo for MockVersionInfo {
+        fn version_string(&self) -> &str {
+            &self.version
+        }
+
+        fn is_yanked(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_is_prerelease_alpha() {
+        let version = MockVersionInfo {
+            version: "4.0.0-alpha.13".into(),
+        };
+        assert!(version.is_prerelease());
+    }
+
+    #[test]
+    fn test_is_prerelease_beta() {
+        let version = MockVersionInfo {
+            version: "2.0.0-beta.1".into(),
+        };
+        assert!(version.is_prerelease());
+    }
+
+    #[test]
+    fn test_is_prerelease_rc() {
+        let version = MockVersionInfo {
+            version: "1.5.0-rc.2".into(),
+        };
+        assert!(version.is_prerelease());
+    }
+
+    #[test]
+    fn test_is_prerelease_dev() {
+        let version = MockVersionInfo {
+            version: "3.0.0-dev".into(),
+        };
+        assert!(version.is_prerelease());
+    }
+
+    #[test]
+    fn test_is_prerelease_canary() {
+        let version = MockVersionInfo {
+            version: "5.0.0-canary".into(),
+        };
+        assert!(version.is_prerelease());
+    }
+
+    #[test]
+    fn test_is_prerelease_nightly() {
+        let version = MockVersionInfo {
+            version: "6.0.0-nightly".into(),
+        };
+        assert!(version.is_prerelease());
+    }
+
+    #[test]
+    fn test_is_not_prerelease_stable() {
+        let version = MockVersionInfo {
+            version: "1.2.3".into(),
+        };
+        assert!(!version.is_prerelease());
+    }
+
+    #[test]
+    fn test_is_not_prerelease_patch() {
+        let version = MockVersionInfo {
+            version: "1.0.214".into(),
+        };
+        assert!(!version.is_prerelease());
     }
 }

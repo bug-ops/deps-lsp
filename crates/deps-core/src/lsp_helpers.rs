@@ -334,7 +334,9 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
                 });
             }
 
-            let latest = versions.iter().find(|v| !v.is_yanked());
+            let latest = versions
+                .iter()
+                .find(|v| !v.is_yanked() && !v.is_prerelease());
             if let Some(latest) = latest
                 && latest.version_string() != current.version_string()
             {

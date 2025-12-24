@@ -760,7 +760,9 @@ where
                 });
             }
 
-            let latest = versions.iter().find(|v| !H::is_deprecated(v));
+            let latest = versions
+                .iter()
+                .find(|v| !H::is_deprecated(v) && !v.is_prerelease());
             if let (Some(latest), Some(current)) = (latest, &matching)
                 && latest.version_string() != current.version_string()
             {
@@ -1844,5 +1846,99 @@ mod tests {
         assert_eq!(config.unknown_severity, DiagnosticSeverity::WARNING);
         assert_eq!(config.yanked_severity, DiagnosticSeverity::WARNING);
         assert_eq!(config.outdated_severity, DiagnosticSeverity::HINT);
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_ignores_prerelease() {
+        let cache = Arc::new(HttpCache::new());
+        let mut handler = MockHandler::new(cache);
+
+        handler.registry.versions.insert(
+            "test-pkg".to_string(),
+            vec![
+                MockVersion {
+                    version: "4.0.0-alpha.13".to_string(),
+                    yanked: false,
+                    features: vec![],
+                },
+                MockVersion {
+                    version: "3.7.4".to_string(),
+                    yanked: false,
+                    features: vec![],
+                },
+                MockVersion {
+                    version: "3.4.2".to_string(),
+                    yanked: false,
+                    features: vec![],
+                },
+            ],
+        );
+
+        let deps = vec![MockDependency {
+            name: "test-pkg".to_string(),
+            version_req: Some("3.4.2".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let config = DiagnosticsConfig::default();
+        let diagnostics = generate_diagnostics(&handler, &deps, &config).await;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("Newer version available"));
+        assert!(diagnostics[0].message.contains("3.7.4"));
+        assert!(!diagnostics[0].message.contains("4.0.0-alpha"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_no_warning_when_latest_is_prerelease() {
+        let cache = Arc::new(HttpCache::new());
+        let mut handler = MockHandler::new(cache);
+
+        handler.registry.versions.insert(
+            "prerelease-pkg".to_string(),
+            vec![
+                MockVersion {
+                    version: "2.0.0-beta.1".to_string(),
+                    yanked: false,
+                    features: vec![],
+                },
+                MockVersion {
+                    version: "1.5.0".to_string(),
+                    yanked: false,
+                    features: vec![],
+                },
+            ],
+        );
+
+        let deps = vec![MockDependency {
+            name: "prerelease-pkg".to_string(),
+            version_req: Some("1.5.0".to_string()),
+            version_range: Some(Range {
+                start: Position {
+                    line: 0,
+                    character: 10,
+                },
+                end: Position {
+                    line: 0,
+                    character: 20,
+                },
+            }),
+            name_range: Range::default(),
+        }];
+
+        let config = DiagnosticsConfig::default();
+        let diagnostics = generate_diagnostics(&handler, &deps, &config).await;
+
+        assert_eq!(diagnostics.len(), 0);
     }
 }
