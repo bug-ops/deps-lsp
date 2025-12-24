@@ -193,7 +193,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .or_else(|| versions.first());
 
     if let Some(latest_ver) = latest_stable {
-        write!(&mut markdown, "**Latest**: `{}`\n\n", latest_ver.version_string()).unwrap();
+        write!(
+            &mut markdown,
+            "**Latest**: `{}`\n\n",
+            latest_ver.version_string()
+        )
+        .unwrap();
     }
 
     markdown.push_str("**Recent versions**:\n");
