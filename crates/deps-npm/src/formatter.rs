@@ -4,7 +4,8 @@ pub struct NpmFormatter;
 
 impl EcosystemFormatter for NpmFormatter {
     fn format_version_for_code_action(&self, version: &str) -> String {
-        format!("\"{}\"", version)
+        // Don't add quotes - version_range already excludes them from parser
+        version.to_string()
     }
 
     fn package_url(&self, name: &str) -> String {
@@ -41,13 +42,14 @@ mod tests {
     #[test]
     fn test_format_version() {
         let formatter = NpmFormatter;
+        // Version should not include quotes - parser's version_range excludes them
         assert_eq!(
             formatter.format_version_for_code_action("1.0.214"),
-            "\"1.0.214\""
+            "1.0.214"
         );
         assert_eq!(
             formatter.format_version_for_code_action("18.3.1"),
-            "\"18.3.1\""
+            "18.3.1"
         );
     }
 
