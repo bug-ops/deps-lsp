@@ -47,10 +47,7 @@ mod tests {
             formatter.format_version_for_code_action("1.0.214"),
             "1.0.214"
         );
-        assert_eq!(
-            formatter.format_version_for_code_action("18.3.1"),
-            "18.3.1"
-        );
+        assert_eq!(formatter.format_version_for_code_action("18.3.1"), "18.3.1");
     }
 
     #[test]
