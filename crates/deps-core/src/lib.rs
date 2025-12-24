@@ -116,7 +116,9 @@ pub use lsp_helpers::{
     generate_inlay_hints as lsp_generate_inlay_hints, is_same_major_minor, ranges_overlap,
 };
 pub use parser::{DependencyInfo, DependencySource, ManifestParser, ParseResultInfo};
-pub use registry::{Metadata, PackageMetadata, PackageRegistry, Registry, Version, VersionInfo};
+pub use registry::{
+    Metadata, PackageMetadata, PackageRegistry, Registry, Version, VersionInfo, find_latest_stable,
+};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version,
