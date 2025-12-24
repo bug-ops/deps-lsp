@@ -27,6 +27,7 @@ deps-pypi = { workspace = true }
 # External dependencies
 async-trait = { workspace = true }
 dashmap = { workspace = true }
+dirs = "6"
 futures = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
