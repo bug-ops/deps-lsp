@@ -406,6 +406,7 @@ name = "deps-core"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "criterion",
  "dashmap 6.1.0",
  "futures",

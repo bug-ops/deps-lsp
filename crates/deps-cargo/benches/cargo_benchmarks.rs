@@ -274,8 +274,8 @@ fn bench_version_matching(c: &mut Criterion) {
         b.iter(|| simple_req.matches(black_box(&latest)))
     });
 
-    // Complex version requirement
-    let complex_req = VersionReq::parse(">=1.0.100, <2.0, !=1.0.150").unwrap();
+    // Complex version requirement (multiple constraints)
+    let complex_req = VersionReq::parse(">=1.0.100, <2.0").unwrap();
     group.bench_function("complex_version_req", |b| {
         b.iter(|| complex_req.matches(black_box(&latest)))
     });

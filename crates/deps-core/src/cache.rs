@@ -1,7 +1,7 @@
 use crate::error::{DepsError, Result};
+use bytes::Bytes;
 use dashmap::DashMap;
 use reqwest::{Client, StatusCode, header};
-use std::sync::Arc;
 use std::time::Instant;
 
 /// Maximum number of cached entries to prevent unbounded memory growth.
@@ -36,30 +36,30 @@ fn ensure_https(url: &str) -> Result<()> {
 /// Cached HTTP response with validation headers.
 ///
 /// Stores response body and cache validation headers (ETag, Last-Modified)
-/// for efficient conditional requests. The body is wrapped in `Arc` for
-/// zero-cost cloning across multiple consumers.
+/// for efficient conditional requests. The body uses `Bytes` which is an
+/// Arc-like type optimized for network data, enabling zero-cost cloning
+/// across multiple consumers without copying.
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::cache::CachedResponse;
-/// use std::sync::Arc;
+/// use bytes::Bytes;
 /// use std::time::Instant;
 ///
 /// let response = CachedResponse {
-///     body: Arc::new(b"response data".to_vec()),
+///     body: Bytes::from("response data"),
 ///     etag: Some("\"abc123\"".into()),
 ///     last_modified: None,
 ///     fetched_at: Instant::now(),
 /// };
 ///
-/// // Clone is cheap - only increments Arc reference count
+/// // Clone is cheap - only increments reference count
 /// let cloned = response.clone();
-/// assert!(Arc::ptr_eq(&response.body, &cloned.body));
 /// ```
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
-    pub body: Arc<Vec<u8>>,
+    pub body: Bytes,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub fetched_at: Instant,
@@ -72,8 +72,9 @@ pub struct CachedResponse {
 /// requests use `If-None-Match` (ETag) or `If-Modified-Since` headers
 /// to check for updates.
 ///
-/// The cache uses `Arc<Vec<u8>>` for response bodies, enabling efficient
-/// sharing of cached data across multiple consumers without copying.
+/// The cache uses `Bytes` for response bodies, enabling efficient sharing
+/// of cached data across multiple consumers without copying. `Bytes` is
+/// an Arc-like type optimized for network I/O.
 ///
 /// # Examples
 ///
@@ -88,9 +89,6 @@ pub struct CachedResponse {
 ///
 /// // Second request - uses conditional GET (304 Not Modified if unchanged)
 /// let data2 = cache.get_cached("https://index.crates.io/se/rd/serde").await?;
-///
-/// // Both share the same underlying buffer
-/// assert!(std::sync::Arc::ptr_eq(&data1, &data2));
 /// # Ok(())
 /// # }
 /// ```
@@ -130,9 +128,8 @@ impl HttpCache {
     ///
     /// # Returns
     ///
-    /// Returns `Arc<Vec<u8>>` containing the response body. Multiple calls
-    /// for the same URL return Arc clones pointing to the same buffer,
-    /// avoiding unnecessary memory allocations.
+    /// Returns `Bytes` containing the response body. Multiple calls for the
+    /// same URL return cheap clones (reference counting) without copying data.
     ///
     /// # Errors
     ///
@@ -150,7 +147,7 @@ impl HttpCache {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn get_cached(&self, url: &str) -> Result<Arc<Vec<u8>>> {
+    pub async fn get_cached(&self, url: &str) -> Result<Bytes> {
         // Evict old entries if cache is at capacity
         if self.entries.len() >= MAX_CACHE_ENTRIES {
             self.evict_entries();
@@ -164,13 +161,13 @@ impl HttpCache {
                     return Ok(new_body);
                 }
                 Ok(None) => {
-                    // 304 Not Modified - use cached body (cheap Arc clone)
-                    return Ok(Arc::clone(&cached.body));
+                    // 304 Not Modified - use cached body (cheap clone)
+                    return Ok(cached.body.clone());
                 }
                 Err(e) => {
                     // Network error - fall back to cached body if available
                     tracing::warn!("conditional request failed, using cache: {}", e);
-                    return Ok(Arc::clone(&cached.body));
+                    return Ok(cached.body.clone());
                 }
             }
         }
@@ -186,14 +183,14 @@ impl HttpCache {
     ///
     /// # Returns
     ///
-    /// - `Ok(Some(Arc<Vec<u8>>))` - Server returned 200 OK with new content
+    /// - `Ok(Some(Bytes))` - Server returned 200 OK with new content
     /// - `Ok(None)` - Server returned 304 Not Modified (cache is valid)
     /// - `Err(_)` - Network or HTTP error occurred
     async fn conditional_request(
         &self,
         url: &str,
         cached: &CachedResponse,
-    ) -> Result<Option<Arc<Vec<u8>>>> {
+    ) -> Result<Option<Bytes>> {
         ensure_https(url)?;
         let mut request = self.client.get(url);
 
@@ -235,20 +232,18 @@ impl HttpCache {
                 source: e,
             })?;
 
-        let body_arc = Arc::new(body.to_vec());
-
         // Update cache with new response
         self.entries.insert(
             url.to_string(),
             CachedResponse {
-                body: Arc::clone(&body_arc),
+                body: body.clone(),
                 etag,
                 last_modified,
                 fetched_at: Instant::now(),
             },
         );
 
-        Ok(Some(body_arc))
+        Ok(Some(body))
     }
 
     /// Fetches a fresh response from the network and stores it in the cache.
@@ -261,7 +256,7 @@ impl HttpCache {
     ///
     /// Returns `DepsError::CacheError` if the server returns a non-2xx status code,
     /// or `DepsError::RegistryError` if the network request fails.
-    pub(crate) async fn fetch_and_store(&self, url: &str) -> Result<Arc<Vec<u8>>> {
+    pub(crate) async fn fetch_and_store(&self, url: &str) -> Result<Bytes> {
         ensure_https(url)?;
         tracing::debug!("fetching fresh: {}", url);
 
@@ -303,19 +298,17 @@ impl HttpCache {
                 source: e,
             })?;
 
-        let body_arc = Arc::new(body.to_vec());
-
         self.entries.insert(
             url.to_string(),
             CachedResponse {
-                body: Arc::clone(&body_arc),
+                body: body.clone(),
                 etag,
                 last_modified,
                 fetched_at: Instant::now(),
             },
         );
 
-        Ok(body_arc)
+        Ok(body)
     }
 
     /// Clears all cached entries.
@@ -380,8 +373,8 @@ impl HttpCache {
 
     /// Benchmark-only helper: Direct cache lookup without network requests.
     #[doc(hidden)]
-    pub fn get_for_bench(&self, url: &str) -> Option<Arc<Vec<u8>>> {
-        self.entries.get(url).map(|entry| Arc::clone(&entry.body))
+    pub fn get_for_bench(&self, url: &str) -> Option<Bytes> {
+        self.entries.get(url).map(|entry| entry.body.clone())
     }
 
     /// Benchmark-only helper: Direct cache insertion.
@@ -414,7 +407,7 @@ mod tests {
         cache.entries.insert(
             "test".into(),
             CachedResponse {
-                body: Arc::new(vec![1, 2, 3]),
+                body: Bytes::from_static(&[1, 2, 3]),
                 etag: None,
                 last_modified: None,
                 fetched_at: Instant::now(),
@@ -428,14 +421,14 @@ mod tests {
     #[test]
     fn test_cached_response_clone() {
         let response = CachedResponse {
-            body: Arc::new(vec![1, 2, 3]),
+            body: Bytes::from_static(&[1, 2, 3]),
             etag: Some("test".into()),
             last_modified: Some("date".into()),
             fetched_at: Instant::now(),
         };
         let cloned = response.clone();
-        // Arc clone points to same data
-        assert!(Arc::ptr_eq(&response.body, &cloned.body));
+        // Bytes clone is cheap (reference counting)
+        assert_eq!(response.body, cloned.body);
         assert_eq!(response.etag, cloned.etag);
     }
 
@@ -447,7 +440,7 @@ mod tests {
         cache.entries.insert(
             "url1".into(),
             CachedResponse {
-                body: Arc::new(vec![]),
+                body: Bytes::new(),
                 etag: None,
                 last_modified: None,
                 fetched_at: Instant::now(),
@@ -471,9 +464,9 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/data", server.url());
-        let result = cache.get_cached(&url).await.unwrap();
+        let result: Bytes = cache.get_cached(&url).await.unwrap();
 
-        assert_eq!(&**result, b"test data");
+        assert_eq!(result.as_ref(), b"test data");
         assert_eq!(cache.len(), 1);
     }
 
@@ -492,8 +485,8 @@ mod tests {
             .create_async()
             .await;
 
-        let result1 = cache.get_cached(&url).await.unwrap();
-        assert_eq!(&**result1, b"original data");
+        let result1: Bytes = cache.get_cached(&url).await.unwrap();
+        assert_eq!(result1.as_ref(), b"original data");
         assert_eq!(cache.len(), 1);
 
         drop(_m1);
@@ -505,8 +498,8 @@ mod tests {
             .create_async()
             .await;
 
-        let result2 = cache.get_cached(&url).await.unwrap();
-        assert_eq!(&**result2, b"original data");
+        let result2: Bytes = cache.get_cached(&url).await.unwrap();
+        assert_eq!(result2.as_ref(), b"original data");
     }
 
     #[tokio::test]
@@ -524,8 +517,8 @@ mod tests {
             .create_async()
             .await;
 
-        let result1 = cache.get_cached(&url).await.unwrap();
-        assert_eq!(&**result1, b"original data");
+        let result1: Bytes = cache.get_cached(&url).await.unwrap();
+        assert_eq!(result1.as_ref(), b"original data");
 
         drop(_m1);
 
@@ -536,8 +529,8 @@ mod tests {
             .create_async()
             .await;
 
-        let result2 = cache.get_cached(&url).await.unwrap();
-        assert_eq!(&**result2, b"original data");
+        let result2: Bytes = cache.get_cached(&url).await.unwrap();
+        assert_eq!(result2.as_ref(), b"original data");
     }
 
     #[tokio::test]
@@ -550,7 +543,7 @@ mod tests {
         cache.entries.insert(
             url.clone(),
             CachedResponse {
-                body: Arc::new(b"cached".to_vec()),
+                body: Bytes::from_static(b"cached"),
                 etag: Some("\"tag123\"".into()),
                 last_modified: None,
                 fetched_at: Instant::now(),
@@ -564,8 +557,8 @@ mod tests {
             .create_async()
             .await;
 
-        let result = cache.get_cached(&url).await.unwrap();
-        assert_eq!(&**result, b"cached");
+        let result: Bytes = cache.get_cached(&url).await.unwrap();
+        assert_eq!(result.as_ref(), b"cached");
     }
 
     #[tokio::test]
@@ -578,7 +571,7 @@ mod tests {
         cache.entries.insert(
             url.clone(),
             CachedResponse {
-                body: Arc::new(b"cached".to_vec()),
+                body: Bytes::from_static(b"cached"),
                 etag: None,
                 last_modified: Some("Wed, 21 Oct 2024 07:28:00 GMT".into()),
                 fetched_at: Instant::now(),
@@ -592,8 +585,8 @@ mod tests {
             .create_async()
             .await;
 
-        let result = cache.get_cached(&url).await.unwrap();
-        assert_eq!(&**result, b"cached");
+        let result: Bytes = cache.get_cached(&url).await.unwrap();
+        assert_eq!(result.as_ref(), b"cached");
     }
 
     #[tokio::test]
@@ -604,15 +597,15 @@ mod tests {
         cache.entries.insert(
             url.to_string(),
             CachedResponse {
-                body: Arc::new(b"stale data".to_vec()),
+                body: Bytes::from_static(b"stale data"),
                 etag: Some("\"old\"".into()),
                 last_modified: None,
                 fetched_at: Instant::now(),
             },
         );
 
-        let result = cache.get_cached(url).await.unwrap();
-        assert_eq!(&**result, b"stale data");
+        let result: Bytes = cache.get_cached(url).await.unwrap();
+        assert_eq!(result.as_ref(), b"stale data");
     }
 
     #[tokio::test]
@@ -628,7 +621,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/missing", server.url());
-        let result = cache.fetch_and_store(&url).await;
+        let result: Result<Bytes> = cache.fetch_and_store(&url).await;
 
         assert!(result.is_err());
         match result {
@@ -654,7 +647,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/data", server.url());
-        cache.fetch_and_store(&url).await.unwrap();
+        let _: Bytes = cache.fetch_and_store(&url).await.unwrap();
 
         let cached = cache.entries.get(&url).unwrap();
         assert_eq!(cached.etag, Some("\"abc123\"".into()));

@@ -619,38 +619,43 @@ impl PypiParser {
     /// allowing us to find duplicate strings at different positions.
     /// Returns `(position, byte_offset)` where `byte_offset` is added to
     /// `used_positions` to track this occurrence.
+    ///
+    /// Performance optimization: Single-pass search without allocations.
+    /// Instead of formatting quoted strings and searching twice, we search
+    /// for the dependency string once and validate quotes in place.
     fn find_dependency_string_position(
         &self,
         content: &str,
         dep_str: &str,
         used_positions: &mut std::collections::HashSet<usize>,
     ) -> Option<(Position, usize)> {
-        // Search for the quoted dependency string
-        let quoted = format!("\"{}\"", dep_str);
-        for (pos, _) in content.match_indices(&quoted) {
-            if used_positions.contains(&pos) {
-                continue;
-            }
-            let before = &content[..pos + 1]; // +1 to skip opening quote
-            let line = before.chars().filter(|&c| c == '\n').count() as u32;
-            let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let character = (pos + 1 - last_newline) as u32; // +1 to skip opening quote
-            used_positions.insert(pos);
-            return Some((Position::new(line, character), pos));
-        }
+        let bytes = content.as_bytes();
 
-        // Try single quotes
-        let single_quoted = format!("'{}'", dep_str);
-        for (pos, _) in content.match_indices(&single_quoted) {
+        // Single pass: search for the dependency string and validate quotes
+        for (pos, _) in content.match_indices(dep_str) {
             if used_positions.contains(&pos) {
                 continue;
             }
-            let before = &content[..pos + 1];
-            let line = before.chars().filter(|&c| c == '\n').count() as u32;
-            let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
-            let character = (pos + 1 - last_newline) as u32;
-            used_positions.insert(pos);
-            return Some((Position::new(line, character), pos));
+
+            // Check if preceded by opening quote (either " or ')
+            if pos > 0 {
+                let opening_quote = bytes[pos - 1];
+                if opening_quote == b'"' || opening_quote == b'\'' {
+                    // Validate matching closing quote exists
+                    let end_pos = pos + dep_str.len();
+                    if end_pos < bytes.len() && bytes[end_pos] == opening_quote {
+                        // Calculate LSP position (line and character)
+                        // pos is now at the start of dep_str (after opening quote)
+                        let before = &content[..pos];
+                        let line = before.chars().filter(|&c| c == '\n').count() as u32;
+                        let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+                        let character = (pos - last_newline) as u32;
+
+                        used_positions.insert(pos);
+                        return Some((Position::new(line, character), pos));
+                    }
+                }
+            }
         }
 
         None

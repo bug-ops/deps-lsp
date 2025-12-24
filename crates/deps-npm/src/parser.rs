@@ -30,12 +30,21 @@ impl LineOffsetTable {
     }
 
     /// Converts byte offset to line/character position in O(log n) time.
-    fn position_from_offset(&self, offset: usize) -> Position {
+    ///
+    /// Uses UTF-16 character counting as required by LSP specification.
+    fn position_from_offset(&self, content: &str, offset: usize) -> Position {
         let line = match self.offsets.binary_search(&offset) {
             Ok(line) => line,
             Err(line) => line.saturating_sub(1),
         };
-        let character = (offset - self.offsets[line]) as u32;
+        let line_start = self.offsets[line];
+
+        // Count UTF-16 code units (not bytes) as required by LSP spec
+        let character = content[line_start..offset]
+            .chars()
+            .map(|c| c.len_utf16() as u32)
+            .sum();
+
         Position::new(line as u32, character)
     }
 }
@@ -211,8 +220,8 @@ fn find_dependency_positions(
         }
 
         // Found a valid key, calculate position
-        let name_start = line_table.position_from_offset(name_start_idx + 1);
-        let name_end = line_table.position_from_offset(name_start_idx + 1 + name.len());
+        let name_start = line_table.position_from_offset(content, name_start_idx + 1);
+        let name_end = line_table.position_from_offset(content, name_start_idx + 1 + name.len());
         name_range = Range::new(name_start, name_end);
 
         // Find version position (after the colon)
@@ -229,9 +238,9 @@ fn find_dependency_positions(
 
             if let Some(ver_rel_idx) = search_area.find(&version_search) {
                 let version_start_idx = colon_offset + ver_rel_idx + 1;
-                let version_start = line_table.position_from_offset(version_start_idx);
+                let version_start = line_table.position_from_offset(content, version_start_idx);
                 let version_end =
-                    line_table.position_from_offset(version_start_idx + version.len());
+                    line_table.position_from_offset(content, version_start_idx + version.len());
                 version_range = Some(Range::new(version_start, version_end));
             }
         }
@@ -410,17 +419,53 @@ mod tests {
         let content = "line0\nline1\nline2";
         let table = LineOffsetTable::new(content);
 
-        let pos0 = table.position_from_offset(0);
+        let pos0 = table.position_from_offset(content, 0);
         assert_eq!(pos0.line, 0);
         assert_eq!(pos0.character, 0);
 
-        let pos6 = table.position_from_offset(6);
+        let pos6 = table.position_from_offset(content, 6);
         assert_eq!(pos6.line, 1);
         assert_eq!(pos6.character, 0);
 
-        let pos12 = table.position_from_offset(12);
+        let pos12 = table.position_from_offset(content, 12);
         assert_eq!(pos12.line, 2);
         assert_eq!(pos12.character, 0);
+    }
+
+    #[test]
+    fn test_line_offset_table_utf16() {
+        // Test UTF-16 character counting (LSP requirement)
+        // "hello 世界" where 世界 are multi-byte Unicode characters
+        let content = "hello 世界\nworld";
+        let table = LineOffsetTable::new(content);
+
+        // Byte offset for "world" is 16 (6 bytes "hello " + 6 bytes "世界" + 1 byte "\n" + 3 bytes "wor")
+        // But we need UTF-16 character count for LSP
+        let world_offset = content.find("world").unwrap();
+        let pos = table.position_from_offset(content, world_offset);
+        assert_eq!(pos.line, 1);
+        assert_eq!(pos.character, 0);
+
+        // Test character position within a line with multi-byte chars
+        // "hello " = 6 UTF-16 code units
+        let world_char_offset = content.find('世').unwrap();
+        let pos = table.position_from_offset(content, world_char_offset);
+        assert_eq!(pos.line, 0);
+        assert_eq!(pos.character, 6); // "hello " = 6 UTF-16 code units
+    }
+
+    #[test]
+    fn test_line_offset_table_emoji() {
+        // Test with emoji (4-byte UTF-8, 2 UTF-16 code units)
+        let content = "test 🚀 rocket\nline2";
+        let table = LineOffsetTable::new(content);
+
+        // Find position of "rocket"
+        let rocket_offset = content.find("rocket").unwrap();
+        let pos = table.position_from_offset(content, rocket_offset);
+        assert_eq!(pos.line, 0);
+        // "test " = 5, "🚀" = 2 UTF-16 code units, " " = 1 => total 8
+        assert_eq!(pos.character, 8);
     }
 
     #[test]
