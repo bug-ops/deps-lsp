@@ -284,6 +284,7 @@ where
     H: EcosystemHandler,
     UnifiedVer: VersionStringGetter + YankedChecker,
 {
+    // Pre-allocate with estimated capacity
     let mut cached_deps = Vec::with_capacity(dependencies.len());
     let mut fetch_deps = Vec::with_capacity(dependencies.len());
 

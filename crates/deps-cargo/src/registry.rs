@@ -205,29 +205,29 @@ fn parse_index_json(data: &[u8], _crate_name: &str) -> Result<Vec<CargoVersion>>
     let content = std::str::from_utf8(data)
         .map_err(|e| DepsError::CacheError(format!("Invalid UTF-8: {}", e)))?;
 
-    let mut versions: Vec<CargoVersion> = content
+    // Parse versions once and cache the parsed Version for sorting
+    let mut versions_with_parsed: Vec<(CargoVersion, Version)> = content
         .lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| {
             let entry: IndexEntry = serde_json::from_str(line).ok()?;
-            Some(CargoVersion {
-                num: entry.version,
-                yanked: entry.yanked,
-                features: entry.features,
-            })
+            let parsed = entry.version.parse::<Version>().ok()?;
+            Some((
+                CargoVersion {
+                    num: entry.version,
+                    yanked: entry.yanked,
+                    features: entry.features,
+                },
+                parsed,
+            ))
         })
         .collect();
 
-    versions.sort_by(|a, b| {
-        let ver_a = a.num.parse::<Version>().ok();
-        let ver_b = b.num.parse::<Version>().ok();
-        match (ver_a, ver_b) {
-            (Some(a), Some(b)) => b.cmp(&a),
-            _ => std::cmp::Ordering::Equal,
-        }
-    });
+    // Sort using already-parsed versions (newest first)
+    versions_with_parsed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-    Ok(versions)
+    // Extract sorted versions
+    Ok(versions_with_parsed.into_iter().map(|(v, _)| v).collect())
 }
 
 /// Response from crates.io search API.

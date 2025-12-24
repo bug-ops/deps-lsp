@@ -170,26 +170,27 @@ struct VersionMetadata {
 fn parse_package_metadata(data: &[u8]) -> Result<Vec<NpmVersion>> {
     let metadata: PackageMetadata = serde_json::from_slice(data)?;
 
-    let mut versions: Vec<NpmVersion> = metadata
+    // Parse versions once and cache the parsed Version for sorting
+    let mut versions_with_parsed: Vec<(NpmVersion, node_semver::Version)> = metadata
         .versions
         .into_iter()
-        .map(|(version, meta)| NpmVersion {
-            version,
-            deprecated: meta.deprecated.is_some(),
+        .filter_map(|(version, meta)| {
+            let parsed = node_semver::Version::parse(&version).ok()?;
+            Some((
+                NpmVersion {
+                    version,
+                    deprecated: meta.deprecated.is_some(),
+                },
+                parsed,
+            ))
         })
         .collect();
 
-    // Sort by semver version (newest first)
-    versions.sort_by(|a, b| {
-        let ver_a = node_semver::Version::parse(&a.version).ok();
-        let ver_b = node_semver::Version::parse(&b.version).ok();
-        match (ver_a, ver_b) {
-            (Some(a), Some(b)) => b.cmp(&a),
-            _ => std::cmp::Ordering::Equal,
-        }
-    });
+    // Sort using already-parsed versions (newest first)
+    versions_with_parsed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-    Ok(versions)
+    // Extract sorted versions
+    Ok(versions_with_parsed.into_iter().map(|(v, _)| v).collect())
 }
 
 /// Search response from npm registry.

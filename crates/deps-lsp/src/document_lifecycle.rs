@@ -116,7 +116,7 @@ pub async fn handle_document_open(
             doc.update_cached_versions(resolved_versions.clone());
         }
 
-        let doc = match state_clone.get_document(&uri_clone) {
+        let doc = match state_clone.get_document_clone(&uri_clone) {
             Some(d) => d,
             None => return,
         };
@@ -132,8 +132,6 @@ pub async fn handle_document_open(
             .into_iter()
             .map(|d| d.name().to_string())
             .collect();
-
-        drop(doc); // Release guard before async operations
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
@@ -220,7 +218,7 @@ pub async fn handle_document_change(
             doc.update_cached_versions(resolved_versions.clone());
         }
 
-        let doc = match state_clone.get_document(&uri_clone) {
+        let doc = match state_clone.get_document_clone(&uri_clone) {
             Some(d) => d,
             None => return,
         };
@@ -236,8 +234,6 @@ pub async fn handle_document_change(
             .into_iter()
             .map(|d| d.name().to_string())
             .collect();
-
-        drop(doc);
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();

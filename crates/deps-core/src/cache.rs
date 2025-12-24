@@ -338,12 +338,11 @@ impl HttpCache {
 
     /// Evicts approximately `CACHE_EVICTION_PERCENTAGE`% of cache entries when capacity is reached.
     ///
-    /// Uses a min-heap to efficiently find the oldest entries in O(N) time
-    /// instead of O(N log N) sorting. This reduces eviction time significantly
-    /// when the cache is full (1000 entries).
+    /// Uses a min-heap to efficiently find the oldest entries instead of full sorting.
+    /// For each entry, we potentially push/pop from the heap, which is O(log K).
     ///
-    /// Time complexity: O(N + K log K) where K = target_removals << N
-    /// Space complexity: O(K) for the heap
+    /// Time complexity: O(N log K) where N = number of cache entries, K = target_removals
+    /// Space complexity: O(K) for the min-heap
     fn evict_entries(&self) {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
