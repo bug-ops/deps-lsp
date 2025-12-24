@@ -44,8 +44,8 @@ async fn fetch_latest_versions_parallel(
                     .await
                     .ok()
                     .and_then(|versions| {
-                        versions
-                            .first()
+                        // Use shared utility for consistent behavior with diagnostics
+                        deps_core::find_latest_stable(&versions)
                             .map(|v| (name, v.version_string().to_string()))
                     })
             }

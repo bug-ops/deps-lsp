@@ -337,9 +337,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
                 });
             }
 
-            let latest = versions
-                .iter()
-                .find(|v| !v.is_yanked() && !v.is_prerelease());
+            let latest = crate::registry::find_latest_stable(&versions);
             if let Some(latest) = latest
                 && latest.version_string() != current.version_string()
             {

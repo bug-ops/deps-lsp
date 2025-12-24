@@ -182,6 +182,46 @@ pub trait Version: Send + Sync {
 
     /// Downcast to concrete version type
     fn as_any(&self) -> &dyn Any;
+
+    /// Whether this version is stable (not yanked and not pre-release).
+    fn is_stable(&self) -> bool {
+        !self.is_yanked() && !self.is_prerelease()
+    }
+}
+
+/// Finds the latest stable version from a list of versions.
+///
+/// Returns the first version that is:
+/// - Not yanked/deprecated
+/// - Not a pre-release (alpha, beta, rc, etc.)
+///
+/// Assumes versions are sorted newest-first (as returned by registries).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::registry::{Version, find_latest_stable};
+/// use std::any::Any;
+///
+/// struct MyVersion { version: String, yanked: bool }
+///
+/// impl Version for MyVersion {
+///     fn version_string(&self) -> &str { &self.version }
+///     fn is_yanked(&self) -> bool { self.yanked }
+///     fn as_any(&self) -> &dyn Any { self }
+/// }
+///
+/// let versions: Vec<Box<dyn Version>> = vec![
+///     Box::new(MyVersion { version: "2.0.0-alpha.1".into(), yanked: false }),
+///     Box::new(MyVersion { version: "1.5.0".into(), yanked: true }),
+///     Box::new(MyVersion { version: "1.4.0".into(), yanked: false }),
+/// ];
+///
+/// let latest = find_latest_stable(&versions);
+/// assert_eq!(latest.map(|v| v.version_string()), Some("1.4.0"));
+/// ```
+pub fn find_latest_stable(versions: &[Box<dyn Version>]) -> Option<&dyn Version> {
+    versions.iter().find(|v| v.is_stable()).map(|v| v.as_ref())
 }
 
 /// Package metadata trait.
@@ -523,5 +563,111 @@ mod tests {
             version: "1.0.214".into(),
         };
         assert!(!version.is_prerelease());
+    }
+
+    #[test]
+    fn test_is_stable_true() {
+        let version = MockVersion {
+            version: "1.0.0".into(),
+            yanked: false,
+        };
+        assert!(version.is_stable());
+    }
+
+    #[test]
+    fn test_is_stable_false_yanked() {
+        let version = MockVersion {
+            version: "1.0.0".into(),
+            yanked: true,
+        };
+        assert!(!version.is_stable());
+    }
+
+    #[test]
+    fn test_is_stable_false_prerelease() {
+        let version = MockVersion {
+            version: "1.0.0-alpha.1".into(),
+            yanked: false,
+        };
+        assert!(!version.is_stable());
+    }
+
+    #[test]
+    fn test_find_latest_stable_skips_prerelease() {
+        let versions: Vec<Box<dyn Version>> = vec![
+            Box::new(MockVersion {
+                version: "2.0.0-alpha.1".into(),
+                yanked: false,
+            }),
+            Box::new(MockVersion {
+                version: "1.5.0".into(),
+                yanked: false,
+            }),
+        ];
+        let latest = super::find_latest_stable(&versions);
+        assert_eq!(latest.map(|v| v.version_string()), Some("1.5.0"));
+    }
+
+    #[test]
+    fn test_find_latest_stable_skips_yanked() {
+        let versions: Vec<Box<dyn Version>> = vec![
+            Box::new(MockVersion {
+                version: "2.0.0".into(),
+                yanked: true,
+            }),
+            Box::new(MockVersion {
+                version: "1.5.0".into(),
+                yanked: false,
+            }),
+        ];
+        let latest = super::find_latest_stable(&versions);
+        assert_eq!(latest.map(|v| v.version_string()), Some("1.5.0"));
+    }
+
+    #[test]
+    fn test_find_latest_stable_returns_first_stable() {
+        let versions: Vec<Box<dyn Version>> = vec![
+            Box::new(MockVersion {
+                version: "3.0.0-beta.1".into(),
+                yanked: false,
+            }),
+            Box::new(MockVersion {
+                version: "2.0.0".into(),
+                yanked: true,
+            }),
+            Box::new(MockVersion {
+                version: "1.5.0".into(),
+                yanked: false,
+            }),
+            Box::new(MockVersion {
+                version: "1.4.0".into(),
+                yanked: false,
+            }),
+        ];
+        let latest = super::find_latest_stable(&versions);
+        assert_eq!(latest.map(|v| v.version_string()), Some("1.5.0"));
+    }
+
+    #[test]
+    fn test_find_latest_stable_empty_list() {
+        let versions: Vec<Box<dyn Version>> = vec![];
+        let latest = super::find_latest_stable(&versions);
+        assert!(latest.is_none());
+    }
+
+    #[test]
+    fn test_find_latest_stable_no_stable_versions() {
+        let versions: Vec<Box<dyn Version>> = vec![
+            Box::new(MockVersion {
+                version: "2.0.0-alpha.1".into(),
+                yanked: false,
+            }),
+            Box::new(MockVersion {
+                version: "1.0.0".into(),
+                yanked: true,
+            }),
+        ];
+        let latest = super::find_latest_stable(&versions);
+        assert!(latest.is_none());
     }
 }
