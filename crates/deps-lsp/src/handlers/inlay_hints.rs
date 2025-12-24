@@ -9,6 +9,7 @@ use deps_core::EcosystemConfig;
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_lsp::lsp_types::{InlayHint, InlayHintParams};
 
 /// Fetches latest versions for multiple packages in parallel (on-demand).
@@ -99,19 +100,30 @@ pub async fn handle_inlay_hints(
         }
     };
 
-    // Fetch versions on-demand if cached_versions is empty
+    // Fetch versions on-demand if cached_versions is empty (with timeout to prevent hanging)
     if cached_versions.is_empty() && !dep_names.is_empty() {
         tracing::debug!(
             "Fetching {} versions on-demand for inlay hints",
             dep_names.len()
         );
-        cached_versions = fetch_versions_on_demand(&ecosystem, dep_names).await;
 
-        // Update document state with fetched versions for future requests
-        if !cached_versions.is_empty()
-            && let Some(mut doc) = state.documents.get_mut(uri)
-        {
-            doc.update_cached_versions(cached_versions.clone());
+        // Use timeout to prevent blocking the LSP server if network is slow
+        let fetch_future = fetch_versions_on_demand(&ecosystem, dep_names);
+        match tokio::time::timeout(Duration::from_secs(5), fetch_future).await {
+            Ok(versions) => {
+                cached_versions = versions;
+
+                // Update document state with fetched versions for future requests
+                if !cached_versions.is_empty()
+                    && let Some(mut doc) = state.documents.get_mut(uri)
+                {
+                    doc.update_cached_versions(cached_versions.clone());
+                }
+            }
+            Err(_) => {
+                tracing::warn!("On-demand version fetch timed out for inlay hints");
+                // Continue with empty cached_versions - will show ⏳ indicator
+            }
         }
     }
 
