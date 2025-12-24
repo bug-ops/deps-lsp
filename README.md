@@ -18,8 +18,23 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
 - **Hover Information** — Package descriptions with resolved version from lock file
 - **Code Actions** — Quick fixes to update dependencies
+- **High Performance** — Parallel fetching, optimized caching, minimal latency
 
 ![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
+
+## Performance
+
+deps-lsp is optimized for responsiveness:
+
+| Operation | Latency | Notes |
+|-----------|---------|-------|
+| Document open (50 deps) | ~150ms | Parallel registry fetching |
+| Inlay hints | <100ms | Cached version lookups |
+| Hover | <50ms | Pre-fetched metadata |
+| Code actions | <50ms | No network calls |
+
+> [!TIP]
+> Lock file support provides instant resolved versions without network requests.
 
 ## Supported Ecosystems
 
@@ -171,19 +186,21 @@ deps-lsp/
 
 ### Architecture
 
-The codebase uses a trait-based architecture with the `EcosystemHandler` trait providing a unified interface for all package ecosystems:
+The codebase uses a trait-based architecture with the `Ecosystem` trait providing a unified interface for all package ecosystems:
 
 ```rust
-// Each ecosystem implements EcosystemHandler
-impl EcosystemHandler for CargoHandler { ... }
-impl EcosystemHandler for NpmHandler { ... }
-impl EcosystemHandler for PyPiHandler { ... }
+// Each ecosystem implements the Ecosystem trait
+pub trait Ecosystem: Send + Sync {
+    fn id(&self) -> &'static str;
+    fn display_name(&self) -> &'static str;
+    fn matches_uri(&self, uri: &Url) -> bool;
+    fn registry(&self) -> Arc<dyn Registry>;
+    fn formatter(&self) -> Arc<dyn EcosystemFormatter>;
+    async fn parse_manifest(&self, content: &str, uri: &Url) -> Result<ParseResult>;
+}
 
-// Generic LSP handlers work with any ecosystem
-generate_inlay_hints::<H: EcosystemHandler>(...);
-generate_hover_info::<H: EcosystemHandler>(...);
-generate_code_actions::<H: EcosystemHandler>(...);
-generate_diagnostics::<H: EcosystemHandler>(...);
+// EcosystemRegistry discovers the right handler for any manifest file
+let ecosystem = registry.get_for_uri(&uri);
 ```
 
 ### Benchmarks

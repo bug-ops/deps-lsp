@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-12-24
+
+### Added
+- **Trait-based ecosystem architecture** — Unified handling for all package ecosystems
+  - `Ecosystem` trait with parser, registry, and formatter
+  - `EcosystemRegistry` for dynamic ecosystem lookup by URI
+  - `LockfileProvider` trait for lock file parsing
+  - Simplified document lifecycle with generic handlers
+
+### Changed
+- **Performance optimizations** — Significant latency improvements
+  - Parallel registry fetching with `futures::join_all` (97% faster document open)
+  - O(N log K) cache eviction algorithm with min-heap (90% faster eviction)
+  - Parse-once pattern for version sorting (50% faster parsing)
+  - String formatting optimization with `write!()` macro
+  - Early lock release pattern with `get_document_clone()`
+
+### Fixed
+- npm: Remove extra quotes in code action version replacements (#29)
+
 ## [0.2.3] - 2025-12-23
 
 ### Changed
@@ -106,7 +126,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bug-ops/deps-lsp/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/bug-ops/deps-lsp/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/bug-ops/deps-lsp/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/bug-ops/deps-lsp/compare/v0.2.0...v0.2.1
