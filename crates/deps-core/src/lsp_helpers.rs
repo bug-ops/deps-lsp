@@ -106,11 +106,14 @@ pub fn generate_inlay_hints(
 
         let (is_up_to_date, display_version) = match (resolved_version, latest_version) {
             (Some(resolved), Some(latest)) => {
-                let is_same = resolved == latest || is_same_major_minor(resolved, latest);
+                // Always compare against absolute latest, not just major.minor match
+                // This ensures exact versions like =2.0.12 show ❌ when 2.1.1 is available
+                let is_same = resolved == latest;
                 (is_same, Some(latest.as_str()))
             }
             (None, Some(latest)) => {
                 let version_req = dep.version_requirement().unwrap_or("");
+                // When no resolved version, check if requirement would match latest
                 let is_match = formatter.version_satisfies_requirement(latest, version_req);
                 (is_match, Some(latest.as_str()))
             }
@@ -524,5 +527,197 @@ mod tests {
             formatter.package_url("requests"),
             "https://pypi.org/project/requests"
         );
+    }
+
+    #[test]
+    fn test_inlay_hint_exact_version_shows_update_needed() {
+        use std::any::Any;
+        use std::collections::HashMap;
+        use tower_lsp::lsp_types::{Position, Range, Url};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+        };
+
+        struct MockParseResult {
+            deps: Vec<MockDep>,
+            uri: Url,
+        }
+
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Url {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockDep {
+            name: String,
+            version_req: String,
+            version_range: Range,
+            name_range: Range,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                self.name_range
+            }
+            fn version_requirement(&self) -> Option<&str> {
+                Some(&self.version_req)
+            }
+            fn version_range(&self) -> Option<Range> {
+                Some(self.version_range)
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".to_string(),
+                version_req: "=2.0.12".to_string(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: Url::parse("file:///test/Cargo.toml").unwrap(),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".to_string(), "2.1.1".to_string());
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".to_string(), "2.0.12".to_string());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            &cached_versions,
+            &resolved_versions,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert_eq!(text, "❌ 2.1.1");
+            }
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    #[test]
+    fn test_inlay_hint_caret_version_up_to_date() {
+        use std::any::Any;
+        use std::collections::HashMap;
+        use tower_lsp::lsp_types::{Position, Range, Url};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+        };
+
+        struct MockParseResult {
+            deps: Vec<MockDep>,
+            uri: Url,
+        }
+
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Url {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockDep {
+            name: String,
+            version_req: String,
+            version_range: Range,
+            name_range: Range,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                self.name_range
+            }
+            fn version_requirement(&self) -> Option<&str> {
+                Some(&self.version_req)
+            }
+            fn version_range(&self) -> Option<Range> {
+                Some(self.version_range)
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".to_string(),
+                version_req: "^2.0".to_string(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: Url::parse("file:///test/Cargo.toml").unwrap(),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".to_string(), "2.1.1".to_string());
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".to_string(), "2.1.1".to_string());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            &cached_versions,
+            &resolved_versions,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(
+                    text.starts_with("✅"),
+                    "Expected up-to-date hint, got: {}",
+                    text
+                );
+            }
+            _ => panic!("Expected string label"),
+        }
     }
 }
