@@ -151,7 +151,7 @@ pub fn generate_inlay_hints(
 pub async fn generate_hover<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
-    cached_versions: &HashMap<String, String>,
+    _cached_versions: &HashMap<String, String>,
     resolved_versions: &HashMap<String, String>,
     registry: &R,
     formatter: &dyn EcosystemFormatter,
@@ -185,16 +185,20 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         write!(&mut markdown, "**Requirement**: `{}`\n\n", version_req).unwrap();
     }
 
-    let latest = cached_versions
-        .get(&normalized_name)
-        .or_else(|| cached_versions.get(dep.name()));
-    if let Some(latest_ver) = latest {
-        write!(&mut markdown, "**Latest**: `{}`\n\n", latest_ver).unwrap();
+    // Find first stable (non-yanked, non-prerelease) version as "Latest"
+    // Use fresh registry data instead of cached_versions to avoid race conditions
+    let latest_stable = versions
+        .iter()
+        .find(|v| !v.is_yanked() && !v.is_prerelease())
+        .or_else(|| versions.first());
+
+    if let Some(latest_ver) = latest_stable {
+        write!(&mut markdown, "**Latest**: `{}`\n\n", latest_ver.version_string()).unwrap();
     }
 
     markdown.push_str("**Recent versions**:\n");
 
-    // Find first stable (non-yanked, non-prerelease) version to mark as "(latest)"
+    // Find index of latest stable for marking in list
     let latest_stable_idx = versions
         .iter()
         .position(|v| !v.is_yanked() && !v.is_prerelease());
