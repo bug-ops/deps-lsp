@@ -6,12 +6,48 @@
 use crate::config::InlayHintsConfig;
 use crate::document::ServerState;
 use deps_core::EcosystemConfig;
+use futures::future::join_all;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tower_lsp::lsp_types::{InlayHint, InlayHintParams};
+
+/// Fetches latest versions for multiple packages in parallel (on-demand).
+///
+/// Returns a HashMap mapping package names to their latest version strings.
+/// Filters out pre-release and yanked versions when finding the latest version.
+async fn fetch_versions_on_demand(
+    ecosystem: &Arc<dyn deps_core::Ecosystem>,
+    package_names: Vec<String>,
+) -> HashMap<String, String> {
+    let registry = ecosystem.registry();
+    let futures: Vec<_> = package_names
+        .into_iter()
+        .map(|name| {
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .get_versions(&name)
+                    .await
+                    .ok()
+                    .and_then(|versions| {
+                        // Find first stable (non-yanked, non-prerelease) version
+                        versions
+                            .iter()
+                            .find(|v| !v.is_yanked() && !v.is_prerelease())
+                            .or_else(|| versions.first())
+                            .map(|v| (name, v.version_string().to_string()))
+                    })
+            }
+        })
+        .collect();
+
+    join_all(futures).await.into_iter().flatten().collect()
+}
 
 /// Handles inlay hint requests using trait-based delegation.
 ///
 /// Returns version status hints for all registry dependencies in the document.
+/// If cached versions are not yet available, fetches them on-demand.
 /// Gracefully degrades by returning empty vec on any errors.
 pub async fn handle_inlay_hints(
     state: Arc<ServerState>,
@@ -24,7 +60,7 @@ pub async fn handle_inlay_hints(
 
     let uri = &params.text_document.uri;
 
-    let (ecosystem_id, cached_versions, resolved_versions) = {
+    let (ecosystem_id, mut cached_versions, resolved_versions, dep_names) = {
         let doc = match state.get_document(uri) {
             Some(d) => d,
             None => {
@@ -32,16 +68,27 @@ pub async fn handle_inlay_hints(
                 return vec![];
             }
         };
+
+        // Collect dependency names if we need to fetch on-demand
+        let dep_names: Vec<String> = if doc.cached_versions.is_empty() {
+            doc.parse_result()
+                .map(|p| {
+                    p.dependencies()
+                        .into_iter()
+                        .map(|d| d.name().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
         (
             doc.ecosystem_id,
             doc.cached_versions.clone(),
             doc.resolved_versions.clone(),
+            dep_names,
         )
-    };
-
-    let doc = match state.get_document(uri) {
-        Some(d) => d,
-        None => return vec![],
     };
 
     let ecosystem = match state.ecosystem_registry.get(ecosystem_id) {
@@ -50,6 +97,27 @@ pub async fn handle_inlay_hints(
             tracing::warn!("Ecosystem not found: {}", ecosystem_id);
             return vec![];
         }
+    };
+
+    // Fetch versions on-demand if cached_versions is empty
+    if cached_versions.is_empty() && !dep_names.is_empty() {
+        tracing::debug!(
+            "Fetching {} versions on-demand for inlay hints",
+            dep_names.len()
+        );
+        cached_versions = fetch_versions_on_demand(&ecosystem, dep_names).await;
+
+        // Update document state with fetched versions for future requests
+        if !cached_versions.is_empty()
+            && let Some(mut doc) = state.documents.get_mut(uri)
+        {
+            doc.update_cached_versions(cached_versions.clone());
+        }
+    }
+
+    let doc = match state.get_document(uri) {
+        Some(d) => d,
+        None => return vec![],
     };
 
     let parse_result = match doc.parse_result() {
