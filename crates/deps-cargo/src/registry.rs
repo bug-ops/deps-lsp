@@ -85,7 +85,11 @@ impl CratesIoRegistry {
     /// ```
     pub async fn get_versions(&self, name: &str) -> Result<Vec<CargoVersion>> {
         let path = sparse_index_path(name);
-        let url = format!("{}/{}", SPARSE_INDEX_BASE, path);
+        // Pre-allocate: SPARSE_INDEX_BASE (25 chars) + "/" + path
+        let mut url = String::with_capacity(SPARSE_INDEX_BASE.len() + 1 + path.len());
+        url.push_str(SPARSE_INDEX_BASE);
+        url.push('/');
+        url.push_str(&path);
 
         let data = self.cache.get_cached(&url).await?;
 
@@ -181,11 +185,42 @@ impl CratesIoRegistry {
 /// - 4+ chars: "{first_2}/{next_2}/{name}"
 fn sparse_index_path(name: &str) -> String {
     let name_lower = name.to_lowercase();
-    match name_lower.len() {
-        1 => format!("1/{}", name_lower),
-        2 => format!("2/{}", name_lower),
-        3 => format!("3/{}/{}", &name_lower[0..1], name_lower),
-        _ => format!("{}/{}/{}", &name_lower[0..2], &name_lower[2..4], name_lower),
+    let len = name_lower.len();
+
+    match len {
+        1 => {
+            // "1/" + name = 2 + 1 = 3 chars
+            let mut path = String::with_capacity(3);
+            path.push_str("1/");
+            path.push_str(&name_lower);
+            path
+        }
+        2 => {
+            // "2/" + name = 2 + 2 = 4 chars
+            let mut path = String::with_capacity(4);
+            path.push_str("2/");
+            path.push_str(&name_lower);
+            path
+        }
+        3 => {
+            // "3/" + first_char + "/" + name = 2 + 1 + 1 + 3 = 7 chars
+            let mut path = String::with_capacity(7);
+            path.push_str("3/");
+            path.push_str(&name_lower[0..1]);
+            path.push('/');
+            path.push_str(&name_lower);
+            path
+        }
+        _ => {
+            // first_2 + "/" + next_2 + "/" + name = 2 + 1 + 2 + 1 + len
+            let mut path = String::with_capacity(6 + len);
+            path.push_str(&name_lower[0..2]);
+            path.push('/');
+            path.push_str(&name_lower[2..4]);
+            path.push('/');
+            path.push_str(&name_lower);
+            path
+        }
     }
 }
 
