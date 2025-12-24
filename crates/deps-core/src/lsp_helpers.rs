@@ -107,23 +107,18 @@ pub fn generate_inlay_hints(
         // Determine display status: Some(true) = up-to-date, Some(false) = outdated, None = waiting
         let (status, display_version) = match (resolved_version, latest_version) {
             (Some(resolved), Some(latest)) => {
-                if resolved == latest {
-                    // Same version - likely stale cached data (resolved used as initial cache)
-                    // Show "waiting" indicator until real registry data arrives
-                    (None, Some(resolved.as_str()))
-                } else {
-                    // Different versions - we have real registry data
-                    let is_same = is_same_major_minor(resolved, latest);
-                    (Some(is_same), Some(latest.as_str()))
-                }
+                // Have both resolved and latest from registry - compare them
+                let is_same = resolved == latest || is_same_major_minor(resolved, latest);
+                (Some(is_same), Some(latest.as_str()))
             }
             (None, Some(latest)) => {
+                // No lock file, but have registry data - check if requirement matches
                 let version_req = dep.version_requirement().unwrap_or("");
                 let is_match = formatter.version_satisfies_requirement(latest, version_req);
                 (Some(is_match), Some(latest.as_str()))
             }
             (Some(resolved), None) => {
-                // Only have resolved from lock file - show "waiting" indicator
+                // Have lock file but no registry data yet - show waiting indicator
                 (None, Some(resolved.as_str()))
             }
             (None, None) => continue,
