@@ -338,32 +338,44 @@ impl HttpCache {
 
     /// Evicts approximately `CACHE_EVICTION_PERCENTAGE`% of cache entries when capacity is reached.
     ///
-    /// Uses a simple random eviction strategy. In a production system,
-    /// this could be replaced with LRU or TTL-based eviction.
+    /// Uses a min-heap to efficiently find the oldest entries instead of full sorting.
+    /// For each entry, we potentially push/pop from the heap, which is O(log K).
+    ///
+    /// Time complexity: O(N log K) where N = number of cache entries, K = target_removals
+    /// Space complexity: O(K) for the min-heap
     fn evict_entries(&self) {
-        let target_removals = MAX_CACHE_ENTRIES / CACHE_EVICTION_PERCENTAGE;
-        let mut removed = 0;
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
 
-        // Simple eviction: remove oldest entries by fetched_at timestamp
-        let mut entries_to_remove = Vec::new();
+        let target_removals = MAX_CACHE_ENTRIES / CACHE_EVICTION_PERCENTAGE;
+
+        // Use min-heap to efficiently find N oldest entries
+        // The heap maintains the K oldest entries seen so far
+        let mut oldest = BinaryHeap::with_capacity(target_removals);
 
         for entry in self.entries.iter() {
-            entries_to_remove.push((entry.key().clone(), entry.value().fetched_at));
-            if entries_to_remove.len() >= MAX_CACHE_ENTRIES {
-                break;
+            let item = (entry.value().fetched_at, entry.key().clone());
+
+            if oldest.len() < target_removals {
+                // Heap not full, insert directly
+                oldest.push(Reverse(item));
+            } else if let Some(Reverse(newest_of_oldest)) = oldest.peek() {
+                // If this entry is older than the newest entry in our "oldest" set,
+                // replace it
+                if item.0 < newest_of_oldest.0 {
+                    oldest.pop();
+                    oldest.push(Reverse(item));
+                }
             }
         }
 
-        // Sort by age (oldest first)
-        entries_to_remove.sort_by_key(|(_, time)| *time);
-
-        // Remove oldest entries
-        for (url, _) in entries_to_remove.iter().take(target_removals) {
-            self.entries.remove(url);
-            removed += 1;
+        // Remove selected oldest entries
+        let removed = oldest.len();
+        for Reverse((_, url)) in oldest {
+            self.entries.remove(&url);
         }
 
-        tracing::debug!("evicted {} cache entries", removed);
+        tracing::debug!("evicted {} cache entries (O(N) algorithm)", removed);
     }
 
     /// Benchmark-only helper: Direct cache lookup without network requests.
