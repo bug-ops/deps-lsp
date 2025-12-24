@@ -114,8 +114,8 @@ pub async fn handle_document_open(
             && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
         {
             doc.update_resolved_versions(resolved_versions.clone());
-            // Use resolved versions as cached versions for instant display
-            doc.update_cached_versions(resolved_versions.clone());
+            // Note: Don't set cached_versions here - only from registry fetch
+            // This prevents false "up-to-date" indicators before real data arrives
         }
 
         let doc = match state_clone.get_document_clone(&uri_clone) {
@@ -216,8 +216,8 @@ pub async fn handle_document_change(
             && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
         {
             doc.update_resolved_versions(resolved_versions.clone());
-            // Use resolved versions as cached versions for instant display
-            doc.update_cached_versions(resolved_versions.clone());
+            // Note: Don't set cached_versions here - only from registry fetch
+            // This prevents false "up-to-date" indicators before real data arrives
         }
 
         let doc = match state_clone.get_document_clone(&uri_clone) {

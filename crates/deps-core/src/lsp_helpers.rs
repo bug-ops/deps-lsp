@@ -114,7 +114,8 @@ pub fn generate_inlay_hints(
                 let is_match = formatter.version_satisfies_requirement(latest, version_req);
                 (is_match, Some(latest.as_str()))
             }
-            (Some(resolved), None) => (true, Some(resolved.as_str())),
+            // No latest from registry yet - skip until we have real data
+            (Some(_resolved), None) => continue,
             (None, None) => continue,
         };
 
