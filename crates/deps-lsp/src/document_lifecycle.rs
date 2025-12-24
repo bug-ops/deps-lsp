@@ -105,25 +105,51 @@ pub async fn handle_document_open(
     let client_clone = client.clone();
 
     let task = tokio::spawn(async move {
+        tracing::info!("[lifecycle] Background task started for {}", uri_clone);
+
         // Load resolved versions from lock file first (instant, no network)
         let resolved_versions =
             load_resolved_versions(&uri_clone, &state_clone, ecosystem_clone.as_ref()).await;
+
+        tracing::debug!(
+            "[lifecycle] Loaded {} resolved versions for {}",
+            resolved_versions.len(),
+            uri_clone
+        );
 
         // Collect dependency names while we have access to the original document
         // Note: get_document_clone() doesn't preserve parse_result (trait objects can't be cloned)
         let dep_names: Vec<String> = {
             let doc = match state_clone.get_document(&uri_clone) {
                 Some(d) => d,
-                None => return,
+                None => {
+                    tracing::error!("[lifecycle] Document not found for {}", uri_clone);
+                    return;
+                }
             };
 
             match doc.parse_result() {
-                Some(p) => p
-                    .dependencies()
-                    .into_iter()
-                    .map(|d| d.name().to_string())
-                    .collect(),
-                None => return,
+                Some(p) => {
+                    let names: Vec<String> = p
+                        .dependencies()
+                        .into_iter()
+                        .map(|d| d.name().to_string())
+                        .collect();
+                    tracing::info!(
+                        "[lifecycle] Found {} dependencies in {}: {:?}",
+                        names.len(),
+                        uri_clone,
+                        names
+                    );
+                    names
+                }
+                None => {
+                    tracing::error!(
+                        "[lifecycle] parse_result is None for {} (this is the bug!)",
+                        uri_clone
+                    );
+                    return;
+                }
             }
         }; // DashMap lock released here
 
@@ -138,17 +164,25 @@ pub async fn handle_document_open(
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
+        tracing::info!(
+            "[lifecycle] Fetching versions for {} dependencies...",
+            dep_names.len()
+        );
         let cached_versions = fetch_latest_versions_parallel(registry, dep_names).await;
 
-        tracing::debug!(
-            "Fetched {} cached versions for {}",
+        tracing::info!(
+            "[lifecycle] Fetched {} cached versions for {}: {:?}",
             cached_versions.len(),
-            uri_clone
+            uri_clone,
+            cached_versions.keys().collect::<Vec<_>>()
         );
 
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.update_cached_versions(cached_versions);
+            tracing::info!("[lifecycle] Updated cached_versions in document state");
+        } else {
+            tracing::error!("[lifecycle] Failed to get_mut document for updating cached_versions");
         }
 
         // Publish diagnostics
@@ -247,17 +281,25 @@ pub async fn handle_document_change(
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
+        tracing::info!(
+            "[lifecycle] Fetching versions for {} dependencies...",
+            dep_names.len()
+        );
         let cached_versions = fetch_latest_versions_parallel(registry, dep_names).await;
 
-        tracing::debug!(
-            "Fetched {} cached versions for {}",
+        tracing::info!(
+            "[lifecycle] Fetched {} cached versions for {}: {:?}",
             cached_versions.len(),
-            uri_clone
+            uri_clone,
+            cached_versions.keys().collect::<Vec<_>>()
         );
 
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.update_cached_versions(cached_versions);
+            tracing::info!("[lifecycle] Updated cached_versions in document state");
+        } else {
+            tracing::error!("[lifecycle] Failed to get_mut document for updating cached_versions");
         }
 
         // Publish diagnostics
