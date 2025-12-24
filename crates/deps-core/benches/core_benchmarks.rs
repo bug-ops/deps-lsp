@@ -6,6 +6,7 @@
 //! - Cache eviction: < 1ms
 //! - Arc cloning (for response bodies): < 10ns
 
+use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use deps_core::cache::{CachedResponse, HttpCache};
 use std::hint::black_box;
@@ -23,7 +24,7 @@ fn bench_cache_lookup(c: &mut Criterion) {
 
     // Pre-populate cache
     let response = CachedResponse {
-        body: Arc::new(vec![1, 2, 3, 4, 5]),
+        body: Bytes::from_static(&[1, 2, 3, 4, 5]),
         etag: Some("\"abc123\"".into()),
         last_modified: None,
         fetched_at: Instant::now(),
@@ -47,21 +48,21 @@ fn bench_cache_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("cache_insert");
 
     let response_small = CachedResponse {
-        body: Arc::new(vec![0u8; 100]),
+        body: Bytes::from(vec![0u8; 100]),
         etag: Some("\"small\"".into()),
         last_modified: None,
         fetched_at: Instant::now(),
     };
 
     let response_medium = CachedResponse {
-        body: Arc::new(vec![0u8; 10_000]),
+        body: Bytes::from(vec![0u8; 10_000]),
         etag: Some("\"medium\"".into()),
         last_modified: Some("Thu, 01 Jan 2024 00:00:00 GMT".into()),
         fetched_at: Instant::now(),
     };
 
     let response_large = CachedResponse {
-        body: Arc::new(vec![0u8; 1_000_000]),
+        body: Bytes::from(vec![0u8; 1_000_000]),
         etag: Some("\"large\"".into()),
         last_modified: None,
         fetched_at: Instant::now(),
@@ -144,7 +145,7 @@ fn bench_concurrent_access(c: &mut Criterion) {
     let cache = StdArc::new(HttpCache::new());
     for i in 0..100 {
         let response = CachedResponse {
-            body: Arc::new(vec![i as u8; 100]),
+            body: Bytes::from(vec![i as u8; 100]),
             etag: Some(format!("\"etag-{}\"", i)),
             last_modified: None,
             fetched_at: Instant::now(),
@@ -182,7 +183,7 @@ fn bench_cache_eviction(c: &mut Criterion) {
     // Pre-populate to near capacity (MAX_CACHE_ENTRIES = 1000)
     for i in 0..990 {
         let response = CachedResponse {
-            body: Arc::new(vec![i as u8; 100]),
+            body: Bytes::from(vec![i as u8; 100]),
             etag: Some(format!("\"etag-{}\"", i)),
             last_modified: None,
             fetched_at: Instant::now(),
@@ -194,7 +195,7 @@ fn bench_cache_eviction(c: &mut Criterion) {
         let mut i = 990;
         b.iter(|| {
             let response = CachedResponse {
-                body: Arc::new(vec![i as u8; 100]),
+                body: Bytes::from(vec![i as u8; 100]),
                 etag: Some(format!("\"etag-{}\"", i)),
                 last_modified: None,
                 fetched_at: Instant::now(),
