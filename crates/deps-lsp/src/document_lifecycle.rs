@@ -112,22 +112,22 @@ pub async fn handle_document_open(
             doc.update_cached_versions(resolved_versions.clone());
         }
 
-        let doc = match state_clone.get_document_clone(&uri_clone) {
-            Some(d) => d,
-            None => return,
+        // Collect dependency names while holding reference (can't hold across await)
+        let dep_names: Vec<String> = {
+            let doc = match state_clone.get_document(&uri_clone) {
+                Some(d) => d,
+                None => return,
+            };
+            let parse_result = match doc.parse_result() {
+                Some(p) => p,
+                None => return,
+            };
+            parse_result
+                .dependencies()
+                .into_iter()
+                .map(|d| d.name().to_string())
+                .collect()
         };
-
-        let parse_result = match doc.parse_result() {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Collect dependency names to fetch
-        let dep_names: Vec<String> = parse_result
-            .dependencies()
-            .into_iter()
-            .map(|d| d.name().to_string())
-            .collect();
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
@@ -214,22 +214,22 @@ pub async fn handle_document_change(
             doc.update_cached_versions(resolved_versions.clone());
         }
 
-        let doc = match state_clone.get_document_clone(&uri_clone) {
-            Some(d) => d,
-            None => return,
+        // Collect dependency names while holding reference (can't hold across await)
+        let dep_names: Vec<String> = {
+            let doc = match state_clone.get_document(&uri_clone) {
+                Some(d) => d,
+                None => return,
+            };
+            let parse_result = match doc.parse_result() {
+                Some(p) => p,
+                None => return,
+            };
+            parse_result
+                .dependencies()
+                .into_iter()
+                .map(|d| d.name().to_string())
+                .collect()
         };
-
-        let parse_result = match doc.parse_result() {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Collect dependency names to fetch
-        let dep_names: Vec<String> = parse_result
-            .dependencies()
-            .into_iter()
-            .map(|d| d.name().to_string())
-            .collect();
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
