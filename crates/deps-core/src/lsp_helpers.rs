@@ -202,7 +202,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
                 "- {} {}",
                 version.version_string(),
                 formatter.yanked_label()
-            ).unwrap();
+            )
+            .unwrap();
         } else {
             writeln!(&mut markdown, "- {}", version.version_string()).unwrap();
         }

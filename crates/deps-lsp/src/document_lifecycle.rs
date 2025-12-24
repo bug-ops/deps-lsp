@@ -52,11 +52,7 @@ async fn fetch_latest_versions_parallel(
         })
         .collect();
 
-    join_all(futures)
-        .await
-        .into_iter()
-        .flatten()
-        .collect()
+    join_all(futures).await.into_iter().flatten().collect()
 }
 
 /// Generic document open handler using ecosystem registry.

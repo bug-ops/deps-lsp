@@ -375,10 +375,7 @@ impl HttpCache {
             self.entries.remove(&url);
         }
 
-        tracing::debug!(
-            "evicted {} cache entries (O(N) algorithm)",
-            removed
-        );
+        tracing::debug!("evicted {} cache entries (O(N) algorithm)", removed);
     }
 
     /// Benchmark-only helper: Direct cache lookup without network requests.
