@@ -109,6 +109,24 @@ pub async fn handle_document_open(
         let resolved_versions =
             load_resolved_versions(&uri_clone, &state_clone, ecosystem_clone.as_ref()).await;
 
+        // Collect dependency names while we have access to the original document
+        // Note: get_document_clone() doesn't preserve parse_result (trait objects can't be cloned)
+        let dep_names: Vec<String> = {
+            let doc = match state_clone.get_document(&uri_clone) {
+                Some(d) => d,
+                None => return,
+            };
+
+            match doc.parse_result() {
+                Some(p) => p
+                    .dependencies()
+                    .into_iter()
+                    .map(|d| d.name().to_string())
+                    .collect(),
+                None => return,
+            }
+        }; // DashMap lock released here
+
         // Update document state with resolved versions immediately
         if !resolved_versions.is_empty()
             && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
@@ -118,26 +136,15 @@ pub async fn handle_document_open(
             // This allows inlay hints to show ⏳ (waiting) indicator
         }
 
-        let doc = match state_clone.get_document_clone(&uri_clone) {
-            Some(d) => d,
-            None => return,
-        };
-
-        let parse_result = match doc.parse_result() {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Collect dependency names to fetch
-        let dep_names: Vec<String> = parse_result
-            .dependencies()
-            .into_iter()
-            .map(|d| d.name().to_string())
-            .collect();
-
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
         let cached_versions = fetch_latest_versions_parallel(registry, dep_names).await;
+
+        tracing::debug!(
+            "Fetched {} cached versions for {}",
+            cached_versions.len(),
+            uri_clone
+        );
 
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
@@ -211,6 +218,24 @@ pub async fn handle_document_change(
         let resolved_versions =
             load_resolved_versions(&uri_clone, &state_clone, ecosystem_clone.as_ref()).await;
 
+        // Collect dependency names while we have access to the original document
+        // Note: get_document_clone() doesn't preserve parse_result (trait objects can't be cloned)
+        let dep_names: Vec<String> = {
+            let doc = match state_clone.get_document(&uri_clone) {
+                Some(d) => d,
+                None => return,
+            };
+
+            match doc.parse_result() {
+                Some(p) => p
+                    .dependencies()
+                    .into_iter()
+                    .map(|d| d.name().to_string())
+                    .collect(),
+                None => return,
+            }
+        }; // DashMap lock released here
+
         // Update document state with resolved versions immediately
         if !resolved_versions.is_empty()
             && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
@@ -220,26 +245,15 @@ pub async fn handle_document_change(
             // This allows inlay hints to show ⏳ (waiting) indicator
         }
 
-        let doc = match state_clone.get_document_clone(&uri_clone) {
-            Some(d) => d,
-            None => return,
-        };
-
-        let parse_result = match doc.parse_result() {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Collect dependency names to fetch
-        let dep_names: Vec<String> = parse_result
-            .dependencies()
-            .into_iter()
-            .map(|d| d.name().to_string())
-            .collect();
-
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
         let cached_versions = fetch_latest_versions_parallel(registry, dep_names).await;
+
+        tracing::debug!(
+            "Fetched {} cached versions for {}",
+            cached_versions.len(),
+            uri_clone
+        );
 
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
