@@ -156,6 +156,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     registry: &R,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<Hover> {
+    use std::fmt::Write;
+
     let dep = parse_result.dependencies().into_iter().find(|d| {
         let on_name = ranges_overlap(d.name_range(), position);
         let on_version = d
@@ -167,7 +169,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let versions = registry.get_versions(dep.name()).await.ok()?;
 
     let url = formatter.package_url(dep.name());
-    let mut markdown = format!("# [{}]({})\n\n", dep.name(), url);
+
+    // Pre-allocate with estimated capacity to reduce allocations
+    let mut markdown = String::with_capacity(512);
+    write!(&mut markdown, "# [{}]({})\n\n", dep.name(), url).unwrap();
 
     let normalized_name = formatter.normalize_package_name(dep.name());
 
@@ -175,30 +180,31 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .get(&normalized_name)
         .or_else(|| resolved_versions.get(dep.name()));
     if let Some(resolved_ver) = resolved {
-        markdown.push_str(&format!("**Current**: `{}`\n\n", resolved_ver));
+        write!(&mut markdown, "**Current**: `{}`\n\n", resolved_ver).unwrap();
     } else if let Some(version_req) = dep.version_requirement() {
-        markdown.push_str(&format!("**Requirement**: `{}`\n\n", version_req));
+        write!(&mut markdown, "**Requirement**: `{}`\n\n", version_req).unwrap();
     }
 
     let latest = cached_versions
         .get(&normalized_name)
         .or_else(|| cached_versions.get(dep.name()));
     if let Some(latest_ver) = latest {
-        markdown.push_str(&format!("**Latest**: `{}`\n\n", latest_ver));
+        write!(&mut markdown, "**Latest**: `{}`\n\n", latest_ver).unwrap();
     }
 
     markdown.push_str("**Recent versions**:\n");
     for (i, version) in versions.iter().take(8).enumerate() {
         if i == 0 {
-            markdown.push_str(&format!("- {} *(latest)*\n", version.version_string()));
+            writeln!(&mut markdown, "- {} *(latest)*", version.version_string()).unwrap();
         } else if version.is_yanked() {
-            markdown.push_str(&format!(
-                "- {} {}\n",
+            writeln!(
+                &mut markdown,
+                "- {} {}",
                 version.version_string(),
                 formatter.yanked_label()
-            ));
+            ).unwrap();
         } else {
-            markdown.push_str(&format!("- {}\n", version.version_string()));
+            writeln!(&mut markdown, "- {}", version.version_string()).unwrap();
         }
     }
 

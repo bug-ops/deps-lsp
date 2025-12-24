@@ -7,13 +7,57 @@ use crate::config::DepsConfig;
 use crate::document::{DocumentState, ServerState};
 use crate::handlers::diagnostics;
 use deps_core::Ecosystem;
+use deps_core::Registry;
 use deps_core::Result;
+use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp::Client;
 use tower_lsp::lsp_types::Url;
+
+/// Fetches latest versions for multiple packages in parallel.
+///
+/// Returns a HashMap mapping package names to their latest version strings.
+/// Packages that fail to fetch are omitted from the result.
+///
+/// This function executes all registry requests concurrently, reducing
+/// total fetch time from O(N × network_latency) to O(max(network_latency)).
+///
+/// # Examples
+///
+/// With 50 dependencies and 100ms per request:
+/// - Sequential: 50 × 100ms = 5000ms
+/// - Parallel: max(100ms) ≈ 150ms
+async fn fetch_latest_versions_parallel(
+    registry: Arc<dyn Registry>,
+    package_names: Vec<String>,
+) -> HashMap<String, String> {
+    let futures: Vec<_> = package_names
+        .into_iter()
+        .map(|name| {
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .get_versions(&name)
+                    .await
+                    .ok()
+                    .and_then(|versions| {
+                        versions
+                            .first()
+                            .map(|v| (name, v.version_string().to_string()))
+                    })
+            }
+        })
+        .collect();
+
+    join_all(futures)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
 
 /// Generic document open handler using ecosystem registry.
 ///
@@ -91,17 +135,9 @@ pub async fn handle_document_open(
 
         drop(doc); // Release guard before async operations
 
-        // Fetch latest versions from registry (for update hints)
+        // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
-        let mut cached_versions = HashMap::new();
-
-        for name in dep_names {
-            if let Ok(versions) = registry.get_versions(&name).await
-                && let Some(latest) = versions.first()
-            {
-                cached_versions.insert(name, latest.version_string().to_string());
-            }
-        }
+        let cached_versions = fetch_latest_versions_parallel(registry, dep_names).await;
 
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
@@ -203,17 +239,9 @@ pub async fn handle_document_change(
 
         drop(doc);
 
-        // Fetch latest versions from registry (for update hints)
+        // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
-        let mut cached_versions = HashMap::new();
-
-        for name in dep_names {
-            if let Ok(versions) = registry.get_versions(&name).await
-                && let Some(latest) = versions.first()
-            {
-                cached_versions.insert(name, latest.version_string().to_string());
-            }
-        }
+        let cached_versions = fetch_latest_versions_parallel(registry, dep_names).await;
 
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {

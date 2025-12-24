@@ -416,6 +416,39 @@ impl ServerState {
         self.documents.get(uri)
     }
 
+    /// Retrieves a cloned copy of document state by URI.
+    ///
+    /// This method clones the document state immediately and releases
+    /// the DashMap lock, allowing concurrent access to the map while
+    /// the document is being processed. Use this in hot paths where
+    /// async operations are performed with the document data.
+    ///
+    /// # Performance
+    ///
+    /// Cloning `DocumentState` is relatively cheap as it only clones
+    /// `String` and `HashMap` metadata, not the underlying parse result
+    /// trait object.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use deps_lsp::document::ServerState;
+    /// # use tower_lsp::lsp_types::Url;
+    /// # async fn example(state: &ServerState, uri: &Url) {
+    /// // Lock released immediately after clone
+    /// let doc = state.get_document_clone(uri);
+    ///
+    /// if let Some(doc) = doc {
+    ///     // Perform async operations without holding lock
+    ///     let result = process_async(&doc).await;
+    /// }
+    /// # }
+    /// # async fn process_async(doc: &deps_lsp::document::DocumentState) {}
+    /// ```
+    pub fn get_document_clone(&self, uri: &Url) -> Option<DocumentState> {
+        self.documents.get(uri).map(|doc| doc.clone())
+    }
+
     /// Updates or inserts document state.
     ///
     /// If a document already exists at the given URI, it is replaced.
