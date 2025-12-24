@@ -22,6 +22,9 @@ use tower_lsp::lsp_types::Url;
 /// Returns a HashMap mapping package names to their latest version strings.
 /// Packages that fail to fetch are omitted from the result.
 ///
+/// Filters out pre-release and yanked versions when finding the latest version.
+/// Falls back to first version if all versions are pre-releases.
+///
 /// This function executes all registry requests concurrently, reducing
 /// total fetch time from O(N × network_latency) to O(max(network_latency)).
 ///
@@ -44,8 +47,11 @@ async fn fetch_latest_versions_parallel(
                     .await
                     .ok()
                     .and_then(|versions| {
+                        // Find first stable (non-yanked, non-prerelease) version
                         versions
-                            .first()
+                            .iter()
+                            .find(|v| !v.is_yanked() && !v.is_prerelease())
+                            .or_else(|| versions.first())
                             .map(|v| (name, v.version_string().to_string()))
                     })
             }

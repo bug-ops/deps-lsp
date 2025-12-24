@@ -193,8 +193,14 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     }
 
     markdown.push_str("**Recent versions**:\n");
+
+    // Find first stable (non-yanked, non-prerelease) version to mark as "(latest)"
+    let latest_stable_idx = versions
+        .iter()
+        .position(|v| !v.is_yanked() && !v.is_prerelease());
+
     for (i, version) in versions.iter().take(8).enumerate() {
-        if i == 0 {
+        if Some(i) == latest_stable_idx {
             writeln!(&mut markdown, "- {} *(latest)*", version.version_string()).unwrap();
         } else if version.is_yanked() {
             writeln!(
@@ -334,7 +340,10 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
                 });
             }
 
-            let latest = versions.iter().find(|v| !v.is_yanked());
+            // Find first stable (non-yanked, non-prerelease) version
+            let latest = versions
+                .iter()
+                .find(|v| !v.is_yanked() && !v.is_prerelease());
             if let Some(latest) = latest
                 && latest.version_string() != current.version_string()
             {

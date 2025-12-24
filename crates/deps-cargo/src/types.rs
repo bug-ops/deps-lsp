@@ -210,6 +210,12 @@ impl deps_core::Version for CargoVersion {
         self.yanked
     }
 
+    fn is_prerelease(&self) -> bool {
+        semver::Version::parse(&self.num)
+            .map(|v| !v.pre.is_empty())
+            .unwrap_or(false)
+    }
+
     fn features(&self) -> Vec<String> {
         self.features.keys().cloned().collect()
     }
@@ -292,5 +298,38 @@ mod tests {
         assert_eq!(version.num, "1.0.0");
         assert!(!version.yanked);
         assert!(version.features.is_empty());
+    }
+
+    #[test]
+    fn test_cargo_version_is_prerelease() {
+        use deps_core::Version;
+
+        let stable = CargoVersion {
+            num: "1.0.0".into(),
+            yanked: false,
+            features: HashMap::new(),
+        };
+        assert!(!stable.is_prerelease());
+
+        let alpha = CargoVersion {
+            num: "1.0.0-alpha.1".into(),
+            yanked: false,
+            features: HashMap::new(),
+        };
+        assert!(alpha.is_prerelease());
+
+        let beta = CargoVersion {
+            num: "2.0.0-beta.2".into(),
+            yanked: false,
+            features: HashMap::new(),
+        };
+        assert!(beta.is_prerelease());
+
+        let rc = CargoVersion {
+            num: "3.0.0-rc.1".into(),
+            yanked: false,
+            features: HashMap::new(),
+        };
+        assert!(rc.is_prerelease());
     }
 }

@@ -160,6 +160,14 @@ pub trait Version: Send + Sync {
     /// Whether this version is yanked/deprecated.
     fn is_yanked(&self) -> bool;
 
+    /// Whether this version is a pre-release (alpha, beta, rc, etc.).
+    ///
+    /// Default implementation returns `false` (stable version).
+    /// Implementations should override this for ecosystems that support pre-releases.
+    fn is_prerelease(&self) -> bool {
+        false
+    }
+
     /// Available feature flags (empty if not supported by ecosystem).
     fn features(&self) -> Vec<String> {
         vec![]

@@ -176,11 +176,34 @@ impl PypiVersion {
     }
 }
 
-// Use macro to implement VersionInfo and Version traits
-deps_core::impl_version!(PypiVersion {
-    version: version,
-    yanked: yanked,
-});
+// Implement VersionInfo and Version traits manually to support is_prerelease()
+impl deps_core::registry::VersionInfo for PypiVersion {
+    fn version_string(&self) -> &str {
+        &self.version
+    }
+
+    fn is_yanked(&self) -> bool {
+        self.yanked
+    }
+}
+
+impl deps_core::registry::Version for PypiVersion {
+    fn version_string(&self) -> &str {
+        &self.version
+    }
+
+    fn is_yanked(&self) -> bool {
+        self.yanked
+    }
+
+    fn is_prerelease(&self) -> bool {
+        self.is_prerelease()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 /// Package metadata from PyPI.
 ///
@@ -444,6 +467,21 @@ mod tests {
         assert!(alpha.is_prerelease());
         assert!(beta.is_prerelease());
         assert!(rc.is_prerelease());
+    }
+
+    #[test]
+    fn test_pypi_version_trait_is_prerelease() {
+        let stable = PypiVersion {
+            version: "1.0.0".into(),
+            yanked: false,
+        };
+        assert!(!stable.is_prerelease());
+
+        let alpha = PypiVersion {
+            version: "1.0.0a1".into(),
+            yanked: false,
+        };
+        assert!(alpha.is_prerelease());
     }
 
     #[test]

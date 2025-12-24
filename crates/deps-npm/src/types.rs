@@ -91,11 +91,36 @@ pub struct NpmVersion {
     pub deprecated: bool,
 }
 
-// Use macro to implement VersionInfo and Version traits
-deps_core::impl_version!(NpmVersion {
-    version: version,
-    yanked: deprecated,
-});
+// Implement VersionInfo and Version traits manually to support is_prerelease()
+impl deps_core::registry::VersionInfo for NpmVersion {
+    fn version_string(&self) -> &str {
+        &self.version
+    }
+
+    fn is_yanked(&self) -> bool {
+        self.deprecated
+    }
+}
+
+impl deps_core::registry::Version for NpmVersion {
+    fn version_string(&self) -> &str {
+        &self.version
+    }
+
+    fn is_yanked(&self) -> bool {
+        self.deprecated
+    }
+
+    fn is_prerelease(&self) -> bool {
+        node_semver::Version::parse(&self.version)
+            .map(|v| !v.pre_release.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 /// Package metadata from npm registry.
 ///
@@ -222,5 +247,34 @@ mod tests {
         assert_eq!(pkg.repository(), Some("axios/axios"));
         assert_eq!(pkg.documentation(), Some("https://axios-http.com"));
         assert_eq!(pkg.latest_version(), "1.6.0");
+    }
+
+    #[test]
+    fn test_npm_version_is_prerelease() {
+        use deps_core::Version;
+
+        let stable = NpmVersion {
+            version: "1.0.0".into(),
+            deprecated: false,
+        };
+        assert!(!stable.is_prerelease());
+
+        let alpha = NpmVersion {
+            version: "1.0.0-alpha.1".into(),
+            deprecated: false,
+        };
+        assert!(alpha.is_prerelease());
+
+        let beta = NpmVersion {
+            version: "2.0.0-beta.2".into(),
+            deprecated: false,
+        };
+        assert!(beta.is_prerelease());
+
+        let rc = NpmVersion {
+            version: "3.0.0-rc.1".into(),
+            deprecated: false,
+        };
+        assert!(rc.is_prerelease());
     }
 }
