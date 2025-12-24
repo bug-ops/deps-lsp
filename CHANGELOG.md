@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2025-12-25
+
+### Fixed
+- Inlay hints now compare against absolute latest stable version, not just matching major.minor
+- Pre-release versions filtered from "newer version available" diagnostics
+- Background tasks no longer exit early due to `parse_result` being lost on clone
+
+### Changed
+- Extracted `find_latest_stable()` utility for consistent version comparison across features
+
 ## [0.3.0] - 2025-12-24
 
 ### Added
@@ -126,7 +136,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/bug-ops/deps-lsp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bug-ops/deps-lsp/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/bug-ops/deps-lsp/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/bug-ops/deps-lsp/compare/v0.2.1...v0.2.2
