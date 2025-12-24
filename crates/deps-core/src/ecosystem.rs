@@ -68,8 +68,8 @@ impl Default for EcosystemConfig {
     fn default() -> Self {
         Self {
             show_up_to_date_hints: true,
-            up_to_date_text: "✓".to_string(),
-            needs_update_text: "→ {}".to_string(),
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
         }
     }
 }
@@ -327,8 +327,8 @@ mod tests {
     fn test_ecosystem_config_default() {
         let config = EcosystemConfig::default();
         assert!(config.show_up_to_date_hints);
-        assert_eq!(config.up_to_date_text, "✓");
-        assert_eq!(config.needs_update_text, "→ {}");
+        assert_eq!(config.up_to_date_text, "✅");
+        assert_eq!(config.needs_update_text, "❌ {}");
     }
 
     #[test]

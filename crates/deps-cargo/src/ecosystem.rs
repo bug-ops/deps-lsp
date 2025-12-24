@@ -242,8 +242,8 @@ mod tests {
 
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
-            up_to_date_text: "✓".to_string(),
-            needs_update_text: "↑ {}".to_string(),
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
         };
 
         let resolved_versions = HashMap::new();
@@ -256,7 +256,7 @@ mod tests {
 
         assert_eq!(hints.len(), 1);
         match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "✓"),
+            InlayHintLabel::String(s) => assert_eq!(s, "✅"),
             _ => panic!("Expected String label"),
         }
     }
@@ -275,8 +275,8 @@ mod tests {
 
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
-            up_to_date_text: "✓".to_string(),
-            needs_update_text: "↑ {}".to_string(),
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
         };
 
         let resolved_versions = HashMap::new();
@@ -289,7 +289,7 @@ mod tests {
 
         assert_eq!(hints.len(), 1);
         match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "✓"),
+            InlayHintLabel::String(s) => assert_eq!(s, "✅"),
             _ => panic!("Expected String label"),
         }
     }
@@ -308,8 +308,8 @@ mod tests {
 
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
-            up_to_date_text: "✓".to_string(),
-            needs_update_text: "↑ {}".to_string(),
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
         };
 
         let resolved_versions = HashMap::new();
@@ -322,7 +322,7 @@ mod tests {
 
         assert_eq!(hints.len(), 1);
         match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "↑ 1.0.214"),
+            InlayHintLabel::String(s) => assert_eq!(s, "❌ 1.0.214"),
             _ => panic!("Expected String label"),
         }
     }
@@ -341,8 +341,8 @@ mod tests {
 
         let config = EcosystemConfig {
             show_up_to_date_hints: false,
-            up_to_date_text: "✓".to_string(),
-            needs_update_text: "↑ {}".to_string(),
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
         };
 
         let resolved_versions = HashMap::new();
@@ -373,8 +373,8 @@ mod tests {
 
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
-            up_to_date_text: "✓".to_string(),
-            needs_update_text: "↑ {}".to_string(),
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
         };
 
         let resolved_versions = HashMap::new();
@@ -405,8 +405,8 @@ mod tests {
 
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
-            up_to_date_text: "✓".to_string(),
-            needs_update_text: "↑ {}".to_string(),
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
         };
 
         // Should not panic, should return update hint
