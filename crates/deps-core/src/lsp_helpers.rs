@@ -104,34 +104,54 @@ pub fn generate_inlay_hints(
             .get(&normalized_name)
             .or_else(|| resolved_versions.get(dep.name()));
 
-        let (is_up_to_date, display_version) = match (resolved_version, latest_version) {
+        // Determine display status: Some(true) = up-to-date, Some(false) = outdated, None = waiting
+        let (status, display_version) = match (resolved_version, latest_version) {
             (Some(resolved), Some(latest)) => {
-                let is_same = resolved == latest || is_same_major_minor(resolved, latest);
-                (is_same, Some(latest.as_str()))
+                if resolved == latest {
+                    // Same version - likely stale cached data (resolved used as initial cache)
+                    // Show "waiting" indicator until real registry data arrives
+                    (None, Some(resolved.as_str()))
+                } else {
+                    // Different versions - we have real registry data
+                    let is_same = is_same_major_minor(resolved, latest);
+                    (Some(is_same), Some(latest.as_str()))
+                }
             }
             (None, Some(latest)) => {
                 let version_req = dep.version_requirement().unwrap_or("");
                 let is_match = formatter.version_satisfies_requirement(latest, version_req);
-                (is_match, Some(latest.as_str()))
+                (Some(is_match), Some(latest.as_str()))
             }
-            // No latest from registry yet - skip until we have real data
-            (Some(_resolved), None) => continue,
+            (Some(resolved), None) => {
+                // Only have resolved from lock file - show "waiting" indicator
+                (None, Some(resolved.as_str()))
+            }
             (None, None) => continue,
         };
 
-        let label_text = if is_up_to_date {
-            if config.show_up_to_date_hints {
-                if let Some(resolved) = resolved_version {
-                    format!("{} {}", config.up_to_date_text, resolved)
+        let label_text = match status {
+            Some(true) => {
+                // Up-to-date - show ✅
+                if config.show_up_to_date_hints {
+                    if let Some(resolved) = resolved_version {
+                        format!("{} {}", config.up_to_date_text, resolved)
+                    } else {
+                        config.up_to_date_text.clone()
+                    }
                 } else {
-                    config.up_to_date_text.clone()
+                    continue;
                 }
-            } else {
-                continue;
             }
-        } else {
-            let version = display_version.unwrap_or("unknown");
-            config.needs_update_text.replace("{}", version)
+            Some(false) => {
+                // Outdated - show ❌ with latest version
+                let version = display_version.unwrap_or("unknown");
+                config.needs_update_text.replace("{}", version)
+            }
+            None => {
+                // Waiting for registry data - show ⏳ with resolved version
+                let version = display_version.unwrap_or("...");
+                format!("⏳ {}", version)
+            }
         };
 
         hints.push(InlayHint {
