@@ -411,6 +411,7 @@ dependencies = [
  "dashmap 6.1.0",
  "futures",
  "mockito",
+ "once_cell",
  "reqwest",
  "semver",
  "serde",

@@ -89,6 +89,7 @@
 //! ```
 
 pub mod cache;
+pub mod completion;
 pub mod ecosystem;
 pub mod ecosystem_registry;
 pub mod error;
