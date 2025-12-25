@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use std::sync::Arc;
-use tower_lsp::lsp_types::Url;
+use tower_lsp_server::ls_types::Uri;
 
 use crate::Ecosystem;
 
@@ -155,17 +155,17 @@ impl EcosystemRegistry {
     ///
     /// ```no_run
     /// use deps_core::EcosystemRegistry;
-    /// use tower_lsp::lsp_types::Url;
+    /// use tower_lsp_server::ls_types::Uri;
     ///
     /// let registry = EcosystemRegistry::new();
-    /// let uri = Url::parse("file:///home/user/project/Cargo.toml").unwrap();
+    /// let uri = Uri::from_file_path("/home/user/project/Cargo.toml").unwrap();
     ///
     /// if let Some(ecosystem) = registry.get_for_uri(&uri) {
     ///     println!("File handled by: {}", ecosystem.display_name());
     /// }
     /// ```
-    pub fn get_for_uri(&self, uri: &Url) -> Option<Arc<dyn Ecosystem>> {
-        let path = uri.path();
+    pub fn get_for_uri(&self, uri: &Uri) -> Option<Arc<dyn Ecosystem>> {
+        let path = uri.path().as_str();
         let filename = path.rsplit('/').next()?;
         self.get_for_filename(filename)
     }
@@ -208,7 +208,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::any::Any;
-    use tower_lsp::lsp_types::{
+    use tower_lsp_server::ls_types::{
         CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position,
     };
 
@@ -238,7 +238,7 @@ mod tests {
         async fn parse_manifest(
             &self,
             _content: &str,
-            _uri: &Url,
+            _uri: &Uri,
         ) -> crate::error::Result<Box<dyn ParseResult>> {
             unimplemented!()
         }
@@ -272,7 +272,7 @@ mod tests {
             _parse_result: &dyn ParseResult,
             _position: Position,
             _cached_versions: &std::collections::HashMap<String, String>,
-            _uri: &Url,
+            _uri: &Uri,
         ) -> Vec<CodeAction> {
             vec![]
         }
@@ -281,7 +281,7 @@ mod tests {
             &self,
             _parse_result: &dyn ParseResult,
             _cached_versions: &std::collections::HashMap<String, String>,
-            _uri: &Url,
+            _uri: &Uri,
         ) -> Vec<Diagnostic> {
             vec![]
         }
@@ -368,11 +368,11 @@ mod tests {
 
         registry.register(ecosystem);
 
-        let uri = Url::parse("file:///home/user/project/test.toml").unwrap();
+        let uri = Uri::from_file_path("/home/user/project/test.toml").unwrap();
         let retrieved = registry.get_for_uri(&uri).unwrap();
         assert_eq!(retrieved.id(), "test");
 
-        let unknown_uri = Url::parse("file:///home/user/project/unknown.toml").unwrap();
+        let unknown_uri = Uri::from_file_path("/home/user/project/unknown.toml").unwrap();
         assert!(registry.get_for_uri(&unknown_uri).is_none());
     }
 

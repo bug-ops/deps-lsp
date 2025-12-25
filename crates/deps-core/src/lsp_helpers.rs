@@ -1,9 +1,9 @@
 //! Shared LSP response builders.
 
 use std::collections::HashMap;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, Hover, HoverContents, InlayHint,
-    InlayHintKind, InlayHintLabel, MarkupContent, MarkupKind, Position, Range, TextEdit, Url,
+    InlayHintKind, InlayHintLabel, MarkupContent, MarkupKind, Position, Range, TextEdit, Uri,
     WorkspaceEdit,
 };
 
@@ -226,7 +226,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 pub async fn generate_code_actions<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
-    uri: &Url,
+    uri: &Uri,
     registry: &R,
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<CodeAction> {
@@ -531,7 +531,7 @@ mod tests {
     fn test_inlay_hint_exact_version_shows_update_needed() {
         use std::any::Any;
         use std::collections::HashMap;
-        use tower_lsp::lsp_types::{Position, Range, Url};
+        use tower_lsp_server::ls_types::{Position, Range, Uri};
 
         let formatter = MockFormatter;
         let config = EcosystemConfig {
@@ -542,7 +542,7 @@ mod tests {
 
         struct MockParseResult {
             deps: Vec<MockDep>,
-            uri: Url,
+            uri: Uri,
         }
 
         impl ParseResult for MockParseResult {
@@ -552,7 +552,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Url {
+            fn uri(&self) -> &Uri {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {
@@ -595,7 +595,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
-            uri: Url::parse("file:///test/Cargo.toml").unwrap(),
+            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
         };
 
         let mut cached_versions = HashMap::new();
@@ -625,7 +625,7 @@ mod tests {
     fn test_inlay_hint_caret_version_up_to_date() {
         use std::any::Any;
         use std::collections::HashMap;
-        use tower_lsp::lsp_types::{Position, Range, Url};
+        use tower_lsp_server::ls_types::{Position, Range, Uri};
 
         let formatter = MockFormatter;
         let config = EcosystemConfig {
@@ -636,7 +636,7 @@ mod tests {
 
         struct MockParseResult {
             deps: Vec<MockDep>,
-            uri: Url,
+            uri: Uri,
         }
 
         impl ParseResult for MockParseResult {
@@ -646,7 +646,7 @@ mod tests {
             fn workspace_root(&self) -> Option<&std::path::Path> {
                 None
             }
-            fn uri(&self) -> &Url {
+            fn uri(&self) -> &Uri {
                 &self.uri
             }
             fn as_any(&self) -> &dyn Any {
@@ -689,7 +689,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
-            uri: Url::parse("file:///test/Cargo.toml").unwrap(),
+            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
         };
 
         let mut cached_versions = HashMap::new();

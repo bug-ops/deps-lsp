@@ -15,14 +15,14 @@
 //!
 //! ```no_run
 //! use deps_cargo::parse_cargo_toml;
-//! use tower_lsp::lsp_types::Url;
+//! use tower_lsp_server::ls_types::Uri;
 //!
 //! let toml = r#"
 //! [dependencies]
 //! serde = "1.0"
 //! "#;
 //!
-//! let url = Url::parse("file:///test/Cargo.toml").unwrap();
+//! let url = Uri::from_file_path("/test/Cargo.toml").unwrap();
 //! let result = parse_cargo_toml(toml, &url).unwrap();
 //! assert_eq!(result.dependencies.len(), 1);
 //! assert_eq!(result.dependencies[0].name, "serde");
@@ -33,7 +33,7 @@ use crate::types::{DependencySection, DependencySource, ParsedDependency};
 use std::any::Any;
 use std::path::PathBuf;
 use toml_edit::{Document, DocumentMut, Item, Table, Value};
-use tower_lsp::lsp_types::{Position, Range, Url};
+use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 /// Result of parsing a Cargo.toml file.
 ///
@@ -46,7 +46,7 @@ pub struct ParseResult {
     /// Workspace root path if this is a workspace member
     pub workspace_root: Option<PathBuf>,
     /// Document URI
-    pub uri: Url,
+    pub uri: Uri,
 }
 
 /// Pre-computed line start byte offsets for O(1) position lookups.
@@ -93,7 +93,7 @@ impl LineOffsetTable {
 ///
 /// ```no_run
 /// use deps_cargo::parse_cargo_toml;
-/// use tower_lsp::lsp_types::Url;
+/// use tower_lsp_server::ls_types::Uri;
 ///
 /// let toml = r#"
 /// [dependencies]
@@ -101,11 +101,11 @@ impl LineOffsetTable {
 /// tokio = { version = "1.0", features = ["full"] }
 /// "#;
 ///
-/// let url = Url::parse("file:///test/Cargo.toml").unwrap();
+/// let url = Uri::from_file_path("/test/Cargo.toml").unwrap();
 /// let result = parse_cargo_toml(toml, &url).unwrap();
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
-pub fn parse_cargo_toml(content: &str, doc_uri: &Url) -> Result<ParseResult> {
+pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
     // Use Document (not DocumentMut) to preserve span information
     let doc: Document<&str> =
         Document::parse(content).map_err(|e| CargoError::TomlParseError { source: e })?;
@@ -396,10 +396,10 @@ fn span_to_range_with_table(
 /// Finds the workspace root by walking up the directory tree.
 ///
 /// Looks for a Cargo.toml file with a [workspace] section.
-fn find_workspace_root(doc_uri: &Url) -> Result<Option<PathBuf>> {
+fn find_workspace_root(doc_uri: &Uri) -> Result<Option<PathBuf>> {
     let path = doc_uri
         .to_file_path()
-        .map_err(|_| CargoError::invalid_uri(doc_uri.to_string()))?;
+        .ok_or_else(|| CargoError::invalid_uri(format!("{:?}", doc_uri)))?;
 
     let mut current = path.parent();
 
@@ -427,7 +427,7 @@ impl deps_core::ManifestParser for CargoParser {
     type Dependency = ParsedDependency;
     type ParseResult = ParseResult;
 
-    fn parse(&self, content: &str, doc_uri: &Url) -> deps_core::Result<Self::ParseResult> {
+    fn parse(&self, content: &str, doc_uri: &Uri) -> deps_core::Result<Self::ParseResult> {
         parse_cargo_toml(content, doc_uri).map_err(Into::into)
     }
 }
@@ -494,7 +494,7 @@ impl deps_core::ParseResult for ParseResult {
         self.workspace_root.as_deref()
     }
 
-    fn uri(&self) -> &Url {
+    fn uri(&self) -> &Uri {
         &self.uri
     }
 
@@ -507,12 +507,12 @@ impl deps_core::ParseResult for ParseResult {
 mod tests {
     use super::*;
 
-    fn test_url() -> Url {
+    fn test_url() -> Uri {
         #[cfg(windows)]
-        let url = "file:///C:/test/Cargo.toml";
+        let path = "C:/test/Cargo.toml";
         #[cfg(not(windows))]
-        let url = "file:///test/Cargo.toml";
-        Url::parse(url).unwrap()
+        let path = "/test/Cargo.toml";
+        Uri::from_file_path(path).unwrap()
     }
 
     #[test]

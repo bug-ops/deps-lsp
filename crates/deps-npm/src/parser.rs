@@ -7,7 +7,7 @@ use crate::error::{NpmError, Result};
 use crate::types::{NpmDependency, NpmDependencySection};
 use serde_json::Value;
 use std::any::Any;
-use tower_lsp::lsp_types::{Position, Range, Url};
+use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 /// Line offset table for O(log n) position lookups.
 ///
@@ -55,7 +55,7 @@ impl LineOffsetTable {
 #[derive(Debug)]
 pub struct NpmParseResult {
     pub dependencies: Vec<NpmDependency>,
-    pub uri: Url,
+    pub uri: Uri,
 }
 
 impl deps_core::ParseResult for NpmParseResult {
@@ -70,7 +70,7 @@ impl deps_core::ParseResult for NpmParseResult {
         None
     }
 
-    fn uri(&self) -> &Url {
+    fn uri(&self) -> &Uri {
         &self.uri
     }
 
@@ -97,20 +97,20 @@ impl deps_core::ParseResult for NpmParseResult {
 ///
 /// ```no_run
 /// use deps_npm::parser::parse_package_json;
-/// use tower_lsp::lsp_types::Url;
+/// use tower_lsp_server::ls_types::Uri;
 ///
 /// let json = r#"{
 ///   "dependencies": {
 ///     "express": "^4.18.2"
 ///   }
 /// }"#;
-/// let uri = Url::parse("file:///project/package.json").unwrap();
+/// let uri = Uri::from_file_path("/project/package.json").unwrap();
 ///
 /// let result = parse_package_json(json, &uri).unwrap();
 /// assert_eq!(result.dependencies.len(), 1);
 /// assert_eq!(result.dependencies[0].name, "express");
 /// ```
-pub fn parse_package_json(content: &str, uri: &Url) -> Result<NpmParseResult> {
+pub fn parse_package_json(content: &str, uri: &Uri) -> Result<NpmParseResult> {
     let root: Value =
         serde_json::from_str(content).map_err(|e| NpmError::JsonParseError { source: e })?;
 
@@ -256,8 +256,8 @@ fn find_dependency_positions(
 mod tests {
     use super::*;
 
-    fn test_uri() -> Url {
-        Url::parse("file:///test/package.json").unwrap()
+    fn test_uri() -> Uri {
+        Uri::from_file_path("/test/package.json").unwrap()
     }
 
     #[test]

@@ -27,7 +27,7 @@ use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
 use std::path::{Path, PathBuf};
 use toml_edit::DocumentMut;
-use tower_lsp::lsp_types::Url;
+use tower_lsp_server::ls_types::Uri;
 
 /// Cargo.lock file parser.
 ///
@@ -45,11 +45,11 @@ use tower_lsp::lsp_types::Url;
 /// ```no_run
 /// use deps_cargo::lockfile::CargoLockParser;
 /// use deps_core::lockfile::LockFileProvider;
-/// use tower_lsp::lsp_types::Url;
+/// use tower_lsp_server::ls_types::Uri;
 ///
 /// # async fn example() -> deps_core::error::Result<()> {
 /// let parser = CargoLockParser;
-/// let manifest_uri = Url::parse("file:///path/to/Cargo.toml").unwrap();
+/// let manifest_uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
 ///
 /// if let Some(lockfile_path) = parser.locate_lockfile(&manifest_uri) {
 ///     let resolved = parser.parse_lockfile(&lockfile_path).await?;
@@ -67,8 +67,8 @@ impl CargoLockParser {
 
 #[async_trait]
 impl LockFileProvider for CargoLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
-        let manifest_path = manifest_uri.to_file_path().ok()?;
+    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+        let manifest_path = manifest_uri.to_file_path()?;
 
         // Try same directory as manifest
         let lock_path = manifest_path.with_file_name("Cargo.lock");
@@ -94,7 +94,7 @@ impl LockFileProvider for CargoLockParser {
             current_dir = current_dir.parent()?;
         }
 
-        tracing::debug!("No Cargo.lock found for: {}", manifest_uri);
+        tracing::debug!("No Cargo.lock found for: {:?}", manifest_uri);
         None
     }
 
@@ -400,7 +400,7 @@ version = 4
         std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
         std::fs::write(&lock_path, "version = 4").unwrap();
 
-        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
         let parser = CargoLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);
@@ -419,7 +419,7 @@ version = 4
         std::fs::write(&workspace_lock, "version = 4").unwrap();
         std::fs::write(&member_manifest, "[package]\nname = \"member\"").unwrap();
 
-        let manifest_uri = Url::from_file_path(&member_manifest).unwrap();
+        let manifest_uri = Uri::from_file_path(&member_manifest).unwrap();
         let parser = CargoLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);
@@ -433,7 +433,7 @@ version = 4
         let manifest_path = temp_dir.path().join("Cargo.toml");
         std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
 
-        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
         let parser = CargoLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);

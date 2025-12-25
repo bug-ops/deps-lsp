@@ -2,7 +2,7 @@
 
 use crate::document::ServerState;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{Hover, HoverParams};
+use tower_lsp_server::ls_types::{Hover, HoverParams};
 
 /// Handles hover requests using trait-based delegation.
 pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Option<Hover> {
@@ -33,12 +33,14 @@ pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Optio
 mod tests {
     use super::*;
     use crate::document::{DocumentState, Ecosystem, ServerState};
-    use tower_lsp::lsp_types::{Position, TextDocumentIdentifier, TextDocumentPositionParams, Url};
+    use tower_lsp_server::ls_types::{
+        Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    };
 
     #[tokio::test]
     async fn test_handle_hover_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         let params = HoverParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -55,7 +57,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_hover_cargo() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
         let content = r#"[dependencies]
@@ -86,7 +88,7 @@ serde = "1.0.0"
     #[tokio::test]
     async fn test_handle_hover_npm() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/package.json").unwrap();
+        let uri = Uri::from_file_path("/test/package.json").unwrap();
 
         let ecosystem = state.ecosystem_registry.get("npm").unwrap();
         let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
@@ -114,7 +116,7 @@ serde = "1.0.0"
     #[tokio::test]
     async fn test_handle_hover_no_parse_result() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
         state.update_document(uri.clone(), doc_state);

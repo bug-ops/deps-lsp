@@ -16,14 +16,14 @@
 //!
 //! ```no_run
 //! use deps_core::completion::{detect_completion_context, CompletionContext};
-//! use tower_lsp::lsp_types::Position;
+//! use tower_lsp_server::ls_types::Position;
 //!
 //! // In your ecosystem's generate_completions implementation:
 //! async fn generate_completions(
 //!     parse_result: &dyn deps_core::ParseResult,
 //!     position: Position,
 //!     content: &str,
-//! ) -> Vec<tower_lsp::lsp_types::CompletionItem> {
+//! ) -> Vec<tower_lsp_server::ls_types::CompletionItem> {
 //!     let context = detect_completion_context(parse_result, position, content);
 //!
 //!     match context {
@@ -41,7 +41,7 @@
 //! ```
 
 use crate::{Metadata, ParseResult, Version};
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionItemTag, CompletionTextEdit, Documentation,
     MarkupContent, MarkupKind, Position, Range, TextEdit,
 };
@@ -104,7 +104,7 @@ pub enum CompletionContext {
 ///
 /// ```no_run
 /// use deps_core::completion::detect_completion_context;
-/// use tower_lsp::lsp_types::Position;
+/// use tower_lsp_server::ls_types::Position;
 ///
 /// # async fn example(parse_result: &dyn deps_core::ParseResult, content: &str) {
 /// // Cursor at position after "ser" in "serde"
@@ -234,7 +234,7 @@ pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
 ///
 /// ```no_run
 /// use deps_core::completion::extract_prefix;
-/// use tower_lsp::lsp_types::{Position, Range};
+/// use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// let content = r#"serde = "1.0""#;
 /// let position = Position { line: 0, character: 11 }; // After "1."
@@ -303,7 +303,7 @@ pub fn extract_prefix(content: &str, position: Position, range: Range) -> String
 ///
 /// ```no_run
 /// use deps_core::completion::build_package_completion;
-/// use tower_lsp::lsp_types::Range;
+/// use tower_lsp_server::ls_types::Range;
 ///
 /// # async fn example(metadata: &dyn deps_core::Metadata) {
 /// let range = Range::default(); // Use actual range from context
@@ -391,7 +391,7 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
 ///
 /// ```no_run
 /// use deps_core::completion::build_version_completion;
-/// use tower_lsp::lsp_types::Range;
+/// use tower_lsp_server::ls_types::Range;
 ///
 /// # async fn example(version: &dyn deps_core::Version) {
 /// let range = Range::default();
@@ -477,7 +477,7 @@ pub fn build_version_completion(
 ///
 /// ```no_run
 /// use deps_core::completion::build_feature_completion;
-/// use tower_lsp::lsp_types::Range;
+/// use tower_lsp_server::ls_types::Range;
 ///
 /// let range = Range::default();
 /// let item = build_feature_completion("derive", "serde", range);
@@ -558,10 +558,10 @@ mod tests {
             None
         }
 
-        fn uri(&self) -> &tower_lsp::lsp_types::Url {
+        fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
             // Create a dummy URL for testing
             static URL_STR: &str = "file:///test/Cargo.toml";
-            static URL: once_cell::sync::Lazy<tower_lsp::lsp_types::Url> =
+            static URL: once_cell::sync::Lazy<tower_lsp_server::ls_types::Uri> =
                 once_cell::sync::Lazy::new(|| URL_STR.parse().unwrap());
             &URL
         }

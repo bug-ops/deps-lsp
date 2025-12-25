@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::JoinHandle;
-use tower_lsp::lsp_types::Url;
+use tower_lsp_server::ls_types::Uri;
 
 /// Unified dependency enum for multi-ecosystem support.
 ///
@@ -34,7 +34,7 @@ impl UnifiedDependency {
     }
 
     /// Returns the name range for LSP operations.
-    pub fn name_range(&self) -> tower_lsp::lsp_types::Range {
+    pub fn name_range(&self) -> tower_lsp_server::ls_types::Range {
         match self {
             UnifiedDependency::Cargo(dep) => dep.name_range,
             UnifiedDependency::Npm(dep) => dep.name_range,
@@ -52,7 +52,7 @@ impl UnifiedDependency {
     }
 
     /// Returns the version range for LSP operations if present.
-    pub fn version_range(&self) -> Option<tower_lsp::lsp_types::Range> {
+    pub fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
         match self {
             UnifiedDependency::Cargo(dep) => dep.version_range,
             UnifiedDependency::Npm(dep) => dep.version_range,
@@ -169,9 +169,9 @@ impl Ecosystem {
     /// Detects ecosystem from full URI path.
     ///
     /// Extracts the filename from the URI and checks if it matches a known manifest.
-    pub fn from_uri(uri: &Url) -> Option<Self> {
+    pub fn from_uri(uri: &Uri) -> Option<Self> {
         let path = uri.path();
-        let filename = path.split('/').next_back()?;
+        let filename = path.as_str().split('/').next_back()?;
         Self::from_filename(filename)
     }
 }
@@ -191,7 +191,7 @@ impl Ecosystem {
 /// use deps_lsp::document::{DocumentState, Ecosystem, UnifiedDependency};
 /// use deps_lsp::ParsedDependency;
 /// use deps_cargo::{DependencySection, DependencySource};
-/// use tower_lsp::lsp_types::{Position, Range};
+/// use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// let dep = ParsedDependency {
 ///     name: "serde".into(),
@@ -383,14 +383,14 @@ impl DocumentState {
 ///
 /// ```
 /// use deps_lsp::document::ServerState;
-/// use tower_lsp::lsp_types::Url;
+/// use tower_lsp_server::ls_types::Uri;
 ///
 /// let state = ServerState::new();
 /// assert_eq!(state.document_count(), 0);
 /// ```
 pub struct ServerState {
     /// Open documents by URI
-    pub documents: DashMap<Url, DocumentState>,
+    pub documents: DashMap<Uri, DocumentState>,
     /// HTTP cache for registry requests
     pub cache: Arc<HttpCache>,
     /// Lock file cache for parsed lock files
@@ -398,7 +398,7 @@ pub struct ServerState {
     /// Ecosystem registry for trait-based architecture
     pub ecosystem_registry: Arc<EcosystemRegistry>,
     /// Background task handles
-    tasks: tokio::sync::RwLock<HashMap<Url, JoinHandle<()>>>,
+    tasks: tokio::sync::RwLock<HashMap<Uri, JoinHandle<()>>>,
 }
 
 impl ServerState {
@@ -436,8 +436,8 @@ impl ServerState {
     /// dropped as soon as possible.
     pub fn get_document(
         &self,
-        uri: &Url,
-    ) -> Option<dashmap::mapref::one::Ref<'_, Url, DocumentState>> {
+        uri: &Uri,
+    ) -> Option<dashmap::mapref::one::Ref<'_, Uri, DocumentState>> {
         self.documents.get(uri)
     }
 
@@ -458,8 +458,8 @@ impl ServerState {
     ///
     /// ```no_run
     /// # use deps_lsp::document::ServerState;
-    /// # use tower_lsp::lsp_types::Url;
-    /// # async fn example(state: &ServerState, uri: &Url) {
+    /// # use tower_lsp_server::ls_types::Uri;
+    /// # async fn example(state: &ServerState, uri: &Uri) {
     /// // Lock released immediately after clone
     /// let doc = state.get_document_clone(uri);
     ///
@@ -470,7 +470,7 @@ impl ServerState {
     /// # }
     /// # async fn process_async(doc: &deps_lsp::document::DocumentState) {}
     /// ```
-    pub fn get_document_clone(&self, uri: &Url) -> Option<DocumentState> {
+    pub fn get_document_clone(&self, uri: &Uri) -> Option<DocumentState> {
         self.documents.get(uri).map(|doc| doc.clone())
     }
 
@@ -478,14 +478,14 @@ impl ServerState {
     ///
     /// If a document already exists at the given URI, it is replaced.
     /// Otherwise, a new entry is created.
-    pub fn update_document(&self, uri: Url, state: DocumentState) {
+    pub fn update_document(&self, uri: Uri, state: DocumentState) {
         self.documents.insert(uri, state);
     }
 
     /// Removes document state and returns the removed entry.
     ///
     /// Returns `None` if no document exists at the given URI.
-    pub fn remove_document(&self, uri: &Url) -> Option<(Url, DocumentState)> {
+    pub fn remove_document(&self, uri: &Uri) -> Option<(Uri, DocumentState)> {
         self.documents.remove(uri)
     }
 
@@ -497,7 +497,7 @@ impl ServerState {
     ///
     /// Typical use case: fetching version data asynchronously after
     /// document open or change.
-    pub async fn spawn_background_task(&self, uri: Url, task: JoinHandle<()>) {
+    pub async fn spawn_background_task(&self, uri: Uri, task: JoinHandle<()>) {
         let mut tasks = self.tasks.write().await;
 
         // Cancel existing task if any
@@ -511,7 +511,7 @@ impl ServerState {
     /// Cancels the background task for a document.
     ///
     /// If no task exists, this is a no-op.
-    pub async fn cancel_background_task(&self, uri: &Url) {
+    pub async fn cancel_background_task(&self, uri: &Uri) {
         let mut tasks = self.tasks.write().await;
         if let Some(task) = tasks.remove(uri) {
             task.abort();
@@ -534,7 +534,7 @@ impl Default for ServerState {
 mod tests {
     use super::*;
     use deps_cargo::{DependencySection, DependencySource};
-    use tower_lsp::lsp_types::{Position, Range};
+    use tower_lsp_server::ls_types::{Position, Range};
 
     fn create_test_cargo_dependency() -> UnifiedDependency {
         UnifiedDependency::Cargo(ParsedDependency {
@@ -569,16 +569,16 @@ mod tests {
 
     #[test]
     fn test_ecosystem_from_uri() {
-        let cargo_uri = Url::parse("file:///path/to/Cargo.toml").unwrap();
+        let cargo_uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
         assert_eq!(Ecosystem::from_uri(&cargo_uri), Some(Ecosystem::Cargo));
 
-        let npm_uri = Url::parse("file:///path/to/package.json").unwrap();
+        let npm_uri = Uri::from_file_path("/path/to/package.json").unwrap();
         assert_eq!(Ecosystem::from_uri(&npm_uri), Some(Ecosystem::Npm));
 
-        let pypi_uri = Url::parse("file:///path/to/pyproject.toml").unwrap();
+        let pypi_uri = Uri::from_file_path("/path/to/pyproject.toml").unwrap();
         assert_eq!(Ecosystem::from_uri(&pypi_uri), Some(Ecosystem::Pypi));
 
-        let unknown_uri = Url::parse("file:///path/to/README.md").unwrap();
+        let unknown_uri = Uri::from_file_path("/path/to/README.md").unwrap();
         assert_eq!(Ecosystem::from_uri(&unknown_uri), None);
     }
 
@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn test_server_state_document_operations() {
         let state = ServerState::new();
-        let uri = Url::parse("file:///test.toml").unwrap();
+        let uri = Uri::from_file_path("/test.toml").unwrap();
         let deps = vec![create_test_cargo_dependency()];
         let doc_state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
 
@@ -645,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_state_background_tasks() {
         let state = ServerState::new();
-        let uri = Url::parse("file:///test.toml").unwrap();
+        let uri = Uri::from_file_path("/test.toml").unwrap();
 
         // Spawn task
         let task = tokio::spawn(async {
@@ -661,7 +661,7 @@ mod tests {
     #[test]
     fn test_unified_dependency_name() {
         use deps_cargo::{DependencySection, DependencySource};
-        use tower_lsp::lsp_types::{Position, Range};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let cargo_dep = UnifiedDependency::Cargo(ParsedDependency {
             name: "serde".into(),
@@ -683,7 +683,7 @@ mod tests {
     #[test]
     fn test_unified_dependency_npm() {
         use deps_npm::{NpmDependency, NpmDependencySection};
-        use tower_lsp::lsp_types::{Position, Range};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let npm_dep = UnifiedDependency::Npm(NpmDependency {
             name: "express".into(),
@@ -701,7 +701,7 @@ mod tests {
     #[test]
     fn test_unified_dependency_pypi() {
         use deps_pypi::{PypiDependency, PypiDependencySection, PypiDependencySource};
-        use tower_lsp::lsp_types::{Position, Range};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let pypi_dep = UnifiedDependency::Pypi(PypiDependency {
             name: "requests".into(),
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn test_document_state_new_from_parse_result() {
         let state = ServerState::new();
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
 
         let content = r#"[dependencies]
@@ -822,7 +822,7 @@ serde = "1.0"
     #[tokio::test]
     async fn test_spawn_background_task_cancels_previous() {
         let state = ServerState::new();
-        let uri = Url::parse("file:///test.toml").unwrap();
+        let uri = Uri::from_file_path("/test.toml").unwrap();
 
         let task1 = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -842,7 +842,7 @@ serde = "1.0"
     #[tokio::test]
     async fn test_cancel_background_task_nonexistent() {
         let state = ServerState::new();
-        let uri = Url::parse("file:///test.toml").unwrap();
+        let uri = Uri::from_file_path("/test.toml").unwrap();
 
         state.cancel_background_task(&uri).await;
     }
@@ -873,7 +873,7 @@ serde = "1.0"
     #[test]
     fn test_unified_dependency_git_source() {
         use deps_cargo::{DependencySection, DependencySource};
-        use tower_lsp::lsp_types::{Position, Range};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let git_dep = UnifiedDependency::Cargo(ParsedDependency {
             name: "custom".into(),

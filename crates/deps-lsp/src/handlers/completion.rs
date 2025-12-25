@@ -4,7 +4,7 @@
 
 use crate::document::ServerState;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, InsertTextFormat,
 };
 
@@ -19,12 +19,31 @@ pub async fn handle_completion(
     let uri = &params.text_document_position.text_document.uri;
     let position = params.text_document_position.position;
 
+    tracing::info!(
+        "completion request: uri={:?}, line={}, character={}",
+        uri,
+        position.line,
+        position.character
+    );
+
     // Get document and extract needed data
-    let doc = state.get_document(uri)?;
+    let doc = match state.get_document(uri) {
+        Some(d) => d,
+        None => {
+            tracing::warn!("completion: document not found: {:?}", uri);
+            return None;
+        }
+    };
     let ecosystem_id = doc.ecosystem_id;
     let content = doc.content.clone();
     let has_parse_result = doc.parse_result().is_some();
     drop(doc);
+
+    tracing::info!(
+        "completion: ecosystem={}, has_parse_result={}",
+        ecosystem_id,
+        has_parse_result
+    );
 
     // Try parse_result first, fallback to text-based detection
     let items = if has_parse_result {
@@ -36,11 +55,21 @@ pub async fn handle_completion(
             .generate_completions(parse_result, position, &content)
             .await;
         drop(doc);
-        completions
+
+        // If ecosystem returned no completions, try fallback
+        // This handles the case where user is typing a NEW package name
+        if completions.is_empty() {
+            tracing::info!("completion: ecosystem returned empty, trying fallback");
+            fallback_completion(&state, ecosystem_id, position, &content).await
+        } else {
+            completions
+        }
     } else {
         // Fallback: detect context from raw text
         fallback_completion(&state, ecosystem_id, position, &content).await
     };
+
+    tracing::info!("completion: returning {} items", items.len());
 
     if items.is_empty() {
         None
@@ -55,17 +84,28 @@ pub async fn handle_completion(
 async fn fallback_completion(
     state: &ServerState,
     ecosystem_id: &str,
-    position: tower_lsp::lsp_types::Position,
+    position: tower_lsp_server::ls_types::Position,
     content: &str,
 ) -> Vec<CompletionItem> {
+    tracing::info!(
+        "fallback_completion: starting for ecosystem={}",
+        ecosystem_id
+    );
+
     // Get the current line
     let line = match content.lines().nth(position.line as usize) {
         Some(l) => l,
-        None => return vec![],
+        None => {
+            tracing::info!("fallback_completion: line {} not found", position.line);
+            return vec![];
+        }
     };
+
+    tracing::info!("fallback_completion: line content = {:?}", line);
 
     // Check if we're in a dependencies section
     if !is_in_dependencies_section(content, position.line as usize, ecosystem_id) {
+        tracing::info!("fallback_completion: not in dependencies section");
         return vec![];
     }
 
@@ -74,8 +114,11 @@ async fn fallback_completion(
     let prefix = &line[..prefix_end];
     let prefix = prefix.trim();
 
+    tracing::info!("fallback_completion: prefix = {:?}", prefix);
+
     // If it looks like a package name (letters, no = sign, at least 2 chars)
     if prefix.is_empty() || prefix.contains('=') || prefix.len() < 2 {
+        tracing::info!("fallback_completion: prefix rejected (empty, contains =, or < 2 chars)");
         return vec![];
     }
 
@@ -118,6 +161,7 @@ fn is_in_toml_dependencies(content: &str, line_number: usize) -> bool {
             return line == "[dependencies]"
                 || line == "[dev-dependencies]"
                 || line == "[build-dependencies]"
+                || line == "[workspace.dependencies]"
                 || line == "[project.dependencies]"
                 || line == "[project.optional-dependencies]"
                 || line.starts_with("[target.")
@@ -189,10 +233,22 @@ async fn search_packages(
     ecosystem_id: &str,
     query: &str,
 ) -> Vec<CompletionItem> {
+    tracing::info!(
+        "search_packages: query={:?}, ecosystem={}",
+        query,
+        ecosystem_id
+    );
+
     // Search for up to 50 packages
     let results = match registry.search(query, 50).await {
-        Ok(r) => r,
-        Err(_) => return vec![],
+        Ok(r) => {
+            tracing::info!("search_packages: found {} results", r.len());
+            r
+        }
+        Err(e) => {
+            tracing::warn!("search_packages: search failed: {}", e);
+            return vec![];
+        }
     };
 
     // Convert search results to completion items
@@ -225,7 +281,8 @@ fn create_package_completion_item(
         label: name.to_string(),
         kind: Some(CompletionItemKind::MODULE),
         detail: Some(detail),
-        documentation: description.map(|d| tower_lsp::lsp_types::Documentation::String(d.into())),
+        documentation: description
+            .map(|d| tower_lsp_server::ls_types::Documentation::String(d.into())),
         insert_text: Some(insert_text),
         insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
         ..Default::default()
@@ -236,12 +293,14 @@ fn create_package_completion_item(
 mod tests {
     use super::*;
     use crate::document::DocumentState;
-    use tower_lsp::lsp_types::{Position, TextDocumentIdentifier, TextDocumentPositionParams, Url};
+    use tower_lsp_server::ls_types::{
+        Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    };
 
     #[tokio::test]
     async fn test_completion_returns_none_for_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         let params = CompletionParams {
             text_document_position: TextDocumentPositionParams {
@@ -260,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn test_completion_delegates_to_ecosystem() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         let content = "[dependencies]\nserde = \"1.0\"".to_string();
 
@@ -323,6 +382,15 @@ cc
         let content = r#"
 [project.dependencies]
 requests
+"#;
+        assert!(is_in_toml_dependencies(content, 2));
+    }
+
+    #[test]
+    fn test_is_in_toml_dependencies_workspace_deps() {
+        let content = r#"
+[workspace.dependencies]
+serde = "1.0"
 "#;
         assert!(is_in_toml_dependencies(content, 2));
     }
@@ -571,7 +639,7 @@ something
         use crate::document::Ecosystem;
 
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         // Malformed content that will fail to parse
         let content = r#"[dependencies]

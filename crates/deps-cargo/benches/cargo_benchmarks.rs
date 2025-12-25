@@ -10,7 +10,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_cargo::parse_cargo_toml;
 use std::hint::black_box;
-use tower_lsp::lsp_types::Url;
+use tower_lsp_server::ls_types::Uri;
 
 /// Small Cargo.toml file with 5 dependencies.
 const SMALL_CARGO_TOML: &str = r#"
@@ -129,12 +129,12 @@ const SPARSE_INDEX_RESPONSE: &str = r#"{"name":"serde","vers":"1.0.0","deps":[],
 {"name":"serde","vers":"1.0.214","deps":[],"cksum":"def","features":{"derive":["serde_derive"],"std":[],"alloc":[],"rc":[]},"yanked":false}
 "#;
 
-fn test_url() -> Url {
+fn test_url() -> Uri {
     #[cfg(windows)]
-    let url = "file:///C:/test/Cargo.toml";
+    let path = "C:/test/Cargo.toml";
     #[cfg(not(windows))]
-    let url = "file:///test/Cargo.toml";
-    Url::parse(url).unwrap()
+    let path = "/test/Cargo.toml";
+    Uri::from_file_path(path).unwrap()
 }
 
 /// Benchmark Cargo.toml parsing with different file sizes.

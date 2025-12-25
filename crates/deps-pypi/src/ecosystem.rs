@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{
-    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Url,
+use tower_lsp_server::ls_types::{
+    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
 };
 
 use deps_core::{
@@ -65,7 +65,7 @@ impl PypiEcosystem {
         };
 
         // Use dummy range - completion will be inserted at cursor position
-        let insert_range = tower_lsp::lsp_types::Range::default();
+        let insert_range = tower_lsp_server::ls_types::Range::default();
 
         results
             .into_iter()
@@ -92,7 +92,7 @@ impl PypiEcosystem {
             }
         };
 
-        let insert_range = tower_lsp::lsp_types::Range::default();
+        let insert_range = tower_lsp_server::ls_types::Range::default();
 
         // Filter by prefix (strip PEP 440 operators like >=, ==, ~=, etc.)
         let clean_prefix = prefix.trim_start_matches(['>', '<', '=', '~', '!']).trim();
@@ -148,7 +148,7 @@ impl Ecosystem for PypiEcosystem {
         &["pyproject.toml"]
     }
 
-    async fn parse_manifest(&self, content: &str, uri: &Url) -> Result<Box<dyn ParseResultTrait>> {
+    async fn parse_manifest(&self, content: &str, uri: &Uri) -> Result<Box<dyn ParseResultTrait>> {
         let result = self.parser.parse_content(content, uri).map_err(|e| {
             deps_core::DepsError::ParseError {
                 file_type: "pyproject.toml".into(),
@@ -205,7 +205,7 @@ impl Ecosystem for PypiEcosystem {
         parse_result: &dyn ParseResultTrait,
         position: Position,
         _cached_versions: &HashMap<String, String>,
-        uri: &Url,
+        uri: &Uri,
     ) -> Vec<CodeAction> {
         lsp_helpers::generate_code_actions(
             parse_result,
@@ -221,7 +221,7 @@ impl Ecosystem for PypiEcosystem {
         &self,
         parse_result: &dyn ParseResultTrait,
         _cached_versions: &HashMap<String, String>,
-        _uri: &Url,
+        _uri: &Uri,
     ) -> Vec<Diagnostic> {
         lsp_helpers::generate_diagnostics(parse_result, self.registry.as_ref(), &self.formatter)
             .await

@@ -43,7 +43,7 @@ use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
 use std::path::{Path, PathBuf};
 use toml_edit::DocumentMut;
-use tower_lsp::lsp_types::Url;
+use tower_lsp_server::ls_types::Uri;
 
 /// PyPI lock file parser.
 ///
@@ -63,11 +63,11 @@ use tower_lsp::lsp_types::Url;
 /// ```no_run
 /// use deps_pypi::lockfile::PypiLockParser;
 /// use deps_core::lockfile::LockFileProvider;
-/// use tower_lsp::lsp_types::Url;
+/// use tower_lsp_server::ls_types::Uri;
 ///
 /// # async fn example() -> deps_core::error::Result<()> {
 /// let parser = PypiLockParser;
-/// let manifest_uri = Url::parse("file:///path/to/pyproject.toml").unwrap();
+/// let manifest_uri = Uri::from_file_path("/path/to/pyproject.toml").unwrap();
 ///
 /// if let Some(lockfile_path) = parser.locate_lockfile(&manifest_uri) {
 ///     let resolved = parser.parse_lockfile(&lockfile_path).await?;
@@ -80,8 +80,8 @@ pub struct PypiLockParser;
 
 #[async_trait]
 impl LockFileProvider for PypiLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
-        let manifest_path = manifest_uri.to_file_path().ok()?;
+    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+        let manifest_path = manifest_uri.to_file_path()?;
         let dir = manifest_path.parent()?;
 
         // Try poetry.lock first (more established)
@@ -98,7 +98,7 @@ impl LockFileProvider for PypiLockParser {
             return Some(uv_lock);
         }
 
-        tracing::debug!("No lock file found for: {}", manifest_uri);
+        tracing::debug!("No lock file found for: {:?}", manifest_uri);
         None
     }
 
@@ -592,7 +592,7 @@ version = 1
         std::fs::write(&poetry_lock, "# poetry.lock").unwrap();
         std::fs::write(&uv_lock, "# uv.lock").unwrap();
 
-        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
         let parser = PypiLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);
@@ -613,7 +613,7 @@ version = 1
         std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
         std::fs::write(&uv_lock, "# uv.lock").unwrap();
 
-        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
         let parser = PypiLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);
@@ -627,7 +627,7 @@ version = 1
         let manifest_path = temp_dir.path().join("pyproject.toml");
         std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
 
-        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
         let parser = PypiLockParser;
 
         let located = parser.locate_lockfile(&manifest_uri);

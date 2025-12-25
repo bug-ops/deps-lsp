@@ -7,7 +7,7 @@ use crate::config::InlayHintsConfig;
 use crate::document::ServerState;
 use deps_core::EcosystemConfig;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{InlayHint, InlayHintParams};
+use tower_lsp_server::ls_types::{InlayHint, InlayHintParams};
 
 /// Handles inlay hint requests using trait-based delegation.
 ///
@@ -28,7 +28,7 @@ pub async fn handle_inlay_hints(
         let doc = match state.get_document(uri) {
             Some(d) => d,
             None => {
-                tracing::warn!("Document not found: {}", uri);
+                tracing::warn!("Document not found: {:?}", uri);
                 return vec![];
             }
         };
@@ -79,7 +79,7 @@ pub async fn handle_inlay_hints(
 mod tests {
     use super::*;
     use crate::document::{DocumentState, Ecosystem, ServerState};
-    use tower_lsp::lsp_types::{TextDocumentIdentifier, Url};
+    use tower_lsp_server::ls_types::{TextDocumentIdentifier, Uri};
 
     #[test]
     fn test_handle_inlay_hints_disabled() {
@@ -95,7 +95,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_inlay_hints_disabled_returns_empty() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let config = InlayHintsConfig {
             enabled: false,
             up_to_date_text: "✅".to_string(),
@@ -105,9 +105,9 @@ mod tests {
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
-            range: tower_lsp::lsp_types::Range::new(
-                tower_lsp::lsp_types::Position::new(0, 0),
-                tower_lsp::lsp_types::Position::new(100, 0),
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(100, 0),
             ),
         };
 
@@ -118,7 +118,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_inlay_hints_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let config = InlayHintsConfig {
             enabled: true,
             up_to_date_text: "✅".to_string(),
@@ -128,9 +128,9 @@ mod tests {
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
-            range: tower_lsp::lsp_types::Range::new(
-                tower_lsp::lsp_types::Position::new(0, 0),
-                tower_lsp::lsp_types::Position::new(100, 0),
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(100, 0),
             ),
         };
 
@@ -141,7 +141,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_inlay_hints_cargo() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let config = InlayHintsConfig {
             enabled: true,
             up_to_date_text: "✅".to_string(),
@@ -165,9 +165,9 @@ serde = "1.0.0"
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
-            range: tower_lsp::lsp_types::Range::new(
-                tower_lsp::lsp_types::Position::new(0, 0),
-                tower_lsp::lsp_types::Position::new(100, 0),
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(100, 0),
             ),
         };
 
@@ -178,7 +178,7 @@ serde = "1.0.0"
     #[tokio::test]
     async fn test_handle_inlay_hints_npm() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/package.json").unwrap();
+        let uri = Uri::from_file_path("/test/package.json").unwrap();
         let config = InlayHintsConfig {
             enabled: true,
             up_to_date_text: "✅".to_string(),
@@ -199,9 +199,9 @@ serde = "1.0.0"
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
-            range: tower_lsp::lsp_types::Range::new(
-                tower_lsp::lsp_types::Position::new(0, 0),
-                tower_lsp::lsp_types::Position::new(100, 0),
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(100, 0),
             ),
         };
 
@@ -212,7 +212,7 @@ serde = "1.0.0"
     #[tokio::test]
     async fn test_handle_inlay_hints_pypi() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/pyproject.toml").unwrap();
+        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
         let config = InlayHintsConfig {
             enabled: true,
             up_to_date_text: "✅".to_string(),
@@ -236,9 +236,9 @@ dependencies = ["requests>=2.0.0"]
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
-            range: tower_lsp::lsp_types::Range::new(
-                tower_lsp::lsp_types::Position::new(0, 0),
-                tower_lsp::lsp_types::Position::new(100, 0),
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(100, 0),
             ),
         };
 
@@ -249,7 +249,7 @@ dependencies = ["requests>=2.0.0"]
     #[tokio::test]
     async fn test_handle_inlay_hints_no_parse_result() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let config = InlayHintsConfig {
             enabled: true,
             up_to_date_text: "✅".to_string(),
@@ -262,9 +262,9 @@ dependencies = ["requests>=2.0.0"]
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
-            range: tower_lsp::lsp_types::Range::new(
-                tower_lsp::lsp_types::Position::new(0, 0),
-                tower_lsp::lsp_types::Position::new(100, 0),
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(100, 0),
             ),
         };
 
@@ -275,7 +275,7 @@ dependencies = ["requests>=2.0.0"]
     #[tokio::test]
     async fn test_handle_inlay_hints_custom_config() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let config = InlayHintsConfig {
             enabled: true,
             up_to_date_text: "OK".to_string(),
@@ -299,9 +299,9 @@ serde = "1.0.0"
         let params = InlayHintParams {
             text_document: TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
-            range: tower_lsp::lsp_types::Range::new(
-                tower_lsp::lsp_types::Position::new(0, 0),
-                tower_lsp::lsp_types::Position::new(100, 0),
+            range: tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(100, 0),
             ),
         };
 

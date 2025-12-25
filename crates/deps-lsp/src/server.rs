@@ -5,7 +5,7 @@ use crate::handlers::{code_actions, completion, diagnostics, hover, inlay_hints}
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionParams, CodeActionProviderCapability, CompletionOptions,
     CompletionParams, CompletionResponse, DiagnosticOptions, DiagnosticServerCapabilities,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
@@ -14,9 +14,9 @@ use tower_lsp::lsp_types::{
     HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, InlayHint,
     InlayHintParams, MessageType, OneOf, Range, RelatedFullDocumentDiagnosticReport,
     ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
-    Url, WorkspaceEdit,
+    Uri, WorkspaceEdit,
 };
-use tower_lsp::{Client, LanguageServer, jsonrpc::Result};
+use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
 
 /// LSP command identifiers.
 mod commands {
@@ -40,7 +40,7 @@ impl Backend {
     }
 
     /// Handles opening a document using unified ecosystem registry.
-    async fn handle_open(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+    async fn handle_open(&self, uri: tower_lsp_server::ls_types::Uri, content: String) {
         match document_lifecycle::handle_document_open(
             uri.clone(),
             content,
@@ -54,7 +54,7 @@ impl Backend {
                 self.state.spawn_background_task(uri, task).await;
             }
             Err(e) => {
-                tracing::error!("failed to open document {}: {}", uri, e);
+                tracing::error!("failed to open document {:?}: {}", uri, e);
                 self.client
                     .log_message(MessageType::ERROR, format!("Parse error: {}", e))
                     .await;
@@ -63,7 +63,7 @@ impl Backend {
     }
 
     /// Handles changes to a document using unified ecosystem registry.
-    async fn handle_change(&self, uri: tower_lsp::lsp_types::Url, content: String) {
+    async fn handle_change(&self, uri: tower_lsp_server::ls_types::Uri, content: String) {
         match document_lifecycle::handle_document_change(
             uri.clone(),
             content,
@@ -77,7 +77,7 @@ impl Backend {
                 self.state.spawn_background_task(uri, task).await;
             }
             Err(e) => {
-                tracing::error!("failed to process document change {}: {}", uri, e);
+                tracing::error!("failed to process document change {:?}: {}", uri, e);
             }
         }
     }
@@ -87,13 +87,13 @@ impl Backend {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             completion_provider: Some(CompletionOptions {
                 trigger_characters: Some(vec!["\"".into(), "=".into(), ".".into()]),
-                resolve_provider: Some(true),
+                resolve_provider: Some(false),
                 ..Default::default()
             }),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             inlay_hint_provider: Some(OneOf::Left(true)),
             code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
-                code_action_kinds: Some(vec![tower_lsp::lsp_types::CodeActionKind::REFACTOR]),
+                code_action_kinds: Some(vec![tower_lsp_server::ls_types::CodeActionKind::REFACTOR]),
                 ..Default::default()
             })),
             diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
@@ -111,7 +111,6 @@ impl Backend {
     }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         tracing::info!("initializing deps-lsp server");
@@ -149,11 +148,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let content = params.text_document.text;
 
-        tracing::info!("document opened: {}", uri);
+        tracing::info!("document opened: {:?}", uri);
 
         // Use ecosystem registry to check if we support this file type
         if self.state.ecosystem_registry.get_for_uri(&uri).is_none() {
-            tracing::debug!("unsupported file type: {}", uri);
+            tracing::debug!("unsupported file type: {:?}", uri);
             return;
         }
 
@@ -168,7 +167,7 @@ impl LanguageServer for Backend {
 
             // Use ecosystem registry to check if we support this file type
             if self.state.ecosystem_registry.get_for_uri(&uri).is_none() {
-                tracing::debug!("unsupported file type: {}", uri);
+                tracing::debug!("unsupported file type: {:?}", uri);
                 return;
             }
 
@@ -178,7 +177,7 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
-        tracing::info!("document closed: {}", uri);
+        tracing::info!("document closed: {:?}", uri);
 
         self.state.remove_document(&uri);
         self.state.cancel_background_task(&uri).await;
@@ -203,9 +202,9 @@ impl LanguageServer for Backend {
     async fn code_action(
         &self,
         params: CodeActionParams,
-    ) -> Result<Option<Vec<tower_lsp::lsp_types::CodeActionOrCommand>>> {
+    ) -> Result<Option<Vec<tower_lsp_server::ls_types::CodeActionOrCommand>>> {
         tracing::info!(
-            "code_action request: uri={}, range={:?}",
+            "code_action request: uri={:?}, range={:?}",
             params.text_document.uri,
             params.range
         );
@@ -219,7 +218,7 @@ impl LanguageServer for Backend {
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
         let uri = params.text_document.uri;
-        tracing::info!("diagnostic request for: {}", uri);
+        tracing::info!("diagnostic request for: {:?}", uri);
 
         let config = self.config.read().await;
 
@@ -275,7 +274,7 @@ impl LanguageServer for Backend {
 
 #[derive(serde::Deserialize)]
 struct UpdateVersionArgs {
-    uri: Url,
+    uri: Uri,
     range: Range,
     version: String,
 }
@@ -294,7 +293,7 @@ mod tests {
         // Verify completion provider
         assert!(caps.completion_provider.is_some());
         let completion = caps.completion_provider.unwrap();
-        assert!(completion.resolve_provider.unwrap());
+        assert!(!completion.resolve_provider.unwrap()); // resolve_provider is disabled
 
         // Verify hover provider
         assert!(caps.hover_provider.is_some());
@@ -308,14 +307,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_backend_creation() {
-        let (_service, _socket) = tower_lsp::LspService::build(Backend::new).finish();
+        let (_service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         // Backend should be created successfully
         // This is a minimal smoke test
     }
 
     #[tokio::test]
     async fn test_initialize_without_options() {
-        let (_service, _socket) = tower_lsp::LspService::build(Backend::new).finish();
+        let (_service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         // Should initialize successfully with default config
         // Integration tests will test actual LSP protocol
     }

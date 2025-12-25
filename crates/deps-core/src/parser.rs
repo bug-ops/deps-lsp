@@ -1,5 +1,5 @@
 use crate::error::Result;
-use tower_lsp::lsp_types::{Range, Url};
+use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Generic manifest parser interface.
 ///
@@ -24,7 +24,7 @@ pub trait ManifestParser: Send + Sync {
     /// Returns error if:
     /// - Manifest syntax is invalid
     /// - File path cannot be determined from URL
-    fn parse(&self, content: &str, doc_uri: &Url) -> Result<Self::ParseResult>;
+    fn parse(&self, content: &str, doc_uri: &Uri) -> Result<Self::ParseResult>;
 }
 
 /// Dependency information trait.

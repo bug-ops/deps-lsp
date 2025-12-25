@@ -2,7 +2,7 @@ use deps_core::Dependency;
 use deps_core::lsp_helpers::EcosystemFormatter;
 use pep440_rs::{Version, VersionSpecifiers};
 use std::str::FromStr;
-use tower_lsp::lsp_types::Position;
+use tower_lsp_server::ls_types::Position;
 
 pub struct PypiFormatter;
 
@@ -160,7 +160,7 @@ mod tests {
         use super::*;
         use deps_core::parser::DependencySource;
         use std::any::Any;
-        use tower_lsp::lsp_types::Range;
+        use tower_lsp_server::ls_types::Range;
 
         struct MockDep {
             name_range: Range,

@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use tower_lsp::lsp_types::DiagnosticSeverity;
+use tower_lsp_server::ls_types::DiagnosticSeverity;
 
 /// Root configuration for the deps-lsp server.
 ///
@@ -91,7 +91,7 @@ impl Default for InlayHintsConfig {
 ///
 /// ```
 /// use deps_lsp::config::DiagnosticsConfig;
-/// use tower_lsp::lsp_types::DiagnosticSeverity;
+/// use tower_lsp_server::ls_types::DiagnosticSeverity;
 ///
 /// let config = DiagnosticsConfig {
 ///     outdated_severity: DiagnosticSeverity::INFORMATION,

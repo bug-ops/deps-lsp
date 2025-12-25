@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
-use tower_lsp::lsp_types::Url;
+use tower_lsp_server::ls_types::Uri;
 
 /// Resolved package information from a lock file.
 ///
@@ -148,13 +148,13 @@ impl ResolvedPackages {
 /// use deps_core::lockfile::{LockFileProvider, ResolvedPackages};
 /// use async_trait::async_trait;
 /// use std::path::{Path, PathBuf};
-/// use tower_lsp::lsp_types::Url;
+/// use tower_lsp_server::ls_types::Uri;
 ///
 /// struct MyLockParser;
 ///
 /// #[async_trait]
 /// impl LockFileProvider for MyLockParser {
-///     fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
+///     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
 ///         let manifest_path = manifest_uri.to_file_path().ok()?;
 ///         let lock_path = manifest_path.with_file_name("my.lock");
 ///         lock_path.exists().then_some(lock_path)
@@ -182,7 +182,7 @@ pub trait LockFileProvider: Send + Sync {
     /// # Returns
     ///
     /// Path to lock file if found
-    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf>;
+    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf>;
 
     /// Parses a lock file and extracts resolved packages.
     ///

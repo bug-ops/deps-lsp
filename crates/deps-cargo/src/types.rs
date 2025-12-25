@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::HashMap;
-use tower_lsp::lsp_types::Range;
+use tower_lsp_server::ls_types::Range;
 
 /// Parsed dependency from Cargo.toml with position tracking.
 ///
@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::Range;
 ///
 /// ```
 /// use deps_cargo::types::{ParsedDependency, DependencySource, DependencySection};
-/// use tower_lsp::lsp_types::{Position, Range};
+/// use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// let dep = ParsedDependency {
 ///     name: "serde".into(),

@@ -42,7 +42,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tower-lsp = { workspace = true }
+tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -142,7 +142,7 @@ Create ecosystem-specific types in `types.rs`:
 ```rust
 //! Types for {Ecosystem} dependency management.
 
-use tower_lsp::lsp_types::Range;
+use tower_lsp_server::ls_types::Range;
 
 /// A dependency from the manifest file.
 #[derive(Debug, Clone)]
@@ -232,7 +232,7 @@ Create manifest parser in `parser.rs` with **position tracking**:
 use crate::error::Result;
 use crate::types::{Ecosystem}Dependency;
 use std::any::Any;
-use tower_lsp::lsp_types::{Position, Range, Url};
+use tower_lsp_server::ls_types::{Position, Range, Url};
 
 /// Parse result containing dependencies and metadata.
 #[derive(Debug)]
@@ -388,7 +388,7 @@ use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower_lsp::lsp_types::*;
+use tower_lsp_server::ls_types::*;
 
 use deps_core::{
     Ecosystem, EcosystemConfig, HttpCache,

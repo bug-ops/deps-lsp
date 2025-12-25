@@ -3,19 +3,19 @@
 use crate::config::DiagnosticsConfig;
 use crate::document::ServerState;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{Diagnostic, Url};
+use tower_lsp_server::ls_types::{Diagnostic, Uri};
 
 /// Handles diagnostic requests using trait-based delegation.
 pub async fn handle_diagnostics(
     state: Arc<ServerState>,
-    uri: &Url,
+    uri: &Uri,
     _config: &DiagnosticsConfig,
 ) -> Vec<Diagnostic> {
     let (ecosystem_id, cached_versions) = {
         let doc = match state.get_document(uri) {
             Some(d) => d,
             None => {
-                tracing::warn!("Document not found for diagnostics: {}", uri);
+                tracing::warn!("Document not found for diagnostics: {:?}", uri);
                 return vec![];
             }
         };
@@ -55,7 +55,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_diagnostics_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let config = DiagnosticsConfig::default();
 
         let result = handle_diagnostics(state, &uri, &config).await;
@@ -65,7 +65,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_diagnostics_cargo() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let config = DiagnosticsConfig::default();
 
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
@@ -89,7 +89,7 @@ serde = "1.0.0"
     #[tokio::test]
     async fn test_handle_diagnostics_npm() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/package.json").unwrap();
+        let uri = Uri::from_file_path("/test/package.json").unwrap();
         let config = DiagnosticsConfig::default();
 
         let ecosystem = state.ecosystem_registry.get("npm").unwrap();
@@ -110,7 +110,7 @@ serde = "1.0.0"
     #[tokio::test]
     async fn test_handle_diagnostics_pypi() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/pyproject.toml").unwrap();
+        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
         let config = DiagnosticsConfig::default();
 
         let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
@@ -134,7 +134,7 @@ dependencies = ["requests>=2.0.0"]
     #[tokio::test]
     async fn test_handle_diagnostics_no_parse_result() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let config = DiagnosticsConfig::default();
 
         let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);

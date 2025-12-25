@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{
+use tower_lsp_server::ls_types::{
     InlayHint, InlayHintKind, InlayHintLabel, InlayHintLabelPart, MarkupContent, MarkupKind, Range,
 };
 
@@ -61,9 +61,9 @@ const MAX_CODE_ACTION_VERSIONS: usize = 5;
 /// # #[derive(Clone)] struct MyDependency { name: String }
 /// # impl DependencyInfo for MyDependency {
 /// #     fn name(&self) -> &str { &self.name }
-/// #     fn name_range(&self) -> tower_lsp::lsp_types::Range { tower_lsp::lsp_types::Range::default() }
+/// #     fn name_range(&self) -> tower_lsp_server::ls_types::Range { tower_lsp_server::ls_types::Range::default() }
 /// #     fn version_requirement(&self) -> Option<&str> { None }
-/// #     fn version_range(&self) -> Option<tower_lsp::lsp_types::Range> { None }
+/// #     fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> { None }
 /// #     fn source(&self) -> deps_core::parser::DependencySource { deps_core::parser::DependencySource::Registry }
 /// # }
 /// # #[derive(Clone)] struct MyRegistry;
@@ -408,13 +408,15 @@ fn create_hint<H: EcosystemHandler>(
         label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
             value: label_text,
             tooltip: Some(
-                tower_lsp::lsp_types::InlayHintLabelPartTooltip::MarkupContent(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: tooltip_content,
-                }),
+                tower_lsp_server::ls_types::InlayHintLabelPartTooltip::MarkupContent(
+                    MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: tooltip_content,
+                    },
+                ),
             ),
             location: None,
-            command: Some(tower_lsp::lsp_types::Command {
+            command: Some(tower_lsp_server::ls_types::Command {
                 title: format!("Open on {}", H::ecosystem_display_name()),
                 command: "vscode.open".into(),
                 arguments: Some(vec![serde_json::json!(url)]),
@@ -447,11 +449,11 @@ pub async fn generate_hover<H>(
     handler: &H,
     dep: &H::UnifiedDep,
     resolved_version: Option<&str>,
-) -> Option<tower_lsp::lsp_types::Hover>
+) -> Option<tower_lsp_server::ls_types::Hover>
 where
     H: EcosystemHandler,
 {
-    use tower_lsp::lsp_types::{Hover, HoverContents};
+    use tower_lsp_server::ls_types::{Hover, HoverContents};
 
     let typed_dep = H::extract_dependency(dep)?;
     let registry = handler.registry();
@@ -512,14 +514,14 @@ where
 ///
 /// This is a simplified version to avoid circular dependencies.
 pub struct DiagnosticsConfig {
-    pub unknown_severity: tower_lsp::lsp_types::DiagnosticSeverity,
-    pub yanked_severity: tower_lsp::lsp_types::DiagnosticSeverity,
-    pub outdated_severity: tower_lsp::lsp_types::DiagnosticSeverity,
+    pub unknown_severity: tower_lsp_server::ls_types::DiagnosticSeverity,
+    pub yanked_severity: tower_lsp_server::ls_types::DiagnosticSeverity,
+    pub outdated_severity: tower_lsp_server::ls_types::DiagnosticSeverity,
 }
 
 impl Default for DiagnosticsConfig {
     fn default() -> Self {
-        use tower_lsp::lsp_types::DiagnosticSeverity;
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
         Self {
             unknown_severity: DiagnosticSeverity::WARNING,
             yanked_severity: DiagnosticSeverity::WARNING,
@@ -549,13 +551,13 @@ impl Default for DiagnosticsConfig {
 pub async fn generate_code_actions<H>(
     handler: &H,
     dependencies: &[H::UnifiedDep],
-    uri: &tower_lsp::lsp_types::Url,
+    uri: &tower_lsp_server::ls_types::Uri,
     selected_range: Range,
-) -> Vec<tower_lsp::lsp_types::CodeActionOrCommand>
+) -> Vec<tower_lsp_server::ls_types::CodeActionOrCommand>
 where
     H: EcosystemHandler,
 {
-    use tower_lsp::lsp_types::{
+    use tower_lsp_server::ls_types::{
         CodeAction, CodeActionKind, CodeActionOrCommand, TextEdit, WorkspaceEdit,
     };
 
@@ -675,11 +677,11 @@ pub async fn generate_diagnostics<H>(
     handler: &H,
     dependencies: &[H::UnifiedDep],
     config: &DiagnosticsConfig,
-) -> Vec<tower_lsp::lsp_types::Diagnostic>
+) -> Vec<tower_lsp_server::ls_types::Diagnostic>
 where
     H: EcosystemHandler,
 {
-    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+    use tower_lsp_server::ls_types::{Diagnostic, DiagnosticSeverity};
 
     let mut deps_to_check = Vec::new();
     for dep in dependencies {
@@ -784,7 +786,7 @@ where
 mod tests {
     use super::*;
     use crate::registry::PackageMetadata;
-    use tower_lsp::lsp_types::{Position, Range};
+    use tower_lsp_server::ls_types::{Position, Range};
 
     #[derive(Clone)]
     struct MockVersion {
@@ -1301,7 +1303,7 @@ mod tests {
         assert!(hover.is_some());
         let hover = hover.unwrap();
 
-        if let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents {
+        if let tower_lsp_server::ls_types::HoverContents::Markup(content) = hover.contents {
             assert!(content.value.contains("serde"));
             assert!(content.value.contains("1.0.195"));
             assert!(content.value.contains("Current"));
@@ -1329,7 +1331,7 @@ mod tests {
         assert!(hover.is_some());
         let hover = hover.unwrap();
 
-        if let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents {
+        if let tower_lsp_server::ls_types::HoverContents::Markup(content) = hover.contents {
             assert!(content.value.contains("Warning"));
             assert!(content.value.contains("yanked"));
         } else {
@@ -1370,7 +1372,7 @@ mod tests {
         assert!(hover.is_some());
         let hover = hover.unwrap();
 
-        if let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents {
+        if let tower_lsp_server::ls_types::HoverContents::Markup(content) = hover.contents {
             assert!(!content.value.contains("Current"));
         } else {
             panic!("Expected Markup content");
@@ -1404,7 +1406,7 @@ mod tests {
         assert!(hover.is_some());
         let hover = hover.unwrap();
 
-        if let tower_lsp::lsp_types::HoverContents::Markup(content) = hover.contents {
+        if let tower_lsp_server::ls_types::HoverContents::Markup(content) = hover.contents {
             // Should show the resolved version (1.0.195) not manifest version (1.0)
             assert!(content.value.contains("**Current**: `1.0.195`"));
             assert!(!content.value.contains("**Current**: `1.0`"));
@@ -1415,7 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_empty_when_up_to_date() {
-        use tower_lsp::lsp_types::Url;
+        use tower_lsp_server::ls_types::Uri;
 
         let cache = Arc::new(HttpCache::new());
         let handler = MockHandler::new(cache);
@@ -1436,7 +1438,7 @@ mod tests {
             name_range: Range::default(),
         }];
 
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let selected_range = Range {
             start: Position {
                 line: 0,
@@ -1455,7 +1457,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_update_outdated() {
-        use tower_lsp::lsp_types::{CodeActionOrCommand, Url};
+        use tower_lsp_server::ls_types::{CodeActionOrCommand, Uri};
 
         let cache = Arc::new(HttpCache::new());
         let handler = MockHandler::new(cache);
@@ -1476,7 +1478,7 @@ mod tests {
             name_range: Range::default(),
         }];
 
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let selected_range = Range {
             start: Position {
                 line: 0,
@@ -1504,7 +1506,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_missing_version_range() {
-        use tower_lsp::lsp_types::Url;
+        use tower_lsp_server::ls_types::Uri;
 
         let cache = Arc::new(HttpCache::new());
         let handler = MockHandler::new(cache);
@@ -1516,7 +1518,7 @@ mod tests {
             name_range: Range::default(),
         }];
 
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let selected_range = Range {
             start: Position {
                 line: 0,
@@ -1535,7 +1537,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_no_overlap() {
-        use tower_lsp::lsp_types::Url;
+        use tower_lsp_server::ls_types::Uri;
 
         let cache = Arc::new(HttpCache::new());
         let handler = MockHandler::new(cache);
@@ -1556,7 +1558,7 @@ mod tests {
             name_range: Range::default(),
         }];
 
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let selected_range = Range {
             start: Position {
                 line: 5,
@@ -1575,7 +1577,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_filters_deprecated() {
-        use tower_lsp::lsp_types::{CodeActionOrCommand, Url};
+        use tower_lsp_server::ls_types::{CodeActionOrCommand, Uri};
 
         let cache = Arc::new(HttpCache::new());
         let handler = MockHandler::new(cache);
@@ -1596,7 +1598,7 @@ mod tests {
             name_range: Range::default(),
         }];
 
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let selected_range = Range {
             start: Position {
                 line: 0,
@@ -1702,7 +1704,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_diagnostics_deprecated_version() {
-        use tower_lsp::lsp_types::DiagnosticSeverity;
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
 
         let cache = Arc::new(HttpCache::new());
         let handler = MockHandler::new(cache);
@@ -1733,7 +1735,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_diagnostics_unknown_package() {
-        use tower_lsp::lsp_types::DiagnosticSeverity;
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
 
         let cache = Arc::new(HttpCache::new());
         let handler = MockHandler::new(cache);
@@ -1792,7 +1794,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_diagnostics_outdated_version() {
-        use tower_lsp::lsp_types::DiagnosticSeverity;
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
 
         let cache = Arc::new(HttpCache::new());
         let mut handler = MockHandler::new(cache);
@@ -1840,7 +1842,7 @@ mod tests {
 
     #[test]
     fn test_diagnostics_config_default() {
-        use tower_lsp::lsp_types::DiagnosticSeverity;
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
 
         let config = DiagnosticsConfig::default();
         assert_eq!(config.unknown_severity, DiagnosticSeverity::WARNING);

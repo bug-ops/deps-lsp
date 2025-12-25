@@ -26,7 +26,7 @@
 //!
 //! ```no_run
 //! use deps_pypi::PypiParser;
-//! use tower_lsp::lsp_types::Url;
+//! use tower_lsp_server::ls_types::Uri;
 //!
 //! let content = r#"
 //! [project]
@@ -37,7 +37,7 @@
 //! "#;
 //!
 //! let parser = PypiParser::new();
-//! let uri = Url::parse("file:///project/pyproject.toml").unwrap();
+//! let uri = Uri::from_file_path("/project/pyproject.toml").unwrap();
 //! let result = parser.parse_content(content, &uri).unwrap();
 //!
 //! assert_eq!(result.dependencies.len(), 2);

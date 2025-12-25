@@ -4,7 +4,7 @@ use pep508_rs::{Requirement, VersionOrUrl};
 use std::any::Any;
 use std::str::FromStr;
 use toml_edit::{DocumentMut, Item, Table};
-use tower_lsp::lsp_types::{Position, Range, Url};
+use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 /// Parse result containing all dependencies from pyproject.toml.
 ///
@@ -16,7 +16,7 @@ pub struct ParseResult {
     /// Workspace root path (None for Python - no workspace concept like Cargo)
     pub workspace_root: Option<std::path::PathBuf>,
     /// URI of the parsed file
-    pub uri: Url,
+    pub uri: Uri,
 }
 
 impl deps_core::ParseResult for ParseResult {
@@ -31,7 +31,7 @@ impl deps_core::ParseResult for ParseResult {
         self.workspace_root.as_deref()
     }
 
-    fn uri(&self) -> &Url {
+    fn uri(&self) -> &Uri {
         &self.uri
     }
 
@@ -49,7 +49,7 @@ impl deps_core::ParseResult for ParseResult {
 ///
 /// ```no_run
 /// use deps_pypi::parser::PypiParser;
-/// use tower_lsp::lsp_types::Url;
+/// use tower_lsp_server::ls_types::Uri;
 ///
 /// let content = r#"
 /// [project]
@@ -57,7 +57,7 @@ impl deps_core::ParseResult for ParseResult {
 /// "#;
 ///
 /// let parser = PypiParser::new();
-/// let uri = Url::parse("file:///test/pyproject.toml").unwrap();
+/// let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
 /// let result = parser.parse_content(content, &uri).unwrap();
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
@@ -83,13 +83,13 @@ impl PypiParser {
     ///
     /// ```no_run
     /// # use deps_pypi::parser::PypiParser;
-    /// # use tower_lsp::lsp_types::Url;
+    /// # use tower_lsp_server::ls_types::Uri;
     /// let parser = PypiParser::new();
     /// let content = std::fs::read_to_string("pyproject.toml").unwrap();
-    /// let uri = Url::parse("file:///project/pyproject.toml").unwrap();
+    /// let uri = Uri::from_file_path("/project/pyproject.toml").unwrap();
     /// let result = parser.parse_content(&content, &uri).unwrap();
     /// ```
-    pub fn parse_content(&self, content: &str, uri: &Url) -> Result<ParseResult> {
+    pub fn parse_content(&self, content: &str, uri: &Uri) -> Result<ParseResult> {
         let doc = content
             .parse::<DocumentMut>()
             .map_err(|e| PypiError::TomlParseError { source: e })?;
@@ -694,7 +694,7 @@ impl deps_core::ManifestParser for PypiParser {
     type Dependency = PypiDependency;
     type ParseResult = ParseResult;
 
-    fn parse(&self, content: &str, doc_uri: &Url) -> deps_core::error::Result<Self::ParseResult> {
+    fn parse(&self, content: &str, doc_uri: &Uri) -> deps_core::error::Result<Self::ParseResult> {
         self.parse_content(content, doc_uri)
             .map_err(|e| deps_core::error::DepsError::ParseError {
                 file_type: "pyproject.toml".to_string(),
@@ -756,8 +756,8 @@ impl deps_core::ParseResultInfo for ParseResult {
 mod tests {
     use super::*;
 
-    fn test_uri() -> Url {
-        Url::parse("file:///test/pyproject.toml").unwrap()
+    fn test_uri() -> Uri {
+        Uri::from_file_path("/test/pyproject.toml").unwrap()
     }
 
     #[test]

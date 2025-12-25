@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn test_extract_dependency_returns_some() {
         use crate::ParsedDependency;
-        use tower_lsp::lsp_types::{Position, Range};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let dep = ParsedDependency {
             name: "test".into(),

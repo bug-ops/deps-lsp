@@ -35,7 +35,7 @@ updates:
       # Ignore major version updates for stable dependencies
       - dependency-name: "tokio"
         update-types: ["version-update:semver-major"]
-      - dependency-name: "tower-lsp"
+      - dependency-name: "tower-lsp-server"
         update-types: ["version-update:semver-major"]
 
   # GitHub Actions

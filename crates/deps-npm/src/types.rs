@@ -1,4 +1,4 @@
-use tower_lsp::lsp_types::Range;
+use tower_lsp_server::ls_types::Range;
 
 /// Parsed dependency from package.json with position tracking.
 ///
@@ -10,7 +10,7 @@ use tower_lsp::lsp_types::Range;
 ///
 /// ```
 /// use deps_npm::types::{NpmDependency, NpmDependencySection};
-/// use tower_lsp::lsp_types::{Position, Range};
+/// use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// let dep = NpmDependency {
 ///     name: "express".into(),
@@ -139,7 +139,7 @@ deps_core::impl_metadata!(NpmPackage {
 mod tests {
     use super::*;
     use deps_core::{PackageMetadata, VersionInfo};
-    use tower_lsp::lsp_types::Position;
+    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_npm_dependency_creation() {

@@ -2,7 +2,7 @@
 
 use crate::document::ServerState;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{CodeActionOrCommand, CodeActionParams};
+use tower_lsp_server::ls_types::{CodeActionOrCommand, CodeActionParams};
 
 /// Handles code action requests using trait-based delegation.
 pub async fn handle_code_actions(
@@ -50,12 +50,12 @@ pub async fn handle_code_actions(
 mod tests {
     use super::*;
     use crate::document::{DocumentState, ServerState};
-    use tower_lsp::lsp_types::{Position, Range, TextDocumentIdentifier, Url};
+    use tower_lsp_server::ls_types::{Position, Range, TextDocumentIdentifier, Uri};
 
     #[tokio::test]
     async fn test_handle_code_actions_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         let params = CodeActionParams {
             text_document: TextDocumentIdentifier { uri },
@@ -72,7 +72,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_code_actions_cargo() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
         let content = r#"[dependencies]
@@ -103,7 +103,7 @@ serde = "1.0.0"
     #[tokio::test]
     async fn test_handle_code_actions_npm() {
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/package.json").unwrap();
+        let uri = Uri::from_file_path("/test/package.json").unwrap();
 
         let ecosystem = state.ecosystem_registry.get("npm").unwrap();
         let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
@@ -133,7 +133,7 @@ serde = "1.0.0"
         use crate::document::Ecosystem;
 
         let state = Arc::new(ServerState::new());
-        let uri = Url::parse("file:///test/Cargo.toml").unwrap();
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
         state.update_document(uri.clone(), doc_state);

@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{
-    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Url,
+use tower_lsp_server::ls_types::{
+    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
 };
 
 use deps_core::{
@@ -63,7 +63,7 @@ impl CargoEcosystem {
         };
 
         // Use dummy range - completion will be inserted at cursor position
-        let insert_range = tower_lsp::lsp_types::Range::default();
+        let insert_range = tower_lsp_server::ls_types::Range::default();
 
         results
             .into_iter()
@@ -90,7 +90,7 @@ impl CargoEcosystem {
             }
         };
 
-        let insert_range = tower_lsp::lsp_types::Range::default();
+        let insert_range = tower_lsp_server::ls_types::Range::default();
 
         // Filter by prefix (strip ^ or ~ operators)
         let clean_prefix = prefix.trim_start_matches(['^', '~', '=', '<', '>']);
@@ -154,7 +154,7 @@ impl CargoEcosystem {
             }
         };
 
-        let insert_range = tower_lsp::lsp_types::Range::default();
+        let insert_range = tower_lsp_server::ls_types::Range::default();
 
         // Get features and filter by prefix
         let features = latest.features();
@@ -180,7 +180,7 @@ impl Ecosystem for CargoEcosystem {
         &["Cargo.toml"]
     }
 
-    async fn parse_manifest(&self, content: &str, uri: &Url) -> Result<Box<dyn ParseResultTrait>> {
+    async fn parse_manifest(&self, content: &str, uri: &Uri) -> Result<Box<dyn ParseResultTrait>> {
         let result = crate::parser::parse_cargo_toml(content, uri)?;
         Ok(Box::new(result))
     }
@@ -232,7 +232,7 @@ impl Ecosystem for CargoEcosystem {
         parse_result: &dyn ParseResultTrait,
         position: Position,
         _cached_versions: &HashMap<String, String>,
-        uri: &Url,
+        uri: &Uri,
     ) -> Vec<CodeAction> {
         lsp_helpers::generate_code_actions(
             parse_result,
@@ -248,7 +248,7 @@ impl Ecosystem for CargoEcosystem {
         &self,
         parse_result: &dyn ParseResultTrait,
         _cached_versions: &HashMap<String, String>,
-        _uri: &Url,
+        _uri: &Uri,
     ) -> Vec<Diagnostic> {
         lsp_helpers::generate_diagnostics(parse_result, self.registry.as_ref(), &self.formatter)
             .await
@@ -288,7 +288,7 @@ mod tests {
     use super::*;
     use crate::types::{DependencySection, DependencySource, ParsedDependency};
     use std::collections::HashMap;
-    use tower_lsp::lsp_types::{InlayHintLabel, Position, Range};
+    use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
     /// Mock dependency for testing
     fn mock_dependency(
@@ -335,9 +335,9 @@ mod tests {
             None
         }
 
-        fn uri(&self) -> &Url {
-            static URI: once_cell::sync::Lazy<Url> =
-                once_cell::sync::Lazy::new(|| Url::parse("file:///test/Cargo.toml").unwrap());
+        fn uri(&self) -> &Uri {
+            static URI: once_cell::sync::Lazy<Uri> =
+                once_cell::sync::Lazy::new(|| Uri::from_file_path("/test/Cargo.toml").unwrap());
             &URI
         }
 

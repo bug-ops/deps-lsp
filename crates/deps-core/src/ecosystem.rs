@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp::lsp_types::{
-    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Url,
+use tower_lsp_server::ls_types::{
+    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
 };
 
 use crate::Registry;
@@ -19,7 +19,7 @@ pub trait ParseResult: Send + Sync {
     fn workspace_root(&self) -> Option<&std::path::Path>;
 
     /// Document URI
-    fn uri(&self) -> &Url;
+    fn uri(&self) -> &Uri;
 
     /// Downcast to concrete type for ecosystem-specific operations
     fn as_any(&self) -> &dyn Any;
@@ -33,13 +33,13 @@ pub trait Dependency: Send + Sync {
     fn name(&self) -> &str;
 
     /// LSP range of the dependency name
-    fn name_range(&self) -> tower_lsp::lsp_types::Range;
+    fn name_range(&self) -> tower_lsp_server::ls_types::Range;
 
     /// Version requirement string (e.g., "^1.0", ">=2.0")
     fn version_requirement(&self) -> Option<&str>;
 
     /// LSP range of the version string
-    fn version_range(&self) -> Option<tower_lsp::lsp_types::Range>;
+    fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range>;
 
     /// Dependency source (registry, git, path)
     fn source(&self) -> crate::parser::DependencySource;
@@ -92,7 +92,7 @@ impl Default for EcosystemConfig {
 /// use async_trait::async_trait;
 /// use std::sync::Arc;
 /// use std::any::Any;
-/// use tower_lsp::lsp_types::{Url, InlayHint, Hover, CodeAction, Diagnostic, CompletionItem, Position};
+/// use tower_lsp_server::ls_types::{Url, InlayHint, Hover, CodeAction, Diagnostic, CompletionItem, Position};
 ///
 /// struct MyEcosystem {
 ///     registry: Arc<dyn Registry>,
@@ -115,7 +115,7 @@ impl Default for EcosystemConfig {
 ///     async fn parse_manifest(
 ///         &self,
 ///         content: &str,
-///         uri: &Url,
+///         uri: &Uri,
 ///     ) -> deps_core::error::Result<Box<dyn ParseResult>> {
 ///         // Implementation here
 ///         todo!()
@@ -152,7 +152,7 @@ impl Default for EcosystemConfig {
 ///         parse_result: &dyn ParseResult,
 ///         position: Position,
 ///         cached_versions: &std::collections::HashMap<String, String>,
-///         uri: &Url,
+///         uri: &Uri,
 ///     ) -> Vec<CodeAction> {
 ///         vec![]
 ///     }
@@ -161,7 +161,7 @@ impl Default for EcosystemConfig {
 ///         &self,
 ///         parse_result: &dyn ParseResult,
 ///         cached_versions: &std::collections::HashMap<String, String>,
-///         uri: &Url,
+///         uri: &Uri,
 ///     ) -> Vec<Diagnostic> {
 ///         vec![]
 ///     }
@@ -211,7 +211,7 @@ pub trait Ecosystem: Send + Sync {
     async fn parse_manifest(
         &self,
         content: &str,
-        uri: &Url,
+        uri: &Uri,
     ) -> crate::error::Result<Box<dyn ParseResult>>;
 
     /// Get the registry client for this ecosystem
@@ -278,7 +278,7 @@ pub trait Ecosystem: Send + Sync {
         parse_result: &dyn ParseResult,
         position: Position,
         cached_versions: &std::collections::HashMap<String, String>,
-        uri: &Url,
+        uri: &Uri,
     ) -> Vec<CodeAction>;
 
     /// Generate diagnostics for the document
@@ -294,7 +294,7 @@ pub trait Ecosystem: Send + Sync {
         &self,
         parse_result: &dyn ParseResult,
         cached_versions: &std::collections::HashMap<String, String>,
-        uri: &Url,
+        uri: &Uri,
     ) -> Vec<Diagnostic>;
 
     /// Generate completions for a position
@@ -359,13 +359,13 @@ mod tests {
             fn name(&self) -> &str {
                 "test"
             }
-            fn name_range(&self) -> tower_lsp::lsp_types::Range {
-                tower_lsp::lsp_types::Range::default()
+            fn name_range(&self) -> tower_lsp_server::ls_types::Range {
+                tower_lsp_server::ls_types::Range::default()
             }
             fn version_requirement(&self) -> Option<&str> {
                 None
             }
-            fn version_range(&self) -> Option<tower_lsp::lsp_types::Range> {
+            fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
                 None
             }
             fn source(&self) -> crate::parser::DependencySource {

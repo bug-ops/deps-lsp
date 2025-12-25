@@ -1,5 +1,5 @@
 use std::any::Any;
-use tower_lsp::lsp_types::Range;
+use tower_lsp_server::ls_types::Range;
 
 /// Parsed dependency from pyproject.toml with position tracking.
 ///
@@ -11,7 +11,7 @@ use tower_lsp::lsp_types::Range;
 ///
 /// ```
 /// use deps_pypi::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
-/// use tower_lsp::lsp_types::{Position, Range};
+/// use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// let dep = PypiDependency {
 ///     name: "requests".into(),
@@ -334,7 +334,7 @@ impl deps_core::Metadata for PypiPackage {
 mod tests {
     use super::*;
     use deps_core::{PackageMetadata, VersionInfo};
-    use tower_lsp::lsp_types::Position;
+    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_pypi_dependency_creation() {

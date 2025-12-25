@@ -10,10 +10,10 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use deps_npm::parser::parse_package_json;
 use std::hint::black_box;
-use tower_lsp::lsp_types::Url;
+use tower_lsp_server::ls_types::Uri;
 
-fn bench_uri() -> Url {
-    Url::parse("file:///bench/package.json").unwrap()
+fn bench_uri() -> Uri {
+    Uri::from_file_path("/bench/package.json").unwrap()
 }
 
 /// Small package.json with 5 dependencies.
