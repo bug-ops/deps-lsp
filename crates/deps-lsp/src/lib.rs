@@ -1,6 +1,7 @@
 pub mod config;
 pub mod document;
 pub mod document_lifecycle;
+pub mod file_watcher;
 pub mod handlers;
 pub mod server;
 

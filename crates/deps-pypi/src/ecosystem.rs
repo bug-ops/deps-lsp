@@ -148,6 +148,10 @@ impl Ecosystem for PypiEcosystem {
         &["pyproject.toml"]
     }
 
+    fn lockfile_filenames(&self) -> &[&'static str] {
+        &["poetry.lock", "uv.lock"]
+    }
+
     async fn parse_manifest(&self, content: &str, uri: &Uri) -> Result<Box<dyn ParseResultTrait>> {
         let result = self.parser.parse_content(content, uri).map_err(|e| {
             deps_core::DepsError::ParseError {
@@ -277,6 +281,13 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
         assert_eq!(ecosystem.manifest_filenames(), &["pyproject.toml"]);
+    }
+
+    #[test]
+    fn test_ecosystem_lockfile_filenames() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        assert_eq!(ecosystem.lockfile_filenames(), &["poetry.lock", "uv.lock"]);
     }
 
     #[test]

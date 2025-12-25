@@ -27,6 +27,7 @@ tracing = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 mockito = { workspace = true }
 once_cell = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tokio-test = { workspace = true }
 

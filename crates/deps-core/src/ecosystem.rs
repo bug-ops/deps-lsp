@@ -198,6 +198,19 @@ pub trait Ecosystem: Send + Sync {
     /// to the appropriate ecosystem implementation.
     fn manifest_filenames(&self) -> &[&'static str];
 
+    /// Lock file filenames this ecosystem uses (e.g., ["Cargo.lock"])
+    ///
+    /// Used for file watching - LSP will monitor changes to these files
+    /// and refresh UI when they change. Returns empty slice if ecosystem
+    /// doesn't use lock files.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns empty slice by default, indicating no lock files are used.
+    fn lockfile_filenames(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Parse a manifest file and return parsed result
     ///
     /// # Arguments

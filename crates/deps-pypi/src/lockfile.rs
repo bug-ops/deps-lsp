@@ -40,7 +40,10 @@
 
 use async_trait::async_trait;
 use deps_core::error::{DepsError, Result};
-use deps_core::lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
+use deps_core::lockfile::{
+    LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
+    locate_lockfile_for_manifest,
+};
 use std::path::{Path, PathBuf};
 use toml_edit::DocumentMut;
 use tower_lsp_server::ls_types::Uri;
@@ -78,28 +81,15 @@ use tower_lsp_server::ls_types::Uri;
 /// ```
 pub struct PypiLockParser;
 
+impl PypiLockParser {
+    /// Lock file names for PyPI ecosystem (poetry.lock, uv.lock).
+    const LOCKFILE_NAMES: &'static [&'static str] = &["poetry.lock", "uv.lock"];
+}
+
 #[async_trait]
 impl LockFileProvider for PypiLockParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
-        let manifest_path = manifest_uri.to_file_path()?;
-        let dir = manifest_path.parent()?;
-
-        // Try poetry.lock first (more established)
-        let poetry_lock = dir.join("poetry.lock");
-        if poetry_lock.exists() {
-            tracing::debug!("Found poetry.lock at: {}", poetry_lock.display());
-            return Some(poetry_lock);
-        }
-
-        // Fall back to uv.lock
-        let uv_lock = dir.join("uv.lock");
-        if uv_lock.exists() {
-            tracing::debug!("Found uv.lock at: {}", uv_lock.display());
-            return Some(uv_lock);
-        }
-
-        tracing::debug!("No lock file found for: {:?}", manifest_uri);
-        None
+        locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
     async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {

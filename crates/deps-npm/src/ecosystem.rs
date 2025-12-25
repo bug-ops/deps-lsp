@@ -147,6 +147,10 @@ impl Ecosystem for NpmEcosystem {
         &["package.json"]
     }
 
+    fn lockfile_filenames(&self) -> &[&'static str] {
+        &["package-lock.json"]
+    }
+
     async fn parse_manifest(&self, content: &str, uri: &Uri) -> Result<Box<dyn ParseResultTrait>> {
         let result = crate::parser::parse_package_json(content, uri)?;
         Ok(Box::new(result))
@@ -271,6 +275,13 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         assert_eq!(ecosystem.manifest_filenames(), &["package.json"]);
+    }
+
+    #[test]
+    fn test_ecosystem_lockfile_filenames() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+        assert_eq!(ecosystem.lockfile_filenames(), &["package-lock.json"]);
     }
 
     #[test]

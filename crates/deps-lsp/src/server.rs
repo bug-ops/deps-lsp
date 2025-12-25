@@ -1,6 +1,7 @@
 use crate::config::DepsConfig;
 use crate::document::ServerState;
 use crate::document_lifecycle;
+use crate::file_watcher;
 use crate::handlers::{code_actions, completion, diagnostics, hover, inlay_hints};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -137,6 +138,18 @@ impl LanguageServer for Backend {
         self.client
             .log_message(MessageType::INFO, "deps-lsp ready")
             .await;
+
+        // Register lock file watchers using patterns from all ecosystems
+        let patterns = self.state.ecosystem_registry.all_lockfile_patterns();
+        if let Err(e) = file_watcher::register_lock_file_watchers(&self.client, &patterns).await {
+            tracing::warn!("Failed to register file watchers: {}", e);
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("File watching disabled: {}", e),
+                )
+                .await;
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {

@@ -180,6 +180,10 @@ impl Ecosystem for CargoEcosystem {
         &["Cargo.toml"]
     }
 
+    fn lockfile_filenames(&self) -> &[&'static str] {
+        &["Cargo.lock"]
+    }
+
     async fn parse_manifest(&self, content: &str, uri: &Uri) -> Result<Box<dyn ParseResultTrait>> {
         let result = crate::parser::parse_cargo_toml(content, uri)?;
         Ok(Box::new(result))
@@ -365,6 +369,13 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
         assert_eq!(ecosystem.manifest_filenames(), &["Cargo.toml"]);
+    }
+
+    #[test]
+    fn test_ecosystem_lockfile_filenames() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+        assert_eq!(ecosystem.lockfile_filenames(), &["Cargo.lock"]);
     }
 
     #[test]

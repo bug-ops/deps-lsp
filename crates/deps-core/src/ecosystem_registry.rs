@@ -195,6 +195,68 @@ impl EcosystemRegistry {
     pub fn ecosystem_ids(&self) -> Vec<&'static str> {
         self.ecosystems.iter().map(|e| *e.key()).collect()
     }
+
+    /// Get ecosystem for a lock file name
+    ///
+    /// # Arguments
+    ///
+    /// * `filename` - Lock file name (e.g., "Cargo.lock", "package-lock.json")
+    ///
+    /// # Returns
+    ///
+    /// * `Some(Arc<dyn Ecosystem>)` - Ecosystem using this lock file
+    /// * `None` - No ecosystem uses this lock file
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use deps_core::EcosystemRegistry;
+    ///
+    /// let registry = EcosystemRegistry::new();
+    /// // registry.register(cargo_ecosystem);
+    ///
+    /// if let Some(ecosystem) = registry.get_for_lockfile("Cargo.lock") {
+    ///     println!("Cargo.lock handled by: {}", ecosystem.display_name());
+    /// }
+    /// ```
+    pub fn get_for_lockfile(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
+        for entry in self.ecosystems.iter() {
+            let ecosystem = entry.value();
+            if ecosystem.lockfile_filenames().contains(&filename) {
+                return Some(Arc::clone(ecosystem));
+            }
+        }
+        None
+    }
+
+    /// Get all lock file patterns for file watching
+    ///
+    /// Returns glob patterns (e.g., "**/Cargo.lock") for all registered ecosystems.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use deps_core::EcosystemRegistry;
+    ///
+    /// let registry = EcosystemRegistry::new();
+    /// // registry.register(cargo_ecosystem);
+    /// // registry.register(npm_ecosystem);
+    ///
+    /// let patterns = registry.all_lockfile_patterns();
+    /// for pattern in patterns {
+    ///     println!("Watching pattern: {}", pattern);
+    /// }
+    /// ```
+    pub fn all_lockfile_patterns(&self) -> Vec<String> {
+        let mut patterns = Vec::new();
+        for entry in self.ecosystems.iter() {
+            let ecosystem = entry.value();
+            for filename in ecosystem.lockfile_filenames() {
+                patterns.push(format!("**/{}", filename));
+            }
+        }
+        patterns
+    }
 }
 
 impl Default for EcosystemRegistry {
@@ -219,6 +281,7 @@ mod tests {
         id: &'static str,
         display_name: &'static str,
         filenames: &'static [&'static str],
+        lockfiles: &'static [&'static str],
     }
 
     #[async_trait]
@@ -233,6 +296,10 @@ mod tests {
 
         fn manifest_filenames(&self) -> &[&'static str] {
             self.filenames
+        }
+
+        fn lockfile_filenames(&self) -> &[&'static str] {
+            self.lockfiles
         }
 
         async fn parse_manifest(
@@ -313,6 +380,7 @@ mod tests {
             id: "test",
             display_name: "Test Ecosystem",
             filenames: &["test.toml"],
+            lockfiles: &[],
         });
 
         registry.register(ecosystem);
@@ -328,6 +396,7 @@ mod tests {
             id: "test",
             display_name: "Test Ecosystem",
             filenames: &["test.toml"],
+            lockfiles: &[],
         });
 
         registry.register(ecosystem);
@@ -344,6 +413,7 @@ mod tests {
             id: "test",
             display_name: "Test Ecosystem",
             filenames: &["test.toml", "test.json"],
+            lockfiles: &[],
         });
 
         registry.register(ecosystem);
@@ -364,6 +434,7 @@ mod tests {
             id: "test",
             display_name: "Test Ecosystem",
             filenames: &["test.toml"],
+            lockfiles: &[],
         });
 
         registry.register(ecosystem);
@@ -384,12 +455,14 @@ mod tests {
             id: "cargo",
             display_name: "Cargo",
             filenames: &["Cargo.toml"],
+            lockfiles: &["Cargo.lock"],
         });
 
         let eco2 = Arc::new(MockEcosystem {
             id: "npm",
             display_name: "npm",
             filenames: &["package.json"],
+            lockfiles: &["package-lock.json"],
         });
 
         registry.register(eco1);
@@ -405,5 +478,120 @@ mod tests {
             registry.get_for_filename("package.json").unwrap().id(),
             "npm"
         );
+    }
+
+    #[test]
+    fn test_get_for_lockfile() {
+        let registry = EcosystemRegistry::new();
+        let ecosystem = Arc::new(MockEcosystem {
+            id: "cargo",
+            display_name: "Cargo",
+            filenames: &["Cargo.toml"],
+            lockfiles: &["Cargo.lock"],
+        });
+
+        registry.register(ecosystem);
+
+        let retrieved = registry.get_for_lockfile("Cargo.lock").unwrap();
+        assert_eq!(retrieved.id(), "cargo");
+        assert_eq!(retrieved.display_name(), "Cargo");
+
+        // Unknown lockfile should return None
+        assert!(registry.get_for_lockfile("unknown.lock").is_none());
+    }
+
+    #[test]
+    fn test_get_for_lockfile_multiple_lockfiles() {
+        let registry = EcosystemRegistry::new();
+        let ecosystem = Arc::new(MockEcosystem {
+            id: "pypi",
+            display_name: "PyPI",
+            filenames: &["pyproject.toml"],
+            lockfiles: &["poetry.lock", "uv.lock"],
+        });
+
+        registry.register(ecosystem);
+
+        let retrieved1 = registry.get_for_lockfile("poetry.lock").unwrap();
+        assert_eq!(retrieved1.id(), "pypi");
+
+        let retrieved2 = registry.get_for_lockfile("uv.lock").unwrap();
+        assert_eq!(retrieved2.id(), "pypi");
+    }
+
+    #[test]
+    fn test_all_lockfile_patterns_empty() {
+        let registry = EcosystemRegistry::new();
+        assert!(registry.all_lockfile_patterns().is_empty());
+    }
+
+    #[test]
+    fn test_all_lockfile_patterns_single_ecosystem() {
+        let registry = EcosystemRegistry::new();
+        let ecosystem = Arc::new(MockEcosystem {
+            id: "cargo",
+            display_name: "Cargo",
+            filenames: &["Cargo.toml"],
+            lockfiles: &["Cargo.lock"],
+        });
+
+        registry.register(ecosystem);
+
+        let patterns = registry.all_lockfile_patterns();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0], "**/Cargo.lock");
+    }
+
+    #[test]
+    fn test_all_lockfile_patterns_multiple_ecosystems() {
+        let registry = EcosystemRegistry::new();
+
+        let eco1 = Arc::new(MockEcosystem {
+            id: "cargo",
+            display_name: "Cargo",
+            filenames: &["Cargo.toml"],
+            lockfiles: &["Cargo.lock"],
+        });
+
+        let eco2 = Arc::new(MockEcosystem {
+            id: "npm",
+            display_name: "npm",
+            filenames: &["package.json"],
+            lockfiles: &["package-lock.json"],
+        });
+
+        let eco3 = Arc::new(MockEcosystem {
+            id: "pypi",
+            display_name: "PyPI",
+            filenames: &["pyproject.toml"],
+            lockfiles: &["poetry.lock", "uv.lock"],
+        });
+
+        registry.register(eco1);
+        registry.register(eco2);
+        registry.register(eco3);
+
+        let patterns = registry.all_lockfile_patterns();
+        assert_eq!(patterns.len(), 4);
+        assert!(patterns.contains(&"**/Cargo.lock".to_string()));
+        assert!(patterns.contains(&"**/package-lock.json".to_string()));
+        assert!(patterns.contains(&"**/poetry.lock".to_string()));
+        assert!(patterns.contains(&"**/uv.lock".to_string()));
+    }
+
+    #[test]
+    fn test_all_lockfile_patterns_no_lockfiles() {
+        let registry = EcosystemRegistry::new();
+        let ecosystem = Arc::new(MockEcosystem {
+            id: "test",
+            display_name: "Test",
+            filenames: &["test.toml"],
+            lockfiles: &[],
+        });
+
+        registry.register(ecosystem);
+
+        let patterns = registry.all_lockfile_patterns();
+        assert!(patterns.is_empty());
     }
 }

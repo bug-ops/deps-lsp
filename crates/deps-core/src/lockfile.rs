@@ -14,6 +14,93 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 use tower_lsp_server::ls_types::Uri;
 
+/// Maximum depth to search for workspace root lock file.
+const MAX_WORKSPACE_DEPTH: usize = 5;
+
+/// Generic lock file locator.
+///
+/// Searches for lock files in the following order:
+/// 1. Same directory as the manifest
+/// 2. Parent directories (up to MAX_WORKSPACE_DEPTH levels) for workspace root
+///
+/// This function is ecosystem-agnostic and works with any lock file name.
+///
+/// # Arguments
+///
+/// * `manifest_uri` - URI of the manifest file
+/// * `lockfile_names` - List of possible lock file names to search for
+///
+/// # Returns
+///
+/// Path to the first found lock file, or None if not found.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::lockfile::locate_lockfile_for_manifest;
+/// use tower_lsp_server::ls_types::Uri;
+///
+/// let manifest_uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
+/// let lockfile_names = &["Cargo.lock"];
+///
+/// if let Some(path) = locate_lockfile_for_manifest(&manifest_uri, lockfile_names) {
+///     println!("Found lock file at: {}", path.display());
+/// }
+/// ```
+pub fn locate_lockfile_for_manifest(
+    manifest_uri: &Uri,
+    lockfile_names: &[&str],
+) -> Option<PathBuf> {
+    let manifest_path = manifest_uri.to_file_path()?;
+    let manifest_dir = manifest_path.parent()?;
+
+    // Reuse single PathBuf to avoid allocations in loops
+    let mut lock_path = manifest_dir.to_path_buf();
+
+    // Try same directory as manifest
+    for &name in lockfile_names {
+        lock_path.push(name);
+        if lock_path.exists() {
+            tracing::debug!("Found {} at: {}", name, lock_path.display());
+            return Some(lock_path);
+        }
+        lock_path.pop();
+    }
+
+    // Search up the directory tree for workspace root
+    let Some(mut current_dir) = manifest_dir.parent() else {
+        tracing::debug!("No lock file found for: {:?}", manifest_uri);
+        return None;
+    };
+
+    for depth in 0..MAX_WORKSPACE_DEPTH {
+        lock_path.clear();
+        lock_path.push(current_dir);
+
+        for &name in lockfile_names {
+            lock_path.push(name);
+            if lock_path.exists() {
+                tracing::debug!(
+                    "Found workspace {} at depth {}: {}",
+                    name,
+                    depth + 1,
+                    lock_path.display()
+                );
+                return Some(lock_path);
+            }
+            lock_path.pop();
+        }
+
+        match current_dir.parent() {
+            Some(parent) => current_dir = parent,
+            None => break,
+        }
+    }
+
+    tracing::debug!("No lock file found for: {:?}", manifest_uri);
+    None
+}
+
 /// Resolved package information from a lock file.
 ///
 /// Contains the exact version and source information for a dependency
@@ -508,5 +595,87 @@ mod tests {
         cache.invalidate(&test_path);
         assert_eq!(cache.len(), 0);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_locate_lockfile_for_manifest_same_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+        let lock_path = temp_dir.path().join("Cargo.lock");
+
+        std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
+        std::fs::write(&lock_path, "version = 4").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
+
+        assert!(located.is_some());
+        assert_eq!(located.unwrap(), lock_path);
+    }
+
+    #[test]
+    fn test_locate_lockfile_for_manifest_workspace_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_lock = temp_dir.path().join("Cargo.lock");
+        let member_dir = temp_dir.path().join("crates").join("member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+
+        std::fs::write(&workspace_lock, "version = 4").unwrap();
+        std::fs::write(&member_manifest, "[package]\nname = \"member\"").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&member_manifest).unwrap();
+        let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
+
+        assert!(located.is_some());
+        assert_eq!(located.unwrap(), workspace_lock);
+    }
+
+    #[test]
+    fn test_locate_lockfile_for_manifest_not_found() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+        std::fs::write(&manifest_path, "[package]\nname = \"test\"").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let located = locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]);
+
+        assert!(located.is_none());
+    }
+
+    #[test]
+    fn test_locate_lockfile_for_manifest_multiple_names() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("pyproject.toml");
+        let uv_lock = temp_dir.path().join("uv.lock");
+
+        std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
+        std::fs::write(&uv_lock, "version = 1").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        // poetry.lock doesn't exist, but uv.lock does - should find uv.lock
+        let located = locate_lockfile_for_manifest(&manifest_uri, &["poetry.lock", "uv.lock"]);
+
+        assert!(located.is_some());
+        assert_eq!(located.unwrap(), uv_lock);
+    }
+
+    #[test]
+    fn test_locate_lockfile_for_manifest_first_match_wins() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("pyproject.toml");
+        let poetry_lock = temp_dir.path().join("poetry.lock");
+        let uv_lock = temp_dir.path().join("uv.lock");
+
+        std::fs::write(&manifest_path, "[project]\nname = \"test\"").unwrap();
+        std::fs::write(&poetry_lock, "# poetry lock").unwrap();
+        std::fs::write(&uv_lock, "version = 1").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        // Both exist, poetry.lock should be found first (listed first)
+        let located = locate_lockfile_for_manifest(&manifest_uri, &["poetry.lock", "uv.lock"]);
+
+        assert!(located.is_some());
+        assert_eq!(located.unwrap(), poetry_lock);
     }
 }

@@ -24,7 +24,10 @@
 
 use async_trait::async_trait;
 use deps_core::error::{DepsError, Result};
-use deps_core::lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
+use deps_core::lockfile::{
+    LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
+    locate_lockfile_for_manifest,
+};
 use std::path::{Path, PathBuf};
 use toml_edit::DocumentMut;
 use tower_lsp_server::ls_types::Uri;
@@ -61,41 +64,14 @@ use tower_lsp_server::ls_types::Uri;
 pub struct CargoLockParser;
 
 impl CargoLockParser {
-    /// Maximum depth to search for workspace root lock file.
-    const MAX_WORKSPACE_DEPTH: usize = 5;
+    /// Lock file names for Cargo ecosystem.
+    const LOCKFILE_NAMES: &'static [&'static str] = &["Cargo.lock"];
 }
 
 #[async_trait]
 impl LockFileProvider for CargoLockParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
-        let manifest_path = manifest_uri.to_file_path()?;
-
-        // Try same directory as manifest
-        let lock_path = manifest_path.with_file_name("Cargo.lock");
-        if lock_path.exists() {
-            tracing::debug!("Found Cargo.lock at: {}", lock_path.display());
-            return Some(lock_path);
-        }
-
-        // Search up the directory tree for workspace root
-        let mut current_dir = manifest_path.parent()?;
-
-        for depth in 0..Self::MAX_WORKSPACE_DEPTH {
-            let workspace_lock = current_dir.join("Cargo.lock");
-            if workspace_lock.exists() {
-                tracing::debug!(
-                    "Found workspace Cargo.lock at depth {}: {}",
-                    depth + 1,
-                    workspace_lock.display()
-                );
-                return Some(workspace_lock);
-            }
-
-            current_dir = current_dir.parent()?;
-        }
-
-        tracing::debug!("No Cargo.lock found for: {:?}", manifest_uri);
-        None
+        locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
     async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {

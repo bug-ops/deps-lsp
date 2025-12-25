@@ -27,7 +27,10 @@
 
 use async_trait::async_trait;
 use deps_core::error::{DepsError, Result};
-use deps_core::lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
+use deps_core::lockfile::{
+    LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
+    locate_lockfile_for_manifest,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -65,8 +68,8 @@ use tower_lsp_server::ls_types::Uri;
 pub struct NpmLockParser;
 
 impl NpmLockParser {
-    /// Maximum depth to search for workspace root lock file.
-    const MAX_WORKSPACE_DEPTH: usize = 5;
+    /// Lock file names for npm ecosystem.
+    const LOCKFILE_NAMES: &'static [&'static str] = &["package-lock.json"];
 }
 
 /// package-lock.json structure (partial, only fields we need).
@@ -101,34 +104,7 @@ struct PackageEntry {
 #[async_trait]
 impl LockFileProvider for NpmLockParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
-        let manifest_path = manifest_uri.to_file_path()?;
-
-        // Try same directory as manifest
-        let lock_path = manifest_path.with_file_name("package-lock.json");
-        if lock_path.exists() {
-            tracing::debug!("Found package-lock.json at: {}", lock_path.display());
-            return Some(lock_path);
-        }
-
-        // Search up the directory tree for workspace root
-        let mut current_dir = manifest_path.parent()?;
-
-        for depth in 0..Self::MAX_WORKSPACE_DEPTH {
-            let workspace_lock = current_dir.join("package-lock.json");
-            if workspace_lock.exists() {
-                tracing::debug!(
-                    "Found workspace package-lock.json at depth {}: {}",
-                    depth + 1,
-                    workspace_lock.display()
-                );
-                return Some(workspace_lock);
-            }
-
-            current_dir = current_dir.parent()?;
-        }
-
-        tracing::debug!("No package-lock.json found for: {:?}", manifest_uri);
-        None
+        locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
     async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {
