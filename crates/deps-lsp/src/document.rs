@@ -798,6 +798,19 @@ serde = "1.0"
     }
 
     #[test]
+    fn test_document_state_update_cached_versions() {
+        let deps = vec![create_test_cargo_dependency()];
+        let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+
+        let mut cached = HashMap::new();
+        cached.insert("serde".into(), "1.0.210".into());
+
+        state.update_cached_versions(cached);
+        assert_eq!(state.cached_versions.len(), 1);
+        assert_eq!(state.cached_versions.get("serde"), Some(&"1.0.210".into()));
+    }
+
+    #[test]
     fn test_document_state_parse_result_accessor() {
         let deps = vec![create_test_cargo_dependency()];
         let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
