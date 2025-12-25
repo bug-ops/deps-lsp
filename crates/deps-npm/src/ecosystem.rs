@@ -40,6 +40,99 @@ impl NpmEcosystem {
             formatter: NpmFormatter,
         }
     }
+
+    /// Completes package names by searching the npm registry.
+    ///
+    /// Requires at least 2 characters for search. Returns up to 20 results.
+    async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
+        use deps_core::completion::build_package_completion;
+
+        // Minimum 2 characters for search to avoid too many results
+        if prefix.len() < 2 {
+            return vec![];
+        }
+
+        // Search registry (limit to 20 results)
+        let results = match self.registry.search(prefix, 20).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Package search failed for '{}': {}", prefix, e);
+                return vec![];
+            }
+        };
+
+        // Use dummy range - completion will be inserted at cursor position
+        let insert_range = tower_lsp::lsp_types::Range::default();
+
+        results
+            .into_iter()
+            .map(|metadata| {
+                let boxed: Box<dyn deps_core::Metadata> = Box::new(metadata);
+                build_package_completion(boxed.as_ref(), insert_range)
+            })
+            .collect()
+    }
+
+    /// Completes version strings for a specific package.
+    ///
+    /// Filters versions by prefix and hides deprecated versions by default.
+    /// Returns up to 20 results, newest stable versions first.
+    async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
+        use deps_core::completion::build_version_completion;
+
+        // Fetch all versions for the package
+        let versions = match self.registry.get_versions(package_name).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
+                return vec![];
+            }
+        };
+
+        let insert_range = tower_lsp::lsp_types::Range::default();
+
+        // Filter by prefix and hide deprecated versions
+        let filtered: Vec<_> = versions
+            .iter()
+            .filter(|v| {
+                // Filter by prefix (strip operators like ^, ~, >=, etc.)
+                let clean_prefix = prefix
+                    .trim_start_matches(['^', '~', '=', '<', '>', '*'])
+                    .trim();
+                v.version.starts_with(clean_prefix) && !v.deprecated
+            })
+            .take(20)
+            .collect();
+
+        // If we have filtered results, use them; otherwise show latest stable versions
+        if !filtered.is_empty() {
+            // Use filtered results
+            filtered
+                .into_iter()
+                .map(|v| {
+                    build_version_completion(
+                        v as &dyn deps_core::Version,
+                        package_name,
+                        insert_range,
+                    )
+                })
+                .collect()
+        } else {
+            // Show up to 20 stable versions (newest first)
+            versions
+                .iter()
+                .filter(|v| !v.deprecated)
+                .take(20)
+                .map(|v| {
+                    build_version_completion(
+                        v as &dyn deps_core::Version,
+                        package_name,
+                        insert_range,
+                    )
+                })
+                .collect()
+        }
+    }
 }
 
 #[async_trait]
@@ -132,11 +225,24 @@ impl Ecosystem for NpmEcosystem {
 
     async fn generate_completions(
         &self,
-        _parse_result: &dyn ParseResultTrait,
-        _position: Position,
-        _content: &str,
+        parse_result: &dyn ParseResultTrait,
+        position: Position,
+        content: &str,
     ) -> Vec<CompletionItem> {
-        vec![]
+        use deps_core::completion::{CompletionContext, detect_completion_context};
+
+        let context = detect_completion_context(parse_result, position, content);
+
+        match context {
+            CompletionContext::PackageName { prefix } => self.complete_package_names(&prefix).await,
+            CompletionContext::Version {
+                package_name,
+                prefix,
+            } => self.complete_versions(&package_name, &prefix).await,
+            // npm doesn't have features like Cargo
+            CompletionContext::Feature { .. } => vec![],
+            CompletionContext::None => vec![],
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -176,5 +282,64 @@ mod tests {
 
         let any = ecosystem.as_any();
         assert!(any.is::<NpmEcosystem>());
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_minimum_prefix() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+
+        // Less than 2 characters should return empty
+        let results = ecosystem.complete_package_names("e").await;
+        assert!(results.is_empty());
+
+        // Empty prefix should return empty
+        let results = ecosystem.complete_package_names("").await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_complete_package_names_real_search() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+
+        let results = ecosystem.complete_package_names("expre").await;
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.label == "express"));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_complete_versions_real() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+
+        let results = ecosystem.complete_versions("express", "4.").await;
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.label.starts_with("4.")));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_complete_versions_with_operator() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+
+        let results = ecosystem.complete_versions("express", "^4.").await;
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.label.starts_with("4.")));
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_unknown_package() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+
+        // Unknown package should return empty (graceful degradation)
+        let results = ecosystem
+            .complete_versions("this-package-does-not-exist-12345", "1.0")
+            .await;
+        assert!(results.is_empty());
     }
 }
