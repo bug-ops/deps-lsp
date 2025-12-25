@@ -49,6 +49,7 @@ async fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(false)
         .init();
 
     tracing::info!("Starting deps-lsp v{VERSION}");

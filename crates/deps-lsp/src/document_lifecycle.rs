@@ -83,11 +83,16 @@ pub async fn handle_document_open(
         ecosystem.display_name()
     );
 
-    // Parse manifest
-    let parse_result = ecosystem.parse_manifest(&content, &uri).await?;
+    // Try to parse manifest (may fail for incomplete syntax)
+    let parse_result = ecosystem.parse_manifest(&content, &uri).await.ok();
 
-    // Create document state
-    let doc_state = DocumentState::new_from_parse_result(ecosystem.id(), content, parse_result);
+    // Create document state (parse_result may be None)
+    let doc_state = if let Some(pr) = parse_result {
+        DocumentState::new_from_parse_result(ecosystem.id(), content, pr)
+    } else {
+        tracing::debug!("Failed to parse manifest, storing document without parse result");
+        DocumentState::new_without_parse_result(ecosystem.id(), content)
+    };
 
     state.update_document(uri.clone(), doc_state);
 
@@ -182,11 +187,16 @@ pub async fn handle_document_change(
         }
     };
 
-    // Parse manifest
-    let parse_result = ecosystem.parse_manifest(&content, &uri).await?;
+    // Try to parse manifest (may fail for incomplete syntax)
+    let parse_result = ecosystem.parse_manifest(&content, &uri).await.ok();
 
-    // Update document state
-    let doc_state = DocumentState::new_from_parse_result(ecosystem.id(), content, parse_result);
+    // Create document state (parse_result may be None)
+    let doc_state = if let Some(pr) = parse_result {
+        DocumentState::new_from_parse_result(ecosystem.id(), content, pr)
+    } else {
+        tracing::debug!("Failed to parse manifest, storing document without parse result");
+        DocumentState::new_without_parse_result(ecosystem.id(), content)
+    };
 
     state.update_document(uri.clone(), doc_state);
 
@@ -407,5 +417,51 @@ dependencies = ["requests>=2.0.0"]
 
         let doc = state.get_document(&uri).unwrap();
         assert_eq!(doc.ecosystem_id, "pypi");
+    }
+
+    #[tokio::test]
+    async fn test_document_stored_even_when_parsing_fails() {
+        let state = Arc::new(ServerState::new());
+        let uri = tower_lsp::lsp_types::Url::parse("file:///test/Cargo.toml").unwrap();
+        // Invalid TOML that will fail parsing
+        let content = r#"[dependencies
+serde = "1.0"
+"#;
+
+        let ecosystem = state
+            .ecosystem_registry
+            .get_for_uri(&uri)
+            .expect("Cargo ecosystem not found");
+
+        // Try to parse (will fail)
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.ok();
+        assert!(
+            parse_result.is_none(),
+            "Parsing should fail for invalid TOML"
+        );
+
+        // Create document state without parse result
+        let doc_state = if let Some(pr) = parse_result {
+            DocumentState::new_from_parse_result("cargo", content.to_string(), pr)
+        } else {
+            DocumentState::new_without_parse_result("cargo", content.to_string())
+        };
+
+        state.update_document(uri.clone(), doc_state);
+
+        // Document should be stored despite parse failure
+        let doc = state.get_document(&uri);
+        assert!(
+            doc.is_some(),
+            "Document should be stored even when parsing fails"
+        );
+
+        let doc = doc.unwrap();
+        assert_eq!(doc.ecosystem_id, "cargo");
+        assert_eq!(doc.content, content);
+        assert!(
+            doc.parse_result().is_none(),
+            "Parse result should be None for failed parse"
+        );
     }
 }

@@ -326,6 +326,31 @@ impl DocumentState {
         }
     }
 
+    /// Creates a new document state without a parse result.
+    ///
+    /// Used when parsing fails but the document should still be stored
+    /// to enable fallback completion and other LSP features.
+    pub fn new_without_parse_result(ecosystem_id: &'static str, content: String) -> Self {
+        let ecosystem = match ecosystem_id {
+            "cargo" => Ecosystem::Cargo,
+            "npm" => Ecosystem::Npm,
+            "pypi" => Ecosystem::Pypi,
+            _ => Ecosystem::Cargo, // Default fallback
+        };
+
+        Self {
+            ecosystem,
+            ecosystem_id,
+            content,
+            dependencies: vec![],
+            parse_result: None,
+            versions: HashMap::new(),
+            cached_versions: HashMap::new(),
+            resolved_versions: HashMap::new(),
+            parsed_at: Instant::now(),
+        }
+    }
+
     /// Gets a reference to the parse result if available.
     pub fn parse_result(&self) -> Option<&dyn ParseResult> {
         self.parse_result.as_ref().map(|b| b.as_ref())
@@ -866,5 +891,49 @@ serde = "1.0"
         });
 
         assert!(!git_dep.is_registry());
+    }
+
+    #[test]
+    fn test_document_state_new_without_parse_result() {
+        let content = r#"[dependencies]
+serde = "1.0"
+"#
+        .to_string();
+
+        let doc_state = DocumentState::new_without_parse_result("cargo", content.clone());
+
+        assert_eq!(doc_state.ecosystem_id, "cargo");
+        assert_eq!(doc_state.ecosystem, Ecosystem::Cargo);
+        assert_eq!(doc_state.content, content);
+        assert!(doc_state.parse_result.is_none());
+        assert!(doc_state.dependencies.is_empty());
+        assert!(doc_state.versions.is_empty());
+        assert!(doc_state.cached_versions.is_empty());
+        assert!(doc_state.resolved_versions.is_empty());
+    }
+
+    #[test]
+    fn test_document_state_new_without_parse_result_npm() {
+        let content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
+
+        let doc_state = DocumentState::new_without_parse_result("npm", content.clone());
+
+        assert_eq!(doc_state.ecosystem_id, "npm");
+        assert_eq!(doc_state.ecosystem, Ecosystem::Npm);
+        assert!(doc_state.parse_result.is_none());
+    }
+
+    #[test]
+    fn test_document_state_new_without_parse_result_pypi() {
+        let content = r#"[project]
+dependencies = ["requests>=2.0.0"]
+"#
+        .to_string();
+
+        let doc_state = DocumentState::new_without_parse_result("pypi", content.clone());
+
+        assert_eq!(doc_state.ecosystem_id, "pypi");
+        assert_eq!(doc_state.ecosystem, Ecosystem::Pypi);
+        assert!(doc_state.parse_result.is_none());
     }
 }
