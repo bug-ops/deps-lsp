@@ -9,13 +9,13 @@ use tokio::sync::RwLock;
 use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionParams, CodeActionProviderCapability, CompletionOptions,
     CompletionParams, CompletionResponse, DiagnosticOptions, DiagnosticServerCapabilities,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
-    ExecuteCommandOptions, ExecuteCommandParams, FullDocumentDiagnosticReport, Hover, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, InlayHint,
-    InlayHintParams, MessageType, OneOf, Range, RelatedFullDocumentDiagnosticReport,
-    ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit,
-    Uri, WorkspaceEdit,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
+    DocumentDiagnosticReportResult, ExecuteCommandOptions, ExecuteCommandParams,
+    FullDocumentDiagnosticReport, Hover, HoverParams, HoverProviderCapability, InitializeParams,
+    InitializeResult, InitializedParams, InlayHint, InlayHintParams, MessageType, OneOf, Range,
+    RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
 
@@ -194,6 +194,36 @@ impl LanguageServer for Backend {
 
         self.state.remove_document(&uri);
         self.state.cancel_background_task(&uri).await;
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        tracing::debug!("Received {} file change events", params.changes.len());
+
+        for change in params.changes {
+            let Some(path) = change.uri.to_file_path() else {
+                tracing::warn!("Invalid file path in change event: {:?}", change.uri);
+                continue;
+            };
+
+            let Some(filename) = file_watcher::extract_lockfile_name(&path) else {
+                continue;
+            };
+
+            let Some(ecosystem) = self.state.ecosystem_registry.get_for_lockfile(filename) else {
+                tracing::debug!("Skipping non-lock-file change: {}", filename);
+                continue;
+            };
+
+            tracing::info!(
+                "Lock file changed: {} (ecosystem: {})",
+                filename,
+                ecosystem.id()
+            );
+
+            self.state.lockfile_cache.invalidate(&path);
+
+            // TODO: Phase 3 - Update affected documents and refresh UI
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
