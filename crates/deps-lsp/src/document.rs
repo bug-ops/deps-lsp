@@ -807,10 +807,7 @@ serde = "1.0"
 
         state.update_cached_versions(cached);
         assert_eq!(state.cached_versions.len(), 1);
-        assert_eq!(
-            state.cached_versions.get("serde"),
-            Some(&"1.0.210".into())
-        );
+        assert_eq!(state.cached_versions.get("serde"), Some(&"1.0.210".into()));
     }
 
     #[test]

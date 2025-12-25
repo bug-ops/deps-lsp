@@ -155,7 +155,6 @@ impl Backend {
         for uri in affected_uris {
             if let Some(mut doc) = self.state.documents.get_mut(&uri) {
                 doc.update_resolved_versions(resolved_versions.clone());
-                // Use resolved versions as cached versions for instant display
                 doc.update_cached_versions(resolved_versions.clone());
             }
 
