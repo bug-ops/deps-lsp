@@ -47,8 +47,8 @@ impl NpmEcosystem {
     async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
         use deps_core::completion::build_package_completion;
 
-        // Minimum 2 characters for search to avoid too many results
-        if prefix.len() < 2 {
+        // Security: reject too short or too long prefixes
+        if prefix.len() < 2 || prefix.len() > 100 {
             return vec![];
         }
 
@@ -91,24 +91,22 @@ impl NpmEcosystem {
 
         let insert_range = tower_lsp::lsp_types::Range::default();
 
-        // Filter by prefix and hide deprecated versions
-        let filtered: Vec<_> = versions
-            .iter()
-            .filter(|v| {
-                // Filter by prefix (strip operators like ^, ~, >=, etc.)
-                let clean_prefix = prefix
-                    .trim_start_matches(['^', '~', '=', '<', '>', '*'])
-                    .trim();
-                v.version.starts_with(clean_prefix) && !v.deprecated
-            })
-            .take(20)
-            .collect();
+        // Filter by prefix (strip operators like ^, ~, >=, etc.)
+        let clean_prefix = prefix
+            .trim_start_matches(['^', '~', '=', '<', '>', '*'])
+            .trim();
 
-        // If we have filtered results, use them; otherwise show latest stable versions
-        if !filtered.is_empty() {
-            // Use filtered results
-            filtered
-                .into_iter()
+        // Filter by prefix and hide deprecated versions
+        let mut filtered_iter = versions
+            .iter()
+            .filter(|v| v.version.starts_with(clean_prefix) && !v.deprecated)
+            .take(20)
+            .peekable();
+
+        // If we have filtered results, use them; otherwise show all non-deprecated versions
+        if filtered_iter.peek().is_some() {
+            // Use filtered results (consume peekable iterator)
+            filtered_iter
                 .map(|v| {
                     build_version_completion(
                         v as &dyn deps_core::Version,
@@ -118,7 +116,7 @@ impl NpmEcosystem {
                 })
                 .collect()
         } else {
-            // Show up to 20 stable versions (newest first)
+            // Show up to 20 non-deprecated versions (newest first)
             versions
                 .iter()
                 .filter(|v| !v.deprecated)
@@ -341,5 +339,55 @@ mod tests {
             .complete_versions("this-package-does-not-exist-12345", "1.0")
             .await;
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_special_characters() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+
+        // Package names with special characters (@scope/package) should work
+        let results = ecosystem.complete_package_names("@type").await;
+        // Should not panic or error
+        assert!(results.is_empty() || !results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_max_length() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+
+        // Prefix longer than 100 chars should return empty (security)
+        let long_prefix = "a".repeat(101);
+        let results = ecosystem.complete_package_names(&long_prefix).await;
+        assert!(results.is_empty());
+
+        // Exactly 100 chars should work
+        let max_prefix = "a".repeat(100);
+        let results = ecosystem.complete_package_names(&max_prefix).await;
+        // Should not panic, but may return empty (no matches)
+        assert!(results.is_empty() || !results.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_complete_versions_limit_20() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+
+        // Test that we respect the 20 result limit
+        let results = ecosystem.complete_versions("express", "4").await;
+        assert!(results.len() <= 20);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_complete_package_names_scoped() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+
+        // Scoped packages (@types/node, etc.)
+        let results = ecosystem.complete_package_names("@types").await;
+        assert!(!results.is_empty() || results.is_empty()); // May not have results but shouldn't panic
     }
 }

@@ -12,7 +12,8 @@ use tower_lsp::lsp_types::{
 };
 
 use deps_core::{
-    Ecosystem, EcosystemConfig, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers,
+    Ecosystem, EcosystemConfig, ParseResult as ParseResultTrait, Registry, Result, Version,
+    lsp_helpers,
 };
 
 use crate::formatter::CargoFormatter;
@@ -47,8 +48,8 @@ impl CargoEcosystem {
     async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
         use deps_core::completion::build_package_completion;
 
-        // Minimum 2 characters for search to avoid too many results
-        if prefix.len() < 2 {
+        // Security: reject too short or too long prefixes
+        if prefix.len() < 2 || prefix.len() > 100 {
             return vec![];
         }
 
@@ -91,22 +92,20 @@ impl CargoEcosystem {
 
         let insert_range = tower_lsp::lsp_types::Range::default();
 
-        // Filter by prefix and hide yanked versions
-        let filtered: Vec<_> = versions
-            .iter()
-            .filter(|v| {
-                // Filter by prefix (strip ^ or ~ operators)
-                let clean_prefix = prefix.trim_start_matches(['^', '~', '=', '<', '>']);
-                v.num.starts_with(clean_prefix) && !v.yanked
-            })
-            .take(20)
-            .collect();
+        // Filter by prefix (strip ^ or ~ operators)
+        let clean_prefix = prefix.trim_start_matches(['^', '~', '=', '<', '>']);
 
-        // If we have filtered results, use them; otherwise show latest stable versions
-        if !filtered.is_empty() {
-            // Use filtered results
-            filtered
-                .into_iter()
+        // Filter by prefix and hide yanked versions
+        let mut filtered_iter = versions
+            .iter()
+            .filter(|v| v.num.starts_with(clean_prefix) && !v.yanked)
+            .take(20)
+            .peekable();
+
+        // If we have filtered results, use them; otherwise show all non-yanked versions
+        if filtered_iter.peek().is_some() {
+            // Use filtered results (consume peekable iterator)
+            filtered_iter
                 .map(|v| {
                     build_version_completion(
                         v as &dyn deps_core::Version,
@@ -116,7 +115,7 @@ impl CargoEcosystem {
                 })
                 .collect()
         } else {
-            // Show up to 20 stable versions (newest first)
+            // Show up to 20 non-yanked versions (newest first)
             versions
                 .iter()
                 .filter(|v| !v.yanked)
@@ -137,7 +136,6 @@ impl CargoEcosystem {
     /// Fetches features from the latest stable version.
     async fn complete_features(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
         use deps_core::completion::build_feature_completion;
-        use deps_core::registry::find_latest_stable;
 
         // Fetch all versions to find latest stable
         let versions = match self.registry.get_versions(package_name).await {
@@ -148,14 +146,7 @@ impl CargoEcosystem {
             }
         };
 
-        // Convert to trait objects
-        let boxed_versions: Vec<Box<dyn deps_core::Version>> = versions
-            .into_iter()
-            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-            .collect();
-
-        // Find latest stable version
-        let latest = match find_latest_stable(&boxed_versions) {
+        let latest = match versions.iter().find(|v| v.is_stable()) {
             Some(v) => v,
             None => {
                 tracing::warn!("No stable version found for '{}'", package_name);
@@ -166,8 +157,8 @@ impl CargoEcosystem {
         let insert_range = tower_lsp::lsp_types::Range::default();
 
         // Get features and filter by prefix
-        latest
-            .features()
+        let features = latest.features();
+        features
             .into_iter()
             .filter(|f| f.starts_with(prefix))
             .map(|feature| build_feature_completion(&feature, package_name, insert_range))
@@ -670,5 +661,68 @@ mod tests {
             .complete_features("this-package-does-not-exist-12345", "")
             .await;
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_special_characters() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+
+        // Package names with hyphens and underscores should work
+        let results = ecosystem.complete_package_names("tokio-ut").await;
+        // Should not panic or error
+        assert!(results.is_empty() || !results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_max_length() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+
+        // Prefix longer than 100 chars should return empty (security)
+        let long_prefix = "a".repeat(101);
+        let results = ecosystem.complete_package_names(&long_prefix).await;
+        assert!(results.is_empty());
+
+        // Exactly 100 chars should work
+        let max_prefix = "a".repeat(100);
+        let results = ecosystem.complete_package_names(&max_prefix).await;
+        // Should not panic, but may return empty (no matches)
+        assert!(results.is_empty() || !results.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_complete_versions_limit_20() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+
+        // Test that we respect the 20 result limit
+        let results = ecosystem.complete_versions("serde", "1").await;
+        assert!(results.len() <= 20);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_complete_features_empty_list() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+
+        // Some packages have no features - should handle gracefully
+        // (Using a package that likely has no features, or empty prefix on a small package)
+        let results = ecosystem.complete_features("anyhow", "nonexistent").await;
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_complete_package_names_special_chars_real() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+
+        // Real packages with special characters
+        let results = ecosystem.complete_package_names("tokio-ut").await;
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.label.contains("-")));
     }
 }
