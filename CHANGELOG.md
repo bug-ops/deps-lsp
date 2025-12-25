@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-12-25
+
+### Changed
+- **BREAKING**: Migrated from `tower-lsp` to `tower-lsp-server` v0.23 (community fork)
+  - Fixes server panics on cancelled LSP requests ([tower-lsp#417](https://github.com/ebkalderon/tower-lsp/issues/417))
+  - `Url` type renamed to `Uri` throughout the codebase
+  - Native async trait support (removed `#[async_trait]` attribute)
+- Completion requests are now ~50ms faster (removed debounce workaround)
+- Updated documentation and templates for new dependency
+
+### Added
+- Fallback completion for incomplete TOML/JSON when parsing fails
+- Support for `[workspace.dependencies]` section in Cargo.toml
+- MIT-0 license added to allowed licenses for new dependencies
+
+### Fixed
+- Server no longer crashes on rapid typing or cancelled requests
+- Documents are now stored even when initial parsing fails
+- Doctests updated for Uri type migration
+
 ## [0.3.1] - 2025-12-25
 
 ### Fixed

@@ -193,10 +193,10 @@ The codebase uses a trait-based architecture with the `Ecosystem` trait providin
 pub trait Ecosystem: Send + Sync {
     fn id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
-    fn matches_uri(&self, uri: &Url) -> bool;
+    fn matches_uri(&self, uri: &Uri) -> bool;
     fn registry(&self) -> Arc<dyn Registry>;
     fn formatter(&self) -> Arc<dyn EcosystemFormatter>;
-    async fn parse_manifest(&self, content: &str, uri: &Url) -> Result<ParseResult>;
+    async fn parse_manifest(&self, content: &str, uri: &Uri) -> Result<ParseResult>;
 }
 
 // EcosystemRegistry discovers the right handler for any manifest file
