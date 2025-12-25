@@ -83,6 +83,92 @@ impl Backend {
         }
     }
 
+    async fn handle_lockfile_change(&self, lockfile_path: &std::path::Path, ecosystem_id: &str) {
+        let Some(ecosystem) = self.state.ecosystem_registry.get(ecosystem_id) else {
+            tracing::error!("Unknown ecosystem: {}", ecosystem_id);
+            return;
+        };
+
+        let Some(lock_provider) = ecosystem.lockfile_provider() else {
+            tracing::warn!("Ecosystem {} has no lock file provider", ecosystem_id);
+            return;
+        };
+
+        // Find all open documents using this lock file
+        let affected_uris: Vec<Uri> = self
+            .state
+            .documents
+            .iter()
+            .filter_map(|entry| {
+                let uri = entry.key();
+                let doc = entry.value();
+                if doc.ecosystem_id != ecosystem_id {
+                    return None;
+                }
+                let doc_lockfile = lock_provider.locate_lockfile(uri)?;
+                if doc_lockfile == lockfile_path {
+                    Some(uri.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if affected_uris.is_empty() {
+            tracing::debug!(
+                "No open manifests affected by lock file: {}",
+                lockfile_path.display()
+            );
+            return;
+        }
+
+        tracing::info!(
+            "Updating {} manifest(s) affected by lock file change",
+            affected_uris.len()
+        );
+
+        // Reload lock file (cache was invalidated, so this re-parses)
+        let resolved_versions = match self
+            .state
+            .lockfile_cache
+            .get_or_parse(lock_provider.as_ref(), lockfile_path)
+            .await
+        {
+            Ok(packages) => packages
+                .iter()
+                .map(|(name, pkg)| (name.clone(), pkg.version.clone()))
+                .collect::<HashMap<String, String>>(),
+            Err(e) => {
+                tracing::error!("Failed to reload lock file: {}", e);
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to reload lock file: {}", e),
+                    )
+                    .await;
+                HashMap::new()
+            }
+        };
+
+        let config = self.config.read().await;
+
+        for uri in affected_uris {
+            if let Some(mut doc) = self.state.documents.get_mut(&uri) {
+                doc.update_resolved_versions(resolved_versions.clone());
+            }
+
+            let items =
+                diagnostics::handle_diagnostics(Arc::clone(&self.state), &uri, &config.diagnostics)
+                    .await;
+
+            self.client.publish_diagnostics(uri, items, None).await;
+        }
+
+        if let Err(e) = self.client.inlay_hint_refresh().await {
+            tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+        }
+    }
+
     fn server_capabilities() -> ServerCapabilities {
         ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -221,8 +307,7 @@ impl LanguageServer for Backend {
             );
 
             self.state.lockfile_cache.invalidate(&path);
-
-            // TODO: Phase 3 - Update affected documents and refresh UI
+            self.handle_lockfile_change(&path, ecosystem.id()).await;
         }
     }
 
