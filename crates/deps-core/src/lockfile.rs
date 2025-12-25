@@ -155,7 +155,7 @@ impl ResolvedPackages {
 /// #[async_trait]
 /// impl LockFileProvider for MyLockParser {
 ///     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
-///         let manifest_path = manifest_uri.to_file_path().ok()?;
+///         let manifest_path = manifest_uri.to_file_path()?;
 ///         let lock_path = manifest_path.with_file_name("my.lock");
 ///         lock_path.exists().then_some(lock_path)
 ///     }

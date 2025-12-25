@@ -92,7 +92,7 @@ impl Default for EcosystemConfig {
 /// use async_trait::async_trait;
 /// use std::sync::Arc;
 /// use std::any::Any;
-/// use tower_lsp_server::ls_types::{Url, InlayHint, Hover, CodeAction, Diagnostic, CompletionItem, Position};
+/// use tower_lsp_server::ls_types::{Uri, InlayHint, Hover, CodeAction, Diagnostic, CompletionItem, Position};
 ///
 /// struct MyEcosystem {
 ///     registry: Arc<dyn Registry>,
