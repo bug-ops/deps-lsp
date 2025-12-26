@@ -8,10 +8,12 @@ use tower_lsp_server::ls_types::{
 
 use deps_core::{
     Ecosystem, EcosystemConfig, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
+    lockfile::LockFileProvider,
     lsp_helpers,
 };
 
 use crate::formatter::{ECOSYSTEM_PASCAL}Formatter;
+use crate::lockfile::{ECOSYSTEM_PASCAL}LockfileParser;
 use crate::parser::parse_{ECOSYSTEM_SNAKE};
 use crate::registry::{ECOSYSTEM_PASCAL}Registry;
 
@@ -54,6 +56,10 @@ impl Ecosystem for {ECOSYSTEM_PASCAL}Ecosystem {
 
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone()
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn LockFileProvider>> {
+        Some(Arc::new({ECOSYSTEM_PASCAL}LockfileParser))
     }
 
     async fn generate_inlay_hints(

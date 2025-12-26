@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2025-12-26
+
+### Added
+- **Go modules support** — Full ecosystem support for Go packages (`deps-go` crate)
+  - go.mod parser with position tracking for all directives
+  - go.sum lock file parser for resolved versions
+  - Support for `require`, `replace`, `exclude` directives
+  - Indirect dependency detection (`// indirect` comments)
+  - Pseudo-version parsing and display
+  - proxy.golang.org registry client with HTTP caching
+  - Module path escaping for uppercase characters
+  - Inlay hints, hover, code actions, diagnostics
+- Lockfile template added to ecosystem templates
+- Formatter template added to ecosystem templates
+
+### Changed
+- **Feature flags for ecosystems** — Each ecosystem can now be enabled/disabled independently
+  - `cargo` — Cargo.toml support (default: enabled)
+  - `npm` — package.json support (default: enabled)
+  - `pypi` — pyproject.toml support (default: enabled)
+  - `go` — go.mod support (default: enabled)
+- Updated ECOSYSTEM_GUIDE.md with Go examples and lockfile/formatter requirements
+- Templates now include lockfile.rs.template and formatter.rs.template
+
 ## [0.4.1] - 2025-12-26
 
 ### Added
@@ -174,7 +198,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/bug-ops/deps-lsp/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/bug-ops/deps-lsp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/bug-ops/deps-lsp/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/bug-ops/deps-lsp/compare/v0.3.0...v0.3.1

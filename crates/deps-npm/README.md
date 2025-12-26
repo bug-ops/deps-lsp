@@ -22,7 +22,7 @@ This crate provides parsing and registry integration for the npm ecosystem.
 
 ```toml
 [dependencies]
-deps-npm = "0.4"
+deps-npm = "0.5"
 ```
 
 ```rust

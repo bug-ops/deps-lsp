@@ -76,9 +76,11 @@ pub async fn handle_inlay_hints(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{DocumentState, Ecosystem, ServerState};
+    use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
     use tower_lsp_server::ls_types::{TextDocumentIdentifier, Uri};
+
+    // Generic tests (no feature flag required)
 
     #[test]
     fn test_handle_inlay_hints_disabled() {
@@ -139,179 +141,200 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_handle_inlay_hints_cargo() {
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
-        let config = InlayHintsConfig {
-            enabled: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+    // Cargo-specific tests
+    #[cfg(feature = "cargo")]
+    mod cargo_tests {
+        use super::*;
+        use crate::document::{DocumentState, Ecosystem};
 
-        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-        let content = r#"[dependencies]
+        #[tokio::test]
+        async fn test_handle_inlay_hints() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let config = InlayHintsConfig {
+                enabled: true,
+                up_to_date_text: "✅".to_string(),
+                needs_update_text: "❌ {}".to_string(),
+            };
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = r#"[dependencies]
 serde = "1.0.0"
 "#
-        .to_string();
+            .to_string();
 
-        let parse_result = ecosystem
-            .parse_manifest(&content, &uri)
-            .await
-            .expect("Failed to parse manifest");
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
 
-        let doc_state = DocumentState::new_from_parse_result("cargo", content, parse_result);
-        state.update_document(uri.clone(), doc_state);
+            let doc_state = DocumentState::new_from_parse_result("cargo", content, parse_result);
+            state.update_document(uri.clone(), doc_state);
 
-        let params = InlayHintParams {
-            text_document: TextDocumentIdentifier { uri },
-            work_done_progress_params: Default::default(),
-            range: tower_lsp_server::ls_types::Range::new(
-                tower_lsp_server::ls_types::Position::new(0, 0),
-                tower_lsp_server::ls_types::Position::new(100, 0),
-            ),
-        };
+            let params = InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                range: tower_lsp_server::ls_types::Range::new(
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                    tower_lsp_server::ls_types::Position::new(100, 0),
+                ),
+            };
 
-        let (client, full_config) = create_test_client_and_config();
-        let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
-        // Test passes if no panic occurs
+            let (client, full_config) = create_test_client_and_config();
+            let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
+            // Test passes if no panic occurs
+        }
+
+        #[tokio::test]
+        async fn test_handle_inlay_hints_no_parse_result() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let config = InlayHintsConfig {
+                enabled: true,
+                up_to_date_text: "✅".to_string(),
+                needs_update_text: "❌ {}".to_string(),
+            };
+
+            let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
+            state.update_document(uri.clone(), doc_state);
+
+            let params = InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                range: tower_lsp_server::ls_types::Range::new(
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                    tower_lsp_server::ls_types::Position::new(100, 0),
+                ),
+            };
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_inlay_hints(state, params, &config, client, full_config).await;
+            assert!(result.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_handle_inlay_hints_custom_config() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let config = InlayHintsConfig {
+                enabled: true,
+                up_to_date_text: "OK".to_string(),
+                needs_update_text: "UPDATE: {}".to_string(),
+            };
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = r#"[dependencies]
+serde = "1.0.0"
+"#
+            .to_string();
+
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let doc_state = DocumentState::new_from_parse_result("cargo", content, parse_result);
+            state.update_document(uri.clone(), doc_state);
+
+            let params = InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                range: tower_lsp_server::ls_types::Range::new(
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                    tower_lsp_server::ls_types::Position::new(100, 0),
+                ),
+            };
+
+            let (client, full_config) = create_test_client_and_config();
+            let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
+            // Test passes if no panic occurs
+        }
     }
 
-    #[tokio::test]
-    async fn test_handle_inlay_hints_npm() {
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
-        let config = InlayHintsConfig {
-            enabled: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+    // npm-specific tests
+    #[cfg(feature = "npm")]
+    mod npm_tests {
+        use super::*;
+        use crate::document::DocumentState;
 
-        let ecosystem = state.ecosystem_registry.get("npm").unwrap();
-        let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
+        #[tokio::test]
+        async fn test_handle_inlay_hints() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/package.json").unwrap();
+            let config = InlayHintsConfig {
+                enabled: true,
+                up_to_date_text: "✅".to_string(),
+                needs_update_text: "❌ {}".to_string(),
+            };
 
-        let parse_result = ecosystem
-            .parse_manifest(&content, &uri)
-            .await
-            .expect("Failed to parse manifest");
+            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
-        let doc_state = DocumentState::new_from_parse_result("npm", content, parse_result);
-        state.update_document(uri.clone(), doc_state);
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
 
-        let params = InlayHintParams {
-            text_document: TextDocumentIdentifier { uri },
-            work_done_progress_params: Default::default(),
-            range: tower_lsp_server::ls_types::Range::new(
-                tower_lsp_server::ls_types::Position::new(0, 0),
-                tower_lsp_server::ls_types::Position::new(100, 0),
-            ),
-        };
+            let doc_state = DocumentState::new_from_parse_result("npm", content, parse_result);
+            state.update_document(uri.clone(), doc_state);
 
-        let (client, full_config) = create_test_client_and_config();
-        let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
-        // Test passes if no panic occurs
+            let params = InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                range: tower_lsp_server::ls_types::Range::new(
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                    tower_lsp_server::ls_types::Position::new(100, 0),
+                ),
+            };
+
+            let (client, full_config) = create_test_client_and_config();
+            let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
+            // Test passes if no panic occurs
+        }
     }
 
-    #[tokio::test]
-    async fn test_handle_inlay_hints_pypi() {
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
-        let config = InlayHintsConfig {
-            enabled: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
+    // PyPI-specific tests
+    #[cfg(feature = "pypi")]
+    mod pypi_tests {
+        use super::*;
+        use crate::document::DocumentState;
 
-        let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
-        let content = r#"[project]
+        #[tokio::test]
+        async fn test_handle_inlay_hints() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+            let config = InlayHintsConfig {
+                enabled: true,
+                up_to_date_text: "✅".to_string(),
+                needs_update_text: "❌ {}".to_string(),
+            };
+
+            let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
+            let content = r#"[project]
 dependencies = ["requests>=2.0.0"]
 "#
-        .to_string();
+            .to_string();
 
-        let parse_result = ecosystem
-            .parse_manifest(&content, &uri)
-            .await
-            .expect("Failed to parse manifest");
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
 
-        let doc_state = DocumentState::new_from_parse_result("pypi", content, parse_result);
-        state.update_document(uri.clone(), doc_state);
+            let doc_state = DocumentState::new_from_parse_result("pypi", content, parse_result);
+            state.update_document(uri.clone(), doc_state);
 
-        let params = InlayHintParams {
-            text_document: TextDocumentIdentifier { uri },
-            work_done_progress_params: Default::default(),
-            range: tower_lsp_server::ls_types::Range::new(
-                tower_lsp_server::ls_types::Position::new(0, 0),
-                tower_lsp_server::ls_types::Position::new(100, 0),
-            ),
-        };
+            let params = InlayHintParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                range: tower_lsp_server::ls_types::Range::new(
+                    tower_lsp_server::ls_types::Position::new(0, 0),
+                    tower_lsp_server::ls_types::Position::new(100, 0),
+                ),
+            };
 
-        let (client, full_config) = create_test_client_and_config();
-        let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
-        // Test passes if no panic occurs
-    }
-
-    #[tokio::test]
-    async fn test_handle_inlay_hints_no_parse_result() {
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
-        let config = InlayHintsConfig {
-            enabled: true,
-            up_to_date_text: "✅".to_string(),
-            needs_update_text: "❌ {}".to_string(),
-        };
-
-        let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
-        state.update_document(uri.clone(), doc_state);
-
-        let params = InlayHintParams {
-            text_document: TextDocumentIdentifier { uri },
-            work_done_progress_params: Default::default(),
-            range: tower_lsp_server::ls_types::Range::new(
-                tower_lsp_server::ls_types::Position::new(0, 0),
-                tower_lsp_server::ls_types::Position::new(100, 0),
-            ),
-        };
-
-        let (client, full_config) = create_test_client_and_config();
-        let result = handle_inlay_hints(state, params, &config, client, full_config).await;
-        assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_handle_inlay_hints_custom_config() {
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
-        let config = InlayHintsConfig {
-            enabled: true,
-            up_to_date_text: "OK".to_string(),
-            needs_update_text: "UPDATE: {}".to_string(),
-        };
-
-        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-        let content = r#"[dependencies]
-serde = "1.0.0"
-"#
-        .to_string();
-
-        let parse_result = ecosystem
-            .parse_manifest(&content, &uri)
-            .await
-            .expect("Failed to parse manifest");
-
-        let doc_state = DocumentState::new_from_parse_result("cargo", content, parse_result);
-        state.update_document(uri.clone(), doc_state);
-
-        let params = InlayHintParams {
-            text_document: TextDocumentIdentifier { uri },
-            work_done_progress_params: Default::default(),
-            range: tower_lsp_server::ls_types::Range::new(
-                tower_lsp_server::ls_types::Position::new(0, 0),
-                tower_lsp_server::ls_types::Position::new(100, 0),
-            ),
-        };
-
-        let (client, full_config) = create_test_client_and_config();
-        let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
-        // Test passes if no panic occurs
+            let (client, full_config) = create_test_client_and_config();
+            let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
+            // Test passes if no panic occurs
+        }
     }
 }

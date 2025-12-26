@@ -430,178 +430,14 @@ pub async fn ensure_document_loaded(
 mod tests {
     use super::*;
 
+    // Generic tests (no feature flag required)
+
     #[test]
-    fn test_ecosystem_registry_lookup() {
+    fn test_ecosystem_registry_unknown_file() {
         let state = ServerState::new();
-
-        let cargo_uri =
-            tower_lsp_server::ls_types::Uri::from_file_path("/test/Cargo.toml").unwrap();
-        assert!(state.ecosystem_registry.get_for_uri(&cargo_uri).is_some());
-
-        let npm_uri =
-            tower_lsp_server::ls_types::Uri::from_file_path("/test/package.json").unwrap();
-        assert!(state.ecosystem_registry.get_for_uri(&npm_uri).is_some());
-
-        let pypi_uri =
-            tower_lsp_server::ls_types::Uri::from_file_path("/test/pyproject.toml").unwrap();
-        assert!(state.ecosystem_registry.get_for_uri(&pypi_uri).is_some());
-
         let unknown_uri =
             tower_lsp_server::ls_types::Uri::from_file_path("/test/unknown.txt").unwrap();
         assert!(state.ecosystem_registry.get_for_uri(&unknown_uri).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_document_parsing_cargo() {
-        let state = Arc::new(ServerState::new());
-        let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/Cargo.toml").unwrap();
-        let content = r#"[dependencies]
-serde = "1.0"
-"#;
-
-        let ecosystem = state
-            .ecosystem_registry
-            .get_for_uri(&uri)
-            .expect("Cargo ecosystem not found");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await;
-        assert!(parse_result.is_ok());
-
-        let doc_state = DocumentState::new_from_parse_result(
-            "cargo",
-            content.to_string(),
-            parse_result.unwrap(),
-        );
-        state.update_document(uri.clone(), doc_state);
-
-        assert_eq!(state.document_count(), 1);
-        let doc = state.get_document(&uri).unwrap();
-        assert_eq!(doc.ecosystem_id, "cargo");
-    }
-
-    #[tokio::test]
-    async fn test_document_parsing_npm() {
-        let state = Arc::new(ServerState::new());
-        let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/package.json").unwrap();
-        let content = r#"{"dependencies": {"express": "^4.18.0"}}"#;
-
-        let ecosystem = state
-            .ecosystem_registry
-            .get_for_uri(&uri)
-            .expect("npm ecosystem not found");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await;
-        assert!(parse_result.is_ok());
-
-        let doc_state =
-            DocumentState::new_from_parse_result("npm", content.to_string(), parse_result.unwrap());
-        state.update_document(uri.clone(), doc_state);
-
-        let doc = state.get_document(&uri).unwrap();
-        assert_eq!(doc.ecosystem_id, "npm");
-    }
-
-    #[tokio::test]
-    async fn test_document_parsing_pypi() {
-        let state = Arc::new(ServerState::new());
-        let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/pyproject.toml").unwrap();
-        let content = r#"[project]
-dependencies = ["requests>=2.0.0"]
-"#;
-
-        let ecosystem = state
-            .ecosystem_registry
-            .get_for_uri(&uri)
-            .expect("pypi ecosystem not found");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await;
-        assert!(parse_result.is_ok());
-
-        let doc_state = DocumentState::new_from_parse_result(
-            "pypi",
-            content.to_string(),
-            parse_result.unwrap(),
-        );
-        state.update_document(uri.clone(), doc_state);
-
-        let doc = state.get_document(&uri).unwrap();
-        assert_eq!(doc.ecosystem_id, "pypi");
-    }
-
-    #[tokio::test]
-    async fn test_document_stored_even_when_parsing_fails() {
-        let state = Arc::new(ServerState::new());
-        let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/Cargo.toml").unwrap();
-        // Invalid TOML that will fail parsing
-        let content = r#"[dependencies
-serde = "1.0"
-"#;
-
-        let ecosystem = state
-            .ecosystem_registry
-            .get_for_uri(&uri)
-            .expect("Cargo ecosystem not found");
-
-        // Try to parse (will fail)
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.ok();
-        assert!(
-            parse_result.is_none(),
-            "Parsing should fail for invalid TOML"
-        );
-
-        // Create document state without parse result
-        let doc_state = if let Some(pr) = parse_result {
-            DocumentState::new_from_parse_result("cargo", content.to_string(), pr)
-        } else {
-            DocumentState::new_without_parse_result("cargo", content.to_string())
-        };
-
-        state.update_document(uri.clone(), doc_state);
-
-        // Document should be stored despite parse failure
-        let doc = state.get_document(&uri);
-        assert!(
-            doc.is_some(),
-            "Document should be stored even when parsing fails"
-        );
-
-        let doc = doc.unwrap();
-        assert_eq!(doc.ecosystem_id, "cargo");
-        assert_eq!(doc.content, content);
-        assert!(
-            doc.parse_result().is_none(),
-            "Parse result should be None for failed parse"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ensure_document_loaded_fast_path() {
-        // Fast path: document already loaded, should return true without loading
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
-        let content = r#"[dependencies]
-serde = "1.0""#;
-
-        // Pre-populate state with document
-        let ecosystem = state
-            .ecosystem_registry
-            .get_for_uri(&uri)
-            .expect("Cargo ecosystem");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let doc_state =
-            DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result);
-        state.update_document(uri.clone(), doc_state);
-
-        // Fast path check: document exists
-        assert!(
-            state.get_document(&uri).is_some(),
-            "Document should exist in state"
-        );
-        assert_eq!(state.document_count(), 1, "Document count should be 1");
-
-        // The fast path in ensure_document_loaded would return true here without
-        // requiring a Client. We test the condition directly since creating a test
-        // Client requires complex tower-lsp-server internals (ServerState, ClientSocket).
     }
 
     #[tokio::test]
@@ -633,74 +469,317 @@ serde = "1.0""#;
         // This error would cause ensure_document_loaded to return false
     }
 
-    #[tokio::test]
-    async fn test_ensure_document_loaded_successful_disk_load() {
-        // Test successful load from filesystem with temp file
-        use super::load_document_from_disk;
-        use std::fs;
-        use tempfile::TempDir;
+    // Cargo-specific tests
+    #[cfg(feature = "cargo")]
+    mod cargo_tests {
+        use super::*;
 
-        // Create a temporary directory with a Cargo.toml file
-        let temp_dir = TempDir::new().unwrap();
-        let cargo_toml_path = temp_dir.path().join("Cargo.toml");
-        let content = r#"[package]
+        #[test]
+        fn test_ecosystem_registry_lookup() {
+            let state = ServerState::new();
+            let cargo_uri =
+                tower_lsp_server::ls_types::Uri::from_file_path("/test/Cargo.toml").unwrap();
+            assert!(state.ecosystem_registry.get_for_uri(&cargo_uri).is_some());
+        }
+
+        #[tokio::test]
+        async fn test_document_parsing() {
+            let state = Arc::new(ServerState::new());
+            let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let content = r#"[dependencies]
+serde = "1.0"
+"#;
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Cargo ecosystem not found");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await;
+            assert!(parse_result.is_ok());
+
+            let doc_state = DocumentState::new_from_parse_result(
+                "cargo",
+                content.to_string(),
+                parse_result.unwrap(),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            assert_eq!(state.document_count(), 1);
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.ecosystem_id, "cargo");
+        }
+
+        #[tokio::test]
+        async fn test_document_stored_even_when_parsing_fails() {
+            let state = Arc::new(ServerState::new());
+            let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/Cargo.toml").unwrap();
+            // Invalid TOML that will fail parsing
+            let content = r#"[dependencies
+serde = "1.0"
+"#;
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Cargo ecosystem not found");
+
+            // Try to parse (will fail)
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.ok();
+            assert!(
+                parse_result.is_none(),
+                "Parsing should fail for invalid TOML"
+            );
+
+            // Create document state without parse result
+            let doc_state = if let Some(pr) = parse_result {
+                DocumentState::new_from_parse_result("cargo", content.to_string(), pr)
+            } else {
+                DocumentState::new_without_parse_result("cargo", content.to_string())
+            };
+
+            state.update_document(uri.clone(), doc_state);
+
+            // Document should be stored despite parse failure
+            let doc = state.get_document(&uri);
+            assert!(
+                doc.is_some(),
+                "Document should be stored even when parsing fails"
+            );
+
+            let doc = doc.unwrap();
+            assert_eq!(doc.ecosystem_id, "cargo");
+            assert_eq!(doc.content, content);
+            assert!(
+                doc.parse_result().is_none(),
+                "Parse result should be None for failed parse"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_ensure_document_loaded_fast_path() {
+            // Fast path: document already loaded, should return true without loading
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let content = r#"[dependencies]
+serde = "1.0""#;
+
+            // Pre-populate state with document
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Cargo ecosystem");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let doc_state =
+                DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result);
+            state.update_document(uri.clone(), doc_state);
+
+            // Fast path check: document exists
+            assert!(
+                state.get_document(&uri).is_some(),
+                "Document should exist in state"
+            );
+            assert_eq!(state.document_count(), 1, "Document count should be 1");
+
+            // The fast path in ensure_document_loaded would return true here without
+            // requiring a Client. We test the condition directly since creating a test
+            // Client requires complex tower-lsp-server internals (ServerState, ClientSocket).
+        }
+
+        #[tokio::test]
+        async fn test_ensure_document_loaded_successful_disk_load() {
+            // Test successful load from filesystem with temp file
+            use super::super::load_document_from_disk;
+            use std::fs;
+            use tempfile::TempDir;
+
+            // Create a temporary directory with a Cargo.toml file
+            let temp_dir = TempDir::new().unwrap();
+            let cargo_toml_path = temp_dir.path().join("Cargo.toml");
+            let content = r#"[package]
 name = "test"
 version = "0.1.0"
 
 [dependencies]
 serde = "1.0"
 "#;
-        fs::write(&cargo_toml_path, content).unwrap();
+            fs::write(&cargo_toml_path, content).unwrap();
 
-        let uri = Uri::from_file_path(&cargo_toml_path).unwrap();
+            let uri = Uri::from_file_path(&cargo_toml_path).unwrap();
 
-        // Test that load_document_from_disk succeeds
-        let loaded_content = load_document_from_disk(&uri).await.unwrap();
-        assert_eq!(loaded_content, content);
+            // Test that load_document_from_disk succeeds
+            let loaded_content = load_document_from_disk(&uri).await.unwrap();
+            assert_eq!(loaded_content, content);
 
-        // Test that parsing succeeds
-        let state = Arc::new(ServerState::new());
-        let ecosystem = state
-            .ecosystem_registry
-            .get_for_uri(&uri)
-            .expect("Cargo ecosystem");
-        let parse_result = ecosystem.parse_manifest(&loaded_content, &uri).await;
-        assert!(parse_result.is_ok(), "Should parse successfully");
+            // Test that parsing succeeds
+            let state = Arc::new(ServerState::new());
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Cargo ecosystem");
+            let parse_result = ecosystem.parse_manifest(&loaded_content, &uri).await;
+            assert!(parse_result.is_ok(), "Should parse successfully");
 
-        // These successful operations are the building blocks of ensure_document_loaded
-    }
+            // These successful operations are the building blocks of ensure_document_loaded
+        }
 
-    #[tokio::test]
-    async fn test_ensure_document_loaded_idempotent_check() {
-        // Test that repeated loads are idempotent at the state level
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
-        let content = r#"[dependencies]
+        #[tokio::test]
+        async fn test_ensure_document_loaded_idempotent_check() {
+            // Test that repeated loads are idempotent at the state level
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let content = r#"[dependencies]
 serde = "1.0""#;
 
-        let ecosystem = state
-            .ecosystem_registry
-            .get_for_uri(&uri)
-            .expect("Cargo ecosystem");
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("Cargo ecosystem");
 
-        // Parse twice to simulate idempotent loads
-        let parse_result1 = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let parse_result2 = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            // Parse twice to simulate idempotent loads
+            let parse_result1 = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let parse_result2 = ecosystem.parse_manifest(content, &uri).await.unwrap();
 
-        // First update
-        let doc_state1 =
-            DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result1);
-        state.update_document(uri.clone(), doc_state1);
-        assert_eq!(state.document_count(), 1);
+            // First update
+            let doc_state1 =
+                DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result1);
+            state.update_document(uri.clone(), doc_state1);
+            assert_eq!(state.document_count(), 1);
 
-        // Second update (idempotent)
-        let doc_state2 =
-            DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result2);
-        state.update_document(uri.clone(), doc_state2);
-        assert_eq!(
-            state.document_count(),
-            1,
-            "Should still have only 1 document"
-        );
+            // Second update (idempotent)
+            let doc_state2 =
+                DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result2);
+            state.update_document(uri.clone(), doc_state2);
+            assert_eq!(
+                state.document_count(),
+                1,
+                "Should still have only 1 document"
+            );
+        }
+    }
+
+    // npm-specific tests
+    #[cfg(feature = "npm")]
+    mod npm_tests {
+        use super::*;
+
+        #[test]
+        fn test_ecosystem_registry_lookup() {
+            let state = ServerState::new();
+            let npm_uri =
+                tower_lsp_server::ls_types::Uri::from_file_path("/test/package.json").unwrap();
+            assert!(state.ecosystem_registry.get_for_uri(&npm_uri).is_some());
+        }
+
+        #[tokio::test]
+        async fn test_document_parsing() {
+            let state = Arc::new(ServerState::new());
+            let uri =
+                tower_lsp_server::ls_types::Uri::from_file_path("/test/package.json").unwrap();
+            let content = r#"{"dependencies": {"express": "^4.18.0"}}"#;
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("npm ecosystem not found");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await;
+            assert!(parse_result.is_ok());
+
+            let doc_state = DocumentState::new_from_parse_result(
+                "npm",
+                content.to_string(),
+                parse_result.unwrap(),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.ecosystem_id, "npm");
+        }
+    }
+
+    // PyPI-specific tests
+    #[cfg(feature = "pypi")]
+    mod pypi_tests {
+        use super::*;
+
+        #[test]
+        fn test_ecosystem_registry_lookup() {
+            let state = ServerState::new();
+            let pypi_uri =
+                tower_lsp_server::ls_types::Uri::from_file_path("/test/pyproject.toml").unwrap();
+            assert!(state.ecosystem_registry.get_for_uri(&pypi_uri).is_some());
+        }
+
+        #[tokio::test]
+        async fn test_document_parsing() {
+            let state = Arc::new(ServerState::new());
+            let uri =
+                tower_lsp_server::ls_types::Uri::from_file_path("/test/pyproject.toml").unwrap();
+            let content = r#"[project]
+dependencies = ["requests>=2.0.0"]
+"#;
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("pypi ecosystem not found");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await;
+            assert!(parse_result.is_ok());
+
+            let doc_state = DocumentState::new_from_parse_result(
+                "pypi",
+                content.to_string(),
+                parse_result.unwrap(),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.ecosystem_id, "pypi");
+        }
+    }
+
+    // Go-specific tests
+    #[cfg(feature = "go")]
+    mod go_tests {
+        use super::*;
+
+        #[test]
+        fn test_ecosystem_registry_lookup() {
+            let state = ServerState::new();
+            let go_uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/go.mod").unwrap();
+            assert!(state.ecosystem_registry.get_for_uri(&go_uri).is_some());
+        }
+
+        #[tokio::test]
+        async fn test_document_parsing() {
+            let state = Arc::new(ServerState::new());
+            let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/go.mod").unwrap();
+            let content = r#"module example.com/mymodule
+
+go 1.21
+
+require github.com/gorilla/mux v1.8.0
+"#;
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("go ecosystem not found");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await;
+            assert!(parse_result.is_ok());
+
+            let doc_state = DocumentState::new_from_parse_result(
+                "go",
+                content.to_string(),
+                parse_result.unwrap(),
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.ecosystem_id, "go");
+        }
     }
 }

@@ -13,10 +13,11 @@ crates/deps-{ecosystem}/
     ├── lib.rs          # Re-exports and module declarations
     ├── ecosystem.rs    # Ecosystem trait implementation
     ├── error.rs        # Ecosystem-specific error types
+    ├── formatter.rs    # Version display formatting
+    ├── lockfile.rs     # Lock file parsing
     ├── parser.rs       # Manifest file parsing with position tracking
     ├── registry.rs     # Package registry API client
-    ├── types.rs        # Dependency, Version, and other types
-    └── lockfile.rs     # Lock file parsing (optional)
+    └── types.rs        # Dependency, Version, and other types
 ```
 
 ## Step 1: Create the Crate
@@ -663,6 +664,8 @@ Before submitting a PR for a new ecosystem:
 - [ ] Error types with conversions to `deps_core::DepsError`
 - [ ] Types implementing `Dependency` and `Version` traits
 - [ ] Parser with accurate position tracking for names AND versions
+- [ ] Lock file parser implementing `LockFileProvider` trait
+- [ ] Formatter implementing `EcosystemFormatter` trait
 - [ ] Registry client with HTTP caching
 - [ ] Ecosystem trait implementation with all LSP features
 - [ ] Unit tests for parser edge cases
@@ -677,3 +680,8 @@ See existing implementations for reference:
 - `crates/deps-cargo/` - Rust/Cargo.toml with crates.io
 - `crates/deps-npm/` - JavaScript/package.json with npm
 - `crates/deps-pypi/` - Python/pyproject.toml with PyPI
+- `crates/deps-go/` - Go/go.mod with proxy.golang.org
+
+## Templates
+
+Use the templates in `templates/deps-ecosystem/` as a starting point for new ecosystems.

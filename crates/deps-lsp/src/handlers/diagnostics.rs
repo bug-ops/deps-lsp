@@ -63,8 +63,10 @@ pub(crate) async fn generate_diagnostics_internal(
 mod tests {
     use super::*;
     use crate::config::DiagnosticsConfig;
-    use crate::document::{DocumentState, Ecosystem, ServerState};
+    use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
+
+    // Generic tests (no feature flag required)
 
     #[tokio::test]
     async fn test_handle_diagnostics_missing_document() {
@@ -77,89 +79,110 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_handle_diagnostics_cargo() {
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
-        let config = DiagnosticsConfig::default();
+    // Cargo-specific tests
+    #[cfg(feature = "cargo")]
+    mod cargo_tests {
+        use super::*;
+        use crate::document::{DocumentState, Ecosystem};
 
-        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-        let content = r#"[dependencies]
+        #[tokio::test]
+        async fn test_handle_diagnostics() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = r#"[dependencies]
 serde = "1.0.0"
 "#
-        .to_string();
+            .to_string();
 
-        let parse_result = ecosystem
-            .parse_manifest(&content, &uri)
-            .await
-            .expect("Failed to parse manifest");
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
 
-        let doc_state = DocumentState::new_from_parse_result("cargo", content, parse_result);
-        state.update_document(uri.clone(), doc_state);
+            let doc_state = DocumentState::new_from_parse_result("cargo", content, parse_result);
+            state.update_document(uri.clone(), doc_state);
 
-        let (client, full_config) = create_test_client_and_config();
-        let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
-        // Test passes if no panic occurs
+            let (client, full_config) = create_test_client_and_config();
+            let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            // Test passes if no panic occurs
+        }
+
+        #[tokio::test]
+        async fn test_handle_diagnostics_no_parse_result() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let config = DiagnosticsConfig::default();
+
+            let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            assert!(result.is_empty());
+        }
     }
 
-    #[tokio::test]
-    async fn test_handle_diagnostics_npm() {
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
-        let config = DiagnosticsConfig::default();
+    // npm-specific tests
+    #[cfg(feature = "npm")]
+    mod npm_tests {
+        use super::*;
+        use crate::document::DocumentState;
 
-        let ecosystem = state.ecosystem_registry.get("npm").unwrap();
-        let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
+        #[tokio::test]
+        async fn test_handle_diagnostics() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/package.json").unwrap();
+            let config = DiagnosticsConfig::default();
 
-        let parse_result = ecosystem
-            .parse_manifest(&content, &uri)
-            .await
-            .expect("Failed to parse manifest");
+            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
-        let doc_state = DocumentState::new_from_parse_result("npm", content, parse_result);
-        state.update_document(uri.clone(), doc_state);
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
 
-        let (client, full_config) = create_test_client_and_config();
-        let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
-        // Test passes if no panic occurs
+            let doc_state = DocumentState::new_from_parse_result("npm", content, parse_result);
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            // Test passes if no panic occurs
+        }
     }
 
-    #[tokio::test]
-    async fn test_handle_diagnostics_pypi() {
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
-        let config = DiagnosticsConfig::default();
+    // PyPI-specific tests
+    #[cfg(feature = "pypi")]
+    mod pypi_tests {
+        use super::*;
+        use crate::document::DocumentState;
 
-        let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
-        let content = r#"[project]
+        #[tokio::test]
+        async fn test_handle_diagnostics() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
+            let content = r#"[project]
 dependencies = ["requests>=2.0.0"]
 "#
-        .to_string();
+            .to_string();
 
-        let parse_result = ecosystem
-            .parse_manifest(&content, &uri)
-            .await
-            .expect("Failed to parse manifest");
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
 
-        let doc_state = DocumentState::new_from_parse_result("pypi", content, parse_result);
-        state.update_document(uri.clone(), doc_state);
+            let doc_state = DocumentState::new_from_parse_result("pypi", content, parse_result);
+            state.update_document(uri.clone(), doc_state);
 
-        let (client, full_config) = create_test_client_and_config();
-        let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
-        // Test passes if no panic occurs
-    }
-
-    #[tokio::test]
-    async fn test_handle_diagnostics_no_parse_result() {
-        let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
-        let config = DiagnosticsConfig::default();
-
-        let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
-        state.update_document(uri.clone(), doc_state);
-
-        let (client, full_config) = create_test_client_and_config();
-        let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
-        assert!(result.is_empty());
+            let (client, full_config) = create_test_client_and_config();
+            let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+            // Test passes if no panic occurs
+        }
     }
 }

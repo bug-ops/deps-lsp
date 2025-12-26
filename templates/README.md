@@ -17,6 +17,7 @@ This directory contains template files for creating new ecosystem support in dep
 | `{MANIFEST_FILE}` | Manifest filename | `pom.xml`, `go.mod`, `packages.config` |
 | `{REGISTRY_NAME}` | Registry name | `Maven Central`, `proxy.golang.org`, `NuGet.org` |
 | `{REGISTRY_URL}` | Registry API URL | `https://search.maven.org/...` |
+| `{LOCK_FILE}` | Lock file name | `pom.xml.lock`, `go.sum`, `packages.lock.json` |
 
 4. Implement the TODO sections in each file
 5. Add your crate to the workspace in `Cargo.toml`
@@ -32,7 +33,9 @@ deps-ecosystem/
     ├── error.rs.template      # Error types
     ├── types.rs.template      # Dependency/Version types
     ├── parser.rs.template     # Manifest parser (IMPORTANT!)
+    ├── lockfile.rs.template   # Lock file parser
     ├── registry.rs.template   # Package registry client
+    ├── formatter.rs.template  # Version display formatting
     └── ecosystem.rs.template  # Main Ecosystem trait impl
 ```
 
