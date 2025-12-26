@@ -117,12 +117,10 @@ jobs:
       - name: Run cargo-deny
         run: cargo deny check
 
-      - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@cargo-semver-checks
-
-      - name: Check SemVer compliance
-        run: cargo semver-checks check-release
-        continue-on-error: true
+      # Note: cargo-semver-checks removed for pre-1.0 development
+      # Checking semver compliance for 7 crates takes 5-7 minutes
+      # and is not valuable for pre-1.0 versions (breaking changes allowed)
+      # Re-enable when approaching 1.0.0 release
 
   # Cross-platform tests with matrix
   test:
