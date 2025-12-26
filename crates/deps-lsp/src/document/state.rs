@@ -562,19 +562,7 @@ impl ServerState {
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
 
         // Register ecosystems based on enabled features
-        #[cfg(feature = "cargo")]
-        ecosystem_registry.register(Arc::new(deps_cargo::CargoEcosystem::new(Arc::clone(
-            &cache,
-        ))));
-
-        #[cfg(feature = "npm")]
-        ecosystem_registry.register(Arc::new(deps_npm::NpmEcosystem::new(Arc::clone(&cache))));
-
-        #[cfg(feature = "pypi")]
-        ecosystem_registry.register(Arc::new(deps_pypi::PypiEcosystem::new(Arc::clone(&cache))));
-
-        #[cfg(feature = "go")]
-        ecosystem_registry.register(Arc::new(deps_go::GoEcosystem::new(Arc::clone(&cache))));
+        crate::register_ecosystems(&ecosystem_registry, Arc::clone(&cache));
 
         // Create cold start limiter with default 100ms interval (10 req/sec per URI)
         let cold_start_limiter = ColdStartLimiter::new(Duration::from_millis(100));
