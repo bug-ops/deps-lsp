@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2025-12-26
+
+### Changed
+- **Ecosystem registration centralized** — All registration now uses macros in `lib.rs`
+  - `ecosystem!()` macro for feature-gated re-exports
+  - `register!()` macro for feature-gated runtime registration
+  - Adding new ecosystem requires only 2 lines in lib.rs
+- Updated ECOSYSTEM_GUIDE.md with new macro-based registration
+- Updated deps-zed README with Go support
+
 ## [0.5.0] - 2025-12-26
 
 ### Added
@@ -198,7 +208,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/bug-ops/deps-lsp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/bug-ops/deps-lsp/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/bug-ops/deps-lsp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/bug-ops/deps-lsp/compare/v0.3.1...v0.4.0

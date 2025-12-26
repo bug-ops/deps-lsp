@@ -589,31 +589,35 @@ pub use types::{{Ecosystem}Dependency, {Ecosystem}Version};
 
 ## Step 8: Register the Ecosystem
 
-In `deps-lsp/src/document.rs`, register your ecosystem:
+In `deps-lsp/src/lib.rs`, add your ecosystem using the macros:
 
 ```rust
-impl ServerState {
-    pub fn new() -> Self {
-        let cache = Arc::new(HttpCache::new());
-        let mut registry = EcosystemRegistry::new();
+// 1. Add re-exports using the ecosystem! macro
+ecosystem!(
+    "{ecosystem_id}",        // Feature flag name
+    deps_{ecosystem},        // Crate name
+    {Ecosystem}Ecosystem,    // Main ecosystem type
+    [
+        {Ecosystem}Dependency,
+        {Ecosystem}Version,
+        {Ecosystem}Registry,
+        // ... other public types
+    ]
+);
 
-        // Register existing ecosystems
-        registry.register(Arc::new(CargoEcosystem::new(Arc::clone(&cache))));
-        registry.register(Arc::new(NpmEcosystem::new(Arc::clone(&cache))));
-        registry.register(Arc::new(PypiEcosystem::new(Arc::clone(&cache))));
+// 2. Add registration in register_ecosystems() using the register! macro
+pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
+    register!("cargo", CargoEcosystem, registry, &cache);
+    register!("npm", NpmEcosystem, registry, &cache);
+    register!("pypi", PypiEcosystem, registry, &cache);
+    register!("go", GoEcosystem, registry, &cache);
 
-        // Register your new ecosystem
-        registry.register(Arc::new({Ecosystem}Ecosystem::new(Arc::clone(&cache))));
-
-        Self {
-            documents: DashMap::new(),
-            background_tasks: tokio::sync::RwLock::new(HashMap::new()),
-            ecosystem_registry: registry,
-            http_cache: cache,
-        }
-    }
+    // Add your ecosystem here:
+    register!("{ecosystem_id}", {Ecosystem}Ecosystem, registry, &cache);
 }
 ```
+
+The macros handle feature-gating automatically. When the feature is disabled, both the re-exports and registration are compiled out.
 
 ## Step 9: Add Tests
 
@@ -672,7 +676,9 @@ Before submitting a PR for a new ecosystem:
 - [ ] Integration tests for registry (can be `#[ignore]`)
 - [ ] Documentation in lib.rs with examples
 - [ ] Added to workspace members in root Cargo.toml
-- [ ] Registered in `ServerState::new()`
+- [ ] Feature flag added in deps-lsp/Cargo.toml
+- [ ] Re-exports via `ecosystem!()` macro in deps-lsp/src/lib.rs
+- [ ] Registration via `register!()` macro in deps-lsp/src/lib.rs
 
 ## Examples
 

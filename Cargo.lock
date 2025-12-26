@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "deps-cargo"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "deps-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "deps-go"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "deps-core",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "deps-lsp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "criterion",
  "dashmap",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "deps-npm"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "deps-pypi"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "criterion",
