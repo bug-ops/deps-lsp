@@ -189,18 +189,19 @@ pub async fn handle_document_open(
             progress.end(success).await;
         }
 
-        // Publish diagnostics (using internal version to avoid recursive cold start)
+        // Refresh inlay hints IMMEDIATELY after loading completes
+        // (before diagnostics which may take longer due to additional network calls)
+        if let Err(e) = client_clone.inlay_hint_refresh().await {
+            tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+        }
+
+        // Publish diagnostics (may be slower, runs after hints are already visible)
         let diags =
             diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone).await;
 
         client_clone
             .publish_diagnostics(uri_clone.clone(), diags, None)
             .await;
-
-        // Refresh inlay hints
-        if let Err(e) = client_clone.inlay_hint_refresh().await {
-            tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
-        }
     });
 
     Ok(task)
@@ -313,18 +314,19 @@ pub async fn handle_document_change(
             progress.end(success).await;
         }
 
-        // Publish diagnostics (using internal version to avoid recursive cold start)
+        // Refresh inlay hints IMMEDIATELY after loading completes
+        // (before diagnostics which may take longer due to additional network calls)
+        if let Err(e) = client_clone.inlay_hint_refresh().await {
+            tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+        }
+
+        // Publish diagnostics (may be slower, runs after hints are already visible)
         let diags =
             diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone).await;
 
         client_clone
             .publish_diagnostics(uri_clone.clone(), diags, None)
             .await;
-
-        // Refresh inlay hints
-        if let Err(e) = client_clone.inlay_hint_refresh().await {
-            tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
-        }
     });
 
     Ok(task)
