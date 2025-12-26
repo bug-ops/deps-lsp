@@ -183,6 +183,22 @@ impl deps_core::YankedChecker for UnifiedVersion {
     }
 }
 
+/// Loading state for registry data fetching.
+///
+/// Tracks the current state of background version fetching tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadingState {
+    /// No data loaded, not currently loading
+    #[default]
+    Idle,
+    /// Currently fetching registry data
+    Loading,
+    /// Data fetched and cached
+    Loaded,
+    /// Fetch failed (still show old cached data if available)
+    Failed,
+}
+
 /// Package ecosystem type.
 ///
 /// Identifies which package manager and manifest file format
@@ -303,6 +319,10 @@ pub struct DocumentState {
     pub resolved_versions: HashMap<String, String>,
     /// Last successful parse time
     pub parsed_at: Instant,
+    /// Current loading state for registry data
+    pub loading_state: LoadingState,
+    /// When the current loading operation started (for timeout/metrics)
+    pub loading_started_at: Option<Instant>,
 }
 
 impl Clone for DocumentState {
@@ -317,6 +337,9 @@ impl Clone for DocumentState {
             cached_versions: self.cached_versions.clone(),
             resolved_versions: self.resolved_versions.clone(),
             parsed_at: self.parsed_at,
+            loading_state: self.loading_state,
+            // Note: Instant is Copy. Clones share the same loading start time.
+            loading_started_at: self.loading_started_at,
         }
     }
 }
@@ -413,6 +436,8 @@ impl std::fmt::Debug for DocumentState {
             .field("cached_versions_count", &self.cached_versions.len())
             .field("resolved_versions_count", &self.resolved_versions.len())
             .field("parsed_at", &self.parsed_at)
+            .field("loading_state", &self.loading_state)
+            .field("loading_started_at", &self.loading_started_at)
             .finish()
     }
 }
@@ -444,6 +469,8 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             parsed_at: Instant::now(),
+            loading_state: LoadingState::Idle,
+            loading_started_at: None,
         }
     }
 
@@ -473,6 +500,8 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             parsed_at: Instant::now(),
+            loading_state: LoadingState::Idle,
+            loading_started_at: None,
         }
     }
 
@@ -499,6 +528,8 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             parsed_at: Instant::now(),
+            loading_state: LoadingState::Idle,
+            loading_started_at: None,
         }
     }
 
@@ -520,6 +551,86 @@ impl DocumentState {
     /// Updates the resolved versions from lock file.
     pub fn update_resolved_versions(&mut self, versions: HashMap<String, String>) {
         self.resolved_versions = versions;
+    }
+
+    /// Mark document as loading registry data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::document::DocumentState;
+    ///
+    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// doc.set_loading();
+    /// assert!(doc.loading_started_at.is_some());
+    /// ```
+    ///
+    /// # Thread Safety
+    ///
+    /// This method requires exclusive access (`&mut self`). When used with
+    /// `DashMap::get_mut()`, thread safety is guaranteed by the lock.
+    /// Calling while already `Loading` resets the timer.
+    pub fn set_loading(&mut self) {
+        self.loading_state = LoadingState::Loading;
+        self.loading_started_at = Some(Instant::now());
+    }
+
+    /// Mark document as loaded with fresh data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::document::{DocumentState, LoadingState};
+    ///
+    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// doc.set_loading();
+    /// doc.set_loaded();
+    /// assert_eq!(doc.loading_state, LoadingState::Loaded);
+    /// assert!(doc.loading_started_at.is_none());
+    /// ```
+    pub fn set_loaded(&mut self) {
+        self.loading_state = LoadingState::Loaded;
+        self.loading_started_at = None;
+    }
+
+    /// Mark document as failed to load (keeps old cached data).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::document::{DocumentState, LoadingState};
+    ///
+    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// doc.set_loading();
+    /// doc.set_failed();
+    /// assert_eq!(doc.loading_state, LoadingState::Failed);
+    /// assert!(doc.loading_started_at.is_none());
+    /// ```
+    pub fn set_failed(&mut self) {
+        self.loading_state = LoadingState::Failed;
+        self.loading_started_at = None;
+    }
+
+    /// Get current loading duration if loading.
+    ///
+    /// Returns `None` if not currently loading, or `Some(Duration)` representing
+    /// how long the current loading operation has been running.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::document::DocumentState;
+    ///
+    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// assert!(doc.loading_duration().is_none());
+    ///
+    /// doc.set_loading();
+    /// assert!(doc.loading_duration().is_some());
+    /// ```
+    #[must_use]
+    pub fn loading_duration(&self) -> Option<Duration> {
+        self.loading_started_at
+            .map(|start| Instant::now().duration_since(start))
     }
 }
 
@@ -685,6 +796,237 @@ mod tests {
     // =========================================================================
     // Generic tests (no feature flag required)
     // =========================================================================
+
+    // =========================================================================
+    // LoadingState tests
+    // =========================================================================
+
+    mod loading_state_tests {
+        use super::*;
+
+        #[test]
+        fn test_loading_state_default() {
+            let state = LoadingState::default();
+            assert_eq!(state, LoadingState::Idle);
+        }
+
+        #[test]
+        fn test_loading_state_transitions() {
+            use std::time::Duration;
+
+            let content = "[dependencies]\nserde = \"1.0\"".to_string();
+            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+
+            // Initial state
+            assert_eq!(doc.loading_state, LoadingState::Idle);
+            assert!(doc.loading_started_at.is_none());
+
+            // Transition to Loading
+            doc.set_loading();
+            assert_eq!(doc.loading_state, LoadingState::Loading);
+            assert!(doc.loading_started_at.is_some());
+
+            // Small sleep to ensure duration is non-zero
+            std::thread::sleep(Duration::from_millis(10));
+
+            // Check loading duration
+            let duration = doc.loading_duration();
+            assert!(duration.is_some());
+            assert!(duration.unwrap() >= Duration::from_millis(10));
+
+            // Transition to Loaded
+            doc.set_loaded();
+            assert_eq!(doc.loading_state, LoadingState::Loaded);
+            assert!(doc.loading_started_at.is_none());
+            assert!(doc.loading_duration().is_none());
+        }
+
+        #[test]
+        fn test_loading_state_failed_transition() {
+            let content = "[dependencies]\nserde = \"1.0\"".to_string();
+            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+
+            doc.set_loading();
+            assert_eq!(doc.loading_state, LoadingState::Loading);
+
+            doc.set_failed();
+            assert_eq!(doc.loading_state, LoadingState::Failed);
+            assert!(doc.loading_started_at.is_none());
+        }
+
+        #[test]
+        fn test_loading_state_clone() {
+            let content = "[dependencies]\nserde = \"1.0\"".to_string();
+            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+
+            doc.set_loading();
+            let cloned = doc.clone();
+
+            assert_eq!(cloned.loading_state, LoadingState::Loading);
+            assert!(cloned.loading_started_at.is_some());
+        }
+
+        #[test]
+        fn test_loading_state_debug() {
+            let content = "[dependencies]\nserde = \"1.0\"".to_string();
+            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            doc.set_loading();
+
+            let debug_str = format!("{:?}", doc);
+            assert!(debug_str.contains("loading_state"));
+            assert!(debug_str.contains("Loading"));
+        }
+
+        #[test]
+        fn test_loading_duration_none_when_idle() {
+            let content = "[dependencies]\nserde = \"1.0\"".to_string();
+            let doc = DocumentState::new_without_parse_result("cargo", content);
+
+            assert_eq!(doc.loading_state, LoadingState::Idle);
+            assert!(doc.loading_duration().is_none());
+        }
+
+        #[test]
+        fn test_loading_state_equality() {
+            assert_eq!(LoadingState::Idle, LoadingState::Idle);
+            assert_eq!(LoadingState::Loading, LoadingState::Loading);
+            assert_eq!(LoadingState::Loaded, LoadingState::Loaded);
+            assert_eq!(LoadingState::Failed, LoadingState::Failed);
+
+            assert_ne!(LoadingState::Idle, LoadingState::Loading);
+            assert_ne!(LoadingState::Loading, LoadingState::Loaded);
+        }
+
+        #[test]
+        fn test_loading_duration_tracks_time_correctly() {
+            use std::time::Duration;
+
+            let content = "[dependencies]\nserde = \"1.0\"".to_string();
+            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+
+            doc.set_loading();
+
+            // Check duration increases over time
+            let duration1 = doc.loading_duration().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let duration2 = doc.loading_duration().unwrap();
+
+            assert!(duration2 > duration1, "Duration should increase over time");
+        }
+
+        #[tokio::test]
+        async fn test_concurrent_loading_state_mutations() {
+            use std::sync::Arc;
+            use tokio::sync::Barrier;
+
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/concurrent-loading-test.toml").unwrap();
+
+            let doc = DocumentState::new_without_parse_result("cargo", String::new());
+            state.update_document(uri.clone(), doc);
+
+            let barrier = Arc::new(Barrier::new(10));
+            let mut handles = vec![];
+
+            for i in 0..10 {
+                let state_clone = Arc::clone(&state);
+                let uri_clone = uri.clone();
+                let barrier_clone = Arc::clone(&barrier);
+
+                handles.push(tokio::spawn(async move {
+                    barrier_clone.wait().await;
+                    if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
+                        if i % 3 == 0 {
+                            doc.set_loading();
+                        } else if i % 3 == 1 {
+                            doc.set_loaded();
+                        } else {
+                            doc.set_failed();
+                        }
+                    }
+                }));
+            }
+
+            for handle in handles {
+                handle.await.unwrap();
+            }
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(matches!(
+                doc.loading_state,
+                LoadingState::Idle
+                    | LoadingState::Loading
+                    | LoadingState::Loaded
+                    | LoadingState::Failed
+            ));
+        }
+
+        #[test]
+        fn test_set_loaded_idempotent() {
+            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+
+            doc.set_loading();
+            doc.set_loaded();
+
+            // Call again - should be safe
+            doc.set_loaded();
+
+            assert_eq!(doc.loading_state, LoadingState::Loaded);
+            assert!(doc.loading_started_at.is_none());
+        }
+
+        #[test]
+        fn test_set_loading_resets_timer() {
+            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+
+            doc.set_loading();
+            let first_start = doc.loading_started_at.unwrap();
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            // Call set_loading again - should reset timer
+            doc.set_loading();
+            let second_start = doc.loading_started_at.unwrap();
+
+            assert!(second_start > first_start, "Timer should be reset");
+            assert_eq!(doc.loading_state, LoadingState::Loading);
+        }
+
+        #[test]
+        fn test_retry_after_failure() {
+            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+
+            doc.set_loading();
+            doc.set_failed();
+            assert_eq!(doc.loading_state, LoadingState::Failed);
+            assert!(doc.loading_started_at.is_none());
+
+            // Retry
+            doc.set_loading();
+            assert_eq!(doc.loading_state, LoadingState::Loading);
+            assert!(doc.loading_started_at.is_some());
+
+            doc.set_loaded();
+            assert_eq!(doc.loading_state, LoadingState::Loaded);
+        }
+
+        #[test]
+        fn test_refresh_after_loaded() {
+            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+
+            doc.set_loading();
+            doc.set_loaded();
+            assert_eq!(doc.loading_state, LoadingState::Loaded);
+
+            // Refresh
+            doc.set_loading();
+            assert_eq!(doc.loading_state, LoadingState::Loading);
+            assert!(doc.loading_started_at.is_some());
+
+            doc.set_loaded();
+            assert_eq!(doc.loading_state, LoadingState::Loaded);
+        }
+    }
 
     #[test]
     fn test_ecosystem_from_filename() {
