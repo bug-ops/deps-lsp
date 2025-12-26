@@ -14,6 +14,7 @@ target
 
 # Testing
 .snapshots/
+**/snapshots/
 
 # Local development
 .local/

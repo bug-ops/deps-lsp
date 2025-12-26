@@ -9,7 +9,7 @@ Language Server Protocol implementation for dependency management.
 
 ## Features
 
-- **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml
+- **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml, go.mod
 - **Inlay Hints** — Show latest versions inline
 - **Hover Info** — Package descriptions and version lists
 - **Code Actions** — Quick fixes to update dependencies

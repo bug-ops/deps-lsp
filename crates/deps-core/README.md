@@ -7,7 +7,7 @@
 
 Core abstractions for deps-lsp: traits, caching, and generic LSP handlers.
 
-This crate provides the shared infrastructure used by ecosystem-specific crates (`deps-cargo`, `deps-npm`, `deps-pypi`).
+This crate provides the shared infrastructure used by ecosystem-specific crates (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-go`).
 
 ## Features
 

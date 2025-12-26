@@ -14,7 +14,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 
 - **Intelligent Autocomplete** — Package names, versions, and feature flags
 - **Version Hints** — Inlay hints showing latest available versions
-- **Lock File Support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock
+- **Lock File Support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
 - **Hover Information** — Package descriptions with resolved version from lock file
 - **Code Actions** — Quick fixes to update dependencies
@@ -43,9 +43,13 @@ deps-lsp is optimized for responsiveness:
 | Rust/Cargo | `Cargo.toml` | ✅ Supported |
 | npm | `package.json` | ✅ Supported |
 | Python/PyPI | `pyproject.toml` | ✅ Supported |
+| Go Modules | `go.mod` | ✅ Supported |
 
 > [!NOTE]
 > PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats.
+
+> [!NOTE]
+> Go support includes require, replace, and exclude directives with pseudo-version handling.
 
 ## Installation
 
@@ -185,6 +189,7 @@ deps-lsp/
 │   ├── deps-cargo/     # Cargo.toml parser + crates.io registry
 │   ├── deps-npm/       # package.json parser + npm registry
 │   ├── deps-pypi/      # pyproject.toml parser + PyPI registry
+│   ├── deps-go/        # go.mod parser + proxy.golang.org
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration

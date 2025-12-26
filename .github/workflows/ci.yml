@@ -215,7 +215,7 @@ jobs:
       - name: Generate per-crate coverage
         run: |
           # Generate coverage for each crate separately
-          for crate in deps-core deps-cargo deps-npm deps-pypi deps-lsp; do
+          for crate in deps-core deps-cargo deps-npm deps-pypi deps-go deps-lsp; do
             echo "Generating coverage for $crate..."
             cargo llvm-cov --all-features --package "$crate" --lcov \
               --output-path "lcov-$crate.info" nextest 2>/dev/null || true
@@ -259,6 +259,14 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov-deps-pypi.info
           flags: deps-pypi
+          fail_ci_if_error: false
+
+      - name: Upload deps-go coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov-deps-go.info
+          flags: deps-go
           fail_ci_if_error: false
 
       - name: Upload deps-lsp coverage
