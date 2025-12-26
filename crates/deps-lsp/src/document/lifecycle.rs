@@ -23,45 +23,71 @@ use tower_lsp_server::ls_types::{MessageType, Uri};
 /// Returns a HashMap mapping package names to their latest version strings.
 /// Packages that fail to fetch are omitted from the result.
 ///
-/// This function executes all registry requests concurrently, reducing
-/// total fetch time from O(N × network_latency) to O(max(network_latency)).
+/// This function executes all registry requests concurrently with per-dependency
+/// timeout isolation, preventing slow packages from blocking others.
 ///
 /// # Arguments
 ///
 /// * `registry` - Package registry to fetch from
 /// * `package_names` - List of package names to fetch
 /// * `progress` - Optional progress tracker (will be updated after each fetch)
+/// * `timeout_secs` - Timeout for each individual package fetch (default: 5s)
+/// * `max_concurrent` - Maximum concurrent fetches (default: 20)
+///
+/// # Timeout Behavior
+///
+/// Each package fetch is wrapped in an individual timeout. If a package
+/// takes longer than `timeout_secs` to fetch, it fails fast with a warning
+/// and does NOT block other packages.
 ///
 /// # Examples
 ///
 /// With 50 dependencies and 100ms per request:
 /// - Sequential: 50 × 100ms = 5000ms
-/// - Parallel: max(100ms) ≈ 150ms
+/// - Parallel (no timeout): max(100ms) ≈ 150ms
+/// - Parallel (5s timeout, 1 slow package at 30s): max(5s) ≈ 5s
 async fn fetch_latest_versions_parallel(
     registry: Arc<dyn Registry>,
     package_names: Vec<String>,
     progress: Option<&RegistryProgress>,
+    timeout_secs: u64,
+    max_concurrent: usize,
 ) -> HashMap<String, String> {
     use futures::stream::{self, StreamExt};
+    use std::time::Duration;
 
     let total = package_names.len();
     let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let timeout = Duration::from_secs(timeout_secs);
 
-    // Process fetches concurrently while reporting progress
+    // Process fetches concurrently with per-dependency timeout
     let results: Vec<_> = stream::iter(package_names)
         .map(|name| {
             let registry = Arc::clone(&registry);
             let fetched = Arc::clone(&fetched);
             async move {
-                let result = registry
-                    .get_versions(&name)
-                    .await
-                    .ok()
-                    .and_then(|versions| {
+                // Wrap each fetch in a timeout
+                let result = tokio::time::timeout(timeout, registry.get_versions(&name)).await;
+
+                let version = match result {
+                    Ok(Ok(versions)) => {
                         // Use shared utility for consistent behavior with diagnostics
                         deps_core::find_latest_stable(&versions)
-                            .map(|v| (name, v.version_string().to_string()))
-                    });
+                            .map(|v| (name.clone(), v.version_string().to_string()))
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(package = %name, error = %e, "Failed to fetch versions");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            package = %name,
+                            timeout_secs,
+                            "Fetch timed out"
+                        );
+                        None
+                    }
+                };
 
                 // Increment counter and report progress
                 let count = fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -69,10 +95,10 @@ async fn fetch_latest_versions_parallel(
                     progress.update(count, total).await;
                 }
 
-                result
+                version
             }
         })
-        .buffer_unordered(10) // Limit concurrent requests to avoid overwhelming the registry
+        .buffer_unordered(max_concurrent)
         .collect()
         .await;
 
@@ -88,7 +114,7 @@ pub async fn handle_document_open(
     content: String,
     state: Arc<ServerState>,
     client: Client,
-    _config: Arc<RwLock<DepsConfig>>,
+    config: Arc<RwLock<DepsConfig>>,
 ) -> Result<JoinHandle<()>> {
     // Find appropriate ecosystem for this URI
     let ecosystem = match state.ecosystem_registry.get_for_uri(&uri) {
@@ -119,6 +145,9 @@ pub async fn handle_document_open(
     };
 
     state.update_document(uri.clone(), doc_state);
+
+    // Clone cache config before spawning background task
+    let cache_config = { config.read().await.cache.clone() };
 
     // Spawn background task to fetch versions
     let uri_clone = uri.clone();
@@ -169,8 +198,14 @@ pub async fn handle_document_open(
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
-        let cached_versions =
-            fetch_latest_versions_parallel(registry, dep_names, progress.as_ref()).await;
+        let cached_versions = fetch_latest_versions_parallel(
+            registry,
+            dep_names,
+            progress.as_ref(),
+            cache_config.fetch_timeout_secs,
+            cache_config.max_concurrent_fetches,
+        )
+        .await;
 
         let success = !cached_versions.is_empty();
 
@@ -216,7 +251,7 @@ pub async fn handle_document_change(
     content: String,
     state: Arc<ServerState>,
     client: Client,
-    _config: Arc<RwLock<DepsConfig>>,
+    config: Arc<RwLock<DepsConfig>>,
 ) -> Result<JoinHandle<()>> {
     // Find appropriate ecosystem for this URI
     let ecosystem = match state.ecosystem_registry.get_for_uri(&uri) {
@@ -241,6 +276,9 @@ pub async fn handle_document_change(
     };
 
     state.update_document(uri.clone(), doc_state);
+
+    // Clone cache config before spawning background task
+    let cache_config = { config.read().await.cache.clone() };
 
     // Spawn background task to update diagnostics
     let uri_clone = uri.clone();
@@ -294,8 +332,14 @@ pub async fn handle_document_change(
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
-        let cached_versions =
-            fetch_latest_versions_parallel(registry, dep_names, progress.as_ref()).await;
+        let cached_versions = fetch_latest_versions_parallel(
+            registry,
+            dep_names,
+            progress.as_ref(),
+            cache_config.fetch_timeout_secs,
+            cache_config.max_concurrent_fetches,
+        )
+        .await;
 
         let success = !cached_versions.is_empty();
 
@@ -536,6 +580,379 @@ mod tests {
         assert!(result.is_err(), "Should fail for missing files");
 
         // This error would cause ensure_document_loaded to return false
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_with_timeout() {
+        use async_trait::async_trait;
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+        use std::time::Duration;
+
+        // Mock registry that always times out
+        struct TimeoutRegistry;
+
+        #[async_trait]
+        impl Registry for TimeoutRegistry {
+            async fn get_versions(&self, _name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
+                // Sleep longer than timeout (5s default)
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok(vec![])
+            }
+
+            async fn get_latest_matching(
+                &self,
+                _name: &str,
+                _req: &str,
+            ) -> deps_core::Result<Option<Box<dyn Version>>> {
+                Ok(None)
+            }
+
+            async fn search(
+                &self,
+                _query: &str,
+                _limit: usize,
+            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
+                Ok(vec![])
+            }
+
+            fn package_url(&self, name: &str) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(TimeoutRegistry);
+        let packages = vec!["slow-package".to_string()];
+
+        // Use 1 second timeout for test speed
+        let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
+
+        // Should return empty (timeout, not success)
+        assert!(result.is_empty(), "Slow package should timeout");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_fast_packages_not_blocked() {
+        use async_trait::async_trait;
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+        use std::time::Duration;
+
+        // Mock registry with one slow, one fast package
+        struct MixedRegistry;
+
+        #[async_trait]
+        impl Registry for MixedRegistry {
+            async fn get_versions(&self, name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
+                if name == "slow-package" {
+                    // Sleep longer than timeout
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+                // Fast package or unknown: return immediately
+                Ok(vec![])
+            }
+
+            async fn get_latest_matching(
+                &self,
+                _name: &str,
+                _req: &str,
+            ) -> deps_core::Result<Option<Box<dyn Version>>> {
+                Ok(None)
+            }
+
+            async fn search(
+                &self,
+                _query: &str,
+                _limit: usize,
+            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
+                Ok(vec![])
+            }
+
+            fn package_url(&self, name: &str) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(MixedRegistry);
+        let packages = vec!["slow-package".to_string(), "fast-package".to_string()];
+
+        let start = std::time::Instant::now();
+        let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
+        let elapsed = start.elapsed();
+
+        // Should complete in ~1s (timeout), not 10s (slow package duration)
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "Should not wait for slow package: {:?}",
+            elapsed
+        );
+
+        // Fast package processed, slow package omitted
+        assert!(
+            result.is_empty(),
+            "No versions returned (test registry returns empty)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_concurrency_limit() {
+        use async_trait::async_trait;
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // Mock registry that tracks concurrent requests
+        struct ConcurrencyTrackingRegistry {
+            current: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Registry for ConcurrencyTrackingRegistry {
+            async fn get_versions(&self, _name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
+                // Increment concurrent counter
+                let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+
+                // Track max concurrent
+                self.max_seen.fetch_max(current, Ordering::SeqCst);
+
+                // Simulate work
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // Decrement counter
+                self.current.fetch_sub(1, Ordering::SeqCst);
+
+                Ok(vec![])
+            }
+
+            async fn get_latest_matching(
+                &self,
+                _name: &str,
+                _req: &str,
+            ) -> deps_core::Result<Option<Box<dyn Version>>> {
+                Ok(None)
+            }
+
+            async fn search(
+                &self,
+                _query: &str,
+                _limit: usize,
+            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
+                Ok(vec![])
+            }
+
+            fn package_url(&self, name: &str) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let current = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let registry: Arc<dyn Registry> = Arc::new(ConcurrencyTrackingRegistry {
+            current: Arc::clone(&current),
+            max_seen: Arc::clone(&max_seen),
+        });
+
+        // Create 50 packages, limit concurrency to 20
+        let packages: Vec<String> = (0..50).map(|i| format!("package-{}", i)).collect();
+
+        fetch_latest_versions_parallel(registry, packages, None, 5, 20).await;
+
+        // Max concurrent should not exceed limit (allow small margin for timing)
+        let max = max_seen.load(Ordering::SeqCst);
+        assert!(
+            max <= 22,
+            "Concurrency limit violated: {} concurrent requests (limit: 20)",
+            max
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_partial_success_with_mixed_outcomes() {
+        use async_trait::async_trait;
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+        use std::time::Duration;
+
+        // Mock version for successful fetches
+        #[derive(Debug)]
+        struct MockVersion {
+            version: String,
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &str {
+                &self.version
+            }
+
+            fn is_prerelease(&self) -> bool {
+                false
+            }
+
+            fn is_yanked(&self) -> bool {
+                false
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        // Mock registry with mixed outcomes:
+        // - "package-fast" returns quickly with version
+        // - "package-slow" times out
+        // - "package-error" returns error
+        struct MixedOutcomeRegistry;
+
+        #[async_trait]
+        impl Registry for MixedOutcomeRegistry {
+            async fn get_versions(&self, name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
+                match name {
+                    "package-fast" => {
+                        // Return immediately with a stable version
+                        Ok(vec![Box::new(MockVersion {
+                            version: "1.0.0".to_string(),
+                        })])
+                    }
+                    "package-slow" => {
+                        // Sleep longer than timeout (test uses 1s timeout)
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Ok(vec![])
+                    }
+                    "package-error" => {
+                        // Return cache error (simpler for testing)
+                        Err(deps_core::error::DepsError::CacheError(
+                            "Mock registry error".to_string(),
+                        ))
+                    }
+                    _ => Ok(vec![]),
+                }
+            }
+
+            async fn get_latest_matching(
+                &self,
+                _name: &str,
+                _req: &str,
+            ) -> deps_core::Result<Option<Box<dyn Version>>> {
+                Ok(None)
+            }
+
+            async fn search(
+                &self,
+                _query: &str,
+                _limit: usize,
+            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
+                Ok(vec![])
+            }
+
+            fn package_url(&self, name: &str) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(MixedOutcomeRegistry);
+        let packages = vec![
+            "package-fast".to_string(),
+            "package-slow".to_string(),
+            "package-error".to_string(),
+        ];
+
+        // Use 1 second timeout for test speed
+        let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
+
+        // Only the fast package should be in results
+        assert_eq!(result.len(), 1, "Should have exactly 1 successful package");
+        assert_eq!(
+            result.get("package-fast"),
+            Some(&"1.0.0".to_string()),
+            "Fast package should have correct version"
+        );
+        assert!(
+            !result.contains_key("package-slow"),
+            "Slow package should not be in results (timeout)"
+        );
+        assert!(
+            !result.contains_key("package-error"),
+            "Error package should not be in results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_registry_error_handled() {
+        use async_trait::async_trait;
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        // Mock registry that returns errors for all packages
+        struct ErrorRegistry;
+
+        #[async_trait]
+        impl Registry for ErrorRegistry {
+            async fn get_versions(&self, name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
+                Err(deps_core::error::DepsError::CacheError(format!(
+                    "Failed to fetch package: {}",
+                    name
+                )))
+            }
+
+            async fn get_latest_matching(
+                &self,
+                _name: &str,
+                _req: &str,
+            ) -> deps_core::Result<Option<Box<dyn Version>>> {
+                Ok(None)
+            }
+
+            async fn search(
+                &self,
+                _query: &str,
+                _limit: usize,
+            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
+                Ok(vec![])
+            }
+
+            fn package_url(&self, name: &str) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(ErrorRegistry);
+        let packages = vec![
+            "package-1".to_string(),
+            "package-2".to_string(),
+            "package-3".to_string(),
+        ];
+
+        // Should not panic, just return empty result
+        let result = fetch_latest_versions_parallel(registry, packages, None, 5, 10).await;
+
+        // All packages failed, result should be empty
+        assert!(
+            result.is_empty(),
+            "All packages with errors should be omitted from results"
+        );
     }
 
     // Cargo-specific tests

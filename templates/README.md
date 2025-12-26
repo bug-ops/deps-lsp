@@ -21,7 +21,8 @@ This directory contains template files for creating new ecosystem support in dep
 
 4. Implement the TODO sections in each file
 5. Add your crate to the workspace in `Cargo.toml`
-6. Register your ecosystem in `deps-lsp/src/document.rs`
+6. Add feature flag in `deps-lsp/Cargo.toml`
+7. Register your ecosystem in `deps-lsp/src/lib.rs` using `ecosystem!()` and `register!()` macros
 
 ## File Structure
 

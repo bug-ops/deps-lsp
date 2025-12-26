@@ -134,6 +134,8 @@ impl Default for DiagnosticsConfig {
 ///
 /// - `enabled`: `true`
 /// - `refresh_interval_secs`: `300` (5 minutes)
+/// - `fetch_timeout_secs`: `5` (5 seconds per package)
+/// - `max_concurrent_fetches`: `20` (20 concurrent requests)
 ///
 /// # Examples
 ///
@@ -143,16 +145,30 @@ impl Default for DiagnosticsConfig {
 /// let config = CacheConfig {
 ///     refresh_interval_secs: 600, // 10 minutes
 ///     enabled: true,
+///     fetch_timeout_secs: 5,
+///     max_concurrent_fetches: 20,
 /// };
 ///
 /// assert_eq!(config.refresh_interval_secs, 600);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval_secs: u64,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Timeout for fetching a single package's versions (default: 5 seconds)
+    #[serde(
+        default = "default_fetch_timeout_secs",
+        deserialize_with = "deserialize_fetch_timeout"
+    )]
+    pub fetch_timeout_secs: u64,
+    /// Maximum concurrent package fetches (default: 20)
+    #[serde(
+        default = "default_max_concurrent_fetches",
+        deserialize_with = "deserialize_max_concurrent"
+    )]
+    pub max_concurrent_fetches: usize,
 }
 
 impl Default for CacheConfig {
@@ -160,6 +176,8 @@ impl Default for CacheConfig {
         Self {
             refresh_interval_secs: default_refresh_interval(),
             enabled: true,
+            fetch_timeout_secs: default_fetch_timeout_secs(),
+            max_concurrent_fetches: default_max_concurrent_fetches(),
         }
     }
 }
@@ -262,6 +280,62 @@ const fn default_refresh_interval() -> u64 {
     300 // 5 minutes
 }
 
+const fn default_fetch_timeout_secs() -> u64 {
+    5
+}
+
+const fn default_max_concurrent_fetches() -> usize {
+    20
+}
+
+/// Minimum timeout (seconds) to prevent zero-timeout edge case
+const MIN_FETCH_TIMEOUT_SECS: u64 = 1;
+/// Maximum timeout (seconds) - 5 minutes is generous
+const MAX_FETCH_TIMEOUT_SECS: u64 = 300;
+
+/// Minimum concurrent fetches (must be at least 1)
+const MIN_CONCURRENT_FETCHES: usize = 1;
+/// Maximum concurrent fetches
+const MAX_CONCURRENT_FETCHES: usize = 100;
+
+/// Custom deserializer for fetch_timeout_secs that validates bounds
+fn deserialize_fetch_timeout<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let secs = u64::deserialize(deserializer)?;
+    let clamped = secs.clamp(MIN_FETCH_TIMEOUT_SECS, MAX_FETCH_TIMEOUT_SECS);
+    if clamped != secs {
+        tracing::warn!(
+            "fetch_timeout_secs {} clamped to {} (valid range: {}-{})",
+            secs,
+            clamped,
+            MIN_FETCH_TIMEOUT_SECS,
+            MAX_FETCH_TIMEOUT_SECS
+        );
+    }
+    Ok(clamped)
+}
+
+/// Custom deserializer for max_concurrent_fetches that validates bounds
+fn deserialize_max_concurrent<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let count = usize::deserialize(deserializer)?;
+    let clamped = count.clamp(MIN_CONCURRENT_FETCHES, MAX_CONCURRENT_FETCHES);
+    if clamped != count {
+        tracing::warn!(
+            "max_concurrent_fetches {} clamped to {} (valid range: {}-{})",
+            count,
+            clamped,
+            MIN_CONCURRENT_FETCHES,
+            MAX_CONCURRENT_FETCHES
+        );
+    }
+    Ok(clamped)
+}
+
 /// Configuration for cold start behavior.
 ///
 /// Controls how the server handles loading documents from disk when
@@ -360,6 +434,31 @@ mod tests {
         let config: CacheConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.refresh_interval_secs, 600);
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn test_cache_config_defaults() {
+        let config = CacheConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.refresh_interval_secs, 300);
+        assert_eq!(config.fetch_timeout_secs, 5);
+        assert_eq!(config.max_concurrent_fetches, 20);
+    }
+
+    #[test]
+    fn test_cache_config_with_timeout_and_concurrency() {
+        let json = r#"{
+            "refresh_interval_secs": 600,
+            "enabled": true,
+            "fetch_timeout_secs": 10,
+            "max_concurrent_fetches": 50
+        }"#;
+
+        let config: CacheConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.refresh_interval_secs, 600);
+        assert!(config.enabled);
+        assert_eq!(config.fetch_timeout_secs, 10);
+        assert_eq!(config.max_concurrent_fetches, 50);
     }
 
     #[test]
@@ -528,5 +627,53 @@ mod tests {
 
         let config: LoadingIndicatorConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.loading_text, "⏳");
+    }
+
+    #[test]
+    fn test_cache_config_fetch_timeout_clamped_min() {
+        let json = r#"{"fetch_timeout_secs": 0}"#;
+        let config: CacheConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.fetch_timeout_secs, 1, "Should clamp 0 to MIN");
+    }
+
+    #[test]
+    fn test_cache_config_fetch_timeout_clamped_max() {
+        let json = r#"{"fetch_timeout_secs": 999999}"#;
+        let config: CacheConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.fetch_timeout_secs, 300, "Should clamp to MAX");
+    }
+
+    #[test]
+    fn test_cache_config_fetch_timeout_valid_range() {
+        let json = r#"{"fetch_timeout_secs": 10}"#;
+        let config: CacheConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.fetch_timeout_secs, 10,
+            "Valid value should not be clamped"
+        );
+    }
+
+    #[test]
+    fn test_cache_config_max_concurrent_clamped_min() {
+        let json = r#"{"max_concurrent_fetches": 0}"#;
+        let config: CacheConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_concurrent_fetches, 1, "Should clamp 0 to MIN");
+    }
+
+    #[test]
+    fn test_cache_config_max_concurrent_clamped_max() {
+        let json = r#"{"max_concurrent_fetches": 100000}"#;
+        let config: CacheConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_concurrent_fetches, 100, "Should clamp to MAX");
+    }
+
+    #[test]
+    fn test_cache_config_max_concurrent_valid_range() {
+        let json = r#"{"max_concurrent_fetches": 50}"#;
+        let config: CacheConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.max_concurrent_fetches, 50,
+            "Valid value should not be clamped"
+        );
     }
 }

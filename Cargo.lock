@@ -424,6 +424,7 @@ dependencies = [
 name = "deps-lsp"
 version = "0.5.1"
 dependencies = [
+ "async-trait",
  "criterion",
  "dashmap",
  "deps-cargo",
