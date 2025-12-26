@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2025-12-26
+
+### Added
+- Cold start support: LSP features now work when IDE restores files without sending didOpen
+- Rate limiting for cold start requests (10 req/sec per URI, configurable)
+- Background cleanup task for rate limiter (60s interval)
+- ColdStartConfig for configuration (enabled, rate_limit_ms)
+- 7 new integration tests for cold start scenarios
+- LspClient test utility extracted to tests/common/mod.rs
+
+### Changed
+- Reduced MAX_FILE_SIZE from 50MB to 10MB for security
+- Added LARGE_FILE_THRESHOLD (1MB) with warning logs
+- Enhanced permission error logging
+
+### Fixed
+- LSP features not working when IDE opens with manifest files already open
+
 ## [0.4.0] - 2025-12-25
 
 ### Changed
@@ -156,7 +174,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/bug-ops/deps-lsp/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/bug-ops/deps-lsp/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/bug-ops/deps-lsp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bug-ops/deps-lsp/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/bug-ops/deps-lsp/compare/v0.2.2...v0.2.3

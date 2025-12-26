@@ -128,9 +128,16 @@ Configure via LSP initialization options:
   },
   "cache": {
     "refresh_interval_secs": 300
+  },
+  "cold_start": {
+    "enabled": true,
+    "rate_limit_ms": 100
   }
 }
 ```
+
+> [!NOTE]
+> Cold start support ensures LSP features work immediately when your IDE restores previously opened files.
 
 ## Development
 

@@ -24,7 +24,7 @@ This crate provides parsing and registry integration for Python's PyPI ecosystem
 
 ```toml
 [dependencies]
-deps-pypi = "0.2"
+deps-pypi = "0.4"
 ```
 
 ```rust

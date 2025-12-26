@@ -22,7 +22,7 @@ This crate provides the shared infrastructure used by ecosystem-specific crates 
 
 ```toml
 [dependencies]
-deps-core = "0.2"
+deps-core = "0.4"
 ```
 
 ```rust

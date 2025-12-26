@@ -232,13 +232,13 @@ Create manifest parser in `parser.rs` with **position tracking**:
 use crate::error::Result;
 use crate::types::{Ecosystem}Dependency;
 use std::any::Any;
-use tower_lsp_server::ls_types::{Position, Range, Url};
+use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 /// Parse result containing dependencies and metadata.
 #[derive(Debug)]
 pub struct {Ecosystem}ParseResult {
     pub dependencies: Vec<{Ecosystem}Dependency>,
-    pub uri: Url,
+    pub uri: Uri,
 }
 
 impl deps_core::ParseResult for {Ecosystem}ParseResult {
@@ -253,7 +253,7 @@ impl deps_core::ParseResult for {Ecosystem}ParseResult {
         None // Override if ecosystem supports workspaces
     }
 
-    fn uri(&self) -> &Url {
+    fn uri(&self) -> &Uri {
         &self.uri
     }
 
@@ -289,7 +289,7 @@ impl LineOffsetTable {
 }
 
 /// Parse manifest file and extract dependencies with positions.
-pub fn parse_{manifest}(content: &str, uri: &Url) -> Result<{Ecosystem}ParseResult> {
+pub fn parse_{manifest}(content: &str, uri: &Uri) -> Result<{Ecosystem}ParseResult> {
     let line_table = LineOffsetTable::new(content);
 
     // TODO: Implement actual parsing logic
@@ -428,7 +428,7 @@ impl Ecosystem for {Ecosystem}Ecosystem {
     async fn parse_manifest(
         &self,
         content: &str,
-        uri: &Url,
+        uri: &Uri,
     ) -> Result<Box<dyn ParseResultTrait>> {
         let result = parse_{manifest}(content, uri)?;
         Ok(Box::new(result))
@@ -527,7 +527,7 @@ impl Ecosystem for {Ecosystem}Ecosystem {
         parse_result: &dyn ParseResultTrait,
         position: Position,
         _cached_versions: &HashMap<String, String>,
-        uri: &Url,
+        uri: &Uri,
     ) -> Vec<CodeAction> {
         // Similar pattern: find dep at position, offer version updates
         vec![]
@@ -537,7 +537,7 @@ impl Ecosystem for {Ecosystem}Ecosystem {
         &self,
         parse_result: &dyn ParseResultTrait,
         _cached_versions: &HashMap<String, String>,
-        _uri: &Url,
+        _uri: &Uri,
     ) -> Vec<Diagnostic> {
         // Check for unknown packages, outdated versions, etc.
         vec![]
@@ -623,8 +623,8 @@ Create comprehensive tests:
 mod tests {
     use super::*;
 
-    fn test_uri() -> Url {
-        Url::parse("file:///test/{manifest_file}").unwrap()
+    fn test_uri() -> Uri {
+        Uri::from_str("file:///test/{manifest_file}").unwrap()
     }
 
     #[test]

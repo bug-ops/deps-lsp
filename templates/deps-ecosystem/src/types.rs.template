@@ -1,7 +1,7 @@
 //! Types for {ECOSYSTEM_DISPLAY} dependency management.
 
 use std::any::Any;
-use tower_lsp::lsp_types::Range;
+use tower_lsp_server::ls_types::Range;
 
 /// A dependency from the manifest file.
 #[derive(Debug, Clone)]
@@ -83,7 +83,7 @@ impl deps_core::Version for {ECOSYSTEM_PASCAL}Version {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp::lsp_types::Position;
+    use tower_lsp_server::ls_types::Position;
 
     #[test]
     fn test_dependency_trait() {

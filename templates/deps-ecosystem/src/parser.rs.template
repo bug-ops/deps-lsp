@@ -3,13 +3,13 @@
 use crate::error::Result;
 use crate::types::{ECOSYSTEM_PASCAL}Dependency, {ECOSYSTEM_PASCAL}DependencySection;
 use std::any::Any;
-use tower_lsp::lsp_types::{Position, Range, Url};
+use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 /// Parse result containing dependencies and metadata.
 #[derive(Debug)]
 pub struct {ECOSYSTEM_PASCAL}ParseResult {
     pub dependencies: Vec<{ECOSYSTEM_PASCAL}Dependency>,
-    pub uri: Url,
+    pub uri: Uri,
 }
 
 impl deps_core::ParseResult for {ECOSYSTEM_PASCAL}ParseResult {
@@ -24,7 +24,7 @@ impl deps_core::ParseResult for {ECOSYSTEM_PASCAL}ParseResult {
         None
     }
 
-    fn uri(&self) -> &Url {
+    fn uri(&self) -> &Uri {
         &self.uri
     }
 
@@ -72,13 +72,13 @@ impl LineOffsetTable {
 ///
 /// ```no_run
 /// use deps_{ECOSYSTEM_SNAKE}::parse_{ECOSYSTEM_SNAKE};
-/// use tower_lsp::lsp_types::Url;
+/// use tower_lsp_server::ls_types::Uri;
 ///
 /// let content = r#"..."#;
-/// let uri = Url::parse("file:///project/{MANIFEST_FILE}").unwrap();
+/// let uri = Uri::from_str("file:///project/{MANIFEST_FILE}").unwrap();
 /// let result = parse_{ECOSYSTEM_SNAKE}(content, &uri).unwrap();
 /// ```
-pub fn parse_{ECOSYSTEM_SNAKE}(content: &str, uri: &Url) -> Result<{ECOSYSTEM_PASCAL}ParseResult> {
+pub fn parse_{ECOSYSTEM_SNAKE}(content: &str, uri: &Uri) -> Result<{ECOSYSTEM_PASCAL}ParseResult> {
     let _line_table = LineOffsetTable::new(content);
 
     // TODO: Implement actual parsing logic
@@ -107,8 +107,8 @@ pub fn parse_{ECOSYSTEM_SNAKE}(content: &str, uri: &Url) -> Result<{ECOSYSTEM_PA
 mod tests {
     use super::*;
 
-    fn test_uri() -> Url {
-        Url::parse("file:///test/{MANIFEST_FILE}").unwrap()
+    fn test_uri() -> Uri {
+        Uri::from_str("file:///test/{MANIFEST_FILE}").unwrap()
     }
 
     #[test]
