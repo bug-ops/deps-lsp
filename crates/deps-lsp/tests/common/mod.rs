@@ -6,23 +6,96 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+/// A captured notification with timing and ordering information.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields used in notification_ordering tests, not all tests
+pub(crate) struct CapturedNotification {
+    /// The LSP method name (e.g., "window/workDoneProgress/create").
+    pub method: String,
+    /// When this notification was received.
+    pub timestamp: Instant,
+    /// Sequence number for ordering (monotonically increasing).
+    pub sequence: u64,
+    /// The full notification parameters.
+    pub params: Value,
+}
 
 /// LSP test client for communicating with the server binary.
 pub(crate) struct LspClient {
     process: Child,
+    /// Captured notifications in order received.
+    notifications: Arc<RwLock<Vec<CapturedNotification>>>,
+    /// Monotonic counter for notification ordering.
+    notification_counter: Arc<AtomicU64>,
+    /// Buffered reader for stdout (wrapped in Option for initialization).
+    reader: Option<BufReader<std::process::ChildStdout>>,
 }
 
 impl LspClient {
     /// Spawn the deps-lsp binary.
     pub(crate) fn spawn() -> Self {
-        let process = Command::new(env!("CARGO_BIN_EXE_deps-lsp"))
+        let mut process = Command::new(env!("CARGO_BIN_EXE_deps-lsp"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("Failed to spawn deps-lsp binary");
 
-        Self { process }
+        let stdout = process.stdout.take().expect("Failed to capture stdout");
+        let reader = BufReader::new(stdout);
+
+        Self {
+            process,
+            notifications: Arc::new(RwLock::new(Vec::new())),
+            notification_counter: Arc::new(AtomicU64::new(0)),
+            reader: Some(reader),
+        }
+    }
+
+    /// Get all captured notifications.
+    #[allow(dead_code)] // Used in notification_ordering tests
+    pub(crate) fn get_notifications(&self) -> Vec<CapturedNotification> {
+        self.notifications
+            .read()
+            .expect("Failed to acquire read lock")
+            .clone()
+    }
+
+    /// Clear all captured notifications.
+    #[allow(dead_code)] // Used in notification_ordering tests
+    pub(crate) fn clear_notifications(&self) {
+        self.notifications
+            .write()
+            .expect("Failed to acquire write lock")
+            .clear();
+        self.notification_counter.store(0, Ordering::SeqCst);
+    }
+
+    /// Trigger a read from the server stream by sending a dummy request.
+    ///
+    /// This forces `read_response()` to be called, which captures any pending
+    /// notifications as a side effect. Use this after sending notifications
+    /// (like `did_open`) to capture server-sent notifications.
+    #[allow(dead_code)] // Used in notification_ordering tests
+    pub(crate) fn flush_notifications(&mut self) {
+        // Send a benign workspace/symbol request with empty query
+        // This is guaranteed to succeed and return quickly
+        let _ = self.workspace_symbol(999, "");
+    }
+
+    /// Find a notification by method name from already captured notifications.
+    #[allow(dead_code)] // Used in notification_ordering tests
+    pub(crate) fn find_notification(&self, method: &str) -> Option<CapturedNotification> {
+        self.notifications
+            .read()
+            .expect("Failed to acquire read lock")
+            .iter()
+            .find(|n| n.method == method)
+            .cloned()
     }
 
     /// Send a JSON-RPC message to the server.
@@ -38,11 +111,10 @@ impl LspClient {
 
     /// Read a JSON-RPC response from the server.
     ///
-    /// Skips notifications and returns the first response with matching id,
+    /// Captures notifications and returns the first response with matching id,
     /// or any response/error if no id filter is provided.
     pub(crate) fn read_response(&mut self, expected_id: Option<i64>) -> Value {
-        let stdout = self.process.stdout.as_mut().expect("stdout not captured");
-        let mut reader = BufReader::new(stdout);
+        let reader = self.reader.as_mut().expect("reader not initialized");
 
         loop {
             // Read headers
@@ -84,7 +156,22 @@ impl LspClient {
 
             // Check if this is a notification (no id field)
             if message.get("id").is_none() {
-                // Skip notifications, continue reading
+                // Capture the notification
+                if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
+                    let params = message.get("params").cloned().unwrap_or(Value::Null);
+                    let seq = self.notification_counter.fetch_add(1, Ordering::SeqCst);
+                    let notification = CapturedNotification {
+                        method: method.to_string(),
+                        timestamp: Instant::now(),
+                        sequence: seq,
+                        params,
+                    };
+                    self.notifications
+                        .write()
+                        .expect("Failed to acquire write lock")
+                        .push(notification);
+                }
+                // Continue reading for response
                 continue;
             }
 
@@ -110,6 +197,11 @@ impl LspClient {
             "params": {
                 "processId": null,
                 "capabilities": {
+                    "workspace": {
+                        "inlayHint": {
+                            "refreshSupport": true
+                        }
+                    },
                     "textDocument": {
                         "hover": {
                             "contentFormat": ["markdown", "plaintext"]
@@ -118,7 +210,8 @@ impl LspClient {
                             "completionItem": {
                                 "snippetSupport": true
                             }
-                        }
+                        },
+                        "publishDiagnostics": {}
                     }
                 },
                 "rootUri": "file:///tmp",
@@ -155,6 +248,7 @@ impl LspClient {
     }
 
     /// Request hover information.
+    #[allow(dead_code)] // Not used in all tests
     pub(crate) fn hover(&mut self, id: i64, uri: &str, line: u32, character: u32) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
@@ -169,6 +263,7 @@ impl LspClient {
     }
 
     /// Request inlay hints.
+    #[allow(dead_code)] // Not used in all tests
     pub(crate) fn inlay_hints(&mut self, id: i64, uri: &str) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
@@ -186,6 +281,7 @@ impl LspClient {
     }
 
     /// Request completions.
+    #[allow(dead_code)] // Not used in all tests
     pub(crate) fn completion(&mut self, id: i64, uri: &str, line: u32, character: u32) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
@@ -194,6 +290,20 @@ impl LspClient {
             "params": {
                 "textDocument": {"uri": uri},
                 "position": {"line": line, "character": character}
+            }
+        }));
+        self.read_response(Some(id))
+    }
+
+    /// Request workspace symbols.
+    #[allow(dead_code)] // Used for flushing notifications
+    pub(crate) fn workspace_symbol(&mut self, id: i64, query: &str) -> Value {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "workspace/symbol",
+            "params": {
+                "query": query
             }
         }));
         self.read_response(Some(id))
