@@ -57,6 +57,9 @@ pub enum DepsError {
 
     #[error("ambiguous ecosystem detection for file: {0}")]
     AmbiguousEcosystem(String),
+
+    #[error("invalid URI: {0}")]
+    InvalidUri(String),
 }
 
 /// Convenience type alias for `Result<T, DepsError>`.
@@ -124,5 +127,11 @@ mod tests {
             error.to_string(),
             "ambiguous ecosystem detection for file: file.txt"
         );
+    }
+
+    #[test]
+    fn test_invalid_uri() {
+        let error = DepsError::InvalidUri("http://example.com".into());
+        assert_eq!(error.to_string(), "invalid URI: http://example.com");
     }
 }

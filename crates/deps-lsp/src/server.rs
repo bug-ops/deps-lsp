@@ -1,6 +1,5 @@
 use crate::config::DepsConfig;
-use crate::document::ServerState;
-use crate::document_lifecycle;
+use crate::document::{ServerState, handle_document_change, handle_document_open};
 use crate::file_watcher;
 use crate::handlers::{code_actions, completion, diagnostics, hover, inlay_hints};
 use std::collections::HashMap;
@@ -42,7 +41,7 @@ impl Backend {
 
     /// Handles opening a document using unified ecosystem registry.
     async fn handle_open(&self, uri: tower_lsp_server::ls_types::Uri, content: String) {
-        match document_lifecycle::handle_document_open(
+        match handle_document_open(
             uri.clone(),
             content,
             Arc::clone(&self.state),
@@ -65,7 +64,7 @@ impl Backend {
 
     /// Handles changes to a document using unified ecosystem registry.
     async fn handle_change(&self, uri: tower_lsp_server::ls_types::Uri, content: String) {
-        match document_lifecycle::handle_document_change(
+        match handle_document_change(
             uri.clone(),
             content,
             Arc::clone(&self.state),

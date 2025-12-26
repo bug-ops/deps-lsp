@@ -3,8 +3,9 @@
 //! This module provides unified open/change/close handlers that work with
 //! the ecosystem trait architecture, eliminating per-ecosystem duplication.
 
+use super::loader::load_document_from_disk;
+use super::state::{DocumentState, ServerState};
 use crate::config::DepsConfig;
-use crate::document::{DocumentState, ServerState};
 use crate::handlers::diagnostics;
 use deps_core::Ecosystem;
 use deps_core::Registry;
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
-use tower_lsp_server::ls_types::Uri;
+use tower_lsp_server::ls_types::{MessageType, Uri};
 
 /// Fetches latest versions for multiple packages in parallel.
 ///
@@ -323,6 +324,105 @@ async fn load_resolved_versions(
     }
 }
 
+/// Ensures a document is loaded in state.
+///
+/// If the document is not already in state, loads it from disk,
+/// parses it, and spawns a background task to fetch version information.
+///
+/// This function is idempotent - calling it multiple times with the
+/// same URI is safe and will only load once.
+///
+/// # Arguments
+///
+/// * `uri` - Document URI
+/// * `state` - Server state
+/// * `client` - LSP client for notifications
+/// * `config` - Server configuration
+///
+/// # Returns
+///
+/// * `true` - Document is now loaded (either already existed or was just loaded)
+/// * `false` - Document could not be loaded (unsupported file type, read error, etc.)
+///
+/// # Behavior
+///
+/// - If document exists in state → Return true immediately (no-op)
+/// - If document doesn't exist → Load from disk, parse, update state, spawn bg task
+/// - If load fails → Log warning and return false (graceful degradation)
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_lsp::document_lifecycle::ensure_document_loaded;
+/// use deps_lsp::document::ServerState;
+/// use tower_lsp_server::ls_types::Uri;
+/// use std::sync::Arc;
+///
+/// # async fn example(
+/// #     uri: &Uri,
+/// #     state: Arc<ServerState>,
+/// #     client: tower_lsp_server::Client,
+/// #     config: Arc<tokio::sync::RwLock<deps_lsp::config::DepsConfig>>,
+/// # ) {
+/// let loaded = ensure_document_loaded(uri, state, client, config).await;
+/// if loaded {
+///     println!("Document is available for processing");
+/// }
+/// # }
+/// ```
+pub async fn ensure_document_loaded(
+    uri: &Uri,
+    state: Arc<ServerState>,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
+) -> bool {
+    // Fast path: document already loaded
+    if state.get_document(uri).is_some() {
+        tracing::debug!("Document already loaded: {:?}", uri);
+        return true;
+    }
+
+    // Check if we support this file type
+    if state.ecosystem_registry.get_for_uri(uri).is_none() {
+        tracing::debug!("Unsupported file type: {:?}", uri);
+        return false;
+    }
+
+    // Load from disk
+    tracing::info!("Loading document from disk (cold start): {:?}", uri);
+    let content = match load_document_from_disk(uri).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to load document {:?}: {}", uri, e);
+            client
+                .log_message(MessageType::WARNING, format!("Could not load file: {}", e))
+                .await;
+            return false;
+        }
+    };
+
+    // Reuse existing handle_document_open logic
+    match handle_document_open(
+        uri.clone(),
+        content,
+        Arc::clone(&state),
+        client.clone(),
+        Arc::clone(&config),
+    )
+    .await
+    {
+        Ok(task) => {
+            state.spawn_background_task(uri.clone(), task).await;
+            tracing::info!("Document loaded successfully from disk: {:?}", uri);
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Failed to process loaded document {:?}: {}", uri, e);
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +568,136 @@ serde = "1.0"
         assert!(
             doc.parse_result().is_none(),
             "Parse result should be None for failed parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_document_loaded_fast_path() {
+        // Fast path: document already loaded, should return true without loading
+        let state = Arc::new(ServerState::new());
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let content = r#"[dependencies]
+serde = "1.0""#;
+
+        // Pre-populate state with document
+        let ecosystem = state
+            .ecosystem_registry
+            .get_for_uri(&uri)
+            .expect("Cargo ecosystem");
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let doc_state =
+            DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result);
+        state.update_document(uri.clone(), doc_state);
+
+        // Fast path check: document exists
+        assert!(
+            state.get_document(&uri).is_some(),
+            "Document should exist in state"
+        );
+        assert_eq!(state.document_count(), 1, "Document count should be 1");
+
+        // The fast path in ensure_document_loaded would return true here without
+        // requiring a Client. We test the condition directly since creating a test
+        // Client requires complex tower-lsp-server internals (ServerState, ClientSocket).
+    }
+
+    #[tokio::test]
+    async fn test_ensure_document_loaded_unsupported_file_check() {
+        // Returns false for unknown file types (e.g., README.md)
+        let state = Arc::new(ServerState::new());
+        let uri = Uri::from_file_path("/test/README.md").unwrap();
+
+        // Verify ecosystem registry correctly identifies unsupported files
+        assert!(
+            state.ecosystem_registry.get_for_uri(&uri).is_none(),
+            "README.md should not have an ecosystem handler"
+        );
+
+        // This would cause ensure_document_loaded to return false
+        // We test the underlying condition without needing Client
+    }
+
+    #[tokio::test]
+    async fn test_ensure_document_loaded_file_not_found_check() {
+        // Test that load_document_from_disk fails gracefully for missing files
+        use super::load_document_from_disk;
+
+        let uri = Uri::from_file_path("/nonexistent/Cargo.toml").unwrap();
+        let result = load_document_from_disk(&uri).await;
+
+        assert!(result.is_err(), "Should fail for missing files");
+
+        // This error would cause ensure_document_loaded to return false
+    }
+
+    #[tokio::test]
+    async fn test_ensure_document_loaded_successful_disk_load() {
+        // Test successful load from filesystem with temp file
+        use super::load_document_from_disk;
+        use std::fs;
+        use tempfile::TempDir;
+
+        // Create a temporary directory with a Cargo.toml file
+        let temp_dir = TempDir::new().unwrap();
+        let cargo_toml_path = temp_dir.path().join("Cargo.toml");
+        let content = r#"[package]
+name = "test"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+"#;
+        fs::write(&cargo_toml_path, content).unwrap();
+
+        let uri = Uri::from_file_path(&cargo_toml_path).unwrap();
+
+        // Test that load_document_from_disk succeeds
+        let loaded_content = load_document_from_disk(&uri).await.unwrap();
+        assert_eq!(loaded_content, content);
+
+        // Test that parsing succeeds
+        let state = Arc::new(ServerState::new());
+        let ecosystem = state
+            .ecosystem_registry
+            .get_for_uri(&uri)
+            .expect("Cargo ecosystem");
+        let parse_result = ecosystem.parse_manifest(&loaded_content, &uri).await;
+        assert!(parse_result.is_ok(), "Should parse successfully");
+
+        // These successful operations are the building blocks of ensure_document_loaded
+    }
+
+    #[tokio::test]
+    async fn test_ensure_document_loaded_idempotent_check() {
+        // Test that repeated loads are idempotent at the state level
+        let state = Arc::new(ServerState::new());
+        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let content = r#"[dependencies]
+serde = "1.0""#;
+
+        let ecosystem = state
+            .ecosystem_registry
+            .get_for_uri(&uri)
+            .expect("Cargo ecosystem");
+
+        // Parse twice to simulate idempotent loads
+        let parse_result1 = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let parse_result2 = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        // First update
+        let doc_state1 =
+            DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result1);
+        state.update_document(uri.clone(), doc_state1);
+        assert_eq!(state.document_count(), 1);
+
+        // Second update (idempotent)
+        let doc_state2 =
+            DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result2);
+        state.update_document(uri.clone(), doc_state2);
+        assert_eq!(
+            state.document_count(),
+            1,
+            "Should still have only 1 document"
         );
     }
 }

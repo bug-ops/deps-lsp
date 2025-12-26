@@ -38,4 +38,5 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 [dev-dependencies]
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
+tempfile = { workspace = true }
 tokio-test = { workspace = true }
