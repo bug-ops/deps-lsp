@@ -348,6 +348,12 @@ pub async fn handle_document_change(
         preserve_cache(&mut doc_state, &old_doc);
     }
 
+    // Prune stale cache entries for removed dependencies
+    for removed_dep in &diff.removed {
+        doc_state.cached_versions.remove(removed_dep);
+        doc_state.resolved_versions.remove(removed_dep);
+    }
+
     state.update_document(uri.clone(), doc_state);
 
     // Clone cache config before spawning background task
@@ -1573,6 +1579,77 @@ serde = "1.0"
             assert_eq!(diff.added.len(), 2);
             assert!(diff.removed.is_empty());
             assert!(diff.needs_fetch());
+        }
+
+        #[tokio::test]
+        async fn test_cache_pruned_on_dependency_removal() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+
+            // Initial document with 3 dependencies
+            let content1 = r#"[dependencies]
+serde = "1.0"
+tokio = "1.0"
+anyhow = "1.0"
+"#;
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 =
+                DocumentState::new_from_parse_result("cargo", content1.to_string(), parse_result1);
+            state.update_document(uri.clone(), doc_state1);
+
+            // Populate cache for all 3 deps
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.cached_versions
+                    .insert("serde".to_string(), "1.0.210".to_string());
+                doc.cached_versions
+                    .insert("tokio".to_string(), "1.40.0".to_string());
+                doc.cached_versions
+                    .insert("anyhow".to_string(), "1.0.89".to_string());
+            }
+
+            // Remove anyhow from manifest
+            let content2 = r#"[dependencies]
+serde = "1.0"
+tokio = "1.0"
+"#;
+
+            // Compute diff and apply cache pruning
+            let old_dep_names: HashSet<String> = ["serde", "tokio", "anyhow"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let new_dep_names: HashSet<String> =
+                ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+            let diff = DependencyDiff::compute(&old_dep_names, &new_dep_names);
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 =
+                DocumentState::new_from_parse_result("cargo", content2.to_string(), parse_result2);
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            // Prune removed dependencies
+            for removed_dep in &diff.removed {
+                doc_state2.cached_versions.remove(removed_dep);
+            }
+
+            state.update_document(uri.clone(), doc_state2);
+
+            // Verify cache was pruned
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.cached_versions.len(),
+                2,
+                "anyhow should be removed from cache"
+            );
+            assert!(doc.cached_versions.contains_key("serde"));
+            assert!(doc.cached_versions.contains_key("tokio"));
+            assert!(!doc.cached_versions.contains_key("anyhow"));
         }
     }
 }
