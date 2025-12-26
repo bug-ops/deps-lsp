@@ -202,12 +202,14 @@ impl Ecosystem for CargoEcosystem {
         parse_result: &dyn ParseResultTrait,
         cached_versions: &HashMap<String, String>,
         resolved_versions: &HashMap<String, String>,
+        loading_state: deps_core::LoadingState,
         config: &EcosystemConfig,
     ) -> Vec<InlayHint> {
         lsp_helpers::generate_inlay_hints(
             parse_result,
             cached_versions,
             resolved_versions,
+            loading_state,
             config,
             &self.formatter,
         )
@@ -391,6 +393,8 @@ mod tests {
         cached_versions.insert("serde".to_string(), "1.0.214".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -401,6 +405,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 
@@ -424,6 +429,8 @@ mod tests {
         cached_versions.insert("serde".to_string(), "1.0.214".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -434,6 +441,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 
@@ -457,6 +465,8 @@ mod tests {
         cached_versions.insert("serde".to_string(), "1.0.214".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -467,6 +477,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 
@@ -490,6 +501,8 @@ mod tests {
         cached_versions.insert("serde".to_string(), "1.0.214".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: false,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -500,6 +513,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 
@@ -522,6 +536,8 @@ mod tests {
         cached_versions.insert("serde".to_string(), "1.0.214".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -532,6 +548,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 
@@ -554,6 +571,8 @@ mod tests {
         cached_versions.insert("serde".to_string(), "1.0.214".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -565,6 +584,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 
@@ -735,5 +755,49 @@ mod tests {
         let results = ecosystem.complete_package_names("tokio-ut").await;
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.label.contains('-')));
+    }
+
+    #[test]
+    fn test_generate_inlay_hints_loading_state() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+
+        let parse_result = MockParseResult {
+            dependencies: vec![mock_dependency("tokio", Some("1.0"), 5, 5)],
+        };
+
+        // Empty caches - simulating loading state
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+        };
+
+        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+            &parse_result,
+            &cached_versions,
+            &resolved_versions,
+            deps_core::LoadingState::Loading,
+            &config,
+        ));
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(s) => assert_eq!(s, "⏳", "Expected loading indicator"),
+            _ => panic!("Expected String label"),
+        }
+
+        if let Some(tower_lsp_server::ls_types::InlayHintTooltip::String(tooltip)) =
+            &hints[0].tooltip
+        {
+            assert_eq!(tooltip, "Fetching latest version...");
+        } else {
+            panic!("Expected tooltip for loading state");
+        }
     }
 }

@@ -29,7 +29,7 @@ pub async fn handle_inlay_hints(
     let uri = &params.text_document.uri;
 
     // Ensure document is loaded (cold start support)
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, full_config).await {
+    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await {
         tracing::warn!("Could not load document for inlay hints: {:?}", uri);
         return vec![];
     }
@@ -56,10 +56,15 @@ pub async fn handle_inlay_hints(
         None => return vec![],
     };
 
+    // Get loading indicator config
+    let loading_config = { full_config.read().await.loading_indicator.clone() };
+
     let ecosystem_config = EcosystemConfig {
         show_up_to_date_hints: true,
         up_to_date_text: config.up_to_date_text.clone(),
         needs_update_text: config.needs_update_text.clone(),
+        loading_text: loading_config.loading_text,
+        show_loading_hints: loading_config.enabled && loading_config.fallback_to_hints,
     };
 
     // Generate hints while holding the lock
@@ -68,6 +73,7 @@ pub async fn handle_inlay_hints(
             parse_result,
             &doc.cached_versions,
             &doc.resolved_versions,
+            doc.loading_state,
             &ecosystem_config,
         )
         .await

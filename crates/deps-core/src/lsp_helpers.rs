@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, Diagnostic, DiagnosticSeverity, Hover, HoverContents, InlayHint,
-    InlayHintKind, InlayHintLabel, MarkupContent, MarkupKind, Position, Range, TextEdit, Uri,
-    WorkspaceEdit,
+    InlayHintKind, InlayHintLabel, InlayHintTooltip, MarkupContent, MarkupKind, Position, Range,
+    TextEdit, Uri, WorkspaceEdit,
 };
 
 use crate::{Dependency, EcosystemConfig, ParseResult, Registry};
@@ -85,6 +85,7 @@ pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
     cached_versions: &HashMap<String, String>,
     resolved_versions: &HashMap<String, String>,
+    loading_state: crate::LoadingState,
     config: &EcosystemConfig,
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<InlayHint> {
@@ -103,6 +104,26 @@ pub fn generate_inlay_hints(
         let resolved_version = resolved_versions
             .get(&normalized_name)
             .or_else(|| resolved_versions.get(dep.name()));
+
+        // Show loading hint if loading and no cached version
+        if loading_state == crate::LoadingState::Loading
+            && config.show_loading_hints
+            && latest_version.is_none()
+        {
+            hints.push(InlayHint {
+                position: version_range.end,
+                label: InlayHintLabel::String(config.loading_text.clone()),
+                kind: Some(InlayHintKind::TYPE),
+                tooltip: Some(InlayHintTooltip::String(
+                    "Fetching latest version...".to_string(),
+                )),
+                padding_left: Some(true),
+                padding_right: None,
+                text_edits: None,
+                data: None,
+            });
+            continue;
+        }
 
         let (is_up_to_date, display_version) = match (resolved_version, latest_version) {
             (Some(resolved), Some(latest)) => {
@@ -538,6 +559,8 @@ mod tests {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
         };
 
         struct MockParseResult {
@@ -608,6 +631,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            crate::LoadingState::Loaded,
             &config,
             &formatter,
         );
@@ -632,6 +656,8 @@ mod tests {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
         };
 
         struct MockParseResult {
@@ -702,6 +728,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            crate::LoadingState::Loaded,
             &config,
             &formatter,
         );
@@ -712,6 +739,298 @@ mod tests {
                 assert!(
                     text.starts_with("✅"),
                     "Expected up-to-date hint, got: {}",
+                    text
+                );
+            }
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    #[test]
+    fn test_loading_hint_shows_when_no_cached_version() {
+        use std::any::Any;
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range, Uri};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+        };
+
+        struct MockParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+        }
+
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockDep {
+            name: String,
+            version_req: String,
+            version_range: Range,
+            name_range: Range,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                self.name_range
+            }
+            fn version_requirement(&self) -> Option<&str> {
+                Some(&self.version_req)
+            }
+            fn version_range(&self) -> Option<Range> {
+                Some(self.version_range)
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "tokio".to_string(),
+                version_req: "1.0".to_string(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            &cached_versions,
+            &resolved_versions,
+            crate::LoadingState::Loading,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert_eq!(text, "⏳", "Expected loading hint");
+            }
+            _ => panic!("Expected string label"),
+        }
+
+        if let Some(InlayHintTooltip::String(tooltip)) = &hints[0].tooltip {
+            assert_eq!(tooltip, "Fetching latest version...");
+        } else {
+            panic!("Expected tooltip");
+        }
+    }
+
+    #[test]
+    fn test_loading_hint_disabled_when_config_false() {
+        use std::any::Any;
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range, Uri};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: false,
+        };
+
+        struct MockParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+        }
+
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockDep {
+            name: String,
+            version_req: String,
+            version_range: Range,
+            name_range: Range,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                self.name_range
+            }
+            fn version_requirement(&self) -> Option<&str> {
+                Some(&self.version_req)
+            }
+            fn version_range(&self) -> Option<Range> {
+                Some(self.version_range)
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "tokio".to_string(),
+                version_req: "1.0".to_string(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            &cached_versions,
+            &resolved_versions,
+            crate::LoadingState::Loading,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(
+            hints.len(),
+            0,
+            "Expected no hints when loading hints disabled"
+        );
+    }
+
+    #[test]
+    fn test_loading_hint_not_shown_when_cached_version_exists() {
+        use std::any::Any;
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range, Uri};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+        };
+
+        struct MockParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+        }
+
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockDep {
+            name: String,
+            version_req: String,
+            version_range: Range,
+            name_range: Range,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &str {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                self.name_range
+            }
+            fn version_requirement(&self) -> Option<&str> {
+                Some(&self.version_req)
+            }
+            fn version_range(&self) -> Option<Range> {
+                Some(self.version_range)
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".to_string(),
+                version_req: "1.0".to_string(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".to_string(), "1.0.214".to_string());
+
+        let resolved_versions = HashMap::new();
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            &cached_versions,
+            &resolved_versions,
+            crate::LoadingState::Loading,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert_eq!(
+                    text, "✅",
+                    "Expected up-to-date hint, not loading hint, got: {}",
                     text
                 );
             }

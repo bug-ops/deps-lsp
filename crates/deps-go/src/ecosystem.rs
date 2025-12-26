@@ -157,12 +157,14 @@ impl Ecosystem for GoEcosystem {
         parse_result: &dyn ParseResultTrait,
         cached_versions: &HashMap<String, String>,
         resolved_versions: &HashMap<String, String>,
+        loading_state: deps_core::LoadingState,
         config: &EcosystemConfig,
     ) -> Vec<InlayHint> {
         lsp_helpers::generate_inlay_hints(
             parse_result,
             cached_versions,
             resolved_versions,
+            loading_state,
             config,
             &self.formatter,
         )
@@ -340,6 +342,8 @@ mod tests {
         cached_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -350,6 +354,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 
@@ -379,6 +384,8 @@ mod tests {
         cached_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -389,6 +396,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 
@@ -418,6 +426,8 @@ mod tests {
         cached_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: false,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -428,6 +438,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 
@@ -452,6 +463,8 @@ mod tests {
         cached_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
 
         let config = EcosystemConfig {
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -462,6 +475,7 @@ mod tests {
             &parse_result,
             &cached_versions,
             &resolved_versions,
+            deps_core::LoadingState::Loaded,
             &config,
         ));
 

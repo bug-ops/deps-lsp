@@ -319,6 +319,7 @@ mod tests {
             _parse_result: &dyn ParseResult,
             _cached_versions: &std::collections::HashMap<String, String>,
             _resolved_versions: &std::collections::HashMap<String, String>,
+            _loading_state: crate::LoadingState,
             _config: &EcosystemConfig,
         ) -> Vec<InlayHint> {
             vec![]

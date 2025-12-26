@@ -62,6 +62,10 @@ pub struct EcosystemConfig {
     pub up_to_date_text: String,
     /// Text to display for dependencies needing updates (use {} for version placeholder)
     pub needs_update_text: String,
+    /// Text to display while loading registry data
+    pub loading_text: String,
+    /// Whether to show loading hints in inlay hints
+    pub show_loading_hints: bool,
 }
 
 impl Default for EcosystemConfig {
@@ -70,6 +74,8 @@ impl Default for EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
         }
     }
 }
@@ -130,9 +136,10 @@ impl Default for EcosystemConfig {
 ///         parse_result: &dyn ParseResult,
 ///         cached_versions: &std::collections::HashMap<String, String>,
 ///         resolved_versions: &std::collections::HashMap<String, String>,
+///         loading_state: deps_core::LoadingState,
 ///         config: &EcosystemConfig,
 ///     ) -> Vec<InlayHint> {
-///         let _ = resolved_versions; // Use resolved versions for lock file support
+///         let _ = (resolved_versions, loading_state); // Use resolved versions for lock file support
 ///         vec![]
 ///     }
 ///
@@ -249,12 +256,14 @@ pub trait Ecosystem: Send + Sync {
     /// * `parse_result` - Parsed dependencies from manifest
     /// * `cached_versions` - Pre-fetched version information (name -> latest version from registry)
     /// * `resolved_versions` - Resolved versions from lock file (name -> locked version)
+    /// * `loading_state` - Current loading state for registry data
     /// * `config` - User configuration for hint display
     async fn generate_inlay_hints(
         &self,
         parse_result: &dyn ParseResult,
         cached_versions: &std::collections::HashMap<String, String>,
         resolved_versions: &std::collections::HashMap<String, String>,
+        loading_state: crate::LoadingState,
         config: &EcosystemConfig,
     ) -> Vec<InlayHint>;
 
@@ -350,6 +359,8 @@ mod tests {
             show_up_to_date_hints: false,
             up_to_date_text: "OK".to_string(),
             needs_update_text: "Update to {}".to_string(),
+            loading_text: "Loading...".to_string(),
+            show_loading_hints: false,
         };
         assert!(!config.show_up_to_date_hints);
         assert_eq!(config.up_to_date_text, "OK");

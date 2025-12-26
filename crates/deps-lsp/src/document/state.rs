@@ -183,21 +183,8 @@ impl deps_core::YankedChecker for UnifiedVersion {
     }
 }
 
-/// Loading state for registry data fetching.
-///
-/// Tracks the current state of background version fetching tasks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LoadingState {
-    /// No data loaded, not currently loading
-    #[default]
-    Idle,
-    /// Currently fetching registry data
-    Loading,
-    /// Data fetched and cached
-    Loaded,
-    /// Fetch failed (still show old cached data if available)
-    Failed,
-}
+// Re-export LoadingState from deps-core for convenience
+pub use deps_core::LoadingState;
 
 /// Package ecosystem type.
 ///

@@ -32,6 +32,8 @@ pub struct DepsConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub cold_start: ColdStartConfig,
+    #[serde(default)]
+    pub loading_indicator: LoadingIndicatorConfig,
 }
 
 /// Configuration for inlay hints (inline version annotations).
@@ -162,6 +164,44 @@ impl Default for CacheConfig {
     }
 }
 
+/// Configuration for loading indicator behavior.
+///
+/// Controls how the server shows loading feedback when fetching registry data.
+///
+/// # Defaults
+///
+/// - `enabled`: `true`
+/// - `fallback_to_hints`: `true`
+/// - `loading_text`: `"⏳"`
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadingIndicatorConfig {
+    /// Enable loading indicators (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Show progress in inlay hints if LSP progress not supported (default: true)
+    #[serde(default = "default_true")]
+    pub fallback_to_hints: bool,
+
+    /// Loading text to show in inlay hints (default: "⏳")
+    /// Maximum length: 100 characters (truncated with warning if exceeded)
+    #[serde(
+        default = "default_loading_text",
+        deserialize_with = "deserialize_loading_text"
+    )]
+    pub loading_text: String,
+}
+
+impl Default for LoadingIndicatorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fallback_to_hints: true,
+            loading_text: default_loading_text(),
+        }
+    }
+}
+
 // Default value functions
 const fn default_true() -> bool {
     true
@@ -173,6 +213,37 @@ fn default_up_to_date() -> String {
 
 fn default_needs_update() -> String {
     "❌ {}".to_string()
+}
+
+fn default_loading_text() -> String {
+    "⏳".to_string()
+}
+
+/// Maximum length for loading_text (security limit)
+const MAX_LOADING_TEXT_LENGTH: usize = 100;
+
+/// Truncates and validates loading_text to prevent abuse
+fn validate_loading_text(text: String) -> String {
+    if text.len() > MAX_LOADING_TEXT_LENGTH {
+        tracing::warn!(
+            "loading_text exceeded max length of {} chars, truncating from {} to {}",
+            MAX_LOADING_TEXT_LENGTH,
+            text.len(),
+            MAX_LOADING_TEXT_LENGTH
+        );
+        text.chars().take(MAX_LOADING_TEXT_LENGTH).collect()
+    } else {
+        text
+    }
+}
+
+/// Custom deserializer for loading_text that validates length
+fn deserialize_loading_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = String::deserialize(deserializer)?;
+    Ok(validate_loading_text(text))
 }
 
 const fn default_outdated_severity() -> DiagnosticSeverity {
@@ -377,5 +448,85 @@ mod tests {
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         assert!(config.cold_start.enabled);
         assert_eq!(config.cold_start.rate_limit_ms, 150);
+    }
+
+    #[test]
+    fn test_loading_indicator_config_defaults() {
+        let config = LoadingIndicatorConfig::default();
+        assert!(config.enabled);
+        assert!(config.fallback_to_hints);
+        assert_eq!(config.loading_text, "⏳");
+    }
+
+    #[test]
+    fn test_loading_indicator_config_deserialization() {
+        let json = r#"{
+            "enabled": false,
+            "fallback_to_hints": false,
+            "loading_text": "Loading..."
+        }"#;
+
+        let config: LoadingIndicatorConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.enabled);
+        assert!(!config.fallback_to_hints);
+        assert_eq!(config.loading_text, "Loading...");
+    }
+
+    #[test]
+    fn test_loading_text_truncation() {
+        let long_text = "a".repeat(150);
+        let json = format!(
+            r#"{{
+            "enabled": true,
+            "fallback_to_hints": true,
+            "loading_text": "{}"
+        }}"#,
+            long_text
+        );
+
+        let config: LoadingIndicatorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.loading_text.len(), 100);
+        assert_eq!(config.loading_text, "a".repeat(100));
+    }
+
+    #[test]
+    fn test_loading_text_exactly_100_chars() {
+        let text = "a".repeat(100);
+        let json = format!(
+            r#"{{
+            "enabled": true,
+            "fallback_to_hints": true,
+            "loading_text": "{}"
+        }}"#,
+            text
+        );
+
+        let config: LoadingIndicatorConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.loading_text.len(), 100);
+        assert_eq!(config.loading_text, text);
+    }
+
+    #[test]
+    fn test_loading_text_under_limit() {
+        let json = r#"{
+            "enabled": true,
+            "fallback_to_hints": true,
+            "loading_text": "⏳ Loading dependencies..."
+        }"#;
+
+        let config: LoadingIndicatorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.loading_text, "⏳ Loading dependencies...");
+        assert!(config.loading_text.len() < 100);
+    }
+
+    #[test]
+    fn test_loading_text_default() {
+        let json = r#"{
+            "enabled": true,
+            "fallback_to_hints": true
+        }"#;
+
+        let config: LoadingIndicatorConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.loading_text, "⏳");
     }
 }

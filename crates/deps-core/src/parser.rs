@@ -84,6 +84,79 @@ pub enum DependencySource {
     Path { path: String },
 }
 
+/// Loading state for registry data fetching.
+///
+/// Tracks the current state of background registry operations to provide
+/// user feedback about data availability.
+///
+/// # State Transitions
+///
+/// Complete state machine diagram showing all valid transitions:
+///
+/// ```text
+///        ┌─────┐
+///        │Idle │ (Initial state: no data loaded, not loading)
+///        └──┬──┘
+///           │
+///           │ didOpen/didChange
+///           │ (start fetching)
+///           ▼
+///      ┌────────┐
+///      │Loading │ (Fetching registry data)
+///      └───┬────┘
+///          │
+///          ├─────── Success ──────┐
+///          │                       ▼
+///          │                  ┌────────┐
+///          │                  │Loaded  │ (Data cached and ready)
+///          │                  └───┬────┘
+///          │                      │
+///          │                      │ didChange/refresh
+///          │                      │ (re-fetch)
+///          │                      │
+///          │                      ▼
+///          │                  ┌────────┐
+///          │                  │Loading │
+///          │                  └────────┘
+///          │
+///          └─────── Error ─────────┐
+///                                   ▼
+///                              ┌────────┐
+///                              │Failed  │ (Fetch failed, old cache may exist)
+///                              └───┬────┘
+///                                  │
+///                                  │ didChange/retry
+///                                  │ (try again)
+///                                  │
+///                                  ▼
+///                              ┌────────┐
+///                              │Loading │
+///                              └────────┘
+/// ```
+///
+/// # Key Behaviors
+///
+/// - **Idle**: Initial state when no data has been fetched yet
+/// - **Loading**: Actively fetching from registry (may show loading indicator)
+/// - **Loaded**: Successfully fetched and cached data
+/// - **Failed**: Network/registry error occurred (falls back to old cache if available)
+///
+/// # Thread Safety
+///
+/// This enum is `Copy` for efficient passing across thread boundaries in async contexts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadingState {
+    /// No data loaded, not currently loading
+    #[default]
+    Idle,
+    /// Currently fetching registry data
+    Loading,
+    /// Data fetched and cached
+    Loaded,
+    /// Fetch failed (old cached data may still be available)
+    Failed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +260,42 @@ mod tests {
         let git_debug = format!("{:?}", git);
         assert!(git_debug.contains("https://example.com"));
         assert!(git_debug.contains("main"));
+    }
+
+    #[test]
+    fn test_loading_state_default() {
+        assert_eq!(LoadingState::default(), LoadingState::Idle);
+    }
+
+    #[test]
+    fn test_loading_state_copy() {
+        let state = LoadingState::Loading;
+        let copied = state;
+        assert_eq!(state, copied);
+    }
+
+    #[test]
+    fn test_loading_state_debug() {
+        let debug_str = format!("{:?}", LoadingState::Loading);
+        assert_eq!(debug_str, "Loading");
+    }
+
+    #[test]
+    fn test_loading_state_all_variants() {
+        let variants = [
+            LoadingState::Idle,
+            LoadingState::Loading,
+            LoadingState::Loaded,
+            LoadingState::Failed,
+        ];
+        for (i, v1) in variants.iter().enumerate() {
+            for (j, v2) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(v1, v2);
+                } else {
+                    assert_ne!(v1, v2);
+                }
+            }
+        }
     }
 }

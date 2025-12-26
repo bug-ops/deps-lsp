@@ -169,12 +169,14 @@ impl Ecosystem for NpmEcosystem {
         parse_result: &dyn ParseResultTrait,
         cached_versions: &HashMap<String, String>,
         resolved_versions: &HashMap<String, String>,
+        loading_state: deps_core::LoadingState,
         config: &EcosystemConfig,
     ) -> Vec<InlayHint> {
         lsp_helpers::generate_inlay_hints(
             parse_result,
             cached_versions,
             resolved_versions,
+            loading_state,
             config,
             &self.formatter,
         )
@@ -480,6 +482,7 @@ mod tests {
                 parse_result.as_ref(),
                 &cached_versions,
                 &resolved_versions,
+                deps_core::LoadingState::Loaded,
                 &config,
             )
             .await;
