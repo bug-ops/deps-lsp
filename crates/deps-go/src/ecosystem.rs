@@ -247,6 +247,7 @@ impl Ecosystem for GoEcosystem {
 mod tests {
     use super::*;
     use crate::types::{GoDependency, GoDirective};
+    use deps_core::Dependency;
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
@@ -536,5 +537,248 @@ mod tests {
             .complete_versions("github.com/gin-gonic/gin", "v")
             .await;
         assert!(results.len() <= 20);
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_on_module_path() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let parse_result = MockParseResult {
+            dependencies: vec![mock_dependency(
+                "github.com/gin-gonic/gin",
+                Some("v1.9.1"),
+                5,
+            )],
+            uri,
+        };
+
+        let position = Position::new(5, 5);
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let hover = ecosystem
+            .generate_hover(
+                &parse_result,
+                position,
+                &cached_versions,
+                &resolved_versions,
+            )
+            .await;
+
+        // Returns hover with package URL
+        assert!(hover.is_some());
+        let hover_content = hover.unwrap();
+        let markdown = format!("{:?}", hover_content.contents);
+        assert!(markdown.contains("pkg.go.dev"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_outside_dependency() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let parse_result = MockParseResult {
+            dependencies: vec![mock_dependency(
+                "github.com/gin-gonic/gin",
+                Some("v1.9.1"),
+                5,
+            )],
+            uri,
+        };
+
+        let position = Position::new(0, 0);
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let hover = ecosystem
+            .generate_hover(
+                &parse_result,
+                position,
+                &cached_versions,
+                &resolved_versions,
+            )
+            .await;
+
+        assert!(hover.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_on_module() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let parse_result = MockParseResult {
+            dependencies: vec![mock_dependency(
+                "github.com/gin-gonic/gin",
+                Some("v1.9.0"),
+                5,
+            )],
+            uri: uri.clone(),
+        };
+
+        let position = Position::new(5, 5);
+        let cached_versions = HashMap::new();
+
+        let actions = ecosystem
+            .generate_code_actions(&parse_result, position, &cached_versions, &uri)
+            .await;
+
+        // Returns actions (open documentation link)
+        assert!(!actions.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires network access to proxy.golang.org"]
+    async fn test_generate_diagnostics_basic() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let parse_result = MockParseResult {
+            dependencies: vec![mock_dependency(
+                "github.com/gin-gonic/gin",
+                Some("v1.9.1"),
+                5,
+            )],
+            uri,
+        };
+
+        let cached_versions = HashMap::new();
+
+        // Use timeout to prevent hanging
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ecosystem.generate_diagnostics(&parse_result, &cached_versions, parse_result.uri()),
+        )
+        .await;
+
+        // Should complete within timeout
+        assert!(result.is_ok(), "Diagnostic generation timed out");
+    }
+
+    #[tokio::test]
+    async fn test_generate_completions_package_name() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        let content = r#"module example.com/myapp
+
+go 1.21
+
+require github.com/
+"#;
+
+        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let parse_result = MockParseResult {
+            dependencies: vec![],
+            uri,
+        };
+
+        let position = Position::new(4, 19);
+
+        let completions = ecosystem
+            .generate_completions(&parse_result, position, content)
+            .await;
+
+        // Go doesn't support package search, should be empty
+        assert!(completions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_completions_outside_context() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        let content = r#"module example.com/myapp
+
+go 1.21
+"#;
+
+        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let parse_result = MockParseResult {
+            dependencies: vec![],
+            uri,
+        };
+
+        let position = Position::new(0, 0);
+
+        let completions = ecosystem
+            .generate_completions(&parse_result, position, content)
+            .await;
+
+        assert!(completions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_valid() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        let content = r#"module example.com/myapp
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+"#;
+
+        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+
+        let result = ecosystem.parse_manifest(content, &uri).await;
+        assert!(result.is_ok());
+
+        let parse_result = result.unwrap();
+        assert_eq!(parse_result.dependencies().len(), 1);
+        assert_eq!(
+            parse_result.dependencies()[0].name(),
+            "github.com/gin-gonic/gin"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_empty() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        let content = "";
+        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+
+        let result = ecosystem.parse_manifest(content, &uri).await;
+        assert!(result.is_ok());
+
+        let parse_result = result.unwrap();
+        assert_eq!(parse_result.dependencies().len(), 0);
+    }
+
+    #[test]
+    fn test_registry_returns_trait_object() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        let registry = ecosystem.registry();
+        assert_eq!(
+            registry.package_url("github.com/gin-gonic/gin"),
+            "https://pkg.go.dev/github.com/gin-gonic/gin"
+        );
+    }
+
+    #[test]
+    fn test_lockfile_provider_none() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GoEcosystem::new(cache);
+
+        assert!(ecosystem.lockfile_provider().is_none());
+    }
+
+    #[test]
+    fn test_mock_dependency_indirect() {
+        let mut dep = mock_dependency("github.com/example/pkg", Some("v1.0.0"), 10);
+        dep.indirect = true;
+
+        assert!(dep.indirect);
+        assert_eq!(dep.name(), "github.com/example/pkg");
     }
 }

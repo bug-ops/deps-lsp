@@ -1188,4 +1188,241 @@ dependencies = ["requests>=2.0.0"]
             "All other requests should be blocked"
         );
     }
+
+    #[test]
+    fn test_ecosystem_from_filename_go() {
+        assert_eq!(Ecosystem::from_filename("go.mod"), Some(Ecosystem::Go));
+    }
+
+    #[test]
+    fn test_ecosystem_from_uri_go() {
+        let go_uri = Uri::from_file_path("/path/to/go.mod").unwrap();
+        assert_eq!(Ecosystem::from_uri(&go_uri), Some(Ecosystem::Go));
+    }
+
+    #[test]
+    fn test_unified_dependency_go() {
+        use deps_go::{GoDependency, GoDirective};
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let go_dep = UnifiedDependency::Go(GoDependency {
+            module_path: "github.com/gin-gonic/gin".into(),
+            module_path_range: Range::new(Position::new(0, 0), Position::new(0, 25)),
+            version: Some("v1.9.1".into()),
+            version_range: Some(Range::new(Position::new(0, 26), Position::new(0, 32))),
+            directive: GoDirective::Require,
+            indirect: false,
+        });
+
+        assert_eq!(go_dep.name(), "github.com/gin-gonic/gin");
+        assert_eq!(go_dep.version_req(), Some("v1.9.1"));
+        assert!(go_dep.is_registry());
+    }
+
+    #[test]
+    fn test_unified_dependency_go_name_range() {
+        use deps_go::{GoDependency, GoDirective};
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let range = Range::new(Position::new(5, 10), Position::new(5, 35));
+        let go_dep = UnifiedDependency::Go(GoDependency {
+            module_path: "github.com/example/pkg".into(),
+            module_path_range: range,
+            version: Some("v1.0.0".into()),
+            version_range: Some(Range::new(Position::new(5, 36), Position::new(5, 42))),
+            directive: GoDirective::Require,
+            indirect: false,
+        });
+
+        assert_eq!(go_dep.name_range(), range);
+    }
+
+    #[test]
+    fn test_unified_dependency_go_version_range() {
+        use deps_go::{GoDependency, GoDirective};
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let version_range = Range::new(Position::new(5, 36), Position::new(5, 42));
+        let go_dep = UnifiedDependency::Go(GoDependency {
+            module_path: "github.com/example/pkg".into(),
+            module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
+            version: Some("v1.0.0".into()),
+            version_range: Some(version_range),
+            directive: GoDirective::Require,
+            indirect: false,
+        });
+
+        assert_eq!(go_dep.version_range(), Some(version_range));
+    }
+
+    #[test]
+    fn test_unified_dependency_go_no_version() {
+        use deps_go::{GoDependency, GoDirective};
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let go_dep = UnifiedDependency::Go(GoDependency {
+            module_path: "github.com/example/pkg".into(),
+            module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
+            version: None,
+            version_range: None,
+            directive: GoDirective::Require,
+            indirect: false,
+        });
+
+        assert_eq!(go_dep.version_req(), None);
+        assert_eq!(go_dep.version_range(), None);
+    }
+
+    #[test]
+    fn test_unified_version_go() {
+        use deps_go::GoVersion;
+
+        let version = UnifiedVersion::Go(GoVersion {
+            version: "v1.9.1".into(),
+            time: Some("2023-07-18T14:30:00Z".into()),
+            is_pseudo: false,
+            retracted: false,
+        });
+
+        assert_eq!(version.version_string(), "v1.9.1");
+        assert!(!version.is_yanked());
+    }
+
+    #[test]
+    fn test_unified_version_go_retracted() {
+        use deps_go::GoVersion;
+
+        let version = UnifiedVersion::Go(GoVersion {
+            version: "v1.0.0".into(),
+            time: None,
+            is_pseudo: false,
+            retracted: true,
+        });
+
+        assert_eq!(version.version_string(), "v1.0.0");
+        assert!(version.is_yanked());
+    }
+
+    #[test]
+    fn test_unified_version_go_pseudo() {
+        use deps_go::GoVersion;
+
+        let version = UnifiedVersion::Go(GoVersion {
+            version: "v0.0.0-20191109021931-daa7c04131f5".into(),
+            time: Some("2019-11-09T02:19:31Z".into()),
+            is_pseudo: true,
+            retracted: false,
+        });
+
+        assert_eq!(
+            version.version_string(),
+            "v0.0.0-20191109021931-daa7c04131f5"
+        );
+        assert!(!version.is_yanked());
+    }
+
+    #[test]
+    fn test_document_state_new_go() {
+        use deps_go::{GoDependency, GoDirective};
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let deps = vec![UnifiedDependency::Go(GoDependency {
+            module_path: "github.com/gin-gonic/gin".into(),
+            module_path_range: Range::new(Position::new(0, 0), Position::new(0, 25)),
+            version: Some("v1.9.1".into()),
+            version_range: Some(Range::new(Position::new(0, 26), Position::new(0, 32))),
+            directive: GoDirective::Require,
+            indirect: false,
+        })];
+
+        let state = DocumentState::new(Ecosystem::Go, "test content".into(), deps);
+
+        assert_eq!(state.ecosystem, Ecosystem::Go);
+        assert_eq!(state.ecosystem_id, "go");
+        assert_eq!(state.content, "test content");
+        assert_eq!(state.dependencies.len(), 1);
+        assert!(state.versions.is_empty());
+    }
+
+    #[test]
+    fn test_document_state_new_without_parse_result_go() {
+        let content = r#"module example.com/myapp
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+"#
+        .to_string();
+
+        let doc_state = DocumentState::new_without_parse_result("go", content.clone());
+
+        assert_eq!(doc_state.ecosystem_id, "go");
+        assert_eq!(doc_state.ecosystem, Ecosystem::Go);
+        assert_eq!(doc_state.content, content);
+        assert!(doc_state.parse_result.is_none());
+        assert!(doc_state.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_document_state_new_from_parse_result_go() {
+        let state = ServerState::new();
+        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let ecosystem = state.ecosystem_registry.get("go").unwrap();
+
+        let content = r#"module example.com/myapp
+
+go 1.21
+
+require github.com/gin-gonic/gin v1.9.1
+"#
+        .to_string();
+
+        let parse_result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(ecosystem.parse_manifest(&content, &uri))
+            .unwrap();
+
+        let doc_state = DocumentState::new_from_parse_result("go", content.clone(), parse_result);
+
+        assert_eq!(doc_state.ecosystem_id, "go");
+        assert_eq!(doc_state.ecosystem, Ecosystem::Go);
+        assert_eq!(doc_state.content, content);
+        assert!(doc_state.parse_result.is_some());
+    }
+
+    #[test]
+    fn test_unified_version_go_version_string_getter() {
+        use deps_go::GoVersion;
+
+        let version = UnifiedVersion::Go(GoVersion {
+            version: "v1.9.1".into(),
+            time: None,
+            is_pseudo: false,
+            retracted: false,
+        });
+
+        assert_eq!(version.version_string(), "v1.9.1");
+    }
+
+    #[test]
+    fn test_unified_version_go_yanked_checker() {
+        use deps_go::GoVersion;
+
+        let retracted = UnifiedVersion::Go(GoVersion {
+            version: "v1.0.0".into(),
+            time: None,
+            is_pseudo: false,
+            retracted: true,
+        });
+
+        let normal = UnifiedVersion::Go(GoVersion {
+            version: "v1.9.1".into(),
+            time: None,
+            is_pseudo: false,
+            retracted: false,
+        });
+
+        assert!(retracted.is_yanked());
+        assert!(!normal.is_yanked());
+    }
 }
