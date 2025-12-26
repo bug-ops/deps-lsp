@@ -406,7 +406,6 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "deps-core",
- "insta",
  "once_cell",
  "regex",
  "semver",

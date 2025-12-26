@@ -486,7 +486,7 @@ exclude github.com/bad/module v0.1.0
     }
 
     #[test]
-    fn test_parse_complex_go_mod_snapshot() {
+    fn test_parse_complex_go_mod() {
         let content = r#"module example.com/myapp
 
 go 1.21
@@ -501,7 +501,39 @@ replace github.com/old/module => github.com/new/module v1.2.3
 exclude github.com/bad/module v0.1.0
 "#;
         let result = parse_go_mod(content, &test_uri()).unwrap();
-        insta::assert_debug_snapshot!(result);
+
+        // Check module metadata
+        assert_eq!(result.module_path, Some("example.com/myapp".to_string()));
+        assert_eq!(result.go_version, Some("1.21".to_string()));
+
+        // Check dependencies count
+        assert_eq!(result.dependencies.len(), 4);
+
+        // Check gin-gonic (require, direct)
+        let gin = &result.dependencies[0];
+        assert_eq!(gin.module_path, "github.com/gin-gonic/gin");
+        assert_eq!(gin.version, Some("v1.9.1".to_string()));
+        assert_eq!(gin.directive, GoDirective::Require);
+        assert!(!gin.indirect);
+
+        // Check crypto (require, indirect)
+        let crypto = &result.dependencies[1];
+        assert_eq!(crypto.module_path, "golang.org/x/crypto");
+        assert_eq!(crypto.version, Some("v0.17.0".to_string()));
+        assert_eq!(crypto.directive, GoDirective::Require);
+        assert!(crypto.indirect);
+
+        // Check replace directive
+        let replace = &result.dependencies[2];
+        assert_eq!(replace.module_path, "github.com/old/module");
+        assert_eq!(replace.version, None);
+        assert_eq!(replace.directive, GoDirective::Replace);
+
+        // Check exclude directive
+        let exclude = &result.dependencies[3];
+        assert_eq!(exclude.module_path, "github.com/bad/module");
+        assert_eq!(exclude.version, Some("v0.1.0".to_string()));
+        assert_eq!(exclude.directive, GoDirective::Exclude);
     }
 
     #[test]
