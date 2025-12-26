@@ -495,4 +495,137 @@ mod tests {
         assert!(version.num.starts_with("1."));
         assert!(!version.yanked);
     }
+
+    #[test]
+    fn test_parse_index_json_empty() {
+        let json = "";
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_index_json_blank_lines() {
+        let json = "\n\n\n";
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_index_json_invalid_version() {
+        let json = r#"{"name":"test","vers":"invalid","yanked":false,"features":{},"deps":[]}"#;
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_index_json_mixed_valid_invalid() {
+        let json = r#"{"name":"test","vers":"1.0.0","yanked":false,"features":{},"deps":[]}
+{"name":"test","vers":"invalid","yanked":false,"features":{},"deps":[]}
+{"name":"test","vers":"2.0.0","yanked":false,"features":{},"deps":[]}"#;
+
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].num, "2.0.0");
+        assert_eq!(versions[1].num, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_index_json_with_features() {
+        let json = r#"{"name":"test","vers":"1.0.0","yanked":false,"features":{"default":["std"],"std":[]},"deps":[]}"#;
+
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].features.len(), 2);
+        assert!(versions[0].features.contains_key("default"));
+        assert!(versions[0].features.contains_key("std"));
+    }
+
+    #[test]
+    fn test_parse_search_response_empty() {
+        let json = r#"{"crates": []}"#;
+        let results = parse_search_response(json.as_bytes()).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_search_response_missing_optional_fields() {
+        let json = r#"{
+            "crates": [
+                {
+                    "name": "minimal",
+                    "max_version": "1.0.0"
+                }
+            ]
+        }"#;
+
+        let results = parse_search_response(json.as_bytes()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "minimal");
+        assert_eq!(results[0].description, None);
+        assert_eq!(results[0].repository, None);
+    }
+
+    #[test]
+    fn test_sparse_index_path_single_char() {
+        assert_eq!(sparse_index_path("x"), "1/x");
+        assert_eq!(sparse_index_path("z"), "1/z");
+    }
+
+    #[test]
+    fn test_sparse_index_path_two_chars() {
+        assert_eq!(sparse_index_path("xy"), "2/xy");
+        assert_eq!(sparse_index_path("ab"), "2/ab");
+    }
+
+    #[test]
+    fn test_sparse_index_path_three_chars() {
+        assert_eq!(sparse_index_path("xyz"), "3/x/xyz");
+        assert_eq!(sparse_index_path("foo"), "3/f/foo");
+    }
+
+    #[test]
+    fn test_sparse_index_path_long_name() {
+        assert_eq!(
+            sparse_index_path("very-long-crate-name"),
+            "ve/ry/very-long-crate-name"
+        );
+    }
+
+    #[test]
+    fn test_sparse_index_path_numbers() {
+        assert_eq!(sparse_index_path("1234"), "12/34/1234");
+    }
+
+    #[test]
+    fn test_sparse_index_path_mixed_case() {
+        assert_eq!(sparse_index_path("MyPackage"), "my/pa/mypackage");
+        assert_eq!(sparse_index_path("UPPERCASE"), "up/pe/uppercase");
+    }
+
+    #[test]
+    fn test_crate_url() {
+        assert_eq!(crate_url("serde"), "https://crates.io/crates/serde");
+        assert_eq!(crate_url("tokio"), "https://crates.io/crates/tokio");
+    }
+
+    #[test]
+    fn test_crate_url_with_hyphens() {
+        assert_eq!(
+            crate_url("serde-json"),
+            "https://crates.io/crates/serde-json"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_registry_creation() {
+        let cache = Arc::new(HttpCache::new());
+        let _registry = CratesIoRegistry::new(cache);
+    }
+
+    #[tokio::test]
+    async fn test_registry_clone() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = CratesIoRegistry::new(cache.clone());
+        let _cloned = registry.clone();
+    }
 }

@@ -39,6 +39,12 @@ impl Backend {
         }
     }
 
+    /// Get a reference to the LSP client (primarily for testing/benchmarking).
+    #[doc(hidden)]
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     /// Handles opening a document using unified ecosystem registry.
     async fn handle_open(&self, uri: tower_lsp_server::ls_types::Uri, content: String) {
         match handle_document_open(
@@ -496,5 +502,116 @@ mod tests {
         let (_service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         // Should initialize successfully with default config
         // Integration tests will test actual LSP protocol
+    }
+
+    #[test]
+    fn test_server_capabilities_text_document_sync() {
+        let caps = Backend::server_capabilities();
+
+        match caps.text_document_sync {
+            Some(TextDocumentSyncCapability::Kind(kind)) => {
+                assert_eq!(kind, TextDocumentSyncKind::FULL);
+            }
+            _ => panic!("Expected text document sync kind to be FULL"),
+        }
+    }
+
+    #[test]
+    fn test_server_capabilities_completion_triggers() {
+        let caps = Backend::server_capabilities();
+
+        let completion = caps
+            .completion_provider
+            .expect("completion provider should exist");
+        let triggers = completion
+            .trigger_characters
+            .expect("trigger characters should exist");
+
+        assert!(triggers.contains(&"\"".to_string()));
+        assert!(triggers.contains(&"=".to_string()));
+        assert!(triggers.contains(&".".to_string()));
+        assert_eq!(triggers.len(), 3);
+    }
+
+    #[test]
+    fn test_server_capabilities_code_actions() {
+        let caps = Backend::server_capabilities();
+
+        match caps.code_action_provider {
+            Some(CodeActionProviderCapability::Options(opts)) => {
+                let kinds = opts
+                    .code_action_kinds
+                    .expect("code action kinds should exist");
+                assert!(kinds.contains(&tower_lsp_server::ls_types::CodeActionKind::REFACTOR));
+            }
+            _ => panic!("Expected code action provider options"),
+        }
+    }
+
+    #[test]
+    fn test_server_capabilities_diagnostics_config() {
+        let caps = Backend::server_capabilities();
+
+        match caps.diagnostic_provider {
+            Some(DiagnosticServerCapabilities::Options(opts)) => {
+                assert_eq!(opts.identifier, Some("deps".to_string()));
+                assert!(!opts.inter_file_dependencies);
+                assert!(!opts.workspace_diagnostics);
+            }
+            _ => panic!("Expected diagnostic options"),
+        }
+    }
+
+    #[test]
+    fn test_server_capabilities_execute_command() {
+        let caps = Backend::server_capabilities();
+
+        let execute = caps
+            .execute_command_provider
+            .expect("execute command provider should exist");
+        assert!(
+            execute
+                .commands
+                .contains(&commands::UPDATE_VERSION.to_string())
+        );
+    }
+
+    #[test]
+    fn test_commands_constants() {
+        assert_eq!(commands::UPDATE_VERSION, "deps-lsp.updateVersion");
+    }
+
+    #[tokio::test]
+    async fn test_backend_state_initialization() {
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        assert_eq!(backend.state.documents.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_backend_config_initialization() {
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        let config = backend.config.read().await;
+        assert!(config.inlay_hints.enabled);
+    }
+
+    #[test]
+    fn test_update_version_args_deserialization() {
+        let json = serde_json::json!({
+            "uri": "file:///test/Cargo.toml",
+            "range": {
+                "start": {"line": 5, "character": 10},
+                "end": {"line": 5, "character": 15}
+            },
+            "version": "1.0.0"
+        });
+
+        let args: UpdateVersionArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(args.version, "1.0.0");
+        assert_eq!(args.range.start.line, 5);
+        assert_eq!(args.range.start.character, 10);
     }
 }

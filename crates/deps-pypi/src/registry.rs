@@ -397,9 +397,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_normalize_package_name_lowercase() {
+        assert_eq!(normalize_package_name("Flask"), "flask");
+        assert_eq!(normalize_package_name("DJANGO"), "django");
+        assert_eq!(normalize_package_name("Requests"), "requests");
+    }
+
+    #[test]
+    fn test_normalize_package_name_underscores() {
+        assert_eq!(
+            normalize_package_name("django_rest_framework"),
+            "django-rest-framework"
+        );
+        assert_eq!(normalize_package_name("my_package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_package_name_dots() {
+        assert_eq!(normalize_package_name("Pillow.Image"), "pillow-image");
+        assert_eq!(normalize_package_name("zope.interface"), "zope-interface");
+    }
+
+    #[test]
+    fn test_normalize_package_name_consecutive_separators() {
+        assert_eq!(normalize_package_name("my__package"), "my-package");
+        assert_eq!(normalize_package_name("my..package"), "my-package");
+        assert_eq!(normalize_package_name("my_.package"), "my-package");
+    }
+
+    #[test]
+    fn test_normalize_package_name_mixed() {
+        assert_eq!(normalize_package_name("My_Package.Name"), "my-package-name");
+        assert_eq!(
+            normalize_package_name("SOME__Weird.._Package"),
+            "some-weird-package"
+        );
+    }
+
+    #[test]
+    fn test_normalize_package_name_already_normalized() {
+        assert_eq!(normalize_package_name("my-package"), "my-package");
+        assert_eq!(
+            normalize_package_name("django-rest-framework"),
+            "django-rest-framework"
+        );
+    }
+
+    #[test]
+    fn test_normalize_package_name_edge_cases() {
+        assert_eq!(normalize_package_name("a"), "a");
+        assert_eq!(normalize_package_name("A_B_C"), "a-b-c");
+        assert_eq!(normalize_package_name("---"), "");
+    }
+
+    #[test]
+    fn test_normalize_package_name_leading_trailing_separators() {
+        assert_eq!(normalize_package_name("_package_"), "package");
+        assert_eq!(normalize_package_name(".package."), "package");
+        assert_eq!(normalize_package_name("__package__"), "package");
+    }
+
+    #[test]
     fn test_package_url() {
         assert_eq!(package_url("requests"), "https://pypi.org/project/requests");
         assert_eq!(package_url("flask"), "https://pypi.org/project/flask");
+    }
+
+    #[test]
+    fn test_package_url_normalization() {
+        assert_eq!(package_url("Flask"), "https://pypi.org/project/flask");
+        assert_eq!(
+            package_url("django_rest_framework"),
+            "https://pypi.org/project/django-rest-framework"
+        );
+    }
+
+    #[test]
+    fn test_package_url_encoding() {
+        let url = package_url("my-package");
+        assert!(url.starts_with("https://pypi.org/project/"));
+        assert!(url.contains("my-package"));
     }
 
     #[test]

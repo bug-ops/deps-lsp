@@ -404,6 +404,7 @@ dependencies = [
 name = "deps-lsp"
 version = "0.4.1"
 dependencies = [
+ "criterion",
  "dashmap",
  "deps-cargo",
  "deps-core",

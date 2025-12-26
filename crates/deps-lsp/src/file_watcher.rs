@@ -125,4 +125,80 @@ mod tests {
         let path = PathBuf::from("/");
         assert_eq!(extract_lockfile_name(&path), None);
     }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_extract_lockfile_name_windows_path() {
+        let path = PathBuf::from(r"C:\Users\project\Cargo.lock");
+        assert_eq!(extract_lockfile_name(&path), Some("Cargo.lock"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_extract_lockfile_name_windows_style_string() {
+        let path = PathBuf::from("/Users/project/Cargo.lock");
+        assert_eq!(extract_lockfile_name(&path), Some("Cargo.lock"));
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_relative_path() {
+        let path = PathBuf::from("./Cargo.lock");
+        assert_eq!(extract_lockfile_name(&path), Some("Cargo.lock"));
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_parent_directory() {
+        let path = PathBuf::from("../project/package-lock.json");
+        assert_eq!(extract_lockfile_name(&path), Some("package-lock.json"));
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_current_directory_only() {
+        let path = PathBuf::from("Cargo.lock");
+        assert_eq!(extract_lockfile_name(&path), Some("Cargo.lock"));
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_empty_path() {
+        let path = PathBuf::from("");
+        assert_eq!(extract_lockfile_name(&path), None);
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_yarn_lock() {
+        let path = PathBuf::from("/project/yarn.lock");
+        assert_eq!(extract_lockfile_name(&path), Some("yarn.lock"));
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_pnpm_lock() {
+        let path = PathBuf::from("/project/pnpm-lock.yaml");
+        assert_eq!(extract_lockfile_name(&path), Some("pnpm-lock.yaml"));
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_pipfile_lock() {
+        let path = PathBuf::from("/project/Pipfile.lock");
+        assert_eq!(extract_lockfile_name(&path), Some("Pipfile.lock"));
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_deeply_nested() {
+        let path = PathBuf::from("/workspace/apps/backend/services/api/Cargo.lock");
+        assert_eq!(extract_lockfile_name(&path), Some("Cargo.lock"));
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_with_dots_in_path() {
+        let path = PathBuf::from("/project/my.app.v1.0/Cargo.lock");
+        assert_eq!(extract_lockfile_name(&path), Some("Cargo.lock"));
+    }
+
+    #[test]
+    fn test_extract_lockfile_name_non_utf8_safe() {
+        let path = PathBuf::from("/project/Cargo.lock");
+        let result = extract_lockfile_name(&path);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_ascii());
+    }
 }
