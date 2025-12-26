@@ -405,6 +405,7 @@ name = "deps-go"
 version = "0.5.1"
 dependencies = [
  "async-trait",
+ "criterion",
  "deps-core",
  "once_cell",
  "regex",
