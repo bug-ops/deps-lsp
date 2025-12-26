@@ -47,3 +47,6 @@ zed_extension_api = "0.7"
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.bench]
+debug = true

@@ -479,6 +479,7 @@ fn test_cold_start_non_file_uri() {
 }
 
 #[test]
+#[ignore = "Flaky on macOS CI - cold start with network requests can timeout"]
 fn test_cold_start_concurrent_requests() {
     use std::io::Write;
     use tempfile::NamedTempFile;
