@@ -82,6 +82,25 @@ Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/lat
 | macOS | Apple Silicon | `deps-lsp-aarch64-apple-darwin` |
 | Windows | x86_64 | `deps-lsp-x86_64-pc-windows-msvc.exe` |
 
+### Feature Flags
+
+By default, all ecosystems are enabled. To build with specific ecosystems only:
+
+```bash
+# Only Cargo and npm support
+cargo install deps-lsp --no-default-features --features "cargo,npm"
+
+# Only Python support
+cargo install deps-lsp --no-default-features --features "pypi"
+```
+
+| Feature | Ecosystem | Default |
+|---------|-----------|---------|
+| `cargo` | Cargo.toml | ✅ |
+| `npm` | package.json | ✅ |
+| `pypi` | pyproject.toml | ✅ |
+| `go` | go.mod | ✅ |
+
 ## Editor Setup
 
 ### Zed

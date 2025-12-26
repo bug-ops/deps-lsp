@@ -12,6 +12,7 @@ This crate provides parsing and registry integration for Go's module ecosystem.
 ## Features
 
 - **go.mod Parsing** — Parse `go.mod` with position tracking for all directives
+- **go.sum Lock File** — Extract resolved versions from `go.sum`
 - **Directive Support** — Handle `require`, `replace`, `exclude`, and `retract` directives
 - **Indirect Dependencies** — Detect and mark indirect dependencies (`// indirect`)
 - **Pseudo-versions** — Parse and validate Go pseudo-version format
@@ -23,7 +24,7 @@ This crate provides parsing and registry integration for Go's module ecosystem.
 
 ```toml
 [dependencies]
-deps-go = "0.4"
+deps-go = "0.5"
 ```
 
 ```rust

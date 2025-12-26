@@ -1,0 +1,81 @@
+//! Lock file parsing for {ECOSYSTEM_DISPLAY}.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use deps_core::lockfile::{LockFileProvider, LockedPackage};
+use tokio::fs;
+
+/// Lock file parser for {ECOSYSTEM_DISPLAY}.
+pub struct {ECOSYSTEM_PASCAL}LockfileParser;
+
+#[async_trait]
+impl LockFileProvider for {ECOSYSTEM_PASCAL}LockfileParser {
+    fn lock_filename(&self) -> &'static str {
+        "{LOCK_FILE}"
+    }
+
+    async fn parse_lockfile(
+        &self,
+        manifest_dir: &Path,
+    ) -> deps_core::Result<HashMap<String, LockedPackage>> {
+        let lock_path = manifest_dir.join(self.lock_filename());
+
+        if !lock_path.exists() {
+            return Ok(HashMap::new());
+        }
+
+        let content = fs::read_to_string(&lock_path)
+            .await
+            .map_err(|e| deps_core::DepsError::Io(e))?;
+
+        parse_lock_content(&content)
+    }
+
+    async fn is_stale(&self, manifest_dir: &Path) -> bool {
+        let lock_path = manifest_dir.join(self.lock_filename());
+        let manifest_path = manifest_dir.join("{MANIFEST_FILE}");
+
+        match (fs::metadata(&lock_path).await, fs::metadata(&manifest_path).await) {
+            (Ok(lock_meta), Ok(manifest_meta)) => {
+                match (lock_meta.modified(), manifest_meta.modified()) {
+                    (Ok(lock_time), Ok(manifest_time)) => manifest_time > lock_time,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Parse lock file content into package map.
+fn parse_lock_content(content: &str) -> deps_core::Result<HashMap<String, LockedPackage>> {
+    let mut packages = HashMap::new();
+
+    // TODO: Implement lock file parsing logic
+    // Key requirements:
+    // 1. Parse each locked package entry
+    // 2. Extract package name and resolved version
+    // 3. Handle ecosystem-specific format
+
+    Ok(packages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_empty_lockfile() {
+        let result = parse_lock_content("").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_lockfile_provider_interface() {
+        let parser = {ECOSYSTEM_PASCAL}LockfileParser;
+        assert_eq!(parser.lock_filename(), "{LOCK_FILE}");
+    }
+}

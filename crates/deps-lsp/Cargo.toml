@@ -17,13 +17,20 @@ path = "src/main.rs"
 name = "deps_lsp"
 path = "src/lib.rs"
 
+[features]
+default = ["cargo", "npm", "pypi", "go"]
+cargo = ["dep:deps-cargo"]
+npm = ["dep:deps-npm"]
+pypi = ["dep:deps-pypi"]
+go = ["dep:deps-go"]
+
 [dependencies]
 # Internal crates
 deps-core = { workspace = true }
-deps-cargo = { workspace = true }
-deps-npm = { workspace = true }
-deps-pypi = { workspace = true }
-deps-go = { workspace = true }
+deps-cargo = { workspace = true, optional = true }
+deps-npm = { workspace = true, optional = true }
+deps-pypi = { workspace = true, optional = true }
+deps-go = { workspace = true, optional = true }
 
 # External dependencies
 dashmap = { workspace = true }

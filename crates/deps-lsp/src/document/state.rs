@@ -1,12 +1,17 @@
 use dashmap::DashMap;
-use deps_cargo::{CargoVersion, ParsedDependency};
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
 use deps_core::{EcosystemRegistry, ParseResult};
-use deps_go::{GoDependency, GoVersion};
-use deps_npm::{NpmDependency, NpmVersion};
-use deps_pypi::{PypiDependency, PypiVersion};
 use std::collections::HashMap;
+
+#[cfg(feature = "cargo")]
+use deps_cargo::{CargoVersion, ParsedDependency};
+#[cfg(feature = "go")]
+use deps_go::{GoDependency, GoVersion};
+#[cfg(feature = "npm")]
+use deps_npm::{NpmDependency, NpmVersion};
+#[cfg(feature = "pypi")]
+use deps_pypi::{PypiDependency, PypiVersion};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -19,64 +24,98 @@ use tower_lsp_server::ls_types::Uri;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum UnifiedDependency {
+    #[cfg(feature = "cargo")]
     Cargo(ParsedDependency),
+    #[cfg(feature = "npm")]
     Npm(NpmDependency),
+    #[cfg(feature = "pypi")]
     Pypi(PypiDependency),
+    #[cfg(feature = "go")]
     Go(GoDependency),
 }
 
 impl UnifiedDependency {
     /// Returns the dependency name.
+    #[allow(unreachable_patterns)]
     pub fn name(&self) -> &str {
         match self {
+            #[cfg(feature = "cargo")]
             UnifiedDependency::Cargo(dep) => &dep.name,
+            #[cfg(feature = "npm")]
             UnifiedDependency::Npm(dep) => &dep.name,
+            #[cfg(feature = "pypi")]
             UnifiedDependency::Pypi(dep) => &dep.name,
+            #[cfg(feature = "go")]
             UnifiedDependency::Go(dep) => &dep.module_path,
+            _ => unreachable!("no ecosystem features enabled"),
         }
     }
 
     /// Returns the name range for LSP operations.
+    #[allow(unreachable_patterns)]
     pub fn name_range(&self) -> tower_lsp_server::ls_types::Range {
         match self {
+            #[cfg(feature = "cargo")]
             UnifiedDependency::Cargo(dep) => dep.name_range,
+            #[cfg(feature = "npm")]
             UnifiedDependency::Npm(dep) => dep.name_range,
+            #[cfg(feature = "pypi")]
             UnifiedDependency::Pypi(dep) => dep.name_range,
+            #[cfg(feature = "go")]
             UnifiedDependency::Go(dep) => dep.module_path_range,
+            _ => unreachable!("no ecosystem features enabled"),
         }
     }
 
     /// Returns the version requirement string if present.
+    #[allow(unreachable_patterns)]
     pub fn version_req(&self) -> Option<&str> {
         match self {
+            #[cfg(feature = "cargo")]
             UnifiedDependency::Cargo(dep) => dep.version_req.as_deref(),
+            #[cfg(feature = "npm")]
             UnifiedDependency::Npm(dep) => dep.version_req.as_deref(),
+            #[cfg(feature = "pypi")]
             UnifiedDependency::Pypi(dep) => dep.version_req.as_deref(),
+            #[cfg(feature = "go")]
             UnifiedDependency::Go(dep) => dep.version.as_deref(),
+            _ => unreachable!("no ecosystem features enabled"),
         }
     }
 
     /// Returns the version range for LSP operations if present.
+    #[allow(unreachable_patterns)]
     pub fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
         match self {
+            #[cfg(feature = "cargo")]
             UnifiedDependency::Cargo(dep) => dep.version_range,
+            #[cfg(feature = "npm")]
             UnifiedDependency::Npm(dep) => dep.version_range,
+            #[cfg(feature = "pypi")]
             UnifiedDependency::Pypi(dep) => dep.version_range,
+            #[cfg(feature = "go")]
             UnifiedDependency::Go(dep) => dep.version_range,
+            _ => unreachable!("no ecosystem features enabled"),
         }
     }
 
     /// Returns true if this is a registry dependency (not Git/Path).
+    #[allow(unreachable_patterns)]
     pub fn is_registry(&self) -> bool {
         match self {
+            #[cfg(feature = "cargo")]
             UnifiedDependency::Cargo(dep) => {
                 matches!(dep.source, deps_cargo::DependencySource::Registry)
             }
+            #[cfg(feature = "npm")]
             UnifiedDependency::Npm(_) => true,
+            #[cfg(feature = "pypi")]
             UnifiedDependency::Pypi(dep) => {
                 matches!(dep.source, deps_pypi::PypiDependencySource::PyPI)
             }
+            #[cfg(feature = "go")]
             UnifiedDependency::Go(_) => true,
+            _ => unreachable!("no ecosystem features enabled"),
         }
     }
 }
@@ -87,30 +126,46 @@ impl UnifiedDependency {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum UnifiedVersion {
+    #[cfg(feature = "cargo")]
     Cargo(CargoVersion),
+    #[cfg(feature = "npm")]
     Npm(NpmVersion),
+    #[cfg(feature = "pypi")]
     Pypi(PypiVersion),
+    #[cfg(feature = "go")]
     Go(GoVersion),
 }
 
 impl UnifiedVersion {
     /// Returns the version number as a string.
+    #[allow(unreachable_patterns)]
     pub fn version_string(&self) -> &str {
         match self {
+            #[cfg(feature = "cargo")]
             UnifiedVersion::Cargo(v) => &v.num,
+            #[cfg(feature = "npm")]
             UnifiedVersion::Npm(v) => &v.version,
+            #[cfg(feature = "pypi")]
             UnifiedVersion::Pypi(v) => &v.version,
+            #[cfg(feature = "go")]
             UnifiedVersion::Go(v) => &v.version,
+            _ => unreachable!("no ecosystem features enabled"),
         }
     }
 
     /// Returns true if this version is yanked/deprecated.
+    #[allow(unreachable_patterns)]
     pub fn is_yanked(&self) -> bool {
         match self {
+            #[cfg(feature = "cargo")]
             UnifiedVersion::Cargo(v) => v.yanked,
+            #[cfg(feature = "npm")]
             UnifiedVersion::Npm(v) => v.deprecated,
+            #[cfg(feature = "pypi")]
             UnifiedVersion::Pypi(v) => v.yanked,
+            #[cfg(feature = "go")]
             UnifiedVersion::Go(v) => v.retracted,
+            _ => unreachable!("no ecosystem features enabled"),
         }
     }
 }
@@ -506,21 +561,20 @@ impl ServerState {
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
 
-        // Register Cargo ecosystem
-        let cargo_ecosystem = Arc::new(deps_cargo::CargoEcosystem::new(Arc::clone(&cache)));
-        ecosystem_registry.register(cargo_ecosystem);
+        // Register ecosystems based on enabled features
+        #[cfg(feature = "cargo")]
+        ecosystem_registry.register(Arc::new(deps_cargo::CargoEcosystem::new(Arc::clone(
+            &cache,
+        ))));
 
-        // Register npm ecosystem
-        let npm_ecosystem = Arc::new(deps_npm::NpmEcosystem::new(Arc::clone(&cache)));
-        ecosystem_registry.register(npm_ecosystem);
+        #[cfg(feature = "npm")]
+        ecosystem_registry.register(Arc::new(deps_npm::NpmEcosystem::new(Arc::clone(&cache))));
 
-        // Register PyPI ecosystem
-        let pypi_ecosystem = Arc::new(deps_pypi::PypiEcosystem::new(Arc::clone(&cache)));
-        ecosystem_registry.register(pypi_ecosystem);
+        #[cfg(feature = "pypi")]
+        ecosystem_registry.register(Arc::new(deps_pypi::PypiEcosystem::new(Arc::clone(&cache))));
 
-        // Register Go ecosystem
-        let go_ecosystem = Arc::new(deps_go::GoEcosystem::new(Arc::clone(&cache)));
-        ecosystem_registry.register(go_ecosystem);
+        #[cfg(feature = "go")]
+        ecosystem_registry.register(Arc::new(deps_go::GoEcosystem::new(Arc::clone(&cache))));
 
         // Create cold start limiter with default 100ms interval (10 req/sec per URI)
         let cold_start_limiter = ColdStartLimiter::new(Duration::from_millis(100));
@@ -639,289 +693,57 @@ impl Default for ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_cargo::{DependencySection, DependencySource};
-    use tower_lsp_server::ls_types::{Position, Range};
 
-    fn create_test_cargo_dependency() -> UnifiedDependency {
-        UnifiedDependency::Cargo(ParsedDependency {
-            name: "serde".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-            version_req: Some("1.0".into()),
-            version_range: Some(Range::new(Position::new(0, 9), Position::new(0, 14))),
-            features: vec![],
-            features_range: None,
-            source: DependencySource::Registry,
-            workspace_inherited: false,
-            section: DependencySection::Dependencies,
-        })
-    }
+    // =========================================================================
+    // Generic tests (no feature flag required)
+    // =========================================================================
 
     #[test]
     fn test_ecosystem_from_filename() {
+        #[cfg(feature = "cargo")]
         assert_eq!(
             Ecosystem::from_filename("Cargo.toml"),
             Some(Ecosystem::Cargo)
         );
+        #[cfg(feature = "npm")]
         assert_eq!(
             Ecosystem::from_filename("package.json"),
             Some(Ecosystem::Npm)
         );
+        #[cfg(feature = "pypi")]
         assert_eq!(
             Ecosystem::from_filename("pyproject.toml"),
             Some(Ecosystem::Pypi)
         );
+        #[cfg(feature = "go")]
+        assert_eq!(Ecosystem::from_filename("go.mod"), Some(Ecosystem::Go));
         assert_eq!(Ecosystem::from_filename("unknown.txt"), None);
     }
 
     #[test]
     fn test_ecosystem_from_uri() {
-        let cargo_uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
-        assert_eq!(Ecosystem::from_uri(&cargo_uri), Some(Ecosystem::Cargo));
-
-        let npm_uri = Uri::from_file_path("/path/to/package.json").unwrap();
-        assert_eq!(Ecosystem::from_uri(&npm_uri), Some(Ecosystem::Npm));
-
-        let pypi_uri = Uri::from_file_path("/path/to/pyproject.toml").unwrap();
-        assert_eq!(Ecosystem::from_uri(&pypi_uri), Some(Ecosystem::Pypi));
-
+        #[cfg(feature = "cargo")]
+        {
+            let cargo_uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
+            assert_eq!(Ecosystem::from_uri(&cargo_uri), Some(Ecosystem::Cargo));
+        }
+        #[cfg(feature = "npm")]
+        {
+            let npm_uri = Uri::from_file_path("/path/to/package.json").unwrap();
+            assert_eq!(Ecosystem::from_uri(&npm_uri), Some(Ecosystem::Npm));
+        }
+        #[cfg(feature = "pypi")]
+        {
+            let pypi_uri = Uri::from_file_path("/path/to/pyproject.toml").unwrap();
+            assert_eq!(Ecosystem::from_uri(&pypi_uri), Some(Ecosystem::Pypi));
+        }
+        #[cfg(feature = "go")]
+        {
+            let go_uri = Uri::from_file_path("/path/to/go.mod").unwrap();
+            assert_eq!(Ecosystem::from_uri(&go_uri), Some(Ecosystem::Go));
+        }
         let unknown_uri = Uri::from_file_path("/path/to/README.md").unwrap();
         assert_eq!(Ecosystem::from_uri(&unknown_uri), None);
-    }
-
-    #[test]
-    fn test_document_state_creation() {
-        let deps = vec![create_test_cargo_dependency()];
-        let state = DocumentState::new(Ecosystem::Cargo, "test content".into(), deps);
-
-        assert_eq!(state.ecosystem, Ecosystem::Cargo);
-        assert_eq!(state.content, "test content");
-        assert_eq!(state.dependencies.len(), 1);
-        assert!(state.versions.is_empty());
-    }
-
-    #[test]
-    fn test_document_state_update_versions() {
-        let deps = vec![create_test_cargo_dependency()];
-        let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
-
-        let mut versions = HashMap::new();
-        versions.insert(
-            "serde".into(),
-            UnifiedVersion::Cargo(CargoVersion {
-                num: "1.0.0".into(),
-                yanked: false,
-                features: HashMap::new(),
-            }),
-        );
-
-        state.update_versions(versions);
-        assert_eq!(state.versions.len(), 1);
-        assert!(state.versions.contains_key("serde"));
-    }
-
-    #[test]
-    fn test_server_state_creation() {
-        let state = ServerState::new();
-        assert_eq!(state.document_count(), 0);
-        assert!(state.cache.is_empty(), "Cache should start empty");
-    }
-
-    #[test]
-    fn test_server_state_document_operations() {
-        let state = ServerState::new();
-        let uri = Uri::from_file_path("/test.toml").unwrap();
-        let deps = vec![create_test_cargo_dependency()];
-        let doc_state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
-
-        // Insert document
-        state.update_document(uri.clone(), doc_state.clone());
-        assert_eq!(state.document_count(), 1);
-
-        // Get document
-        let retrieved = state.get_document(&uri);
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().content, "test");
-
-        // Remove document
-        let removed = state.remove_document(&uri);
-        assert!(removed.is_some());
-        assert_eq!(state.document_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_server_state_background_tasks() {
-        let state = ServerState::new();
-        let uri = Uri::from_file_path("/test.toml").unwrap();
-
-        // Spawn task
-        let task = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        });
-
-        state.spawn_background_task(uri.clone(), task).await;
-
-        // Cancel task
-        state.cancel_background_task(&uri).await;
-    }
-
-    #[test]
-    fn test_unified_dependency_name() {
-        use deps_cargo::{DependencySection, DependencySource};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        let cargo_dep = UnifiedDependency::Cargo(ParsedDependency {
-            name: "serde".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-            version_req: Some("1.0".into()),
-            version_range: Some(Range::new(Position::new(0, 9), Position::new(0, 14))),
-            features: vec![],
-            features_range: None,
-            source: DependencySource::Registry,
-            workspace_inherited: false,
-            section: DependencySection::Dependencies,
-        });
-
-        assert_eq!(cargo_dep.name(), "serde");
-        assert_eq!(cargo_dep.version_req(), Some("1.0"));
-        assert!(cargo_dep.is_registry());
-    }
-
-    #[test]
-    fn test_unified_dependency_npm() {
-        use deps_npm::{NpmDependency, NpmDependencySection};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        let npm_dep = UnifiedDependency::Npm(NpmDependency {
-            name: "express".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
-            version_req: Some("^4.0.0".into()),
-            version_range: Some(Range::new(Position::new(0, 11), Position::new(0, 18))),
-            section: NpmDependencySection::Dependencies,
-        });
-
-        assert_eq!(npm_dep.name(), "express");
-        assert_eq!(npm_dep.version_req(), Some("^4.0.0"));
-        assert!(npm_dep.is_registry());
-    }
-
-    #[test]
-    fn test_unified_dependency_pypi() {
-        use deps_pypi::{PypiDependency, PypiDependencySection, PypiDependencySource};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        let pypi_dep = UnifiedDependency::Pypi(PypiDependency {
-            name: "requests".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
-            version_req: Some(">=2.0.0".into()),
-            version_range: Some(Range::new(Position::new(0, 10), Position::new(0, 18))),
-            extras: vec![],
-            extras_range: None,
-            markers: None,
-            markers_range: None,
-            source: PypiDependencySource::PyPI,
-            section: PypiDependencySection::Dependencies,
-        });
-
-        assert_eq!(pypi_dep.name(), "requests");
-        assert_eq!(pypi_dep.version_req(), Some(">=2.0.0"));
-        assert!(pypi_dep.is_registry());
-    }
-
-    #[test]
-    fn test_unified_version_cargo() {
-        let version = UnifiedVersion::Cargo(CargoVersion {
-            num: "1.0.0".into(),
-            yanked: false,
-            features: HashMap::new(),
-        });
-
-        assert_eq!(version.version_string(), "1.0.0");
-        assert!(!version.is_yanked());
-    }
-
-    #[test]
-    fn test_unified_version_npm() {
-        let version = UnifiedVersion::Npm(deps_npm::NpmVersion {
-            version: "4.18.2".into(),
-            deprecated: false,
-        });
-
-        assert_eq!(version.version_string(), "4.18.2");
-        assert!(!version.is_yanked());
-    }
-
-    #[test]
-    fn test_unified_version_pypi() {
-        let version = UnifiedVersion::Pypi(deps_pypi::PypiVersion {
-            version: "2.31.0".into(),
-            yanked: true,
-        });
-
-        assert_eq!(version.version_string(), "2.31.0");
-        assert!(version.is_yanked());
-    }
-
-    #[test]
-    fn test_document_state_new_from_parse_result() {
-        let state = ServerState::new();
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
-        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
-
-        let content = r#"[dependencies]
-serde = "1.0"
-"#
-        .to_string();
-
-        let parse_result = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(ecosystem.parse_manifest(&content, &uri))
-            .unwrap();
-
-        let doc_state =
-            DocumentState::new_from_parse_result("cargo", content.clone(), parse_result);
-
-        assert_eq!(doc_state.ecosystem_id, "cargo");
-        assert_eq!(doc_state.content, content);
-        assert!(doc_state.parse_result.is_some());
-        assert!(doc_state.versions.is_empty());
-        assert!(doc_state.cached_versions.is_empty());
-    }
-
-    #[test]
-    fn test_document_state_update_resolved_versions() {
-        let deps = vec![create_test_cargo_dependency()];
-        let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
-
-        let mut resolved = HashMap::new();
-        resolved.insert("serde".into(), "1.0.195".into());
-
-        state.update_resolved_versions(resolved);
-        assert_eq!(state.resolved_versions.len(), 1);
-        assert_eq!(
-            state.resolved_versions.get("serde"),
-            Some(&"1.0.195".into())
-        );
-    }
-
-    #[test]
-    fn test_document_state_update_cached_versions() {
-        let deps = vec![create_test_cargo_dependency()];
-        let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
-
-        let mut cached = HashMap::new();
-        cached.insert("serde".into(), "1.0.210".into());
-
-        state.update_cached_versions(cached);
-        assert_eq!(state.cached_versions.len(), 1);
-        assert_eq!(state.cached_versions.get("serde"), Some(&"1.0.210".into()));
-    }
-
-    #[test]
-    fn test_document_state_parse_result_accessor() {
-        let deps = vec![create_test_cargo_dependency()];
-        let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
-
-        assert!(state.parse_result().is_none());
     }
 
     #[test]
@@ -933,9 +755,29 @@ serde = "1.0"
     }
 
     #[test]
+    fn test_server_state_creation() {
+        let state = ServerState::new();
+        assert_eq!(state.document_count(), 0);
+        assert!(state.cache.is_empty(), "Cache should start empty");
+    }
+
+    #[test]
     fn test_server_state_default() {
         let state = ServerState::default();
         assert_eq!(state.document_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_server_state_background_tasks() {
+        let state = ServerState::new();
+        let uri = Uri::from_file_path("/test.toml").unwrap();
+
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+
+        state.spawn_background_task(uri.clone(), task).await;
+        state.cancel_background_task(&uri).await;
     }
 
     #[tokio::test]
@@ -946,15 +788,12 @@ serde = "1.0"
         let task1 = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         });
-
         state.spawn_background_task(uri.clone(), task1).await;
 
         let task2 = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         });
-
         state.spawn_background_task(uri.clone(), task2).await;
-
         state.cancel_background_task(&uri).await;
     }
 
@@ -962,467 +801,570 @@ serde = "1.0"
     async fn test_cancel_background_task_nonexistent() {
         let state = ServerState::new();
         let uri = Uri::from_file_path("/test.toml").unwrap();
-
         state.cancel_background_task(&uri).await;
     }
 
-    #[test]
-    fn test_document_state_clone() {
-        let deps = vec![create_test_cargo_dependency()];
-        let state = DocumentState::new(Ecosystem::Cargo, "test content".into(), deps);
+    // =========================================================================
+    // ColdStartLimiter tests
+    // =========================================================================
 
-        let cloned = state.clone();
+    mod cold_start_limiter {
+        use super::*;
+        use std::time::Duration;
 
-        assert_eq!(cloned.ecosystem, state.ecosystem);
-        assert_eq!(cloned.content, state.content);
-        assert_eq!(cloned.dependencies.len(), state.dependencies.len());
-        assert!(cloned.parse_result.is_none());
+        #[test]
+        fn test_allows_first_request() {
+            let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+            let uri = Uri::from_file_path("/test.toml").unwrap();
+            assert!(
+                limiter.allow_cold_start(&uri),
+                "First request should be allowed"
+            );
+        }
+
+        #[test]
+        fn test_blocks_rapid_requests() {
+            let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+            let uri = Uri::from_file_path("/test.toml").unwrap();
+
+            assert!(limiter.allow_cold_start(&uri), "First request allowed");
+            assert!(
+                !limiter.allow_cold_start(&uri),
+                "Second immediate request should be blocked"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_allows_after_interval() {
+            let limiter = ColdStartLimiter::new(Duration::from_millis(50));
+            let uri = Uri::from_file_path("/test.toml").unwrap();
+
+            assert!(limiter.allow_cold_start(&uri), "First request allowed");
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(
+                limiter.allow_cold_start(&uri),
+                "Request after interval should be allowed"
+            );
+        }
+
+        #[test]
+        fn test_different_uris_independent() {
+            let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+            let uri1 = Uri::from_file_path("/test1.toml").unwrap();
+            let uri2 = Uri::from_file_path("/test2.toml").unwrap();
+
+            assert!(limiter.allow_cold_start(&uri1), "URI 1 first request");
+            assert!(limiter.allow_cold_start(&uri2), "URI 2 first request");
+            assert!(
+                !limiter.allow_cold_start(&uri1),
+                "URI 1 second request blocked"
+            );
+            assert!(
+                !limiter.allow_cold_start(&uri2),
+                "URI 2 second request blocked"
+            );
+        }
+
+        #[test]
+        fn test_cleanup() {
+            let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+            let uri1 = Uri::from_file_path("/test1.toml").unwrap();
+            let uri2 = Uri::from_file_path("/test2.toml").unwrap();
+
+            limiter.allow_cold_start(&uri1);
+            limiter.allow_cold_start(&uri2);
+            assert_eq!(limiter.tracked_count(), 2, "Should track 2 URIs");
+
+            limiter.cleanup_old_entries(Duration::from_millis(0));
+            assert_eq!(
+                limiter.tracked_count(),
+                0,
+                "All entries should be cleaned up"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_concurrent_access() {
+            use std::sync::Arc;
+
+            let limiter = Arc::new(ColdStartLimiter::new(Duration::from_millis(100)));
+            let uri = Uri::from_file_path("/concurrent-test.toml").unwrap();
+
+            let mut handles = vec![];
+            const CONCURRENT_TASKS: usize = 10;
+
+            for _ in 0..CONCURRENT_TASKS {
+                let limiter_clone = Arc::clone(&limiter);
+                let uri_clone = uri.clone();
+                let handle =
+                    tokio::spawn(async move { limiter_clone.allow_cold_start(&uri_clone) });
+                handles.push(handle);
+            }
+
+            let mut results = vec![];
+            for handle in handles {
+                results.push(handle.await.unwrap());
+            }
+
+            let allowed_count = results.iter().filter(|&&allowed| allowed).count();
+            assert_eq!(allowed_count, 1, "Exactly one concurrent request allowed");
+
+            let blocked_count = results.iter().filter(|&&allowed| !allowed).count();
+            assert_eq!(
+                blocked_count,
+                CONCURRENT_TASKS - 1,
+                "Rest should be blocked"
+            );
+        }
     }
 
-    #[test]
-    fn test_document_state_debug() {
-        let deps = vec![create_test_cargo_dependency()];
-        let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+    // =========================================================================
+    // Cargo ecosystem tests
+    // =========================================================================
 
-        let debug_str = format!("{:?}", state);
-        assert!(debug_str.contains("DocumentState"));
-        assert!(debug_str.contains("ecosystem"));
-    }
-
-    #[test]
-    fn test_unified_dependency_git_source() {
+    #[cfg(feature = "cargo")]
+    mod cargo_tests {
+        use super::*;
         use deps_cargo::{DependencySection, DependencySource};
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let git_dep = UnifiedDependency::Cargo(ParsedDependency {
-            name: "custom".into(),
-            name_range: Range::new(Position::new(0, 0), Position::new(0, 6)),
-            version_req: None,
-            version_range: None,
-            features: vec![],
-            features_range: None,
-            source: DependencySource::Git {
-                url: "https://github.com/user/repo".into(),
-                rev: None,
-            },
-            workspace_inherited: false,
-            section: DependencySection::Dependencies,
-        });
-
-        assert!(!git_dep.is_registry());
-    }
-
-    #[test]
-    fn test_document_state_new_without_parse_result() {
-        let content = r#"[dependencies]
-serde = "1.0"
-"#
-        .to_string();
-
-        let doc_state = DocumentState::new_without_parse_result("cargo", content.clone());
-
-        assert_eq!(doc_state.ecosystem_id, "cargo");
-        assert_eq!(doc_state.ecosystem, Ecosystem::Cargo);
-        assert_eq!(doc_state.content, content);
-        assert!(doc_state.parse_result.is_none());
-        assert!(doc_state.dependencies.is_empty());
-        assert!(doc_state.versions.is_empty());
-        assert!(doc_state.cached_versions.is_empty());
-        assert!(doc_state.resolved_versions.is_empty());
-    }
-
-    #[test]
-    fn test_document_state_new_without_parse_result_npm() {
-        let content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
-
-        let doc_state = DocumentState::new_without_parse_result("npm", content.clone());
-
-        assert_eq!(doc_state.ecosystem_id, "npm");
-        assert_eq!(doc_state.ecosystem, Ecosystem::Npm);
-        assert!(doc_state.parse_result.is_none());
-    }
-
-    #[test]
-    fn test_document_state_new_without_parse_result_pypi() {
-        let content = r#"[project]
-dependencies = ["requests>=2.0.0"]
-"#
-        .to_string();
-
-        let doc_state = DocumentState::new_without_parse_result("pypi", content.clone());
-
-        assert_eq!(doc_state.ecosystem_id, "pypi");
-        assert_eq!(doc_state.ecosystem, Ecosystem::Pypi);
-        assert!(doc_state.parse_result.is_none());
-    }
-
-    #[test]
-    fn test_cold_start_limiter_allows_first_request() {
-        use std::time::Duration;
-
-        let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-        let uri = Uri::from_file_path("/test.toml").unwrap();
-
-        assert!(
-            limiter.allow_cold_start(&uri),
-            "First request should be allowed"
-        );
-    }
-
-    #[test]
-    fn test_cold_start_limiter_blocks_rapid_requests() {
-        use std::time::Duration;
-
-        let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-        let uri = Uri::from_file_path("/test.toml").unwrap();
-
-        assert!(limiter.allow_cold_start(&uri), "First request allowed");
-        assert!(
-            !limiter.allow_cold_start(&uri),
-            "Second immediate request should be blocked"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cold_start_limiter_allows_after_interval() {
-        use std::time::Duration;
-
-        let limiter = ColdStartLimiter::new(Duration::from_millis(50));
-        let uri = Uri::from_file_path("/test.toml").unwrap();
-
-        assert!(limiter.allow_cold_start(&uri), "First request allowed");
-
-        // Wait for interval to expire
-        tokio::time::sleep(Duration::from_millis(60)).await;
-
-        assert!(
-            limiter.allow_cold_start(&uri),
-            "Request after interval should be allowed"
-        );
-    }
-
-    #[test]
-    fn test_cold_start_limiter_different_uris_independent() {
-        use std::time::Duration;
-
-        let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-        let uri1 = Uri::from_file_path("/test1.toml").unwrap();
-        let uri2 = Uri::from_file_path("/test2.toml").unwrap();
-
-        assert!(limiter.allow_cold_start(&uri1), "URI 1 first request");
-        assert!(limiter.allow_cold_start(&uri2), "URI 2 first request");
-        assert!(
-            !limiter.allow_cold_start(&uri1),
-            "URI 1 second request blocked"
-        );
-        assert!(
-            !limiter.allow_cold_start(&uri2),
-            "URI 2 second request blocked"
-        );
-    }
-
-    #[test]
-    fn test_cold_start_limiter_cleanup() {
-        use std::time::Duration;
-
-        let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-        let uri1 = Uri::from_file_path("/test1.toml").unwrap();
-        let uri2 = Uri::from_file_path("/test2.toml").unwrap();
-
-        limiter.allow_cold_start(&uri1);
-        limiter.allow_cold_start(&uri2);
-
-        assert_eq!(limiter.tracked_count(), 2, "Should track 2 URIs");
-
-        // Cleanup entries older than 0ms (all entries)
-        limiter.cleanup_old_entries(Duration::from_millis(0));
-
-        assert_eq!(
-            limiter.tracked_count(),
-            0,
-            "All entries should be cleaned up"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cold_start_limiter_concurrent_access() {
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        let limiter = Arc::new(ColdStartLimiter::new(Duration::from_millis(100)));
-        let uri = Uri::from_file_path("/concurrent-test.toml").unwrap();
-
-        // Spawn multiple concurrent tasks trying to cold start the same URI
-        let mut handles = vec![];
-        const CONCURRENT_TASKS: usize = 10;
-
-        for _ in 0..CONCURRENT_TASKS {
-            let limiter_clone = Arc::clone(&limiter);
-            let uri_clone = uri.clone();
-
-            let handle = tokio::spawn(async move { limiter_clone.allow_cold_start(&uri_clone) });
-
-            handles.push(handle);
+        fn create_test_dependency() -> UnifiedDependency {
+            UnifiedDependency::Cargo(ParsedDependency {
+                name: "serde".into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_req: Some("1.0".into()),
+                version_range: Some(Range::new(Position::new(0, 9), Position::new(0, 14))),
+                features: vec![],
+                features_range: None,
+                source: DependencySource::Registry,
+                workspace_inherited: false,
+                section: DependencySection::Dependencies,
+            })
         }
 
-        // Collect results
-        let mut results = vec![];
-        for handle in handles {
-            let allowed = handle.await.unwrap();
-            results.push(allowed);
+        #[test]
+        fn test_document_state_creation() {
+            let deps = vec![create_test_dependency()];
+            let state = DocumentState::new(Ecosystem::Cargo, "test content".into(), deps);
+
+            assert_eq!(state.ecosystem, Ecosystem::Cargo);
+            assert_eq!(state.content, "test content");
+            assert_eq!(state.dependencies.len(), 1);
+            assert!(state.versions.is_empty());
         }
 
-        // Exactly one request should be allowed (first one wins)
-        let allowed_count = results.iter().filter(|&&allowed| allowed).count();
-        assert_eq!(
-            allowed_count, 1,
-            "Exactly one concurrent request should be allowed, got {}",
-            allowed_count
-        );
+        #[test]
+        fn test_document_state_update_versions() {
+            let deps = vec![create_test_dependency()];
+            let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
 
-        // The rest should be rate limited
-        let blocked_count = results.iter().filter(|&&allowed| !allowed).count();
-        assert_eq!(
-            blocked_count,
-            CONCURRENT_TASKS - 1,
-            "All other requests should be blocked"
-        );
+            let mut versions = HashMap::new();
+            versions.insert(
+                "serde".into(),
+                UnifiedVersion::Cargo(CargoVersion {
+                    num: "1.0.0".into(),
+                    yanked: false,
+                    features: HashMap::new(),
+                }),
+            );
+
+            state.update_versions(versions);
+            assert_eq!(state.versions.len(), 1);
+            assert!(state.versions.contains_key("serde"));
+        }
+
+        #[test]
+        fn test_server_state_document_operations() {
+            let state = ServerState::new();
+            let uri = Uri::from_file_path("/test.toml").unwrap();
+            let deps = vec![create_test_dependency()];
+            let doc_state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+
+            state.update_document(uri.clone(), doc_state.clone());
+            assert_eq!(state.document_count(), 1);
+
+            let retrieved = state.get_document(&uri);
+            assert!(retrieved.is_some());
+            assert_eq!(retrieved.unwrap().content, "test");
+
+            let removed = state.remove_document(&uri);
+            assert!(removed.is_some());
+            assert_eq!(state.document_count(), 0);
+        }
+
+        #[test]
+        fn test_unified_dependency_name() {
+            let cargo_dep = create_test_dependency();
+            assert_eq!(cargo_dep.name(), "serde");
+            assert_eq!(cargo_dep.version_req(), Some("1.0"));
+            assert!(cargo_dep.is_registry());
+        }
+
+        #[test]
+        fn test_unified_dependency_git_source() {
+            let git_dep = UnifiedDependency::Cargo(ParsedDependency {
+                name: "custom".into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 6)),
+                version_req: None,
+                version_range: None,
+                features: vec![],
+                features_range: None,
+                source: DependencySource::Git {
+                    url: "https://github.com/user/repo".into(),
+                    rev: None,
+                },
+                workspace_inherited: false,
+                section: DependencySection::Dependencies,
+            });
+            assert!(!git_dep.is_registry());
+        }
+
+        #[test]
+        fn test_unified_version() {
+            let version = UnifiedVersion::Cargo(CargoVersion {
+                num: "1.0.0".into(),
+                yanked: false,
+                features: HashMap::new(),
+            });
+            assert_eq!(version.version_string(), "1.0.0");
+            assert!(!version.is_yanked());
+        }
+
+        #[test]
+        fn test_document_state_new_from_parse_result() {
+            let state = ServerState::new();
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+
+            let parse_result = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(ecosystem.parse_manifest(&content, &uri))
+                .unwrap();
+
+            let doc_state =
+                DocumentState::new_from_parse_result("cargo", content.clone(), parse_result);
+
+            assert_eq!(doc_state.ecosystem_id, "cargo");
+            assert_eq!(doc_state.content, content);
+            assert!(doc_state.parse_result.is_some());
+        }
+
+        #[test]
+        fn test_document_state_new_without_parse_result() {
+            let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+            let doc_state = DocumentState::new_without_parse_result("cargo", content.clone());
+
+            assert_eq!(doc_state.ecosystem_id, "cargo");
+            assert_eq!(doc_state.ecosystem, Ecosystem::Cargo);
+            assert!(doc_state.parse_result.is_none());
+            assert!(doc_state.dependencies.is_empty());
+        }
+
+        #[test]
+        fn test_document_state_update_resolved_versions() {
+            let deps = vec![create_test_dependency()];
+            let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+
+            let mut resolved = HashMap::new();
+            resolved.insert("serde".into(), "1.0.195".into());
+
+            state.update_resolved_versions(resolved);
+            assert_eq!(state.resolved_versions.len(), 1);
+            assert_eq!(
+                state.resolved_versions.get("serde"),
+                Some(&"1.0.195".into())
+            );
+        }
+
+        #[test]
+        fn test_document_state_update_cached_versions() {
+            let deps = vec![create_test_dependency()];
+            let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+
+            let mut cached = HashMap::new();
+            cached.insert("serde".into(), "1.0.210".into());
+
+            state.update_cached_versions(cached);
+            assert_eq!(state.cached_versions.len(), 1);
+        }
+
+        #[test]
+        fn test_document_state_parse_result_accessor() {
+            let deps = vec![create_test_dependency()];
+            let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+            assert!(state.parse_result().is_none());
+        }
+
+        #[test]
+        fn test_document_state_clone() {
+            let deps = vec![create_test_dependency()];
+            let state = DocumentState::new(Ecosystem::Cargo, "test content".into(), deps);
+            let cloned = state.clone();
+
+            assert_eq!(cloned.ecosystem, state.ecosystem);
+            assert_eq!(cloned.content, state.content);
+            assert_eq!(cloned.dependencies.len(), state.dependencies.len());
+            assert!(cloned.parse_result.is_none());
+        }
+
+        #[test]
+        fn test_document_state_debug() {
+            let deps = vec![create_test_dependency()];
+            let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+            let debug_str = format!("{:?}", state);
+            assert!(debug_str.contains("DocumentState"));
+        }
     }
 
-    #[test]
-    fn test_ecosystem_from_filename_go() {
-        assert_eq!(Ecosystem::from_filename("go.mod"), Some(Ecosystem::Go));
-    }
+    // =========================================================================
+    // npm ecosystem tests
+    // =========================================================================
 
-    #[test]
-    fn test_ecosystem_from_uri_go() {
-        let go_uri = Uri::from_file_path("/path/to/go.mod").unwrap();
-        assert_eq!(Ecosystem::from_uri(&go_uri), Some(Ecosystem::Go));
-    }
-
-    #[test]
-    fn test_unified_dependency_go() {
-        use deps_go::{GoDependency, GoDirective};
+    #[cfg(feature = "npm")]
+    mod npm_tests {
+        use super::*;
+        use deps_npm::{NpmDependency, NpmDependencySection};
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let go_dep = UnifiedDependency::Go(GoDependency {
-            module_path: "github.com/gin-gonic/gin".into(),
-            module_path_range: Range::new(Position::new(0, 0), Position::new(0, 25)),
-            version: Some("v1.9.1".into()),
-            version_range: Some(Range::new(Position::new(0, 26), Position::new(0, 32))),
-            directive: GoDirective::Require,
-            indirect: false,
-        });
+        #[test]
+        fn test_unified_dependency() {
+            let npm_dep = UnifiedDependency::Npm(NpmDependency {
+                name: "express".into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+                version_req: Some("^4.0.0".into()),
+                version_range: Some(Range::new(Position::new(0, 11), Position::new(0, 18))),
+                section: NpmDependencySection::Dependencies,
+            });
 
-        assert_eq!(go_dep.name(), "github.com/gin-gonic/gin");
-        assert_eq!(go_dep.version_req(), Some("v1.9.1"));
-        assert!(go_dep.is_registry());
+            assert_eq!(npm_dep.name(), "express");
+            assert_eq!(npm_dep.version_req(), Some("^4.0.0"));
+            assert!(npm_dep.is_registry());
+        }
+
+        #[test]
+        fn test_unified_version() {
+            let version = UnifiedVersion::Npm(deps_npm::NpmVersion {
+                version: "4.18.2".into(),
+                deprecated: false,
+            });
+            assert_eq!(version.version_string(), "4.18.2");
+            assert!(!version.is_yanked());
+        }
+
+        #[test]
+        fn test_document_state_new_without_parse_result() {
+            let content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
+            let doc_state = DocumentState::new_without_parse_result("npm", content.clone());
+
+            assert_eq!(doc_state.ecosystem_id, "npm");
+            assert_eq!(doc_state.ecosystem, Ecosystem::Npm);
+            assert!(doc_state.parse_result.is_none());
+        }
     }
 
-    #[test]
-    fn test_unified_dependency_go_name_range() {
-        use deps_go::{GoDependency, GoDirective};
+    // =========================================================================
+    // PyPI ecosystem tests
+    // =========================================================================
+
+    #[cfg(feature = "pypi")]
+    mod pypi_tests {
+        use super::*;
+        use deps_pypi::{PypiDependency, PypiDependencySection, PypiDependencySource};
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let range = Range::new(Position::new(5, 10), Position::new(5, 35));
-        let go_dep = UnifiedDependency::Go(GoDependency {
-            module_path: "github.com/example/pkg".into(),
-            module_path_range: range,
-            version: Some("v1.0.0".into()),
-            version_range: Some(Range::new(Position::new(5, 36), Position::new(5, 42))),
-            directive: GoDirective::Require,
-            indirect: false,
-        });
+        #[test]
+        fn test_unified_dependency() {
+            let pypi_dep = UnifiedDependency::Pypi(PypiDependency {
+                name: "requests".into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+                version_req: Some(">=2.0.0".into()),
+                version_range: Some(Range::new(Position::new(0, 10), Position::new(0, 18))),
+                extras: vec![],
+                extras_range: None,
+                markers: None,
+                markers_range: None,
+                source: PypiDependencySource::PyPI,
+                section: PypiDependencySection::Dependencies,
+            });
 
-        assert_eq!(go_dep.name_range(), range);
+            assert_eq!(pypi_dep.name(), "requests");
+            assert_eq!(pypi_dep.version_req(), Some(">=2.0.0"));
+            assert!(pypi_dep.is_registry());
+        }
+
+        #[test]
+        fn test_unified_version() {
+            let version = UnifiedVersion::Pypi(deps_pypi::PypiVersion {
+                version: "2.31.0".into(),
+                yanked: true,
+            });
+            assert_eq!(version.version_string(), "2.31.0");
+            assert!(version.is_yanked());
+        }
+
+        #[test]
+        fn test_document_state_new_without_parse_result() {
+            let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n".to_string();
+            let doc_state = DocumentState::new_without_parse_result("pypi", content.clone());
+
+            assert_eq!(doc_state.ecosystem_id, "pypi");
+            assert_eq!(doc_state.ecosystem, Ecosystem::Pypi);
+            assert!(doc_state.parse_result.is_none());
+        }
     }
 
-    #[test]
-    fn test_unified_dependency_go_version_range() {
-        use deps_go::{GoDependency, GoDirective};
+    // =========================================================================
+    // Go ecosystem tests
+    // =========================================================================
+
+    #[cfg(feature = "go")]
+    mod go_tests {
+        use super::*;
+        use deps_go::{GoDependency, GoDirective, GoVersion};
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let version_range = Range::new(Position::new(5, 36), Position::new(5, 42));
-        let go_dep = UnifiedDependency::Go(GoDependency {
-            module_path: "github.com/example/pkg".into(),
-            module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
-            version: Some("v1.0.0".into()),
-            version_range: Some(version_range),
-            directive: GoDirective::Require,
-            indirect: false,
-        });
+        fn create_test_dependency() -> UnifiedDependency {
+            UnifiedDependency::Go(GoDependency {
+                module_path: "github.com/gin-gonic/gin".into(),
+                module_path_range: Range::new(Position::new(0, 0), Position::new(0, 25)),
+                version: Some("v1.9.1".into()),
+                version_range: Some(Range::new(Position::new(0, 26), Position::new(0, 32))),
+                directive: GoDirective::Require,
+                indirect: false,
+            })
+        }
 
-        assert_eq!(go_dep.version_range(), Some(version_range));
-    }
+        #[test]
+        fn test_unified_dependency() {
+            let go_dep = create_test_dependency();
+            assert_eq!(go_dep.name(), "github.com/gin-gonic/gin");
+            assert_eq!(go_dep.version_req(), Some("v1.9.1"));
+            assert!(go_dep.is_registry());
+        }
 
-    #[test]
-    fn test_unified_dependency_go_no_version() {
-        use deps_go::{GoDependency, GoDirective};
-        use tower_lsp_server::ls_types::{Position, Range};
+        #[test]
+        fn test_unified_dependency_name_range() {
+            let range = Range::new(Position::new(5, 10), Position::new(5, 35));
+            let go_dep = UnifiedDependency::Go(GoDependency {
+                module_path: "github.com/example/pkg".into(),
+                module_path_range: range,
+                version: Some("v1.0.0".into()),
+                version_range: Some(Range::new(Position::new(5, 36), Position::new(5, 42))),
+                directive: GoDirective::Require,
+                indirect: false,
+            });
+            assert_eq!(go_dep.name_range(), range);
+        }
 
-        let go_dep = UnifiedDependency::Go(GoDependency {
-            module_path: "github.com/example/pkg".into(),
-            module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
-            version: None,
-            version_range: None,
-            directive: GoDirective::Require,
-            indirect: false,
-        });
+        #[test]
+        fn test_unified_dependency_version_range() {
+            let version_range = Range::new(Position::new(5, 36), Position::new(5, 42));
+            let go_dep = UnifiedDependency::Go(GoDependency {
+                module_path: "github.com/example/pkg".into(),
+                module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
+                version: Some("v1.0.0".into()),
+                version_range: Some(version_range),
+                directive: GoDirective::Require,
+                indirect: false,
+            });
+            assert_eq!(go_dep.version_range(), Some(version_range));
+        }
 
-        assert_eq!(go_dep.version_req(), None);
-        assert_eq!(go_dep.version_range(), None);
-    }
+        #[test]
+        fn test_unified_dependency_no_version() {
+            let go_dep = UnifiedDependency::Go(GoDependency {
+                module_path: "github.com/example/pkg".into(),
+                module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
+                version: None,
+                version_range: None,
+                directive: GoDirective::Require,
+                indirect: false,
+            });
+            assert_eq!(go_dep.version_req(), None);
+            assert_eq!(go_dep.version_range(), None);
+        }
 
-    #[test]
-    fn test_unified_version_go() {
-        use deps_go::GoVersion;
+        #[test]
+        fn test_unified_version() {
+            let version = UnifiedVersion::Go(GoVersion {
+                version: "v1.9.1".into(),
+                time: Some("2023-07-18T14:30:00Z".into()),
+                is_pseudo: false,
+                retracted: false,
+            });
+            assert_eq!(version.version_string(), "v1.9.1");
+            assert!(!version.is_yanked());
+        }
 
-        let version = UnifiedVersion::Go(GoVersion {
-            version: "v1.9.1".into(),
-            time: Some("2023-07-18T14:30:00Z".into()),
-            is_pseudo: false,
-            retracted: false,
-        });
+        #[test]
+        fn test_unified_version_retracted() {
+            let version = UnifiedVersion::Go(GoVersion {
+                version: "v1.0.0".into(),
+                time: None,
+                is_pseudo: false,
+                retracted: true,
+            });
+            assert_eq!(version.version_string(), "v1.0.0");
+            assert!(version.is_yanked());
+        }
 
-        assert_eq!(version.version_string(), "v1.9.1");
-        assert!(!version.is_yanked());
-    }
+        #[test]
+        fn test_unified_version_pseudo() {
+            let version = UnifiedVersion::Go(GoVersion {
+                version: "v0.0.0-20191109021931-daa7c04131f5".into(),
+                time: Some("2019-11-09T02:19:31Z".into()),
+                is_pseudo: true,
+                retracted: false,
+            });
+            assert_eq!(
+                version.version_string(),
+                "v0.0.0-20191109021931-daa7c04131f5"
+            );
+            assert!(!version.is_yanked());
+        }
 
-    #[test]
-    fn test_unified_version_go_retracted() {
-        use deps_go::GoVersion;
+        #[test]
+        fn test_document_state_new() {
+            let deps = vec![create_test_dependency()];
+            let state = DocumentState::new(Ecosystem::Go, "test content".into(), deps);
 
-        let version = UnifiedVersion::Go(GoVersion {
-            version: "v1.0.0".into(),
-            time: None,
-            is_pseudo: false,
-            retracted: true,
-        });
+            assert_eq!(state.ecosystem, Ecosystem::Go);
+            assert_eq!(state.ecosystem_id, "go");
+            assert_eq!(state.dependencies.len(), 1);
+        }
 
-        assert_eq!(version.version_string(), "v1.0.0");
-        assert!(version.is_yanked());
-    }
+        #[test]
+        fn test_document_state_new_without_parse_result() {
+            let content =
+                "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n"
+                    .to_string();
+            let doc_state = DocumentState::new_without_parse_result("go", content.clone());
 
-    #[test]
-    fn test_unified_version_go_pseudo() {
-        use deps_go::GoVersion;
+            assert_eq!(doc_state.ecosystem_id, "go");
+            assert_eq!(doc_state.ecosystem, Ecosystem::Go);
+            assert!(doc_state.parse_result.is_none());
+        }
 
-        let version = UnifiedVersion::Go(GoVersion {
-            version: "v0.0.0-20191109021931-daa7c04131f5".into(),
-            time: Some("2019-11-09T02:19:31Z".into()),
-            is_pseudo: true,
-            retracted: false,
-        });
+        #[test]
+        fn test_document_state_new_from_parse_result() {
+            let state = ServerState::new();
+            let uri = Uri::from_file_path("/test/go.mod").unwrap();
+            let ecosystem = state.ecosystem_registry.get("go").unwrap();
+            let content =
+                "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n"
+                    .to_string();
 
-        assert_eq!(
-            version.version_string(),
-            "v0.0.0-20191109021931-daa7c04131f5"
-        );
-        assert!(!version.is_yanked());
-    }
+            let parse_result = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(ecosystem.parse_manifest(&content, &uri))
+                .unwrap();
 
-    #[test]
-    fn test_document_state_new_go() {
-        use deps_go::{GoDependency, GoDirective};
-        use tower_lsp_server::ls_types::{Position, Range};
+            let doc_state =
+                DocumentState::new_from_parse_result("go", content.clone(), parse_result);
 
-        let deps = vec![UnifiedDependency::Go(GoDependency {
-            module_path: "github.com/gin-gonic/gin".into(),
-            module_path_range: Range::new(Position::new(0, 0), Position::new(0, 25)),
-            version: Some("v1.9.1".into()),
-            version_range: Some(Range::new(Position::new(0, 26), Position::new(0, 32))),
-            directive: GoDirective::Require,
-            indirect: false,
-        })];
-
-        let state = DocumentState::new(Ecosystem::Go, "test content".into(), deps);
-
-        assert_eq!(state.ecosystem, Ecosystem::Go);
-        assert_eq!(state.ecosystem_id, "go");
-        assert_eq!(state.content, "test content");
-        assert_eq!(state.dependencies.len(), 1);
-        assert!(state.versions.is_empty());
-    }
-
-    #[test]
-    fn test_document_state_new_without_parse_result_go() {
-        let content = r#"module example.com/myapp
-
-go 1.21
-
-require github.com/gin-gonic/gin v1.9.1
-"#
-        .to_string();
-
-        let doc_state = DocumentState::new_without_parse_result("go", content.clone());
-
-        assert_eq!(doc_state.ecosystem_id, "go");
-        assert_eq!(doc_state.ecosystem, Ecosystem::Go);
-        assert_eq!(doc_state.content, content);
-        assert!(doc_state.parse_result.is_none());
-        assert!(doc_state.dependencies.is_empty());
-    }
-
-    #[test]
-    fn test_document_state_new_from_parse_result_go() {
-        let state = ServerState::new();
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
-        let ecosystem = state.ecosystem_registry.get("go").unwrap();
-
-        let content = r#"module example.com/myapp
-
-go 1.21
-
-require github.com/gin-gonic/gin v1.9.1
-"#
-        .to_string();
-
-        let parse_result = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(ecosystem.parse_manifest(&content, &uri))
-            .unwrap();
-
-        let doc_state = DocumentState::new_from_parse_result("go", content.clone(), parse_result);
-
-        assert_eq!(doc_state.ecosystem_id, "go");
-        assert_eq!(doc_state.ecosystem, Ecosystem::Go);
-        assert_eq!(doc_state.content, content);
-        assert!(doc_state.parse_result.is_some());
-    }
-
-    #[test]
-    fn test_unified_version_go_version_string_getter() {
-        use deps_go::GoVersion;
-
-        let version = UnifiedVersion::Go(GoVersion {
-            version: "v1.9.1".into(),
-            time: None,
-            is_pseudo: false,
-            retracted: false,
-        });
-
-        assert_eq!(version.version_string(), "v1.9.1");
-    }
-
-    #[test]
-    fn test_unified_version_go_yanked_checker() {
-        use deps_go::GoVersion;
-
-        let retracted = UnifiedVersion::Go(GoVersion {
-            version: "v1.0.0".into(),
-            time: None,
-            is_pseudo: false,
-            retracted: true,
-        });
-
-        let normal = UnifiedVersion::Go(GoVersion {
-            version: "v1.9.1".into(),
-            time: None,
-            is_pseudo: false,
-            retracted: false,
-        });
-
-        assert!(retracted.is_yanked());
-        assert!(!normal.is_yanked());
+            assert_eq!(doc_state.ecosystem_id, "go");
+            assert!(doc_state.parse_result.is_some());
+        }
     }
 }

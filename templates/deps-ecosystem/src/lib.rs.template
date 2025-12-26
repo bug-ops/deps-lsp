@@ -1,6 +1,9 @@
+//! {ECOSYSTEM_DISPLAY} ecosystem support for deps-lsp.
+
 pub mod ecosystem;
 pub mod error;
 pub mod formatter;
+pub mod lockfile;
 pub mod parser;
 pub mod registry;
 pub mod types;
@@ -8,6 +11,7 @@ pub mod types;
 pub use ecosystem::{ECOSYSTEM_PASCAL}Ecosystem;
 pub use error::{ECOSYSTEM_PASCAL}Error, Result;
 pub use formatter::{ECOSYSTEM_PASCAL}Formatter;
+pub use lockfile::{ECOSYSTEM_PASCAL}LockfileParser;
 pub use parser::parse_{ECOSYSTEM_SNAKE};
 pub use registry::{ECOSYSTEM_PASCAL}Registry;
 pub use types::{ECOSYSTEM_PASCAL}Dependency, {ECOSYSTEM_PASCAL}Version;

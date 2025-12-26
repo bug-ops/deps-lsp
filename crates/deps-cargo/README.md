@@ -22,7 +22,7 @@ This crate provides parsing and registry integration for Rust's Cargo ecosystem.
 
 ```toml
 [dependencies]
-deps-cargo = "0.4"
+deps-cargo = "0.5"
 ```
 
 ```rust
