@@ -30,6 +30,8 @@ pub struct DepsConfig {
     pub diagnostics: DiagnosticsConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub cold_start: ColdStartConfig,
 }
 
 /// Configuration for inlay hints (inline version annotations).
@@ -189,6 +191,54 @@ fn default_refresh_interval() -> u64 {
     300 // 5 minutes
 }
 
+/// Configuration for cold start behavior.
+///
+/// Controls how the server handles loading documents from disk when
+/// they haven't been explicitly opened via didOpen notifications.
+///
+/// # Defaults
+///
+/// - `enabled`: `true`
+/// - `rate_limit_ms`: `100` (10 req/sec per URI)
+///
+/// # Security
+///
+/// File size limit (10MB) is hardcoded and NOT configurable for security reasons.
+/// See `loader::MAX_FILE_SIZE` constant.
+///
+/// # Examples
+///
+/// ```
+/// use deps_lsp::config::ColdStartConfig;
+///
+/// let config = ColdStartConfig {
+///     enabled: true,
+///     rate_limit_ms: 200,
+/// };
+///
+/// assert_eq!(config.rate_limit_ms, 200);
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct ColdStartConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_rate_limit_ms")]
+    pub rate_limit_ms: u64,
+}
+
+impl Default for ColdStartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rate_limit_ms: default_rate_limit_ms(),
+        }
+    }
+}
+
+fn default_rate_limit_ms() -> u64 {
+    100 // 10 req/sec per URI
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +344,38 @@ mod tests {
         // All fields should use defaults
         assert!(config.inlay_hints.enabled);
         assert!(config.cache.enabled);
+    }
+
+    #[test]
+    fn test_cold_start_config_defaults() {
+        let config = ColdStartConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.rate_limit_ms, 100);
+    }
+
+    #[test]
+    fn test_cold_start_config_deserialization() {
+        let json = r#"{
+            "enabled": false,
+            "rate_limit_ms": 200
+        }"#;
+
+        let config: ColdStartConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.rate_limit_ms, 200);
+    }
+
+    #[test]
+    fn test_full_config_with_cold_start() {
+        let json = r#"{
+            "cold_start": {
+                "enabled": true,
+                "rate_limit_ms": 150
+            }
+        }"#;
+
+        let config: DepsConfig = serde_json::from_str(json).unwrap();
+        assert!(config.cold_start.enabled);
+        assert_eq!(config.cold_start.rate_limit_ms, 150);
     }
 }

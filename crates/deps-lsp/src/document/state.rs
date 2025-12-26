@@ -7,7 +7,7 @@ use deps_npm::{NpmDependency, NpmVersion};
 use deps_pypi::{PypiDependency, PypiVersion};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tower_lsp_server::ls_types::Uri;
 
@@ -253,6 +253,86 @@ impl Clone for DocumentState {
     }
 }
 
+/// Tracks recent cold start attempts per URI to prevent DOS.
+///
+/// Uses rate limiting with a configurable minimum interval between
+/// cold start attempts for the same URI. This prevents malicious or
+/// buggy clients from overwhelming the server with rapid file loading
+/// requests.
+///
+/// # Examples
+///
+/// ```
+/// use deps_lsp::document::ColdStartLimiter;
+/// use tower_lsp_server::ls_types::Uri;
+/// use std::time::Duration;
+///
+/// let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+/// let uri = Uri::from_file_path("/test.toml").unwrap();
+///
+/// assert!(limiter.allow_cold_start(&uri));
+/// assert!(!limiter.allow_cold_start(&uri)); // Rate limited
+/// ```
+#[derive(Debug)]
+pub struct ColdStartLimiter {
+    /// Maps URI to last cold start attempt time.
+    last_attempts: DashMap<Uri, Instant>,
+    /// Minimum interval between cold start attempts for the same URI.
+    min_interval: Duration,
+}
+
+impl ColdStartLimiter {
+    /// Creates a new cold start limiter with the specified minimum interval.
+    pub fn new(min_interval: Duration) -> Self {
+        Self {
+            last_attempts: DashMap::new(),
+            min_interval,
+        }
+    }
+
+    /// Returns true if cold start is allowed, false if rate limited.
+    ///
+    /// Updates the last attempt time if the cold start is allowed.
+    pub fn allow_cold_start(&self, uri: &Uri) -> bool {
+        let now = Instant::now();
+
+        // Check last attempt time
+        if let Some(mut entry) = self.last_attempts.get_mut(uri) {
+            let elapsed = now.duration_since(*entry);
+            if elapsed < self.min_interval {
+                let retry_after = self.min_interval - elapsed;
+                tracing::warn!(
+                    "Cold start rate limited for {:?} (retry after {:?})",
+                    uri,
+                    retry_after
+                );
+                return false;
+            }
+            *entry = now;
+        } else {
+            self.last_attempts.insert(uri.clone(), now);
+        }
+
+        true
+    }
+
+    /// Cleans up old entries periodically.
+    ///
+    /// Removes entries older than `max_age` to prevent unbounded memory growth.
+    /// Should be called from a background task.
+    pub fn cleanup_old_entries(&self, max_age: Duration) {
+        let now = Instant::now();
+        self.last_attempts
+            .retain(|_, instant| now.duration_since(*instant) < max_age);
+    }
+
+    /// Returns the number of tracked URIs.
+    #[cfg(test)]
+    pub fn tracked_count(&self) -> usize {
+        self.last_attempts.len()
+    }
+}
+
 impl std::fmt::Debug for DocumentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DocumentState")
@@ -397,6 +477,8 @@ pub struct ServerState {
     pub lockfile_cache: Arc<LockFileCache>,
     /// Ecosystem registry for trait-based architecture
     pub ecosystem_registry: Arc<EcosystemRegistry>,
+    /// Cold start rate limiter
+    pub cold_start_limiter: ColdStartLimiter,
     /// Background task handles
     tasks: tokio::sync::RwLock<HashMap<Uri, JoinHandle<()>>>,
 }
@@ -420,11 +502,15 @@ impl ServerState {
         let pypi_ecosystem = Arc::new(deps_pypi::PypiEcosystem::new(Arc::clone(&cache)));
         ecosystem_registry.register(pypi_ecosystem);
 
+        // Create cold start limiter with default 100ms interval (10 req/sec per URI)
+        let cold_start_limiter = ColdStartLimiter::new(Duration::from_millis(100));
+
         Self {
             documents: DashMap::new(),
             cache,
             lockfile_cache,
             ecosystem_registry,
+            cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
@@ -948,5 +1034,138 @@ dependencies = ["requests>=2.0.0"]
         assert_eq!(doc_state.ecosystem_id, "pypi");
         assert_eq!(doc_state.ecosystem, Ecosystem::Pypi);
         assert!(doc_state.parse_result.is_none());
+    }
+
+    #[test]
+    fn test_cold_start_limiter_allows_first_request() {
+        use std::time::Duration;
+
+        let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+        let uri = Uri::from_file_path("/test.toml").unwrap();
+
+        assert!(
+            limiter.allow_cold_start(&uri),
+            "First request should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_limiter_blocks_rapid_requests() {
+        use std::time::Duration;
+
+        let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+        let uri = Uri::from_file_path("/test.toml").unwrap();
+
+        assert!(limiter.allow_cold_start(&uri), "First request allowed");
+        assert!(
+            !limiter.allow_cold_start(&uri),
+            "Second immediate request should be blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cold_start_limiter_allows_after_interval() {
+        use std::time::Duration;
+
+        let limiter = ColdStartLimiter::new(Duration::from_millis(50));
+        let uri = Uri::from_file_path("/test.toml").unwrap();
+
+        assert!(limiter.allow_cold_start(&uri), "First request allowed");
+
+        // Wait for interval to expire
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert!(
+            limiter.allow_cold_start(&uri),
+            "Request after interval should be allowed"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_limiter_different_uris_independent() {
+        use std::time::Duration;
+
+        let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+        let uri1 = Uri::from_file_path("/test1.toml").unwrap();
+        let uri2 = Uri::from_file_path("/test2.toml").unwrap();
+
+        assert!(limiter.allow_cold_start(&uri1), "URI 1 first request");
+        assert!(limiter.allow_cold_start(&uri2), "URI 2 first request");
+        assert!(
+            !limiter.allow_cold_start(&uri1),
+            "URI 1 second request blocked"
+        );
+        assert!(
+            !limiter.allow_cold_start(&uri2),
+            "URI 2 second request blocked"
+        );
+    }
+
+    #[test]
+    fn test_cold_start_limiter_cleanup() {
+        use std::time::Duration;
+
+        let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+        let uri1 = Uri::from_file_path("/test1.toml").unwrap();
+        let uri2 = Uri::from_file_path("/test2.toml").unwrap();
+
+        limiter.allow_cold_start(&uri1);
+        limiter.allow_cold_start(&uri2);
+
+        assert_eq!(limiter.tracked_count(), 2, "Should track 2 URIs");
+
+        // Cleanup entries older than 0ms (all entries)
+        limiter.cleanup_old_entries(Duration::from_millis(0));
+
+        assert_eq!(
+            limiter.tracked_count(),
+            0,
+            "All entries should be cleaned up"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cold_start_limiter_concurrent_access() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let limiter = Arc::new(ColdStartLimiter::new(Duration::from_millis(100)));
+        let uri = Uri::from_file_path("/concurrent-test.toml").unwrap();
+
+        // Spawn multiple concurrent tasks trying to cold start the same URI
+        let mut handles = vec![];
+        const CONCURRENT_TASKS: usize = 10;
+
+        for _ in 0..CONCURRENT_TASKS {
+            let limiter_clone = Arc::clone(&limiter);
+            let uri_clone = uri.clone();
+
+            let handle = tokio::spawn(async move { limiter_clone.allow_cold_start(&uri_clone) });
+
+            handles.push(handle);
+        }
+
+        // Collect results
+        let mut results = vec![];
+        for handle in handles {
+            let allowed = handle.await.unwrap();
+            results.push(allowed);
+        }
+
+        // Exactly one request should be allowed (first one wins)
+        let allowed_count = results.iter().filter(|&&allowed| allowed).count();
+        assert_eq!(
+            allowed_count, 1,
+            "Exactly one concurrent request should be allowed, got {}",
+            allowed_count
+        );
+
+        // The rest should be rate limited
+        let blocked_count = results.iter().filter(|&&allowed| !allowed).count();
+        assert_eq!(
+            blocked_count,
+            CONCURRENT_TASKS - 1,
+            "All other requests should be blocked"
+        );
     }
 }

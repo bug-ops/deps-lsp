@@ -3,222 +3,12 @@
 //! These tests spawn the LSP server binary and verify correct
 //! JSON-RPC message handling and LSP protocol compliance.
 
-use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+mod common;
+
+use common::LspClient;
+use serde_json::json;
 use std::thread;
 use std::time::Duration;
-
-/// LSP test client for communicating with the server binary.
-struct LspClient {
-    process: Child,
-}
-
-impl LspClient {
-    /// Spawn the deps-lsp binary.
-    fn spawn() -> Self {
-        let process = Command::new(env!("CARGO_BIN_EXE_deps-lsp"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to spawn deps-lsp binary");
-
-        Self { process }
-    }
-
-    /// Send a JSON-RPC message to the server.
-    fn send(&mut self, message: &Value) {
-        let body = serde_json::to_string(message).unwrap();
-        let header = format!("Content-Length: {}\r\n\r\n", body.len());
-
-        let stdin = self.process.stdin.as_mut().expect("stdin not captured");
-        stdin.write_all(header.as_bytes()).unwrap();
-        stdin.write_all(body.as_bytes()).unwrap();
-        stdin.flush().unwrap();
-    }
-
-    /// Read a JSON-RPC response from the server.
-    ///
-    /// Skips notifications and returns the first response with matching id,
-    /// or any response/error if no id filter is provided.
-    fn read_response(&mut self, expected_id: Option<i64>) -> Value {
-        let stdout = self.process.stdout.as_mut().expect("stdout not captured");
-        let mut reader = BufReader::new(stdout);
-
-        loop {
-            // Read headers
-            let mut content_length = 0;
-            loop {
-                let mut line = String::new();
-                let bytes_read = reader.read_line(&mut line).expect("Failed to read header");
-
-                // EOF - server closed connection
-                if bytes_read == 0 {
-                    panic!("Server closed connection unexpectedly");
-                }
-
-                if line == "\r\n" || line == "\n" {
-                    break;
-                }
-
-                if line.to_lowercase().starts_with("content-length:") {
-                    content_length = line
-                        .split(':')
-                        .nth(1)
-                        .unwrap()
-                        .trim()
-                        .parse()
-                        .expect("Invalid content length");
-                }
-            }
-
-            // Handle empty content (shouldn't happen in valid LSP)
-            if content_length == 0 {
-                continue;
-            }
-
-            // Read body
-            let mut body = vec![0u8; content_length];
-            reader.read_exact(&mut body).expect("Failed to read body");
-
-            let message: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-                panic!("Invalid JSON: {e} in: {:?}", String::from_utf8_lossy(&body))
-            });
-
-            // Check if this is a notification (no id field)
-            if message.get("id").is_none() {
-                // Skip notifications, continue reading
-                continue;
-            }
-
-            // Check id if filter is specified
-            if let Some(id) = expected_id {
-                if message.get("id") == Some(&json!(id)) {
-                    return message;
-                }
-                // Wrong id, keep reading
-                continue;
-            }
-
-            return message;
-        }
-    }
-
-    /// Initialize the LSP session.
-    fn initialize(&mut self) -> Value {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "processId": null,
-                "capabilities": {
-                    "textDocument": {
-                        "hover": {
-                            "contentFormat": ["markdown", "plaintext"]
-                        },
-                        "completion": {
-                            "completionItem": {
-                                "snippetSupport": true
-                            }
-                        }
-                    }
-                },
-                "rootUri": "file:///tmp",
-                "workspaceFolders": null
-            }
-        }));
-
-        let response = self.read_response(Some(1));
-
-        // Send initialized notification
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "initialized",
-            "params": {}
-        }));
-
-        response
-    }
-
-    /// Open a text document.
-    fn did_open(&mut self, uri: &str, language_id: &str, text: &str) {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didOpen",
-            "params": {
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": language_id,
-                    "version": 1,
-                    "text": text
-                }
-            }
-        }));
-    }
-
-    /// Request hover information.
-    fn hover(&mut self, id: i64, uri: &str, line: u32, character: u32) -> Value {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/hover",
-            "params": {
-                "textDocument": {"uri": uri},
-                "position": {"line": line, "character": character}
-            }
-        }));
-        self.read_response(Some(id))
-    }
-
-    /// Request inlay hints.
-    fn inlay_hints(&mut self, id: i64, uri: &str) -> Value {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/inlayHint",
-            "params": {
-                "textDocument": {"uri": uri},
-                "range": {
-                    "start": {"line": 0, "character": 0},
-                    "end": {"line": 100, "character": 0}
-                }
-            }
-        }));
-        self.read_response(Some(id))
-    }
-
-    /// Request completions.
-    fn completion(&mut self, id: i64, uri: &str, line: u32, character: u32) -> Value {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "textDocument/completion",
-            "params": {
-                "textDocument": {"uri": uri},
-                "position": {"line": line, "character": character}
-            }
-        }));
-        self.read_response(Some(id))
-    }
-
-    /// Shutdown the server.
-    fn shutdown(&mut self) -> Value {
-        self.send(&json!({
-            "jsonrpc": "2.0",
-            "id": 999,
-            "method": "shutdown"
-        }));
-        self.read_response(Some(999))
-    }
-}
-
-impl Drop for LspClient {
-    fn drop(&mut self) {
-        let _ = self.process.kill();
-    }
-}
 
 #[test]
 fn test_initialize_response() {
@@ -512,4 +302,206 @@ fn test_jsonrpc_error_on_invalid_method() {
         "Should return error for unknown method"
     );
     assert_eq!(response["error"]["code"], json!(-32601)); // Method not found
+}
+
+// Cold Start Integration Tests
+
+#[test]
+fn test_cold_start_completion_without_didopen() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let content = r#"[dependencies]
+serde = ""
+"#;
+    temp_file.write_all(content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let uri = format!("file://{}", temp_file.path().display());
+
+    let mut client = LspClient::spawn();
+    client.initialize();
+
+    // NO didOpen - cold start scenario
+
+    // Request completion at cursor position after `serde = "`
+    let completion = client.completion(100, &uri, 1, 9);
+
+    // Should not error
+    assert!(
+        completion.get("error").is_none(),
+        "Cold start completion should not error: {:?}",
+        completion
+    );
+
+    // Should return some response (may be empty if network fails)
+    assert!(completion.get("result").is_some(), "Should return result");
+}
+
+#[test]
+fn test_cold_start_hover_without_didopen() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let content = r#"[dependencies]
+serde = "1.0"
+"#;
+    temp_file.write_all(content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let uri = format!("file://{}", temp_file.path().display());
+
+    let mut client = LspClient::spawn();
+    client.initialize();
+
+    // NO didOpen
+
+    // Hover over "serde" (line 1, character 2)
+    let hover = client.hover(110, &uri, 1, 2);
+
+    assert!(
+        hover.get("error").is_none(),
+        "Cold start hover should not error"
+    );
+}
+
+#[test]
+fn test_cold_start_inlay_hints_without_didopen() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let content = r#"[dependencies]
+tokio = "1.0"
+serde = "1.0"
+"#;
+    temp_file.write_all(content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let uri = format!("file://{}", temp_file.path().display());
+
+    let mut client = LspClient::spawn();
+    client.initialize();
+
+    // NO didOpen
+
+    // Wait for background version fetch (inlay hints require version data)
+    thread::sleep(Duration::from_millis(500));
+
+    let hints = client.inlay_hints(120, &uri);
+
+    assert!(
+        hints.get("error").is_none(),
+        "Cold start hints should not error"
+    );
+
+    // Should return inlay hints (may be empty if network fetch failed)
+    assert!(hints.get("result").is_some(), "Should return result");
+}
+
+#[test]
+fn test_cold_start_diagnostics_without_didopen() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let content = r#"[dependencies]
+serde = "1.0"
+"#;
+    temp_file.write_all(content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let uri = format!("file://{}", temp_file.path().display());
+
+    let mut client = LspClient::spawn();
+    client.initialize();
+
+    // NO didOpen
+
+    // Request diagnostics
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 130,
+        "method": "textDocument/diagnostic",
+        "params": {
+            "textDocument": {"uri": uri}
+        }
+    }));
+
+    let response = client.read_response(Some(130));
+
+    assert!(
+        response.get("error").is_none(),
+        "Cold start diagnostics should not error"
+    );
+}
+
+#[test]
+fn test_cold_start_file_not_found() {
+    let uri = "file:///nonexistent/Cargo.toml";
+
+    let mut client = LspClient::spawn();
+    client.initialize();
+
+    // Request on non-existent file
+    let hints = client.inlay_hints(140, uri);
+
+    // Should not crash, return empty result
+    assert!(
+        hints.get("error").is_none(),
+        "Should handle missing file gracefully"
+    );
+
+    if let Some(result) = hints.get("result")
+        && let Some(arr) = result.as_array()
+    {
+        assert!(arr.is_empty(), "Should return empty array for missing file");
+    }
+}
+
+#[test]
+fn test_cold_start_non_file_uri() {
+    let uri = "http://example.com/Cargo.toml";
+
+    let mut client = LspClient::spawn();
+    client.initialize();
+
+    // Request on HTTP URI (not file://)
+    let hints = client.inlay_hints(150, uri);
+
+    // Should handle gracefully (return empty, not crash)
+    assert!(
+        hints.get("error").is_none(),
+        "Should handle non-file URI gracefully"
+    );
+}
+
+#[test]
+fn test_cold_start_concurrent_requests() {
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    let mut temp_file = NamedTempFile::new().unwrap();
+    let content = r#"[dependencies]
+serde = "1.0"
+"#;
+    temp_file.write_all(content.as_bytes()).unwrap();
+    temp_file.flush().unwrap();
+
+    let uri = format!("file://{}", temp_file.path().display());
+
+    let mut client = LspClient::spawn();
+    client.initialize();
+
+    // NO didOpen
+
+    // Test concurrent requests don't crash the server by sending hover twice
+    let hover1 = client.hover(200, &uri, 1, 2);
+    let hover2 = client.hover(201, &uri, 1, 2);
+
+    // Both should succeed without errors (may return null/empty, but no error)
+    assert!(hover1.get("error").is_none());
+    assert!(hover2.get("error").is_none());
 }

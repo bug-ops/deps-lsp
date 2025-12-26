@@ -341,7 +341,7 @@ async fn load_resolved_versions(
 /// # Examples
 ///
 /// ```no_run
-/// use deps_lsp::document_lifecycle::ensure_document_loaded;
+/// use deps_lsp::document::ensure_document_loaded;
 /// use deps_lsp::document::ServerState;
 /// use tower_lsp_server::ls_types::Uri;
 /// use std::sync::Arc;
@@ -368,6 +368,21 @@ pub async fn ensure_document_loaded(
     if state.get_document(uri).is_some() {
         tracing::debug!("Document already loaded: {:?}", uri);
         return true;
+    }
+
+    // Clone cold start config before async operations to release lock
+    let cold_start_config = { config.read().await.cold_start.clone() };
+
+    // Check if cold start is enabled
+    if !cold_start_config.enabled {
+        tracing::debug!("Cold start disabled via configuration");
+        return false;
+    }
+
+    // Rate limiting check
+    if !state.cold_start_limiter.allow_cold_start(uri) {
+        tracing::warn!("Cold start rate limited: {:?}", uri);
+        return false;
     }
 
     // Check if we support this file type

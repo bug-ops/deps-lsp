@@ -241,6 +241,20 @@ impl LanguageServer for Backend {
                 )
                 .await;
         }
+
+        // Spawn background cleanup task for cold start rate limiter
+        let state_clone = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                // Clean up entries older than 5 minutes
+                state_clone
+                    .cold_start_limiter
+                    .cleanup_old_entries(std::time::Duration::from_secs(300));
+                tracing::trace!("Cleaned up old cold start rate limit entries");
+            }
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
