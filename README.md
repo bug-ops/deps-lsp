@@ -14,11 +14,12 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 
 - **Intelligent Autocomplete** — Package names, versions, and feature flags
 - **Version Hints** — Inlay hints showing latest available versions
+- **Loading Indicators** — Visual feedback during registry fetches with LSP progress support
 - **Lock File Support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
 - **Hover Information** — Package descriptions with resolved version from lock file
 - **Code Actions** — Quick fixes to update dependencies
-- **High Performance** — Parallel fetching, optimized caching, minimal latency
+- **High Performance** — Parallel fetching with per-dependency timeouts, optimized caching
 
 ![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
 
@@ -150,7 +151,15 @@ Configure via LSP initialization options:
     "yanked_severity": "warning"
   },
   "cache": {
-    "refresh_interval_secs": 300
+    "enabled": true,
+    "refresh_interval_secs": 300,
+    "fetch_timeout_secs": 5,
+    "max_concurrent_fetches": 20
+  },
+  "loading_indicator": {
+    "enabled": true,
+    "fallback_to_hints": true,
+    "loading_text": "⏳"
   },
   "cold_start": {
     "enabled": true,
@@ -158,6 +167,19 @@ Configure via LSP initialization options:
   }
 }
 ```
+
+### Configuration Reference
+
+| Section | Option | Default | Description |
+|---------|--------|---------|-------------|
+| `cache` | `fetch_timeout_secs` | `5` | Per-package fetch timeout (1-300 seconds) |
+| `cache` | `max_concurrent_fetches` | `20` | Concurrent registry requests (1-100) |
+| `loading_indicator` | `enabled` | `true` | Show loading feedback during fetches |
+| `loading_indicator` | `fallback_to_hints` | `true` | Show loading in inlay hints if LSP progress unsupported |
+| `loading_indicator` | `loading_text` | `"⏳"` | Text shown during loading (max 100 chars) |
+
+> [!TIP]
+> Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others.
 
 > [!NOTE]
 > Cold start support ensures LSP features work immediately when your IDE restores previously opened files.
