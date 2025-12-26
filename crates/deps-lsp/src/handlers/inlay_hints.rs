@@ -3,10 +3,12 @@
 //! This handler uses the ecosystem registry to delegate inlay hint generation
 //! to the appropriate ecosystem implementation.
 
-use crate::config::InlayHintsConfig;
-use crate::document::ServerState;
+use crate::config::{DepsConfig, InlayHintsConfig};
+use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemConfig;
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{InlayHint, InlayHintParams};
 
 /// Handles inlay hint requests using trait-based delegation.
@@ -17,6 +19,8 @@ pub async fn handle_inlay_hints(
     state: Arc<ServerState>,
     params: InlayHintParams,
     config: &InlayHintsConfig,
+    client: Client,
+    full_config: Arc<RwLock<DepsConfig>>,
 ) -> Vec<InlayHint> {
     if !config.enabled {
         return vec![];
@@ -24,30 +28,25 @@ pub async fn handle_inlay_hints(
 
     let uri = &params.text_document.uri;
 
-    let (ecosystem_id, cached_versions, resolved_versions) = {
-        let doc = match state.get_document(uri) {
-            Some(d) => d,
-            None => {
-                tracing::warn!("Document not found: {:?}", uri);
-                return vec![];
-            }
-        };
-        (
-            doc.ecosystem_id,
-            doc.cached_versions.clone(),
-            doc.resolved_versions.clone(),
-        )
-    };
+    // Ensure document is loaded (cold start support)
+    if !ensure_document_loaded(uri, Arc::clone(&state), client, full_config).await {
+        tracing::warn!("Could not load document for inlay hints: {:?}", uri);
+        return vec![];
+    }
 
+    // Single document lookup: extract all needed data at once
     let doc = match state.get_document(uri) {
         Some(d) => d,
-        None => return vec![],
+        None => {
+            tracing::warn!("Document not found: {:?}", uri);
+            return vec![];
+        }
     };
 
-    let ecosystem = match state.ecosystem_registry.get(ecosystem_id) {
+    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id) {
         Some(e) => e,
         None => {
-            tracing::warn!("Ecosystem not found: {}", ecosystem_id);
+            tracing::warn!("Ecosystem not found: {}", doc.ecosystem_id);
             return vec![];
         }
     };
@@ -63,22 +62,22 @@ pub async fn handle_inlay_hints(
         needs_update_text: config.needs_update_text.clone(),
     };
 
-    let hints = ecosystem
+    // Generate hints while holding the lock
+    ecosystem
         .generate_inlay_hints(
             parse_result,
-            &cached_versions,
-            &resolved_versions,
+            &doc.cached_versions,
+            &doc.resolved_versions,
             &ecosystem_config,
         )
-        .await;
-    drop(doc);
-    hints
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::document::{DocumentState, Ecosystem, ServerState};
+    use crate::test_utils::test_helpers::create_test_client_and_config;
     use tower_lsp_server::ls_types::{TextDocumentIdentifier, Uri};
 
     #[test]
@@ -111,7 +110,8 @@ mod tests {
             ),
         };
 
-        let result = handle_inlay_hints(state, params, &config).await;
+        let (client, full_config) = create_test_client_and_config();
+        let result = handle_inlay_hints(state, params, &config, client, full_config).await;
         assert!(result.is_empty());
     }
 
@@ -134,7 +134,8 @@ mod tests {
             ),
         };
 
-        let result = handle_inlay_hints(state, params, &config).await;
+        let (client, full_config) = create_test_client_and_config();
+        let result = handle_inlay_hints(state, params, &config, client, full_config).await;
         assert!(result.is_empty());
     }
 
@@ -171,8 +172,9 @@ serde = "1.0.0"
             ),
         };
 
-        let result = handle_inlay_hints(state, params, &config).await;
-        assert!(result.is_empty() || !result.is_empty());
+        let (client, full_config) = create_test_client_and_config();
+        let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -205,8 +207,9 @@ serde = "1.0.0"
             ),
         };
 
-        let result = handle_inlay_hints(state, params, &config).await;
-        assert!(result.is_empty() || !result.is_empty());
+        let (client, full_config) = create_test_client_and_config();
+        let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -242,8 +245,9 @@ dependencies = ["requests>=2.0.0"]
             ),
         };
 
-        let result = handle_inlay_hints(state, params, &config).await;
-        assert!(result.is_empty() || !result.is_empty());
+        let (client, full_config) = create_test_client_and_config();
+        let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -268,7 +272,8 @@ dependencies = ["requests>=2.0.0"]
             ),
         };
 
-        let result = handle_inlay_hints(state, params, &config).await;
+        let (client, full_config) = create_test_client_and_config();
+        let result = handle_inlay_hints(state, params, &config, client, full_config).await;
         assert!(result.is_empty());
     }
 
@@ -305,7 +310,8 @@ serde = "1.0.0"
             ),
         };
 
-        let result = handle_inlay_hints(state, params, &config).await;
-        assert!(result.is_empty() || !result.is_empty());
+        let (client, full_config) = create_test_client_and_config();
+        let _result = handle_inlay_hints(state, params, &config, client, full_config).await;
+        // Test passes if no panic occurs
     }
 }

@@ -2,8 +2,11 @@
 //!
 //! Delegates to ecosystem-specific completion logic.
 
-use crate::document::ServerState;
+use crate::config::DepsConfig;
+use crate::document::{ServerState, ensure_document_loaded};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, InsertTextFormat,
 };
@@ -15,6 +18,8 @@ use tower_lsp_server::ls_types::{
 pub async fn handle_completion(
     state: Arc<ServerState>,
     params: CompletionParams,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
 ) -> Option<CompletionResponse> {
     let uri = &params.text_document_position.text_document.uri;
     let position = params.text_document_position.position;
@@ -25,6 +30,31 @@ pub async fn handle_completion(
         position.line,
         position.character
     );
+
+    // Check if document is loaded, if not try to load with short timeout
+    // Completion is latency-critical, so we use a 200ms timeout
+    if state.get_document(uri).is_none() {
+        tracing::info!("completion: document not loaded, loading from disk");
+
+        // Try to load with short timeout (200ms)
+        let load_result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            ensure_document_loaded(uri, Arc::clone(&state), client.clone(), Arc::clone(&config)),
+        )
+        .await;
+
+        match load_result {
+            Ok(true) => {
+                // Document loaded successfully, continue with completion
+                tracing::debug!("completion: document loaded successfully");
+            }
+            Ok(false) | Err(_) => {
+                // Load failed or timed out, return empty completions
+                tracing::warn!("completion: document load failed or timed out");
+                return Some(CompletionResponse::Array(vec![]));
+            }
+        }
+    }
 
     // Get document and extract needed data
     let doc = match state.get_document(uri) {
@@ -293,12 +323,13 @@ fn create_package_completion_item(
 mod tests {
     use super::*;
     use crate::document::DocumentState;
+    use crate::test_utils::test_helpers::create_test_client_and_config;
     use tower_lsp_server::ls_types::{
         Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
     };
 
     #[tokio::test]
-    async fn test_completion_returns_none_for_missing_document() {
+    async fn test_completion_returns_empty_for_missing_document() {
         let state = Arc::new(ServerState::new());
         let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
@@ -312,8 +343,11 @@ mod tests {
             context: None,
         };
 
-        let result = handle_completion(state, params).await;
-        assert!(result.is_none());
+        let (client, config) = create_test_client_and_config();
+        let result = handle_completion(state, params, client, config).await;
+        // With cold start support, missing documents trigger background load
+        // and return empty completions for the first request
+        assert!(matches!(result, Some(CompletionResponse::Array(items)) if items.is_empty()));
     }
 
     #[tokio::test]
@@ -342,7 +376,8 @@ mod tests {
 
         // Should return Some or None based on ecosystem implementation
         // We don't test the actual completions here as that's ecosystem-specific
-        let _result = handle_completion(state, params).await;
+        let (client, config) = create_test_client_and_config();
+        let _result = handle_completion(state, params, client, config).await;
         // Just verify it doesn't panic - actual completion logic is in ecosystem
     }
 
@@ -661,7 +696,8 @@ ser"#
         };
 
         // Should use fallback completion (won't panic, may return empty if search fails)
-        let result = handle_completion(state, params).await;
+        let (client, config) = create_test_client_and_config();
+        let result = handle_completion(state, params, client, config).await;
         // Just verify it doesn't panic - actual results depend on registry availability
         // In a real scenario with mocked registry, we'd verify it returns search results
         drop(result);

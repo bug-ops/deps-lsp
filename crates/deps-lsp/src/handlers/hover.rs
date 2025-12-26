@@ -1,38 +1,49 @@
 //! Hover handler using ecosystem trait delegation.
 
-use crate::document::ServerState;
+use crate::config::DepsConfig;
+use crate::document::{ServerState, ensure_document_loaded};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{Hover, HoverParams};
 
 /// Handles hover requests using trait-based delegation.
-pub async fn handle_hover(state: Arc<ServerState>, params: HoverParams) -> Option<Hover> {
+pub async fn handle_hover(
+    state: Arc<ServerState>,
+    params: HoverParams,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
+) -> Option<Hover> {
     let uri = &params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
 
-    let (ecosystem_id, cached_versions, resolved_versions) = {
-        let doc = state.get_document(uri)?;
-        (
-            doc.ecosystem_id,
-            doc.cached_versions.clone(),
-            doc.resolved_versions.clone(),
-        )
-    };
+    // Ensure document is loaded (cold start support)
+    if !ensure_document_loaded(uri, Arc::clone(&state), client, config).await {
+        tracing::warn!("Could not load document for hover: {:?}", uri);
+        return None;
+    }
 
+    // Single document lookup: extract all needed data at once
     let doc = state.get_document(uri)?;
-    let ecosystem = state.ecosystem_registry.get(ecosystem_id)?;
+    let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id)?;
     let parse_result = doc.parse_result()?;
 
-    let hover = ecosystem
-        .generate_hover(parse_result, position, &cached_versions, &resolved_versions)
-        .await;
-    drop(doc);
-    hover
+    // Generate hover while holding the lock
+    ecosystem
+        .generate_hover(
+            parse_result,
+            position,
+            &doc.cached_versions,
+            &doc.resolved_versions,
+        )
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::document::{DocumentState, Ecosystem, ServerState};
+    use crate::test_utils::test_helpers::create_test_client_and_config;
     use tower_lsp_server::ls_types::{
         Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
     };
@@ -41,6 +52,7 @@ mod tests {
     async fn test_handle_hover_missing_document() {
         let state = Arc::new(ServerState::new());
         let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let (client, config) = create_test_client_and_config();
 
         let params = HoverParams {
             text_document_position_params: TextDocumentPositionParams {
@@ -50,7 +62,7 @@ mod tests {
             work_done_progress_params: Default::default(),
         };
 
-        let result = handle_hover(state, params).await;
+        let result = handle_hover(state, params, client, config).await;
         assert!(result.is_none());
     }
 
@@ -81,8 +93,9 @@ serde = "1.0.0"
             work_done_progress_params: Default::default(),
         };
 
-        let result = handle_hover(state, params).await;
-        assert!(result.is_some() || result.is_none());
+        let (client, config) = create_test_client_and_config();
+        let _result = handle_hover(state, params, client, config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -109,8 +122,9 @@ serde = "1.0.0"
             work_done_progress_params: Default::default(),
         };
 
-        let result = handle_hover(state, params).await;
-        assert!(result.is_some() || result.is_none());
+        let (client, config) = create_test_client_and_config();
+        let _result = handle_hover(state, params, client, config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -129,7 +143,8 @@ serde = "1.0.0"
             work_done_progress_params: Default::default(),
         };
 
-        let result = handle_hover(state, params).await;
+        let (client, config) = create_test_client_and_config();
+        let result = handle_hover(state, params, client, config).await;
         assert!(result.is_none());
     }
 }

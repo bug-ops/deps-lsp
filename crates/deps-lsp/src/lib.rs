@@ -4,6 +4,9 @@ pub mod file_watcher;
 pub mod handlers;
 pub mod server;
 
+#[cfg(test)]
+mod test_utils;
+
 // Re-export from deps-core
 pub use deps_core::{DepsError, Result};
 

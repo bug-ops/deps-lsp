@@ -1,8 +1,10 @@
 //! Diagnostics handler using ecosystem trait delegation.
 
-use crate::config::DiagnosticsConfig;
-use crate::document::ServerState;
+use crate::config::{DepsConfig, DiagnosticsConfig};
+use crate::document::{ServerState, ensure_document_loaded};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{Diagnostic, Uri};
 
 /// Handles diagnostic requests using trait-based delegation.
@@ -10,27 +12,38 @@ pub async fn handle_diagnostics(
     state: Arc<ServerState>,
     uri: &Uri,
     _config: &DiagnosticsConfig,
+    client: Client,
+    full_config: Arc<RwLock<DepsConfig>>,
 ) -> Vec<Diagnostic> {
-    let (ecosystem_id, cached_versions) = {
-        let doc = match state.get_document(uri) {
-            Some(d) => d,
-            None => {
-                tracing::warn!("Document not found for diagnostics: {:?}", uri);
-                return vec![];
-            }
-        };
-        (doc.ecosystem_id, doc.cached_versions.clone())
-    };
+    // Ensure document is loaded (cold start support)
+    if !ensure_document_loaded(uri, Arc::clone(&state), client, full_config).await {
+        tracing::warn!("Could not load document for diagnostics: {:?}", uri);
+        return vec![];
+    }
 
+    generate_diagnostics_internal(state, uri).await
+}
+
+/// Internal diagnostic generation without cold start support.
+///
+/// This is used when we know the document is already loaded (e.g., from background tasks).
+pub(crate) async fn generate_diagnostics_internal(
+    state: Arc<ServerState>,
+    uri: &Uri,
+) -> Vec<Diagnostic> {
+    // Single document lookup: extract all needed data at once
     let doc = match state.get_document(uri) {
         Some(d) => d,
-        None => return vec![],
+        None => {
+            tracing::warn!("Document not found for diagnostics: {:?}", uri);
+            return vec![];
+        }
     };
 
-    let ecosystem = match state.ecosystem_registry.get(ecosystem_id) {
+    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id) {
         Some(e) => e,
         None => {
-            tracing::warn!("Ecosystem not found for diagnostics: {}", ecosystem_id);
+            tracing::warn!("Ecosystem not found for diagnostics: {}", doc.ecosystem_id);
             return vec![];
         }
     };
@@ -40,17 +53,18 @@ pub async fn handle_diagnostics(
         None => return vec![],
     };
 
-    let diags = ecosystem
-        .generate_diagnostics(parse_result, &cached_versions, uri)
-        .await;
-    drop(doc);
-    diags
+    // Generate diagnostics while holding the lock
+    ecosystem
+        .generate_diagnostics(parse_result, &doc.cached_versions, uri)
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DiagnosticsConfig;
     use crate::document::{DocumentState, Ecosystem, ServerState};
+    use crate::test_utils::test_helpers::create_test_client_and_config;
 
     #[tokio::test]
     async fn test_handle_diagnostics_missing_document() {
@@ -58,7 +72,8 @@ mod tests {
         let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
         let config = DiagnosticsConfig::default();
 
-        let result = handle_diagnostics(state, &uri, &config).await;
+        let (client, full_config) = create_test_client_and_config();
+        let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
         assert!(result.is_empty());
     }
 
@@ -82,8 +97,9 @@ serde = "1.0.0"
         let doc_state = DocumentState::new_from_parse_result("cargo", content, parse_result);
         state.update_document(uri.clone(), doc_state);
 
-        let result = handle_diagnostics(state, &uri, &config).await;
-        assert!(result.is_empty() || !result.is_empty());
+        let (client, full_config) = create_test_client_and_config();
+        let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -103,8 +119,9 @@ serde = "1.0.0"
         let doc_state = DocumentState::new_from_parse_result("npm", content, parse_result);
         state.update_document(uri.clone(), doc_state);
 
-        let result = handle_diagnostics(state, &uri, &config).await;
-        assert!(result.is_empty() || !result.is_empty());
+        let (client, full_config) = create_test_client_and_config();
+        let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -127,8 +144,9 @@ dependencies = ["requests>=2.0.0"]
         let doc_state = DocumentState::new_from_parse_result("pypi", content, parse_result);
         state.update_document(uri.clone(), doc_state);
 
-        let result = handle_diagnostics(state, &uri, &config).await;
-        assert!(result.is_empty() || !result.is_empty());
+        let (client, full_config) = create_test_client_and_config();
+        let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -140,7 +158,8 @@ dependencies = ["requests>=2.0.0"]
         let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
         state.update_document(uri.clone(), doc_state);
 
-        let result = handle_diagnostics(state, &uri, &config).await;
+        let (client, full_config) = create_test_client_and_config();
+        let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
         assert!(result.is_empty());
     }
 }

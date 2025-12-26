@@ -25,7 +25,7 @@ mod commands {
 }
 
 pub struct Backend {
-    client: Client,
+    pub(crate) client: Client,
     state: Arc<ServerState>,
     config: Arc<RwLock<DepsConfig>>,
 }
@@ -157,9 +157,14 @@ impl Backend {
                 doc.update_cached_versions(resolved_versions.clone());
             }
 
-            let items =
-                diagnostics::handle_diagnostics(Arc::clone(&self.state), &uri, &config.diagnostics)
-                    .await;
+            let items = diagnostics::handle_diagnostics(
+                Arc::clone(&self.state),
+                &uri,
+                &config.diagnostics,
+                self.client.clone(),
+                Arc::clone(&self.config),
+            )
+            .await;
 
             self.client.publish_diagnostics(uri, items, None).await;
         }
@@ -312,18 +317,38 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        Ok(hover::handle_hover(Arc::clone(&self.state), params).await)
+        Ok(hover::handle_hover(
+            Arc::clone(&self.state),
+            params,
+            self.client.clone(),
+            Arc::clone(&self.config),
+        )
+        .await)
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        Ok(completion::handle_completion(Arc::clone(&self.state), params).await)
+        Ok(completion::handle_completion(
+            Arc::clone(&self.state),
+            params,
+            self.client.clone(),
+            Arc::clone(&self.config),
+        )
+        .await)
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-        let config = self.config.read().await;
+        // Clone config before async call to release lock early
+        let inlay_config = { self.config.read().await.inlay_hints.clone() };
+
         Ok(Some(
-            inlay_hints::handle_inlay_hints(Arc::clone(&self.state), params, &config.inlay_hints)
-                .await,
+            inlay_hints::handle_inlay_hints(
+                Arc::clone(&self.state),
+                params,
+                &inlay_config,
+                self.client.clone(),
+                Arc::clone(&self.config),
+            )
+            .await,
         ))
     }
 
@@ -336,7 +361,13 @@ impl LanguageServer for Backend {
             params.text_document.uri,
             params.range
         );
-        let actions = code_actions::handle_code_actions(Arc::clone(&self.state), params).await;
+        let actions = code_actions::handle_code_actions(
+            Arc::clone(&self.state),
+            params,
+            self.client.clone(),
+            Arc::clone(&self.config),
+        )
+        .await;
         tracing::info!("code_action response: {} actions", actions.len());
         Ok(Some(actions))
     }
@@ -348,11 +379,17 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         tracing::info!("diagnostic request for: {:?}", uri);
 
-        let config = self.config.read().await;
+        // Clone config before async call to release lock early
+        let diagnostics_config = { self.config.read().await.diagnostics.clone() };
 
-        let items =
-            diagnostics::handle_diagnostics(Arc::clone(&self.state), &uri, &config.diagnostics)
-                .await;
+        let items = diagnostics::handle_diagnostics(
+            Arc::clone(&self.state),
+            &uri,
+            &diagnostics_config,
+            self.client.clone(),
+            Arc::clone(&self.config),
+        )
+        .await;
 
         tracing::info!("returning {} diagnostics", items.len());
 

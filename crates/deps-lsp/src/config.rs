@@ -56,7 +56,7 @@ pub struct DepsConfig {
 ///
 /// assert_eq!(config.up_to_date_text, "OK");
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct InlayHintsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -101,7 +101,7 @@ impl Default for InlayHintsConfig {
 ///
 /// assert_eq!(config.unknown_severity, DiagnosticSeverity::ERROR);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DiagnosticsConfig {
     #[serde(default = "default_outdated_severity")]
     pub outdated_severity: DiagnosticSeverity,

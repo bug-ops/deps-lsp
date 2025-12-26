@@ -65,7 +65,7 @@ pub async fn handle_document_open(
     content: String,
     state: Arc<ServerState>,
     client: Client,
-    config: Arc<RwLock<DepsConfig>>,
+    _config: Arc<RwLock<DepsConfig>>,
 ) -> Result<JoinHandle<()>> {
     // Find appropriate ecosystem for this URI
     let ecosystem = match state.ecosystem_registry.get_for_uri(&uri) {
@@ -102,7 +102,6 @@ pub async fn handle_document_open(
     let uri_clone = uri.clone();
     let state_clone = Arc::clone(&state);
     let ecosystem_clone = Arc::clone(&ecosystem);
-    let config_clone = Arc::clone(&config);
     let client_clone = client.clone();
 
     let task = tokio::spawn(async move {
@@ -145,14 +144,9 @@ pub async fn handle_document_open(
             doc.update_cached_versions(cached_versions);
         }
 
-        // Publish diagnostics
-        let config_read = config_clone.read().await;
-        let diags = diagnostics::handle_diagnostics(
-            Arc::clone(&state_clone),
-            &uri_clone,
-            &config_read.diagnostics,
-        )
-        .await;
+        // Publish diagnostics (using internal version to avoid recursive cold start)
+        let diags =
+            diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone).await;
 
         client_clone
             .publish_diagnostics(uri_clone.clone(), diags, None)
@@ -176,7 +170,7 @@ pub async fn handle_document_change(
     content: String,
     state: Arc<ServerState>,
     client: Client,
-    config: Arc<RwLock<DepsConfig>>,
+    _config: Arc<RwLock<DepsConfig>>,
 ) -> Result<JoinHandle<()>> {
     // Find appropriate ecosystem for this URI
     let ecosystem = match state.ecosystem_registry.get_for_uri(&uri) {
@@ -207,7 +201,6 @@ pub async fn handle_document_change(
     let uri_clone = uri.clone();
     let state_clone = Arc::clone(&state);
     let ecosystem_clone = Arc::clone(&ecosystem);
-    let config_clone = Arc::clone(&config);
     let client_clone = client.clone();
 
     let task = tokio::spawn(async move {
@@ -253,14 +246,9 @@ pub async fn handle_document_change(
             doc.update_cached_versions(cached_versions);
         }
 
-        // Publish diagnostics
-        let config_read = config_clone.read().await;
-        let diags = diagnostics::handle_diagnostics(
-            Arc::clone(&state_clone),
-            &uri_clone,
-            &config_read.diagnostics,
-        )
-        .await;
+        // Publish diagnostics (using internal version to avoid recursive cold start)
+        let diags =
+            diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone).await;
 
         client_clone
             .publish_diagnostics(uri_clone.clone(), diags, None)

@@ -1,31 +1,35 @@
 //! Code actions handler using ecosystem trait delegation.
 
-use crate::document::ServerState;
+use crate::config::DepsConfig;
+use crate::document::{ServerState, ensure_document_loaded};
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{CodeActionOrCommand, CodeActionParams};
 
 /// Handles code action requests using trait-based delegation.
 pub async fn handle_code_actions(
     state: Arc<ServerState>,
     params: CodeActionParams,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
 ) -> Vec<CodeActionOrCommand> {
     let uri = &params.text_document.uri;
     let position = params.range.start;
 
-    let (ecosystem_id, cached_versions) = {
-        let doc = match state.get_document(uri) {
-            Some(d) => d,
-            None => return vec![],
-        };
-        (doc.ecosystem_id, doc.cached_versions.clone())
-    };
+    // Ensure document is loaded (cold start support)
+    if !ensure_document_loaded(uri, Arc::clone(&state), client, config).await {
+        tracing::warn!("Could not load document for code actions: {:?}", uri);
+        return vec![];
+    }
 
+    // Single document lookup: extract all needed data at once
     let doc = match state.get_document(uri) {
         Some(d) => d,
         None => return vec![],
     };
 
-    let ecosystem = match state.ecosystem_registry.get(ecosystem_id) {
+    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id) {
         Some(e) => e,
         None => return vec![],
     };
@@ -35,10 +39,10 @@ pub async fn handle_code_actions(
         None => return vec![],
     };
 
+    // Generate code actions while holding the lock
     let actions = ecosystem
-        .generate_code_actions(parse_result, position, &cached_versions, uri)
+        .generate_code_actions(parse_result, position, &doc.cached_versions, uri)
         .await;
-    drop(doc);
 
     actions
         .into_iter()
@@ -50,6 +54,7 @@ pub async fn handle_code_actions(
 mod tests {
     use super::*;
     use crate::document::{DocumentState, ServerState};
+    use crate::test_utils::test_helpers::create_test_client_and_config;
     use tower_lsp_server::ls_types::{Position, Range, TextDocumentIdentifier, Uri};
 
     #[tokio::test]
@@ -65,7 +70,8 @@ mod tests {
             partial_result_params: Default::default(),
         };
 
-        let result = handle_code_actions(state, params).await;
+        let (client, config) = create_test_client_and_config();
+        let result = handle_code_actions(state, params, client, config).await;
         assert!(result.is_empty());
     }
 
@@ -96,8 +102,9 @@ serde = "1.0.0"
             partial_result_params: Default::default(),
         };
 
-        let result = handle_code_actions(state, params).await;
-        assert!(result.is_empty() || !result.is_empty());
+        let (client, config) = create_test_client_and_config();
+        let _result = handle_code_actions(state, params, client, config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -124,8 +131,9 @@ serde = "1.0.0"
             partial_result_params: Default::default(),
         };
 
-        let result = handle_code_actions(state, params).await;
-        assert!(result.is_empty() || !result.is_empty());
+        let (client, config) = create_test_client_and_config();
+        let _result = handle_code_actions(state, params, client, config).await;
+        // Test passes if no panic occurs
     }
 
     #[tokio::test]
@@ -146,7 +154,8 @@ serde = "1.0.0"
             partial_result_params: Default::default(),
         };
 
-        let result = handle_code_actions(state, params).await;
+        let (client, config) = create_test_client_and_config();
+        let result = handle_code_actions(state, params, client, config).await;
         assert!(result.is_empty());
     }
 }
