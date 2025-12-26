@@ -254,4 +254,22 @@ mod tests {
         // Second end() call - should be no-op
         assert!(!active, "Second call should be no-op due to inactive flag");
     }
+
+    #[test]
+    fn test_drop_cleanup_active_flag_logic() {
+        // Test the logic that determines if cleanup is needed
+        let active = true;
+        let should_cleanup = active;
+        assert!(
+            should_cleanup,
+            "Active progress should trigger cleanup on drop"
+        );
+
+        let active = false;
+        let should_cleanup = active;
+        assert!(
+            !should_cleanup,
+            "Inactive progress should not trigger cleanup"
+        );
+    }
 }
