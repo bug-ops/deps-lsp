@@ -414,6 +414,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-test",
  "tower-lsp-server",
  "tracing",
 ]
@@ -426,6 +427,7 @@ dependencies = [
  "dashmap",
  "deps-cargo",
  "deps-core",
+ "deps-go",
  "deps-npm",
  "deps-pypi",
  "futures",

@@ -24,3 +24,4 @@ semver.workspace = true
 [dev-dependencies]
 insta.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
+tokio-test.workspace = true

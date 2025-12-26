@@ -28,14 +28,18 @@
 //! assert_eq!(result.dependencies.len(), 1);
 //! ```
 
+pub mod ecosystem;
 pub mod error;
+pub mod formatter;
 pub mod parser;
 pub mod registry;
 pub mod types;
 pub mod version;
 
 // Re-export commonly used types
+pub use ecosystem::GoEcosystem;
 pub use error::{GoError, Result};
+pub use formatter::GoFormatter;
 pub use parser::{GoParseResult, parse_go_mod};
 pub use registry::{GoRegistry, package_url};
 pub use types::{GoDependency, GoDirective, GoMetadata, GoVersion};

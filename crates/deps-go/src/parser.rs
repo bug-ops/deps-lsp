@@ -68,7 +68,7 @@ pub fn parse_go_mod(content: &str, doc_uri: &Uri) -> Result<GoParseResult> {
     tracing::debug!(uri = ?doc_uri, "Parsing go.mod file");
 
     let line_table = LineOffsetTable::new(content);
-    let mut dependencies = Vec::new();
+    let mut dependencies = Vec::with_capacity(50);
     let mut module_path = None;
     let mut go_version = None;
 

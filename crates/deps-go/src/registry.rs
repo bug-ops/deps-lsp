@@ -604,7 +604,10 @@ mod tests {
     fn test_validate_version_string_empty() {
         let result = validate_version_string("");
         assert!(result.is_err());
-        assert!(matches!(result, Err(GoError::InvalidVersionSpecifier { .. })));
+        assert!(matches!(
+            result,
+            Err(GoError::InvalidVersionSpecifier { .. })
+        ));
     }
 
     #[test]
@@ -612,14 +615,20 @@ mod tests {
         let long_version = "v".to_string() + &"1".repeat(MAX_VERSION_LENGTH);
         let result = validate_version_string(&long_version);
         assert!(result.is_err());
-        assert!(matches!(result, Err(GoError::InvalidVersionSpecifier { .. })));
+        assert!(matches!(
+            result,
+            Err(GoError::InvalidVersionSpecifier { .. })
+        ));
     }
 
     #[test]
     fn test_validate_version_string_path_traversal() {
         let result = validate_version_string("v1.0.0/../etc/passwd");
         assert!(result.is_err());
-        assert!(matches!(result, Err(GoError::InvalidVersionSpecifier { .. })));
+        assert!(matches!(
+            result,
+            Err(GoError::InvalidVersionSpecifier { .. })
+        ));
     }
 
     #[test]

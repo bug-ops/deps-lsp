@@ -3,6 +3,7 @@ use deps_cargo::{CargoVersion, ParsedDependency};
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
 use deps_core::{EcosystemRegistry, ParseResult};
+use deps_go::{GoDependency, GoVersion};
 use deps_npm::{NpmDependency, NpmVersion};
 use deps_pypi::{PypiDependency, PypiVersion};
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ pub enum UnifiedDependency {
     Cargo(ParsedDependency),
     Npm(NpmDependency),
     Pypi(PypiDependency),
+    Go(GoDependency),
 }
 
 impl UnifiedDependency {
@@ -30,6 +32,7 @@ impl UnifiedDependency {
             UnifiedDependency::Cargo(dep) => &dep.name,
             UnifiedDependency::Npm(dep) => &dep.name,
             UnifiedDependency::Pypi(dep) => &dep.name,
+            UnifiedDependency::Go(dep) => &dep.module_path,
         }
     }
 
@@ -39,6 +42,7 @@ impl UnifiedDependency {
             UnifiedDependency::Cargo(dep) => dep.name_range,
             UnifiedDependency::Npm(dep) => dep.name_range,
             UnifiedDependency::Pypi(dep) => dep.name_range,
+            UnifiedDependency::Go(dep) => dep.module_path_range,
         }
     }
 
@@ -48,6 +52,7 @@ impl UnifiedDependency {
             UnifiedDependency::Cargo(dep) => dep.version_req.as_deref(),
             UnifiedDependency::Npm(dep) => dep.version_req.as_deref(),
             UnifiedDependency::Pypi(dep) => dep.version_req.as_deref(),
+            UnifiedDependency::Go(dep) => dep.version.as_deref(),
         }
     }
 
@@ -57,6 +62,7 @@ impl UnifiedDependency {
             UnifiedDependency::Cargo(dep) => dep.version_range,
             UnifiedDependency::Npm(dep) => dep.version_range,
             UnifiedDependency::Pypi(dep) => dep.version_range,
+            UnifiedDependency::Go(dep) => dep.version_range,
         }
     }
 
@@ -70,6 +76,7 @@ impl UnifiedDependency {
             UnifiedDependency::Pypi(dep) => {
                 matches!(dep.source, deps_pypi::PypiDependencySource::PyPI)
             }
+            UnifiedDependency::Go(_) => true,
         }
     }
 }
@@ -83,6 +90,7 @@ pub enum UnifiedVersion {
     Cargo(CargoVersion),
     Npm(NpmVersion),
     Pypi(PypiVersion),
+    Go(GoVersion),
 }
 
 impl UnifiedVersion {
@@ -92,6 +100,7 @@ impl UnifiedVersion {
             UnifiedVersion::Cargo(v) => &v.num,
             UnifiedVersion::Npm(v) => &v.version,
             UnifiedVersion::Pypi(v) => &v.version,
+            UnifiedVersion::Go(v) => &v.version,
         }
     }
 
@@ -101,6 +110,7 @@ impl UnifiedVersion {
             UnifiedVersion::Cargo(v) => v.yanked,
             UnifiedVersion::Npm(v) => v.deprecated,
             UnifiedVersion::Pypi(v) => v.yanked,
+            UnifiedVersion::Go(v) => v.retracted,
         }
     }
 }
@@ -150,6 +160,8 @@ pub enum Ecosystem {
     Npm,
     /// Python PyPI ecosystem (pyproject.toml)
     Pypi,
+    /// Go modules ecosystem (go.mod)
+    Go,
 }
 
 impl Ecosystem {
@@ -162,6 +174,7 @@ impl Ecosystem {
             "Cargo.toml" => Some(Self::Cargo),
             "package.json" => Some(Self::Npm),
             "pyproject.toml" => Some(Self::Pypi),
+            "go.mod" => Some(Self::Go),
             _ => None,
         }
     }
@@ -363,6 +376,7 @@ impl DocumentState {
             Ecosystem::Cargo => "cargo",
             Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "pypi",
+            Ecosystem::Go => "go",
         };
 
         Self {
@@ -390,6 +404,7 @@ impl DocumentState {
             "cargo" => Ecosystem::Cargo,
             "npm" => Ecosystem::Npm,
             "pypi" => Ecosystem::Pypi,
+            "go" => Ecosystem::Go,
             _ => Ecosystem::Cargo, // Default fallback
         };
 
@@ -415,6 +430,7 @@ impl DocumentState {
             "cargo" => Ecosystem::Cargo,
             "npm" => Ecosystem::Npm,
             "pypi" => Ecosystem::Pypi,
+            "go" => Ecosystem::Go,
             _ => Ecosystem::Cargo, // Default fallback
         };
 
@@ -501,6 +517,10 @@ impl ServerState {
         // Register PyPI ecosystem
         let pypi_ecosystem = Arc::new(deps_pypi::PypiEcosystem::new(Arc::clone(&cache)));
         ecosystem_registry.register(pypi_ecosystem);
+
+        // Register Go ecosystem
+        let go_ecosystem = Arc::new(deps_go::GoEcosystem::new(Arc::clone(&cache)));
+        ecosystem_registry.register(go_ecosystem);
 
         // Create cold start limiter with default 100ms interval (10 req/sec per URI)
         let cold_start_limiter = ColdStartLimiter::new(Duration::from_millis(100));
