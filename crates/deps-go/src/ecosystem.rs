@@ -149,8 +149,7 @@ impl Ecosystem for GoEcosystem {
     }
 
     fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
-        // TODO: Implement go.sum parser in Phase 4
-        None
+        Some(Arc::new(crate::lockfile::GoSumParser))
     }
 
     async fn generate_inlay_hints(
@@ -766,11 +765,11 @@ require github.com/gin-gonic/gin v1.9.1
     }
 
     #[test]
-    fn test_lockfile_provider_none() {
+    fn test_lockfile_provider_exists() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        assert!(ecosystem.lockfile_provider().is_none());
+        assert!(ecosystem.lockfile_provider().is_some());
     }
 
     #[test]
