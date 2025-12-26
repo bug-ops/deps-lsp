@@ -11,7 +11,7 @@ use crate::progress::RegistryProgress;
 use deps_core::Ecosystem;
 use deps_core::Registry;
 use deps_core::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -32,6 +32,28 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     new_state
         .resolved_versions
         .clone_from(&old_state.resolved_versions);
+}
+
+/// Diff between old and new dependency sets.
+#[derive(Debug, Clone, Default)]
+struct DependencyDiff {
+    added: Vec<String>,
+    #[allow(dead_code)]
+    removed: Vec<String>,
+}
+
+impl DependencyDiff {
+    fn compute(old_deps: &HashSet<String>, new_deps: &HashSet<String>) -> Self {
+        Self {
+            added: new_deps.difference(old_deps).cloned().collect(),
+            removed: old_deps.difference(new_deps).cloned().collect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn needs_fetch(&self) -> bool {
+        !self.added.is_empty()
+    }
 }
 
 /// Fetches latest versions for multiple packages in parallel with progress reporting.
@@ -280,8 +302,40 @@ pub async fn handle_document_change(
         }
     };
 
+    // Extract old dependency names before parsing (for diff computation)
+    let old_dep_names: HashSet<String> =
+        state.get_document(&uri).map_or_else(HashSet::new, |doc| {
+            doc.parse_result()
+                .map(|pr| {
+                    pr.dependencies()
+                        .into_iter()
+                        .map(|d| d.name().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+
     // Try to parse manifest (may fail for incomplete syntax)
     let parse_result = ecosystem.parse_manifest(&content, &uri).await.ok();
+
+    // Extract new dependency names for diff
+    let new_dep_names: HashSet<String> = parse_result
+        .as_ref()
+        .map(|pr| {
+            pr.dependencies()
+                .into_iter()
+                .map(|d| d.name().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Compute dependency diff
+    let diff = DependencyDiff::compute(&old_dep_names, &new_dep_names);
+    tracing::debug!(
+        added = diff.added.len(),
+        removed = diff.removed.len(),
+        "dependency diff"
+    );
 
     let mut doc_state = if let Some(pr) = parse_result {
         DocumentState::new_from_parse_result(ecosystem.id(), content, pr)
@@ -304,6 +358,7 @@ pub async fn handle_document_change(
     let state_clone = Arc::clone(&state);
     let ecosystem_clone = Arc::clone(&ecosystem);
     let client_clone = client.clone();
+    let deps_to_fetch = diff.added;
 
     let task = tokio::spawn(async move {
         // Small debounce delay
@@ -318,53 +373,69 @@ pub async fn handle_document_change(
             && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
         {
             doc.update_resolved_versions(resolved_versions.clone());
-            // Use resolved versions as cached versions for instant display
-            doc.update_cached_versions(resolved_versions.clone());
+            // Merge resolved versions into cache (preserves existing registry versions)
+            for (name, version) in resolved_versions {
+                doc.cached_versions.insert(name, version);
+            }
         }
 
-        // Collect dependency names while holding reference (can't hold across await)
-        let dep_names: Vec<String> = {
-            let doc = match state_clone.get_document(&uri_clone) {
-                Some(d) => d,
-                None => return,
-            };
-            let parse_result = match doc.parse_result() {
-                Some(p) => p,
-                None => return,
-            };
-            parse_result
-                .dependencies()
-                .into_iter()
-                .map(|d| d.name().to_string())
-                .collect()
-        };
+        // Skip registry fetch if no new dependencies
+        if deps_to_fetch.is_empty() {
+            tracing::debug!("no new dependencies, skipping registry fetch");
+
+            if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
+                doc.set_loaded();
+            }
+
+            if let Err(e) = client_clone.inlay_hint_refresh().await {
+                tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+            }
+
+            let diags =
+                diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone)
+                    .await;
+            client_clone
+                .publish_diagnostics(uri_clone.clone(), diags, None)
+                .await;
+            return;
+        }
+
+        tracing::info!(
+            count = deps_to_fetch.len(),
+            "fetching versions for new dependencies"
+        );
 
         // Mark as loading and start progress
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.set_loading();
         }
 
-        let progress =
-            RegistryProgress::start(client_clone.clone(), uri_clone.as_str(), dep_names.len())
-                .await
-                .ok(); // Ignore errors if client doesn't support progress
+        let progress = RegistryProgress::start(
+            client_clone.clone(),
+            uri_clone.as_str(),
+            deps_to_fetch.len(),
+        )
+        .await
+        .ok();
 
-        // Fetch latest versions from registry in parallel (for update hints)
+        // Fetch latest versions only for NEW dependencies
         let registry = ecosystem_clone.registry();
-        let cached_versions = fetch_latest_versions_parallel(
+        let new_versions = fetch_latest_versions_parallel(
             registry,
-            dep_names,
+            deps_to_fetch,
             progress.as_ref(),
             cache_config.fetch_timeout_secs,
             cache_config.max_concurrent_fetches,
         )
         .await;
 
-        let success = !cached_versions.is_empty();
+        let success = !new_versions.is_empty();
 
-        // Update document state with cached versions (latest from registry)
+        // Merge new versions into existing cache
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
-            doc.update_cached_versions(cached_versions);
+            for (name, version) in new_versions {
+                doc.cached_versions.insert(name, version);
+            }
             if success {
                 doc.set_loaded();
             } else {
@@ -372,18 +443,14 @@ pub async fn handle_document_change(
             }
         }
 
-        // End progress
         if let Some(progress) = progress {
             progress.end(success).await;
         }
 
-        // Refresh inlay hints IMMEDIATELY after loading completes
-        // (before diagnostics which may take longer due to additional network calls)
         if let Err(e) = client_clone.inlay_hint_refresh().await {
             tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
         }
 
-        // Publish diagnostics (may be slower, runs after hints are already visible)
         let diags =
             diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone).await;
 
@@ -1450,6 +1517,62 @@ serde = "1.0"
                 doc.cached_versions.get("serde"),
                 Some(&"1.0.210".to_string())
             );
+        }
+
+        #[test]
+        fn test_dependency_diff_detects_additions() {
+            let old: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+            let new: HashSet<String> = ["serde", "tokio", "anyhow"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+            let diff = DependencyDiff::compute(&old, &new);
+
+            assert_eq!(diff.added.len(), 1);
+            assert!(diff.added.contains(&"anyhow".to_string()));
+            assert!(diff.removed.is_empty());
+            assert!(diff.needs_fetch());
+        }
+
+        #[test]
+        fn test_dependency_diff_detects_removals() {
+            let old: HashSet<String> = ["serde", "tokio", "anyhow"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let new: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+
+            let diff = DependencyDiff::compute(&old, &new);
+
+            assert!(diff.added.is_empty());
+            assert_eq!(diff.removed.len(), 1);
+            assert!(diff.removed.contains(&"anyhow".to_string()));
+            assert!(!diff.needs_fetch());
+        }
+
+        #[test]
+        fn test_dependency_diff_no_changes() {
+            let old: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+            let new: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+
+            let diff = DependencyDiff::compute(&old, &new);
+
+            assert!(diff.added.is_empty());
+            assert!(diff.removed.is_empty());
+            assert!(!diff.needs_fetch());
+        }
+
+        #[test]
+        fn test_dependency_diff_empty_to_new() {
+            let old: HashSet<String> = HashSet::new();
+            let new: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+
+            let diff = DependencyDiff::compute(&old, &new);
+
+            assert_eq!(diff.added.len(), 2);
+            assert!(diff.removed.is_empty());
+            assert!(diff.needs_fetch());
         }
     }
 }
