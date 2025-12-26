@@ -18,6 +18,22 @@ use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{MessageType, Uri};
 
+/// Preserves cached version data from old document state to new state.
+/// Called during document updates to avoid re-fetching versions for unchanged deps.
+fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
+    tracing::trace!(
+        cached = old_state.cached_versions.len(),
+        resolved = old_state.resolved_versions.len(),
+        "preserving version cache"
+    );
+    new_state
+        .cached_versions
+        .clone_from(&old_state.cached_versions);
+    new_state
+        .resolved_versions
+        .clone_from(&old_state.resolved_versions);
+}
+
 /// Fetches latest versions for multiple packages in parallel with progress reporting.
 ///
 /// Returns a HashMap mapping package names to their latest version strings.
@@ -267,13 +283,16 @@ pub async fn handle_document_change(
     // Try to parse manifest (may fail for incomplete syntax)
     let parse_result = ecosystem.parse_manifest(&content, &uri).await.ok();
 
-    // Create document state (parse_result may be None)
-    let doc_state = if let Some(pr) = parse_result {
+    let mut doc_state = if let Some(pr) = parse_result {
         DocumentState::new_from_parse_result(ecosystem.id(), content, pr)
     } else {
         tracing::debug!("Failed to parse manifest, storing document without parse result");
         DocumentState::new_without_parse_result(ecosystem.id(), content)
     };
+
+    if let Some(old_doc) = state.get_document(&uri) {
+        preserve_cache(&mut doc_state, &old_doc);
+    }
 
     state.update_document(uri.clone(), doc_state);
 
@@ -1266,6 +1285,171 @@ require github.com/gorilla/mux v1.8.0
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(doc.ecosystem_id, "go");
+        }
+    }
+
+    // Phase 1: Cache Preservation Tests
+    #[cfg(feature = "cargo")]
+    mod incremental_fetch_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_preserve_cached_versions_on_change() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+
+            // Initial document with 2 dependencies
+            let content1 = r#"[dependencies]
+serde = "1.0"
+tokio = "1.0"
+"#;
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 =
+                DocumentState::new_from_parse_result("cargo", content1.to_string(), parse_result1);
+            state.update_document(uri.clone(), doc_state1);
+
+            // Manually populate cache (simulating background fetch)
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.cached_versions
+                    .insert("serde".to_string(), "1.0.210".to_string());
+                doc.cached_versions
+                    .insert("tokio".to_string(), "1.40.0".to_string());
+                doc.resolved_versions
+                    .insert("serde".to_string(), "1.0.195".to_string());
+                doc.resolved_versions
+                    .insert("tokio".to_string(), "1.35.0".to_string());
+            }
+
+            // Verify cache populated
+            {
+                let doc = state.get_document(&uri).unwrap();
+                assert_eq!(doc.cached_versions.len(), 2);
+                assert_eq!(doc.resolved_versions.len(), 2);
+            }
+
+            // Change document (modify serde version)
+            let content2 = r#"[dependencies]
+serde = "1.0.210"
+tokio = "1.0"
+"#;
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 =
+                DocumentState::new_from_parse_result("cargo", content2.to_string(), parse_result2);
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            state.update_document(uri.clone(), doc_state2);
+
+            // Verify cache preserved after update
+            {
+                let doc = state.get_document(&uri).unwrap();
+                assert_eq!(
+                    doc.cached_versions.len(),
+                    2,
+                    "Cached versions should be preserved"
+                );
+                assert_eq!(
+                    doc.cached_versions.get("serde"),
+                    Some(&"1.0.210".to_string()),
+                    "serde cache preserved"
+                );
+                assert_eq!(
+                    doc.cached_versions.get("tokio"),
+                    Some(&"1.40.0".to_string()),
+                    "tokio cache preserved"
+                );
+                assert_eq!(
+                    doc.resolved_versions.len(),
+                    2,
+                    "Resolved versions should be preserved"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_first_open_has_empty_cache() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+
+            let content = r#"[dependencies]
+serde = "1.0"
+"#;
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let doc_state =
+                DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result);
+            state.update_document(uri.clone(), doc_state);
+
+            // First open: cache should be empty (no old state to preserve)
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.cached_versions.len(),
+                0,
+                "First open should have empty cache"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_preserve_cache_on_parse_failure() {
+            let state = Arc::new(ServerState::new());
+            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+
+            // Valid initial document
+            let content1 = r#"[dependencies]
+serde = "1.0"
+"#;
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 =
+                DocumentState::new_from_parse_result("cargo", content1.to_string(), parse_result1);
+            state.update_document(uri.clone(), doc_state1);
+
+            // Populate cache
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.cached_versions
+                    .insert("serde".to_string(), "1.0.210".to_string());
+            }
+
+            // Invalid TOML (parse will fail)
+            let content2 = r#"[dependencies
+serde = "1.0"
+"#;
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.ok();
+            assert!(
+                parse_result2.is_none(),
+                "Parse should fail for invalid TOML"
+            );
+
+            let mut doc_state2 =
+                DocumentState::new_without_parse_result("cargo", content2.to_string());
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            state.update_document(uri.clone(), doc_state2);
+
+            // Cache should be preserved despite parse failure
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.cached_versions.len(),
+                1,
+                "Cache should be preserved on parse failure"
+            );
+            assert_eq!(
+                doc.cached_versions.get("serde"),
+                Some(&"1.0.210".to_string())
+            );
         }
     }
 }
