@@ -37,7 +37,10 @@ pub fn escape_module_path(path: &str) -> String {
         {
             result.push(c);
         } else {
-            for byte in c.to_string().as_bytes() {
+            // Encode each byte of the UTF-8 representation
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            for &byte in encoded.as_bytes() {
                 result.push_str(&format!("%{:02X}", byte));
             }
         }
