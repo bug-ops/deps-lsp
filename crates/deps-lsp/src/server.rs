@@ -21,7 +21,7 @@ use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
 /// LSP command identifiers.
 mod commands {
     /// Command to update a dependency version.
-    pub const UPDATE_VERSION: &str = "deps-lsp.updateVersion";
+    pub(super) const UPDATE_VERSION: &str = "deps-lsp.updateVersion";
 }
 
 pub struct Backend {
@@ -41,7 +41,7 @@ impl Backend {
 
     /// Get a reference to the LSP client (primarily for testing/benchmarking).
     #[doc(hidden)]
-    pub fn client(&self) -> &Client {
+    pub const fn client(&self) -> &Client {
         &self.client
     }
 
@@ -62,7 +62,7 @@ impl Backend {
             Err(e) => {
                 tracing::error!("failed to open document {:?}: {}", uri, e);
                 self.client
-                    .log_message(MessageType::ERROR, format!("Parse error: {}", e))
+                    .log_message(MessageType::ERROR, format!("Parse error: {e}"))
                     .await;
             }
         }
@@ -148,7 +148,7 @@ impl Backend {
                 self.client
                     .log_message(
                         MessageType::ERROR,
-                        format!("Failed to reload lock file: {}", e),
+                        format!("Failed to reload lock file: {e}"),
                     )
                     .await;
                 HashMap::new()
@@ -241,10 +241,7 @@ impl LanguageServer for Backend {
         if let Err(e) = file_watcher::register_lock_file_watchers(&self.client, &patterns).await {
             tracing::warn!("Failed to register file watchers: {}", e);
             self.client
-                .log_message(
-                    MessageType::WARNING,
-                    format!("File watching disabled: {}", e),
-                )
+                .log_message(MessageType::WARNING, format!("File watching disabled: {e}"))
                 .await;
         }
 

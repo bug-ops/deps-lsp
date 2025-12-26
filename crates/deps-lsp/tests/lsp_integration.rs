@@ -81,8 +81,7 @@ serde = "1.0"
     let hints = client.inlay_hints(10, "file:///test/Cargo.toml");
     assert!(
         hints.get("error").is_none(),
-        "Inlay hints request should not error: {:?}",
-        hints
+        "Inlay hints request should not error: {hints:?}"
     );
     assert!(
         hints.get("result").is_some(),
@@ -170,8 +169,7 @@ serde = "1.0"
     // Should return a result (may be null if no hover info available yet)
     assert!(
         hover.get("error").is_none(),
-        "Hover should not error: {:?}",
-        hover
+        "Hover should not error: {hover:?}"
     );
 }
 
@@ -200,8 +198,7 @@ serde = ""
     // Should not error
     assert!(
         completion.get("error").is_none(),
-        "Completion should not error: {:?}",
-        completion
+        "Completion should not error: {completion:?}"
     );
 }
 
@@ -331,8 +328,7 @@ serde = ""
     // Should not error
     assert!(
         completion.get("error").is_none(),
-        "Cold start completion should not error: {:?}",
-        completion
+        "Cold start completion should not error: {completion:?}"
     );
 
     // Should return some response (may be empty if network fails)

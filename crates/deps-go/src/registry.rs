@@ -58,8 +58,7 @@ fn validate_module_path(module_path: &str) -> Result<()> {
 
     if module_path.len() > MAX_MODULE_PATH_LENGTH {
         return Err(GoError::InvalidModulePath(format!(
-            "module path exceeds maximum length of {} characters",
-            MAX_MODULE_PATH_LENGTH
+            "module path exceeds maximum length of {MAX_MODULE_PATH_LENGTH} characters"
         )));
     }
 
@@ -86,8 +85,7 @@ fn validate_version_string(version: &str) -> Result<()> {
         return Err(GoError::InvalidVersionSpecifier {
             specifier: version.to_string(),
             message: format!(
-                "version string exceeds maximum length of {} characters",
-                MAX_VERSION_LENGTH
+                "version string exceeds maximum length of {MAX_VERSION_LENGTH} characters"
             ),
         });
     }
@@ -105,7 +103,7 @@ fn validate_version_string(version: &str) -> Result<()> {
 
 /// Returns the URL for a module's documentation page on pkg.go.dev.
 pub fn package_url(module_path: &str) -> String {
-    format!("{}/{}", PKG_GO_DEV_URL, module_path)
+    format!("{PKG_GO_DEV_URL}/{module_path}")
 }
 
 /// Client for interacting with proxy.golang.org.
@@ -119,7 +117,7 @@ pub struct GoRegistry {
 
 impl GoRegistry {
     /// Creates a new Go registry client with the given HTTP cache.
-    pub fn new(cache: Arc<HttpCache>) -> Self {
+    pub const fn new(cache: Arc<HttpCache>) -> Self {
         Self { cache }
     }
 
@@ -154,7 +152,7 @@ impl GoRegistry {
         validate_module_path(module_path)?;
 
         let escaped = escape_module_path(module_path);
-        let url = format!("{}/{}/@v/list", PROXY_BASE, escaped);
+        let url = format!("{PROXY_BASE}/{escaped}/@v/list");
 
         let data = self
             .cache
@@ -199,7 +197,7 @@ impl GoRegistry {
         validate_version_string(version)?;
 
         let escaped = escape_module_path(module_path);
-        let url = format!("{}/{}/@v/{}.info", PROXY_BASE, escaped, version);
+        let url = format!("{PROXY_BASE}/{escaped}/@v/{version}.info");
 
         let data = self
             .cache
@@ -243,7 +241,7 @@ impl GoRegistry {
         validate_module_path(module_path)?;
 
         let escaped = escape_module_path(module_path);
-        let url = format!("{}/{}/@latest", PROXY_BASE, escaped);
+        let url = format!("{PROXY_BASE}/{escaped}/@latest");
 
         let data = self
             .cache
@@ -288,7 +286,7 @@ impl GoRegistry {
         validate_version_string(version)?;
 
         let escaped = escape_module_path(module_path);
-        let url = format!("{}/{}/@v/{}.mod", PROXY_BASE, escaped, version);
+        let url = format!("{PROXY_BASE}/{escaped}/@v/{version}.mod");
 
         let data = self
             .cache
@@ -300,8 +298,8 @@ impl GoRegistry {
             })?;
 
         std::str::from_utf8(&data)
-            .map(|s| s.to_string())
-            .map_err(|e| GoError::CacheError(format!("Invalid UTF-8 in go.mod: {}", e)))
+            .map(std::string::ToString::to_string)
+            .map_err(|e| GoError::CacheError(format!("Invalid UTF-8 in go.mod: {e}")))
     }
 }
 
@@ -318,7 +316,7 @@ struct VersionInfo {
 fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
     let content = std::str::from_utf8(data).map_err(|e| GoError::InvalidVersionSpecifier {
         specifier: String::new(),
-        message: format!("Invalid UTF-8 in version list response: {}", e),
+        message: format!("Invalid UTF-8 in version list response: {e}"),
     })?;
 
     let versions: Vec<GoVersion> = content
@@ -485,7 +483,7 @@ mod tests {
     async fn test_registry_clone() {
         let cache = Arc::new(HttpCache::new());
         let registry = GoRegistry::new(cache);
-        let _cloned = registry.clone();
+        let _cloned = registry;
     }
 
     #[tokio::test]
@@ -526,7 +524,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(latest.version.starts_with("v"));
+        assert!(latest.version.starts_with('v'));
         assert!(!latest.is_pseudo);
     }
 

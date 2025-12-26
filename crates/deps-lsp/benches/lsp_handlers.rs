@@ -117,7 +117,7 @@ fn bench_completion_handler(c: &mut Criterion) {
                 )
                 .await
             })
-        })
+        });
     });
 
     // Setup: Pre-load document with medium manifest
@@ -147,7 +147,7 @@ fn bench_completion_handler(c: &mut Criterion) {
                 )
                 .await
             })
-        })
+        });
     });
 
     group.finish();
@@ -202,7 +202,7 @@ fn bench_inlay_hints_handler(c: &mut Criterion) {
                     )
                     .await
                 })
-            })
+            });
         });
     }
 
@@ -236,7 +236,7 @@ fn bench_inlay_hints_handler(c: &mut Criterion) {
                 )
                 .await
             })
-        })
+        });
     });
 
     group.finish();
@@ -282,7 +282,7 @@ fn bench_hover_handler(c: &mut Criterion) {
                 )
                 .await
             })
-        })
+        });
     });
 
     group.bench_function("hover_on_version_string", |b| {
@@ -304,7 +304,7 @@ fn bench_hover_handler(c: &mut Criterion) {
                 )
                 .await
             })
-        })
+        });
     });
 
     group.finish();
@@ -321,7 +321,7 @@ fn bench_document_state_access(c: &mut Criterion) {
 
     // Pre-populate with 10 documents
     for i in 0..10 {
-        let uri = Uri::from_file_path(format!("/bench/doc{}/Cargo.toml", i)).unwrap();
+        let uri = Uri::from_file_path(format!("/bench/doc{i}/Cargo.toml")).unwrap();
         rt.block_on(setup_document(&state, &uri, SMALL_CARGO));
     }
 
@@ -330,7 +330,7 @@ fn bench_document_state_access(c: &mut Criterion) {
 
         b.iter(|| {
             let _doc = state.get_document(black_box(&uri));
-        })
+        });
     });
 
     group.bench_function("concurrent_reads_10_documents", |b| {
@@ -341,8 +341,7 @@ fn bench_document_state_access(c: &mut Criterion) {
                 for i in 0..10 {
                     let state = Arc::clone(&state);
                     let handle = tokio::spawn(async move {
-                        let uri =
-                            Uri::from_file_path(format!("/bench/doc{}/Cargo.toml", i)).unwrap();
+                        let uri = Uri::from_file_path(format!("/bench/doc{i}/Cargo.toml")).unwrap();
                         let _doc = state.get_document(&uri);
                     });
                     handles.push(handle);
@@ -351,8 +350,8 @@ fn bench_document_state_access(c: &mut Criterion) {
                 for handle in handles {
                     let _ = handle.await;
                 }
-            })
-        })
+            });
+        });
     });
 
     group.finish();
@@ -392,8 +391,8 @@ fn bench_cold_start_loading(c: &mut Criterion) {
                         content.to_string(),
                         parse_result,
                     );
-                })
-            })
+                });
+            });
         });
     }
 

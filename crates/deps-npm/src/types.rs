@@ -23,7 +23,7 @@ use tower_lsp_server::ls_types::Range;
 /// assert_eq!(dep.name, "express");
 /// assert!(matches!(dep.section, NpmDependencySection::Dependencies));
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NpmDependency {
     pub name: String,
     pub name_range: Range,
@@ -56,7 +56,7 @@ deps_core::impl_dependency!(NpmDependency {
 /// let section = NpmDependencySection::Dependencies;
 /// assert!(matches!(section, NpmDependencySection::Dependencies));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NpmDependencySection {
     /// Production dependencies (`dependencies`)
     Dependencies,

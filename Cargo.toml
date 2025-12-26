@@ -45,6 +45,104 @@ tracing-subscriber = "0.3"
 urlencoding = "2.1"
 zed_extension_api = "0.7"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "allow"
+missing_debug_implementations = "allow"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# Allowed lints - too noisy for this codebase
+module_name_repetitions = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+single_match_else = "allow"
+
+# Documentation lints - allow for now, can enable incrementally
+doc_markdown = "allow"
+missing_docs_in_private_items = "allow"
+
+# Cargo lints - metadata can be added later
+cargo_common_metadata = "allow"
+
+# Nursery lints that are too pedantic
+option_if_let_else = "allow"
+future_not_send = "allow"
+redundant_pub_crate = "allow"
+
+# Pattern-matching lints - allow for now
+wildcard_enum_match_arm = "allow"
+redundant_else = "allow"
+
+# Style lints - allow for readability
+manual_let_else = "allow"
+items_after_statements = "allow"
+
+# Type conversion lints - allow where intentional
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+
+# Nursery performance lints that need review
+significant_drop_tightening = "allow"
+
+# Cargo lints that conflict with workspace setup
+multiple_crate_versions = "allow"
+
+# Style lints - allow for now, can be fixed incrementally
+uninlined_format_args = "allow"
+explicit_iter_loop = "allow"
+redundant_closure_for_method_calls = "allow"
+match_wildcard_for_single_variants = "allow"
+
+# Function lints - allow for now
+missing_const_for_fn = "allow"
+unnecessary_wraps = "allow"
+
+# LazyLock migration - allow until we can target newer MSRV
+non_std_lazy_statics = "allow"
+
+# HashMap generics - too noisy for internal APIs
+implicit_hasher = "allow"
+
+# Performance lints that are pedantic
+map_unwrap_or = "allow"
+needless_collect = "allow"
+or_fun_call = "allow"
+format_push_string = "allow"
+
+# Documentation lints
+doc_link_with_quotes = "allow"
+
+# Derive lints - can be fixed incrementally
+derive_partial_eq_without_eq = "allow"
+
+# Test-specific lints
+used_underscore_binding = "allow"
+ignore_without_reason = "allow"
+
+# API design lints that need review
+unused_self = "allow"
+unused_async = "allow"
+
+# Pattern matching lints
+match_same_arms = "allow"
+
+# File extension checks - too strict
+case_sensitive_file_extension_comparisons = "allow"
+
+# Style preferences
+default_trait_access = "allow"
+needless_pass_by_value = "allow"
+
 [profile.release]
 lto = true
 codegen-units = 1

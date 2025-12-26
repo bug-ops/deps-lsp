@@ -39,7 +39,7 @@ pub const CRATES_IO_URL: &str = "https://crates.io/crates";
 
 /// Returns the URL for a crate's page on crates.io.
 pub fn crate_url(name: &str) -> String {
-    format!("{}/{}", CRATES_IO_URL, name)
+    format!("{CRATES_IO_URL}/{name}")
 }
 
 /// Client for interacting with crates.io registry.
@@ -53,7 +53,7 @@ pub struct CratesIoRegistry {
 
 impl CratesIoRegistry {
     /// Creates a new registry client with the given HTTP cache.
-    pub fn new(cache: Arc<HttpCache>) -> Self {
+    pub const fn new(cache: Arc<HttpCache>) -> Self {
         Self { cache }
     }
 
@@ -238,7 +238,7 @@ struct IndexEntry {
 /// Parses newline-delimited JSON from sparse index.
 fn parse_index_json(data: &[u8], _crate_name: &str) -> Result<Vec<CargoVersion>> {
     let content = std::str::from_utf8(data)
-        .map_err(|e| DepsError::CacheError(format!("Invalid UTF-8: {}", e)))?;
+        .map_err(|e| DepsError::CacheError(format!("Invalid UTF-8: {e}")))?;
 
     // Parse versions once and cache the parsed Version for sorting
     let mut versions_with_parsed: Vec<(CargoVersion, Version)> = content
@@ -625,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_clone() {
         let cache = Arc::new(HttpCache::new());
-        let registry = CratesIoRegistry::new(cache.clone());
-        let _cloned = registry.clone();
+        let registry = CratesIoRegistry::new(cache);
+        let _cloned = registry;
     }
 }

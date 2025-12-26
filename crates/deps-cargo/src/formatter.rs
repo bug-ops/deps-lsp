@@ -4,11 +4,11 @@ pub struct CargoFormatter;
 
 impl EcosystemFormatter for CargoFormatter {
     fn format_version_for_code_action(&self, version: &str) -> String {
-        format!("\"{}\"", version)
+        format!("\"{version}\"")
     }
 
     fn package_url(&self, name: &str) -> String {
-        format!("https://crates.io/crates/{}", name)
+        format!("https://crates.io/crates/{name}")
     }
 }
 

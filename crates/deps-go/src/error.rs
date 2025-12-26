@@ -102,28 +102,26 @@ impl GoError {
 impl From<GoError> for deps_core::DepsError {
     fn from(err: GoError) -> Self {
         match err {
-            GoError::ParseError { source } => deps_core::DepsError::ParseError {
+            GoError::ParseError { source } => Self::ParseError {
                 file_type: "go.mod".into(),
                 source,
             },
-            GoError::InvalidVersionSpecifier { message, .. } => {
-                deps_core::DepsError::InvalidVersionReq(message)
-            }
+            GoError::InvalidVersionSpecifier { message, .. } => Self::InvalidVersionReq(message),
             GoError::ModuleNotFound { module } => {
-                deps_core::DepsError::CacheError(format!("Module '{}' not found", module))
+                Self::CacheError(format!("Module '{module}' not found"))
             }
-            GoError::RegistryError { module, source } => deps_core::DepsError::ParseError {
-                file_type: format!("registry for {}", module),
+            GoError::RegistryError { module, source } => Self::ParseError {
+                file_type: format!("registry for {module}"),
                 source,
             },
-            GoError::CacheError(msg) => deps_core::DepsError::CacheError(msg),
-            GoError::InvalidModulePath(msg) => deps_core::DepsError::InvalidVersionReq(msg),
+            GoError::CacheError(msg) => Self::CacheError(msg),
+            GoError::InvalidModulePath(msg) => Self::InvalidVersionReq(msg),
             GoError::InvalidPseudoVersion { version, reason } => {
-                deps_core::DepsError::InvalidVersionReq(format!("{}: {}", version, reason))
+                Self::InvalidVersionReq(format!("{version}: {reason}"))
             }
-            GoError::ApiResponseError { module: _, source } => deps_core::DepsError::Json(source),
-            GoError::Io(e) => deps_core::DepsError::Io(e),
-            GoError::Other(e) => deps_core::DepsError::ParseError {
+            GoError::ApiResponseError { module: _, source } => Self::Json(source),
+            GoError::Io(e) => Self::Io(e),
+            GoError::Other(e) => Self::ParseError {
                 file_type: "go".into(),
                 source: e,
             },
@@ -134,18 +132,18 @@ impl From<GoError> for deps_core::DepsError {
 impl From<deps_core::DepsError> for GoError {
     fn from(err: deps_core::DepsError) -> Self {
         match err {
-            deps_core::DepsError::ParseError { source, .. } => GoError::ParseError { source },
-            deps_core::DepsError::CacheError(msg) => GoError::CacheError(msg),
-            deps_core::DepsError::InvalidVersionReq(msg) => GoError::InvalidVersionSpecifier {
+            deps_core::DepsError::ParseError { source, .. } => Self::ParseError { source },
+            deps_core::DepsError::CacheError(msg) => Self::CacheError(msg),
+            deps_core::DepsError::InvalidVersionReq(msg) => Self::InvalidVersionSpecifier {
                 specifier: String::new(),
                 message: msg,
             },
-            deps_core::DepsError::Io(e) => GoError::Io(e),
-            deps_core::DepsError::Json(e) => GoError::ApiResponseError {
+            deps_core::DepsError::Io(e) => Self::Io(e),
+            deps_core::DepsError::Json(e) => Self::ApiResponseError {
                 module: String::new(),
                 source: e,
             },
-            other => GoError::CacheError(other.to_string()),
+            other => Self::CacheError(other.to_string()),
         }
     }
 }

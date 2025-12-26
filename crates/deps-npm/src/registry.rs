@@ -35,7 +35,7 @@ pub struct NpmRegistry {
 
 impl NpmRegistry {
     /// Creates a new npm registry client with the given HTTP cache.
-    pub fn new(cache: Arc<HttpCache>) -> Self {
+    pub const fn new(cache: Arc<HttpCache>) -> Self {
         Self { cache }
     }
 
@@ -67,7 +67,7 @@ impl NpmRegistry {
     /// # }
     /// ```
     pub async fn get_versions(&self, name: &str) -> Result<Vec<NpmVersion>> {
-        let url = format!("{}/{}", REGISTRY_BASE, name);
+        let url = format!("{REGISTRY_BASE}/{name}");
         let data = self.cache.get_cached(&url).await?;
 
         parse_package_metadata(&data)

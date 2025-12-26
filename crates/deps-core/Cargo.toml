@@ -9,6 +9,9 @@ repository.workspace = true
 description = "Core abstractions for deps-lsp: caching, errors, and traits"
 publish = true
 
+[lints]
+workspace = true
+
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }

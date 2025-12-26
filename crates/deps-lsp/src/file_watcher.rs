@@ -52,7 +52,7 @@ pub async fn register_lock_file_watchers(
     client
         .register_capability(vec![registration])
         .await
-        .map_err(|e| format!("Failed to register file watchers: {}", e))?;
+        .map_err(|e| format!("Failed to register file watchers: {e}"))?;
 
     tracing::info!("Registered {} lock file watchers", patterns.len());
     Ok(())

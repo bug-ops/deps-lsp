@@ -108,7 +108,7 @@ pub enum PypiDependencySection {
 ///     url: "https://example.com/package.whl".into(),
 /// };
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PypiDependencySource {
     /// Dependency from PyPI registry
     PyPI,

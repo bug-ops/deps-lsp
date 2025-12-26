@@ -9,6 +9,9 @@ repository.workspace = true
 description = "Language Server Protocol implementation for dependency management"
 publish = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "deps-lsp"
 path = "src/main.rs"

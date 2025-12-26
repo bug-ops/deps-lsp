@@ -23,10 +23,7 @@ const CACHE_EVICTION_PERCENTAGE: usize = 10;
 fn ensure_https(url: &str) -> Result<()> {
     #[cfg(not(test))]
     if !url.starts_with("https://") {
-        return Err(DepsError::CacheError(format!(
-            "URL must use HTTPS: {}",
-            url
-        )));
+        return Err(DepsError::CacheError(format!("URL must use HTTPS: {url}")));
     }
     #[cfg(test)]
     let _ = url; // Silence unused warning in tests
@@ -166,7 +163,7 @@ impl HttpCache {
                 }
                 Err(e) => {
                     // Network error - fall back to cached body if available
-                    tracing::warn!("conditional request failed, using cache: {}", e);
+                    tracing::warn!("conditional request failed, using cache: {e}");
                     return Ok(cached.body.clone());
                 }
             }
@@ -258,7 +255,7 @@ impl HttpCache {
     /// or `DepsError::RegistryError` if the network request fails.
     pub(crate) async fn fetch_and_store(&self, url: &str) -> Result<Bytes> {
         ensure_https(url)?;
-        tracing::debug!("fetching fresh: {}", url);
+        tracing::debug!("fetching fresh: {url}");
 
         let response = self
             .client
@@ -271,11 +268,8 @@ impl HttpCache {
             })?;
 
         if !response.status().is_success() {
-            return Err(DepsError::CacheError(format!(
-                "HTTP {} for {}",
-                response.status(),
-                url
-            )));
+            let status = response.status();
+            return Err(DepsError::CacheError(format!("HTTP {status} for {url}")));
         }
 
         let etag = response
@@ -346,7 +340,7 @@ impl HttpCache {
         // The heap maintains the K oldest entries seen so far
         let mut oldest = BinaryHeap::with_capacity(target_removals);
 
-        for entry in self.entries.iter() {
+        for entry in &self.entries {
             let item = (entry.value().fetched_at, entry.key().clone());
 
             if oldest.len() < target_removals {

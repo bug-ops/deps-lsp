@@ -480,9 +480,9 @@ dependencies = []
         let ecosystem = PypiEcosystem::new(cache);
         let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
 
-        let content = r#"[project]
+        let content = r"[project]
 dependencies = []
-"#;
+";
 
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
         let cached_versions = HashMap::new();

@@ -299,13 +299,13 @@ fn create_package_completion_item(
 
     // Create insert text based on ecosystem
     let insert_text = match ecosystem_id {
-        "cargo" | "pypi" => format!("{} = \"{}\"", name, latest),
-        "npm" => format!("\"{}\": \"^{}\"", name, latest),
-        _ => format!("{} = \"{}\"", name, latest),
+        "cargo" | "pypi" => format!("{name} = \"{latest}\""),
+        "npm" => format!("\"{name}\": \"^{latest}\""),
+        _ => format!("{name} = \"{latest}\""),
     };
 
     // Build detail text
-    let detail = format!("Latest: {}", latest);
+    let detail = format!("Latest: {latest}");
 
     CompletionItem {
         label: name.to_string(),
@@ -396,28 +396,28 @@ serde
 
     #[test]
     fn test_is_in_toml_dependencies_dev_deps() {
-        let content = r#"
+        let content = r"
 [dev-dependencies]
 tokio
-"#;
+";
         assert!(is_in_toml_dependencies(content, 2));
     }
 
     #[test]
     fn test_is_in_toml_dependencies_build_deps() {
-        let content = r#"
+        let content = r"
 [build-dependencies]
 cc
-"#;
+";
         assert!(is_in_toml_dependencies(content, 2));
     }
 
     #[test]
     fn test_is_in_toml_dependencies_project_deps() {
-        let content = r#"
+        let content = r"
 [project.dependencies]
 requests
-"#;
+";
         assert!(is_in_toml_dependencies(content, 2));
     }
 
@@ -432,10 +432,10 @@ serde = "1.0"
 
     #[test]
     fn test_is_in_toml_dependencies_target_specific() {
-        let content = r#"
+        let content = r"
 [target.'cfg(windows)'.dependencies]
 winapi
-"#;
+";
         assert!(is_in_toml_dependencies(content, 2));
     }
 
@@ -534,20 +534,20 @@ tokio
 
     #[test]
     fn test_is_in_dependencies_section_cargo() {
-        let content = r#"
+        let content = r"
 [dependencies]
 serde
-"#;
+";
         assert!(is_in_dependencies_section(content, 2, "cargo"));
         assert!(!is_in_dependencies_section(content, 0, "cargo"));
     }
 
     #[test]
     fn test_is_in_dependencies_section_pypi() {
-        let content = r#"
+        let content = r"
 [project.dependencies]
 requests
-"#;
+";
         assert!(is_in_dependencies_section(content, 2, "pypi"));
     }
 
@@ -563,10 +563,10 @@ requests
 
     #[test]
     fn test_is_in_dependencies_section_unknown_ecosystem() {
-        let content = r#"
+        let content = r"
 [dependencies]
 something
-"#;
+";
         assert!(!is_in_dependencies_section(content, 2, "unknown"));
     }
 
@@ -574,7 +574,7 @@ something
     fn test_create_package_completion_item_cargo() {
         struct MockMetadata;
         impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "serde"
             }
             fn description(&self) -> Option<&str> {
@@ -586,7 +586,7 @@ something
             fn documentation(&self) -> Option<&str> {
                 None
             }
-            fn latest_version(&self) -> &str {
+            fn latest_version(&self) -> &'static str {
                 "1.0.214"
             }
             fn as_any(&self) -> &dyn std::any::Any {
@@ -608,7 +608,7 @@ something
     fn test_create_package_completion_item_npm() {
         struct MockMetadata;
         impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "express"
             }
             fn description(&self) -> Option<&str> {
@@ -620,7 +620,7 @@ something
             fn documentation(&self) -> Option<&str> {
                 None
             }
-            fn latest_version(&self) -> &str {
+            fn latest_version(&self) -> &'static str {
                 "4.18.2"
             }
             fn as_any(&self) -> &dyn std::any::Any {
@@ -642,7 +642,7 @@ something
     fn test_create_package_completion_item_pypi() {
         struct MockMetadata;
         impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "requests"
             }
             fn description(&self) -> Option<&str> {
@@ -654,7 +654,7 @@ something
             fn documentation(&self) -> Option<&str> {
                 None
             }
-            fn latest_version(&self) -> &str {
+            fn latest_version(&self) -> &'static str {
                 "2.31.0"
             }
             fn as_any(&self) -> &dyn std::any::Any {
@@ -677,9 +677,9 @@ something
         let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
         // Malformed content that will fail to parse
-        let content = r#"[dependencies]
-ser"#
-            .to_string();
+        let content = r"[dependencies]
+ser"
+        .to_string();
 
         // Create document without parse result (simulating parse failure)
         let doc = DocumentState::new(Ecosystem::Cargo, content.clone(), vec![]);
@@ -705,10 +705,10 @@ ser"#
 
     #[test]
     fn test_fallback_rejects_single_char_prefix() {
-        let content = r#"
+        let content = r"
 [dependencies]
 s
-"#;
+";
 
         // Extract prefix at position (1 char)
         let line = content.lines().nth(2).unwrap();
@@ -740,10 +740,10 @@ serde = "1.0"
 
     #[test]
     fn test_prefix_extraction_cursor_beyond_line() {
-        let content = r#"
+        let content = r"
 [dependencies]
 serde
-"#;
+";
 
         // Try to extract prefix with cursor beyond line length
         let line = content.lines().nth(2).unwrap();

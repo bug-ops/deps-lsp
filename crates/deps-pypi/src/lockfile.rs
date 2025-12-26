@@ -117,7 +117,7 @@ impl LockFileProvider for PypiLockParser {
             return Ok(packages);
         };
 
-        for table in package_array.iter() {
+        for table in package_array {
             // Extract required fields
             let Some(name) = table.get("name").and_then(|v: &toml_edit::Item| v.as_str()) else {
                 tracing::warn!("Package missing name field");
@@ -542,9 +542,9 @@ source = { path = "../local-package" }
 
     #[tokio::test]
     async fn test_parse_empty_lock_file() {
-        let lockfile_content = r#"
+        let lockfile_content = r"
 version = 1
-"#;
+";
 
         let temp_dir = tempfile::tempdir().unwrap();
         let lockfile_path = temp_dir.path().join("poetry.lock");

@@ -340,8 +340,8 @@ mod tests {
         }
 
         fn uri(&self) -> &Uri {
-            static URI: once_cell::sync::Lazy<Uri> =
-                once_cell::sync::Lazy::new(|| Uri::from_file_path("/test/Cargo.toml").unwrap());
+            static URI: std::sync::LazyLock<Uri> =
+                std::sync::LazyLock::new(|| Uri::from_file_path("/test/Cargo.toml").unwrap());
             &URI
         }
 
@@ -734,6 +734,6 @@ mod tests {
         // Real packages with special characters
         let results = ecosystem.complete_package_names("tokio-ut").await;
         assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.label.contains("-")));
+        assert!(results.iter().any(|r| r.label.contains('-')));
     }
 }

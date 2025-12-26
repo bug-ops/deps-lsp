@@ -195,7 +195,7 @@ serde = "1.0.0"
                 needs_update_text: "❌ {}".to_string(),
             };
 
-            let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
+            let doc_state = DocumentState::new(Ecosystem::Cargo, String::new(), vec![]);
             state.update_document(uri.clone(), doc_state);
 
             let params = InlayHintParams {

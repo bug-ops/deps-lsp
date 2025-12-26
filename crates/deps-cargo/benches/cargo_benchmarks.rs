@@ -108,7 +108,7 @@ resolver = "2"
                 i % 20
             ));
         } else if i % 3 == 1 {
-            content.push_str(&format!("dep{} = {{ workspace = true }}\n", i));
+            content.push_str(&format!("dep{i} = {{ workspace = true }}\n"));
         } else {
             content.push_str(&format!("dep{} = \"1.{}.0\"\n", i, i % 20));
         }
@@ -145,24 +145,24 @@ fn bench_cargo_parsing(c: &mut Criterion) {
 
     group.bench_function("small_5_deps", |b| {
         let url = test_url();
-        b.iter(|| parse_cargo_toml(black_box(SMALL_CARGO_TOML), black_box(&url)))
+        b.iter(|| parse_cargo_toml(black_box(SMALL_CARGO_TOML), black_box(&url)));
     });
 
     group.bench_function("medium_25_deps", |b| {
         let url = test_url();
-        b.iter(|| parse_cargo_toml(black_box(MEDIUM_CARGO_TOML), black_box(&url)))
+        b.iter(|| parse_cargo_toml(black_box(MEDIUM_CARGO_TOML), black_box(&url)));
     });
 
     let large_toml = generate_large_cargo_toml();
     group.bench_function("large_100_deps", |b| {
         let url = test_url();
-        b.iter(|| parse_cargo_toml(black_box(&large_toml), black_box(&url)))
+        b.iter(|| parse_cargo_toml(black_box(&large_toml), black_box(&url)));
     });
 
     let workspace_toml = generate_workspace_cargo_toml();
     group.bench_function("workspace_100_deps", |b| {
         let url = test_url();
-        b.iter(|| parse_cargo_toml(black_box(&workspace_toml), black_box(&url)))
+        b.iter(|| parse_cargo_toml(black_box(&workspace_toml), black_box(&url)));
     });
 
     group.finish();
@@ -188,12 +188,12 @@ serde = { version = "1.0", features = ["derive", "std"], default-features = fals
 
     group.bench_function("inline_dependency", |b| {
         let url = test_url();
-        b.iter(|| parse_cargo_toml(black_box(inline), black_box(&url)))
+        b.iter(|| parse_cargo_toml(black_box(inline), black_box(&url)));
     });
 
     group.bench_function("table_dependency", |b| {
         let url = test_url();
-        b.iter(|| parse_cargo_toml(black_box(table), black_box(&url)))
+        b.iter(|| parse_cargo_toml(black_box(table), black_box(&url)));
     });
 
     group.finish();
@@ -226,15 +226,14 @@ fn bench_registry_parsing(c: &mut Criterion) {
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .collect();
-        })
+        });
     });
 
     // Generate large sparse index response (100 versions)
     let mut large_index = String::new();
     for i in 0..100 {
         large_index.push_str(&format!(
-            r#"{{"name":"crate","vers":"1.0.{}","deps":[],"cksum":"abc{}","features":{{}},"yanked":false}}"#,
-            i, i
+            r#"{{"name":"crate","vers":"1.0.{i}","deps":[],"cksum":"abc{i}","features":{{}},"yanked":false}}"#
         ));
         large_index.push('\n');
     }
@@ -245,7 +244,7 @@ fn bench_registry_parsing(c: &mut Criterion) {
                 .lines()
                 .filter_map(|line| serde_json::from_str(line).ok())
                 .collect();
-        })
+        });
     });
 
     group.finish();
@@ -271,13 +270,13 @@ fn bench_version_matching(c: &mut Criterion) {
     // Simple version requirement
     let simple_req = VersionReq::parse("1.0").unwrap();
     group.bench_function("simple_version_req", |b| {
-        b.iter(|| simple_req.matches(black_box(&latest)))
+        b.iter(|| simple_req.matches(black_box(&latest)));
     });
 
     // Complex version requirement (multiple constraints)
     let complex_req = VersionReq::parse(">=1.0.100, <2.0").unwrap();
     group.bench_function("complex_version_req", |b| {
-        b.iter(|| complex_req.matches(black_box(&latest)))
+        b.iter(|| complex_req.matches(black_box(&latest)));
     });
 
     // Find latest matching version
@@ -288,7 +287,7 @@ fn bench_version_matching(c: &mut Criterion) {
                 .filter(|v| simple_req.matches(v))
                 .max()
                 .cloned()
-        })
+        });
     });
 
     group.finish();
@@ -318,8 +317,8 @@ serde = { version = "1.0", features = ["derive"] }"#,
         ),
         (
             "workspace_inheritance",
-            r#"[dependencies]
-serde = { workspace = true }"#,
+            r"[dependencies]
+serde = { workspace = true }",
         ),
         (
             "git_dependency",
@@ -344,7 +343,7 @@ default-features = false"#,
     for (name, content) in formats {
         group.bench_with_input(BenchmarkId::from_parameter(name), &content, |b, content| {
             let url = test_url();
-            b.iter(|| parse_cargo_toml(black_box(content), black_box(&url)))
+            b.iter(|| parse_cargo_toml(black_box(content), black_box(&url)));
         });
     }
 
@@ -367,7 +366,7 @@ tokio = "1.0"  # Зависимость с кириллицей
 
     c.bench_function("unicode_parsing", |b| {
         let url = test_url();
-        b.iter(|| parse_cargo_toml(black_box(unicode_toml), black_box(&url)))
+        b.iter(|| parse_cargo_toml(black_box(unicode_toml), black_box(&url)));
     });
 }
 

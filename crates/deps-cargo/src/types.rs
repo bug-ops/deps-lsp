@@ -29,7 +29,7 @@ use tower_lsp_server::ls_types::Range;
 /// assert_eq!(dep.name, "serde");
 /// assert!(matches!(dep.source, DependencySource::Registry));
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedDependency {
     pub name: String,
     pub name_range: Range,
@@ -62,7 +62,7 @@ pub struct ParsedDependency {
 ///     path: "../local-crate".into(),
 /// };
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencySource {
     /// Dependency from crates.io registry
     Registry,
@@ -88,7 +88,7 @@ pub enum DependencySource {
 /// let section = DependencySection::Dependencies;
 /// assert!(matches!(section, DependencySection::Dependencies));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencySection {
     /// Runtime dependencies (`[dependencies]`)
     Dependencies,

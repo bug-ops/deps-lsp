@@ -13,7 +13,7 @@ pub(crate) mod test_helpers {
     /// Since handler tests pre-populate documents in state, the cold start
     /// logic is never triggered. These are just dummy values to satisfy
     /// the function signatures.
-    pub fn create_test_client_and_config() -> (Client, Arc<RwLock<DepsConfig>>) {
+    pub(crate) fn create_test_client_and_config() -> (Client, Arc<RwLock<DepsConfig>>) {
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         let client = service.inner().client.clone();
         let config = Arc::new(RwLock::new(DepsConfig::default()));

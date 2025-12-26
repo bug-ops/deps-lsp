@@ -73,8 +73,7 @@ pub async fn handle_document_open(
         None => {
             tracing::debug!("No ecosystem handler for {:?}", uri);
             return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
-                "{:?}",
-                uri
+                "{uri:?}"
             )));
         }
     };
@@ -178,8 +177,7 @@ pub async fn handle_document_change(
         None => {
             tracing::debug!("No ecosystem handler for {:?}", uri);
             return Err(deps_core::error::DepsError::UnsupportedEcosystem(format!(
-                "{:?}",
-                uri
+                "{uri:?}"
             )));
         }
     };
@@ -398,7 +396,7 @@ pub async fn ensure_document_loaded(
         Err(e) => {
             tracing::warn!("Failed to load document {:?}: {}", uri, e);
             client
-                .log_message(MessageType::WARNING, format!("Could not load file: {}", e))
+                .log_message(MessageType::WARNING, format!("Could not load file: {e}"))
                 .await;
             return false;
         }
@@ -756,12 +754,12 @@ dependencies = ["requests>=2.0.0"]
         async fn test_document_parsing() {
             let state = Arc::new(ServerState::new());
             let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/go.mod").unwrap();
-            let content = r#"module example.com/mymodule
+            let content = r"module example.com/mymodule
 
 go 1.21
 
 require github.com/gorilla/mux v1.8.0
-"#;
+";
 
             let ecosystem = state
                 .ecosystem_registry

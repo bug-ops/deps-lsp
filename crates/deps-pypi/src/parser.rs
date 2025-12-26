@@ -65,7 +65,7 @@ pub struct PypiParser;
 
 impl PypiParser {
     /// Create a new PyPI parser.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 
@@ -162,7 +162,7 @@ impl PypiParser {
 
         let mut dependencies = Vec::new();
 
-        for value in requires_array.iter() {
+        for value in requires_array {
             if let Some(dep_str) = value.as_str() {
                 // Find exact position of this dependency string in content
                 let position = self
@@ -201,7 +201,7 @@ impl PypiParser {
 
         let mut dependencies = Vec::new();
 
-        for value in deps_array.iter() {
+        for value in deps_array {
             if let Some(dep_str) = value.as_str() {
                 // Find exact position of this dependency string in content
                 let position = self
@@ -240,9 +240,9 @@ impl PypiParser {
 
         let mut dependencies = Vec::new();
 
-        for (group_name, group_item) in opt_deps_table.iter() {
+        for (group_name, group_item) in opt_deps_table {
             if let Some(group_array) = group_item.as_array() {
-                for value in group_array.iter() {
+                for value in group_array {
                     if let Some(dep_str) = value.as_str() {
                         // Find exact position of this dependency string in content
                         let position = self
@@ -285,9 +285,9 @@ impl PypiParser {
     ) -> Result<Vec<PypiDependency>> {
         let mut dependencies = Vec::new();
 
-        for (group_name, group_item) in dep_groups.iter() {
+        for (group_name, group_item) in dep_groups {
             if let Some(group_array) = group_item.as_array() {
-                for value in group_array.iter() {
+                for value in group_array {
                     if let Some(dep_str) = value.as_str() {
                         // Find exact position of this dependency string in content
                         let position = self
@@ -334,7 +334,7 @@ impl PypiParser {
 
         let mut dependencies = Vec::new();
 
-        for (name, value) in deps_table.iter() {
+        for (name, value) in deps_table {
             // Skip Python version constraint
             if name == "python" {
                 continue;
@@ -368,13 +368,13 @@ impl PypiParser {
 
         let mut dependencies = Vec::new();
 
-        for (group_name, group_item) in groups_table.iter() {
+        for (group_name, group_item) in groups_table {
             if let Some(group_table) = group_item.as_table()
                 && let Some(deps_item) = group_table.get("dependencies")
                 && let Some(deps_table) = deps_item.as_table()
             {
-                for (name, value) in deps_table.iter() {
-                    let section_path = format!("tool.poetry.group.{}.dependencies", group_name);
+                for (name, value) in deps_table {
+                    let section_path = format!("tool.poetry.group.{group_name}.dependencies");
                     let position = self.find_table_key_position(content, &section_path, name);
 
                     match self.parse_poetry_dependency(name, value, position) {
@@ -429,7 +429,7 @@ impl PypiParser {
                     let extras_joined = requirement
                         .extras
                         .iter()
-                        .map(|e| e.to_string())
+                        .map(std::string::ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(",");
                     extras_joined.len() + 2 // +2 for [ and ]
@@ -459,7 +459,7 @@ impl PypiParser {
                         None,
                         None,
                         PypiDependencySource::Git {
-                            url: url_str.clone(),
+                            url: url_str,
                             rev: None,
                         },
                     )
@@ -606,8 +606,7 @@ impl PypiParser {
         }
 
         Err(PypiError::unsupported_format(format!(
-            "Unsupported Poetry dependency format for '{}'",
-            name
+            "Unsupported Poetry dependency format for '{name}'"
         )))
     }
 
@@ -648,7 +647,7 @@ impl PypiParser {
                         // pos is now at the start of dep_str (after opening quote)
                         let before = &content[..pos];
                         let line = before.chars().filter(|&c| c == '\n').count() as u32;
-                        let last_newline = before.rfind('\n').map(|p| p + 1).unwrap_or(0);
+                        let last_newline = before.rfind('\n').map_or(0, |p| p + 1);
                         let character = (pos - last_newline) as u32;
 
                         used_positions.insert(pos);
@@ -664,18 +663,18 @@ impl PypiParser {
     /// Find position of table key in source content.
     fn find_table_key_position(&self, content: &str, section: &str, key: &str) -> Option<Position> {
         // Find section first
-        let section_marker = format!("[{}]", section);
+        let section_marker = format!("[{section}]");
         let section_start = content.find(&section_marker)?;
 
         // Find the key after the section
         let after_section = &content[section_start..];
-        let key_pattern = format!("{} = ", key);
+        let key_pattern = format!("{key} = ");
         let key_pos = after_section.find(&key_pattern)?;
 
         let total_offset = section_start + key_pos;
         let before_key = &content[..total_offset];
         let line = before_key.chars().filter(|&c| c == '\n').count() as u32;
-        let last_newline = before_key.rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let last_newline = before_key.rfind('\n').map_or(0, |p| p + 1);
         let character = (total_offset - last_newline) as u32;
 
         Some(Position::new(line, character))

@@ -33,11 +33,11 @@ fn bench_cache_lookup(c: &mut Criterion) {
     cache.insert_for_bench(url.to_string(), response);
 
     group.bench_function("cache_hit", |b| {
-        b.iter(|| cache.get_for_bench(black_box(url)))
+        b.iter(|| cache.get_for_bench(black_box(url)));
     });
 
     group.bench_function("cache_miss", |b| {
-        b.iter(|| cache.get_for_bench(black_box("https://nonexistent.url")))
+        b.iter(|| cache.get_for_bench(black_box("https://nonexistent.url")));
     });
 
     group.finish();
@@ -72,27 +72,27 @@ fn bench_cache_insert(c: &mut Criterion) {
         let cache = HttpCache::new();
         let mut i = 0;
         b.iter(|| {
-            cache.insert_for_bench(format!("https://url-{}", i), response_small.clone());
+            cache.insert_for_bench(format!("https://url-{i}"), response_small.clone());
             i += 1;
-        })
+        });
     });
 
     group.bench_function("insert_medium_10KB", |b| {
         let cache = HttpCache::new();
         let mut i = 0;
         b.iter(|| {
-            cache.insert_for_bench(format!("https://url-{}", i), response_medium.clone());
+            cache.insert_for_bench(format!("https://url-{i}"), response_medium.clone());
             i += 1;
-        })
+        });
     });
 
     group.bench_function("insert_large_1MB", |b| {
         let cache = HttpCache::new();
         let mut i = 0;
         b.iter(|| {
-            cache.insert_for_bench(format!("https://url-{}", i), response_large.clone());
+            cache.insert_for_bench(format!("https://url-{i}"), response_large.clone());
             i += 1;
-        })
+        });
     });
 
     group.finish();
@@ -108,11 +108,11 @@ fn bench_arc_cloning(c: &mut Criterion) {
     let large_data = Arc::new(vec![0u8; 1_000_000]);
 
     group.bench_function("clone_small_100B", |b| {
-        b.iter(|| Arc::clone(black_box(&small_data)))
+        b.iter(|| Arc::clone(black_box(&small_data)));
     });
 
     group.bench_function("clone_large_1MB", |b| {
-        b.iter(|| Arc::clone(black_box(&large_data)))
+        b.iter(|| Arc::clone(black_box(&large_data)));
     });
 
     // Compare with actual Vec cloning to show the benefit
@@ -120,11 +120,11 @@ fn bench_arc_cloning(c: &mut Criterion) {
     let large_vec = vec![0u8; 1_000_000];
 
     group.bench_function("vec_clone_small_100B", |b| {
-        b.iter(|| black_box(&small_vec).clone())
+        b.iter(|| black_box(&small_vec).clone());
     });
 
     group.bench_function("vec_clone_large_1MB", |b| {
-        b.iter(|| black_box(&large_vec).clone())
+        b.iter(|| black_box(&large_vec).clone());
     });
 
     group.finish();
@@ -146,11 +146,11 @@ fn bench_concurrent_access(c: &mut Criterion) {
     for i in 0..100 {
         let response = CachedResponse {
             body: Bytes::from(vec![i as u8; 100]),
-            etag: Some(format!("\"etag-{}\"", i)),
+            etag: Some(format!("\"etag-{i}\"")),
             last_modified: None,
             fetched_at: Instant::now(),
         };
-        cache.insert_for_bench(format!("https://url-{}", i), response);
+        cache.insert_for_bench(format!("https://url-{i}"), response);
     }
 
     group.bench_function("concurrent_reads_10_tasks", |b| {
@@ -169,8 +169,8 @@ fn bench_concurrent_access(c: &mut Criterion) {
                 for handle in handles {
                     let _ = handle.await;
                 }
-            })
-        })
+            });
+        });
     });
 
     group.finish();
@@ -184,11 +184,11 @@ fn bench_cache_eviction(c: &mut Criterion) {
     for i in 0..990 {
         let response = CachedResponse {
             body: Bytes::from(vec![i as u8; 100]),
-            etag: Some(format!("\"etag-{}\"", i)),
+            etag: Some(format!("\"etag-{i}\"")),
             last_modified: None,
             fetched_at: Instant::now(),
         };
-        cache.insert_for_bench(format!("https://url-{}", i), response);
+        cache.insert_for_bench(format!("https://url-{i}"), response);
     }
 
     c.bench_function("cache_eviction_trigger", |b| {
@@ -196,13 +196,13 @@ fn bench_cache_eviction(c: &mut Criterion) {
         b.iter(|| {
             let response = CachedResponse {
                 body: Bytes::from(vec![i as u8; 100]),
-                etag: Some(format!("\"etag-{}\"", i)),
+                etag: Some(format!("\"etag-{i}\"")),
                 last_modified: None,
                 fetched_at: Instant::now(),
             };
-            cache.insert_for_bench(format!("https://url-{}", i), response);
+            cache.insert_for_bench(format!("https://url-{i}"), response);
             i += 1;
-        })
+        });
     });
 }
 
@@ -223,23 +223,23 @@ fn bench_url_formatting(c: &mut Criterion) {
                 &package_name[2..3],
                 package_name
             );
-            format!("https://index.crates.io/{}", path)
-        })
+            format!("https://index.crates.io/{path}")
+        });
     });
 
     // npm registry URL
     group.bench_function("npm_registry", |b| {
-        b.iter(|| format!("https://registry.npmjs.org/{}", black_box(package_name)))
+        b.iter(|| format!("https://registry.npmjs.org/{}", black_box(package_name)));
     });
 
     // PyPI simple API URL
     group.bench_function("pypi_simple_api", |b| {
-        b.iter(|| format!("https://pypi.org/simple/{}/", black_box(package_name)))
+        b.iter(|| format!("https://pypi.org/simple/{}/", black_box(package_name)));
     });
 
     // PyPI JSON API URL
     group.bench_function("pypi_json_api", |b| {
-        b.iter(|| format!("https://pypi.org/pypi/{}/json", black_box(package_name)))
+        b.iter(|| format!("https://pypi.org/pypi/{}/json", black_box(package_name)));
     });
 
     group.finish();
@@ -286,15 +286,15 @@ fn bench_json_parsing(c: &mut Criterion) {
     large_json.push_str("}}");
 
     group.bench_function("small_simple_object", |b| {
-        b.iter(|| serde_json::from_str::<Value>(black_box(small_json)))
+        b.iter(|| serde_json::from_str::<Value>(black_box(small_json)));
     });
 
     group.bench_function("medium_nested_object", |b| {
-        b.iter(|| serde_json::from_str::<Value>(black_box(medium_json)))
+        b.iter(|| serde_json::from_str::<Value>(black_box(medium_json)));
     });
 
     group.bench_function("large_100_versions", |b| {
-        b.iter(|| serde_json::from_str::<Value>(black_box(&large_json)))
+        b.iter(|| serde_json::from_str::<Value>(black_box(&large_json)));
     });
 
     group.finish();
@@ -312,7 +312,7 @@ fn bench_allocations(c: &mut Criterion) {
                 v.push(i);
             }
             v
-        })
+        });
     });
 
     // Vec without capacity (multiple reallocations)
@@ -323,7 +323,7 @@ fn bench_allocations(c: &mut Criterion) {
                 v.push(i);
             }
             v
-        })
+        });
     });
 
     // String with capacity
@@ -331,10 +331,10 @@ fn bench_allocations(c: &mut Criterion) {
         b.iter(|| {
             let mut s = String::with_capacity(1000);
             for i in 0..100 {
-                s.push_str(&format!("item-{}", i));
+                s.push_str(&format!("item-{i}"));
             }
             s
-        })
+        });
     });
 
     // String without capacity
@@ -342,10 +342,10 @@ fn bench_allocations(c: &mut Criterion) {
         b.iter(|| {
             let mut s = String::new();
             for i in 0..100 {
-                s.push_str(&format!("item-{}", i));
+                s.push_str(&format!("item-{i}"));
             }
             s
-        })
+        });
     });
 
     group.finish();

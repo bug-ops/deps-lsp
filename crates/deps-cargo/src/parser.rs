@@ -178,7 +178,7 @@ fn parse_dependencies_section(
 ) -> Result<Vec<ParsedDependency>> {
     let mut deps = Vec::new();
 
-    for (key, value) in table.iter() {
+    for (key, value) in table {
         let name = key.to_string();
 
         let name_range = compute_name_range_from_value(content, line_table, &name, value);
@@ -197,7 +197,7 @@ fn parse_dependencies_section(
 
         match value {
             Item::Value(Value::String(s)) => {
-                dep.version_req = Some(s.value().to_string());
+                dep.version_req = Some(s.value().clone());
                 if let Some(span) = s.span() {
                     dep.version_range = Some(span_to_range_with_table(
                         content, line_table, span.start, span.end,
@@ -270,7 +270,7 @@ fn parse_inline_table_dependency(
     content: &str,
     line_table: &LineOffsetTable,
 ) -> Result<()> {
-    for (key, value) in table.iter() {
+    for (key, value) in table {
         match key {
             "version" => {
                 if let Some(s) = value.as_str() {
@@ -327,7 +327,7 @@ fn parse_table_dependency(
     content: &str,
     line_table: &LineOffsetTable,
 ) -> Result<()> {
-    for (key, item) in table.iter() {
+    for (key, item) in table {
         let Item::Value(value) = item else {
             continue;
         };
@@ -399,7 +399,7 @@ fn span_to_range_with_table(
 fn find_workspace_root(doc_uri: &Uri) -> Result<Option<PathBuf>> {
     let path = doc_uri
         .to_file_path()
-        .ok_or_else(|| CargoError::invalid_uri(format!("{:?}", doc_uri)))?;
+        .ok_or_else(|| CargoError::invalid_uri(format!("{doc_uri:?}")))?;
 
     let mut current = path.parent();
 
@@ -541,8 +541,8 @@ serde = { version = "1.0", features = ["derive"] }"#;
 
     #[test]
     fn test_parse_workspace_inheritance() {
-        let toml = r#"[dependencies]
-serde = { workspace = true }"#;
+        let toml = r"[dependencies]
+serde = { workspace = true }";
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert!(result.dependencies[0].workspace_inherited);
@@ -630,7 +630,7 @@ serde = "1.0"#;
 
     #[test]
     fn test_empty_dependencies() {
-        let toml = r#"[dependencies]"#;
+        let toml = r"[dependencies]";
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
         assert_eq!(result.dependencies.len(), 0);
     }

@@ -176,7 +176,7 @@ fn parse_dependency_section(
 
         // Calculate positions for name and version
         let (name_range, version_range) =
-            find_dependency_positions(content, name, &version_req, line_table);
+            find_dependency_positions(content, name, version_req.as_ref(), line_table);
 
         result.push(NpmDependency {
             name: name.clone(),
@@ -197,13 +197,13 @@ fn parse_dependency_section(
 fn find_dependency_positions(
     content: &str,
     name: &str,
-    version_req: &Option<String>,
+    version_req: Option<&String>,
     line_table: &LineOffsetTable,
 ) -> (Range, Option<Range>) {
     let mut name_range = Range::default();
     let mut version_range = None;
 
-    let name_pattern = format!("\"{}\"", name);
+    let name_pattern = format!("\"{name}\"");
 
     // Find all occurrences of the name pattern and check which one is a dependency key
     let mut search_start = 0;
@@ -226,7 +226,7 @@ fn find_dependency_positions(
 
         // Find version position (after the colon)
         if let Some(version) = version_req {
-            let version_search = format!("\"{}\"", version);
+            let version_search = format!("\"{version}\"");
             // Search for version only in the portion after the colon
             let colon_offset =
                 name_start_idx + name_pattern.len() + (after_name.len() - trimmed.len());

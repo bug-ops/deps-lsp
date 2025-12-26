@@ -79,7 +79,7 @@ pub async fn load_document_from_disk(uri: &Uri) -> Result<String> {
         Some(p) => p,
         None => {
             tracing::debug!("Cannot load non-file URI: {:?}", uri);
-            return Err(DepsError::InvalidUri(format!("{:?}", uri)));
+            return Err(DepsError::InvalidUri(format!("{uri:?}")));
         }
     };
 
@@ -98,8 +98,7 @@ pub async fn load_document_from_disk(uri: &Uri) -> Result<String> {
                     MAX_FILE_SIZE
                 );
                 return Err(DepsError::CacheError(format!(
-                    "file too large: {} bytes (max: {} bytes)",
-                    size, MAX_FILE_SIZE
+                    "file too large: {size} bytes (max: {MAX_FILE_SIZE} bytes)"
                 )));
             }
 
@@ -383,14 +382,12 @@ serde = "1.0"
                 Err(DepsError::CacheError(msg)) => {
                     assert!(
                         msg.contains("file too large"),
-                        "Error message should indicate file size issue: {}",
-                        msg
+                        "Error message should indicate file size issue: {msg}"
                     );
                     assert!(
                         msg.contains(&beyond_limit.to_string())
                             || msg.contains(&(beyond_limit + 1).to_string()),
-                        "Error should mention actual file size: {}",
-                        msg
+                        "Error should mention actual file size: {msg}"
                     );
                 }
                 _ => panic!("Expected CacheError for oversized file"),

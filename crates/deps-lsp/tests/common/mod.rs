@@ -8,13 +8,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 
 /// LSP test client for communicating with the server binary.
-pub struct LspClient {
+pub(crate) struct LspClient {
     process: Child,
 }
 
 impl LspClient {
     /// Spawn the deps-lsp binary.
-    pub fn spawn() -> Self {
+    pub(crate) fn spawn() -> Self {
         let process = Command::new(env!("CARGO_BIN_EXE_deps-lsp"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -26,7 +26,7 @@ impl LspClient {
     }
 
     /// Send a JSON-RPC message to the server.
-    pub fn send(&mut self, message: &Value) {
+    pub(crate) fn send(&mut self, message: &Value) {
         let body = serde_json::to_string(message).unwrap();
         let header = format!("Content-Length: {}\r\n\r\n", body.len());
 
@@ -40,7 +40,7 @@ impl LspClient {
     ///
     /// Skips notifications and returns the first response with matching id,
     /// or any response/error if no id filter is provided.
-    pub fn read_response(&mut self, expected_id: Option<i64>) -> Value {
+    pub(crate) fn read_response(&mut self, expected_id: Option<i64>) -> Value {
         let stdout = self.process.stdout.as_mut().expect("stdout not captured");
         let mut reader = BufReader::new(stdout);
 
@@ -52,9 +52,7 @@ impl LspClient {
                 let bytes_read = reader.read_line(&mut line).expect("Failed to read header");
 
                 // EOF - server closed connection
-                if bytes_read == 0 {
-                    panic!("Server closed connection unexpectedly");
-                }
+                assert!(bytes_read != 0, "Server closed connection unexpectedly");
 
                 if line == "\r\n" || line == "\n" {
                     break;
@@ -104,7 +102,7 @@ impl LspClient {
     }
 
     /// Initialize the LSP session.
-    pub fn initialize(&mut self) -> Value {
+    pub(crate) fn initialize(&mut self) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -141,7 +139,7 @@ impl LspClient {
     }
 
     /// Open a text document.
-    pub fn did_open(&mut self, uri: &str, language_id: &str, text: &str) {
+    pub(crate) fn did_open(&mut self, uri: &str, language_id: &str, text: &str) {
         self.send(&json!({
             "jsonrpc": "2.0",
             "method": "textDocument/didOpen",
@@ -157,7 +155,7 @@ impl LspClient {
     }
 
     /// Request hover information.
-    pub fn hover(&mut self, id: i64, uri: &str, line: u32, character: u32) -> Value {
+    pub(crate) fn hover(&mut self, id: i64, uri: &str, line: u32, character: u32) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -171,7 +169,7 @@ impl LspClient {
     }
 
     /// Request inlay hints.
-    pub fn inlay_hints(&mut self, id: i64, uri: &str) -> Value {
+    pub(crate) fn inlay_hints(&mut self, id: i64, uri: &str) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -188,7 +186,7 @@ impl LspClient {
     }
 
     /// Request completions.
-    pub fn completion(&mut self, id: i64, uri: &str, line: u32, character: u32) -> Value {
+    pub(crate) fn completion(&mut self, id: i64, uri: &str, line: u32, character: u32) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -202,7 +200,7 @@ impl LspClient {
     }
 
     /// Shutdown the server.
-    pub fn shutdown(&mut self) -> Value {
+    pub(crate) fn shutdown(&mut self) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": 999,

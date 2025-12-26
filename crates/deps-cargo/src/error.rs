@@ -137,20 +137,18 @@ impl CargoError {
 impl From<deps_core::DepsError> for CargoError {
     fn from(err: deps_core::DepsError) -> Self {
         match err {
-            deps_core::DepsError::ParseError { source, .. } => {
-                CargoError::CacheError(source.to_string())
-            }
-            deps_core::DepsError::CacheError(msg) => CargoError::CacheError(msg),
-            deps_core::DepsError::InvalidVersionReq(msg) => CargoError::InvalidVersionSpecifier {
+            deps_core::DepsError::ParseError { source, .. } => Self::CacheError(source.to_string()),
+            deps_core::DepsError::CacheError(msg) => Self::CacheError(msg),
+            deps_core::DepsError::InvalidVersionReq(msg) => Self::InvalidVersionSpecifier {
                 specifier: String::new(),
                 message: msg,
             },
-            deps_core::DepsError::Io(e) => CargoError::Io(e),
-            deps_core::DepsError::Json(e) => CargoError::ApiResponseError {
+            deps_core::DepsError::Io(e) => Self::Io(e),
+            deps_core::DepsError::Json(e) => Self::ApiResponseError {
                 package: String::new(),
                 source: e,
             },
-            other => CargoError::CacheError(other.to_string()),
+            other => Self::CacheError(other.to_string()),
         }
     }
 }
@@ -159,32 +157,28 @@ impl From<deps_core::DepsError> for CargoError {
 impl From<CargoError> for deps_core::DepsError {
     fn from(err: CargoError) -> Self {
         match err {
-            CargoError::TomlParseError { source } => deps_core::DepsError::ParseError {
+            CargoError::TomlParseError { source } => Self::ParseError {
                 file_type: "Cargo.toml".into(),
                 source: Box::new(source),
             },
-            CargoError::InvalidVersionSpecifier { message, .. } => {
-                deps_core::DepsError::InvalidVersionReq(message)
-            }
+            CargoError::InvalidVersionSpecifier { message, .. } => Self::InvalidVersionReq(message),
             CargoError::PackageNotFound { package } => {
-                deps_core::DepsError::CacheError(format!("Crate '{}' not found", package))
+                Self::CacheError(format!("Crate '{package}' not found"))
             }
-            CargoError::RegistryError { package, source } => deps_core::DepsError::ParseError {
-                file_type: format!("crates.io registry for {}", package),
+            CargoError::RegistryError { package, source } => Self::ParseError {
+                file_type: format!("crates.io registry for {package}"),
                 source,
             },
-            CargoError::ApiResponseError { source, .. } => deps_core::DepsError::Json(source),
-            CargoError::InvalidStructure { message } => deps_core::DepsError::CacheError(message),
+            CargoError::ApiResponseError { source, .. } => Self::Json(source),
+            CargoError::InvalidStructure { message } => Self::CacheError(message),
             CargoError::MissingField { section, field } => {
-                deps_core::DepsError::CacheError(format!("Missing '{}' in {}", field, section))
+                Self::CacheError(format!("Missing '{field}' in {section}"))
             }
-            CargoError::WorkspaceError { message } => deps_core::DepsError::CacheError(message),
-            CargoError::InvalidUri { uri } => {
-                deps_core::DepsError::CacheError(format!("Invalid URI: {}", uri))
-            }
-            CargoError::CacheError(msg) => deps_core::DepsError::CacheError(msg),
-            CargoError::Io(e) => deps_core::DepsError::Io(e),
-            CargoError::Other(e) => deps_core::DepsError::CacheError(e.to_string()),
+            CargoError::WorkspaceError { message } => Self::CacheError(message),
+            CargoError::InvalidUri { uri } => Self::CacheError(format!("Invalid URI: {uri}")),
+            CargoError::CacheError(msg) => Self::CacheError(msg),
+            CargoError::Io(e) => Self::Io(e),
+            CargoError::Other(e) => Self::CacheError(e.to_string()),
         }
     }
 }

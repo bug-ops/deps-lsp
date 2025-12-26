@@ -149,7 +149,7 @@ pub fn detect_completion_context(
 /// LSP ranges are inclusive of start, exclusive of end.
 /// We also consider the position to be "in range" if it's immediately
 /// after the range end (for completion after typing).
-fn position_in_range(position: Position, range: Range) -> bool {
+const fn position_in_range(position: Position, range: Range) -> bool {
     // Before range start
     if position.line < range.start.line {
         return false;

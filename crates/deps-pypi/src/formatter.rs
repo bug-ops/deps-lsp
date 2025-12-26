@@ -22,7 +22,7 @@ impl EcosystemFormatter for PypiFormatter {
             .and_then(|v| v.checked_add(1))
             .unwrap_or(1);
 
-        format!(">={},<{}", version, next_major)
+        format!(">={version},<{next_major}")
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -38,7 +38,7 @@ impl EcosystemFormatter for PypiFormatter {
     }
 
     fn package_url(&self, name: &str) -> String {
-        format!("https://pypi.org/project/{}", name)
+        format!("https://pypi.org/project/{name}")
     }
 
     fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
@@ -50,8 +50,7 @@ impl EcosystemFormatter for PypiFormatter {
 
         let end_char = dep
             .version_range()
-            .map(|r| r.end.character)
-            .unwrap_or(name_range.end.character);
+            .map_or(name_range.end.character, |r| r.end.character);
 
         let start_char = name_range.start.character.saturating_sub(2);
         let end_char = end_char.saturating_add(2);
@@ -168,7 +167,7 @@ mod tests {
         }
 
         impl deps_core::Dependency for MockDep {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "test-package"
             }
             fn name_range(&self) -> Range {
