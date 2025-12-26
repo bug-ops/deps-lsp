@@ -1,0 +1,140 @@
+---
+source: crates/deps-go/src/parser.rs
+assertion_line: 502
+expression: result
+---
+GoParseResult {
+    dependencies: [
+        GoDependency {
+            module_path: "github.com/gin-gonic/gin",
+            module_path_range: Range {
+                start: Position {
+                    line: 5,
+                    character: 4,
+                },
+                end: Position {
+                    line: 5,
+                    character: 28,
+                },
+            },
+            version: Some(
+                "v1.9.1",
+            ),
+            version_range: Some(
+                Range {
+                    start: Position {
+                        line: 5,
+                        character: 29,
+                    },
+                    end: Position {
+                        line: 5,
+                        character: 35,
+                    },
+                },
+            ),
+            directive: Require,
+            indirect: false,
+        },
+        GoDependency {
+            module_path: "golang.org/x/crypto",
+            module_path_range: Range {
+                start: Position {
+                    line: 6,
+                    character: 4,
+                },
+                end: Position {
+                    line: 6,
+                    character: 23,
+                },
+            },
+            version: Some(
+                "v0.17.0",
+            ),
+            version_range: Some(
+                Range {
+                    start: Position {
+                        line: 6,
+                        character: 24,
+                    },
+                    end: Position {
+                        line: 6,
+                        character: 31,
+                    },
+                },
+            ),
+            directive: Require,
+            indirect: true,
+        },
+        GoDependency {
+            module_path: "github.com/old/module",
+            module_path_range: Range {
+                start: Position {
+                    line: 9,
+                    character: 8,
+                },
+                end: Position {
+                    line: 9,
+                    character: 29,
+                },
+            },
+            version: None,
+            version_range: None,
+            directive: Replace,
+            indirect: false,
+        },
+        GoDependency {
+            module_path: "github.com/bad/module",
+            module_path_range: Range {
+                start: Position {
+                    line: 11,
+                    character: 8,
+                },
+                end: Position {
+                    line: 11,
+                    character: 29,
+                },
+            },
+            version: Some(
+                "v0.1.0",
+            ),
+            version_range: Some(
+                Range {
+                    start: Position {
+                        line: 11,
+                        character: 30,
+                    },
+                    end: Position {
+                        line: 11,
+                        character: 36,
+                    },
+                },
+            ),
+            directive: Exclude,
+            indirect: false,
+        },
+    ],
+    module_path: Some(
+        "example.com/myapp",
+    ),
+    go_version: Some(
+        "1.21",
+    ),
+    uri: Uri(
+        Uri {
+            scheme: "file",
+            authority: Some(
+                Authority {
+                    userinfo: None,
+                    host: "",
+                    host_parsed: RegName(
+                        "",
+                    ),
+                    port: None,
+                },
+            ),
+            path: "/test/go.mod",
+            query: None,
+            fragment: None,
+        },
+    ),
+}

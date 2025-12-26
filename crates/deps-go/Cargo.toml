@@ -1,0 +1,25 @@
+[package]
+name = "deps-go"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Go module support for deps-lsp"
+
+[dependencies]
+deps-core = { workspace = true }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-lsp-server.workspace = true
+tracing.workspace = true
+regex.workspace = true
+once_cell.workspace = true
+semver.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
