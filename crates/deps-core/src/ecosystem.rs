@@ -369,7 +369,7 @@ mod tests {
     fn test_dependency_default_features() {
         struct MockDep;
         impl Dependency for MockDep {
-            fn name(&self) -> &str {
+            fn name(&self) -> &'static str {
                 "test"
             }
             fn name_range(&self) -> tower_lsp_server::ls_types::Range {

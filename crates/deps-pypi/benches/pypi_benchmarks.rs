@@ -161,24 +161,24 @@ fn bench_pypi_parsing(c: &mut Criterion) {
     let uri = bench_uri();
 
     group.bench_function("pep621_small_5_deps", |b| {
-        b.iter(|| parser.parse_content(black_box(SMALL_PEP621), &uri))
+        b.iter(|| parser.parse_content(black_box(SMALL_PEP621), &uri));
     });
 
     group.bench_function("pep621_medium_25_deps", |b| {
-        b.iter(|| parser.parse_content(black_box(MEDIUM_PEP621), &uri))
+        b.iter(|| parser.parse_content(black_box(MEDIUM_PEP621), &uri));
     });
 
     let large_poetry = generate_large_poetry();
     group.bench_function("poetry_large_100_deps", |b| {
-        b.iter(|| parser.parse_content(black_box(&large_poetry), &uri))
+        b.iter(|| parser.parse_content(black_box(&large_poetry), &uri));
     });
 
     group.bench_function("pep735_format", |b| {
-        b.iter(|| parser.parse_content(black_box(PEP735_FORMAT), &uri))
+        b.iter(|| parser.parse_content(black_box(PEP735_FORMAT), &uri));
     });
 
     group.bench_function("mixed_format", |b| {
-        b.iter(|| parser.parse_content(black_box(MIXED_FORMAT), &uri))
+        b.iter(|| parser.parse_content(black_box(MIXED_FORMAT), &uri));
     });
 
     group.finish();
@@ -213,7 +213,7 @@ fn bench_pep508_parsing(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(name), &req_str, |b, req_str| {
             b.iter(|| {
                 let _: Result<Requirement, _> = Requirement::from_str(black_box(req_str));
-            })
+            });
         });
     }
 
@@ -232,20 +232,20 @@ fn bench_pep440_version_matching(c: &mut Criterion) {
     // Simple version specifier
     let simple = VersionSpecifiers::from_str(">=2.28.0").unwrap();
     group.bench_function("simple_specifier", |b| {
-        b.iter(|| simple.contains(black_box(&latest)))
+        b.iter(|| simple.contains(black_box(&latest)));
     });
 
     // Complex version specifier
     let complex = VersionSpecifiers::from_str(">=2.0,<3.0,!=2.28.1").unwrap();
     group.bench_function("complex_specifier", |b| {
-        b.iter(|| complex.contains(black_box(&latest)))
+        b.iter(|| complex.contains(black_box(&latest)));
     });
 
     // Pre-release handling
     let prerelease_version = Version::from_str("3.0.0b1").unwrap();
     let prerelease_spec = VersionSpecifiers::from_str(">=3.0.0").unwrap();
     group.bench_function("prerelease_check", |b| {
-        b.iter(|| prerelease_spec.contains(black_box(&prerelease_version)))
+        b.iter(|| prerelease_spec.contains(black_box(&prerelease_version)));
     });
 
     // Find latest matching version
@@ -261,7 +261,7 @@ fn bench_pep440_version_matching(c: &mut Criterion) {
                 .filter(|v| simple.contains(v))
                 .max()
                 .cloned()
-        })
+        });
     });
 
     group.finish();
@@ -292,15 +292,15 @@ dependencies = ["numpy>=1.24; python_version>='3.9'"]
 "#;
 
     group.bench_function("simple_dependency", |b| {
-        b.iter(|| parser.parse_content(black_box(simple), &uri))
+        b.iter(|| parser.parse_content(black_box(simple), &uri));
     });
 
     group.bench_function("with_extras", |b| {
-        b.iter(|| parser.parse_content(black_box(with_extras), &uri))
+        b.iter(|| parser.parse_content(black_box(with_extras), &uri));
     });
 
     group.bench_function("with_markers", |b| {
-        b.iter(|| parser.parse_content(black_box(with_markers), &uri))
+        b.iter(|| parser.parse_content(black_box(with_markers), &uri));
     });
 
     group.finish();
@@ -347,7 +347,7 @@ package = { url = "https://example.com/package.whl" }"#,
 
     for (name, content) in sources {
         group.bench_with_input(BenchmarkId::from_parameter(name), &content, |b, content| {
-            b.iter(|| parser.parse_content(black_box(content), &uri))
+            b.iter(|| parser.parse_content(black_box(content), &uri));
         });
     }
 
@@ -378,7 +378,7 @@ dev = [
 "#;
 
     c.bench_function("parsing_with_comments", |b| {
-        b.iter(|| parser.parse_content(black_box(with_comments), &uri))
+        b.iter(|| parser.parse_content(black_box(with_comments), &uri));
     });
 }
 
@@ -398,7 +398,7 @@ dependencies = [
 "#;
 
     c.bench_function("unicode_parsing", |b| {
-        b.iter(|| parser.parse_content(black_box(unicode_toml), &uri))
+        b.iter(|| parser.parse_content(black_box(unicode_toml), &uri));
     });
 }
 
@@ -438,7 +438,7 @@ django = ">=4.0,<5.0""#,
 
     for (name, content) in constraints {
         group.bench_with_input(BenchmarkId::from_parameter(name), &content, |b, content| {
-            b.iter(|| parser.parse_content(black_box(content), &uri))
+            b.iter(|| parser.parse_content(black_box(content), &uri));
         });
     }
 

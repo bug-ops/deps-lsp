@@ -116,7 +116,7 @@ serde = "1.0.0"
             let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
             let config = DiagnosticsConfig::default();
 
-            let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
+            let doc_state = DocumentState::new(Ecosystem::Cargo, String::new(), vec![]);
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();

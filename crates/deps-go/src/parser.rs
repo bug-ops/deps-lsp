@@ -13,7 +13,6 @@
 
 use crate::error::Result;
 use crate::types::{GoDependency, GoDirective};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -72,16 +71,19 @@ pub fn parse_go_mod(content: &str, doc_uri: &Uri) -> Result<GoParseResult> {
     let mut module_path = None;
     let mut go_version = None;
 
-    static MODULE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*module\s+(\S+)").unwrap());
-    static GO_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*go\s+(\S+)").unwrap());
-    static REQUIRE_SINGLE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^\s*require\s+(\S+)\s+(\S+)").unwrap());
-    static REQUIRE_BLOCK_START: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^\s*require\s*\(").unwrap());
-    static REPLACE_PATTERN: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^\s*replace\s+(\S+)\s+(?:(\S+)\s+)?=>\s+(\S+)\s+(\S+)").unwrap());
-    static EXCLUDE_PATTERN: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^\s*exclude\s+(\S+)\s+(\S+)").unwrap());
+    static MODULE_PATTERN: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*module\s+(\S+)").unwrap());
+    static GO_PATTERN: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*go\s+(\S+)").unwrap());
+    static REQUIRE_SINGLE: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*require\s+(\S+)\s+(\S+)").unwrap());
+    static REQUIRE_BLOCK_START: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*require\s*\(").unwrap());
+    static REPLACE_PATTERN: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^\s*replace\s+(\S+)\s+(?:(\S+)\s+)?=>\s+(\S+)\s+(\S+)").unwrap()
+    });
+    static EXCLUDE_PATTERN: std::sync::LazyLock<Regex> =
+        std::sync::LazyLock::new(|| Regex::new(r"^\s*exclude\s+(\S+)\s+(\S+)").unwrap());
 
     let mut in_require_block = false;
     let mut line_offset = 0;
@@ -331,12 +333,12 @@ mod tests {
 
     #[test]
     fn test_parse_single_require() {
-        let content = r#"module example.com/myapp
+        let content = r"module example.com/myapp
 
 go 1.21
 
 require github.com/gin-gonic/gin v1.9.1
-"#;
+";
         let result = parse_go_mod(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(
@@ -363,11 +365,11 @@ require github.com/gin-gonic/gin v1.9.1
 
     #[test]
     fn test_parse_require_block() {
-        let content = r#"require (
+        let content = r"require (
     github.com/gin-gonic/gin v1.9.1
     golang.org/x/crypto v0.17.0 // indirect
 )
-"#;
+";
         let result = parse_go_mod(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 2);
         assert!(!result.dependencies[0].indirect);
@@ -433,7 +435,7 @@ require github.com/gin-gonic/gin v1.9.1
 
     #[test]
     fn test_complex_go_mod() {
-        let content = r#"module example.com/myapp
+        let content = r"module example.com/myapp
 
 go 1.21
 
@@ -445,7 +447,7 @@ require (
 replace github.com/old/module => github.com/new/module v1.2.3
 
 exclude github.com/bad/module v0.1.0
-"#;
+";
         let result = parse_go_mod(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 4);
         assert_eq!(result.module_path, Some("example.com/myapp".to_string()));
@@ -487,7 +489,7 @@ exclude github.com/bad/module v0.1.0
 
     #[test]
     fn test_parse_complex_go_mod() {
-        let content = r#"module example.com/myapp
+        let content = r"module example.com/myapp
 
 go 1.21
 
@@ -499,7 +501,7 @@ require (
 replace github.com/old/module => github.com/new/module v1.2.3
 
 exclude github.com/bad/module v0.1.0
-"#;
+";
         let result = parse_go_mod(content, &test_uri()).unwrap();
 
         // Check module metadata

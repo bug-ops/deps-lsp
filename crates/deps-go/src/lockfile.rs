@@ -181,10 +181,10 @@ mod tests {
 
     #[test]
     fn test_parse_simple_go_sum() {
-        let content = r#"
+        let content = r"
 github.com/gin-gonic/gin v1.9.1 h1:4idEAncQnU5cB7BeOkPtxjfCSye0AAm1R0RVIqJ+Jmg=
 github.com/gin-gonic/gin v1.9.1/go.mod h1:hPrL9t9/HBtKc7e/Q7Nb2nqKqTW8mHZy6E7k8m4dLvs=
-"#;
+";
         let packages = parse_go_sum(content);
         assert_eq!(
             packages.get_version("github.com/gin-gonic/gin"),
@@ -194,11 +194,11 @@ github.com/gin-gonic/gin v1.9.1/go.mod h1:hPrL9t9/HBtKc7e/Q7Nb2nqKqTW8mHZy6E7k8m
 
     #[test]
     fn test_parse_multiple_modules() {
-        let content = r#"
+        let content = r"
 github.com/gin-gonic/gin v1.9.1 h1:hash1=
 golang.org/x/sync v0.5.0 h1:hash2=
 github.com/stretchr/testify v1.8.4 h1:hash3=
-"#;
+";
         let packages = parse_go_sum(content);
         assert_eq!(packages.len(), 3);
         assert_eq!(
@@ -214,10 +214,10 @@ github.com/stretchr/testify v1.8.4 h1:hash3=
 
     #[test]
     fn test_skip_go_mod_entries() {
-        let content = r#"
+        let content = r"
 github.com/gin-gonic/gin v1.9.1/go.mod h1:mod_hash=
 github.com/gin-gonic/gin v1.9.1 h1:actual_hash=
-"#;
+";
         let packages = parse_go_sum(content);
         assert_eq!(packages.len(), 1);
         assert_eq!(
@@ -228,10 +228,10 @@ github.com/gin-gonic/gin v1.9.1 h1:actual_hash=
 
     #[test]
     fn test_first_version_wins() {
-        let content = r#"
+        let content = r"
 github.com/pkg/errors v0.9.1 h1:hash1=
 github.com/pkg/errors v0.8.0 h1:hash2=
-"#;
+";
         let packages = parse_go_sum(content);
         assert_eq!(packages.len(), 1);
         // First occurrence should win
@@ -289,11 +289,11 @@ github.com/pkg/errors v0.8.0 h1:hash2=
 
     #[test]
     fn test_malformed_line_ignored() {
-        let content = r#"
+        let content = r"
 github.com/gin-gonic/gin v1.9.1 h1:hash=
 invalid line with only one part
 github.com/valid/pkg v1.0.0 h1:valid_hash=
-"#;
+";
         let packages = parse_go_sum(content);
         // Should only parse the valid lines
         assert_eq!(packages.len(), 2);
@@ -306,12 +306,12 @@ github.com/valid/pkg v1.0.0 h1:valid_hash=
 
     #[tokio::test]
     async fn test_parse_lockfile_simple() {
-        let lockfile_content = r#"
+        let lockfile_content = r"
 github.com/gin-gonic/gin v1.9.1 h1:4idEAncQnU5cB7BeOkPtxjfCSye0AAm1R0RVIqJ+Jmg=
 github.com/gin-gonic/gin v1.9.1/go.mod h1:hPrL9t9/HBtKc7e/Q7Nb2nqKqTW8mHZy6E7k8m4dLvs=
 golang.org/x/sync v0.5.0 h1:60k92dhOjHxJkrq=
 golang.org/x/sync v0.5.0/go.mod h1:RxMgew5V=
-"#;
+";
 
         let temp_dir = tempfile::tempdir().unwrap();
         let lockfile_path = temp_dir.path().join("go.sum");

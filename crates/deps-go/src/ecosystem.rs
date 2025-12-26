@@ -664,12 +664,12 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let content = r#"module example.com/myapp
+        let content = r"module example.com/myapp
 
 go 1.21
 
 require github.com/
-"#;
+";
 
         let uri = Uri::from_file_path("/test/go.mod").unwrap();
         let parse_result = MockParseResult {
@@ -692,10 +692,10 @@ require github.com/
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let content = r#"module example.com/myapp
+        let content = r"module example.com/myapp
 
 go 1.21
-"#;
+";
 
         let uri = Uri::from_file_path("/test/go.mod").unwrap();
         let parse_result = MockParseResult {
@@ -717,12 +717,12 @@ go 1.21
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let content = r#"module example.com/myapp
+        let content = r"module example.com/myapp
 
 go 1.21
 
 require github.com/gin-gonic/gin v1.9.1
-"#;
+";
 
         let uri = Uri::from_file_path("/test/go.mod").unwrap();
 

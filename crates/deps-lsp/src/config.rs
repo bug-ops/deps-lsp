@@ -163,7 +163,7 @@ impl Default for CacheConfig {
 }
 
 // Default value functions
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -175,19 +175,19 @@ fn default_needs_update() -> String {
     "❌ {}".to_string()
 }
 
-fn default_outdated_severity() -> DiagnosticSeverity {
+const fn default_outdated_severity() -> DiagnosticSeverity {
     DiagnosticSeverity::HINT
 }
 
-fn default_unknown_severity() -> DiagnosticSeverity {
+const fn default_unknown_severity() -> DiagnosticSeverity {
     DiagnosticSeverity::WARNING
 }
 
-fn default_yanked_severity() -> DiagnosticSeverity {
+const fn default_yanked_severity() -> DiagnosticSeverity {
     DiagnosticSeverity::WARNING
 }
 
-fn default_refresh_interval() -> u64 {
+const fn default_refresh_interval() -> u64 {
     300 // 5 minutes
 }
 
@@ -235,7 +235,7 @@ impl Default for ColdStartConfig {
     }
 }
 
-fn default_rate_limit_ms() -> u64 {
+const fn default_rate_limit_ms() -> u64 {
     100 // 10 req/sec per URI
 }
 
@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn test_empty_config_deserialization() {
-        let json = r#"{}"#;
+        let json = r"{}";
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         // All fields should use defaults
         assert!(config.inlay_hints.enabled);

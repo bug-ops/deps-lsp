@@ -175,20 +175,20 @@ fn bench_npm_parsing(c: &mut Criterion) {
     let uri = bench_uri();
 
     group.bench_function("small_5_deps", |b| {
-        b.iter(|| parse_package_json(black_box(SMALL_PACKAGE_JSON), &uri))
+        b.iter(|| parse_package_json(black_box(SMALL_PACKAGE_JSON), &uri));
     });
 
     group.bench_function("medium_25_deps", |b| {
-        b.iter(|| parse_package_json(black_box(MEDIUM_PACKAGE_JSON), &uri))
+        b.iter(|| parse_package_json(black_box(MEDIUM_PACKAGE_JSON), &uri));
     });
 
     let large_json = generate_large_package_json();
     group.bench_function("large_100_deps", |b| {
-        b.iter(|| parse_package_json(black_box(&large_json), &uri))
+        b.iter(|| parse_package_json(black_box(&large_json), &uri));
     });
 
     group.bench_function("monorepo_all_sections", |b| {
-        b.iter(|| parse_package_json(black_box(MONOREPO_PACKAGE_JSON), &uri))
+        b.iter(|| parse_package_json(black_box(MONOREPO_PACKAGE_JSON), &uri));
     });
 
     group.finish();
@@ -217,11 +217,11 @@ fn bench_position_tracking(c: &mut Criterion) {
 }"#;
 
     group.bench_function("single_dependency", |b| {
-        b.iter(|| parse_package_json(black_box(single), &uri))
+        b.iter(|| parse_package_json(black_box(single), &uri));
     });
 
     group.bench_function("scoped_packages", |b| {
-        b.iter(|| parse_package_json(black_box(scoped), &uri))
+        b.iter(|| parse_package_json(black_box(scoped), &uri));
     });
 
     group.finish();
@@ -236,7 +236,7 @@ fn bench_registry_parsing(c: &mut Criterion) {
     group.bench_function("npm_registry_response", |b| {
         b.iter(|| {
             let _value: Value = serde_json::from_str(black_box(NPM_REGISTRY_RESPONSE)).unwrap();
-        })
+        });
     });
 
     // Large registry response with 100 versions
@@ -261,7 +261,7 @@ fn bench_registry_parsing(c: &mut Criterion) {
     group.bench_function("large_registry_100_versions", |b| {
         b.iter(|| {
             let _value: Value = serde_json::from_str(black_box(&large_response)).unwrap();
-        })
+        });
     });
 
     group.finish();
@@ -278,24 +278,24 @@ fn bench_version_matching(c: &mut Criterion) {
     // Caret range (most common)
     let caret_range = Range::parse("^4.18.0").unwrap();
     group.bench_function("caret_range", |b| {
-        b.iter(|| caret_range.satisfies(black_box(&latest)))
+        b.iter(|| caret_range.satisfies(black_box(&latest)));
     });
 
     // Tilde range
     let tilde_range = Range::parse("~4.18.0").unwrap();
     group.bench_function("tilde_range", |b| {
-        b.iter(|| tilde_range.satisfies(black_box(&latest)))
+        b.iter(|| tilde_range.satisfies(black_box(&latest)));
     });
 
     // Complex range
     let complex_range = Range::parse(">=4.17.0 <5.0.0").unwrap();
     group.bench_function("complex_range", |b| {
-        b.iter(|| complex_range.satisfies(black_box(&latest)))
+        b.iter(|| complex_range.satisfies(black_box(&latest)));
     });
 
     // Find latest matching version
     let versions: Vec<Version> = (0..20)
-        .map(|i| Version::parse(format!("4.18.{}", i)).unwrap())
+        .map(|i| Version::parse(format!("4.18.{i}")).unwrap())
         .collect();
 
     group.bench_function("find_latest_matching", |b| {
@@ -305,7 +305,7 @@ fn bench_version_matching(c: &mut Criterion) {
                 .filter(|v| caret_range.satisfies(v))
                 .max()
                 .cloned()
-        })
+        });
     });
 
     group.finish();
@@ -335,7 +335,7 @@ fn bench_version_specifiers(c: &mut Criterion) {
     let uri = bench_uri();
     for (name, content) in specifiers {
         group.bench_with_input(BenchmarkId::from_parameter(name), &content, |b, content| {
-            b.iter(|| parse_package_json(black_box(content), &uri))
+            b.iter(|| parse_package_json(black_box(content), &uri));
         });
     }
 
@@ -360,7 +360,7 @@ fn bench_name_collision(c: &mut Criterion) {
 }"#;
 
     c.bench_function("name_collision_in_scripts", |b| {
-        b.iter(|| parse_package_json(black_box(collision_json), &uri))
+        b.iter(|| parse_package_json(black_box(collision_json), &uri));
     });
 }
 
@@ -377,7 +377,7 @@ fn bench_unicode_parsing(c: &mut Criterion) {
 }"#;
 
     c.bench_function("unicode_parsing", |b| {
-        b.iter(|| parse_package_json(black_box(unicode_json), &uri))
+        b.iter(|| parse_package_json(black_box(unicode_json), &uri));
     });
 }
 

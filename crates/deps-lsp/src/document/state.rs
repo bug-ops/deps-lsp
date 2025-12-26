@@ -40,13 +40,13 @@ impl UnifiedDependency {
     pub fn name(&self) -> &str {
         match self {
             #[cfg(feature = "cargo")]
-            UnifiedDependency::Cargo(dep) => &dep.name,
+            Self::Cargo(dep) => &dep.name,
             #[cfg(feature = "npm")]
-            UnifiedDependency::Npm(dep) => &dep.name,
+            Self::Npm(dep) => &dep.name,
             #[cfg(feature = "pypi")]
-            UnifiedDependency::Pypi(dep) => &dep.name,
+            Self::Pypi(dep) => &dep.name,
             #[cfg(feature = "go")]
-            UnifiedDependency::Go(dep) => &dep.module_path,
+            Self::Go(dep) => &dep.module_path,
             _ => unreachable!("no ecosystem features enabled"),
         }
     }
@@ -56,13 +56,13 @@ impl UnifiedDependency {
     pub fn name_range(&self) -> tower_lsp_server::ls_types::Range {
         match self {
             #[cfg(feature = "cargo")]
-            UnifiedDependency::Cargo(dep) => dep.name_range,
+            Self::Cargo(dep) => dep.name_range,
             #[cfg(feature = "npm")]
-            UnifiedDependency::Npm(dep) => dep.name_range,
+            Self::Npm(dep) => dep.name_range,
             #[cfg(feature = "pypi")]
-            UnifiedDependency::Pypi(dep) => dep.name_range,
+            Self::Pypi(dep) => dep.name_range,
             #[cfg(feature = "go")]
-            UnifiedDependency::Go(dep) => dep.module_path_range,
+            Self::Go(dep) => dep.module_path_range,
             _ => unreachable!("no ecosystem features enabled"),
         }
     }
@@ -72,13 +72,13 @@ impl UnifiedDependency {
     pub fn version_req(&self) -> Option<&str> {
         match self {
             #[cfg(feature = "cargo")]
-            UnifiedDependency::Cargo(dep) => dep.version_req.as_deref(),
+            Self::Cargo(dep) => dep.version_req.as_deref(),
             #[cfg(feature = "npm")]
-            UnifiedDependency::Npm(dep) => dep.version_req.as_deref(),
+            Self::Npm(dep) => dep.version_req.as_deref(),
             #[cfg(feature = "pypi")]
-            UnifiedDependency::Pypi(dep) => dep.version_req.as_deref(),
+            Self::Pypi(dep) => dep.version_req.as_deref(),
             #[cfg(feature = "go")]
-            UnifiedDependency::Go(dep) => dep.version.as_deref(),
+            Self::Go(dep) => dep.version.as_deref(),
             _ => unreachable!("no ecosystem features enabled"),
         }
     }
@@ -88,13 +88,13 @@ impl UnifiedDependency {
     pub fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
         match self {
             #[cfg(feature = "cargo")]
-            UnifiedDependency::Cargo(dep) => dep.version_range,
+            Self::Cargo(dep) => dep.version_range,
             #[cfg(feature = "npm")]
-            UnifiedDependency::Npm(dep) => dep.version_range,
+            Self::Npm(dep) => dep.version_range,
             #[cfg(feature = "pypi")]
-            UnifiedDependency::Pypi(dep) => dep.version_range,
+            Self::Pypi(dep) => dep.version_range,
             #[cfg(feature = "go")]
-            UnifiedDependency::Go(dep) => dep.version_range,
+            Self::Go(dep) => dep.version_range,
             _ => unreachable!("no ecosystem features enabled"),
         }
     }
@@ -104,17 +104,17 @@ impl UnifiedDependency {
     pub fn is_registry(&self) -> bool {
         match self {
             #[cfg(feature = "cargo")]
-            UnifiedDependency::Cargo(dep) => {
+            Self::Cargo(dep) => {
                 matches!(dep.source, deps_cargo::DependencySource::Registry)
             }
             #[cfg(feature = "npm")]
-            UnifiedDependency::Npm(_) => true,
+            Self::Npm(_) => true,
             #[cfg(feature = "pypi")]
-            UnifiedDependency::Pypi(dep) => {
+            Self::Pypi(dep) => {
                 matches!(dep.source, deps_pypi::PypiDependencySource::PyPI)
             }
             #[cfg(feature = "go")]
-            UnifiedDependency::Go(_) => true,
+            Self::Go(_) => true,
             _ => unreachable!("no ecosystem features enabled"),
         }
     }
@@ -142,13 +142,13 @@ impl UnifiedVersion {
     pub fn version_string(&self) -> &str {
         match self {
             #[cfg(feature = "cargo")]
-            UnifiedVersion::Cargo(v) => &v.num,
+            Self::Cargo(v) => &v.num,
             #[cfg(feature = "npm")]
-            UnifiedVersion::Npm(v) => &v.version,
+            Self::Npm(v) => &v.version,
             #[cfg(feature = "pypi")]
-            UnifiedVersion::Pypi(v) => &v.version,
+            Self::Pypi(v) => &v.version,
             #[cfg(feature = "go")]
-            UnifiedVersion::Go(v) => &v.version,
+            Self::Go(v) => &v.version,
             _ => unreachable!("no ecosystem features enabled"),
         }
     }
@@ -158,13 +158,13 @@ impl UnifiedVersion {
     pub fn is_yanked(&self) -> bool {
         match self {
             #[cfg(feature = "cargo")]
-            UnifiedVersion::Cargo(v) => v.yanked,
+            Self::Cargo(v) => v.yanked,
             #[cfg(feature = "npm")]
-            UnifiedVersion::Npm(v) => v.deprecated,
+            Self::Npm(v) => v.deprecated,
             #[cfg(feature = "pypi")]
-            UnifiedVersion::Pypi(v) => v.yanked,
+            Self::Pypi(v) => v.yanked,
             #[cfg(feature = "go")]
-            UnifiedVersion::Go(v) => v.retracted,
+            Self::Go(v) => v.retracted,
             _ => unreachable!("no ecosystem features enabled"),
         }
     }
@@ -368,7 +368,7 @@ impl ColdStartLimiter {
         if let Some(mut entry) = self.last_attempts.get_mut(uri) {
             let elapsed = now.duration_since(*entry);
             if elapsed < self.min_interval {
-                let retry_after = self.min_interval - elapsed;
+                let retry_after = self.min_interval.checked_sub(elapsed).unwrap();
                 tracing::warn!(
                     "Cold start rate limited for {:?} (retry after {:?})",
                     uri,
@@ -504,7 +504,7 @@ impl DocumentState {
 
     /// Gets a reference to the parse result if available.
     pub fn parse_result(&self) -> Option<&dyn ParseResult> {
-        self.parse_result.as_ref().map(|b| b.as_ref())
+        self.parse_result.as_ref().map(std::convert::AsRef::as_ref)
     }
 
     /// Updates the cached latest version information for dependencies.
@@ -968,7 +968,7 @@ mod tests {
             let deps = vec![create_test_dependency()];
             let doc_state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
 
-            state.update_document(uri.clone(), doc_state.clone());
+            state.update_document(uri.clone(), doc_state);
             assert_eq!(state.document_count(), 1);
 
             let retrieved = state.get_document(&uri);
@@ -1041,7 +1041,7 @@ mod tests {
         #[test]
         fn test_document_state_new_without_parse_result() {
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-            let doc_state = DocumentState::new_without_parse_result("cargo", content.clone());
+            let doc_state = DocumentState::new_without_parse_result("cargo", content);
 
             assert_eq!(doc_state.ecosystem_id, "cargo");
             assert_eq!(doc_state.ecosystem, Ecosystem::Cargo);
@@ -1100,7 +1100,7 @@ mod tests {
         fn test_document_state_debug() {
             let deps = vec![create_test_dependency()];
             let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
-            let debug_str = format!("{:?}", state);
+            let debug_str = format!("{state:?}");
             assert!(debug_str.contains("DocumentState"));
         }
     }
@@ -1143,7 +1143,7 @@ mod tests {
         #[test]
         fn test_document_state_new_without_parse_result() {
             let content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
-            let doc_state = DocumentState::new_without_parse_result("npm", content.clone());
+            let doc_state = DocumentState::new_without_parse_result("npm", content);
 
             assert_eq!(doc_state.ecosystem_id, "npm");
             assert_eq!(doc_state.ecosystem, Ecosystem::Npm);
@@ -1194,7 +1194,7 @@ mod tests {
         #[test]
         fn test_document_state_new_without_parse_result() {
             let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n".to_string();
-            let doc_state = DocumentState::new_without_parse_result("pypi", content.clone());
+            let doc_state = DocumentState::new_without_parse_result("pypi", content);
 
             assert_eq!(doc_state.ecosystem_id, "pypi");
             assert_eq!(doc_state.ecosystem, Ecosystem::Pypi);
@@ -1327,7 +1327,7 @@ mod tests {
             let content =
                 "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n"
                     .to_string();
-            let doc_state = DocumentState::new_without_parse_result("go", content.clone());
+            let doc_state = DocumentState::new_without_parse_result("go", content);
 
             assert_eq!(doc_state.ecosystem_id, "go");
             assert_eq!(doc_state.ecosystem, Ecosystem::Go);

@@ -80,7 +80,7 @@ pub struct PypiRegistry {
 
 impl PypiRegistry {
     /// Creates a new PyPI registry client with the given HTTP cache.
-    pub fn new(cache: Arc<HttpCache>) -> Self {
+    pub const fn new(cache: Arc<HttpCache>) -> Self {
         Self { cache }
     }
 
@@ -113,7 +113,7 @@ impl PypiRegistry {
     /// ```
     pub async fn get_versions(&self, name: &str) -> Result<Vec<PypiVersion>> {
         let normalized = normalize_package_name(name);
-        let url = format!("{}/{}/json", PYPI_BASE, normalized);
+        let url = format!("{PYPI_BASE}/{normalized}/json");
         let data = self.cache.get_cached(&url).await.map_err(|e| {
             if e.to_string().contains("404") {
                 PypiError::PackageNotFound {
@@ -218,7 +218,7 @@ impl PypiRegistry {
     /// - JSON parsing fails
     pub async fn get_package_metadata(&self, name: &str) -> Result<PypiPackage> {
         let normalized = normalize_package_name(name);
-        let url = format!("{}/{}/json", PYPI_BASE, normalized);
+        let url = format!("{PYPI_BASE}/{normalized}/json");
         let data = self.cache.get_cached(&url).await.map_err(|e| {
             if e.to_string().contains("404") {
                 PypiError::PackageNotFound {
@@ -240,7 +240,7 @@ impl PackageRegistry for PypiRegistry {
     type VersionReq = String;
 
     async fn get_versions(&self, name: &str) -> deps_core::error::Result<Vec<Self::Version>> {
-        PypiRegistry::get_versions(self, name)
+        Self::get_versions(self, name)
             .await
             .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))
     }
@@ -250,7 +250,7 @@ impl PackageRegistry for PypiRegistry {
         name: &str,
         req: &Self::VersionReq,
     ) -> deps_core::error::Result<Option<Self::Version>> {
-        PypiRegistry::get_latest_matching(self, name, req)
+        Self::get_latest_matching(self, name, req)
             .await
             .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))
     }
@@ -260,7 +260,7 @@ impl PackageRegistry for PypiRegistry {
         query: &str,
         limit: usize,
     ) -> deps_core::error::Result<Vec<Self::Metadata>> {
-        PypiRegistry::search(self, query, limit)
+        Self::search(self, query, limit)
             .await
             .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))
     }
@@ -273,7 +273,7 @@ impl deps_core::Registry for PypiRegistry {
         &self,
         name: &str,
     ) -> deps_core::error::Result<Vec<Box<dyn deps_core::Version>>> {
-        let versions = PypiRegistry::get_versions(self, name)
+        let versions = Self::get_versions(self, name)
             .await
             .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
         Ok(versions
@@ -287,7 +287,7 @@ impl deps_core::Registry for PypiRegistry {
         name: &str,
         req: &str,
     ) -> deps_core::error::Result<Option<Box<dyn deps_core::Version>>> {
-        let version = PypiRegistry::get_latest_matching(self, name, req)
+        let version = Self::get_latest_matching(self, name, req)
             .await
             .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
         Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
@@ -298,7 +298,7 @@ impl deps_core::Registry for PypiRegistry {
         query: &str,
         limit: usize,
     ) -> deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>> {
-        let packages = PypiRegistry::search(self, query, limit)
+        let packages = Self::search(self, query, limit)
             .await
             .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
         Ok(packages

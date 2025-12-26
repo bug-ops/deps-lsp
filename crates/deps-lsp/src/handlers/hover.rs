@@ -111,7 +111,7 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
 
-            let doc_state = DocumentState::new(Ecosystem::Cargo, "".to_string(), vec![]);
+            let doc_state = DocumentState::new(Ecosystem::Cargo, String::new(), vec![]);
             state.update_document(uri.clone(), doc_state);
 
             let params = HoverParams {

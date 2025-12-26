@@ -5,7 +5,7 @@ use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
 /// A dependency from a go.mod file.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GoDependency {
     /// Module path (e.g., "github.com/gin-gonic/gin")
     pub module_path: String,

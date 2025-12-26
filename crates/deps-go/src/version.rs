@@ -1,7 +1,6 @@
 //! Version parsing and module path utilities for Go modules.
 
 use crate::error::{GoError, Result};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use std::cmp::Ordering;
 
@@ -41,7 +40,7 @@ pub fn escape_module_path(path: &str) -> String {
             let mut buf = [0u8; 4];
             let encoded = c.encode_utf8(&mut buf);
             for &byte in encoded.as_bytes() {
-                result.push_str(&format!("%{:02X}", byte));
+                result.push_str(&format!("%{byte:02X}"));
             }
         }
     }
@@ -62,7 +61,7 @@ pub fn escape_module_path(path: &str) -> String {
 /// assert!(!is_pseudo_version("v1.2.3"));
 /// ```
 pub fn is_pseudo_version(version: &str) -> bool {
-    static PSEUDO_REGEX: Lazy<Regex> = Lazy::new(|| {
+    static PSEUDO_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"^v[0-9]+\.(0\.0-|\d+\.\d+-([^+]*\.)?0\.)\d{14}-[A-Za-z0-9]+(\+.*)?$").unwrap()
     });
 
@@ -141,15 +140,15 @@ pub fn compare_versions(v1: &str, v2: &str) -> Ordering {
     let clean2 = v2.trim_start_matches('v').replace("+incompatible", "");
 
     let cmp1 = if is_pseudo_version(v1) {
-        base_version_from_pseudo(v1).unwrap_or(clean1.clone())
+        base_version_from_pseudo(v1).unwrap_or(clean1)
     } else {
-        clean1.clone()
+        clean1
     };
 
     let cmp2 = if is_pseudo_version(v2) {
-        base_version_from_pseudo(v2).unwrap_or(clean2.clone())
+        base_version_from_pseudo(v2).unwrap_or(clean2)
     } else {
-        clean2.clone()
+        clean2
     };
 
     match (parse_semver(&cmp1), parse_semver(&cmp2)) {

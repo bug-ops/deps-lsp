@@ -9,7 +9,7 @@ impl EcosystemFormatter for NpmFormatter {
     }
 
     fn package_url(&self, name: &str) -> String {
-        format!("https://www.npmjs.com/package/{}", name)
+        format!("https://www.npmjs.com/package/{name}")
     }
 
     fn yanked_message(&self) -> &'static str {

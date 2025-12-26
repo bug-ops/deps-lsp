@@ -51,7 +51,7 @@ impl EcosystemHandler for CargoHandler {
     }
 
     fn format_version_for_edit(_dep: &Self::Dependency, version: &str) -> String {
-        format!("\"{}\"", version)
+        format!("\"{version}\"")
     }
 
     fn is_deprecated(version: &crate::CargoVersion) -> bool {

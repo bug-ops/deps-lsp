@@ -117,17 +117,15 @@ impl NpmError {
 impl From<deps_core::DepsError> for NpmError {
     fn from(err: deps_core::DepsError) -> Self {
         match err {
-            deps_core::DepsError::ParseError { source, .. } => {
-                NpmError::CacheError(source.to_string())
-            }
-            deps_core::DepsError::CacheError(msg) => NpmError::CacheError(msg),
-            deps_core::DepsError::InvalidVersionReq(msg) => NpmError::InvalidVersionSpecifier {
+            deps_core::DepsError::ParseError { source, .. } => Self::CacheError(source.to_string()),
+            deps_core::DepsError::CacheError(msg) => Self::CacheError(msg),
+            deps_core::DepsError::InvalidVersionReq(msg) => Self::InvalidVersionSpecifier {
                 specifier: String::new(),
                 message: msg,
             },
-            deps_core::DepsError::Io(e) => NpmError::Io(e),
-            deps_core::DepsError::Json(e) => NpmError::JsonParseError { source: e },
-            other => NpmError::CacheError(other.to_string()),
+            deps_core::DepsError::Io(e) => Self::Io(e),
+            deps_core::DepsError::Json(e) => Self::JsonParseError { source: e },
+            other => Self::CacheError(other.to_string()),
         }
     }
 }
@@ -136,25 +134,23 @@ impl From<deps_core::DepsError> for NpmError {
 impl From<NpmError> for deps_core::DepsError {
     fn from(err: NpmError) -> Self {
         match err {
-            NpmError::JsonParseError { source } => deps_core::DepsError::Json(source),
-            NpmError::InvalidVersionSpecifier { message, .. } => {
-                deps_core::DepsError::InvalidVersionReq(message)
-            }
+            NpmError::JsonParseError { source } => Self::Json(source),
+            NpmError::InvalidVersionSpecifier { message, .. } => Self::InvalidVersionReq(message),
             NpmError::PackageNotFound { package } => {
-                deps_core::DepsError::CacheError(format!("Package '{}' not found", package))
+                Self::CacheError(format!("Package '{package}' not found"))
             }
-            NpmError::RegistryError { package, source } => deps_core::DepsError::ParseError {
-                file_type: format!("npm registry for {}", package),
+            NpmError::RegistryError { package, source } => Self::ParseError {
+                file_type: format!("npm registry for {package}"),
                 source,
             },
-            NpmError::ApiResponseError { source, .. } => deps_core::DepsError::Json(source),
-            NpmError::InvalidStructure { message } => deps_core::DepsError::CacheError(message),
+            NpmError::ApiResponseError { source, .. } => Self::Json(source),
+            NpmError::InvalidStructure { message } => Self::CacheError(message),
             NpmError::MissingField { section, field } => {
-                deps_core::DepsError::CacheError(format!("Missing '{}' in {}", field, section))
+                Self::CacheError(format!("Missing '{field}' in {section}"))
             }
-            NpmError::CacheError(msg) => deps_core::DepsError::CacheError(msg),
-            NpmError::Io(e) => deps_core::DepsError::Io(e),
-            NpmError::Other(e) => deps_core::DepsError::CacheError(e.to_string()),
+            NpmError::CacheError(msg) => Self::CacheError(msg),
+            NpmError::Io(e) => Self::Io(e),
+            NpmError::Other(e) => Self::CacheError(e.to_string()),
         }
     }
 }

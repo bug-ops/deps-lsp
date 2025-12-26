@@ -19,7 +19,7 @@ impl EcosystemFormatter for GoFormatter {
         // Use pkg.go.dev for package documentation
         // URL encode special characters (@ and space)
         let encoded = name.replace('@', "%40").replace(' ', "%20");
-        format!("https://pkg.go.dev/{}", encoded)
+        format!("https://pkg.go.dev/{encoded}")
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
