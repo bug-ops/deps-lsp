@@ -28,6 +28,7 @@ pub struct Backend {
     pub(crate) client: Client,
     state: Arc<ServerState>,
     config: Arc<RwLock<DepsConfig>>,
+    client_capabilities: Arc<RwLock<Option<tower_lsp_server::ls_types::ClientCapabilities>>>,
 }
 
 impl Backend {
@@ -36,6 +37,7 @@ impl Backend {
             client,
             state: Arc::new(ServerState::new()),
             config: Arc::new(RwLock::new(DepsConfig::default())),
+            client_capabilities: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -180,6 +182,16 @@ impl Backend {
         }
     }
 
+    /// Check if client supports work done progress.
+    #[allow(dead_code)]
+    async fn supports_progress(&self) -> bool {
+        let caps = self.client_capabilities.read().await;
+        caps.as_ref()
+            .and_then(|c| c.window.as_ref())
+            .and_then(|w| w.work_done_progress)
+            .unwrap_or(false)
+    }
+
     fn server_capabilities() -> ServerCapabilities {
         ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -212,6 +224,9 @@ impl Backend {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         tracing::info!("initializing deps-lsp server");
+
+        // Store client capabilities
+        *self.client_capabilities.write().await = Some(params.capabilities.clone());
 
         // Parse initialization options
         if let Some(init_options) = params.initialization_options

@@ -7,6 +7,7 @@ use super::loader::load_document_from_disk;
 use super::state::{DocumentState, ServerState};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
+use crate::progress::RegistryProgress;
 use deps_core::Ecosystem;
 use deps_core::Registry;
 use deps_core::Result;
@@ -134,13 +135,35 @@ pub async fn handle_document_open(
                 .collect()
         };
 
+        // Mark as loading and start progress
+        if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
+            doc.set_loading();
+        }
+
+        let progress =
+            RegistryProgress::start(client_clone.clone(), uri_clone.as_str(), dep_names.len())
+                .await
+                .ok(); // Ignore errors if client doesn't support progress
+
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
         let cached_versions = fetch_latest_versions_parallel(registry, dep_names).await;
 
+        let success = !cached_versions.is_empty();
+
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.update_cached_versions(cached_versions);
+            if success {
+                doc.set_loaded();
+            } else {
+                doc.set_failed();
+            }
+        }
+
+        // End progress
+        if let Some(progress) = progress {
+            progress.end(success).await;
         }
 
         // Publish diagnostics (using internal version to avoid recursive cold start)
@@ -235,13 +258,35 @@ pub async fn handle_document_change(
                 .collect()
         };
 
+        // Mark as loading and start progress
+        if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
+            doc.set_loading();
+        }
+
+        let progress =
+            RegistryProgress::start(client_clone.clone(), uri_clone.as_str(), dep_names.len())
+                .await
+                .ok(); // Ignore errors if client doesn't support progress
+
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
         let cached_versions = fetch_latest_versions_parallel(registry, dep_names).await;
 
+        let success = !cached_versions.is_empty();
+
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.update_cached_versions(cached_versions);
+            if success {
+                doc.set_loaded();
+            } else {
+                doc.set_failed();
+            }
+        }
+
+        // End progress
+        if let Some(progress) = progress {
+            progress.end(success).await;
         }
 
         // Publish diagnostics (using internal version to avoid recursive cold start)

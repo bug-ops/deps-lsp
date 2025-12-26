@@ -2,6 +2,7 @@ pub mod config;
 pub mod document;
 pub mod file_watcher;
 pub mod handlers;
+pub mod progress;
 pub mod server;
 
 #[cfg(test)]
