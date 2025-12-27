@@ -107,11 +107,13 @@ impl NpmEcosystem {
         if filtered_iter.peek().is_some() {
             // Use filtered results (consume peekable iterator)
             filtered_iter
-                .map(|v| {
+                .enumerate()
+                .map(|(idx, v)| {
                     build_version_completion(
                         v as &dyn deps_core::Version,
                         package_name,
                         insert_range,
+                        idx,
                     )
                 })
                 .collect()
@@ -121,11 +123,13 @@ impl NpmEcosystem {
                 .iter()
                 .filter(|v| !v.deprecated)
                 .take(20)
-                .map(|v| {
+                .enumerate()
+                .map(|(idx, v)| {
                     build_version_completion(
                         v as &dyn deps_core::Version,
                         package_name,
                         insert_range,
+                        idx,
                     )
                 })
                 .collect()

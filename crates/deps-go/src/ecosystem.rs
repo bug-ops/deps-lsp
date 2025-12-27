@@ -88,11 +88,13 @@ impl GoEcosystem {
                 .iter()
                 .filter(|v| !v.retracted)
                 .take(20)
-                .map(|v| {
+                .enumerate()
+                .map(|(idx, v)| {
                     build_version_completion(
                         v as &dyn deps_core::Version,
                         package_name,
                         insert_range,
+                        idx,
                     )
                 })
                 .collect()
@@ -100,11 +102,13 @@ impl GoEcosystem {
             // Use filtered results
             filtered
                 .iter()
-                .map(|v| {
+                .enumerate()
+                .map(|(idx, v)| {
                     build_version_completion(
                         *v as &dyn deps_core::Version,
                         package_name,
                         insert_range,
+                        idx,
                     )
                 })
                 .collect()
