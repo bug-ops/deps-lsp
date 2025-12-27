@@ -73,67 +73,14 @@ impl NpmEcosystem {
             .collect()
     }
 
-    /// Completes version strings for a specific package.
-    ///
-    /// Filters versions by prefix and hides deprecated versions by default.
-    /// Returns up to 20 results, newest stable versions first.
     async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
-        use deps_core::completion::build_version_completion;
-
-        // Fetch all versions for the package
-        let versions = match self.registry.get_versions(package_name).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
-                return vec![];
-            }
-        };
-
-        let insert_range = tower_lsp_server::ls_types::Range::default();
-
-        // Filter by prefix (strip operators like ^, ~, >=, etc.)
-        let clean_prefix = prefix
-            .trim_start_matches(['^', '~', '=', '<', '>', '*'])
-            .trim();
-
-        // Filter by prefix and hide deprecated versions
-        let mut filtered_iter = versions
-            .iter()
-            .filter(|v| v.version.starts_with(clean_prefix) && !v.deprecated)
-            .take(20)
-            .peekable();
-
-        // If we have filtered results, use them; otherwise show all non-deprecated versions
-        if filtered_iter.peek().is_some() {
-            // Use filtered results (consume peekable iterator)
-            filtered_iter
-                .enumerate()
-                .map(|(idx, v)| {
-                    build_version_completion(
-                        v as &dyn deps_core::Version,
-                        package_name,
-                        insert_range,
-                        idx,
-                    )
-                })
-                .collect()
-        } else {
-            // Show up to 20 non-deprecated versions (newest first)
-            versions
-                .iter()
-                .filter(|v| !v.deprecated)
-                .take(20)
-                .enumerate()
-                .map(|(idx, v)| {
-                    build_version_completion(
-                        v as &dyn deps_core::Version,
-                        package_name,
-                        insert_range,
-                        idx,
-                    )
-                })
-                .collect()
-        }
+        deps_core::completion::complete_versions_generic(
+            self.registry.as_ref(),
+            package_name,
+            prefix,
+            &['^', '~', '=', '<', '>', '*'],
+        )
+        .await
     }
 }
 

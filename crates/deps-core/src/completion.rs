@@ -507,6 +507,87 @@ pub fn build_feature_completion(
     }
 }
 
+/// Generic version completion logic used by all ecosystems.
+///
+/// Filters versions by prefix (stripping ecosystem-specific operators),
+/// hides yanked/deprecated versions, returns up to 20 completion items.
+///
+/// # Arguments
+///
+/// * `registry` - Package registry to fetch versions from
+/// * `package_name` - Name of the package
+/// * `prefix` - Partial version string typed by user (may include operators)
+/// * `operator_chars` - Ecosystem-specific version operators to strip (e.g., `&['^', '~']`)
+///
+/// # Returns
+///
+/// Up to 20 completion items for non-yanked versions, filtered by prefix.
+/// If no versions match the prefix, returns up to 20 non-yanked versions.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::completion::complete_versions_generic;
+///
+/// # async fn example(registry: &dyn deps_core::Registry) {
+/// // Cargo: strip ^, ~, =, <, > operators
+/// let items = complete_versions_generic(
+///     registry,
+///     "serde",
+///     "^1.0",
+///     &['^', '~', '=', '<', '>'],
+/// ).await;
+///
+/// // Go: no operators to strip
+/// let items = complete_versions_generic(
+///     registry,
+///     "github.com/gin-gonic/gin",
+///     "v1.9",
+///     &[],
+/// ).await;
+/// # }
+/// ```
+pub async fn complete_versions_generic(
+    registry: &dyn crate::Registry,
+    package_name: &str,
+    prefix: &str,
+    operator_chars: &[char],
+) -> Vec<CompletionItem> {
+    let versions = match registry.get_versions(package_name).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
+            return vec![];
+        }
+    };
+
+    let insert_range = Range::default();
+    let clean_prefix = prefix.trim_start_matches(operator_chars).trim();
+
+    // Collect filtered versions first to avoid peek() consuming the iterator
+    let filtered: Vec<_> = versions
+        .iter()
+        .filter(|v| v.version_string().starts_with(clean_prefix) && !v.is_yanked())
+        .take(20)
+        .collect();
+
+    if filtered.is_empty() {
+        versions
+            .iter()
+            .filter(|v| !v.is_yanked())
+            .take(20)
+            .enumerate()
+            .map(|(idx, v)| build_version_completion(v.as_ref(), package_name, insert_range, idx))
+            .collect()
+    } else {
+        filtered
+            .into_iter()
+            .enumerate()
+            .map(|(idx, v)| build_version_completion(v.as_ref(), package_name, insert_range, idx))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,6 +707,54 @@ mod tests {
 
         fn latest_version(&self) -> &str {
             &self.latest_version
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct MockRegistry {
+        versions: Vec<MockVersion>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::Registry for MockRegistry {
+        async fn get_versions(
+            &self,
+            _package_name: &str,
+        ) -> crate::error::Result<Vec<Box<dyn crate::Version>>> {
+            Ok(self
+                .versions
+                .iter()
+                .map(|v| {
+                    Box::new(MockVersion {
+                        version: v.version.clone(),
+                        yanked: v.yanked,
+                        prerelease: v.prerelease,
+                    }) as Box<dyn crate::Version>
+                })
+                .collect())
+        }
+
+        async fn get_latest_matching(
+            &self,
+            _name: &str,
+            _req: &str,
+        ) -> crate::error::Result<Option<Box<dyn crate::Version>>> {
+            Ok(None)
+        }
+
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> crate::error::Result<Vec<Box<dyn crate::Metadata>>> {
+            Ok(vec![])
+        }
+
+        fn package_url(&self, _name: &str) -> String {
+            String::new()
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -1468,5 +1597,206 @@ mod tests {
 
         let prefix = extract_prefix(content, position, range);
         assert_eq!(prefix, "emoji-😀");
+    }
+
+    // Generic version completion tests
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_operator_stripping() {
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "1.0.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "1.0.1".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "1.1.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "2.0.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+            ],
+        };
+
+        // Test with Cargo-style operators (^, ~, =, <, >)
+        let items =
+            complete_versions_generic(&registry, "test-pkg", "^1.0", &['^', '~', '=', '<', '>'])
+                .await;
+
+        // Should return versions starting with "1.0" (after stripping ^)
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[1].label, "1.0.1");
+
+        // Test with tilde operator
+        let items =
+            complete_versions_generic(&registry, "test-pkg", "~1.1", &['^', '~', '=', '<', '>'])
+                .await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "1.1.0");
+
+        // Test with equals operator
+        let items =
+            complete_versions_generic(&registry, "test-pkg", "=2.0", &['^', '~', '=', '<', '>'])
+                .await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "2.0.0");
+
+        // Test with no operator (should work the same)
+        let items =
+            complete_versions_generic(&registry, "test-pkg", "1.0", &['^', '~', '=', '<', '>'])
+                .await;
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[1].label, "1.0.1");
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_fallback_when_no_prefix_match() {
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "1.0.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "1.1.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "2.0.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "2.1.0".to_string(),
+                    yanked: true, // Yanked version
+                    prerelease: false,
+                },
+            ],
+        };
+
+        // Test with prefix that doesn't match any version
+        let items =
+            complete_versions_generic(&registry, "test-pkg", "3.0", &['^', '~', '=', '<', '>'])
+                .await;
+
+        // Should fallback to showing all non-yanked versions
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[1].label, "1.1.0");
+        assert_eq!(items[2].label, "2.0.0");
+
+        // Yanked version should not be included in fallback
+        assert!(!items.iter().any(|item| item.label == "2.1.0"));
+
+        // Test with empty prefix (should show all non-yanked)
+        let items = complete_versions_generic(&registry, "test-pkg", "", &[]).await;
+
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[1].label, "1.1.0");
+        assert_eq!(items[2].label, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_filters_yanked_in_prefix_match() {
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "1.0.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "1.0.1".to_string(),
+                    yanked: true, // Yanked version
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "1.0.2".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+            ],
+        };
+
+        // Test that yanked versions are filtered out even when prefix matches
+        let items = complete_versions_generic(&registry, "test-pkg", "1.0", &[]).await;
+
+        // Should only include non-yanked versions
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[1].label, "1.0.2");
+
+        // Yanked version 1.0.1 should not be included
+        assert!(!items.iter().any(|item| item.label == "1.0.1"));
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_limit_20() {
+        // Create more than 20 versions
+        let versions: Vec<_> = (0..30)
+            .map(|i| MockVersion {
+                version: format!("1.0.{}", i),
+                yanked: false,
+                prerelease: false,
+            })
+            .collect();
+
+        let registry = MockRegistry { versions };
+
+        // Test that we only return 20 items
+        let items = complete_versions_generic(&registry, "test-pkg", "1.0", &[]).await;
+
+        assert_eq!(items.len(), 20);
+        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[19].label, "1.0.19");
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_go_no_operators() {
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "v1.9.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "v1.9.1".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "v1.10.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+            ],
+        };
+
+        // Go has no operators, so empty array
+        let items =
+            complete_versions_generic(&registry, "github.com/gin-gonic/gin", "v1.9", &[]).await;
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "v1.9.0");
+        assert_eq!(items[1].label, "v1.9.1");
     }
 }
