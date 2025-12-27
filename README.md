@@ -28,29 +28,29 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 deps-lsp is optimized for responsiveness:
 
 | Operation | Latency | Notes |
-|-----------|---------|-------|
+| ----------- | --------- | ------- |
 | Document open (50 deps) | ~150ms | Parallel registry fetching |
 | Inlay hints | <100ms | Cached version lookups |
 | Hover | <50ms | Pre-fetched metadata |
 | Code actions | <50ms | No network calls |
 
 > [!TIP]
+>
 > Lock file support provides instant resolved versions without network requests.
 
 ## Supported Ecosystems
 
 | Ecosystem | Manifest File | Status |
-|-----------|---------------|--------|
+| ----------- | --------------- | -------- |
 | Rust/Cargo | `Cargo.toml` | ✅ Supported |
 | npm | `package.json` | ✅ Supported |
 | Python/PyPI | `pyproject.toml` | ✅ Supported |
 | Go Modules | `go.mod` | ✅ Supported |
 
 > [!NOTE]
-> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats.
-
-> [!NOTE]
-> Go support includes require, replace, and exclude directives with pseudo-version handling.
+>
+> - PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats.
+> - Go support includes require, replace, and exclude directives with pseudo-version handling.
 
 ## Installation
 
@@ -61,6 +61,7 @@ cargo install deps-lsp
 ```
 
 > [!TIP]
+>
 > Use `cargo binstall deps-lsp` for faster installation without compilation.
 
 ### From source
@@ -76,7 +77,7 @@ cargo install --path crates/deps-lsp
 Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/latest):
 
 | Platform | Architecture | Binary |
-|----------|--------------|--------|
+| ---------- | -------------- | -------- |
 | Linux | x86_64 | `deps-lsp-x86_64-unknown-linux-gnu` |
 | Linux | aarch64 | `deps-lsp-aarch64-unknown-linux-gnu` |
 | macOS | x86_64 | `deps-lsp-x86_64-apple-darwin` |
@@ -97,7 +98,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 ```
 
 | Feature | Ecosystem | Default |
-|---------|-----------|---------|
+| --------- | ----------- | ------- |
 | `cargo` | Cargo.toml | ✅ |
 | `npm` | package.json | ✅ |
 | `pypi` | pyproject.toml | ✅ |
@@ -105,9 +106,24 @@ cargo install deps-lsp --no-default-features --features "pypi"
 
 ## Editor Setup
 
+> [!IMPORTANT]
+>
+> Inlay hints must be enabled in your editor to see version indicators. See configuration for each editor below.
+
 ### Zed
 
 Install the **Deps** extension from Zed Extensions marketplace.
+
+Enable inlay hints in Zed settings:
+
+```json
+// settings.json
+{
+  "inlay_hints": {
+    "enabled": true
+  }
+}
+```
 
 ### Neovim
 
@@ -116,7 +132,12 @@ require('lspconfig').deps_lsp.setup({
   cmd = { "deps-lsp", "--stdio" },
   filetypes = { "toml", "json" },
 })
+
+-- Enable inlay hints (Neovim 0.10+)
+vim.lsp.inlay_hint.enable(true)
 ```
+
+For older Neovim versions, use [nvim-lsp-inlayhints](https://github.com/lvimuser/lsp-inlayhints.nvim).
 
 ### Helix
 
@@ -133,6 +154,25 @@ language-servers = ["deps-lsp"]
 [language-server.deps-lsp]
 command = "deps-lsp"
 args = ["--stdio"]
+```
+
+Enable inlay hints in Helix config:
+
+```toml
+# ~/.config/helix/config.toml
+[editor.lsp]
+display-inlay-hints = true
+```
+
+### VS Code
+
+Install an LSP client extension and configure deps-lsp. Enable inlay hints:
+
+```json
+// settings.json
+{
+  "editor.inlayHints.enabled": "on"
+}
 ```
 
 ## Configuration
@@ -172,7 +212,7 @@ Configure via LSP initialization options:
 ### Configuration Reference
 
 | Section | Option | Default | Description |
-|---------|--------|---------|-------------|
+| --------- | -------- | --------- | ------------- |
 | `cache` | `fetch_timeout_secs` | `5` | Per-package fetch timeout (1-300 seconds) |
 | `cache` | `max_concurrent_fetches` | `20` | Concurrent registry requests (1-100) |
 | `loading_indicator` | `enabled` | `true` | Show loading feedback during fetches |
@@ -180,14 +220,17 @@ Configure via LSP initialization options:
 | `loading_indicator` | `loading_text` | `"⏳"` | Text shown during loading (max 100 chars) |
 
 > [!TIP]
+>
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others.
 
 > [!NOTE]
+>
 > Cold start support ensures LSP features work immediately when your IDE restores previously opened files.
 
 ## Development
 
 > [!IMPORTANT]
+>
 > Requires Rust 1.89+ (Edition 2024).
 
 ### Build
@@ -224,7 +267,7 @@ cargo deny check
 
 ### Project Structure
 
-```
+```text
 deps-lsp/
 ├── crates/
 │   ├── deps-core/      # Shared traits, cache, generic handlers
