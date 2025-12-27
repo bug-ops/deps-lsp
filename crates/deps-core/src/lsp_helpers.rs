@@ -251,6 +251,8 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     registry: &R,
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<CodeAction> {
+    use crate::completion::prepare_version_display_items;
+
     let deps = parse_result.dependencies();
     let mut actions = Vec::with_capacity(deps.len().min(5));
 
@@ -269,13 +271,10 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         return actions;
     };
 
-    for (i, version) in versions
-        .iter()
-        .filter(|v| !v.is_yanked())
-        .take(5)
-        .enumerate()
-    {
-        let new_text = formatter.format_version_for_code_action(version.version_string());
+    let display_items = prepare_version_display_items(&versions, dep.name());
+
+    for item in display_items {
+        let new_text = formatter.format_version_for_code_action(&item.version);
 
         let mut edits = HashMap::new();
         edits.insert(
@@ -286,24 +285,14 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
             }],
         );
 
-        let title = if i == 0 {
-            format!(
-                "Update {} to {} (latest)",
-                dep.name(),
-                version.version_string()
-            )
-        } else {
-            format!("Update {} to {}", dep.name(), version.version_string())
-        };
-
         actions.push(CodeAction {
-            title,
+            title: item.label,
             kind: Some(CodeActionKind::REFACTOR),
             edit: Some(WorkspaceEdit {
                 changes: Some(edits),
                 ..Default::default()
             }),
-            is_preferred: Some(i == 0),
+            is_preferred: Some(item.is_latest),
             ..Default::default()
         });
     }

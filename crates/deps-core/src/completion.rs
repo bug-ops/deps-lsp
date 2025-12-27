@@ -42,8 +42,8 @@
 
 use crate::{Metadata, ParseResult, Version};
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionItemKind, CompletionItemTag, CompletionTextEdit, Documentation,
-    MarkupContent, MarkupKind, Position, Range, TextEdit,
+    CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, MarkupContent,
+    MarkupKind, Position, Range, TextEdit,
 };
 
 /// Context for completion request based on cursor position.
@@ -368,98 +368,113 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
 /// Builds a completion item for a version string.
 ///
 /// Creates a properly formatted LSP CompletionItem with version metadata
-/// including yanked status, pre-release indicators, and appropriate sorting.
+/// in a simplified format matching Code Actions (Cmd+.) style.
 ///
 /// # Arguments
 ///
-/// * `version` - Version information from registry
-/// * `package_name` - Name of the package this version belongs to
+/// * `display_item` - Version display metadata with label, description, and flags
 /// * `insert_range` - LSP range where the completion should be inserted
-/// * `index` - Position in the version list (0-based), used for sort ordering
 ///
 /// # Returns
 ///
-/// A complete `CompletionItem` with proper sorting and deprecation tags.
+/// A complete `CompletionItem` with simple index-based sorting and preselect.
 ///
-/// # Sorting
+/// # Format
 ///
-/// Versions are sorted in this priority order:
-/// 1. Stable versions (not yanked, not pre-release) - newest first
-/// 2. Pre-release versions - newest first
-/// 3. Yanked versions - newest first
-///
-/// The `index` parameter preserves the semantic order from the registry.
+/// - Label: `"version"` or `"version (latest)"` for the latest version
+/// - Detail: `"Update package_name to version"`
+/// - Preselect: `true` for latest version, `false` otherwise
+/// - Sort: Index-based (00000, 00001, etc.)
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use deps_core::completion::build_version_completion;
+/// use deps_core::completion::{build_version_completion, VersionDisplayItem};
 /// use tower_lsp_server::ls_types::Range;
 ///
 /// # async fn example(version: &dyn deps_core::Version) {
 /// let range = Range::default();
-/// let item = build_version_completion(version, "serde", range, 0);
-/// assert_eq!(item.label, version.version_string());
+/// let display_item = VersionDisplayItem::new(version, "serde", 0, true);
+/// let item = build_version_completion(&display_item, range);
+/// assert_eq!(item.label, display_item.label);
 /// # }
 /// ```
 pub fn build_version_completion(
-    version: &dyn Version,
-    package_name: &str,
+    display_item: &VersionDisplayItem,
     insert_range: Range,
-    index: usize,
 ) -> CompletionItem {
-    let version_str = version.version_string();
-
-    // Build detail text with status indicators
-    let mut detail_parts = vec![format!("v{}", version_str)];
-
-    if version.is_yanked() {
-        detail_parts.push("(yanked)".to_string());
-    }
-
-    if version.is_prerelease() {
-        detail_parts.push("(pre-release)".to_string());
-    }
-
-    let detail = detail_parts.join(" ");
-
-    // Tags for deprecated/yanked versions
-    let tags = if version.is_yanked() {
-        Some(vec![CompletionItemTag::DEPRECATED])
-    } else {
-        None
-    };
-
-    // Sort key: stable first, then pre-release, then yanked
-    // Within each group, preserve registry order (newest first) via index
-    let sort_prefix = if version.is_yanked() {
-        "3_"
-    } else if version.is_prerelease() {
-        "2_"
-    } else {
-        "1_"
-    };
-
-    let sort_text = format!("{}_{:05}", sort_prefix, index);
+    // Simple index-based sorting (00000, 00001, etc.)
+    let sort_text = format!("{:05}", display_item.index);
 
     CompletionItem {
-        label: version_str.to_string(),
+        label: display_item.label.clone(),
         kind: Some(CompletionItemKind::VALUE),
-        detail: Some(detail),
-        documentation: Some(Documentation::String(format!(
-            "Version {} of {}",
-            version_str, package_name
-        ))),
-        insert_text: Some(version_str.to_string()),
+        detail: Some(display_item.description.clone()),
+        documentation: None,
+        insert_text: Some(display_item.version.clone()),
         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
             range: insert_range,
-            new_text: version_str.to_string(),
+            new_text: display_item.version.clone(),
         })),
         sort_text: Some(sort_text),
-        deprecated: Some(version.is_yanked()),
-        tags,
+        preselect: Some(display_item.is_latest),
         ..Default::default()
     }
+}
+
+/// Display metadata for a single version in LSP responses.
+///
+/// Captures common formatting logic shared between completion items and code actions.
+#[derive(Debug, Clone)]
+pub struct VersionDisplayItem {
+    /// Raw version string (e.g., "1.0.0")
+    pub version: String,
+    /// Display label with "(latest)" suffix for first item
+    pub label: String,
+    /// Action description (e.g., "Update serde to 1.0.0")
+    pub description: String,
+    /// Zero-based index for sorting
+    pub index: usize,
+    /// True if this is the latest non-yanked version
+    pub is_latest: bool,
+}
+
+impl VersionDisplayItem {
+    /// Creates a display item from version metadata.
+    pub fn new(version: &dyn Version, package_name: &str, index: usize, is_latest: bool) -> Self {
+        let version_str = version.version_string();
+        let label = if is_latest {
+            format!("{} (latest)", version_str)
+        } else {
+            version_str.to_string()
+        };
+        let description = format!("Update {} to {}", package_name, version_str);
+
+        Self {
+            version: version_str.to_string(),
+            label,
+            description,
+            index,
+            is_latest,
+        }
+    }
+}
+
+/// Filters and formats versions for LSP display.
+///
+/// Returns up to 5 non-yanked versions with display metadata.
+pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
+    versions: &[V],
+    package_name: &str,
+) -> Vec<VersionDisplayItem> {
+    versions
+        .iter()
+        .map(|v| v.as_ref())
+        .filter(|v| !v.is_yanked())
+        .take(MAX_COMPLETION_VERSIONS)
+        .enumerate()
+        .map(|(index, version)| VersionDisplayItem::new(version, package_name, index, index == 0))
+        .collect()
 }
 
 /// Builds a completion item for a feature flag.
@@ -507,10 +522,13 @@ pub fn build_feature_completion(
     }
 }
 
+/// Maximum number of version completions to show (matches Code Actions limit).
+const MAX_COMPLETION_VERSIONS: usize = 5;
+
 /// Generic version completion logic used by all ecosystems.
 ///
 /// Filters versions by prefix (stripping ecosystem-specific operators),
-/// hides yanked/deprecated versions, returns up to 20 completion items.
+/// hides yanked/deprecated versions, returns up to 5 completion items.
 ///
 /// # Arguments
 ///
@@ -521,8 +539,9 @@ pub fn build_feature_completion(
 ///
 /// # Returns
 ///
-/// Up to 20 completion items for non-yanked versions, filtered by prefix.
-/// If no versions match the prefix, returns up to 20 non-yanked versions.
+/// Up to 5 completion items for non-yanked versions, filtered by prefix.
+/// If no versions match the prefix, returns up to 5 non-yanked versions.
+/// The first item (latest version) is marked with "(latest)" suffix and preselected.
 ///
 /// # Examples
 ///
@@ -564,28 +583,23 @@ pub async fn complete_versions_generic(
     let insert_range = Range::default();
     let clean_prefix = prefix.trim_start_matches(operator_chars).trim();
 
-    // Collect filtered versions first to avoid peek() consuming the iterator
-    let filtered: Vec<_> = versions
+    // Filter versions by prefix first
+    let filtered_versions: Vec<_> = versions
         .iter()
-        .filter(|v| v.version_string().starts_with(clean_prefix) && !v.is_yanked())
-        .take(20)
+        .filter(|v| v.version_string().starts_with(clean_prefix))
         .collect();
 
-    if filtered.is_empty() {
-        versions
-            .iter()
-            .filter(|v| !v.is_yanked())
-            .take(20)
-            .enumerate()
-            .map(|(idx, v)| build_version_completion(v.as_ref(), package_name, insert_range, idx))
-            .collect()
+    // Use filtered or all versions, prepare_version_display_items will handle yanked filtering
+    let display_items = if filtered_versions.is_empty() {
+        prepare_version_display_items(&versions, package_name)
     } else {
-        filtered
-            .into_iter()
-            .enumerate()
-            .map(|(idx, v)| build_version_completion(v.as_ref(), package_name, insert_range, idx))
-            .collect()
-    }
+        prepare_version_display_items(&filtered_versions, package_name)
+    };
+
+    display_items
+        .iter()
+        .map(|item| build_version_completion(item, insert_range))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1103,82 +1117,91 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_version_completion(&version, "serde", range, 0);
+        let display_item = VersionDisplayItem::new(&version, "serde", 0, false);
+        let item = build_version_completion(&display_item, range);
 
         assert_eq!(item.label, "1.0.0");
         assert_eq!(item.kind, Some(CompletionItemKind::VALUE));
-        assert_eq!(item.detail, Some("v1.0.0".to_string()));
-        assert_eq!(item.deprecated, Some(false));
-        assert!(item.tags.is_none());
-        assert!(item.sort_text.as_ref().unwrap().starts_with("1_"));
+        assert_eq!(item.detail, Some("Update serde to 1.0.0".to_string()));
+        assert_eq!(item.documentation, None);
+        assert_eq!(item.preselect, Some(false));
+        assert_eq!(item.sort_text, Some("00000".to_string()));
     }
 
     #[test]
-    fn test_build_version_completion_yanked() {
+    fn test_build_version_completion_latest() {
         let version = MockVersion {
             version: "1.0.0".to_string(),
-            yanked: true,
+            yanked: false,
             prerelease: false,
         };
 
         let range = Range::default();
-        let item = build_version_completion(&version, "serde", range, 0);
+        let display_item = VersionDisplayItem::new(&version, "serde", 0, true);
+        let item = build_version_completion(&display_item, range);
 
-        assert_eq!(item.detail, Some("v1.0.0 (yanked)".to_string()));
-        assert_eq!(item.deprecated, Some(true));
-        assert_eq!(item.tags, Some(vec![CompletionItemTag::DEPRECATED]));
-        assert!(item.sort_text.as_ref().unwrap().starts_with("3_"));
+        assert_eq!(item.label, "1.0.0 (latest)");
+        assert_eq!(item.kind, Some(CompletionItemKind::VALUE));
+        assert_eq!(item.detail, Some("Update serde to 1.0.0".to_string()));
+        assert_eq!(item.documentation, None);
+        assert_eq!(item.preselect, Some(true));
+        assert_eq!(item.sort_text, Some("00000".to_string()));
     }
 
     #[test]
-    fn test_build_version_completion_prerelease() {
+    fn test_build_version_completion_not_latest() {
         let version = MockVersion {
-            version: "2.0.0-alpha.1".to_string(),
+            version: "0.9.0".to_string(),
             yanked: false,
-            prerelease: true,
+            prerelease: false,
         };
 
         let range = Range::default();
-        let item = build_version_completion(&version, "tokio", range, 0);
+        let display_item = VersionDisplayItem::new(&version, "tokio", 1, false);
+        let item = build_version_completion(&display_item, range);
 
-        assert_eq!(
-            item.detail,
-            Some("v2.0.0-alpha.1 (pre-release)".to_string())
-        );
-        assert_eq!(item.deprecated, Some(false));
-        assert!(item.tags.is_none());
-        assert!(item.sort_text.as_ref().unwrap().starts_with("2_"));
+        assert_eq!(item.label, "0.9.0");
+        assert_eq!(item.detail, Some("Update tokio to 0.9.0".to_string()));
+        assert_eq!(item.documentation, None);
+        assert_eq!(item.preselect, Some(false));
+        assert_eq!(item.sort_text, Some("00001".to_string()));
     }
 
     #[test]
     fn test_build_version_completion_sort_order() {
-        let stable = MockVersion {
+        let v1 = MockVersion {
             version: "1.0.0".to_string(),
             yanked: false,
             prerelease: false,
         };
-        let prerelease = MockVersion {
-            version: "2.0.0-beta".to_string(),
-            yanked: false,
-            prerelease: true,
-        };
-        let yanked = MockVersion {
+        let v2 = MockVersion {
             version: "0.9.0".to_string(),
-            yanked: true,
+            yanked: false,
+            prerelease: false,
+        };
+        let v3 = MockVersion {
+            version: "0.8.0".to_string(),
+            yanked: false,
             prerelease: false,
         };
 
         let range = Range::default();
-        let stable_item = build_version_completion(&stable, "test", range, 0);
-        let prerelease_item = build_version_completion(&prerelease, "test", range, 1);
-        let yanked_item = build_version_completion(&yanked, "test", range, 2);
+        let display_item1 = VersionDisplayItem::new(&v1, "test", 0, true);
+        let display_item2 = VersionDisplayItem::new(&v2, "test", 1, false);
+        let display_item3 = VersionDisplayItem::new(&v3, "test", 2, false);
+        let item1 = build_version_completion(&display_item1, range);
+        let item2 = build_version_completion(&display_item2, range);
+        let item3 = build_version_completion(&display_item3, range);
 
-        // Stable should sort first (1__00000)
-        assert_eq!(stable_item.sort_text.as_ref().unwrap(), "1__00000");
-        // Pre-release should sort second (2__00001)
-        assert_eq!(prerelease_item.sort_text.as_ref().unwrap(), "2__00001");
-        // Yanked should sort last (3__00002)
-        assert_eq!(yanked_item.sort_text.as_ref().unwrap(), "3__00002");
+        // Simple index-based sorting
+        assert_eq!(item1.sort_text.as_ref().unwrap(), "00000");
+        assert_eq!(item2.sort_text.as_ref().unwrap(), "00001");
+        assert_eq!(item3.sort_text.as_ref().unwrap(), "00002");
+
+        // First item should be preselected
+        assert_eq!(item1.preselect, Some(true));
+        assert_eq!(item2.preselect, Some(false));
+        assert_eq!(item3.preselect, Some(false));
     }
 
     #[test]
@@ -1205,12 +1228,15 @@ mod tests {
         let items: Vec<_> = versions
             .iter()
             .enumerate()
-            .map(|(idx, v)| build_version_completion(v, "test", range, idx))
+            .map(|(idx, v)| {
+                let display_item = VersionDisplayItem::new(v, "test", idx, idx == 0);
+                build_version_completion(&display_item, range)
+            })
             .collect();
 
-        assert_eq!(items[0].sort_text.as_ref().unwrap(), "1__00000");
-        assert_eq!(items[1].sort_text.as_ref().unwrap(), "1__00001");
-        assert_eq!(items[2].sort_text.as_ref().unwrap(), "1__00002");
+        assert_eq!(items[0].sort_text.as_ref().unwrap(), "00000");
+        assert_eq!(items[1].sort_text.as_ref().unwrap(), "00001");
+        assert_eq!(items[2].sort_text.as_ref().unwrap(), "00002");
 
         let mut sorted_items = items;
         sorted_items.sort_by(|a, b| {
@@ -1220,44 +1246,35 @@ mod tests {
                 .cmp(b.sort_text.as_ref().unwrap())
         });
 
-        assert_eq!(sorted_items[0].label, "0.14.0");
+        assert_eq!(sorted_items[0].label, "0.14.0 (latest)");
         assert_eq!(sorted_items[1].label, "0.8.0");
         assert_eq!(sorted_items[2].label, "0.2.0");
     }
 
     #[test]
-    fn test_version_completion_mixed_categories_ordering() {
-        let versions = [
-            ("1.20.0", false, false),
-            ("1.9.0", false, false),
-            ("1.2.0", false, false),
-            ("2.0.0-beta.2", false, true),
-            ("2.0.0-beta.10", false, true),
-            ("0.99.0", true, false),
-            ("0.100.0", true, false),
-        ];
+    fn test_version_completion_index_ordering() {
+        let versions = ["1.20.0", "1.9.0", "1.2.0", "0.99.0", "0.50.0"];
 
         let range = Range::default();
         let items: Vec<_> = versions
             .iter()
             .enumerate()
-            .map(|(idx, (ver, yanked, pre))| {
+            .map(|(idx, ver)| {
                 let v = MockVersion {
                     version: ver.to_string(),
-                    yanked: *yanked,
-                    prerelease: *pre,
+                    yanked: false,
+                    prerelease: false,
                 };
-                build_version_completion(&v, "test", range, idx)
+                let display_item = VersionDisplayItem::new(&v, "test", idx, idx == 0);
+                build_version_completion(&display_item, range)
             })
             .collect();
 
-        assert_eq!(items[0].sort_text.as_ref().unwrap(), "1__00000");
-        assert_eq!(items[1].sort_text.as_ref().unwrap(), "1__00001");
-        assert_eq!(items[2].sort_text.as_ref().unwrap(), "1__00002");
-        assert_eq!(items[3].sort_text.as_ref().unwrap(), "2__00003");
-        assert_eq!(items[4].sort_text.as_ref().unwrap(), "2__00004");
-        assert_eq!(items[5].sort_text.as_ref().unwrap(), "3__00005");
-        assert_eq!(items[6].sort_text.as_ref().unwrap(), "3__00006");
+        assert_eq!(items[0].sort_text.as_ref().unwrap(), "00000");
+        assert_eq!(items[1].sort_text.as_ref().unwrap(), "00001");
+        assert_eq!(items[2].sort_text.as_ref().unwrap(), "00002");
+        assert_eq!(items[3].sort_text.as_ref().unwrap(), "00003");
+        assert_eq!(items[4].sort_text.as_ref().unwrap(), "00004");
 
         let mut sorted_items = items;
         sorted_items.sort_by(|a, b| {
@@ -1267,13 +1284,126 @@ mod tests {
                 .cmp(b.sort_text.as_ref().unwrap())
         });
 
-        assert_eq!(sorted_items[0].label, "1.20.0");
+        assert_eq!(sorted_items[0].label, "1.20.0 (latest)");
         assert_eq!(sorted_items[1].label, "1.9.0");
         assert_eq!(sorted_items[2].label, "1.2.0");
-        assert_eq!(sorted_items[3].label, "2.0.0-beta.2");
-        assert_eq!(sorted_items[4].label, "2.0.0-beta.10");
-        assert_eq!(sorted_items[5].label, "0.99.0");
-        assert_eq!(sorted_items[6].label, "0.100.0");
+        assert_eq!(sorted_items[3].label, "0.99.0");
+        assert_eq!(sorted_items[4].label, "0.50.0");
+    }
+
+    #[test]
+    fn test_version_display_item_latest() {
+        let version = MockVersion {
+            version: "1.0.0".to_string(),
+            yanked: false,
+            prerelease: false,
+        };
+
+        let item = VersionDisplayItem::new(&version, "serde", 0, true);
+
+        assert_eq!(item.version, "1.0.0");
+        assert_eq!(item.label, "1.0.0 (latest)");
+        assert_eq!(item.description, "Update serde to 1.0.0");
+        assert_eq!(item.index, 0);
+        assert!(item.is_latest);
+    }
+
+    #[test]
+    fn test_version_display_item_not_latest() {
+        let version = MockVersion {
+            version: "0.9.0".to_string(),
+            yanked: false,
+            prerelease: false,
+        };
+
+        let item = VersionDisplayItem::new(&version, "tokio", 1, false);
+
+        assert_eq!(item.version, "0.9.0");
+        assert_eq!(item.label, "0.9.0");
+        assert_eq!(item.description, "Update tokio to 0.9.0");
+        assert_eq!(item.index, 1);
+        assert!(!item.is_latest);
+    }
+
+    #[test]
+    fn test_prepare_version_display_items_filters_yanked() {
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
+            std::sync::Arc::new(MockVersion {
+                version: "1.0.0".to_string(),
+                yanked: false,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "0.9.0".to_string(),
+                yanked: true,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "0.8.0".to_string(),
+                yanked: false,
+                prerelease: false,
+            }),
+        ];
+
+        let items = prepare_version_display_items(&versions, "test");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].version, "1.0.0");
+        assert_eq!(items[0].label, "1.0.0 (latest)");
+        assert!(items[0].is_latest);
+        assert_eq!(items[1].version, "0.8.0");
+        assert_eq!(items[1].label, "0.8.0");
+        assert!(!items[1].is_latest);
+    }
+
+    #[test]
+    fn test_prepare_version_display_items_limits_to_5() {
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = (0..10)
+            .map(|i| {
+                std::sync::Arc::new(MockVersion {
+                    version: format!("1.0.{}", i),
+                    yanked: false,
+                    prerelease: false,
+                }) as std::sync::Arc<dyn crate::Version>
+            })
+            .collect();
+
+        let items = prepare_version_display_items(&versions, "test");
+
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].version, "1.0.0");
+        assert_eq!(items[0].label, "1.0.0 (latest)");
+        assert_eq!(items[4].version, "1.0.4");
+        assert_eq!(items[4].label, "1.0.4");
+    }
+
+    #[test]
+    fn test_prepare_version_display_items_empty() {
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![];
+
+        let items = prepare_version_display_items(&versions, "test");
+
+        assert_eq!(items.len(), 0);
+    }
+
+    #[test]
+    fn test_prepare_version_display_items_all_yanked() {
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
+            std::sync::Arc::new(MockVersion {
+                version: "1.0.0".to_string(),
+                yanked: true,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "0.9.0".to_string(),
+                yanked: true,
+                prerelease: false,
+            }),
+        ];
+
+        let items = prepare_version_display_items(&versions, "test");
+
+        assert_eq!(items.len(), 0);
     }
 
     #[test]
@@ -1635,7 +1765,7 @@ mod tests {
 
         // Should return versions starting with "1.0" (after stripping ^)
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.0.1");
 
         // Test with tilde operator
@@ -1644,7 +1774,7 @@ mod tests {
                 .await;
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "1.1.0");
+        assert_eq!(items[0].label, "1.1.0 (latest)");
 
         // Test with equals operator
         let items =
@@ -1652,7 +1782,7 @@ mod tests {
                 .await;
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "2.0.0");
+        assert_eq!(items[0].label, "2.0.0 (latest)");
 
         // Test with no operator (should work the same)
         let items =
@@ -1660,7 +1790,7 @@ mod tests {
                 .await;
 
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.0.1");
     }
 
@@ -1698,7 +1828,7 @@ mod tests {
 
         // Should fallback to showing all non-yanked versions
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.1.0");
         assert_eq!(items[2].label, "2.0.0");
 
@@ -1709,7 +1839,7 @@ mod tests {
         let items = complete_versions_generic(&registry, "test-pkg", "", &[]).await;
 
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.1.0");
         assert_eq!(items[2].label, "2.0.0");
     }
@@ -1741,7 +1871,7 @@ mod tests {
 
         // Should only include non-yanked versions
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].label, "1.0.0");
+        assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.0.2");
 
         // Yanked version 1.0.1 should not be included
@@ -1749,9 +1879,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_versions_generic_limit_20() {
-        // Create more than 20 versions
-        let versions: Vec<_> = (0..30)
+    async fn test_complete_versions_generic_limit_5() {
+        // Create more than 5 versions
+        let versions: Vec<_> = (0..10)
             .map(|i| MockVersion {
                 version: format!("1.0.{}", i),
                 yanked: false,
@@ -1761,12 +1891,12 @@ mod tests {
 
         let registry = MockRegistry { versions };
 
-        // Test that we only return 20 items
+        // Test that we only return 5 items
         let items = complete_versions_generic(&registry, "test-pkg", "1.0", &[]).await;
 
-        assert_eq!(items.len(), 20);
-        assert_eq!(items[0].label, "1.0.0");
-        assert_eq!(items[19].label, "1.0.19");
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].label, "1.0.0 (latest)");
+        assert_eq!(items[4].label, "1.0.4");
     }
 
     #[tokio::test]
@@ -1796,7 +1926,7 @@ mod tests {
             complete_versions_generic(&registry, "github.com/gin-gonic/gin", "v1.9", &[]).await;
 
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].label, "v1.9.0");
+        assert_eq!(items[0].label, "v1.9.0 (latest)");
         assert_eq!(items[1].label, "v1.9.1");
     }
 }
