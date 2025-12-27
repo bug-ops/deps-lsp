@@ -1,0 +1,9 @@
+(function() {
+    var implementors = Object.fromEntries([["deps_cargo",[["impl EcosystemFormatter for <a class=\"struct\" href=\"deps_cargo/formatter/struct.CargoFormatter.html\" title=\"struct deps_cargo::formatter::CargoFormatter\">CargoFormatter</a>"]]],["deps_go",[["impl <a class=\"trait\" href=\"deps_core/lsp_helpers/trait.EcosystemFormatter.html\" title=\"trait deps_core::lsp_helpers::EcosystemFormatter\">EcosystemFormatter</a> for <a class=\"struct\" href=\"deps_go/formatter/struct.GoFormatter.html\" title=\"struct deps_go::formatter::GoFormatter\">GoFormatter</a>"]]],["deps_npm",[["impl <a class=\"trait\" href=\"deps_core/lsp_helpers/trait.EcosystemFormatter.html\" title=\"trait deps_core::lsp_helpers::EcosystemFormatter\">EcosystemFormatter</a> for <a class=\"struct\" href=\"deps_npm/formatter/struct.NpmFormatter.html\" title=\"struct deps_npm::formatter::NpmFormatter\">NpmFormatter</a>"]]],["deps_pypi",[["impl EcosystemFormatter for <a class=\"struct\" href=\"deps_pypi/formatter/struct.PypiFormatter.html\" title=\"struct deps_pypi::formatter::PypiFormatter\">PypiFormatter</a>"]]]]);
+    if (window.register_implementors) {
+        window.register_implementors(implementors);
+    } else {
+        window.pending_implementors = implementors;
+    }
+})()
+//{"start":57,"fragment_lengths":[199,325,331,194]}

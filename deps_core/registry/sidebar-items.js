@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["find_latest_stable"],"trait":["Metadata","PackageMetadata","PackageRegistry","Registry","Version","VersionInfo"]};

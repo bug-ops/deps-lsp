@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["generate_code_actions","generate_diagnostics","generate_hover","generate_inlay_hints","is_same_major_minor","ranges_overlap"],"trait":["EcosystemFormatter"]};
