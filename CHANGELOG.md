@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2025-12-27
+
+### Changed
+- **Unified version completion display** — Completion and code actions now share formatting
+  - `VersionDisplayItem` struct for consistent version display metadata
+  - `prepare_version_display_items()` for shared filtering logic (yanked, limit 5)
+  - First version marked as "(latest)" with preselect in both features
+- **Semantic version ordering** — Versions sorted by index, not lexicographically
+  - Fixes "0.8.0" appearing after "0.14.0" in completion lists
+- **Code deduplication** — Extracted `complete_versions_generic()` to deps-core
+  - Consolidated ~220 lines of duplicated code across 4 ecosystem crates
+  - Each ecosystem now specifies only operator characters
+
+### Fixed
+- Version completion for empty strings (`pkg = ""`) no longer deletes preceding text
+  - Changed to insert mode when no text_edit range available
+
 ## [0.5.1] - 2025-12-26
 
 ### Changed
@@ -208,7 +225,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/bug-ops/deps-lsp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/bug-ops/deps-lsp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/bug-ops/deps-lsp/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/bug-ops/deps-lsp/compare/v0.4.0...v0.4.1

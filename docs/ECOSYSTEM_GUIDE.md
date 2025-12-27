@@ -392,22 +392,25 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::*;
 
 use deps_core::{
-    Ecosystem, EcosystemConfig, HttpCache,
+    Ecosystem, EcosystemConfig, HttpCache, lsp_helpers,
     ParseResult as ParseResultTrait, Registry, Result,
 };
 
+use crate::formatter::{Ecosystem}Formatter;
 use crate::parser::parse_{manifest};
 use crate::registry::{Ecosystem}Registry;
 
 /// {Ecosystem} implementation.
 pub struct {Ecosystem}Ecosystem {
     registry: Arc<{Ecosystem}Registry>,
+    formatter: {Ecosystem}Formatter,
 }
 
 impl {Ecosystem}Ecosystem {
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self {
             registry: Arc::new({Ecosystem}Registry::new(cache)),
+            formatter: {Ecosystem}Formatter,
         }
     }
 }
@@ -443,45 +446,19 @@ impl Ecosystem for {Ecosystem}Ecosystem {
         &self,
         parse_result: &dyn ParseResultTrait,
         cached_versions: &HashMap<String, String>,
+        resolved_versions: &HashMap<String, String>,
+        loading_state: deps_core::LoadingState,
         config: &EcosystemConfig,
     ) -> Vec<InlayHint> {
-        let mut hints = Vec::new();
-
-        for dep in parse_result.dependencies() {
-            let Some(version_range) = dep.version_range() else {
-                continue;
-            };
-
-            let Some(latest) = cached_versions.get(dep.name()) else {
-                continue;
-            };
-
-            let current = dep.version_requirement().unwrap_or("");
-            let is_up_to_date = /* implement version comparison */;
-
-            let label = if is_up_to_date {
-                if config.show_up_to_date_hints {
-                    config.up_to_date_text.clone()
-                } else {
-                    continue;
-                }
-            } else {
-                config.needs_update_text.replace("{}", latest)
-            };
-
-            hints.push(InlayHint {
-                position: version_range.end,
-                label: InlayHintLabel::String(label),
-                kind: Some(InlayHintKind::TYPE),
-                padding_left: Some(true),
-                padding_right: None,
-                text_edits: None,
-                tooltip: None,
-                data: None,
-            });
-        }
-
-        hints
+        // Use shared helper for consistent behavior across ecosystems
+        lsp_helpers::generate_inlay_hints(
+            parse_result,
+            cached_versions,
+            resolved_versions,
+            loading_state,
+            config,
+            &self.formatter,
+        )
     }
 
     async fn generate_hover(

@@ -82,6 +82,7 @@ Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/lat
 | macOS | x86_64 | `deps-lsp-x86_64-apple-darwin` |
 | macOS | Apple Silicon | `deps-lsp-aarch64-apple-darwin` |
 | Windows | x86_64 | `deps-lsp-x86_64-pc-windows-msvc.exe` |
+| Windows | ARM64 | `deps-lsp-aarch64-pc-windows-msvc.exe` |
 
 ### Feature Flags
 
