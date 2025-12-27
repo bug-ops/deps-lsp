@@ -57,58 +57,14 @@ impl GoEcosystem {
         vec![]
     }
 
-    /// Completes version strings for a specific package.
-    ///
-    /// Fetches versions from proxy.golang.org and filters by prefix.
-    /// Returns up to 20 results, newest versions first.
     async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
-        use deps_core::completion::build_version_completion;
-
-        // Fetch all versions for the package
-        let versions = match self.registry.get_versions(package_name).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
-                return vec![];
-            }
-        };
-
-        let insert_range = tower_lsp_server::ls_types::Range::default();
-
-        // Single-pass: collect filtered results first
-        let filtered: Vec<_> = versions
-            .iter()
-            .filter(|v| v.version.starts_with(prefix) && !v.retracted)
-            .take(20)
-            .collect();
-
-        if filtered.is_empty() {
-            // No prefix match, show up to 20 non-retracted versions (newest first)
-            versions
-                .iter()
-                .filter(|v| !v.retracted)
-                .take(20)
-                .map(|v| {
-                    build_version_completion(
-                        v as &dyn deps_core::Version,
-                        package_name,
-                        insert_range,
-                    )
-                })
-                .collect()
-        } else {
-            // Use filtered results
-            filtered
-                .iter()
-                .map(|v| {
-                    build_version_completion(
-                        *v as &dyn deps_core::Version,
-                        package_name,
-                        insert_range,
-                    )
-                })
-                .collect()
-        }
+        deps_core::completion::complete_versions_generic(
+            self.registry.as_ref(),
+            package_name,
+            prefix,
+            &[],
+        )
+        .await
     }
 
     /// Completes feature flags for a specific package.
