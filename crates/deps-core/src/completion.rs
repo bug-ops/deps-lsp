@@ -373,7 +373,8 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
 /// # Arguments
 ///
 /// * `display_item` - Version display metadata with label, description, and flags
-/// * `insert_range` - LSP range where the completion should be inserted
+/// * `insert_range` - Optional LSP range where the completion should replace text.
+///   If `None`, the completion will insert at cursor position without replacing.
 ///
 /// # Returns
 ///
@@ -393,15 +394,19 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
 /// use tower_lsp_server::ls_types::Range;
 ///
 /// # async fn example(version: &dyn deps_core::Version) {
-/// let range = Range::default();
+/// // Without range - insert at cursor
 /// let display_item = VersionDisplayItem::new(version, "serde", 0, true);
-/// let item = build_version_completion(&display_item, range);
+/// let item = build_version_completion(&display_item, None);
 /// assert_eq!(item.label, display_item.label);
+///
+/// // With range - replace existing text
+/// let range = Range::default();
+/// let item = build_version_completion(&display_item, Some(range));
 /// # }
 /// ```
 pub fn build_version_completion(
     display_item: &VersionDisplayItem,
-    insert_range: Range,
+    insert_range: Option<Range>,
 ) -> CompletionItem {
     // Simple index-based sorting (00000, 00001, etc.)
     let sort_text = format!("{:05}", display_item.index);
@@ -412,10 +417,12 @@ pub fn build_version_completion(
         detail: Some(display_item.description.clone()),
         documentation: None,
         insert_text: Some(display_item.version.clone()),
-        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-            range: insert_range,
-            new_text: display_item.version.clone(),
-        })),
+        text_edit: insert_range.map(|range| {
+            CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: display_item.version.clone(),
+            })
+        }),
         sort_text: Some(sort_text),
         preselect: Some(display_item.is_latest),
         ..Default::default()
@@ -580,7 +587,6 @@ pub async fn complete_versions_generic(
         }
     };
 
-    let insert_range = Range::default();
     let clean_prefix = prefix.trim_start_matches(operator_chars).trim();
 
     // Filter versions by prefix first
@@ -596,9 +602,10 @@ pub async fn complete_versions_generic(
         prepare_version_display_items(&filtered_versions, package_name)
     };
 
+    // Don't provide text_edit range - let LSP client insert at cursor position
     display_items
         .iter()
-        .map(|item| build_version_completion(item, insert_range))
+        .map(|item| build_version_completion(item, None))
         .collect()
 }
 
@@ -1116,9 +1123,8 @@ mod tests {
             prerelease: false,
         };
 
-        let range = Range::default();
         let display_item = VersionDisplayItem::new(&version, "serde", 0, false);
-        let item = build_version_completion(&display_item, range);
+        let item = build_version_completion(&display_item, None);
 
         assert_eq!(item.label, "1.0.0");
         assert_eq!(item.kind, Some(CompletionItemKind::VALUE));
@@ -1126,6 +1132,7 @@ mod tests {
         assert_eq!(item.documentation, None);
         assert_eq!(item.preselect, Some(false));
         assert_eq!(item.sort_text, Some("00000".to_string()));
+        assert_eq!(item.text_edit, None); // No text_edit when range is None
     }
 
     #[test]
@@ -1136,9 +1143,8 @@ mod tests {
             prerelease: false,
         };
 
-        let range = Range::default();
         let display_item = VersionDisplayItem::new(&version, "serde", 0, true);
-        let item = build_version_completion(&display_item, range);
+        let item = build_version_completion(&display_item, None);
 
         assert_eq!(item.label, "1.0.0 (latest)");
         assert_eq!(item.kind, Some(CompletionItemKind::VALUE));
@@ -1146,6 +1152,7 @@ mod tests {
         assert_eq!(item.documentation, None);
         assert_eq!(item.preselect, Some(true));
         assert_eq!(item.sort_text, Some("00000".to_string()));
+        assert_eq!(item.text_edit, None); // No text_edit when range is None
     }
 
     #[test]
@@ -1156,15 +1163,15 @@ mod tests {
             prerelease: false,
         };
 
-        let range = Range::default();
         let display_item = VersionDisplayItem::new(&version, "tokio", 1, false);
-        let item = build_version_completion(&display_item, range);
+        let item = build_version_completion(&display_item, None);
 
         assert_eq!(item.label, "0.9.0");
         assert_eq!(item.detail, Some("Update tokio to 0.9.0".to_string()));
         assert_eq!(item.documentation, None);
         assert_eq!(item.preselect, Some(false));
         assert_eq!(item.sort_text, Some("00001".to_string()));
+        assert_eq!(item.text_edit, None); // No text_edit when range is None
     }
 
     #[test]
@@ -1185,13 +1192,12 @@ mod tests {
             prerelease: false,
         };
 
-        let range = Range::default();
         let display_item1 = VersionDisplayItem::new(&v1, "test", 0, true);
         let display_item2 = VersionDisplayItem::new(&v2, "test", 1, false);
         let display_item3 = VersionDisplayItem::new(&v3, "test", 2, false);
-        let item1 = build_version_completion(&display_item1, range);
-        let item2 = build_version_completion(&display_item2, range);
-        let item3 = build_version_completion(&display_item3, range);
+        let item1 = build_version_completion(&display_item1, None);
+        let item2 = build_version_completion(&display_item2, None);
+        let item3 = build_version_completion(&display_item3, None);
 
         // Simple index-based sorting
         assert_eq!(item1.sort_text.as_ref().unwrap(), "00000");
@@ -1224,13 +1230,12 @@ mod tests {
             },
         ];
 
-        let range = Range::default();
         let items: Vec<_> = versions
             .iter()
             .enumerate()
             .map(|(idx, v)| {
                 let display_item = VersionDisplayItem::new(v, "test", idx, idx == 0);
-                build_version_completion(&display_item, range)
+                build_version_completion(&display_item, None)
             })
             .collect();
 
@@ -1255,7 +1260,6 @@ mod tests {
     fn test_version_completion_index_ordering() {
         let versions = ["1.20.0", "1.9.0", "1.2.0", "0.99.0", "0.50.0"];
 
-        let range = Range::default();
         let items: Vec<_> = versions
             .iter()
             .enumerate()
@@ -1266,7 +1270,7 @@ mod tests {
                     prerelease: false,
                 };
                 let display_item = VersionDisplayItem::new(&v, "test", idx, idx == 0);
-                build_version_completion(&display_item, range)
+                build_version_completion(&display_item, None)
             })
             .collect();
 
