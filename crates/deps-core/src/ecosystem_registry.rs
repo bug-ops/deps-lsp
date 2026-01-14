@@ -349,6 +349,7 @@ mod tests {
             &self,
             _parse_result: &dyn ParseResult,
             _cached_versions: &std::collections::HashMap<String, String>,
+            _resolved_versions: &std::collections::HashMap<String, String>,
             _uri: &Uri,
         ) -> Vec<Diagnostic> {
             vec![]

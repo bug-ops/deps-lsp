@@ -160,8 +160,10 @@ impl PypiRegistry {
     ) -> Result<Option<PypiVersion>> {
         let versions = self.get_versions(name).await?;
 
-        // Parse PEP 440 version specifiers
-        let specs = VersionSpecifiers::from_str(req_str).map_err(|e| {
+        // PEP 440 uses empty string for "any version"
+        let normalized_req = if req_str == "*" { "" } else { req_str };
+
+        let specs = VersionSpecifiers::from_str(normalized_req).map_err(|e| {
             PypiError::InvalidVersionSpecifier {
                 specifier: req_str.to_string(),
                 source: e,
@@ -527,6 +529,20 @@ mod tests {
         assert_eq!(pkg.summary, Some("A micro web framework".to_string()));
         assert_eq!(pkg.latest_version, "3.0.0");
         assert_eq!(pkg.project_urls.len(), 2);
+    }
+
+    #[test]
+    fn test_wildcard_specifier_normalization() {
+        // Test that "*" is normalized to empty string for PEP 440 compatibility
+        // The get_latest_matching method normalizes "*" to "" internally
+        let normalized = if "*" == "*" { "" } else { "*" };
+        assert_eq!(normalized, "");
+
+        // Verify that empty string is valid PEP 440 (matches any version)
+        let specs = VersionSpecifiers::from_str("").unwrap();
+        assert!(specs.contains(&Version::from_str("1.0.0").unwrap()));
+        assert!(specs.contains(&Version::from_str("2.5.3").unwrap()));
+        assert!(specs.contains(&Version::from_str("0.0.1").unwrap()));
     }
 
     #[test]

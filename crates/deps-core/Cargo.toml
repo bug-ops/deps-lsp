@@ -17,7 +17,7 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
-reqwest = { workspace = true, features = ["json", "gzip", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "gzip"] }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

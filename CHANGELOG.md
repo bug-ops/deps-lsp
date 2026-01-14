@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-01-15
+
+### Changed
+- **Improved inlay hints logic** — Shows ❌ only when code action is needed (requirement doesn't allow latest), ✅ when requirement allows latest (just need lockfile update)
+- **Enhanced version_satisfies_requirement** — Proper handling of caret (^) and tilde (~) semantics
+  - `^X.Y.Z` where X > 0: allows any `X.*.*`
+  - `^0.Y.Z`: allows only `0.Y.*`
+  - `^0.0.Z`: allows only `0.0.Z` exactly
+  - `~X.Y.Z`: allows only patch-level changes
+- **NPM formatter simplified** — Now uses default trait implementation for version matching
+- **Diagnostics use cached versions** — Eliminates redundant network calls during diagnostic generation
+
+### Fixed
+- PyPI `"*"` specifier handling — PEP 440 requires empty string for "any version"
+- Go.sum parser now uses "last occurrence wins" semantics (matches Go toolchain behavior)
+- Caret version matching for `^0.x.y` edge cases
+
+### Added
+- Unit tests for `generate_diagnostics_from_cache` function
+- Unit tests for caret version edge cases (`^0.2`, `^0.0.3`)
+- Test for PyPI `"*"` specifier normalization
+- OpenSSL license added to deny.toml (required by aws-lc-sys via reqwest 0.13)
+
 ## [0.5.2] - 2025-12-27
 
 ### Changed

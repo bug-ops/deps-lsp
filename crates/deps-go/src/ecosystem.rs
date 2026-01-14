@@ -164,11 +164,16 @@ impl Ecosystem for GoEcosystem {
     async fn generate_diagnostics(
         &self,
         parse_result: &dyn ParseResultTrait,
-        _cached_versions: &HashMap<String, String>,
+        cached_versions: &HashMap<String, String>,
+        resolved_versions: &HashMap<String, String>,
         _uri: &Uri,
     ) -> Vec<Diagnostic> {
-        lsp_helpers::generate_diagnostics(parse_result, self.registry.as_ref(), &self.formatter)
-            .await
+        lsp_helpers::generate_diagnostics_from_cache(
+            parse_result,
+            cached_versions,
+            resolved_versions,
+            &self.formatter,
+        )
     }
 
     async fn generate_completions(
@@ -617,11 +622,17 @@ mod tests {
         };
 
         let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
 
         // Use timeout to prevent hanging
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            ecosystem.generate_diagnostics(&parse_result, &cached_versions, parse_result.uri()),
+            ecosystem.generate_diagnostics(
+                &parse_result,
+                &cached_versions,
+                &resolved_versions,
+                parse_result.uri(),
+            ),
         )
         .await;
 

@@ -313,24 +313,59 @@ struct VersionInfo {
 }
 
 /// Parses newline-separated version list from `/@v/list` endpoint.
+///
+/// Versions are sorted in descending order (newest first) to ensure
+/// `find_latest_stable` returns the correct latest version.
 fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
     let content = std::str::from_utf8(data).map_err(|e| GoError::InvalidVersionSpecifier {
         specifier: String::new(),
         message: format!("Invalid UTF-8 in version list response: {e}"),
     })?;
 
-    let versions: Vec<GoVersion> = content
+    // Parse versions with precomputed sort keys (Schwartzian transform)
+    // This avoids repeated regex/semver parsing during sort comparisons
+    let mut versions_with_keys: Vec<(GoVersion, Option<semver::Version>)> = content
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| GoVersion {
-            version: line.to_string(),
-            time: None,
-            is_pseudo: is_pseudo_version(line),
-            retracted: false, // Would need to check .info for retraction
+        .map(|line| {
+            let is_pseudo = is_pseudo_version(line);
+            let sort_key = parse_sort_key(line, is_pseudo);
+            let version = GoVersion {
+                version: line.to_string(),
+                time: None,
+                is_pseudo,
+                retracted: false,
+            };
+            (version, sort_key)
         })
         .collect();
 
-    Ok(versions)
+    // Sort by precomputed keys (descending - newest first)
+    versions_with_keys.sort_by(|a, b| match (&b.1, &a.1) {
+        (Some(v1), Some(v2)) => v1.cmp(v2),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b.0.version.cmp(&a.0.version),
+    });
+
+    Ok(versions_with_keys.into_iter().map(|(v, _)| v).collect())
+}
+
+/// Parses a version string into a semver::Version for sorting.
+/// Uses precomputed is_pseudo flag to avoid regex during sort.
+fn parse_sort_key(version: &str, is_pseudo: bool) -> Option<semver::Version> {
+    use crate::version::base_version_from_pseudo;
+
+    let clean = version.trim_start_matches('v').replace("+incompatible", "");
+    let cmp_str = if is_pseudo {
+        base_version_from_pseudo(version).unwrap_or(clean)
+    } else {
+        clean
+    };
+
+    // Parse only the X.Y.Z part, ignoring prerelease suffix
+    let base = cmp_str.split('-').next().unwrap_or(&cmp_str);
+    semver::Version::parse(base.trim_start_matches('v')).ok()
 }
 
 /// Parses JSON version info from `/@v/{version}.info` or `/@latest` endpoint.
@@ -369,11 +404,13 @@ impl deps_core::Registry for GoRegistry {
         name: &str,
         _req: &str,
     ) -> deps_core::Result<Option<Box<dyn deps_core::Version>>> {
-        // Go doesn't support version requirements in proxy API
-        // Just return latest stable (non-pseudo) version
+        // Try /@latest first (fast path)
+        if let Ok(version) = self.get_latest(name).await {
+            return Ok(Some(Box::new(version) as Box<dyn deps_core::Version>));
+        }
+        // Fallback to /@v/list (/@latest is optional per Go proxy spec)
         let versions = self.get_versions(name).await?;
         let latest = versions.into_iter().find(|v| !v.is_pseudo && !v.retracted);
-
         Ok(latest.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
     }
 
@@ -406,8 +443,11 @@ mod tests {
 
         let versions = parse_version_list(data).unwrap();
         assert_eq!(versions.len(), 4);
-        assert_eq!(versions[0].version, "v1.0.0");
-        assert_eq!(versions[1].version, "v1.0.1");
+        // Sorted descending (newest first)
+        assert_eq!(versions[0].version, "v2.0.0");
+        assert_eq!(versions[1].version, "v1.1.0");
+        assert_eq!(versions[2].version, "v1.0.1");
+        assert_eq!(versions[3].version, "v1.0.0");
         assert!(!versions[0].is_pseudo);
     }
 
@@ -417,9 +457,12 @@ mod tests {
 
         let versions = parse_version_list(data).unwrap();
         assert_eq!(versions.len(), 3);
+        // Sorted descending: v1.1.0, v1.0.0, v0.0.0-... (pseudo based on v0.0.0)
+        assert_eq!(versions[0].version, "v1.1.0");
         assert!(!versions[0].is_pseudo);
-        assert!(versions[1].is_pseudo);
-        assert!(!versions[2].is_pseudo);
+        assert_eq!(versions[1].version, "v1.0.0");
+        assert!(!versions[1].is_pseudo);
+        assert!(versions[2].is_pseudo);
     }
 
     #[test]
@@ -557,10 +600,14 @@ mod tests {
         let data = b"v1.0.0\nv1.1.0-0.20200101000000-abcdefabcdef\nv1.2.0\nv1.2.1-beta.1\n";
         let versions = parse_version_list(data).unwrap();
         assert_eq!(versions.len(), 4);
-        assert!(!versions[0].is_pseudo); // v1.0.0
-        assert!(versions[1].is_pseudo); // pseudo-version
-        assert!(!versions[2].is_pseudo); // v1.2.0
-        assert!(!versions[3].is_pseudo); // v1.2.1-beta.1 (prerelease, not pseudo)
+        // Sorted descending: v1.2.1-beta.1, v1.2.0, v1.1.0-0...(pseudo), v1.0.0
+        assert_eq!(versions[0].version, "v1.2.1-beta.1");
+        assert!(!versions[0].is_pseudo); // prerelease, not pseudo
+        assert_eq!(versions[1].version, "v1.2.0");
+        assert!(!versions[1].is_pseudo);
+        assert!(versions[2].is_pseudo); // pseudo-version based on v1.1.0
+        assert_eq!(versions[3].version, "v1.0.0");
+        assert!(!versions[3].is_pseudo);
     }
 
     #[test]
