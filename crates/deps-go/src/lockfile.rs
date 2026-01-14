@@ -77,8 +77,6 @@ impl LockFileProvider for GoSumParser {
     }
 
     async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {
-        tracing::debug!("Parsing go.sum: {}", lockfile_path.display());
-
         let content = tokio::fs::read_to_string(lockfile_path)
             .await
             .map_err(|e| DepsError::ParseError {
@@ -86,15 +84,7 @@ impl LockFileProvider for GoSumParser {
                 source: Box::new(e),
             })?;
 
-        let packages = parse_go_sum(&content);
-
-        tracing::info!(
-            "Parsed go.sum: {} packages from {}",
-            packages.len(),
-            lockfile_path.display()
-        );
-
-        Ok(packages)
+        Ok(parse_go_sum(&content))
     }
 }
 
@@ -103,9 +93,10 @@ impl LockFileProvider for GoSumParser {
 /// Filters out `/go.mod` entries (module file checksums) and only processes
 /// module content checksums (lines with `h1:` hashes).
 ///
-/// When a module appears multiple times with different versions, the first
-/// occurrence is used. This typically represents the version selected by
-/// Go's minimal version selection algorithm.
+/// When a module appears multiple times with different versions, the **last**
+/// occurrence is used. Go's go.sum file typically has older versions first
+/// (from when they were initially added) and newer versions appended later
+/// (after upgrades). The last version represents the current state.
 ///
 /// # Arguments
 ///
@@ -156,19 +147,17 @@ pub fn parse_go_sum(content: &str) -> ResolvedPackages {
                 continue;
             }
 
-            // Only insert if not already present (first occurrence wins)
-            // This handles cases where multiple versions exist
-            if packages.get(module_path).is_none() {
-                packages.insert(ResolvedPackage {
-                    name: module_path.to_string(),
-                    version: version.to_string(),
-                    source: ResolvedSource::Registry {
-                        url: "https://proxy.golang.org".to_string(),
-                        checksum: checksum.to_string(),
-                    },
-                    dependencies: vec![],
-                });
-            }
+            // Always insert/overwrite (last occurrence wins)
+            // Go.sum files have older versions first, newer versions appended later
+            packages.insert(ResolvedPackage {
+                name: module_path.to_string(),
+                version: version.to_string(),
+                source: ResolvedSource::Registry {
+                    url: "https://proxy.golang.org".to_string(),
+                    checksum: checksum.to_string(),
+                },
+                dependencies: vec![],
+            });
         }
     }
 
@@ -227,14 +216,14 @@ github.com/gin-gonic/gin v1.9.1 h1:actual_hash=
     }
 
     #[test]
-    fn test_first_version_wins() {
+    fn test_last_version_wins() {
         let content = r"
-github.com/pkg/errors v0.9.1 h1:hash1=
-github.com/pkg/errors v0.8.0 h1:hash2=
+github.com/pkg/errors v0.8.0 h1:hash1=
+github.com/pkg/errors v0.9.1 h1:hash2=
 ";
         let packages = parse_go_sum(content);
         assert_eq!(packages.len(), 1);
-        // First occurrence should win
+        // Last occurrence should win (newer version added after upgrade)
         assert_eq!(
             packages.get_version("github.com/pkg/errors"),
             Some("v0.9.1")

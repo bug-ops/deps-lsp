@@ -168,8 +168,10 @@ impl Default for EcosystemConfig {
 ///         &self,
 ///         parse_result: &dyn ParseResult,
 ///         cached_versions: &std::collections::HashMap<String, String>,
+///         resolved_versions: &std::collections::HashMap<String, String>,
 ///         uri: &Uri,
 ///     ) -> Vec<Diagnostic> {
+///         let _ = resolved_versions; // Use resolved versions for lock file support
 ///         vec![]
 ///     }
 ///
@@ -310,12 +312,14 @@ pub trait Ecosystem: Send + Sync {
     /// # Arguments
     ///
     /// * `parse_result` - Parsed dependencies from manifest
-    /// * `cached_versions` - Pre-fetched version information
+    /// * `cached_versions` - Pre-fetched latest version information from registry
+    /// * `resolved_versions` - Resolved versions from lock file
     /// * `uri` - Document URI for diagnostic reporting
     async fn generate_diagnostics(
         &self,
         parse_result: &dyn ParseResult,
         cached_versions: &std::collections::HashMap<String, String>,
+        resolved_versions: &std::collections::HashMap<String, String>,
         uri: &Uri,
     ) -> Vec<Diagnostic>;
 

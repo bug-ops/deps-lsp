@@ -1,10 +1,9 @@
-use deps_core::lsp_helpers::{EcosystemFormatter, is_same_major_minor};
+use deps_core::lsp_helpers::EcosystemFormatter;
 
 pub struct NpmFormatter;
 
 impl EcosystemFormatter for NpmFormatter {
     fn format_version_for_code_action(&self, version: &str) -> String {
-        // Don't add quotes - version_range already excludes them from parser
         version.to_string()
     }
 
@@ -18,20 +17,6 @@ impl EcosystemFormatter for NpmFormatter {
 
     fn yanked_label(&self) -> &'static str {
         "*(deprecated)*"
-    }
-
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
-        let req_normalized = requirement
-            .strip_prefix('^')
-            .or_else(|| requirement.strip_prefix('~'))
-            .unwrap_or(requirement);
-
-        let req_parts: Vec<&str> = req_normalized.split('.').collect();
-        let is_partial_version = req_parts.len() <= 2;
-
-        version == requirement
-            || (is_partial_version && is_same_major_minor(req_normalized, version))
-            || (is_partial_version && version.starts_with(req_normalized))
     }
 }
 
@@ -84,13 +69,27 @@ mod tests {
     fn test_version_satisfies_requirement() {
         let formatter = NpmFormatter;
 
+        // Exact match
         assert!(formatter.version_satisfies_requirement("1.2.3", "1.2.3"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "^1.2"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "~1.2"));
+
+        // Partial versions
         assert!(formatter.version_satisfies_requirement("1.2.3", "1"));
         assert!(formatter.version_satisfies_requirement("1.2.3", "1.2"));
 
+        // Caret - allows any version with same major (for major > 0)
+        assert!(formatter.version_satisfies_requirement("1.2.3", "^1.2"));
+        assert!(formatter.version_satisfies_requirement("1.2.3", "^1.0"));
+        assert!(formatter.version_satisfies_requirement("1.5.0", "^1.2.3"));
+        assert!(formatter.version_satisfies_requirement("10.1.3", "^10.1.3")); // Same version
+        assert!(formatter.version_satisfies_requirement("10.2.0", "^10.1.3")); // Higher minor
+
+        // Tilde - allows patch changes
+        assert!(formatter.version_satisfies_requirement("1.2.3", "~1.2"));
+        assert!(formatter.version_satisfies_requirement("1.2.5", "~1.2"));
+
+        // Should not match
         assert!(!formatter.version_satisfies_requirement("1.2.3", "2.0.0"));
         assert!(!formatter.version_satisfies_requirement("1.2.3", "1.3"));
+        assert!(!formatter.version_satisfies_requirement("2.0.0", "^1.2.3")); // Different major
     }
 }

@@ -55,7 +55,12 @@ pub(crate) async fn generate_diagnostics_internal(
 
     // Generate diagnostics while holding the lock
     ecosystem
-        .generate_diagnostics(parse_result, &doc.cached_versions, uri)
+        .generate_diagnostics(
+            parse_result,
+            &doc.cached_versions,
+            &doc.resolved_versions,
+            uri,
+        )
         .await
 }
 

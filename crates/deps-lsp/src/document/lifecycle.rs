@@ -56,10 +56,18 @@ impl DependencyDiff {
     }
 }
 
+/// Result of parallel version fetching.
+struct FetchResult {
+    /// Successfully fetched versions (package -> latest version)
+    versions: HashMap<String, String>,
+    /// Number of packages that failed to fetch (timeout or error)
+    failed_count: usize,
+}
+
 /// Fetches latest versions for multiple packages in parallel with progress reporting.
 ///
-/// Returns a HashMap mapping package names to their latest version strings.
-/// Packages that fail to fetch are omitted from the result.
+/// Returns a [`FetchResult`] containing successfully fetched versions and failure count.
+/// Packages that fail to fetch are omitted from the versions map.
 ///
 /// This function executes all registry requests concurrently with per-dependency
 /// timeout isolation, preventing slow packages from blocking others.
@@ -69,7 +77,7 @@ impl DependencyDiff {
 /// * `registry` - Package registry to fetch from
 /// * `package_names` - List of package names to fetch
 /// * `progress` - Optional progress tracker (will be updated after each fetch)
-/// * `timeout_secs` - Timeout for each individual package fetch (default: 5s)
+/// * `timeout_secs` - Timeout for each individual package fetch (default: 10s)
 /// * `max_concurrent` - Maximum concurrent fetches (default: 20)
 ///
 /// # Timeout Behavior
@@ -78,56 +86,45 @@ impl DependencyDiff {
 /// takes longer than `timeout_secs` to fetch, it fails fast with a warning
 /// and does NOT block other packages.
 ///
-/// # Examples
+/// # Performance
 ///
 /// With 50 dependencies and 100ms per request:
 /// - Sequential: 50 × 100ms = 5000ms
 /// - Parallel (no timeout): max(100ms) ≈ 150ms
-/// - Parallel (5s timeout, 1 slow package at 30s): max(5s) ≈ 5s
+/// - Parallel (10s timeout, 1 slow package at 30s): max(10s) ≈ 10s
 async fn fetch_latest_versions_parallel(
     registry: Arc<dyn Registry>,
     package_names: Vec<String>,
     progress: Option<&RegistryProgress>,
     timeout_secs: u64,
     max_concurrent: usize,
-) -> HashMap<String, String> {
+) -> FetchResult {
     use futures::stream::{self, StreamExt};
     use std::time::Duration;
 
     let total = package_names.len();
     let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let timeout = Duration::from_secs(timeout_secs);
 
-    // Process fetches concurrently with per-dependency timeout
     let results: Vec<_> = stream::iter(package_names)
         .map(|name| {
             let registry = Arc::clone(&registry);
             let fetched = Arc::clone(&fetched);
+            let failed = Arc::clone(&failed);
             async move {
-                // Wrap each fetch in a timeout
-                let result = tokio::time::timeout(timeout, registry.get_versions(&name)).await;
+                let result =
+                    tokio::time::timeout(timeout, registry.get_latest_matching(&name, "*")).await;
 
                 let version = match result {
-                    Ok(Ok(versions)) => {
-                        // Use shared utility for consistent behavior with diagnostics
-                        deps_core::find_latest_stable(&versions)
-                            .map(|v| (name.clone(), v.version_string().to_string()))
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(package = %name, error = %e, "Failed to fetch versions");
-                        None
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            package = %name,
-                            timeout_secs,
-                            "Fetch timed out"
-                        );
+                    Ok(Ok(Some(v))) => Some((name.clone(), v.version_string().to_string())),
+                    Ok(Ok(None)) => None,
+                    Ok(Err(_)) | Err(_) => {
+                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         None
                     }
                 };
 
-                // Increment counter and report progress
                 let count = fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if let Some(progress) = progress {
                     progress.update(count, total).await;
@@ -140,7 +137,10 @@ async fn fetch_latest_versions_parallel(
         .collect()
         .await;
 
-    results.into_iter().flatten().collect()
+    FetchResult {
+        versions: results.into_iter().flatten().collect(),
+        failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 /// Generic document open handler using ecosystem registry.
@@ -236,7 +236,7 @@ pub async fn handle_document_open(
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
-        let cached_versions = fetch_latest_versions_parallel(
+        let fetch_result = fetch_latest_versions_parallel(
             registry,
             dep_names,
             progress.as_ref(),
@@ -245,11 +245,11 @@ pub async fn handle_document_open(
         )
         .await;
 
-        let success = !cached_versions.is_empty();
+        let success = !fetch_result.versions.is_empty();
 
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
-            doc.update_cached_versions(cached_versions);
+            doc.update_cached_versions(fetch_result.versions);
             if success {
                 doc.set_loaded();
             } else {
@@ -260,6 +260,19 @@ pub async fn handle_document_open(
         // End progress
         if let Some(progress) = progress {
             progress.end(success).await;
+        }
+
+        // Notify user about failed packages
+        if fetch_result.failed_count > 0 {
+            client_clone
+                .show_message(
+                    tower_lsp_server::ls_types::MessageType::WARNING,
+                    format!(
+                        "deps-lsp: {} package(s) failed to fetch (timeout or network error)",
+                        fetch_result.failed_count
+                    ),
+                )
+                .await;
         }
 
         // Refresh inlay hints IMMEDIATELY after loading completes
@@ -426,7 +439,7 @@ pub async fn handle_document_change(
 
         // Fetch latest versions only for NEW dependencies
         let registry = ecosystem_clone.registry();
-        let new_versions = fetch_latest_versions_parallel(
+        let fetch_result = fetch_latest_versions_parallel(
             registry,
             deps_to_fetch,
             progress.as_ref(),
@@ -435,11 +448,11 @@ pub async fn handle_document_change(
         )
         .await;
 
-        let success = !new_versions.is_empty();
+        let success = !fetch_result.versions.is_empty();
 
         // Merge new versions into existing cache
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
-            for (name, version) in new_versions {
+            for (name, version) in fetch_result.versions {
                 doc.cached_versions.insert(name, version);
             }
             if success {
@@ -451,6 +464,19 @@ pub async fn handle_document_change(
 
         if let Some(progress) = progress {
             progress.end(success).await;
+        }
+
+        // Notify user about failed packages
+        if fetch_result.failed_count > 0 {
+            client_clone
+                .show_message(
+                    tower_lsp_server::ls_types::MessageType::WARNING,
+                    format!(
+                        "deps-lsp: {} package(s) failed to fetch (timeout or network error)",
+                        fetch_result.failed_count
+                    ),
+                )
+                .await;
         }
 
         if let Err(e) = client_clone.inlay_hint_refresh().await {
@@ -687,7 +713,7 @@ mod tests {
         #[async_trait]
         impl Registry for TimeoutRegistry {
             async fn get_versions(&self, _name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
-                // Sleep longer than timeout (5s default)
+                // Sleep longer than timeout (10s default)
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 Ok(vec![])
             }
@@ -697,6 +723,8 @@ mod tests {
                 _name: &str,
                 _req: &str,
             ) -> deps_core::Result<Option<Box<dyn Version>>> {
+                // Sleep longer than timeout
+                tokio::time::sleep(Duration::from_secs(10)).await;
                 Ok(None)
             }
 
@@ -724,7 +752,8 @@ mod tests {
         let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
 
         // Should return empty (timeout, not success)
-        assert!(result.is_empty(), "Slow package should timeout");
+        assert!(result.versions.is_empty(), "Slow package should timeout");
+        assert_eq!(result.failed_count, 1, "Should track 1 failed package");
     }
 
     #[tokio::test]
@@ -750,9 +779,14 @@ mod tests {
 
             async fn get_latest_matching(
                 &self,
-                _name: &str,
+                name: &str,
                 _req: &str,
             ) -> deps_core::Result<Option<Box<dyn Version>>> {
+                if name == "slow-package" {
+                    // Sleep longer than timeout
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+                // Fast package or unknown: return immediately (no versions)
                 Ok(None)
             }
 
@@ -787,10 +821,14 @@ mod tests {
             elapsed
         );
 
-        // Fast package processed, slow package omitted
+        // Fast package processed (no versions), slow package timed out
         assert!(
-            result.is_empty(),
+            result.versions.is_empty(),
             "No versions returned (test registry returns empty)"
+        );
+        assert_eq!(
+            result.failed_count, 1,
+            "Slow package should be marked as failed"
         );
     }
 
@@ -831,6 +869,18 @@ mod tests {
                 _name: &str,
                 _req: &str,
             ) -> deps_core::Result<Option<Box<dyn Version>>> {
+                // Increment concurrent counter
+                let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+
+                // Track max concurrent
+                self.max_seen.fetch_max(current, Ordering::SeqCst);
+
+                // Simulate work
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // Decrement counter
+                self.current.fetch_sub(1, Ordering::SeqCst);
+
                 Ok(None)
             }
 
@@ -937,10 +987,22 @@ mod tests {
 
             async fn get_latest_matching(
                 &self,
-                _name: &str,
+                name: &str,
                 _req: &str,
             ) -> deps_core::Result<Option<Box<dyn Version>>> {
-                Ok(None)
+                match name {
+                    "package-fast" => Ok(Some(Box::new(MockVersion {
+                        version: "1.0.0".to_string(),
+                    }))),
+                    "package-slow" => {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Ok(None)
+                    }
+                    "package-error" => Err(deps_core::error::DepsError::CacheError(
+                        "Mock registry error".to_string(),
+                    )),
+                    _ => Ok(None),
+                }
             }
 
             async fn search(
@@ -971,18 +1033,22 @@ mod tests {
         let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
 
         // Only the fast package should be in results
-        assert_eq!(result.len(), 1, "Should have exactly 1 successful package");
         assert_eq!(
-            result.get("package-fast"),
+            result.versions.len(),
+            1,
+            "Should have exactly 1 successful package"
+        );
+        assert_eq!(
+            result.versions.get("package-fast"),
             Some(&"1.0.0".to_string()),
             "Fast package should have correct version"
         );
         assert!(
-            !result.contains_key("package-slow"),
+            !result.versions.contains_key("package-slow"),
             "Slow package should not be in results (timeout)"
         );
         assert!(
-            !result.contains_key("package-error"),
+            !result.versions.contains_key("package-error"),
             "Error package should not be in results"
         );
     }
@@ -1007,10 +1073,13 @@ mod tests {
 
             async fn get_latest_matching(
                 &self,
-                _name: &str,
+                name: &str,
                 _req: &str,
             ) -> deps_core::Result<Option<Box<dyn Version>>> {
-                Ok(None)
+                Err(deps_core::error::DepsError::CacheError(format!(
+                    "Failed to fetch package: {}",
+                    name
+                )))
             }
 
             async fn search(
@@ -1042,8 +1111,12 @@ mod tests {
 
         // All packages failed, result should be empty
         assert!(
-            result.is_empty(),
+            result.versions.is_empty(),
             "All packages with errors should be omitted from results"
+        );
+        assert_eq!(
+            result.failed_count, 3,
+            "All 3 packages should be marked as failed"
         );
     }
 

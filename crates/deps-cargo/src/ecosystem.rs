@@ -206,11 +206,16 @@ impl Ecosystem for CargoEcosystem {
     async fn generate_diagnostics(
         &self,
         parse_result: &dyn ParseResultTrait,
-        _cached_versions: &HashMap<String, String>,
+        cached_versions: &HashMap<String, String>,
+        resolved_versions: &HashMap<String, String>,
         _uri: &Uri,
     ) -> Vec<Diagnostic> {
-        lsp_helpers::generate_diagnostics(parse_result, self.registry.as_ref(), &self.formatter)
-            .await
+        lsp_helpers::generate_diagnostics_from_cache(
+            parse_result,
+            cached_versions,
+            resolved_versions,
+            &self.formatter,
+        )
     }
 
     async fn generate_completions(

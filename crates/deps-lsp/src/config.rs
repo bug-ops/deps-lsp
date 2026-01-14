@@ -134,7 +134,7 @@ impl Default for DiagnosticsConfig {
 ///
 /// - `enabled`: `true`
 /// - `refresh_interval_secs`: `300` (5 minutes)
-/// - `fetch_timeout_secs`: `5` (5 seconds per package)
+/// - `fetch_timeout_secs`: `10` (10 seconds per package)
 /// - `max_concurrent_fetches`: `20` (20 concurrent requests)
 ///
 /// # Examples
@@ -157,7 +157,7 @@ pub struct CacheConfig {
     pub refresh_interval_secs: u64,
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Timeout for fetching a single package's versions (default: 5 seconds)
+    /// Timeout for fetching a single package's versions (default: 10 seconds)
     #[serde(
         default = "default_fetch_timeout_secs",
         deserialize_with = "deserialize_fetch_timeout"
@@ -281,11 +281,11 @@ const fn default_refresh_interval() -> u64 {
 }
 
 const fn default_fetch_timeout_secs() -> u64 {
-    5
+    10
 }
 
 const fn default_max_concurrent_fetches() -> usize {
-    20
+    5
 }
 
 /// Minimum timeout (seconds) to prevent zero-timeout edge case
@@ -441,8 +441,8 @@ mod tests {
         let config = CacheConfig::default();
         assert!(config.enabled);
         assert_eq!(config.refresh_interval_secs, 300);
-        assert_eq!(config.fetch_timeout_secs, 5);
-        assert_eq!(config.max_concurrent_fetches, 20);
+        assert_eq!(config.fetch_timeout_secs, 10);
+        assert_eq!(config.max_concurrent_fetches, 5);
     }
 
     #[test]

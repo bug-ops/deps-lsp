@@ -4,7 +4,7 @@ exclude = ["crates/deps-zed"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Andrei G"]
@@ -15,28 +15,28 @@ repository = "https://github.com/bug-ops/deps-lsp"
 async-trait = "0.1"
 criterion = "0.8"
 dashmap = "6.1"
-deps-core = { version = "0.5.2", path = "crates/deps-core" }
-deps-cargo = { version = "0.5.2", path = "crates/deps-cargo" }
-deps-npm = { version = "0.5.2", path = "crates/deps-npm" }
-deps-pypi = { version = "0.5.2", path = "crates/deps-pypi" }
-deps-go = { version = "0.5.2", path = "crates/deps-go" }
-deps-lsp = { version = "0.5.2", path = "crates/deps-lsp" }
+deps-core = { version = "0.5.3", path = "crates/deps-core" }
+deps-cargo = { version = "0.5.3", path = "crates/deps-cargo" }
+deps-npm = { version = "0.5.3", path = "crates/deps-npm" }
+deps-pypi = { version = "0.5.3", path = "crates/deps-pypi" }
+deps-go = { version = "0.5.3", path = "crates/deps-go" }
+deps-lsp = { version = "0.5.3", path = "crates/deps-lsp" }
 futures = "0.3"
 insta = "1"
 mockito = "1"
 node-semver = "2.2"
-once_cell = "1.20"
+once_cell = "1.21"
 pep440_rs = "0.7"
 pep508_rs = "0.9"
 bytes = "1"
 regex = "1"
-reqwest = { version = "0.12", default-features = false }
+reqwest = "0.13"
 semver = "1"
 serde = "1"
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
-tokio = "1.48"
+tokio = "1.49"
 tokio-test = "0.4"
 toml_edit = "0.24"
 tower-lsp-server = "0.23"
