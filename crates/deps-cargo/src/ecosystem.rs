@@ -358,7 +358,9 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
         };
 
-        let resolved_versions = HashMap::new();
+        // Lock file has the latest version
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".to_string(), "1.0.214".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
             &cached_versions,
@@ -369,7 +371,7 @@ mod tests {
 
         assert_eq!(hints.len(), 1);
         match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "✅"),
+            InlayHintLabel::String(s) => assert_eq!(s, "✅ 1.0.214"),
             _ => panic!("Expected String label"),
         }
     }
@@ -394,7 +396,9 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
         };
 
-        let resolved_versions = HashMap::new();
+        // Lock file has the latest version
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".to_string(), "1.0.214".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
             &cached_versions,
@@ -405,7 +409,7 @@ mod tests {
 
         assert_eq!(hints.len(), 1);
         match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "✅"),
+            InlayHintLabel::String(s) => assert_eq!(s, "✅ 1.0.214"),
             _ => panic!("Expected String label"),
         }
     }
@@ -466,7 +470,9 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
         };
 
-        let resolved_versions = HashMap::new();
+        // Lock file has the latest version - but show_up_to_date_hints is false
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".to_string(), "1.0.214".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
             &cached_versions,

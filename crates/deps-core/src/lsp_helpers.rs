@@ -172,11 +172,9 @@ pub fn generate_inlay_hints(
             continue;
         };
 
-        let version_req = dep.version_requirement().unwrap_or("");
-        let requirement_allows_latest =
-            formatter.version_satisfies_requirement(latest, version_req);
-
-        let (is_up_to_date, display_version) = (requirement_allows_latest, Some(latest.as_str()));
+        // Up-to-date only if lock file already has the latest version
+        let is_up_to_date =
+            resolved_version.is_some_and(|resolved| resolved.as_str() == latest.as_str());
 
         let label_text = if is_up_to_date {
             if config.show_up_to_date_hints {
@@ -189,8 +187,7 @@ pub fn generate_inlay_hints(
                 continue;
             }
         } else {
-            let version = display_version.unwrap_or("unknown");
-            config.needs_update_text.replace("{}", version)
+            config.needs_update_text.replace("{}", latest)
         };
 
         hints.push(InlayHint {
@@ -1141,7 +1138,9 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("serde".to_string(), "1.0.214".to_string());
 
-        let resolved_versions = HashMap::new();
+        // Lock file has the latest version
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".to_string(), "1.0.214".to_string());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1156,7 +1155,7 @@ mod tests {
         match &hints[0].label {
             InlayHintLabel::String(text) => {
                 assert_eq!(
-                    text, "✅",
+                    text, "✅ 1.0.214",
                     "Expected up-to-date hint, not loading hint, got: {}",
                     text
                 );
