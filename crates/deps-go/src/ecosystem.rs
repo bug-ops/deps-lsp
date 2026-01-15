@@ -310,7 +310,9 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
         };
 
-        let resolved_versions = HashMap::new();
+        // Lock file has the latest version
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
             &cached_versions,
@@ -321,7 +323,7 @@ mod tests {
 
         assert_eq!(hints.len(), 1);
         match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "✅"),
+            InlayHintLabel::String(s) => assert_eq!(s, "✅ v1.9.1"),
             _ => panic!("Expected String label"),
         }
     }
@@ -394,7 +396,9 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
         };
 
-        let resolved_versions = HashMap::new();
+        // Lock file has the latest version - but show_up_to_date_hints is false
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
             &cached_versions,

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-01-15
+
+### Fixed
+- **Inlay hints now based on lock file version** — Shows ✅ only when lock file has the latest version, ❌ otherwise (regardless of manifest requirement)
+
 ## [0.5.3] - 2026-01-15
 
 ### Changed
