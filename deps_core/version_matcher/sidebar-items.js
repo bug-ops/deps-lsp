@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["extract_pypi_min_version","normalize_and_parse_version"],"struct":["Pep440Matcher","SemverMatcher"],"trait":["VersionRequirementMatcher"]};
