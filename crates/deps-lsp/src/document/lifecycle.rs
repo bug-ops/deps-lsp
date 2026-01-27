@@ -387,15 +387,12 @@ pub async fn handle_document_change(
         let resolved_versions =
             load_resolved_versions(&uri_clone, &state_clone, ecosystem_clone.as_ref()).await;
 
-        // Update document state with resolved versions immediately
+        // Update document state with resolved versions only
+        // Do NOT touch cached_versions - they contain latest registry versions
         if !resolved_versions.is_empty()
             && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
         {
             doc.update_resolved_versions(resolved_versions.clone());
-            // Merge resolved versions into cache (preserves existing registry versions)
-            for (name, version) in resolved_versions {
-                doc.cached_versions.insert(name, version);
-            }
         }
 
         // Skip registry fetch if no new dependencies

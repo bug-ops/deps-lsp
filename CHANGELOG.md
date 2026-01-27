@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-01-27
+
+### Fixed
+- **Inlay hints now correctly handle cached versions** — Fixed bug where inlay hints showed all green checkmarks after cargo update or code actions
+  - Removed incorrect overwriting of cached_versions with resolved_versions in handle_lockfile_change (server.rs)
+  - Removed incorrect merging of resolved_versions into cached_versions in handle_document_change (lifecycle.rs)
+  - cached_versions now correctly preserve latest registry versions while resolved_versions track lock file versions
+- **Inlay hints for dependencies not in lock file** — Dependencies missing from Cargo.lock now show correct status based on version requirement satisfaction
+  - Two-tier check: lock file versions compared directly, missing dependencies checked against version requirements
+  - Fixes incorrect red cross display for dev-dependencies in workspace members
+
+### Changed
+- Updated dependencies (aws-lc-rs, aws-lc-sys, cc, colored, and others)
+
 ## [0.5.4] - 2026-01-15
 
 ### Fixed
