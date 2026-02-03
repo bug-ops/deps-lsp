@@ -388,7 +388,7 @@ gem 'rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 3);
 
-        // rspec and pry should be in development group
+        // rspec and pry should be in development group (development is checked first)
         assert!(matches!(
             result.dependencies[0].group,
             DependencyGroup::Development
@@ -507,6 +507,295 @@ gem 'rails'
     fn test_line_offset_table() {
         let content = "abc\ndef";
         let table = LineOffsetTable::new(content);
+        let pos = table.byte_offset_to_position(content, 4);
+        assert_eq!(pos.line, 1);
+        assert_eq!(pos.character, 0);
+    }
+
+    #[test]
+    fn test_parse_production_group() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'unicorn', group: :production";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert!(matches!(
+            result.dependencies[0].group,
+            DependencyGroup::Production
+        ));
+    }
+
+    #[test]
+    fn test_parse_development_group() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'pry', group: :development";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert!(matches!(
+            result.dependencies[0].group,
+            DependencyGroup::Development
+        ));
+    }
+
+    #[test]
+    fn test_parse_custom_group() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'sidekiq', group: :staging";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        if let DependencyGroup::Custom(name) = &result.dependencies[0].group {
+            assert_eq!(name, "staging");
+        } else {
+            panic!("Expected custom group");
+        }
+    }
+
+    #[test]
+    fn test_parse_group_block_test() {
+        let gemfile = r"source 'https://rubygems.org'
+group :test do
+  gem 'minitest'
+end";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert!(matches!(
+            result.dependencies[0].group,
+            DependencyGroup::Test
+        ));
+    }
+
+    #[test]
+    fn test_parse_group_block_production() {
+        let gemfile = r"source 'https://rubygems.org'
+group :production do
+  gem 'newrelic_rpm'
+end";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert!(matches!(
+            result.dependencies[0].group,
+            DependencyGroup::Production
+        ));
+    }
+
+    #[test]
+    fn test_parse_single_platform() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'wdm', platforms: :mswin";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].platforms, vec!["mswin"]);
+    }
+
+    #[test]
+    fn test_parse_require_custom_path() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'my_gem', require: 'custom/path'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].require, Some("custom/path".into()));
+    }
+
+    #[test]
+    fn test_parse_multiple_sources() {
+        let gemfile = r"source 'https://rubygems.org'
+source 'https://gems.example.com'
+gem 'rails'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        // First source should be kept
+        assert_eq!(result.source_url, Some("https://rubygems.org".into()));
+    }
+
+    #[test]
+    fn test_parse_double_quoted_strings() {
+        let gemfile = r#"source "https://rubygems.org"
+gem "rails", "~> 7.0""#;
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "rails");
+        assert_eq!(result.source_url, Some("https://rubygems.org".into()));
+    }
+
+    #[test]
+    fn test_parse_gem_with_multiple_options() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'sidekiq', '~> 7.0', require: false, group: :production";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].name, "sidekiq");
+        assert_eq!(result.dependencies[0].version_req, Some("~> 7.0".into()));
+        assert_eq!(result.dependencies[0].require, Some("false".into()));
+        assert!(matches!(
+            result.dependencies[0].group,
+            DependencyGroup::Production
+        ));
+    }
+
+    #[test]
+    fn test_parse_nested_group_blocks() {
+        let gemfile = r"source 'https://rubygems.org'
+group :development do
+  gem 'pry'
+end
+group :test do
+  gem 'rspec'
+end
+gem 'rails'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        assert!(matches!(
+            result.dependencies[0].group,
+            DependencyGroup::Development
+        ));
+        assert!(matches!(
+            result.dependencies[1].group,
+            DependencyGroup::Test
+        ));
+        assert!(matches!(
+            result.dependencies[2].group,
+            DependencyGroup::Default
+        ));
+    }
+
+    #[test]
+    fn test_line_offset_table_empty() {
+        let content = "";
+        let table = LineOffsetTable::new(content);
+        assert_eq!(table.line_starts.len(), 1);
+        assert_eq!(table.line_starts[0], 0);
+    }
+
+    #[test]
+    fn test_line_offset_table_single_line() {
+        let content = "hello world";
+        let table = LineOffsetTable::new(content);
+        assert_eq!(table.line_starts.len(), 1);
+        let pos = table.byte_offset_to_position(content, 6);
+        assert_eq!(pos.line, 0);
+        assert_eq!(pos.character, 6);
+    }
+
+    #[test]
+    fn test_line_offset_table_multiple_lines() {
+        let content = "line1\nline2\nline3";
+        let table = LineOffsetTable::new(content);
+        assert_eq!(table.line_starts.len(), 3);
+
+        // First char of line 2
+        let pos = table.byte_offset_to_position(content, 6);
+        assert_eq!(pos.line, 1);
+        assert_eq!(pos.character, 0);
+
+        // First char of line 3
+        let pos = table.byte_offset_to_position(content, 12);
+        assert_eq!(pos.line, 2);
+        assert_eq!(pos.character, 0);
+    }
+
+    #[test]
+    fn test_parse_result_trait() {
+        use deps_core::ParseResult;
+
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails', '~> 7.0'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+
+        assert_eq!(result.dependencies().len(), 1);
+        assert!(result.workspace_root().is_none());
+        assert!(result.as_any().is::<BundlerParseResult>());
+    }
+
+    #[test]
+    fn test_parse_result_info_trait() {
+        use deps_core::ParseResultInfo;
+
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+
+        assert_eq!(result.dependencies().len(), 1);
+        assert!(result.workspace_root().is_none());
+    }
+
+    #[test]
+    fn test_bundler_parser_trait() {
+        use deps_core::ManifestParser;
+
+        let parser = BundlerParser;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails'";
+        let result = parser.parse(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_version_operators() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'gem1', '>= 1.0'
+gem 'gem2', '> 2.0'
+gem 'gem3', '<= 3.0'
+gem 'gem4', '< 4.0'
+gem 'gem5', '!= 5.0'";
+
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 5);
+        assert_eq!(result.dependencies[0].version_req, Some(">= 1.0".into()));
+        assert_eq!(result.dependencies[1].version_req, Some("> 2.0".into()));
+        assert_eq!(result.dependencies[2].version_req, Some("<= 3.0".into()));
+        assert_eq!(result.dependencies[3].version_req, Some("< 4.0".into()));
+        assert_eq!(result.dependencies[4].version_req, Some("!= 5.0".into()));
+    }
+
+    #[test]
+    fn test_parse_exact_version() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails', '7.0.8'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].version_req, Some("7.0.8".into()));
+    }
+
+    #[test]
+    fn test_parse_result_uri() {
+        use deps_core::ParseResult;
+
+        let uri = test_uri();
+        let gemfile = r"source 'https://rubygems.org'";
+        let result = parse_gemfile(gemfile, &uri).unwrap();
+
+        assert_eq!(result.uri(), &uri);
+    }
+
+    #[test]
+    fn test_group_array_syntax() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rspec', group: [:test, :development]";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        // When array contains both :test and :development, development is checked first
+        assert!(matches!(
+            result.dependencies[0].group,
+            DependencyGroup::Development
+        ));
+    }
+
+    #[test]
+    fn test_whitespace_handling() {
+        let gemfile = "source 'https://rubygems.org'\n  gem  'rails'  ";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "rails");
+    }
+
+    #[test]
+    fn test_gem_without_source() {
+        let gemfile = "gem 'rails'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(result.source_url.is_none());
+    }
+
+    #[test]
+    fn test_unicode_in_content() {
+        let gemfile = "source 'https://rubygems.org'\n# UTF-8: \u{1F600}\ngem 'rails'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn test_line_offset_unicode() {
+        let content = "abc\n\u{1F600}def";
+        let table = LineOffsetTable::new(content);
+        // The emoji takes 4 bytes in UTF-8
         let pos = table.byte_offset_to_position(content, 4);
         assert_eq!(pos.line, 1);
         assert_eq!(pos.character, 0);

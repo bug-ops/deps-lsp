@@ -199,4 +199,183 @@ mod tests {
         let deps_err: deps_core::DepsError = bundler_err.into();
         assert!(deps_err.to_string().contains("not found"));
     }
+
+    #[test]
+    fn test_parse_error_display() {
+        let err = BundlerError::ParseError {
+            message: "unexpected token".into(),
+        };
+        assert_eq!(err.to_string(), "Failed to parse Gemfile: unexpected token");
+    }
+
+    #[test]
+    fn test_parse_error_to_deps_error() {
+        let err = BundlerError::ParseError {
+            message: "syntax error".into(),
+        };
+        let deps_err: deps_core::DepsError = err.into();
+        assert!(matches!(deps_err, deps_core::DepsError::ParseError { .. }));
+    }
+
+    #[test]
+    fn test_invalid_version_specifier_to_deps_error() {
+        let err = BundlerError::InvalidVersionSpecifier {
+            specifier: "~>".into(),
+            message: "incomplete specifier".into(),
+        };
+        let deps_err: deps_core::DepsError = err.into();
+        assert!(matches!(
+            deps_err,
+            deps_core::DepsError::InvalidVersionReq(_)
+        ));
+    }
+
+    #[test]
+    fn test_registry_error_to_deps_error() {
+        let io_err = std::io::Error::other("connection refused");
+        let err = BundlerError::RegistryError {
+            package: "nokogiri".into(),
+            source: Box::new(io_err),
+        };
+        let deps_err: deps_core::DepsError = err.into();
+        assert!(matches!(deps_err, deps_core::DepsError::ParseError { .. }));
+    }
+
+    #[test]
+    fn test_api_response_error_to_deps_error() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err();
+        let err = BundlerError::ApiResponseError {
+            package: "test".into(),
+            source: json_err,
+        };
+        let deps_err: deps_core::DepsError = err.into();
+        assert!(matches!(deps_err, deps_core::DepsError::Json(_)));
+    }
+
+    #[test]
+    fn test_invalid_structure_to_deps_error() {
+        let err = BundlerError::InvalidStructure {
+            message: "missing gem declaration".into(),
+        };
+        let deps_err: deps_core::DepsError = err.into();
+        assert!(matches!(deps_err, deps_core::DepsError::CacheError(_)));
+    }
+
+    #[test]
+    fn test_invalid_uri_to_deps_error() {
+        let err = BundlerError::InvalidUri {
+            uri: "invalid://uri".into(),
+        };
+        let deps_err: deps_core::DepsError = err.into();
+        assert!(matches!(deps_err, deps_core::DepsError::CacheError(_)));
+        assert!(deps_err.to_string().contains("Invalid URI"));
+    }
+
+    #[test]
+    fn test_cache_error_to_deps_error() {
+        let err = BundlerError::CacheError("cache miss".into());
+        let deps_err: deps_core::DepsError = err.into();
+        assert!(matches!(deps_err, deps_core::DepsError::CacheError(_)));
+    }
+
+    #[test]
+    fn test_io_error_to_deps_error() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let err = BundlerError::Io(io_err);
+        let deps_err: deps_core::DepsError = err.into();
+        assert!(matches!(deps_err, deps_core::DepsError::Io(_)));
+    }
+
+    #[test]
+    fn test_other_error_to_deps_error() {
+        let other_err: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("unknown error"));
+        let err = BundlerError::Other(other_err);
+        let deps_err: deps_core::DepsError = err.into();
+        assert!(matches!(deps_err, deps_core::DepsError::CacheError(_)));
+    }
+
+    #[test]
+    fn test_deps_error_to_bundler_error_parse() {
+        let deps_err = deps_core::DepsError::ParseError {
+            file_type: "test".into(),
+            source: Box::new(std::io::Error::other("parse failed")),
+        };
+        let bundler_err: BundlerError = deps_err.into();
+        assert!(matches!(bundler_err, BundlerError::CacheError(_)));
+    }
+
+    #[test]
+    fn test_deps_error_to_bundler_error_cache() {
+        let deps_err = deps_core::DepsError::CacheError("cache failure".into());
+        let bundler_err: BundlerError = deps_err.into();
+        assert!(matches!(bundler_err, BundlerError::CacheError(_)));
+    }
+
+    #[test]
+    fn test_deps_error_to_bundler_error_invalid_version() {
+        let deps_err = deps_core::DepsError::InvalidVersionReq("bad version".into());
+        let bundler_err: BundlerError = deps_err.into();
+        assert!(matches!(
+            bundler_err,
+            BundlerError::InvalidVersionSpecifier { .. }
+        ));
+    }
+
+    #[test]
+    fn test_deps_error_to_bundler_error_io() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let deps_err = deps_core::DepsError::Io(io_err);
+        let bundler_err: BundlerError = deps_err.into();
+        assert!(matches!(bundler_err, BundlerError::Io(_)));
+    }
+
+    #[test]
+    fn test_deps_error_to_bundler_error_json() {
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let deps_err = deps_core::DepsError::Json(json_err);
+        let bundler_err: BundlerError = deps_err.into();
+        assert!(matches!(bundler_err, BundlerError::ApiResponseError { .. }));
+    }
+
+    #[test]
+    fn test_io_error_from_impl() {
+        let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let bundler_err: BundlerError = io_err.into();
+        assert!(matches!(bundler_err, BundlerError::Io(_)));
+    }
+
+    #[test]
+    fn test_error_display_api_response_error() {
+        let json_err = serde_json::from_str::<serde_json::Value>("[invalid").unwrap_err();
+        let err = BundlerError::ApiResponseError {
+            package: "rails".into(),
+            source: json_err,
+        };
+        let display = err.to_string();
+        assert!(display.contains("rails"));
+        assert!(display.contains("rubygems API response"));
+    }
+
+    #[test]
+    fn test_error_display_registry_error() {
+        let io_err = std::io::Error::other("timeout");
+        let err = BundlerError::RegistryError {
+            package: "nokogiri".into(),
+            source: Box::new(io_err),
+        };
+        let display = err.to_string();
+        assert!(display.contains("nokogiri"));
+        assert!(display.contains("rubygems.org"));
+    }
+
+    #[test]
+    fn test_error_debug() {
+        let err = BundlerError::PackageNotFound {
+            package: "test".into(),
+        };
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("PackageNotFound"));
+        assert!(debug.contains("test"));
+    }
 }
