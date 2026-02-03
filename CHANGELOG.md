@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-02-03
+
+### Added
+- **Ruby/Bundler ecosystem support** — New `deps-bundler` crate with full Gemfile and Gemfile.lock support
+  - Gemfile DSL parser with regex-based extraction
+  - Gemfile.lock parser with state machine for GEM, GIT, PATH sections
+  - rubygems.org API client with HTTP caching
+  - Version comparison with pessimistic operator (`~>`)
+  - Support for git, path, github dependency sources
+  - Group handling (development, test, production)
+  - Implements Ecosystem, Dependency, Version, Metadata traits from deps-core
+
+### Fixed
+- **"Unknown package" false positives** — Packages present in lock file no longer show "Unknown" diagnostic when registry fetch fails
+- **Platform-specific gems** — Gemfile.lock DEPENDENCIES section is now parsed to recognize platform-specific gems (e.g., `tzinfo-data` on Windows/JRuby)
+
+### Changed
+- Zed extension now supports Ruby language for Gemfile files
+- Updated deps-bundler README with usage examples
+
 ## [0.5.5] - 2026-01-27
 
 ### Fixed
