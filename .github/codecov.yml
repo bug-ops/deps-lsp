@@ -41,7 +41,13 @@ ignore:
   - "crates/deps-zed/**/*"  # WASM extension has limited testing
 
 # Per-crate flags for detailed coverage tracking
+# Codecov automatically filters coverage by paths defined here
 flags:
+  overall:
+    paths:
+      - crates/
+    carryforward: true
+
   deps-core:
     paths:
       - crates/deps-core/src/
@@ -60,6 +66,16 @@ flags:
   deps-pypi:
     paths:
       - crates/deps-pypi/src/
+    carryforward: true
+
+  deps-go:
+    paths:
+      - crates/deps-go/src/
+    carryforward: true
+
+  deps-bundler:
+    paths:
+      - crates/deps-bundler/src/
     carryforward: true
 
   deps-lsp:

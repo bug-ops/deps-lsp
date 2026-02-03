@@ -408,8 +408,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "deps-bundler"
+version = "0.6.0"
+dependencies = [
+ "async-trait",
+ "criterion",
+ "deps-core",
+ "insta",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tower-lsp-server",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
 name = "deps-cargo"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -431,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "deps-core"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -454,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "deps-go"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -474,11 +495,12 @@ dependencies = [
 
 [[package]]
 name = "deps-lsp"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "criterion",
  "dashmap",
+ "deps-bundler",
  "deps-cargo",
  "deps-core",
  "deps-go",
@@ -500,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "deps-npm"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -519,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "deps-pypi"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "criterion",

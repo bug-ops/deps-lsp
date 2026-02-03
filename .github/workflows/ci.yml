@@ -8,7 +8,6 @@ on:
   schedule:
     - cron: '0 0 * * 0'  # Weekly dependency check
 
-# Restrict permissions for all jobs by default
 permissions:
   contents: read
 
@@ -20,13 +19,11 @@ env:
   RUSTFLAGS: "-D warnings"
   RUSTUP_MAX_RETRIES: 10
 
-# Cancel previous runs on new push
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # Detect changes to skip unnecessary jobs
   changes:
     name: Detect Changes
     runs-on: ubuntu-latest
@@ -51,7 +48,6 @@ jobs:
             workflows:
               - '.github/workflows/**'
 
-  # Format check (nightly for Edition 2024)
   fmt:
     name: Format
     needs: changes
@@ -61,15 +57,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - uses: moonrepo/setup-rust@v1
         with:
+          channel: nightly
           components: rustfmt
+          cache: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: cargo +nightly fmt --all -- --check
 
-  # Clippy and docs (stable)
   check:
     name: Check
     needs: changes
@@ -79,16 +77,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - uses: moonrepo/setup-rust@v1
         with:
           components: clippy
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "check"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -98,7 +91,6 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-  # Security audit
   security:
     name: Security Audit
     needs: changes
@@ -117,12 +109,6 @@ jobs:
       - name: Run cargo-deny
         run: cargo deny check
 
-      # Note: cargo-semver-checks removed for pre-1.0 development
-      # Checking semver compliance for 7 crates takes 5-7 minutes
-      # and is not valuable for pre-1.0 versions (breaking changes allowed)
-      # Re-enable when approaching 1.0.0 release
-
-  # Cross-platform tests with matrix
   test:
     name: Test (${{ matrix.os }}${{ matrix.target && format(' / {0}', matrix.target) || '' }})
     needs: [changes, fmt, check]
@@ -135,10 +121,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable]
         include:
-          # Test on beta channel on Linux only
           - os: ubuntu-latest
             rust: beta
-          # Cross-compile check for Windows ARM64
           - os: windows-latest
             rust: stable
             target: aarch64-pc-windows-msvc
@@ -147,28 +131,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust ${{ matrix.rust }}
-        uses: dtolnay/rust-toolchain@master
+      - uses: moonrepo/setup-rust@v1
         with:
-          toolchain: ${{ matrix.rust }}
+          channel: ${{ matrix.rust }}
           targets: ${{ matrix.target }}
+          bins: cargo-nextest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Platform-specific setup
       - name: Install dependencies (Ubuntu)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "test-${{ matrix.os }}${{ matrix.target && format('-{0}', matrix.target) || '' }}"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Install nextest
-        if: ${{ !matrix.cross }}
-        uses: taiki-e/install-action@nextest
 
       - name: Run tests
         if: ${{ !matrix.cross }}
@@ -182,10 +157,6 @@ jobs:
         if: ${{ matrix.cross }}
         run: cargo build --workspace --target ${{ matrix.target }}
 
-  # Code coverage (Linux only for speed)
-  # Optimized: Single test run with codecov flags for per-crate tracking
-  # Previous approach ran tests 7 times (1 overall + 6 per-crate) taking ~15 min
-  # New approach: Single run with flags takes ~5 min (67% faster, 67% less runner cost)
   coverage:
     name: Code Coverage
     needs: [changes, fmt, check]
@@ -195,83 +166,22 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install llvm-cov and nextest
-        uses: taiki-e/install-action@v2
+      - uses: moonrepo/setup-rust@v1
         with:
-          tool: cargo-llvm-cov,cargo-nextest
+          bins: cargo-llvm-cov,cargo-nextest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "coverage"
+      - name: Generate coverage
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest
 
-      - name: Generate coverage (single run for all crates)
-        run: |
-          cargo llvm-cov --all-features --workspace --lcov \
-            --output-path lcov.info nextest
-
-      # Upload overall coverage with overall flag
-      - name: Upload overall coverage
+      - name: Upload coverage
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
-          flags: overall
           fail_ci_if_error: false
           verbose: true
-
-      # Upload per-crate coverage using flags
-      # Codecov automatically filters by file paths in each crate
-      - name: Upload deps-core coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-core
-          fail_ci_if_error: false
-
-      - name: Upload deps-cargo coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-cargo
-          fail_ci_if_error: false
-
-      - name: Upload deps-npm coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-npm
-          fail_ci_if_error: false
-
-      - name: Upload deps-pypi coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-pypi
-          fail_ci_if_error: false
-
-      - name: Upload deps-go coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-go
-          fail_ci_if_error: false
-
-      - name: Upload deps-lsp coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-lsp
-          fail_ci_if_error: false
 
       - name: Archive coverage report
         uses: actions/upload-artifact@v4
@@ -280,7 +190,6 @@ jobs:
           path: lcov.info
           retention-days: 30
 
-  # MSRV check
   msrv:
     name: Check MSRV
     needs: [changes, fmt, check]
@@ -296,23 +205,15 @@ jobs:
           MSRV=$(grep '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$MSRV" >> $GITHUB_OUTPUT
 
-      - name: Install Rust ${{ steps.msrv.outputs.version }}
-        uses: dtolnay/rust-toolchain@master
+      - uses: moonrepo/setup-rust@v1
         with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "msrv"
+          channel: ${{ steps.msrv.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check with MSRV
         run: cargo check --workspace --all-features
 
-  # WASM build check for Zed extension
-  # Note: deps-zed is now a separate repository (submodule).
-  # WASM build is handled in the deps-zed repo CI.
-  # This job now validates that submodule is properly configured.
   wasm:
     name: WASM Build (Zed Extension)
     needs: [changes, fmt, check]
@@ -324,15 +225,12 @@ jobs:
         with:
           submodules: true
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: moonrepo/setup-rust@v1
         with:
           targets: wasm32-wasip1
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "wasm"
+          cache-target: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build Zed extension
         working-directory: crates/deps-zed
@@ -343,7 +241,6 @@ jobs:
           ls -lh crates/deps-zed/target/wasm32-wasip1/release/*.wasm
           du -sh crates/deps-zed/target/wasm32-wasip1/release/*.wasm
 
-  # Verify benchmarks compile (without running)
   benchmark:
     name: Check Benchmarks
     needs: [changes, fmt, check]
@@ -353,19 +250,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "bench"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: moonrepo/setup-rust@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build benchmarks
         run: cargo build --workspace --benches
 
-  # Release build check
   release-check:
     name: Release Build Check
     needs: [test]
@@ -374,13 +265,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: moonrepo/setup-rust@v1
         with:
-          shared-key: "release"
+          cache-target: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build release
         run: cargo build --workspace --release --all-features
@@ -390,7 +279,6 @@ jobs:
           ls -lh target/release/
           du -sh target/release/
 
-  # All checks passed
   ci-success:
     name: CI Success
     needs: [changes, fmt, check, security, test, coverage, msrv, wasm, benchmark]
@@ -399,13 +287,11 @@ jobs:
     steps:
       - name: Check all jobs
         run: |
-          # If no relevant changes, all skipped jobs are OK
           if [[ "${{ needs.changes.outputs.rust }}" != "true" && "${{ needs.changes.outputs.workflows }}" != "true" ]]; then
             echo "No relevant changes - skipped jobs are OK"
             exit 0
           fi
 
-          # Check if any required job failed (skipped is OK for conditional jobs)
           check_job() {
             local result="$1"
             local name="$2"

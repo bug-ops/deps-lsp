@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **deps-bundler benchmarks** — Criterion benchmarks for Gemfile/Gemfile.lock parsing with various file sizes (5-100 deps)
+
+### Changed
+- **CI migrated to moonrepo/setup-rust** — Replaced dtolnay/rust-toolchain and Swatinem/rust-cache with unified moonrepo action
+- **Simplified codecov upload** — Single upload with path-based flags (8 actions → 1)
+- **Removed sccache from CI** — moonrepo handles caching natively
+
+### Fixed
+- **deps-bundler test coverage increased to 90%+** — Added comprehensive tests for error handling, parser edge cases, registry response parsing
+
+## [0.6.0] - 2026-02-03
+
+### Added
+- **Ruby/Bundler ecosystem support** — New `deps-bundler` crate with full Gemfile and Gemfile.lock support
+  - Gemfile DSL parser with regex-based extraction
+  - Gemfile.lock parser with state machine for GEM, GIT, PATH sections
+  - rubygems.org API client with HTTP caching
+  - Version comparison with pessimistic operator (`~>`)
+  - Support for git, path, github dependency sources
+  - Group handling (development, test, production)
+  - Implements Ecosystem, Dependency, Version, Metadata traits from deps-core
+
+### Fixed
+- **"Unknown package" false positives** — Packages present in lock file no longer show "Unknown" diagnostic when registry fetch fails
+- **Platform-specific gems** — Gemfile.lock DEPENDENCIES section is now parsed to recognize platform-specific gems (e.g., `tzinfo-data` on Windows/JRuby)
+
+### Changed
+- Zed extension now supports Ruby language for Gemfile files
+- Updated deps-bundler README with usage examples
+
 ## [0.5.5] - 2026-01-27
 
 ### Fixed
@@ -267,7 +298,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/bug-ops/deps-lsp/compare/v0.5.5...v0.6.0
+[0.5.5]: https://github.com/bug-ops/deps-lsp/compare/v0.5.4...v0.5.5
+[0.5.4]: https://github.com/bug-ops/deps-lsp/compare/v0.5.3...v0.5.3
+[0.5.3]: https://github.com/bug-ops/deps-lsp/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/bug-ops/deps-lsp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/bug-ops/deps-lsp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/bug-ops/deps-lsp/compare/v0.4.1...v0.5.0
