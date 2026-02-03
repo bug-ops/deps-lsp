@@ -31,3 +31,7 @@ once_cell = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test = { workspace = true }
+
+[[bench]]
+name = "bundler_benchmarks"
+harness = false

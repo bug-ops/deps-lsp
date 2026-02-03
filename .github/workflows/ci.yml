@@ -224,7 +224,7 @@ jobs:
           verbose: true
 
       # Upload per-crate coverage using flags
-      # Codecov automatically filters by file paths in each crate
+      # Codecov filters by file paths defined in codecov.yml
       - name: Upload deps-core coverage
         uses: codecov/codecov-action@v5
         with:
@@ -263,6 +263,14 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           flags: deps-go
+          fail_ci_if_error: false
+
+      - name: Upload deps-bundler coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          flags: deps-bundler
           fail_ci_if_error: false
 
       - name: Upload deps-lsp coverage
