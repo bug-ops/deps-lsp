@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn test_parse_simple_gemfile_lock() {
-        let lockfile = r#"GEM
+        let lockfile = r"GEM
   remote: https://rubygems.org/
   specs:
     rails (7.0.8)
@@ -185,7 +185,7 @@ DEPENDENCIES
 
 BUNDLED WITH
    2.5.3
-"#;
+";
 
         let packages = parse_gemfile_lock(lockfile).unwrap();
         assert_eq!(packages.len(), 3);
@@ -196,7 +196,7 @@ BUNDLED WITH
 
     #[test]
     fn test_parse_git_source() {
-        let lockfile = r#"GIT
+        let lockfile = r"GIT
   remote: https://github.com/rails/rails.git
   revision: abc123
   specs:
@@ -213,7 +213,7 @@ DEPENDENCIES
 
 BUNDLED WITH
    2.5.3
-"#;
+";
 
         let packages = parse_gemfile_lock(lockfile).unwrap();
         assert_eq!(packages.len(), 2);
@@ -231,7 +231,7 @@ BUNDLED WITH
 
     #[test]
     fn test_parse_path_source() {
-        let lockfile = r#"PATH
+        let lockfile = r"PATH
   remote: ../my_gem
   specs:
     my_gem (0.1.0)
@@ -247,7 +247,7 @@ DEPENDENCIES
 
 BUNDLED WITH
    2.5.3
-"#;
+";
 
         let packages = parse_gemfile_lock(lockfile).unwrap();
         assert_eq!(packages.len(), 2);
@@ -303,7 +303,7 @@ BUNDLED WITH
         let temp_dir = tempfile::tempdir().unwrap();
         let lockfile_path = temp_dir.path().join("Gemfile.lock");
 
-        let content = r#"GEM
+        let content = r"GEM
   remote: https://rubygems.org/
   specs:
     rails (7.0.8)
@@ -313,7 +313,7 @@ DEPENDENCIES
 
 BUNDLED WITH
    2.5.3
-"#;
+";
         std::fs::write(&lockfile_path, content).unwrap();
 
         let parser = GemfileLockParser;

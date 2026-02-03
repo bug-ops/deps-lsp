@@ -353,7 +353,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 pub fn generate_diagnostics_from_cache(
     parse_result: &dyn ParseResult,
     cached_versions: &HashMap<String, String>,
-    _resolved_versions: &HashMap<String, String>,
+    resolved_versions: &HashMap<String, String>,
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
@@ -366,13 +366,19 @@ pub fn generate_diagnostics_from_cache(
             .or_else(|| cached_versions.get(dep.name()));
 
         let Some(latest) = latest_version else {
-            diagnostics.push(Diagnostic {
-                range: dep.name_range(),
-                severity: Some(DiagnosticSeverity::WARNING),
-                message: format!("Unknown package '{}' (or failed to fetch)", dep.name()),
-                source: Some("deps-lsp".into()),
-                ..Default::default()
-            });
+            // Skip "unknown" diagnostic if package exists in lock file
+            // (registry fetch may have failed due to rate limiting)
+            let in_lockfile = resolved_versions.contains_key(&normalized_name)
+                || resolved_versions.contains_key(dep.name());
+            if !in_lockfile {
+                diagnostics.push(Diagnostic {
+                    range: dep.name_range(),
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    message: format!("Unknown package '{}'", dep.name()),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+            }
             continue;
         };
 

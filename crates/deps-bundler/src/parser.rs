@@ -345,8 +345,8 @@ mod tests {
 
     #[test]
     fn test_parse_simple_gem() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'rails'"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "rails");
@@ -355,8 +355,8 @@ gem 'rails'"#;
 
     #[test]
     fn test_parse_gem_with_version() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'rails', '~> 7.0'"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails', '~> 7.0'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "rails");
@@ -365,8 +365,8 @@ gem 'rails', '~> 7.0'"#;
 
     #[test]
     fn test_parse_gem_with_group() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'rspec', group: :test"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rspec', group: :test";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert!(matches!(
@@ -377,14 +377,14 @@ gem 'rspec', group: :test"#;
 
     #[test]
     fn test_parse_group_block() {
-        let gemfile = r#"source 'https://rubygems.org'
+        let gemfile = r"source 'https://rubygems.org'
 
 group :development, :test do
   gem 'rspec'
   gem 'pry'
 end
 
-gem 'rails'"#;
+gem 'rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 3);
 
@@ -407,8 +407,8 @@ gem 'rails'"#;
 
     #[test]
     fn test_parse_git_source() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'rails', git: 'https://github.com/rails/rails.git'"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails', git: 'https://github.com/rails/rails.git'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert!(matches!(
             result.dependencies[0].source,
@@ -418,8 +418,8 @@ gem 'rails', git: 'https://github.com/rails/rails.git'"#;
 
     #[test]
     fn test_parse_github_source() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'rails', github: 'rails/rails'"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails', github: 'rails/rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert!(matches!(
             result.dependencies[0].source,
@@ -429,8 +429,8 @@ gem 'rails', github: 'rails/rails'"#;
 
     #[test]
     fn test_parse_path_source() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'local_gem', path: '../local_gem'"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'local_gem', path: '../local_gem'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert!(matches!(
             result.dependencies[0].source,
@@ -440,25 +440,25 @@ gem 'local_gem', path: '../local_gem'"#;
 
     #[test]
     fn test_parse_ruby_version() {
-        let gemfile = r#"source 'https://rubygems.org'
+        let gemfile = r"source 'https://rubygems.org'
 ruby '3.2.2'
-gem 'rails'"#;
+gem 'rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.ruby_version, Some("3.2.2".into()));
     }
 
     #[test]
     fn test_parse_source_url() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'rails'"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.source_url, Some("https://rubygems.org".into()));
     }
 
     #[test]
     fn test_position_tracking() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'rails', '~> 7.0'"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails', '~> 7.0'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
 
@@ -471,16 +471,16 @@ gem 'rails', '~> 7.0'"#;
 
     #[test]
     fn test_parse_platforms() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'tzinfo-data', platforms: [:mingw, :mswin]"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'tzinfo-data', platforms: [:mingw, :mswin]";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies[0].platforms, vec!["mingw", "mswin"]);
     }
 
     #[test]
     fn test_parse_require_false() {
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'puma', require: false"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'puma', require: false";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies[0].require, Some("false".into()));
     }
@@ -494,10 +494,10 @@ gem 'puma', require: false"#;
 
     #[test]
     fn test_gemfile_with_comments() {
-        let gemfile = r#"source 'https://rubygems.org'
+        let gemfile = r"source 'https://rubygems.org'
 # This is a comment
 gem 'rails'
-# gem 'disabled'"#;
+# gem 'disabled'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "rails");

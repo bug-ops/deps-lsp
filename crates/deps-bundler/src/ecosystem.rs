@@ -278,8 +278,8 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = BundlerEcosystem::new(cache);
 
-        let gemfile = r#"source 'https://rubygems.org'
-gem 'rails', '~> 7.0'"#;
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails', '~> 7.0'";
 
         #[cfg(windows)]
         let path = "C:/test/Gemfile";
