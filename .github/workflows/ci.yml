@@ -213,73 +213,14 @@ jobs:
           cargo llvm-cov --all-features --workspace --lcov \
             --output-path lcov.info nextest
 
-      # Upload overall coverage with overall flag
-      - name: Upload overall coverage
+      # Single upload - Codecov applies flags based on paths in codecov.yml
+      - name: Upload coverage
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
-          flags: overall
           fail_ci_if_error: false
           verbose: true
-
-      # Upload per-crate coverage using flags
-      # Codecov filters by file paths defined in codecov.yml
-      - name: Upload deps-core coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-core
-          fail_ci_if_error: false
-
-      - name: Upload deps-cargo coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-cargo
-          fail_ci_if_error: false
-
-      - name: Upload deps-npm coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-npm
-          fail_ci_if_error: false
-
-      - name: Upload deps-pypi coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-pypi
-          fail_ci_if_error: false
-
-      - name: Upload deps-go coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-go
-          fail_ci_if_error: false
-
-      - name: Upload deps-bundler coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-bundler
-          fail_ci_if_error: false
-
-      - name: Upload deps-lsp coverage
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: lcov.info
-          flags: deps-lsp
-          fail_ci_if_error: false
 
       - name: Archive coverage report
         uses: actions/upload-artifact@v4
