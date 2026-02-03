@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **deps-bundler benchmarks** — Criterion benchmarks for Gemfile/Gemfile.lock parsing with various file sizes (5-100 deps)
+
+### Changed
+- **CI migrated to moonrepo/setup-rust** — Replaced dtolnay/rust-toolchain and Swatinem/rust-cache with unified moonrepo action
+- **Simplified codecov upload** — Single upload with path-based flags (8 actions → 1)
+- **Removed sccache from CI** — moonrepo handles caching natively
+
+### Fixed
+- **deps-bundler test coverage increased to 90%+** — Added comprehensive tests for error handling, parser edge cases, registry response parsing
+
 ## [0.6.0] - 2026-02-03
 
 ### Added
@@ -287,7 +298,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/bug-ops/deps-lsp/compare/v0.5.5...v0.6.0
+[0.5.5]: https://github.com/bug-ops/deps-lsp/compare/v0.5.4...v0.5.5
+[0.5.4]: https://github.com/bug-ops/deps-lsp/compare/v0.5.3...v0.5.3
+[0.5.3]: https://github.com/bug-ops/deps-lsp/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/bug-ops/deps-lsp/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/bug-ops/deps-lsp/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/bug-ops/deps-lsp/compare/v0.4.1...v0.5.0
