@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["EcosystemConfig"],"trait":["Dependency","Ecosystem","ParseResult"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["ecosystem","error","formatter","lockfile","parser","registry","types"],"type":["NpmVersionReq"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["NPMJS_URL"],"fn":["package_url"],"struct":["NpmRegistry"]};

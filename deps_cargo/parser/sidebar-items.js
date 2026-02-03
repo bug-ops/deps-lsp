@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["parse_cargo_toml"],"struct":["CargoParser","ParseResult"]};
