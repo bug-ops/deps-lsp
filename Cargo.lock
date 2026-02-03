@@ -408,6 +408,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "deps-bundler"
+version = "0.5.5"
+dependencies = [
+ "async-trait",
+ "criterion",
+ "deps-core",
+ "insta",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tower-lsp-server",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
 name = "deps-cargo"
 version = "0.5.5"
 dependencies = [
@@ -479,6 +500,7 @@ dependencies = [
  "async-trait",
  "criterion",
  "dashmap",
+ "deps-bundler",
  "deps-cargo",
  "deps-core",
  "deps-go",

@@ -20,6 +20,7 @@ deps-cargo = { version = "0.5.5", path = "crates/deps-cargo" }
 deps-npm = { version = "0.5.5", path = "crates/deps-npm" }
 deps-pypi = { version = "0.5.5", path = "crates/deps-pypi" }
 deps-go = { version = "0.5.5", path = "crates/deps-go" }
+deps-bundler = { version = "0.5.5", path = "crates/deps-bundler" }
 deps-lsp = { version = "0.5.5", path = "crates/deps-lsp" }
 futures = "0.3"
 insta = "1"

@@ -92,12 +92,29 @@ ecosystem!(
     ]
 );
 
+ecosystem!(
+    "bundler",
+    deps_bundler,
+    BundlerEcosystem,
+    [
+        BundlerDependency,
+        BundlerParseResult,
+        BundlerVersion,
+        DependencyGroup,
+        GemInfo,
+        GemfileLockParser,
+        RubyGemsRegistry,
+        parse_gemfile,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
     register!("cargo", CargoEcosystem, registry, &cache);
     register!("npm", NpmEcosystem, registry, &cache);
     register!("pypi", PypiEcosystem, registry, &cache);
     register!("go", GoEcosystem, registry, &cache);
+    register!("bundler", BundlerEcosystem, registry, &cache);
 }
 
 #[cfg(test)]
@@ -118,5 +135,7 @@ mod tests {
         assert!(registry.get("pypi").is_some());
         #[cfg(feature = "go")]
         assert!(registry.get("go").is_some());
+        #[cfg(feature = "bundler")]
+        assert!(registry.get("bundler").is_some());
     }
 }
