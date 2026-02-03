@@ -8,18 +8,18 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across multiple package ecosystems.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, and Go modules.
 
 ## Features
 
-- **Intelligent Autocomplete** — Package names, versions, and feature flags
-- **Version Hints** — Inlay hints showing latest available versions
-- **Loading Indicators** — Visual feedback during registry fetches with LSP progress support
-- **Lock File Support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum
+- **Intelligent autocomplete** — Package names, versions, and feature flags
+- **Version hints** — Inlay hints showing latest available versions
+- **Loading indicators** — Visual feedback during registry fetches with LSP progress support
+- **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
-- **Hover Information** — Package descriptions with resolved version from lock file
-- **Code Actions** — Quick fixes to update dependencies
-- **High Performance** — Parallel fetching with per-dependency timeouts, optimized caching
+- **Hover information** — Package descriptions with resolved version from lock file
+- **Code actions** — Quick fixes to update dependencies
+- **High performance** — Parallel fetching with per-dependency timeouts, optimized caching
 
 ![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
 
@@ -35,22 +35,20 @@ deps-lsp is optimized for responsiveness:
 | Code actions | <50ms | No network calls |
 
 > [!TIP]
->
 > Lock file support provides instant resolved versions without network requests.
 
-## Supported Ecosystems
+## Supported ecosystems
 
-| Ecosystem | Manifest File | Status |
+| Ecosystem | Manifest file | Status |
 | ----------- | --------------- | -------- |
 | Rust/Cargo | `Cargo.toml` | ✅ Supported |
 | npm | `package.json` | ✅ Supported |
 | Python/PyPI | `pyproject.toml` | ✅ Supported |
 | Go Modules | `go.mod` | ✅ Supported |
+| Ruby/Bundler | `Gemfile` | ✅ Supported |
 
 > [!NOTE]
->
-> - PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats.
-> - Go support includes require, replace, and exclude directives with pseudo-version handling.
+> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`).
 
 ## Installation
 
@@ -60,8 +58,9 @@ deps-lsp is optimized for responsiveness:
 cargo install deps-lsp
 ```
 
+Latest published crate version: `0.6.0`.
+
 > [!TIP]
->
 > Use `cargo binstall deps-lsp` for faster installation without compilation.
 
 ### From source
@@ -85,7 +84,15 @@ Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/lat
 | Windows | x86_64 | `deps-lsp-x86_64-pc-windows-msvc.exe` |
 | Windows | ARM64 | `deps-lsp-aarch64-pc-windows-msvc.exe` |
 
-### Feature Flags
+## Supported platforms
+
+Pre-built binaries are published for:
+
+- Linux (x86_64, aarch64)
+- macOS (x86_64, Apple Silicon)
+- Windows (x86_64, ARM64)
+
+## Feature flags
 
 By default, all ecosystems are enabled. To build with specific ecosystems only:
 
@@ -103,16 +110,27 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `npm` | package.json | ✅ |
 | `pypi` | pyproject.toml | ✅ |
 | `go` | go.mod | ✅ |
+| `bundler` | Ruby (Bundler/Gemfile) | ✅ |
 
-## Editor Setup
+## Usage
+
+Run the server over stdio (typical editor integration):
+
+```bash
+deps-lsp --stdio
+```
+
+> [!TIP]
+> Configure your editor to launch `deps-lsp` and connect over stdio. See the editor snippets below.
+
+## Editor setup
 
 > [!IMPORTANT]
->
 > Inlay hints must be enabled in your editor to see version indicators. See configuration for each editor below.
 
 ### Zed
 
-Install the **Deps** extension from Zed Extensions marketplace.
+Install the **Deps** extension from Zed Extensions marketplace. Ruby support is enabled for Gemfile files.
 
 Enable inlay hints in Zed settings:
 
@@ -209,7 +227,7 @@ Configure via LSP initialization options:
 }
 ```
 
-### Configuration Reference
+### Configuration reference
 
 | Section | Option | Default | Description |
 | --------- | -------- | --------- | ------------- |
@@ -220,17 +238,11 @@ Configure via LSP initialization options:
 | `loading_indicator` | `loading_text` | `"⏳"` | Text shown during loading (max 100 chars) |
 
 > [!TIP]
->
-> Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others.
-
-> [!NOTE]
->
-> Cold start support ensures LSP features work immediately when your IDE restores previously opened files.
+> Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.
 
 ## Development
 
 > [!IMPORTANT]
->
 > Requires Rust 1.89+ (Edition 2024).
 
 ### Build
@@ -256,16 +268,16 @@ cargo llvm-cov nextest --html
 
 ```bash
 # Format (requires nightly for Edition 2024)
-cargo +nightly fmt
+cargo +nightly fmt --check
 
-# Clippy
-cargo clippy --workspace -- -D warnings
+# Clippy (all targets, all features)
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Security audit
 cargo deny check
 ```
 
-### Project Structure
+### Project structure
 
 ```text
 deps-lsp/
@@ -275,6 +287,7 @@ deps-lsp/
 │   ├── deps-npm/       # package.json parser + npm registry
 │   ├── deps-pypi/      # pyproject.toml parser + PyPI registry
 │   ├── deps-go/        # go.mod parser + proxy.golang.org
+│   ├── deps-bundler/   # Gemfile parser + rubygems.org registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration
@@ -309,6 +322,10 @@ cargo bench --workspace
 ```
 
 View HTML report: `open target/criterion/report/index.html`
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, style, and testing expectations.
 
 ## License
 
