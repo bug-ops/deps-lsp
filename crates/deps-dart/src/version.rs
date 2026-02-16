@@ -32,7 +32,7 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 pub fn version_matches_constraint(version: &str, constraint: &str) -> bool {
     let constraint = constraint.trim();
 
-    if constraint.is_empty() || constraint == "any" {
+    if constraint.is_empty() || constraint == "any" || constraint == "*" {
         return true;
     }
 
