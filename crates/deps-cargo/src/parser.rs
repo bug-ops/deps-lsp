@@ -233,7 +233,10 @@ fn compute_name_range_from_value(
     };
 
     if let Some(span) = value_span {
-        let search_start = span.start.saturating_sub(name.len() + 100);
+        let mut search_start = span.start.saturating_sub(name.len() + 100);
+        while search_start > 0 && !content.is_char_boundary(search_start) {
+            search_start -= 1;
+        }
         let search_end = span.start;
 
         if search_start < content.len() && search_end <= content.len() {
