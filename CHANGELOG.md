@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Dart/Pub ecosystem support** — New `deps-dart` crate with full pubspec.yaml and pubspec.lock support
+  - YAML parser with position tracking via yaml-rust2
+  - pub.dev API client for package info and search
+  - pubspec.lock parser for installed version resolution
+  - Dart version constraint matching (caret, range, any, exact) with correct 0.x semantics
+  - Hosted, git, path, and SDK dependency sources
+
 ## [0.6.1] - 2026-02-16
 
 ### Added

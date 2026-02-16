@@ -1,0 +1,33 @@
+[package]
+name = "deps-dart"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "pubspec.yaml support for deps-lsp"
+publish = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deps-core = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+tower-lsp-server = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+yaml-rust2 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+insta = { workspace = true, features = ["json"] }
+once_cell = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test = { workspace = true }
