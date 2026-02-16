@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-02-16
+
 ### Added
 - **deps-bundler benchmarks** — Criterion benchmarks for Gemfile/Gemfile.lock parsing with various file sizes (5-100 deps)
 
@@ -17,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-bundler test coverage increased to 90%+** — Added comprehensive tests for error handling, parser edge cases, registry response parsing
+- **Lock file duplicate versions** — ResolvedPackages now stores all versions per package name and returns the highest semver version, fixing incorrect outdated status when both direct and transitive dependency versions coexist
 
 ## [0.6.0] - 2026-02-03
 
@@ -298,7 +301,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/bug-ops/deps-lsp/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/bug-ops/deps-lsp/compare/v0.5.5...v0.6.0
 [0.5.5]: https://github.com/bug-ops/deps-lsp/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/bug-ops/deps-lsp/compare/v0.5.3...v0.5.3
