@@ -145,7 +145,8 @@ pub enum ResolvedSource {
 
 /// Collection of resolved packages from a lock file.
 ///
-/// Provides efficient lookup of resolved versions by package name.
+/// Supports multiple versions per package name, returning the highest
+/// semver version through public API methods.
 ///
 /// # Examples
 ///
@@ -168,8 +169,22 @@ pub enum ResolvedSource {
 /// ```
 #[derive(Debug, Default, Clone)]
 pub struct ResolvedPackages {
-    /// Map from package name to resolved package info
-    packages: HashMap<String, ResolvedPackage>,
+    packages: HashMap<String, Vec<ResolvedPackage>>,
+}
+
+/// Returns the package with the highest semver version from a slice.
+fn best_package(packages: &[ResolvedPackage]) -> Option<&ResolvedPackage> {
+    packages.iter().max_by(|a, b| {
+        match (
+            semver::Version::parse(&a.version),
+            semver::Version::parse(&b.version),
+        ) {
+            (Ok(va), Ok(vb)) => va.cmp(&vb),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+            (Err(_), Err(_)) => a.version.cmp(&b.version),
+        }
+    })
 }
 
 impl ResolvedPackages {
@@ -180,30 +195,30 @@ impl ResolvedPackages {
         }
     }
 
-    /// Inserts a resolved package.
-    ///
-    /// If a package with the same name already exists, it is replaced.
+    /// Inserts a resolved package, storing all versions per name.
     pub fn insert(&mut self, package: ResolvedPackage) {
-        self.packages.insert(package.name.clone(), package);
+        self.packages
+            .entry(package.name.clone())
+            .or_default()
+            .push(package);
     }
 
-    /// Gets a resolved package by name.
-    ///
-    /// Returns `None` if the package is not in the lock file.
+    /// Gets the resolved package with the highest semver version.
     pub fn get(&self, name: &str) -> Option<&ResolvedPackage> {
-        self.packages.get(name)
+        self.packages.get(name).and_then(|v| best_package(v))
     }
 
-    /// Gets the resolved version string for a package.
-    ///
-    /// Returns `None` if the package is not in the lock file.
-    ///
-    /// This is a convenience method equivalent to `get(name).map(|p| p.version.as_str())`.
+    /// Gets the highest resolved version string for a package.
     pub fn get_version(&self, name: &str) -> Option<&str> {
-        self.packages.get(name).map(|p| p.version.as_str())
+        self.get(name).map(|p| p.version.as_str())
     }
 
-    /// Returns the number of resolved packages.
+    /// Returns all stored versions for a package.
+    pub fn get_all(&self, name: &str) -> Option<&[ResolvedPackage]> {
+        self.packages.get(name).map(|v| v.as_slice())
+    }
+
+    /// Returns the number of unique package names.
     pub fn len(&self) -> usize {
         self.packages.len()
     }
@@ -213,14 +228,21 @@ impl ResolvedPackages {
         self.packages.is_empty()
     }
 
-    /// Returns an iterator over package names and their resolved info.
+    /// Returns an iterator yielding the best version per unique package name.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &ResolvedPackage)> {
-        self.packages.iter()
+        self.packages.keys().filter_map(|name| {
+            self.packages
+                .get(name)
+                .and_then(|v| best_package(v).map(|p| (name, p)))
+        })
     }
 
-    /// Converts into a HashMap for easier integration.
+    /// Converts into a HashMap with the best version per package name.
     pub fn into_map(self) -> HashMap<String, ResolvedPackage> {
         self.packages
+            .into_iter()
+            .filter_map(|(name, versions)| best_package(&versions).cloned().map(|p| (name, p)))
+            .collect()
     }
 }
 
@@ -495,8 +517,94 @@ mod tests {
             dependencies: vec![],
         });
 
+        // Both versions stored, but len counts unique names
         assert_eq!(packages.len(), 1);
         assert_eq!(packages.get_version("serde"), Some("1.0.195"));
+        // Both versions accessible via get_all
+        assert_eq!(packages.get_all("serde").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_resolved_packages_multiple_versions() {
+        let mut packages = ResolvedPackages::new();
+
+        packages.insert(ResolvedPackage {
+            name: "serde".into(),
+            version: "1.0.195".into(),
+            source: ResolvedSource::Registry {
+                url: "test".into(),
+                checksum: "a".into(),
+            },
+            dependencies: vec![],
+        });
+
+        packages.insert(ResolvedPackage {
+            name: "serde".into(),
+            version: "0.9.0".into(),
+            source: ResolvedSource::Registry {
+                url: "test".into(),
+                checksum: "b".into(),
+            },
+            dependencies: vec![],
+        });
+
+        packages.insert(ResolvedPackage {
+            name: "serde".into(),
+            version: "2.0.0-beta.1".into(),
+            source: ResolvedSource::Registry {
+                url: "test".into(),
+                checksum: "c".into(),
+            },
+            dependencies: vec![],
+        });
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages.get_version("serde"), Some("2.0.0-beta.1"));
+        assert_eq!(packages.get_all("serde").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_resolved_packages_non_semver_fallback() {
+        let mut packages = ResolvedPackages::new();
+
+        packages.insert(ResolvedPackage {
+            name: "weird".into(),
+            version: "abc".into(),
+            source: ResolvedSource::Path { path: ".".into() },
+            dependencies: vec![],
+        });
+
+        packages.insert(ResolvedPackage {
+            name: "weird".into(),
+            version: "xyz".into(),
+            source: ResolvedSource::Path { path: ".".into() },
+            dependencies: vec![],
+        });
+
+        // Falls back to string comparison: "xyz" > "abc"
+        assert_eq!(packages.get_version("weird"), Some("xyz"));
+    }
+
+    #[test]
+    fn test_resolved_packages_semver_preferred_over_non_semver() {
+        let mut packages = ResolvedPackages::new();
+
+        packages.insert(ResolvedPackage {
+            name: "mixed".into(),
+            version: "not-a-version".into(),
+            source: ResolvedSource::Path { path: ".".into() },
+            dependencies: vec![],
+        });
+
+        packages.insert(ResolvedPackage {
+            name: "mixed".into(),
+            version: "1.0.0".into(),
+            source: ResolvedSource::Path { path: ".".into() },
+            dependencies: vec![],
+        });
+
+        // Parseable semver is preferred over non-parseable
+        assert_eq!(packages.get_version("mixed"), Some("1.0.0"));
     }
 
     #[test]
