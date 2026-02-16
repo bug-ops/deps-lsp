@@ -230,18 +230,18 @@ impl ResolvedPackages {
 
     /// Returns an iterator yielding the best version per unique package name.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &ResolvedPackage)> {
-        self.packages
-            .keys()
-            .filter_map(|name| self.packages.get(name).and_then(|v| best_package(v).map(|p| (name, p))))
+        self.packages.keys().filter_map(|name| {
+            self.packages
+                .get(name)
+                .and_then(|v| best_package(v).map(|p| (name, p)))
+        })
     }
 
     /// Converts into a HashMap with the best version per package name.
     pub fn into_map(self) -> HashMap<String, ResolvedPackage> {
         self.packages
             .into_iter()
-            .filter_map(|(name, versions)| {
-                best_package(&versions).cloned().map(|p| (name, p))
-            })
+            .filter_map(|(name, versions)| best_package(&versions).cloned().map(|p| (name, p)))
             .collect()
     }
 }
@@ -570,18 +570,14 @@ mod tests {
         packages.insert(ResolvedPackage {
             name: "weird".into(),
             version: "abc".into(),
-            source: ResolvedSource::Path {
-                path: ".".into(),
-            },
+            source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
         });
 
         packages.insert(ResolvedPackage {
             name: "weird".into(),
             version: "xyz".into(),
-            source: ResolvedSource::Path {
-                path: ".".into(),
-            },
+            source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
         });
 
@@ -596,18 +592,14 @@ mod tests {
         packages.insert(ResolvedPackage {
             name: "mixed".into(),
             version: "not-a-version".into(),
-            source: ResolvedSource::Path {
-                path: ".".into(),
-            },
+            source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
         });
 
         packages.insert(ResolvedPackage {
             name: "mixed".into(),
             version: "1.0.0".into(),
-            source: ResolvedSource::Path {
-                path: ".".into(),
-            },
+            source: ResolvedSource::Path { path: ".".into() },
             dependencies: vec![],
         });
 
