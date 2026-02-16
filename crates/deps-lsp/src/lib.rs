@@ -108,6 +108,22 @@ ecosystem!(
     ]
 );
 
+ecosystem!(
+    "dart",
+    deps_dart,
+    DartEcosystem,
+    [
+        DartDependency,
+        DartParseResult,
+        DartVersion,
+        DartFormatter,
+        PackageInfo,
+        PubDevRegistry,
+        PubspecLockParser,
+        parse_pubspec_yaml,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
     register!("cargo", CargoEcosystem, registry, &cache);
@@ -115,6 +131,7 @@ pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) 
     register!("pypi", PypiEcosystem, registry, &cache);
     register!("go", GoEcosystem, registry, &cache);
     register!("bundler", BundlerEcosystem, registry, &cache);
+    register!("dart", DartEcosystem, registry, &cache);
 }
 
 #[cfg(test)]
@@ -137,5 +154,7 @@ mod tests {
         assert!(registry.get("go").is_some());
         #[cfg(feature = "bundler")]
         assert!(registry.get("bundler").is_some());
+        #[cfg(feature = "dart")]
+        assert!(registry.get("dart").is_some());
     }
 }
