@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-02-16
+
 ### Added
 - **Dart/Pub ecosystem support** — New `deps-dart` crate with full pubspec.yaml and pubspec.lock support
   - YAML parser with position tracking via yaml-rust2
@@ -14,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - pubspec.lock parser for installed version resolution
   - Dart version constraint matching (caret, range, any, exact) with correct 0.x semantics
   - Hosted, git, path, and SDK dependency sources
+
+### Changed
+- **Workspace dependencies updated** — reqwest 0.12 -> 0.13, tokio 1 -> 1.49, toml_edit 0.22 -> 0.25, yaml-rust2 0.10 -> 0.11
+
+### Fixed
+- **Cargo parser panic on multi-byte UTF-8** — Adjust search_start to char boundary when slicing content for dependency name lookup
+- **Dart wildcard version matching** — Treat `"*"` as wildcard alias for `"any"` in version constraint matching
 
 ## [0.6.1] - 2026-02-16
 
@@ -309,7 +318,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/bug-ops/deps-lsp/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/bug-ops/deps-lsp/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/bug-ops/deps-lsp/compare/v0.5.5...v0.6.0
 [0.5.5]: https://github.com/bug-ops/deps-lsp/compare/v0.5.4...v0.5.5

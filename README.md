@@ -8,14 +8,14 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, and Go modules.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, and Dart ecosystems.
 
 ## Features
 
 - **Intelligent autocomplete** — Package names, versions, and feature flags
 - **Version hints** — Inlay hints showing latest available versions
 - **Loading indicators** — Visual feedback during registry fetches with LSP progress support
-- **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock
+- **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
 - **Hover information** — Package descriptions with resolved version from lock file
 - **Code actions** — Quick fixes to update dependencies
@@ -46,9 +46,10 @@ deps-lsp is optimized for responsiveness:
 | Python/PyPI | `pyproject.toml` | ✅ Supported |
 | Go Modules | `go.mod` | ✅ Supported |
 | Ruby/Bundler | `Gemfile` | ✅ Supported |
+| Dart/Pub | `pubspec.yaml` | ✅ Supported |
 
 > [!NOTE]
-> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`).
+> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`). Dart support includes hosted, git, path, and SDK dependency sources with caret version semantics.
 
 ## Installation
 
@@ -58,7 +59,7 @@ deps-lsp is optimized for responsiveness:
 cargo install deps-lsp
 ```
 
-Latest published crate version: `0.6.1`.
+Latest published crate version: `0.7.0`.
 
 > [!TIP]
 > Use `cargo binstall deps-lsp` for faster installation without compilation.
@@ -111,6 +112,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `pypi` | pyproject.toml | ✅ |
 | `go` | go.mod | ✅ |
 | `bundler` | Ruby (Bundler/Gemfile) | ✅ |
+| `dart` | pubspec.yaml | ✅ |
 
 ## Usage
 
@@ -148,7 +150,7 @@ Enable inlay hints in Zed settings:
 ```lua
 require('lspconfig').deps_lsp.setup({
   cmd = { "deps-lsp", "--stdio" },
-  filetypes = { "toml", "json" },
+  filetypes = { "toml", "json", "gomod", "ruby", "yaml" },
 })
 
 -- Enable inlay hints (Neovim 0.10+)
@@ -288,6 +290,7 @@ deps-lsp/
 │   ├── deps-pypi/      # pyproject.toml parser + PyPI registry
 │   ├── deps-go/        # go.mod parser + proxy.golang.org
 │   ├── deps-bundler/   # Gemfile parser + rubygems.org registry
+│   ├── deps-dart/      # pubspec.yaml parser + pub.dev registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration
