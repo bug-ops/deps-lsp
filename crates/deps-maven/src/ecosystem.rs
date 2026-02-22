@@ -10,6 +10,7 @@ use tower_lsp_server::ls_types::{
 
 use deps_core::{
     Ecosystem, EcosystemConfig, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers,
+    position_in_range,
 };
 
 use crate::formatter::MavenFormatter;
@@ -29,29 +30,8 @@ impl MavenEcosystem {
     }
 
     async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
-        use deps_core::completion::build_package_completion;
-
-        if prefix.len() < 2 || prefix.len() > 200 {
-            return vec![];
-        }
-
-        let results = match self.registry.search_typed(prefix, 20).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Maven Central search failed for '{}': {}", prefix, e);
-                return vec![];
-            }
-        };
-
-        let insert_range = tower_lsp_server::ls_types::Range::default();
-
-        results
-            .into_iter()
-            .map(|metadata| {
-                let boxed: Box<dyn deps_core::Metadata> = Box::new(metadata);
-                build_package_completion(boxed.as_ref(), insert_range)
-            })
-            .collect()
+        deps_core::completion::complete_package_names_generic(self.registry.as_ref(), prefix, 20)
+            .await
     }
 
     async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
@@ -249,19 +229,6 @@ impl Ecosystem for MavenEcosystem {
     fn as_any(&self) -> &dyn Any {
         self
     }
-}
-
-fn position_in_range(pos: Position, range: tower_lsp_server::ls_types::Range) -> bool {
-    if pos.line < range.start.line || pos.line > range.end.line {
-        return false;
-    }
-    if pos.line == range.start.line && pos.character < range.start.character {
-        return false;
-    }
-    if pos.line == range.end.line && pos.character > range.end.character {
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]

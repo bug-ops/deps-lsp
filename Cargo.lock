@@ -527,6 +527,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "deps-gradle"
+version = "0.7.1"
+dependencies = [
+ "async-trait",
+ "deps-core",
+ "deps-maven",
+ "insta",
+ "regex",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "toml_edit",
+ "tower-lsp-server",
+ "tracing",
+]
+
+[[package]]
 name = "deps-lsp"
 version = "0.7.1"
 dependencies = [
@@ -538,6 +556,7 @@ dependencies = [
  "deps-core",
  "deps-dart",
  "deps-go",
+ "deps-gradle",
  "deps-maven",
  "deps-npm",
  "deps-pypi",

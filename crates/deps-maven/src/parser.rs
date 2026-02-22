@@ -5,48 +5,17 @@
 
 use crate::error::{MavenError, Result};
 use crate::types::{MavenDependency, MavenScope};
+use deps_core::lsp_helpers::LineOffsetTable;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::any::Any;
 use std::collections::HashMap;
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use tower_lsp_server::ls_types::{Range, Uri};
 
 pub struct MavenParseResult {
     pub dependencies: Vec<MavenDependency>,
     pub properties: HashMap<String, String>,
     pub uri: Uri,
-}
-
-struct LineOffsetTable {
-    line_starts: Vec<usize>,
-}
-
-impl LineOffsetTable {
-    fn new(content: &str) -> Self {
-        let mut line_starts = vec![0];
-        for (i, c) in content.char_indices() {
-            if c == '\n' {
-                line_starts.push(i + 1);
-            }
-        }
-        Self { line_starts }
-    }
-
-    fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
-        let offset = offset.min(content.len());
-        let line = self
-            .line_starts
-            .partition_point(|&start| start <= offset)
-            .saturating_sub(1);
-        let line_start = self.line_starts[line];
-
-        let character = content[line_start..offset]
-            .chars()
-            .map(|c| c.len_utf16() as u32)
-            .sum();
-
-        Position::new(line as u32, character)
-    }
 }
 
 /// Context stack element for SAX parsing.

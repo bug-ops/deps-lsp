@@ -23,6 +23,7 @@ deps-go = { version = "0.7.1", path = "crates/deps-go" }
 deps-bundler = { version = "0.7.1", path = "crates/deps-bundler" }
 deps-dart = { version = "0.7.1", path = "crates/deps-dart" }
 deps-maven = { version = "0.7.1", path = "crates/deps-maven" }
+deps-gradle = { version = "0.7.1", path = "crates/deps-gradle" }
 deps-lsp = { version = "0.7.1", path = "crates/deps-lsp" }
 futures = "0.3"
 insta = "1"
