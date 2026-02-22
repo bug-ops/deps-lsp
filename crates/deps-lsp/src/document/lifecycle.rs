@@ -7,7 +7,7 @@ use super::loader::load_document_from_disk;
 use super::state::{DocumentState, ServerState};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
-use crate::progress::RegistryProgress;
+use crate::progress::{ProgressSender, RegistryProgress};
 use deps_core::Ecosystem;
 use deps_core::Registry;
 use deps_core::Result;
@@ -95,14 +95,13 @@ struct FetchResult {
 async fn fetch_latest_versions_parallel(
     registry: Arc<dyn Registry>,
     package_names: Vec<String>,
-    progress: Option<&RegistryProgress>,
+    progress_sender: Option<ProgressSender>,
     timeout_secs: u64,
     max_concurrent: usize,
 ) -> FetchResult {
     use futures::stream::{self, StreamExt};
     use std::time::Duration;
 
-    let total = package_names.len();
     let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let timeout = Duration::from_secs(timeout_secs);
@@ -112,22 +111,35 @@ async fn fetch_latest_versions_parallel(
             let registry = Arc::clone(&registry);
             let fetched = Arc::clone(&fetched);
             let failed = Arc::clone(&failed);
+            let progress_sender = progress_sender.clone();
             async move {
                 let result =
                     tokio::time::timeout(timeout, registry.get_latest_matching(&name, "*")).await;
 
                 let version = match result {
-                    Ok(Ok(Some(v))) => Some((name.clone(), v.version_string().to_string())),
-                    Ok(Ok(None)) => None,
-                    Ok(Err(_)) | Err(_) => {
+                    Ok(Ok(Some(v))) => {
+                        tracing::debug!(package = %name, version = %v.version_string(), "fetched");
+                        Some((name.clone(), v.version_string().to_string()))
+                    }
+                    Ok(Ok(None)) => {
+                        tracing::debug!(package = %name, "no version found");
+                        None
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(package = %name, error = %e, "fetch failed");
+                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(package = %name, "fetch timed out ({}s)", timeout.as_secs());
                         failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         None
                     }
                 };
 
                 let count = fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if let Some(progress) = progress {
-                    progress.update(count, total).await;
+                if let Some(ref sender) = progress_sender {
+                    sender.send(count);
                 }
 
                 version
@@ -194,6 +206,8 @@ pub async fn handle_document_open(
     let client_clone = client.clone();
 
     let task = tokio::spawn(async move {
+        tracing::debug!("background task started");
+
         // Load resolved versions from lock file first (instant, no network)
         let resolved_versions =
             load_resolved_versions(&uri_clone, &state_clone, ecosystem_clone.as_ref()).await;
@@ -211,11 +225,17 @@ pub async fn handle_document_open(
         let dep_names: Vec<String> = {
             let doc = match state_clone.get_document(&uri_clone) {
                 Some(d) => d,
-                None => return,
+                None => {
+                    tracing::warn!("document not found, aborting fetch");
+                    return;
+                }
             };
             let parse_result = match doc.parse_result() {
                 Some(p) => p,
-                None => return,
+                None => {
+                    tracing::warn!("no parse result, aborting fetch");
+                    return;
+                }
             };
             parse_result
                 .dependencies()
@@ -224,28 +244,42 @@ pub async fn handle_document_open(
                 .collect()
         };
 
+        tracing::debug!(count = dep_names.len(), "starting registry fetch");
+
         // Mark as loading and start progress
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.set_loading();
         }
 
-        let progress =
-            RegistryProgress::start(client_clone.clone(), uri_clone.as_str(), dep_names.len())
-                .await
-                .ok(); // Ignore errors if client doesn't support progress
+        let (progress, progress_sender) = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            RegistryProgress::start(client_clone.clone(), uri_clone.as_str(), dep_names.len()),
+        )
+        .await
+        {
+            Ok(Ok((p, s))) => (Some(p), Some(s)),
+            _ => (None, None),
+        };
+
+        tracing::debug!("progress started, fetching versions");
 
         // Fetch latest versions from registry in parallel (for update hints)
         let registry = ecosystem_clone.registry();
         let fetch_result = fetch_latest_versions_parallel(
             registry,
             dep_names,
-            progress.as_ref(),
+            progress_sender,
             cache_config.fetch_timeout_secs,
             cache_config.max_concurrent_fetches,
         )
         .await;
 
         let success = !fetch_result.versions.is_empty();
+        tracing::debug!(
+            fetched = fetch_result.versions.len(),
+            failed = fetch_result.failed_count,
+            "registry fetch complete"
+        );
 
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
@@ -426,20 +460,26 @@ pub async fn handle_document_change(
             doc.set_loading();
         }
 
-        let progress = RegistryProgress::start(
-            client_clone.clone(),
-            uri_clone.as_str(),
-            deps_to_fetch.len(),
+        let (progress, progress_sender) = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            RegistryProgress::start(
+                client_clone.clone(),
+                uri_clone.as_str(),
+                deps_to_fetch.len(),
+            ),
         )
         .await
-        .ok();
+        {
+            Ok(Ok((p, s))) => (Some(p), Some(s)),
+            _ => (None, None),
+        };
 
         // Fetch latest versions only for NEW dependencies
         let registry = ecosystem_clone.registry();
         let fetch_result = fetch_latest_versions_parallel(
             registry,
             deps_to_fetch,
-            progress.as_ref(),
+            progress_sender,
             cache_config.fetch_timeout_secs,
             cache_config.max_concurrent_fetches,
         )

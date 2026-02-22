@@ -1,21 +1,26 @@
 //! LSP Work Done Progress protocol support for loading indicators.
 //!
-//! Implements the `window/workDoneProgress` protocol to show registry fetch
-//! progress in the editor UI.
+//! Uses a channel-based architecture to decouple progress producers (fetch tasks)
+//! from the LSP transport consumer, preventing backpressure from blocking fetches.
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌─────────────┐     mpsc channel     ┌──────────────┐     LSP transport
+//! │ fetch task 1 │──┐                   │              │──────────────────►
+//! │ fetch task 2 │──┼── ProgressUpdate ──► progress    │  send_notification
+//! │ fetch task N │──┘                   │   task       │──────────────────►
+//! └─────────────┘                       └──────────────┘
+//! ```
 //!
 //! # Protocol Flow
 //!
 //! 1. `window/workDoneProgress/create` - Request token creation
 //! 2. `$/progress` with `WorkDoneProgressBegin` - Start indicator
-//! 3. `$/progress` with `WorkDoneProgressReport` - Update progress (optional)
+//! 3. `$/progress` with `WorkDoneProgressReport` - Update progress (via channel)
 //! 4. `$/progress` with `WorkDoneProgressEnd` - Complete indicator
-//!
-//! # Drop Behavior
-//!
-//! If dropped without calling `end()`, spawns a cleanup task to send
-//! the end notification. This is best-effort - the task may not complete
-//! if the runtime is shutting down.
 
+use tokio::sync::mpsc;
 use tower_lsp_server::Client;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
@@ -23,39 +28,65 @@ use tower_lsp_server::ls_types::{
     WorkDoneProgressEnd, WorkDoneProgressReport,
 };
 
+/// Channel capacity for progress updates.
+/// Small buffer is sufficient since updates are coalesced by the editor.
+const PROGRESS_CHANNEL_CAPACITY: usize = 8;
+
+/// Non-blocking sender for progress updates from fetch tasks.
+///
+/// Cheap to clone and safe to use from multiple concurrent futures.
+/// Dropped messages are acceptable — progress is best-effort UI feedback.
+#[derive(Clone)]
+pub struct ProgressSender {
+    tx: mpsc::Sender<ProgressUpdate>,
+    total: usize,
+}
+
+struct ProgressUpdate {
+    fetched: usize,
+    total: usize,
+}
+
+impl ProgressSender {
+    /// Send a progress update without blocking.
+    ///
+    /// Uses `try_send` — if the channel is full, the update is silently dropped.
+    /// This is intentional: progress is best-effort UI feedback, and dropping
+    /// updates is always preferable to blocking fetch tasks.
+    pub fn send(&self, fetched: usize) {
+        let _ = self.tx.try_send(ProgressUpdate {
+            fetched,
+            total: self.total,
+        });
+    }
+}
+
 /// Progress tracker for registry data fetching.
 ///
-/// Manages the lifecycle of an LSP progress indicator, from creation
-/// through updates to completion.
+/// Owns the LSP progress lifecycle (begin → report → end).
+/// Creates a [`ProgressSender`] for non-blocking updates from fetch tasks.
 pub struct RegistryProgress {
     client: Client,
     token: ProgressToken,
     active: bool,
+    /// Background task draining progress updates.
+    /// Dropped when `RegistryProgress` is dropped or `end()` is called.
+    _consumer_handle: tokio::task::JoinHandle<()>,
 }
 
 impl RegistryProgress {
     /// Create and start a new progress indicator.
     ///
-    /// # Arguments
-    ///
-    /// * `client` - LSP client for sending notifications
-    /// * `uri` - Document URI (used to create unique token)
-    /// * `total_deps` - Total number of dependencies to fetch
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(RegistryProgress)` if progress is supported by the client,
-    /// or `Err` if the client doesn't support progress notifications.
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Client doesn't support progress (no workDoneProgress capability)
-    /// - Failed to create progress token
-    pub async fn start(client: Client, uri: &str, total_deps: usize) -> Result<Self> {
+    /// Returns both the progress tracker and a [`ProgressSender`] for
+    /// non-blocking updates from fetch tasks.
+    pub async fn start(
+        client: Client,
+        uri: &str,
+        total_deps: usize,
+    ) -> Result<(Self, ProgressSender)> {
         let token = ProgressToken::String(format!("deps-fetch-{}", uri));
 
-        // Request progress token creation
+        // Request progress token creation (blocking request to client)
         client
             .send_request::<tower_lsp_server::ls_types::request::WorkDoneProgressCreate>(
                 tower_lsp_server::ls_types::WorkDoneProgressCreateParams {
@@ -81,57 +112,42 @@ impl RegistryProgress {
             )
             .await;
 
-        Ok(Self {
-            client,
-            token,
-            active: true,
-        })
-    }
+        let (tx, rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
 
-    /// Update progress (optional, for partial updates).
-    ///
-    /// # Arguments
-    ///
-    /// * `fetched` - Number of packages fetched so far
-    /// * `total` - Total number of packages
-    ///
-    /// # Note
-    ///
-    /// This method should be called sparingly (e.g., every 20% progress)
-    /// to avoid flooding the client with notifications.
-    pub async fn update(&self, fetched: usize, total: usize) {
-        if !self.active || total == 0 {
-            return;
-        }
+        // Spawn consumer task that drains the channel and sends LSP notifications
+        let consumer_client = client.clone();
+        let consumer_token = token.clone();
+        let consumer_handle = tokio::spawn(async move {
+            consume_progress_updates(rx, consumer_client, consumer_token).await;
+        });
 
-        let percentage = ((fetched as f64 / total as f64) * 100.0) as u32;
-        self.client
-            .send_notification::<tower_lsp_server::ls_types::notification::Progress>(
-                ProgressParams {
-                    token: self.token.clone(),
-                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
-                        WorkDoneProgressReport {
-                            message: Some(format!("Fetched {}/{} packages", fetched, total)),
-                            percentage: Some(percentage),
-                            cancellable: Some(false),
-                        },
-                    )),
-                },
-            )
-            .await;
+        let sender = ProgressSender {
+            tx,
+            total: total_deps,
+        };
+
+        Ok((
+            Self {
+                client,
+                token,
+                active: true,
+                _consumer_handle: consumer_handle,
+            },
+            sender,
+        ))
     }
 
     /// End progress indicator.
-    ///
-    /// # Arguments
-    ///
-    /// * `success` - Whether the fetch completed successfully
     pub async fn end(mut self, success: bool) {
         if !self.active {
             return;
         }
 
         self.active = false;
+
+        // Abort the consumer task — remaining updates are irrelevant after end
+        self._consumer_handle.abort();
+
         let message = if success {
             "Package versions loaded"
         } else {
@@ -153,6 +169,39 @@ impl RegistryProgress {
     }
 }
 
+/// Drains progress updates from the channel and sends LSP notifications.
+async fn consume_progress_updates(
+    mut rx: mpsc::Receiver<ProgressUpdate>,
+    client: Client,
+    token: ProgressToken,
+) {
+    while let Some(update) = rx.recv().await {
+        let percentage = if update.total > 0 {
+            ((update.fetched as f64 / update.total as f64) * 100.0) as u32
+        } else {
+            0
+        };
+
+        client
+            .send_notification::<tower_lsp_server::ls_types::notification::Progress>(
+                ProgressParams {
+                    token: token.clone(),
+                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                        WorkDoneProgressReport {
+                            message: Some(format!(
+                                "Fetched {}/{} packages",
+                                update.fetched, update.total
+                            )),
+                            percentage: Some(percentage),
+                            cancellable: Some(false),
+                        },
+                    )),
+                },
+            )
+            .await;
+    }
+}
+
 /// Ensure progress is cleaned up on drop
 impl Drop for RegistryProgress {
     fn drop(&mut self) {
@@ -161,7 +210,7 @@ impl Drop for RegistryProgress {
                 token = ?self.token,
                 "RegistryProgress dropped without explicit end() - spawning cleanup"
             );
-            // Can't await in Drop, so spawn cleanup task
+            self._consumer_handle.abort();
             let client = self.client.clone();
             let token = self.token.clone();
             tokio::spawn(async move {
@@ -216,60 +265,31 @@ mod tests {
         assert_eq!(format_message(20, 20), "Fetched 20/20 packages");
     }
 
-    #[test]
-    fn test_update_after_end_is_safe() {
-        // Verify the guard checks prevent operations after end()
-        let active = false;
-        let total = 10;
+    #[tokio::test]
+    async fn test_progress_sender_try_send_on_closed_channel() {
+        use super::*;
 
-        // This is the guard in update()
-        if !active || total == 0 {
-            return; // No-op - expected behavior
-        }
+        let (tx, rx) = mpsc::channel(1);
+        let sender = ProgressSender { tx, total: 10 };
 
-        panic!("Should have returned early");
+        // Drop receiver — channel is closed
+        drop(rx);
+
+        // Should not panic
+        sender.send(5);
     }
 
-    #[test]
-    fn test_update_with_zero_total_returns_early() {
-        let active = true;
-        let total = 0;
+    #[tokio::test]
+    async fn test_progress_sender_try_send_on_full_channel() {
+        use super::*;
 
-        if !active || total == 0 {
-            return; // Expected behavior
-        }
+        let (tx, _rx) = mpsc::channel(1);
+        let sender = ProgressSender { tx, total: 10 };
 
-        panic!("Should have returned early");
-    }
-
-    #[test]
-    fn test_end_idempotency_flag() {
-        // Verify the active flag behavior
-        let mut active = true;
-
-        // First end() call
-        assert!(active, "First call should proceed");
-        active = false;
-
-        // Second end() call - should be no-op
-        assert!(!active, "Second call should be no-op due to inactive flag");
-    }
-
-    #[test]
-    fn test_drop_cleanup_active_flag_logic() {
-        // Test the logic that determines if cleanup is needed
-        let active = true;
-        let should_cleanup = active;
-        assert!(
-            should_cleanup,
-            "Active progress should trigger cleanup on drop"
-        );
-
-        let active = false;
-        let should_cleanup = active;
-        assert!(
-            !should_cleanup,
-            "Inactive progress should not trigger cleanup"
-        );
+        // Fill the channel
+        sender.send(1);
+        // Should silently drop — channel is full
+        sender.send(2);
+        sender.send(3);
     }
 }

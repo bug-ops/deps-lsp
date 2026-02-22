@@ -150,21 +150,20 @@ impl HttpCache {
             self.evict_entries();
         }
 
-        if let Some(cached) = self.entries.get(url) {
-            // Attempt conditional request with cached headers
+        if let Some(cached) = self.entries.get(url).map(|r| r.clone()) {
+            // Clone and drop the DashMap Ref immediately to release the shard lock.
+            // Holding a Ref across .await causes deadlocks when concurrent tasks
+            // need write access to the same shard (e.g., conditional_request → insert).
             match self.conditional_request(url, &cached).await {
                 Ok(Some(new_body)) => {
-                    // 200 OK - content changed, cache updated internally
                     return Ok(new_body);
                 }
                 Ok(None) => {
-                    // 304 Not Modified - use cached body (cheap clone)
-                    return Ok(cached.body.clone());
+                    return Ok(cached.body);
                 }
                 Err(e) => {
-                    // Network error - fall back to cached body if available
                     tracing::warn!("conditional request failed, using cache: {e}");
-                    return Ok(cached.body.clone());
+                    return Ok(cached.body);
                 }
             }
         }

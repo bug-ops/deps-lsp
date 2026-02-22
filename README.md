@@ -8,7 +8,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, and Dart ecosystems.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, and Maven ecosystems.
 
 ## Features
 
@@ -39,15 +39,15 @@ deps-lsp is optimized for responsiveness:
 
 ## Supported ecosystems
 
-| Ecosystem | Manifest file | Status |
-| ----------- | --------------- | -------- |
-| Rust/Cargo | `Cargo.toml` | ✅ Supported |
-| npm | `package.json` | ✅ Supported |
-| Python/PyPI | `pyproject.toml` | ✅ Supported |
-| Go Modules | `go.mod` | ✅ Supported |
-| Ruby/Bundler | `Gemfile` | ✅ Supported |
-| Dart/Pub | `pubspec.yaml` | ✅ Supported |
-| Maven | `pom.xml` | ✅ Supported |
+| Language | Ecosystem | Manifest file | Status |
+| ---------- | ----------- | --------------- | -------- |
+| Rust | Cargo | `Cargo.toml` | ✅ Supported |
+| JavaScript | npm | `package.json` | ✅ Supported |
+| Python | PyPI | `pyproject.toml` | ✅ Supported |
+| Go | Go Modules | `go.mod` | ✅ Supported |
+| Ruby | Bundler | `Gemfile` | ✅ Supported |
+| Dart | Pub | `pubspec.yaml` | ✅ Supported |
+| Java | Maven | `pom.xml` | ✅ Supported |
 
 > [!NOTE]
 > PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`). Dart support includes hosted, git, path, and SDK dependency sources with caret version semantics. Maven support covers `dependencies`, `dependencyManagement`, and `build/plugins` sections with Maven qualifier-aware version comparison.
@@ -106,15 +106,15 @@ cargo install deps-lsp --no-default-features --features "cargo,npm"
 cargo install deps-lsp --no-default-features --features "pypi"
 ```
 
-| Feature | Ecosystem | Default |
-| --------- | ----------- | ------- |
-| `cargo` | Cargo.toml | ✅ |
-| `npm` | package.json | ✅ |
-| `pypi` | pyproject.toml | ✅ |
-| `go` | go.mod | ✅ |
-| `bundler` | Ruby (Bundler/Gemfile) | ✅ |
-| `dart` | pubspec.yaml | ✅ |
-| `maven` | pom.xml | ✅ |
+| Feature | Language | Manifest | Default |
+| --------- | ---------- | ----------- | ------- |
+| `cargo` | Rust | Cargo.toml | ✅ |
+| `npm` | JavaScript | package.json | ✅ |
+| `pypi` | Python | pyproject.toml | ✅ |
+| `go` | Go | go.mod | ✅ |
+| `bundler` | Ruby | Gemfile | ✅ |
+| `dart` | Dart | pubspec.yaml | ✅ |
+| `maven` | Java | pom.xml | ✅ |
 
 ## Usage
 
@@ -152,7 +152,7 @@ Enable inlay hints in Zed settings:
 ```lua
 require('lspconfig').deps_lsp.setup({
   cmd = { "deps-lsp", "--stdio" },
-  filetypes = { "toml", "json", "gomod", "ruby", "yaml" },
+  filetypes = { "toml", "json", "gomod", "ruby", "yaml", "xml" },
 })
 
 -- Enable inlay hints (Neovim 0.10+)

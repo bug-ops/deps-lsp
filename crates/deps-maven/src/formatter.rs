@@ -15,7 +15,10 @@ impl EcosystemFormatter for MavenFormatter {
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
-        // MVP: exact match only
+        // Unresolved properties (missing from <properties>) — skip comparison
+        if requirement.contains("${") {
+            return true;
+        }
         version == requirement
     }
 }
@@ -49,6 +52,14 @@ mod tests {
         assert!(f.version_satisfies_requirement("3.14.0", "3.14.0"));
         assert!(!f.version_satisfies_requirement("3.14.0", "3.13.0"));
         assert!(!f.version_satisfies_requirement("3.14.0", "3.14.1"));
+    }
+
+    #[test]
+    fn test_version_satisfies_maven_property() {
+        let f = MavenFormatter;
+        assert!(f.version_satisfies_requirement("7.1.1", "${woodstoxVersion}"));
+        assert!(f.version_satisfies_requirement("2.0.17", "${slf4j.version}"));
+        assert!(f.version_satisfies_requirement("1.0.0", "${project.version}"));
     }
 
     #[test]

@@ -86,6 +86,7 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
     let mut current_dep: Option<DepAccum> = None;
     let mut current_tag: Option<String> = None;
     let mut current_prop_key: Option<String> = None;
+    let mut root_tag: Option<String> = None;
 
     loop {
         let pos = reader.buffer_position();
@@ -133,6 +134,9 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
                     }
                     (ParseContext::Dependency | ParseContext::Plugin, field) => {
                         current_tag = Some(field.to_string());
+                    }
+                    (ParseContext::Root, tag @ ("version" | "groupId" | "artifactId")) => {
+                        root_tag = Some(tag.to_string());
                     }
                     _ => {}
                 }
@@ -182,6 +186,11 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
                     && let Some(key) = current_prop_key.take()
                 {
                     properties.insert(key, text);
+                } else if ctx == ParseContext::Root
+                    && let Some(tag) = root_tag.take()
+                {
+                    let prop_key = format!("project.{tag}");
+                    properties.insert(prop_key, text);
                 }
             }
             Event::End(ref e) => {
@@ -192,7 +201,8 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
                     (ParseContext::Dependency, "dependency") | (ParseContext::Plugin, "plugin") => {
                         context_stack.pop();
                         if let Some(dep) = current_dep.take()
-                            && let Some(maven_dep) = finalize_dep(dep, content, &line_table)
+                            && let Some(maven_dep) =
+                                finalize_dep(dep, content, &line_table, &properties)
                         {
                             dependencies.push(maven_dep);
                         }
@@ -226,6 +236,7 @@ fn finalize_dep(
     dep: DepAccum,
     content: &str,
     line_table: &LineOffsetTable,
+    properties: &HashMap<String, String>,
 ) -> Option<MavenDependency> {
     let group_id = dep.group_id?;
     let artifact_id = dep.artifact_id?;
@@ -257,15 +268,46 @@ fn finalize_dep(
         .parse::<MavenScope>()
         .unwrap_or_default();
 
+    let version_req = dep.version.map(|v| resolve_properties(&v, properties));
+
     Some(MavenDependency {
         group_id,
         artifact_id,
         name,
         name_range,
-        version_req: dep.version,
+        version_req,
         version_range,
         scope,
     })
+}
+
+/// Resolves `${property}` references in a string using the properties map.
+///
+/// Handles `${project.version}` and similar Maven property expressions.
+/// Unresolved properties are left as-is.
+fn resolve_properties(input: &str, properties: &HashMap<String, String>) -> String {
+    let mut result = input.to_string();
+    // Iterate until no more replacements (handles nested, though rare)
+    for _ in 0..5 {
+        let Some(start) = result.find("${") else {
+            break;
+        };
+        let Some(end) = result[start..].find('}') else {
+            break;
+        };
+        let key = &result[start + 2..start + end];
+        if let Some(value) = properties.get(key) {
+            result = format!(
+                "{}{}{}",
+                &result[..start],
+                value,
+                &result[start + end + 1..]
+            );
+        } else {
+            break;
+        }
+    }
+    result
 }
 
 /// Finds the LSP range of `text` within content, searching near `hint_start`.
@@ -463,7 +505,27 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_property_version() {
+    fn test_parse_property_version_resolved() {
+        let xml = r"<project>
+  <properties>
+    <slf4j.version>2.0.16</slf4j.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+  </dependencies>
+</project>";
+
+        let result = parse_pom_xml(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].version_req, Some("2.0.16".into()));
+    }
+
+    #[test]
+    fn test_parse_property_version_unresolved() {
         let xml = r"<project>
   <dependencies>
     <dependency>
@@ -476,10 +538,41 @@ mod tests {
 
         let result = parse_pom_xml(xml, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        // Property references are stored as-is (not resolved in MVP)
+        // Unresolved property kept as-is
         assert_eq!(
             result.dependencies[0].version_req,
             Some("${slf4j.version}".into())
+        );
+    }
+
+    #[test]
+    fn test_parse_project_version_property() {
+        let xml = r"<project>
+  <groupId>org.example</groupId>
+  <artifactId>my-app</artifactId>
+  <version>2.5.0</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.example</groupId>
+      <artifactId>my-lib</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+  </dependencies>
+</project>";
+
+        let result = parse_pom_xml(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].version_req, Some("2.5.0".into()));
+        assert_eq!(
+            result.properties.get("project.version"),
+            Some(&"2.5.0".to_string())
+        );
+        assert_eq!(
+            result.properties.get("project.groupId"),
+            Some(&"org.example".to_string())
+        );
+        assert_eq!(
+            result.properties.get("project.artifactId"),
+            Some(&"my-app".to_string())
         );
     }
 
@@ -554,6 +647,21 @@ mod tests {
         assert_eq!(result.dependencies().len(), 1);
         assert!(result.workspace_root().is_none());
         assert!(result.as_any().is::<MavenParseResult>());
+    }
+
+    #[test]
+    fn test_resolve_properties() {
+        let mut props = HashMap::new();
+        props.insert("ver".to_string(), "1.0".to_string());
+        props.insert("suffix".to_string(), "RELEASE".to_string());
+
+        assert_eq!(resolve_properties("${ver}", &props), "1.0");
+        assert_eq!(resolve_properties("plain", &props), "plain");
+        assert_eq!(resolve_properties("${missing}", &props), "${missing}");
+        assert_eq!(
+            resolve_properties("${ver}-${suffix}", &props),
+            "1.0-RELEASE"
+        );
     }
 
     #[test]
