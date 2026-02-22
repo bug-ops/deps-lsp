@@ -1,6 +1,6 @@
 //! Parser for Gradle Version Catalog (gradle/libs.versions.toml).
 //!
-//! Handles [versions], [libraries] sections with position tracking via toml_edit spans.
+//! Handles \[versions\], \[libraries\] sections with position tracking via toml_edit spans.
 
 use crate::error::{GradleError, Result};
 use crate::parser::{GradleParseResult, LineOffsetTable};
