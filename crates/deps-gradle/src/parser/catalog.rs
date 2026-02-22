@@ -83,8 +83,9 @@ fn parse_from_inline(
 ) -> Option<GradleDependency> {
     let (group_id, artifact_id, name, name_range) =
         extract_coordinates_inline(table, content, line_table)?;
+    let hint_line = name_range.start.line;
     let (version_req, version_range) =
-        extract_version_inline(table, content, line_table, version_refs);
+        extract_version_inline(table, content, line_table, version_refs, hint_line);
 
     Some(GradleDependency {
         group_id,
@@ -105,8 +106,9 @@ fn parse_from_table(
 ) -> Option<GradleDependency> {
     let (group_id, artifact_id, name, name_range) =
         extract_coordinates_table(table, content, line_table)?;
+    let hint_line = name_range.start.line;
     let (version_req, version_range) =
-        extract_version_table(table, content, line_table, version_refs);
+        extract_version_table(table, content, line_table, version_refs, hint_line);
 
     Some(GradleDependency {
         group_id,
@@ -204,20 +206,20 @@ fn extract_version_inline(
     content: &str,
     line_table: &LineOffsetTable,
     version_refs: &HashMap<String, String>,
+    hint_line: u32,
 ) -> (Option<String>, Option<Range>) {
-    let parent_span = table.span();
     let Some(version_val) = table.get("version") else {
         return (None, None);
     };
 
     if let Some(ver_str) = version_val.as_str() {
-        let range = span_to_range_or_fallback(
+        let range = span_to_range_with_hint(
             content,
             line_table,
             version_val.span(),
-            parent_span,
             "version",
             ver_str,
+            hint_line,
         );
         return (Some(ver_str.to_string()), Some(range));
     }
@@ -227,13 +229,13 @@ fn extract_version_inline(
         && let Some(ref_key) = ref_val.as_str()
     {
         let resolved = version_refs.get(ref_key).cloned();
-        let range = span_to_range_or_fallback(
+        let range = span_to_range_with_hint(
             content,
             line_table,
             ref_val.span(),
-            parent_span,
             "ref",
             ref_key,
+            hint_line,
         );
         return (resolved, Some(range));
     }
@@ -246,20 +248,20 @@ fn extract_version_table(
     content: &str,
     line_table: &LineOffsetTable,
     version_refs: &HashMap<String, String>,
+    hint_line: u32,
 ) -> (Option<String>, Option<Range>) {
-    let parent_span = table.span();
     let Some(version_item) = table.get("version") else {
         return (None, None);
     };
 
     if let Some(ver_str) = version_item.as_str() {
-        let range = span_to_range_or_fallback(
+        let range = span_to_range_with_hint(
             content,
             line_table,
             version_item.span(),
-            parent_span,
             "version",
             ver_str,
+            hint_line,
         );
         return (Some(ver_str.to_string()), Some(range));
     }
@@ -269,13 +271,13 @@ fn extract_version_table(
         && let Some(ref_key) = ref_item.as_str()
     {
         let resolved = version_refs.get(ref_key).cloned();
-        let range = span_to_range_or_fallback(
+        let range = span_to_range_with_hint(
             content,
             line_table,
             ref_item.span(),
-            parent_span,
             "ref",
             ref_key,
+            hint_line,
         );
         return (resolved, Some(range));
     }
@@ -285,13 +287,13 @@ fn extract_version_table(
         && let Some(ref_key) = ref_val.as_str()
     {
         let resolved = version_refs.get(ref_key).cloned();
-        let range = span_to_range_or_fallback(
+        let range = span_to_range_with_hint(
             content,
             line_table,
             ref_val.span(),
-            parent_span,
             "ref",
             ref_key,
+            hint_line,
         );
         return (resolved, Some(range));
     }
@@ -310,7 +312,21 @@ fn span_to_range_or_fallback(
     if span.is_some() {
         return span_to_range(content, line_table, span);
     }
-    find_value_range_in_content(content, line_table, key, value)
+    find_value_in_content(content, line_table, key, value)
+}
+
+fn span_to_range_with_hint(
+    content: &str,
+    line_table: &LineOffsetTable,
+    span: Option<std::ops::Range<usize>>,
+    key: &str,
+    value: &str,
+    hint_line: u32,
+) -> Range {
+    if span.is_some() {
+        return span_to_range(content, line_table, span);
+    }
+    find_value_on_line(content, line_table, key, value, hint_line)
 }
 
 fn span_to_range(
@@ -327,31 +343,53 @@ fn span_to_range(
     Range::new(start, end)
 }
 
-/// Find the range of a quoted value string by text search.
-/// Used as fallback when `span()` returns `None` for inline table values.
-fn find_value_range_in_content(
+/// Find the first occurrence of a quoted value by key in the entire content.
+/// Used for unique values like module/name coordinates.
+fn find_value_in_content(
     content: &str,
     line_table: &LineOffsetTable,
     key: &str,
     value: &str,
 ) -> Range {
     let needle = format!("\"{value}\"");
-    // Search for all occurrences of key, then find value after it
     let mut search_from = 0;
     while let Some(key_pos) = content[search_from..].find(key) {
         let abs_key = search_from + key_pos;
         let after_key = &content[abs_key..];
-        // Ensure we're in the right context (key followed by = or . within the same line)
         let line_end = after_key.find('\n').unwrap_or(after_key.len());
-        let line_slice = &after_key[..line_end];
-        if let Some(val_offset) = line_slice.find(&needle) {
-            let abs_start = abs_key + val_offset + 1; // skip opening quote
+        if let Some(val_offset) = after_key[..line_end].find(&needle) {
+            let abs_start = abs_key + val_offset + 1;
             let abs_end = abs_start + value.len();
             let start = line_table.byte_offset_to_position(content, abs_start);
             let end = line_table.byte_offset_to_position(content, abs_end);
             return Range::new(start, end);
         }
         search_from = abs_key + key.len();
+    }
+    Range::default()
+}
+
+/// Find the range of a quoted value on a specific line by text search.
+/// `hint_line` constrains the search to a specific 0-based line number.
+fn find_value_on_line(
+    content: &str,
+    line_table: &LineOffsetTable,
+    key: &str,
+    value: &str,
+    hint_line: u32,
+) -> Range {
+    let line_start = line_table.line_start_offset(hint_line);
+    let line_end = line_table.line_end_offset(content, hint_line);
+    let line_slice = &content[line_start..line_end];
+    let needle = format!("\"{value}\"");
+    if let Some(key_pos) = line_slice.find(key)
+        && let Some(val_offset) = line_slice[key_pos..].find(&needle)
+    {
+        let abs_start = line_start + key_pos + val_offset + 1;
+        let abs_end = abs_start + value.len();
+        let start = line_table.byte_offset_to_position(content, abs_start);
+        let end = line_table.byte_offset_to_position(content, abs_end);
+        return Range::new(start, end);
     }
     Range::default()
 }
@@ -481,6 +519,29 @@ spring-boot = { module = "org.springframework.boot:spring-boot-starter", version
         let vr = dep.version_range.as_ref().unwrap();
         assert_eq!(vr.start.line, 4);
         assert!(vr.start.character > 0);
+    }
+
+    #[test]
+    fn test_duplicate_version_ref_different_lines() {
+        let content = r#"[versions]
+hilt = "2.50"
+
+[libraries]
+hilt-android = { group = "com.google.dagger", name = "hilt-android", version.ref = "hilt" }
+hilt-compiler = { group = "com.google.dagger", name = "hilt-compiler", version.ref = "hilt" }
+"#;
+        let result = parse_version_catalog(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+
+        let d0 = &result.dependencies[0];
+        let d1 = &result.dependencies[1];
+        let vr0 = d0.version_range.as_ref().unwrap();
+        let vr1 = d1.version_range.as_ref().unwrap();
+
+        // Each dependency's version range must be on its own line
+        assert_ne!(vr0.start.line, vr1.start.line);
+        assert_eq!(vr0.start.line, d0.name_range.start.line);
+        assert_eq!(vr1.start.line, d1.name_range.start.line);
     }
 
     #[test]

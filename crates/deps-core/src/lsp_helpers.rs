@@ -44,6 +44,21 @@ impl LineOffsetTable {
         Self { line_starts }
     }
 
+    /// Returns the byte offset of the start of the given 0-based line.
+    pub fn line_start_offset(&self, line: u32) -> usize {
+        self.line_starts.get(line as usize).copied().unwrap_or(0)
+    }
+
+    /// Returns the byte offset of the end of the given 0-based line (before newline).
+    pub fn line_end_offset(&self, content: &str, line: u32) -> usize {
+        let next_line = line as usize + 1;
+        if next_line < self.line_starts.len() {
+            self.line_starts[next_line].saturating_sub(1)
+        } else {
+            content.len()
+        }
+    }
+
     /// Converts a byte offset into an LSP `Position`.
     pub fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
         let offset = offset.min(content.len());
