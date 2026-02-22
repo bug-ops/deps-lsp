@@ -19,7 +19,7 @@ async-trait = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-toml_edit = { workspace = true }
+toml-span = { workspace = true }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 

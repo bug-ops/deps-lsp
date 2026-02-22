@@ -13,15 +13,45 @@ use std::any::Any;
 use std::sync::Arc;
 
 const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
+const GOOGLE_MAVEN_BASE: &str = "https://dl.google.com/dl/android/maven2";
 const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";
+
+const GOOGLE_PREFIXES: &[&str] = &[
+    "androidx.",
+    "com.google.firebase.",
+    "com.google.android.",
+    "com.google.gms.",
+    "com.android.",
+];
+
+fn is_google_group(group_id: &str) -> bool {
+    GOOGLE_PREFIXES.iter().any(|p| group_id.starts_with(p))
+}
+
+fn repo_base_for_group(group_id: &str) -> &'static str {
+    if is_google_group(group_id) {
+        GOOGLE_MAVEN_BASE
+    } else {
+        MAVEN_REPO_BASE
+    }
+}
 
 pub fn package_url(name: &str) -> String {
     let parts: Vec<&str> = name.splitn(2, ':').collect();
     if parts.len() == 2 {
-        format!(
-            "https://central.sonatype.com/artifact/{}/{}",
-            parts[0], parts[1]
-        )
+        let group_id = parts[0];
+        let artifact_id = parts[1];
+        if is_google_group(group_id) {
+            format!(
+                "https://maven.google.com/web/index.html#{}:{}",
+                group_id, artifact_id
+            )
+        } else {
+            format!(
+                "https://central.sonatype.com/artifact/{}/{}",
+                group_id, artifact_id
+            )
+        }
     } else {
         format!(
             "https://central.sonatype.com/search?q={}",
@@ -86,12 +116,13 @@ impl MavenCentralRegistry {
     }
 }
 
-/// Converts `groupId:artifactId` to maven-metadata.xml URL.
+/// Converts `groupId:artifactId` to maven-metadata.xml URL, routing to the correct repository.
 fn metadata_url(name: &str) -> Option<String> {
     let (group_id, artifact_id) = name.split_once(':')?;
+    let base = repo_base_for_group(group_id);
     let group_path = group_id.replace('.', "/");
     Some(format!(
-        "{MAVEN_REPO_BASE}/{group_path}/{artifact_id}/maven-metadata.xml"
+        "{base}/{group_path}/{artifact_id}/maven-metadata.xml"
     ))
 }
 
@@ -224,10 +255,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_package_url() {
+    fn test_repo_base_for_group_central() {
+        assert_eq!(repo_base_for_group("org.apache.commons"), MAVEN_REPO_BASE);
+        assert_eq!(repo_base_for_group("com.example"), MAVEN_REPO_BASE);
+        // com.google.protobuf is on Maven Central, not Google Maven
+        assert_eq!(repo_base_for_group("com.google.protobuf"), MAVEN_REPO_BASE);
+    }
+
+    #[test]
+    fn test_repo_base_for_group_google() {
+        assert_eq!(repo_base_for_group("androidx.core"), GOOGLE_MAVEN_BASE);
+        assert_eq!(
+            repo_base_for_group("com.google.firebase.crashlytics"),
+            GOOGLE_MAVEN_BASE
+        );
+        assert_eq!(
+            repo_base_for_group("com.google.android.gms"),
+            GOOGLE_MAVEN_BASE
+        );
+        assert_eq!(
+            repo_base_for_group("com.google.gms.google-services"),
+            GOOGLE_MAVEN_BASE
+        );
+        assert_eq!(repo_base_for_group("com.android.tools"), GOOGLE_MAVEN_BASE);
+    }
+
+    #[test]
+    fn test_package_url_central() {
         assert_eq!(
             package_url("org.apache.commons:commons-lang3"),
             "https://central.sonatype.com/artifact/org.apache.commons/commons-lang3"
+        );
+    }
+
+    #[test]
+    fn test_package_url_google() {
+        assert_eq!(
+            package_url("androidx.core:core-ktx"),
+            "https://maven.google.com/web/index.html#androidx.core:core-ktx"
+        );
+        assert_eq!(
+            package_url("com.google.firebase.crashlytics:firebase-crashlytics"),
+            "https://maven.google.com/web/index.html#com.google.firebase.crashlytics:firebase-crashlytics"
         );
     }
 
@@ -238,10 +307,25 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_url() {
+    fn test_metadata_url_central() {
         assert_eq!(
             metadata_url("org.apache.commons:commons-lang3"),
             Some("https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/maven-metadata.xml".into())
+        );
+    }
+
+    #[test]
+    fn test_metadata_url_google() {
+        assert_eq!(
+            metadata_url("androidx.core:core-ktx"),
+            Some(
+                "https://dl.google.com/dl/android/maven2/androidx/core/core-ktx/maven-metadata.xml"
+                    .into()
+            )
+        );
+        assert_eq!(
+            metadata_url("com.google.firebase.crashlytics:firebase-crashlytics"),
+            Some("https://dl.google.com/dl/android/maven2/com/google/firebase/crashlytics/firebase-crashlytics/maven-metadata.xml".into())
         );
     }
 

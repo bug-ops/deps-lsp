@@ -9,13 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Gradle ecosystem support** — New `deps-gradle` crate with support for three manifest formats
-  - Version Catalog parser (`gradle/libs.versions.toml`) via toml_edit with position tracking
+  - Version Catalog parser (`gradle/libs.versions.toml`) via toml-span with reliable span tracking
   - Kotlin DSL parser (`build.gradle.kts`) via regex
   - Groovy DSL parser (`build.gradle`) via regex
   - Reuses `MavenCentralRegistry` from deps-maven (no registry duplication)
   - Parses `[versions]`, `[libraries]` sections with `version.ref` resolution
   - Recognizes all Gradle configurations: implementation, api, compileOnly, runtimeOnly, testImplementation, etc.
   - Feature-gated registration in deps-lsp (`gradle`)
+- **Google Maven repository support** — Android packages (`androidx.*`, `com.google.firebase.*`, `com.google.android.*`, `com.android.*`) now resolve from Google Maven instead of Maven Central
 
 ### Changed
 - Extract `LineOffsetTable` and `position_in_range` to deps-core for reuse across ecosystems
