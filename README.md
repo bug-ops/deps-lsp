@@ -8,7 +8,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, and Maven ecosystems.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, and Gradle ecosystems.
 
 ## Features
 
@@ -48,9 +48,10 @@ deps-lsp is optimized for responsiveness:
 | Ruby | Bundler | `Gemfile` | ✅ Supported |
 | Dart | Pub | `pubspec.yaml` | ✅ Supported |
 | Java | Maven | `pom.xml` | ✅ Supported |
+| Java | Gradle | `libs.versions.toml`, `build.gradle.kts`, `build.gradle` | ✅ Supported |
 
 > [!NOTE]
-> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`). Dart support includes hosted, git, path, and SDK dependency sources with caret version semantics. Maven support covers `dependencies`, `dependencyManagement`, and `build/plugins` sections with Maven qualifier-aware version comparison.
+> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`). Dart support includes hosted, git, path, and SDK dependency sources with caret version semantics. Maven support covers `dependencies`, `dependencyManagement`, and `build/plugins` sections with Maven qualifier-aware version comparison. Gradle support covers Version Catalogs (`libs.versions.toml`), Kotlin DSL (`build.gradle.kts`), and Groovy DSL (`build.gradle`) with version.ref resolution.
 
 ## Installation
 
@@ -115,6 +116,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `bundler` | Ruby | Gemfile | ✅ |
 | `dart` | Dart | pubspec.yaml | ✅ |
 | `maven` | Java | pom.xml | ✅ |
+| `gradle` | Java | libs.versions.toml, build.gradle.kts, build.gradle | ✅ |
 
 ## Usage
 
@@ -294,6 +296,7 @@ deps-lsp/
 │   ├── deps-bundler/   # Gemfile parser + rubygems.org registry
 │   ├── deps-dart/      # pubspec.yaml parser + pub.dev registry
 │   ├── deps-maven/     # pom.xml parser + Maven Central registry
+│   ├── deps-gradle/    # Gradle parser (Version Catalog, Kotlin/Groovy DSL)
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration

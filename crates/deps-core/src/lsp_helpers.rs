@@ -9,6 +9,57 @@ use tower_lsp_server::ls_types::{
 
 use crate::{Dependency, EcosystemConfig, ParseResult, Registry};
 
+/// Checks whether a cursor position falls within an LSP range (inclusive on both ends).
+pub fn position_in_range(pos: Position, range: Range) -> bool {
+    if pos.line < range.start.line || pos.line > range.end.line {
+        return false;
+    }
+    if pos.line == range.start.line && pos.character < range.start.character {
+        return false;
+    }
+    if pos.line == range.end.line && pos.character > range.end.character {
+        return false;
+    }
+    true
+}
+
+/// Converts byte offsets in source text to LSP `Position` values.
+///
+/// Precomputes line-start byte offsets once, then maps any byte offset to a
+/// `(line, character)` position. Characters are counted as UTF-16 code units
+/// as required by the LSP specification.
+pub struct LineOffsetTable {
+    line_starts: Vec<usize>,
+}
+
+impl LineOffsetTable {
+    /// Builds the table for `content`.
+    pub fn new(content: &str) -> Self {
+        let mut line_starts = vec![0];
+        for (i, c) in content.char_indices() {
+            if c == '\n' {
+                line_starts.push(i + 1);
+            }
+        }
+        Self { line_starts }
+    }
+
+    /// Converts a byte offset into an LSP `Position`.
+    pub fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
+        let offset = offset.min(content.len());
+        let line = self
+            .line_starts
+            .partition_point(|&start| start <= offset)
+            .saturating_sub(1);
+        let line_start = self.line_starts[line];
+        let character = content[line_start..offset]
+            .chars()
+            .map(|c| c.len_utf16() as u32)
+            .sum();
+        Position::new(line as u32, character)
+    }
+}
+
 /// Checks if a position overlaps with a range (inclusive start, exclusive end).
 pub fn ranges_overlap(range: Range, position: Position) -> bool {
     !(range.end.line < position.line

@@ -139,6 +139,19 @@ ecosystem!(
     ]
 );
 
+ecosystem!(
+    "gradle",
+    deps_gradle,
+    GradleEcosystem,
+    [
+        GradleDependency,
+        GradleParseResult,
+        GradleVersion,
+        GradleFormatter,
+        parse_gradle,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
     register!("cargo", CargoEcosystem, registry, &cache);
@@ -148,6 +161,7 @@ pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) 
     register!("bundler", BundlerEcosystem, registry, &cache);
     register!("dart", DartEcosystem, registry, &cache);
     register!("maven", MavenEcosystem, registry, &cache);
+    register!("gradle", GradleEcosystem, registry, &cache);
 }
 
 #[cfg(test)]

@@ -573,6 +573,36 @@ const MAX_COMPLETION_VERSIONS: usize = 5;
 /// ).await;
 /// # }
 /// ```
+/// Generic package name completion using any `Registry` implementation.
+///
+/// Searches the registry for packages matching `prefix` and returns up to `limit`
+/// completion items. Returns empty vec if `prefix` is shorter than 2 characters or
+/// longer than 200 characters.
+pub async fn complete_package_names_generic(
+    registry: &dyn crate::Registry,
+    prefix: &str,
+    limit: usize,
+) -> Vec<CompletionItem> {
+    if prefix.len() < 2 || prefix.len() > 200 {
+        return vec![];
+    }
+
+    let results = match registry.search(prefix, limit).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Registry search failed for '{}': {}", prefix, e);
+            return vec![];
+        }
+    };
+
+    let insert_range = tower_lsp_server::ls_types::Range::default();
+
+    results
+        .into_iter()
+        .map(|metadata| build_package_completion(metadata.as_ref(), insert_range))
+        .collect()
+}
+
 pub async fn complete_versions_generic(
     registry: &dyn crate::Registry,
     package_name: &str,

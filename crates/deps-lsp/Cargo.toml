@@ -21,7 +21,7 @@ name = "deps_lsp"
 path = "src/lib.rs"
 
 [features]
-default = ["cargo", "npm", "pypi", "go", "bundler", "dart", "maven"]
+default = ["cargo", "npm", "pypi", "go", "bundler", "dart", "maven", "gradle"]
 cargo = ["dep:deps-cargo"]
 npm = ["dep:deps-npm"]
 pypi = ["dep:deps-pypi"]
@@ -29,6 +29,7 @@ go = ["dep:deps-go"]
 bundler = ["dep:deps-bundler"]
 dart = ["dep:deps-dart"]
 maven = ["dep:deps-maven"]
+gradle = ["dep:deps-gradle"]
 
 [dependencies]
 # Internal crates
@@ -40,6 +41,7 @@ deps-go = { workspace = true, optional = true }
 deps-bundler = { workspace = true, optional = true }
 deps-dart = { workspace = true, optional = true }
 deps-maven = { workspace = true, optional = true }
+deps-gradle = { workspace = true, optional = true }
 
 # External dependencies
 dashmap = { workspace = true }

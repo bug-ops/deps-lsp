@@ -1,0 +1,30 @@
+[package]
+name = "deps-gradle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Gradle build system support for deps-lsp"
+publish = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deps-core = { workspace = true }
+deps-maven = { workspace = true }
+async-trait = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml_edit = { workspace = true }
+tower-lsp-server = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true, features = ["json"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test = { workspace = true }
