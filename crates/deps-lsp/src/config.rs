@@ -281,11 +281,11 @@ const fn default_refresh_interval() -> u64 {
 }
 
 const fn default_fetch_timeout_secs() -> u64 {
-    10
+    5
 }
 
 const fn default_max_concurrent_fetches() -> usize {
-    5
+    20
 }
 
 /// Minimum timeout (seconds) to prevent zero-timeout edge case
@@ -441,8 +441,8 @@ mod tests {
         let config = CacheConfig::default();
         assert!(config.enabled);
         assert_eq!(config.refresh_interval_secs, 300);
-        assert_eq!(config.fetch_timeout_secs, 10);
-        assert_eq!(config.max_concurrent_fetches, 5);
+        assert_eq!(config.fetch_timeout_secs, 5);
+        assert_eq!(config.max_concurrent_fetches, 20);
     }
 
     #[test]

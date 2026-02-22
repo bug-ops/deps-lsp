@@ -42,10 +42,17 @@ impl MavenCentralRegistry {
 
     pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
         let Some(url) = metadata_url(name) else {
+            tracing::debug!(package = %name, "skipping: invalid groupId:artifactId format");
             return Ok(vec![]);
         };
 
-        let data = self.cache.get_cached(&url).await?;
+        let data = match self.cache.get_cached(&url).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(package = %name, url = %url, error = %e, "metadata fetch failed");
+                return Err(e);
+            }
+        };
         parse_metadata_xml(&data)
     }
 
@@ -57,9 +64,13 @@ impl MavenCentralRegistry {
         let versions = self.get_versions_typed(name).await?;
         // For Maven MVP: exact string match, or latest stable if req is empty/wildcard
         if req.is_empty() || req == "*" {
-            return Ok(versions
-                .into_iter()
-                .find(|v| !crate::version::is_prerelease(&v.version)));
+            // Prefer latest stable; fall back to latest pre-release if no stable exists
+            let latest = versions
+                .iter()
+                .find(|v| !crate::version::is_prerelease(&v.version))
+                .or_else(|| versions.first())
+                .cloned();
+            return Ok(latest);
         }
         Ok(versions.into_iter().find(|v| v.version == req))
     }

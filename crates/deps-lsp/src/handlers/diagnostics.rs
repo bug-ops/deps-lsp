@@ -48,6 +48,12 @@ pub(crate) async fn generate_diagnostics_internal(
         }
     };
 
+    // Skip diagnostics while versions are still loading to avoid
+    // false "Unknown package" warnings from empty cache
+    if doc.loading_state == deps_core::LoadingState::Loading {
+        return vec![];
+    }
+
     let parse_result = match doc.parse_result() {
         Some(p) => p,
         None => return vec![],

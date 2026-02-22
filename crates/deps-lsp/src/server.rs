@@ -247,7 +247,15 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         tracing::info!("deps-lsp server initialized");
         self.client
-            .log_message(MessageType::INFO, "deps-lsp ready")
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "deps-lsp v{} ({} {})",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("GIT_HASH"),
+                    env!("BUILD_TIME")
+                ),
+            )
             .await;
 
         // Register lock file watchers using patterns from all ecosystems
