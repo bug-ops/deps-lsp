@@ -11,10 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Maven ecosystem support** — New `deps-maven` crate with pom.xml parsing and Maven Central integration
   - SAX parser via quick-xml with byte-accurate position tracking
   - Parses `<dependencies>`, `<dependencyManagement>`, and `<build><plugins>` sections
-  - Maven Central Solr API client for version lookup and package search
+  - Maven property resolution from `<properties>` section including built-in `project.version`, `project.groupId`, `project.artifactId`
+  - maven-metadata.xml CDN fetch for version lookup (50-150ms vs 300-800ms Solr)
+  - Maven Solr search API for package search (full-text)
   - Maven version comparison with prerelease qualifier detection (alpha, beta, RC, SNAPSHOT)
   - `groupId:artifactId` as canonical package identifier
   - Feature-gated registration in deps-lsp (`maven`)
+
+### Fixed
+- **DashMap deadlock in HttpCache** — Release shard read lock before awaiting conditional requests to prevent deadlock under concurrent fetches
+- **LSP progress backpressure** — Channel-based progress architecture with `try_send` prevents registry fetches from stalling on LSP transport
+- **False "Unknown package" during loading** — Skip diagnostics while versions are still being fetched
+- **Pre-release-only packages** — Fall back to latest pre-release when no stable version exists
+
+### Changed
+- Default `max_concurrent_fetches` increased from 5 to 20
+- Default `fetch_timeout_secs` reduced from 10 to 5
 
 ## [0.7.0] - 2026-02-16
 
