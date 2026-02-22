@@ -18,9 +18,9 @@ const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";
 
 const GOOGLE_PREFIXES: &[&str] = &[
     "androidx.",
-    "com.google.firebase.",
-    "com.google.android.",
-    "com.google.gms.",
+    "com.google.firebase",
+    "com.google.android",
+    "com.google.gms",
     "com.android.",
 ];
 
