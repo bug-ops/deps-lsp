@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-02-22
+
 ### Added
 - **Maven ecosystem support** — New `deps-maven` crate with pom.xml parsing and Maven Central integration
   - SAX parser via quick-xml with byte-accurate position tracking
@@ -339,7 +341,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/bug-ops/deps-lsp/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/bug-ops/deps-lsp/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/bug-ops/deps-lsp/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/bug-ops/deps-lsp/compare/v0.5.5...v0.6.0
