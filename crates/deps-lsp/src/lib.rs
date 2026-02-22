@@ -124,6 +124,21 @@ ecosystem!(
     ]
 );
 
+ecosystem!(
+    "maven",
+    deps_maven,
+    MavenEcosystem,
+    [
+        MavenDependency,
+        MavenParseResult,
+        MavenVersion,
+        MavenFormatter,
+        ArtifactInfo,
+        MavenCentralRegistry,
+        parse_pom_xml,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
     register!("cargo", CargoEcosystem, registry, &cache);
@@ -132,6 +147,7 @@ pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) 
     register!("go", GoEcosystem, registry, &cache);
     register!("bundler", BundlerEcosystem, registry, &cache);
     register!("dart", DartEcosystem, registry, &cache);
+    register!("maven", MavenEcosystem, registry, &cache);
 }
 
 #[cfg(test)]
@@ -156,5 +172,7 @@ mod tests {
         assert!(registry.get("bundler").is_some());
         #[cfg(feature = "dart")]
         assert!(registry.get("dart").is_some());
+        #[cfg(feature = "maven")]
+        assert!(registry.get("maven").is_some());
     }
 }
