@@ -70,14 +70,11 @@ fn test_fixture_property_versions() {
     let content = load_fixture("property_versions.xml");
     let result = parse_pom_xml(&content, &fixture_uri("property_versions.xml")).unwrap();
     assert_eq!(result.dependencies.len(), 2);
-    // Property references stored as-is
-    assert_eq!(
-        result.dependencies[0].version_req,
-        Some("${commons.version}".into())
-    );
+    // Property references resolved from <properties> section
+    assert_eq!(result.dependencies[0].version_req, Some("3.14.0".into()));
     assert_eq!(
         result.dependencies[1].version_req,
-        Some("${guava.version}".into())
+        Some("33.0.0-jre".into())
     );
 }
 
