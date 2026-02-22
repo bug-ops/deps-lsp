@@ -124,9 +124,17 @@ fn extract_coordinates_inline(
     content: &str,
     line_table: &LineOffsetTable,
 ) -> Option<(String, String, String, Range)> {
+    let parent_span = table.span();
     if let Some(module_val) = table.get("module") {
         let module_str = module_val.as_str()?;
-        let name_range = span_to_range(content, line_table, module_val.span());
+        let name_range = span_to_range_or_fallback(
+            content,
+            line_table,
+            module_val.span(),
+            parent_span,
+            "module",
+            module_str,
+        );
         let (g, a) = module_str.split_once(':')?;
         return Some((
             g.to_string(),
@@ -140,7 +148,14 @@ fn extract_coordinates_inline(
     let g = group_val.as_str()?.to_string();
     let a = name_val.as_str()?.to_string();
     let name_str = format!("{g}:{a}");
-    let name_range = span_to_range(content, line_table, name_val.span());
+    let name_range = span_to_range_or_fallback(
+        content,
+        line_table,
+        name_val.span(),
+        parent_span,
+        "name",
+        &a,
+    );
     Some((g, a, name_str, name_range))
 }
 
@@ -149,9 +164,17 @@ fn extract_coordinates_table(
     content: &str,
     line_table: &LineOffsetTable,
 ) -> Option<(String, String, String, Range)> {
+    let parent_span = table.span();
     if let Some(module_item) = table.get("module") {
         let module_str = module_item.as_str()?;
-        let name_range = span_to_range(content, line_table, module_item.span());
+        let name_range = span_to_range_or_fallback(
+            content,
+            line_table,
+            module_item.span(),
+            parent_span,
+            "module",
+            module_str,
+        );
         let (g, a) = module_str.split_once(':')?;
         return Some((
             g.to_string(),
@@ -165,7 +188,14 @@ fn extract_coordinates_table(
     let g = group_item.as_str()?.to_string();
     let a = name_item.as_str()?.to_string();
     let name_str = format!("{g}:{a}");
-    let name_range = span_to_range(content, line_table, name_item.span());
+    let name_range = span_to_range_or_fallback(
+        content,
+        line_table,
+        name_item.span(),
+        parent_span,
+        "name",
+        &a,
+    );
     Some((g, a, name_str, name_range))
 }
 
@@ -175,12 +205,20 @@ fn extract_version_inline(
     line_table: &LineOffsetTable,
     version_refs: &HashMap<String, String>,
 ) -> (Option<String>, Option<Range>) {
+    let parent_span = table.span();
     let Some(version_val) = table.get("version") else {
         return (None, None);
     };
 
     if let Some(ver_str) = version_val.as_str() {
-        let range = span_to_range(content, line_table, version_val.span());
+        let range = span_to_range_or_fallback(
+            content,
+            line_table,
+            version_val.span(),
+            parent_span,
+            "version",
+            ver_str,
+        );
         return (Some(ver_str.to_string()), Some(range));
     }
 
@@ -189,7 +227,14 @@ fn extract_version_inline(
         && let Some(ref_key) = ref_val.as_str()
     {
         let resolved = version_refs.get(ref_key).cloned();
-        let range = span_to_range(content, line_table, ref_val.span());
+        let range = span_to_range_or_fallback(
+            content,
+            line_table,
+            ref_val.span(),
+            parent_span,
+            "ref",
+            ref_key,
+        );
         return (resolved, Some(range));
     }
 
@@ -202,12 +247,20 @@ fn extract_version_table(
     line_table: &LineOffsetTable,
     version_refs: &HashMap<String, String>,
 ) -> (Option<String>, Option<Range>) {
+    let parent_span = table.span();
     let Some(version_item) = table.get("version") else {
         return (None, None);
     };
 
     if let Some(ver_str) = version_item.as_str() {
-        let range = span_to_range(content, line_table, version_item.span());
+        let range = span_to_range_or_fallback(
+            content,
+            line_table,
+            version_item.span(),
+            parent_span,
+            "version",
+            ver_str,
+        );
         return (Some(ver_str.to_string()), Some(range));
     }
 
@@ -216,7 +269,14 @@ fn extract_version_table(
         && let Some(ref_key) = ref_item.as_str()
     {
         let resolved = version_refs.get(ref_key).cloned();
-        let range = span_to_range(content, line_table, ref_item.span());
+        let range = span_to_range_or_fallback(
+            content,
+            line_table,
+            ref_item.span(),
+            parent_span,
+            "ref",
+            ref_key,
+        );
         return (resolved, Some(range));
     }
 
@@ -225,11 +285,32 @@ fn extract_version_table(
         && let Some(ref_key) = ref_val.as_str()
     {
         let resolved = version_refs.get(ref_key).cloned();
-        let range = span_to_range(content, line_table, ref_val.span());
+        let range = span_to_range_or_fallback(
+            content,
+            line_table,
+            ref_val.span(),
+            parent_span,
+            "ref",
+            ref_key,
+        );
         return (resolved, Some(range));
     }
 
     (None, None)
+}
+
+fn span_to_range_or_fallback(
+    content: &str,
+    line_table: &LineOffsetTable,
+    span: Option<std::ops::Range<usize>>,
+    _parent_span: Option<std::ops::Range<usize>>,
+    key: &str,
+    value: &str,
+) -> Range {
+    if span.is_some() {
+        return span_to_range(content, line_table, span);
+    }
+    find_value_range_in_content(content, line_table, key, value)
 }
 
 fn span_to_range(
@@ -244,6 +325,35 @@ fn span_to_range(
     let start = line_table.byte_offset_to_position(content, start_off);
     let end = line_table.byte_offset_to_position(content, end_off);
     Range::new(start, end)
+}
+
+/// Find the range of a quoted value string by text search.
+/// Used as fallback when `span()` returns `None` for inline table values.
+fn find_value_range_in_content(
+    content: &str,
+    line_table: &LineOffsetTable,
+    key: &str,
+    value: &str,
+) -> Range {
+    let needle = format!("\"{value}\"");
+    // Search for all occurrences of key, then find value after it
+    let mut search_from = 0;
+    while let Some(key_pos) = content[search_from..].find(key) {
+        let abs_key = search_from + key_pos;
+        let after_key = &content[abs_key..];
+        // Ensure we're in the right context (key followed by = or . within the same line)
+        let line_end = after_key.find('\n').unwrap_or(after_key.len());
+        let line_slice = &after_key[..line_end];
+        if let Some(val_offset) = line_slice.find(&needle) {
+            let abs_start = abs_key + val_offset + 1; // skip opening quote
+            let abs_end = abs_start + value.len();
+            let start = line_table.byte_offset_to_position(content, abs_start);
+            let end = line_table.byte_offset_to_position(content, abs_end);
+            return Range::new(start, end);
+        }
+        search_from = abs_key + key.len();
+    }
+    Range::default()
 }
 
 /// If the byte range in `content` is a quoted string, returns the inner range (excluding quotes).
@@ -350,6 +460,27 @@ guava = { module = "com.google.guava:guava", version.ref = "guava" }
         let content = "plain";
         let (s, e) = strip_quotes(content, 0, content.len());
         assert_eq!(&content[s..e], "plain");
+    }
+
+    #[test]
+    fn test_version_ref_position_tracking() {
+        let content = r#"[versions]
+spring = "3.2.0"
+
+[libraries]
+spring-boot = { module = "org.springframework.boot:spring-boot-starter", version.ref = "spring" }
+"#;
+        let result = parse_version_catalog(content, &make_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        // name_range should point to the module value on line 4
+        assert_eq!(dep.name_range.start.line, 4);
+        assert!(dep.name_range.start.character > 0);
+
+        // version_range should also be on line 4, not line 0
+        let vr = dep.version_range.as_ref().unwrap();
+        assert_eq!(vr.start.line, 4);
+        assert!(vr.start.character > 0);
     }
 
     #[test]
