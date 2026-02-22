@@ -1,12 +1,18 @@
 //! Maven Central registry client.
+//!
+//! Uses `maven-metadata.xml` from Maven Central CDN for version fetching
+//! (fast, CDN-cached) and Solr search API for package search (full-text).
 
 use crate::types::{ArtifactInfo, MavenVersion};
 use crate::version::compare_versions;
 use deps_core::{HttpCache, Result};
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
 use serde::Deserialize;
 use std::any::Any;
 use std::sync::Arc;
 
+const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
 const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";
 
 pub fn package_url(name: &str) -> String {
@@ -35,20 +41,12 @@ impl MavenCentralRegistry {
     }
 
     pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
-        let parts: Vec<&str> = name.splitn(2, ':').collect();
-        if parts.len() != 2 {
+        let Some(url) = metadata_url(name) else {
             return Ok(vec![]);
-        }
-        let (group_id, artifact_id) = (parts[0], parts[1]);
-
-        let url = format!(
-            "{MAVEN_SEARCH_BASE}?q=g:{group}+AND+a:{artifact}&core=gav&rows=200&wt=json",
-            group = urlencoding::encode(group_id),
-            artifact = urlencoding::encode(artifact_id),
-        );
+        };
 
         let data = self.cache.get_cached(&url).await?;
-        parse_versions_response(&data)
+        parse_metadata_xml(&data)
     }
 
     pub async fn get_latest_matching_typed(
@@ -77,15 +75,57 @@ impl MavenCentralRegistry {
     }
 }
 
-#[derive(Deserialize)]
-struct SolrVersionResponse {
-    response: SolrVersionBody,
+/// Converts `groupId:artifactId` to maven-metadata.xml URL.
+fn metadata_url(name: &str) -> Option<String> {
+    let (group_id, artifact_id) = name.split_once(':')?;
+    let group_path = group_id.replace('.', "/");
+    Some(format!(
+        "{MAVEN_REPO_BASE}/{group_path}/{artifact_id}/maven-metadata.xml"
+    ))
 }
 
-#[derive(Deserialize)]
-struct SolrVersionBody {
-    #[serde(default)]
-    docs: Vec<VersionDoc>,
+/// Parses maven-metadata.xml to extract version list.
+fn parse_metadata_xml(data: &[u8]) -> Result<Vec<MavenVersion>> {
+    let mut reader = Reader::from_reader(data);
+    let mut versions = Vec::new();
+    let mut in_versions = false;
+    let mut in_version = false;
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match e.name().as_ref() {
+                b"versions" => in_versions = true,
+                b"version" if in_versions => in_version = true,
+                _ => {}
+            },
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"versions" => in_versions = false,
+                b"version" => in_version = false,
+                _ => {}
+            },
+            Ok(Event::Text(e)) if in_version => {
+                let Ok(decoded) = e.decode() else {
+                    continue;
+                };
+                let text = quick_xml::escape::unescape(&decoded).unwrap_or_default();
+                let version = text.trim().to_string();
+                if !version.is_empty() {
+                    versions.push(MavenVersion {
+                        version,
+                        timestamp: None,
+                    });
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    versions.sort_by(|a, b| compare_versions(&b.version, &a.version));
+    Ok(versions)
 }
 
 #[derive(Deserialize)]
@@ -100,36 +140,11 @@ struct SolrSearchBody {
 }
 
 #[derive(Deserialize)]
-struct VersionDoc {
-    #[serde(rename = "v")]
-    version: String,
-    #[serde(default)]
-    timestamp: Option<u64>,
-}
-
-#[derive(Deserialize)]
 struct SearchDoc {
     g: String,
     a: String,
     #[serde(rename = "latestVersion")]
     latest_version: Option<String>,
-}
-
-fn parse_versions_response(data: &[u8]) -> Result<Vec<MavenVersion>> {
-    let response: SolrVersionResponse = serde_json::from_slice(data)?;
-
-    let mut versions: Vec<MavenVersion> = response
-        .response
-        .docs
-        .into_iter()
-        .map(|d| MavenVersion {
-            version: d.version,
-            timestamp: d.timestamp,
-        })
-        .collect();
-
-    versions.sort_by(|a, b| compare_versions(&b.version, &a.version));
-    Ok(versions)
 }
 
 fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<ArtifactInfo>> {
@@ -212,28 +227,46 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_versions_response() {
-        let json = r#"{
-            "response": {
-                "numFound": 3,
-                "docs": [
-                    {"g": "org.apache.commons", "a": "commons-lang3", "v": "3.14.0"},
-                    {"g": "org.apache.commons", "a": "commons-lang3", "v": "3.13.0"},
-                    {"g": "org.apache.commons", "a": "commons-lang3", "v": "3.12.0"}
-                ]
-            }
-        }"#;
-
-        let versions = parse_versions_response(json.as_bytes()).unwrap();
-        assert_eq!(versions.len(), 3);
-        assert_eq!(versions[0].version, "3.14.0");
-        assert_eq!(versions[1].version, "3.13.0");
+    fn test_metadata_url() {
+        assert_eq!(
+            metadata_url("org.apache.commons:commons-lang3"),
+            Some("https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/maven-metadata.xml".into())
+        );
     }
 
     #[test]
-    fn test_parse_versions_response_empty() {
-        let json = r#"{"response": {"numFound": 0, "docs": []}}"#;
-        let versions = parse_versions_response(json.as_bytes()).unwrap();
+    fn test_metadata_url_no_colon() {
+        assert_eq!(metadata_url("bad"), None);
+    }
+
+    #[test]
+    fn test_parse_metadata_xml() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>org.apache.commons</groupId>
+  <artifactId>commons-lang3</artifactId>
+  <versioning>
+    <latest>3.14.0</latest>
+    <release>3.14.0</release>
+    <versions>
+      <version>3.12.0</version>
+      <version>3.13.0</version>
+      <version>3.14.0</version>
+    </versions>
+  </versioning>
+</metadata>"#;
+
+        let versions = parse_metadata_xml(xml.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].version, "3.14.0");
+        assert_eq!(versions[1].version, "3.13.0");
+        assert_eq!(versions[2].version, "3.12.0");
+    }
+
+    #[test]
+    fn test_parse_metadata_xml_empty() {
+        let xml = r#"<?xml version="1.0"?><metadata><versioning><versions></versions></versioning></metadata>"#;
+        let versions = parse_metadata_xml(xml.as_bytes()).unwrap();
         assert!(versions.is_empty());
     }
 
