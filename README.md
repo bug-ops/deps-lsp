@@ -47,9 +47,10 @@ deps-lsp is optimized for responsiveness:
 | Go Modules | `go.mod` | ✅ Supported |
 | Ruby/Bundler | `Gemfile` | ✅ Supported |
 | Dart/Pub | `pubspec.yaml` | ✅ Supported |
+| Maven | `pom.xml` | ✅ Supported |
 
 > [!NOTE]
-> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`). Dart support includes hosted, git, path, and SDK dependency sources with caret version semantics.
+> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`). Dart support includes hosted, git, path, and SDK dependency sources with caret version semantics. Maven support covers `dependencies`, `dependencyManagement`, and `build/plugins` sections with Maven qualifier-aware version comparison.
 
 ## Installation
 
@@ -113,6 +114,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `go` | go.mod | ✅ |
 | `bundler` | Ruby (Bundler/Gemfile) | ✅ |
 | `dart` | pubspec.yaml | ✅ |
+| `maven` | pom.xml | ✅ |
 
 ## Usage
 
@@ -291,6 +293,7 @@ deps-lsp/
 │   ├── deps-go/        # go.mod parser + proxy.golang.org
 │   ├── deps-bundler/   # Gemfile parser + rubygems.org registry
 │   ├── deps-dart/      # pubspec.yaml parser + pub.dev registry
+│   ├── deps-maven/     # pom.xml parser + Maven Central registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration

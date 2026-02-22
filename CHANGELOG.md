@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Maven ecosystem support** — New `deps-maven` crate with pom.xml parsing and Maven Central integration
+  - SAX parser via quick-xml with byte-accurate position tracking
+  - Parses `<dependencies>`, `<dependencyManagement>`, and `<build><plugins>` sections
+  - Maven Central Solr API client for version lookup and package search
+  - Maven version comparison with prerelease qualifier detection (alpha, beta, RC, SNAPSHOT)
+  - `groupId:artifactId` as canonical package identifier
+  - Feature-gated registration in deps-lsp (`maven`)
+
 ## [0.7.0] - 2026-02-16
 
 ### Added

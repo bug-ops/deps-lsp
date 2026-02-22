@@ -1,0 +1,31 @@
+[package]
+name = "deps-maven"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "pom.xml support for deps-lsp"
+publish = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deps-core = { workspace = true }
+async-trait = { workspace = true }
+quick-xml = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower-lsp-server = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true, features = ["json"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test = { workspace = true }

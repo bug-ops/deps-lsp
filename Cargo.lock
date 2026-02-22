@@ -538,6 +538,7 @@ dependencies = [
  "deps-core",
  "deps-dart",
  "deps-go",
+ "deps-maven",
  "deps-npm",
  "deps-pypi",
  "futures",
@@ -552,6 +553,25 @@ dependencies = [
  "tower-lsp-server",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "deps-maven"
+version = "0.7.0"
+dependencies = [
+ "async-trait",
+ "deps-core",
+ "insta",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tower-lsp-server",
+ "tracing",
+ "urlencoding",
 ]
 
 [[package]]
@@ -1594,6 +1614,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.39.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
