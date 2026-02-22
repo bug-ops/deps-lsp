@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CompletionContext"],"fn":["build_feature_completion","build_package_completion","build_version_completion","complete_package_names_generic","complete_versions_generic","detect_completion_context","extract_prefix","prepare_version_display_items","utf16_to_byte_offset"],"struct":["VersionDisplayItem"]};

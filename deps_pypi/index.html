@@ -1,0 +1,69 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="PyPI/Python support for deps-lsp."><title>deps_pypi - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-ca0dd0c4.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="deps_pypi" data-themes="" data-resource-suffix="" data-rustdoc-version="1.93.1 (01f6ddf75 2026-02-11)" data-channel="1.93.1" data-search-js="search-9e2438ea.js" data-stringdex-js="stringdex-a3946164.js" data-settings-js="settings-c38705f0.js" ><script src="../static.files/storage-e2aeef58.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-a410ff4d.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate deps_pypi</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../deps_pypi/index.html">deps_<wbr>pypi</a><span class="version">0.7.1</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#features" title="Features">Features</a></li><li><a href="#architecture" title="Architecture">Architecture</a></li><li><a href="#examples" title="Examples">Examples</a><ul><li><a href="#parsing-pyprojecttoml" title="Parsing pyproject.toml">Parsing pyproject.toml</a></li><li><a href="#fetching-versions-from-pypi" title="Fetching versions from PyPI">Fetching versions from PyPI</a></li><li><a href="#supported-formats" title="Supported Formats">Supported Formats</a></li></ul></li></ul><h3><a href="#reexports">Crate Items</a></h3><ul class="block"><li><a href="#reexports" title="Re-exports">Re-exports</a></li><li><a href="#modules" title="Modules">Modules</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><h1>Crate <span>deps_<wbr>pypi</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/deps_pypi/lib.rs.html#1-117">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>PyPI/Python support for deps-lsp.</p>
+<p>This crate provides parsing, validation, and registry client functionality
+for Python dependency management in <code>pyproject.toml</code> files, supporting both
+PEP 621 and Poetry formats.</p>
+<h2 id="features"><a class="doc-anchor" href="#features">§</a>Features</h2>
+<ul>
+<li><strong>PEP 621 Support</strong>: Parse <code>[project.dependencies]</code> and <code>[project.optional-dependencies]</code></li>
+<li><strong>Poetry Support</strong>: Parse <code>[tool.poetry.dependencies]</code> and <code>[tool.poetry.group.*.dependencies]</code></li>
+<li><strong>PEP 508 Parsing</strong>: Handle complex dependency specifications with extras and markers</li>
+<li><strong>PEP 440 Versions</strong>: Validate and compare Python version specifiers</li>
+<li><strong>PyPI API Client</strong>: Fetch package metadata from PyPI JSON API with HTTP caching</li>
+</ul>
+<h2 id="architecture"><a class="doc-anchor" href="#architecture">§</a>Architecture</h2>
+<p>deps-pypi follows the same architecture as deps-cargo and deps-npm:</p>
+<ul>
+<li><strong>Types</strong>: <code>PypiDependency</code>, <code>PypiVersion</code>, <code>PypiPackage</code> with LSP range tracking</li>
+<li><strong>Parser</strong>: Parse both PEP 621 and Poetry formats using <code>toml_edit</code></li>
+<li><strong>Registry</strong>: PyPI JSON API client with HTTP caching</li>
+<li><strong>Error Handling</strong>: Typed errors with <code>thiserror</code></li>
+</ul>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2><h3 id="parsing-pyprojecttoml"><a class="doc-anchor" href="#parsing-pyprojecttoml">§</a>Parsing pyproject.toml</h3>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_pypi::PypiParser;
+<span class="kw">use </span>tower_lsp_server::ls_types::Uri;
+
+<span class="kw">let </span>content = <span class="string">r#"
+[project]
+dependencies = [
+    "requests&gt;=2.28.0,&lt;3.0",
+    "flask[async]&gt;=3.0",
+]
+"#</span>;
+
+<span class="kw">let </span>parser = PypiParser::new();
+<span class="kw">let </span>uri = Uri::from_file_path(<span class="string">"/project/pyproject.toml"</span>).unwrap();
+<span class="kw">let </span>result = parser.parse_content(content, <span class="kw-2">&amp;</span>uri).unwrap();
+
+<span class="macro">assert_eq!</span>(result.dependencies.len(), <span class="number">2</span>);
+<span class="macro">assert_eq!</span>(result.dependencies[<span class="number">0</span>].name, <span class="string">"requests"</span>);
+<span class="macro">assert_eq!</span>(result.dependencies[<span class="number">1</span>].extras, <span class="macro">vec!</span>[<span class="string">"async"</span>]);</code></pre></div><h3 id="fetching-versions-from-pypi"><a class="doc-anchor" href="#fetching-versions-from-pypi">§</a>Fetching versions from PyPI</h3>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_pypi::PypiRegistry;
+<span class="kw">use </span>deps_core::HttpCache;
+<span class="kw">use </span>std::sync::Arc;
+
+<span class="kw">let </span>cache = Arc::new(HttpCache::new());
+<span class="kw">let </span>registry = PypiRegistry::new(cache);
+
+<span class="kw">let </span>versions = registry.get_versions(<span class="string">"requests"</span>).<span class="kw">await</span>.unwrap();
+<span class="macro">assert!</span>(!versions.is_empty());
+
+<span class="kw">let </span>latest = registry
+    .get_latest_matching(<span class="string">"requests"</span>, <span class="string">"&gt;=2.28.0,&lt;3.0"</span>)
+    .<span class="kw">await
+    </span>.unwrap();
+<span class="macro">assert!</span>(latest.is_some());</code></pre></div><h3 id="supported-formats"><a class="doc-anchor" href="#supported-formats">§</a>Supported Formats</h3><h4 id="pep-621-standard"><a class="doc-anchor" href="#pep-621-standard">§</a>PEP 621 (Standard)</h4><div class="example-wrap"><pre class="language-toml"><code>[project]
+dependencies = [
+    &quot;requests&gt;=2.28.0,&lt;3.0&quot;,
+    &quot;flask[async]&gt;=3.0&quot;,
+    &quot;numpy&gt;=1.24; python_version&gt;=&#39;3.9&#39;&quot;,
+]
+
+[project.optional-dependencies]
+dev = [&quot;pytest&gt;=7.0&quot;, &quot;mypy&gt;=1.0&quot;]</code></pre></div><h4 id="poetry"><a class="doc-anchor" href="#poetry">§</a>Poetry</h4><div class="example-wrap"><pre class="language-toml"><code>[tool.poetry.dependencies]
+python = &quot;^3.9&quot;
+requests = &quot;^2.28.0&quot;
+flask = {version = &quot;^3.0&quot;, extras = [&quot;async&quot;]}
+
+[tool.poetry.group.dev.dependencies]
+pytest = &quot;^7.0&quot;
+mypy = &quot;^1.0&quot;</code></pre></div></div></details><h2 id="reexports" class="section-header">Re-exports<a href="#reexports" class="anchor">§</a></h2><dl class="item-table reexports"><dt id="reexport.PypiEcosystem"><code>pub use ecosystem::<a class="struct" href="ecosystem/struct.PypiEcosystem.html" title="struct deps_pypi::ecosystem::PypiEcosystem">PypiEcosystem</a>;</code></dt><dt id="reexport.PypiError"><code>pub use error::<a class="enum" href="error/enum.PypiError.html" title="enum deps_pypi::error::PypiError">PypiError</a>;</code></dt><dt id="reexport.Result"><code>pub use error::<a class="type" href="error/type.Result.html" title="type deps_pypi::error::Result">Result</a>;</code></dt><dt id="reexport.PypiFormatter"><code>pub use formatter::<a class="struct" href="formatter/struct.PypiFormatter.html" title="struct deps_pypi::formatter::PypiFormatter">PypiFormatter</a>;</code></dt><dt id="reexport.PypiLockParser"><code>pub use lockfile::<a class="struct" href="lockfile/struct.PypiLockParser.html" title="struct deps_pypi::lockfile::PypiLockParser">PypiLockParser</a>;</code></dt><dt id="reexport.PypiParser"><code>pub use parser::<a class="struct" href="parser/struct.PypiParser.html" title="struct deps_pypi::parser::PypiParser">PypiParser</a>;</code></dt><dt id="reexport.PypiRegistry"><code>pub use registry::<a class="struct" href="registry/struct.PypiRegistry.html" title="struct deps_pypi::registry::PypiRegistry">PypiRegistry</a>;</code></dt><dt id="reexport.PypiDependency"><code>pub use types::<a class="struct" href="types/struct.PypiDependency.html" title="struct deps_pypi::types::PypiDependency">PypiDependency</a>;</code></dt><dt id="reexport.PypiDependencySection"><code>pub use types::<a class="enum" href="types/enum.PypiDependencySection.html" title="enum deps_pypi::types::PypiDependencySection">PypiDependencySection</a>;</code></dt><dt id="reexport.PypiDependencySource"><code>pub use types::<a class="enum" href="types/enum.PypiDependencySource.html" title="enum deps_pypi::types::PypiDependencySource">PypiDependencySource</a>;</code></dt><dt id="reexport.PypiPackage"><code>pub use types::<a class="struct" href="types/struct.PypiPackage.html" title="struct deps_pypi::types::PypiPackage">PypiPackage</a>;</code></dt><dt id="reexport.PypiVersion"><code>pub use types::<a class="struct" href="types/struct.PypiVersion.html" title="struct deps_pypi::types::PypiVersion">PypiVersion</a>;</code></dt></dl><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="ecosystem/index.html" title="mod deps_pypi::ecosystem">ecosystem</a></dt><dd>PyPI ecosystem implementation for deps-lsp.</dd><dt><a class="mod" href="error/index.html" title="mod deps_pypi::error">error</a></dt><dt><a class="mod" href="formatter/index.html" title="mod deps_pypi::formatter">formatter</a></dt><dt><a class="mod" href="lockfile/index.html" title="mod deps_pypi::lockfile">lockfile</a></dt><dd>Poetry/uv lock file parsing.</dd><dt><a class="mod" href="parser/index.html" title="mod deps_pypi::parser">parser</a></dt><dt><a class="mod" href="registry/index.html" title="mod deps_pypi::registry">registry</a></dt><dd>PyPI registry client.</dd><dt><a class="mod" href="types/index.html" title="mod deps_pypi::types">types</a></dt></dl></section></div></main></body></html>

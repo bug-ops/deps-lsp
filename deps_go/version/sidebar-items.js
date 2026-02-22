@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["base_version_from_pseudo","compare_versions","escape_module_path","is_pseudo_version"]};

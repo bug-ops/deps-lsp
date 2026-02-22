@@ -1,0 +1,170 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Generic package registry interface."><title>Registry in deps_core::registry - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-ca0dd0c4.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.93.1 (01f6ddf75 2026-02-11)" data-channel="1.93.1" data-search-js="search-9e2438ea.js" data-stringdex-js="stringdex-a3946164.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-a410ff4d.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Registry</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.7.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Registry</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#type-erasure" title="Type Erasure">Type Erasure</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.as_any" title="as_any">as_any</a></li><li><a href="#tymethod.get_latest_matching" title="get_latest_matching">get_latest_matching</a></li><li><a href="#tymethod.get_versions" title="get_versions">get_versions</a></li><li><a href="#tymethod.package_url" title="package_url">package_url</a></li><li><a href="#tymethod.search" title="search">search</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>registry</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">registry</a></div><h1>Trait <span class="trait">Registry</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/registry.rs.html#105-151">Source</a> </span></div><pre class="rust item-decl"><code>pub trait Registry: <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a> {
+    // Required methods
+    fn <a href="#tymethod.get_versions" class="fn">get_versions</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        name: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.get_latest_matching" class="fn">get_latest_matching</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+        &amp;'life0 self,
+        name: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>,
+        req: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.93.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait,
+             'life2: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.search" class="fn">search</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        query: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>,
+        limit: <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Metadata.html" title="trait deps_core::registry::Metadata">Metadata</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait</span>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.package_url" class="fn">package_url</a>(&amp;self, name: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.as_any" class="fn">as_any</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/any/trait.Any.html" title="trait core::any::Any">Any</a>;
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Generic package registry interface.</p>
+<p>Implementors provide access to a package registry (crates.io, npm, PyPI, etc.)
+with version lookup, search, and metadata retrieval capabilities.</p>
+<p>All methods return <code>Result&lt;T&gt;</code> to allow graceful error handling.
+LSP handlers must never panic on registry errors.</p>
+<h2 id="type-erasure"><a class="doc-anchor" href="#type-erasure">§</a>Type Erasure</h2>
+<p>This trait uses <code>Box&lt;dyn Trait&gt;</code> return types instead of associated types
+to allow runtime polymorphism and dynamic ecosystem registration.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::{Registry, Version, Metadata};
+<span class="kw">use </span>async_trait::async_trait;
+<span class="kw">use </span>std::any::Any;
+
+<span class="kw">struct </span>MyRegistry;
+
+<span class="attr">#[derive(Clone)]
+</span><span class="kw">struct </span>MyVersion {
+    version: String,
+}
+
+<span class="kw">impl </span>Version <span class="kw">for </span>MyVersion {
+    <span class="kw">fn </span>version_string(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>str {
+        <span class="kw-2">&amp;</span><span class="self">self</span>.version
+    }
+
+    <span class="kw">fn </span>is_yanked(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+        <span class="bool-val">false
+    </span>}
+
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any {
+        <span class="self">self
+    </span>}
+}
+
+<span class="attr">#[derive(Clone)]
+</span><span class="kw">struct </span>MyMetadata {
+    name: String,
+}
+
+<span class="kw">impl </span>Metadata <span class="kw">for </span>MyMetadata {
+    <span class="kw">fn </span>name(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>str {
+        <span class="kw-2">&amp;</span><span class="self">self</span>.name
+    }
+
+    <span class="kw">fn </span>description(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt; {
+        <span class="prelude-val">None
+    </span>}
+
+    <span class="kw">fn </span>repository(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt; {
+        <span class="prelude-val">None
+    </span>}
+
+    <span class="kw">fn </span>documentation(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt; {
+        <span class="prelude-val">None
+    </span>}
+
+    <span class="kw">fn </span>latest_version(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>str {
+        <span class="string">"1.0.0"
+    </span>}
+
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any {
+        <span class="self">self
+    </span>}
+}
+
+<span class="attr">#[async_trait]
+</span><span class="kw">impl </span>Registry <span class="kw">for </span>MyRegistry {
+    <span class="kw">async fn </span>get_versions(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>str) -&gt; deps_core::error::Result&lt;Vec&lt;Box&lt;<span class="kw">dyn </span>Version&gt;&gt;&gt; {
+        <span class="prelude-val">Ok</span>(<span class="macro">vec!</span>[Box::new(MyVersion { version: <span class="string">"1.0.0"</span>.into() })])
+    }
+
+    <span class="kw">async fn </span>get_latest_matching(
+        <span class="kw-2">&amp;</span><span class="self">self</span>,
+        _name: <span class="kw-2">&amp;</span>str,
+        _req: <span class="kw-2">&amp;</span>str,
+    ) -&gt; deps_core::error::Result&lt;<span class="prelude-ty">Option</span>&lt;Box&lt;<span class="kw">dyn </span>Version&gt;&gt;&gt; {
+        <span class="prelude-val">Ok</span>(<span class="prelude-val">None</span>)
+    }
+
+    <span class="kw">async fn </span>search(<span class="kw-2">&amp;</span><span class="self">self</span>, _query: <span class="kw-2">&amp;</span>str, _limit: usize) -&gt; deps_core::error::Result&lt;Vec&lt;Box&lt;<span class="kw">dyn </span>Metadata&gt;&gt;&gt; {
+        <span class="prelude-val">Ok</span>(<span class="macro">vec!</span>[])
+    }
+
+    <span class="kw">fn </span>package_url(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>str) -&gt; String {
+        <span class="macro">format!</span>(<span class="string">"https://example.com/packages/{}"</span>, name)
+    }
+
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any {
+        <span class="self">self
+    </span>}
+}</code></pre></div></div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.get_versions" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#116">Source</a><h4 class="code-header">fn <a href="#tymethod.get_versions" class="fn">get_versions</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    name: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Fetches all available versions for a package.</p>
+<p>Returns versions sorted newest-first. May include yanked/deprecated versions.</p>
+<h5 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h5>
+<p>Returns error if:</p>
+<ul>
+<li>Package does not exist</li>
+<li>Network request fails</li>
+<li>Response parsing fails</li>
+</ul>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.get_latest_matching" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#133">Source</a><h4 class="code-header">fn <a href="#tymethod.get_latest_matching" class="fn">get_latest_matching</a>&lt;'life0, 'life1, 'life2, 'async_trait&gt;(
+    &amp;'life0 self,
+    name: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>,
+    req: &amp;'life2 <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="enum" href="https://doc.rust-lang.org/1.93.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Version.html" title="trait deps_core::registry::Version">Version</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,
+    'life2: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Finds the latest version matching a version requirement.</p>
+<p>Only returns stable (non-yanked, non-deprecated) versions unless
+explicitly requested in the version requirement.</p>
+<h5 id="arguments"><a class="doc-anchor" href="#arguments">§</a>Arguments</h5>
+<ul>
+<li><code>name</code> - Package name</li>
+<li><code>req</code> - Version requirement string (e.g., “^1.0”, “&gt;=2.0”)</li>
+</ul>
+<h5 id="returns"><a class="doc-anchor" href="#returns">§</a>Returns</h5>
+<ul>
+<li><code>Ok(Some(version))</code> - Latest matching version found</li>
+<li><code>Ok(None)</code> - No matching version found</li>
+<li><code>Err(_)</code> - Network or parsing error</li>
+</ul>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.search" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#142">Source</a><h4 class="code-header">fn <a href="#tymethod.search" class="fn">search</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    query: &amp;'life1 <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>,
+    limit: <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.Metadata.html" title="trait deps_core::registry::Metadata">Metadata</a>&gt;&gt;&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Searches for packages by name or keywords.</p>
+<p>Returns up to <code>limit</code> results sorted by relevance/popularity.</p>
+<h5 id="errors-1"><a class="doc-anchor" href="#errors-1">§</a>Errors</h5>
+<p>Returns error if network request or parsing fails.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.package_url" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#147">Source</a><h4 class="code-header">fn <a href="#tymethod.package_url" class="fn">package_url</a>(&amp;self, name: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.str.html">str</a>) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/string/struct.String.html" title="struct alloc::string::String">String</a></h4></section></summary><div class="docblock"><p>Package URL for ecosystem (e.g., <a href="https://crates.io/crates/serde">https://crates.io/crates/serde</a>)</p>
+<p>Returns a URL that links to the package page on the registry website.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.as_any" class="method"><a class="src rightside" href="../../src/deps_core/registry.rs.html#150">Source</a><h4 class="code-header">fn <a href="#tymethod.as_any" class="fn">as_any</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/any/trait.Any.html" title="trait core::any::Any">Any</a></h4></section></summary><div class="docblock"><p>Downcast to concrete registry type for ecosystem-specific operations</p>
+</div></details></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/deps_core/registry/trait.Registry.js" async></script></section></div></main></body></html>

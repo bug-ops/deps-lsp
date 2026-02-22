@@ -1,0 +1,88 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Lock file provider trait for ecosystem-specific implementations."><title>LockFileProvider in deps_core::lockfile - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-ca0dd0c4.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.93.1 (01f6ddf75 2026-02-11)" data-channel="1.93.1" data-search-js="search-9e2438ea.js" data-stringdex-js="stringdex-a3946164.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-a410ff4d.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">LockFileProvider</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.7.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Lock<wbr>File<wbr>Provider</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#examples" title="Examples">Examples</a></li></ul><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.locate_lockfile" title="locate_lockfile">locate_lockfile</a></li><li><a href="#tymethod.parse_lockfile" title="parse_lockfile">parse_lockfile</a></li></ul><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.is_lockfile_stale" title="is_lockfile_stale">is_lockfile_stale</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>lockfile</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">lockfile</a></div><h1>Trait <span class="trait">Lock<wbr>File<wbr>Provider</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/lockfile.rs.html#279-335">Source</a> </span></div><pre class="rust item-decl"><code>pub trait LockFileProvider: <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a> {
+    // Required methods
+    fn <a href="#tymethod.locate_lockfile" class="fn">locate_lockfile</a>(&amp;self, manifest_uri: &amp;Uri) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.93.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/std/path/struct.PathBuf.html" title="struct std::path::PathBuf">PathBuf</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.parse_lockfile" class="fn">parse_lockfile</a>&lt;'life0, 'life1, 'async_trait&gt;(
+        &amp;'life0 self,
+        lockfile_path: &amp;'life1 <a class="struct" href="https://doc.rust-lang.org/1.93.1/std/path/struct.Path.html" title="struct std::path::Path">Path</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="struct.ResolvedPackages.html" title="struct deps_core::lockfile::ResolvedPackages">ResolvedPackages</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;
+       <span class="where">where Self: 'async_trait,
+             'life0: 'async_trait,
+             'life1: 'async_trait</span>;
+
+    // Provided method
+    fn <a href="#method.is_lockfile_stale" class="fn">is_lockfile_stale</a>(
+        &amp;self,
+        lockfile_path: &amp;<a class="struct" href="https://doc.rust-lang.org/1.93.1/std/path/struct.Path.html" title="struct std::path::Path">Path</a>,
+        last_modified: <a class="struct" href="https://doc.rust-lang.org/1.93.1/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>,
+    ) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.bool.html">bool</a> { ... }
+}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Lock file provider trait for ecosystem-specific implementations.</p>
+<p>Implementations parse lock files for a specific package ecosystem
+(Cargo.lock, package-lock.json, etc.) and extract resolved versions.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::lockfile::{LockFileProvider, ResolvedPackages};
+<span class="kw">use </span>async_trait::async_trait;
+<span class="kw">use </span>std::path::{Path, PathBuf};
+<span class="kw">use </span>tower_lsp_server::ls_types::Uri;
+
+<span class="kw">struct </span>MyLockParser;
+
+<span class="attr">#[async_trait]
+</span><span class="kw">impl </span>LockFileProvider <span class="kw">for </span>MyLockParser {
+    <span class="kw">fn </span>locate_lockfile(<span class="kw-2">&amp;</span><span class="self">self</span>, manifest_uri: <span class="kw-2">&amp;</span>Uri) -&gt; <span class="prelude-ty">Option</span>&lt;PathBuf&gt; {
+        <span class="kw">let </span>manifest_path = manifest_uri.to_file_path()<span class="question-mark">?</span>;
+        <span class="kw">let </span>lock_path = manifest_path.with_file_name(<span class="string">"my.lock"</span>);
+        lock_path.exists().then_some(lock_path)
+    }
+
+    <span class="kw">async fn </span>parse_lockfile(<span class="kw-2">&amp;</span><span class="self">self</span>, lockfile_path: <span class="kw-2">&amp;</span>Path) -&gt; deps_core::error::Result&lt;ResolvedPackages&gt; {
+        <span class="comment">// Parse lock file format and extract packages
+        </span><span class="prelude-val">Ok</span>(ResolvedPackages::new())
+    }
+}</code></pre></div></div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.locate_lockfile" class="method"><a class="src rightside" href="../../src/deps_core/lockfile.rs.html#294">Source</a><h4 class="code-header">fn <a href="#tymethod.locate_lockfile" class="fn">locate_lockfile</a>(&amp;self, manifest_uri: &amp;Uri) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.93.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/std/path/struct.PathBuf.html" title="struct std::path::PathBuf">PathBuf</a>&gt;</h4></section></summary><div class="docblock"><p>Locates the lock file for a given manifest URI.</p>
+<p>Returns <code>None</code> if:</p>
+<ul>
+<li>Lock file doesn’t exist</li>
+<li>Manifest path cannot be determined from URI</li>
+<li>Workspace root search fails</li>
+</ul>
+<h5 id="arguments"><a class="doc-anchor" href="#arguments">§</a>Arguments</h5>
+<ul>
+<li><code>manifest_uri</code> - URI of the manifest file (Cargo.toml, package.json, etc.)</li>
+</ul>
+<h5 id="returns"><a class="doc-anchor" href="#returns">§</a>Returns</h5>
+<p>Path to lock file if found</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.parse_lockfile" class="method"><a class="src rightside" href="../../src/deps_core/lockfile.rs.html#312">Source</a><h4 class="code-header">fn <a href="#tymethod.parse_lockfile" class="fn">parse_lockfile</a>&lt;'life0, 'life1, 'async_trait&gt;(
+    &amp;'life0 self,
+    lockfile_path: &amp;'life1 <a class="struct" href="https://doc.rust-lang.org/1.93.1/std/path/struct.Path.html" title="struct std::path::Path">Path</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.93.1/core/pin/struct.Pin.html" title="struct core::pin::Pin">Pin</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.93.1/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="struct.ResolvedPackages.html" title="struct deps_core::lockfile::ResolvedPackages">ResolvedPackages</a>&gt;&gt; + <a class="trait" href="https://doc.rust-lang.org/1.93.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a> + 'async_trait&gt;&gt;<div class="where">where
+    Self: 'async_trait,
+    'life0: 'async_trait,
+    'life1: 'async_trait,</div></h4></section></summary><div class="docblock"><p>Parses a lock file and extracts resolved packages.</p>
+<h5 id="arguments-1"><a class="doc-anchor" href="#arguments-1">§</a>Arguments</h5>
+<ul>
+<li><code>lockfile_path</code> - Path to the lock file</li>
+</ul>
+<h5 id="returns-1"><a class="doc-anchor" href="#returns-1">§</a>Returns</h5>
+<p>ResolvedPackages on success, error if parse fails</p>
+<h5 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h5>
+<p>Returns an error if:</p>
+<ul>
+<li>File cannot be read</li>
+<li>File format is invalid</li>
+<li>Required fields are missing</li>
+</ul>
+</div></details></div><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.is_lockfile_stale" class="method"><a class="src rightside" href="../../src/deps_core/lockfile.rs.html#327-334">Source</a><h4 class="code-header">fn <a href="#method.is_lockfile_stale" class="fn">is_lockfile_stale</a>(
+    &amp;self,
+    lockfile_path: &amp;<a class="struct" href="https://doc.rust-lang.org/1.93.1/std/path/struct.Path.html" title="struct std::path::Path">Path</a>,
+    last_modified: <a class="struct" href="https://doc.rust-lang.org/1.93.1/std/time/struct.SystemTime.html" title="struct std::time::SystemTime">SystemTime</a>,
+) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.93.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Checks if lock file has been modified since last parse.</p>
+<p>Used for cache invalidation. Default implementation compares
+file modification time.</p>
+<h5 id="arguments-2"><a class="doc-anchor" href="#arguments-2">§</a>Arguments</h5>
+<ul>
+<li><code>lockfile_path</code> - Path to the lock file</li>
+<li><code>last_modified</code> - Last known modification time</li>
+</ul>
+<h5 id="returns-2"><a class="doc-anchor" href="#returns-2">§</a>Returns</h5>
+<p><code>true</code> if file has been modified or cannot be stat’d, <code>false</code> otherwise</p>
+</div></details></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/deps_core/lockfile/trait.LockFileProvider.js" async></script></section></div></main></body></html>

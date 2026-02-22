@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DependencySection","DependencySource"],"struct":["CargoVersion","CrateInfo","ParsedDependency"]};

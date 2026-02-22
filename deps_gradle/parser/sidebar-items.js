@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["parse_gradle"],"mod":["catalog","groovy","kotlin"],"struct":["GradleParseResult","LineOffsetTable"]};
