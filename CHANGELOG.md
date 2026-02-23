@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **PHP/Composer ecosystem support** — New `deps-composer` crate with full composer.json and composer.lock support
+  - JSON parser for `require` and `require-dev` sections with position tracking
+  - Platform package filtering (`php`, `ext-*`, `lib-*` excluded from registry lookups)
+  - Packagist v2 API with metadata de-minification (field inheritance algorithm)
+  - Packagist search API for package name autocomplete
+  - Composer-specific version constraint matching: tilde (`~1.2` = `>=1.2.0 <2.0.0`), caret, wildcard (`1.0.*`), OR (`||`), ranges
+  - Case-insensitive package name normalization (`vendor/package`)
+  - composer.lock parser for `packages` and `packages-dev` sections
+  - URL-safe registry queries with proper encoding per path segment
+  - Feature-gated registration in deps-lsp (`composer`)
 - **Swift/SPM ecosystem support** — New `deps-swift` crate with full Package.swift and Package.resolved support
   - Regex-based Package.swift parser covering all 9 `.package()` call signatures (from, upToNextMajor, upToNextMinor, exact, half-open range, closed range, branch, revision, path)
   - Comment stripping with byte-offset preservation for accurate LSP positions

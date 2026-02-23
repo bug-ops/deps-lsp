@@ -8,14 +8,14 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, and Swift ecosystems.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, and Composer ecosystems.
 
 ## Features
 
 - **Intelligent autocomplete** — Package names, versions, and feature flags
 - **Version hints** — Inlay hints showing latest available versions
 - **Loading indicators** — Visual feedback during registry fetches with LSP progress support
-- **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved
+- **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved, composer.lock
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
 - **Hover information** — Package descriptions with resolved version from lock file
 - **Code actions** — Quick fixes to update dependencies
@@ -50,6 +50,7 @@ deps-lsp is optimized for responsiveness:
 | Java | Maven | `pom.xml` | ✅ Supported |
 | Java | Gradle | `libs.versions.toml`, `build.gradle.kts`, `build.gradle`, `settings.gradle` | ✅ Supported |
 | Swift | SPM | `Package.swift` | ✅ Supported |
+| PHP | Composer | `composer.json` | ✅ Supported |
 
 > [!NOTE]
 > **Ecosystem details:**
@@ -60,6 +61,7 @@ deps-lsp is optimized for responsiveness:
 > - **Maven** — `dependencies`, `dependencyManagement`, `build/plugins`, qualifier-aware version comparison
 > - **Gradle** — Version Catalogs, Kotlin/Groovy DSL, `settings.gradle` plugins; resolves from Maven Central, Google Maven, Gradle Plugin Portal
 > - **Swift** — all `.package()` forms (from, upToNextMajor/Minor, exact, range, branch, revision, path); versions via GitHub API tags
+> - **Composer** — `require`/`require-dev` sections, Packagist v2 API with metadata de-minification, Composer-specific tilde semantics (`~1.2` = `>=1.2.0 <2.0.0`)
 
 ## Installation
 
@@ -118,6 +120,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `maven` | Java | pom.xml | ✅ |
 | `gradle` | Java | libs.versions.toml, build.gradle.kts, build.gradle | ✅ |
 | `swift` | Swift | Package.swift | ✅ |
+| `composer` | PHP | composer.json | ✅ |
 
 ## Usage
 
@@ -155,7 +158,7 @@ Enable inlay hints in Zed settings:
 ```lua
 require('lspconfig').deps_lsp.setup({
   cmd = { "deps-lsp", "--stdio" },
-  filetypes = { "toml", "json", "gomod", "ruby", "yaml", "xml", "swift" },
+  filetypes = { "toml", "json", "gomod", "ruby", "yaml", "xml", "swift", "php" },
 })
 
 -- Enable inlay hints (Neovim 0.10+)
@@ -325,6 +328,7 @@ deps-lsp/
 │   ├── deps-maven/     # pom.xml parser + Maven Central registry
 │   ├── deps-gradle/    # Gradle parser (Version Catalog, Kotlin/Groovy DSL)
 │   ├── deps-swift/     # Package.swift parser + GitHub API registry
+│   ├── deps-composer/  # composer.json parser + Packagist registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration
