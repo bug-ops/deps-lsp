@@ -3,6 +3,8 @@
 use std::any::Any;
 use tower_lsp_server::ls_types::Range;
 
+pub use deps_core::parser::DependencySource;
+
 /// A dependency from the manifest file.
 #[derive(Debug, Clone)]
 pub struct {ECOSYSTEM_PASCAL}Dependency {
@@ -10,11 +12,13 @@ pub struct {ECOSYSTEM_PASCAL}Dependency {
     pub name: String,
     /// LSP range of the name in source
     pub name_range: Range,
-    /// Version requirement
+    /// Version requirement (e.g., "^1.0", ">=2.0")
     pub version_req: Option<String>,
     /// LSP range of version in source
     pub version_range: Option<Range>,
-    /// Dependency section
+    /// Dependency source (registry, git, path)
+    pub source: DependencySource,
+    /// Dependency section (dependencies, dev, etc.)
     pub section: {ECOSYSTEM_PASCAL}DependencySection,
 }
 
@@ -31,6 +35,14 @@ pub enum {ECOSYSTEM_PASCAL}DependencySection {
 pub struct {ECOSYSTEM_PASCAL}Version {
     pub version: String,
     pub yanked: bool,
+}
+
+/// Package metadata for search results.
+#[derive(Debug, Clone)]
+pub struct {ECOSYSTEM_PASCAL}Metadata {
+    pub name: String,
+    pub description: Option<String>,
+    pub latest_version: String,
 }
 
 impl deps_core::Dependency for {ECOSYSTEM_PASCAL}Dependency {
@@ -50,8 +62,8 @@ impl deps_core::Dependency for {ECOSYSTEM_PASCAL}Dependency {
         self.version_range
     }
 
-    fn is_workspace_inherited(&self) -> bool {
-        false
+    fn source(&self) -> DependencySource {
+        self.source
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -80,6 +92,32 @@ impl deps_core::Version for {ECOSYSTEM_PASCAL}Version {
     }
 }
 
+impl deps_core::Metadata for {ECOSYSTEM_PASCAL}Metadata {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    fn repository(&self) -> Option<&str> {
+        None
+    }
+
+    fn documentation(&self) -> Option<&str> {
+        None
+    }
+
+    fn latest_version(&self) -> &str {
+        &self.latest_version
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +130,7 @@ mod tests {
             name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
             version_req: Some("1.0.0".into()),
             version_range: Some(Range::new(Position::new(0, 10), Position::new(0, 15))),
+            source: DependencySource::Registry,
             section: {ECOSYSTEM_PASCAL}DependencySection::Dependencies,
         };
 

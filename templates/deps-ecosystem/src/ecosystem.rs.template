@@ -1,15 +1,12 @@
-use async_trait::async_trait;
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{
-    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
-};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
 
 use deps_core::{
-    Ecosystem, EcosystemConfig, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
+    Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
+    ecosystem::BoxFuture,
     lockfile::LockFileProvider,
-    lsp_helpers,
+    lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::{ECOSYSTEM_PASCAL}Formatter;
@@ -17,12 +14,14 @@ use crate::lockfile::{ECOSYSTEM_PASCAL}LockfileParser;
 use crate::parser::parse_{ECOSYSTEM_SNAKE};
 use crate::registry::{ECOSYSTEM_PASCAL}Registry;
 
+/// {ECOSYSTEM_DISPLAY} ecosystem implementation.
 pub struct {ECOSYSTEM_PASCAL}Ecosystem {
     registry: Arc<{ECOSYSTEM_PASCAL}Registry>,
     formatter: {ECOSYSTEM_PASCAL}Formatter,
 }
 
 impl {ECOSYSTEM_PASCAL}Ecosystem {
+    /// Creates a new {ECOSYSTEM_DISPLAY} ecosystem with the given HTTP cache.
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self {
             registry: Arc::new({ECOSYSTEM_PASCAL}Registry::new(cache)),
@@ -31,7 +30,8 @@ impl {ECOSYSTEM_PASCAL}Ecosystem {
     }
 }
 
-#[async_trait]
+impl deps_core::ecosystem::private::Sealed for {ECOSYSTEM_PASCAL}Ecosystem {}
+
 impl Ecosystem for {ECOSYSTEM_PASCAL}Ecosystem {
     fn id(&self) -> &'static str {
         "{ECOSYSTEM_SNAKE}"
@@ -45,93 +45,40 @@ impl Ecosystem for {ECOSYSTEM_PASCAL}Ecosystem {
         &["{MANIFEST_FILE}"]
     }
 
-    async fn parse_manifest(
-        &self,
-        content: &str,
-        uri: &Uri,
-    ) -> Result<Box<dyn ParseResultTrait>> {
-        let result = parse_{ECOSYSTEM_SNAKE}(content, uri)?;
-        Ok(Box::new(result))
+    fn lockfile_filenames(&self) -> &[&'static str] {
+        &["{LOCK_FILE}"]
+    }
+
+    fn parse_manifest<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Uri,
+    ) -> BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
+        Box::pin(async move {
+            let result = parse_{ECOSYSTEM_SNAKE}(content, uri)?;
+            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
+        })
     }
 
     fn registry(&self) -> Arc<dyn Registry> {
-        self.registry.clone()
+        self.registry.clone() as Arc<dyn Registry>
     }
 
     fn lockfile_provider(&self) -> Option<Arc<dyn LockFileProvider>> {
         Some(Arc::new({ECOSYSTEM_PASCAL}LockfileParser))
     }
 
-    async fn generate_inlay_hints(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        cached_versions: &HashMap<String, String>,
-        resolved_versions: &HashMap<String, String>,
-        loading_state: deps_core::LoadingState,
-        config: &EcosystemConfig,
-    ) -> Vec<InlayHint> {
-        lsp_helpers::generate_inlay_hints(
-            parse_result,
-            cached_versions,
-            resolved_versions,
-            loading_state,
-            config,
-            &self.formatter,
-        )
+    fn formatter(&self) -> &dyn EcosystemFormatter {
+        &self.formatter
     }
 
-    async fn generate_hover(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        cached_versions: &HashMap<String, String>,
-        resolved_versions: &HashMap<String, String>,
-    ) -> Option<Hover> {
-        lsp_helpers::generate_hover(
-            parse_result,
-            position,
-            cached_versions,
-            resolved_versions,
-            self.registry.as_ref(),
-            &self.formatter,
-        )
-        .await
-    }
-
-    async fn generate_code_actions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        _cached_versions: &HashMap<String, String>,
-        uri: &Uri,
-    ) -> Vec<CodeAction> {
-        lsp_helpers::generate_code_actions(
-            parse_result,
-            position,
-            uri,
-            self.registry.as_ref(),
-            &self.formatter,
-        )
-        .await
-    }
-
-    async fn generate_diagnostics(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        _cached_versions: &HashMap<String, String>,
-        _uri: &Uri,
-    ) -> Vec<Diagnostic> {
-        lsp_helpers::generate_diagnostics(parse_result, self.registry.as_ref(), &self.formatter)
-            .await
-    }
-
-    async fn generate_completions(
-        &self,
-        _parse_result: &dyn ParseResultTrait,
+    fn generate_completions<'a>(
+        &'a self,
+        _parse_result: &'a dyn ParseResultTrait,
         _position: Position,
-        _content: &str,
-    ) -> Vec<CompletionItem> {
-        vec![]
+        _content: &'a str,
+    ) -> BoxFuture<'a, Vec<CompletionItem>> {
+        Box::pin(async move { vec![] })
     }
 
     fn as_any(&self) -> &dyn Any {

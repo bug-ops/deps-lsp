@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-02-23
+
 ### Added
 - **Gradle ecosystem support** — New `deps-gradle` crate with support for three manifest formats
   - Version Catalog parser (`gradle/libs.versions.toml`) via toml-span with reliable span tracking
@@ -19,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Gradle variable resolution** — `$var` and `${var}` in `build.gradle`/`build.gradle.kts` resolved from `gradle.properties` (walks parent directories)
 - **settings.gradle parsing** — Extract plugin dependencies from `pluginManagement { plugins { } }` blocks (Groovy and Kotlin DSL)
 - **Google Maven repository support** — Android packages (`androidx.*`, `com.google.firebase.*`, `com.google.android.*`, `com.android.*`) now resolve from Google Maven instead of Maven Central
+- **Gradle Plugin Portal fallback** — Packages not found on Maven Central are now retried on `plugins.gradle.org/m2`, resolving 404 errors for Gradle-exclusive plugins
 
 ### Changed
 - **Migrate deps-cargo and deps-pypi from toml_edit to toml-span** — Reliable span tracking for all values including inline tables; eliminates text-search fallbacks for position tracking
@@ -366,7 +369,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/bug-ops/deps-lsp/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/bug-ops/deps-lsp/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/bug-ops/deps-lsp/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/bug-ops/deps-lsp/compare/v0.6.0...v0.6.1

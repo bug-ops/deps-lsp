@@ -3,7 +3,7 @@ use deps_core::lsp_helpers::EcosystemFormatter;
 pub struct {ECOSYSTEM_PASCAL}Formatter;
 
 impl EcosystemFormatter for {ECOSYSTEM_PASCAL}Formatter {
-    fn format_version_for_code_action(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &str) -> String {
         // TODO: Format version according to ecosystem conventions
         format!("\"{}\"", version)
     }
@@ -22,7 +22,7 @@ mod tests {
     fn test_format_version() {
         let formatter = {ECOSYSTEM_PASCAL}Formatter;
         assert_eq!(
-            formatter.format_version_for_code_action("1.0.0"),
+            formatter.format_version_for_text_edit("1.0.0"),
             "\"1.0.0\""
         );
     }

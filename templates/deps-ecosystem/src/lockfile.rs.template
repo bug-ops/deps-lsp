@@ -1,64 +1,43 @@
 //! Lock file parsing for {ECOSYSTEM_DISPLAY}.
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
-use async_trait::async_trait;
-use deps_core::lockfile::{LockFileProvider, LockedPackage};
-use tokio::fs;
+use deps_core::lockfile::{LockFileProvider, ResolvedPackages, locate_lockfile_for_manifest};
+use tower_lsp_server::ls_types::Uri;
 
 /// Lock file parser for {ECOSYSTEM_DISPLAY}.
 pub struct {ECOSYSTEM_PASCAL}LockfileParser;
 
-#[async_trait]
 impl LockFileProvider for {ECOSYSTEM_PASCAL}LockfileParser {
-    fn lock_filename(&self) -> &'static str {
-        "{LOCK_FILE}"
+    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+        locate_lockfile_for_manifest(manifest_uri, &["{LOCK_FILE}"])
     }
 
-    async fn parse_lockfile(
-        &self,
-        manifest_dir: &Path,
-    ) -> deps_core::Result<HashMap<String, LockedPackage>> {
-        let lock_path = manifest_dir.join(self.lock_filename());
+    fn parse_lockfile<'a>(
+        &'a self,
+        lockfile_path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<ResolvedPackages>> + Send + 'a>> {
+        Box::pin(async move {
+            let content = tokio::fs::read_to_string(lockfile_path)
+                .await
+                .map_err(deps_core::DepsError::Io)?;
 
-        if !lock_path.exists() {
-            return Ok(HashMap::new());
-        }
-
-        let content = fs::read_to_string(&lock_path)
-            .await
-            .map_err(|e| deps_core::DepsError::Io(e))?;
-
-        parse_lock_content(&content)
-    }
-
-    async fn is_stale(&self, manifest_dir: &Path) -> bool {
-        let lock_path = manifest_dir.join(self.lock_filename());
-        let manifest_path = manifest_dir.join("{MANIFEST_FILE}");
-
-        match (fs::metadata(&lock_path).await, fs::metadata(&manifest_path).await) {
-            (Ok(lock_meta), Ok(manifest_meta)) => {
-                match (lock_meta.modified(), manifest_meta.modified()) {
-                    (Ok(lock_time), Ok(manifest_time)) => manifest_time > lock_time,
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+            parse_lock_content(&content)
+        })
     }
 }
 
-/// Parse lock file content into package map.
-fn parse_lock_content(content: &str) -> deps_core::Result<HashMap<String, LockedPackage>> {
-    let mut packages = HashMap::new();
+/// Parse lock file content into resolved packages.
+fn parse_lock_content(content: &str) -> deps_core::error::Result<ResolvedPackages> {
+    let mut packages = ResolvedPackages::new();
 
     // TODO: Implement lock file parsing logic
     // Key requirements:
     // 1. Parse each locked package entry
-    // 2. Extract package name and resolved version
-    // 3. Handle ecosystem-specific format
+    // 2. Create ResolvedPackage with name, version, and source
+    // 3. Call packages.insert(resolved_package)
+
+    let _ = content;
 
     Ok(packages)
 }
@@ -71,11 +50,5 @@ mod tests {
     fn test_parse_empty_lockfile() {
         let result = parse_lock_content("").unwrap();
         assert!(result.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_lockfile_provider_interface() {
-        let parser = {ECOSYSTEM_PASCAL}LockfileParser;
-        assert_eq!(parser.lock_filename(), "{LOCK_FILE}");
     }
 }
