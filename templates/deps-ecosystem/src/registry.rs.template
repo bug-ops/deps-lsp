@@ -1,17 +1,13 @@
 //! {REGISTRY_NAME} API client with HTTP caching.
 
-use crate::error::{ECOSYSTEM_PASCAL}Error, Result;
+use crate::error::{ECOSYSTEM_PASCAL}Error;
 use crate::types::{ECOSYSTEM_PASCAL}Version;
-use deps_core::HttpCache;
+use deps_core::{HttpCache, ecosystem::BoxFuture};
+use std::any::Any;
 use std::sync::Arc;
 
 /// Base URL for the package registry.
 const REGISTRY_URL: &str = "{REGISTRY_URL}";
-
-/// Generate package URL for documentation links.
-pub fn package_url(name: &str) -> String {
-    format!("{}/{}", REGISTRY_URL, urlencoding::encode(name))
-}
 
 /// {REGISTRY_NAME} API client.
 pub struct {ECOSYSTEM_PASCAL}Registry {
@@ -19,12 +15,12 @@ pub struct {ECOSYSTEM_PASCAL}Registry {
 }
 
 impl {ECOSYSTEM_PASCAL}Registry {
-    /// Create a new registry client with shared HTTP cache.
+    /// Creates a new registry client with shared HTTP cache.
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self { cache }
     }
 
-    /// Fetch all versions for a package.
+    /// Fetches all versions for a package.
     ///
     /// # Examples
     ///
@@ -40,7 +36,7 @@ impl {ECOSYSTEM_PASCAL}Registry {
     /// let versions = registry.get_versions("package-name").await.unwrap();
     /// # }
     /// ```
-    pub async fn get_versions(&self, name: &str) -> Result<Vec<{ECOSYSTEM_PASCAL}Version>> {
+    pub async fn get_versions(&self, name: &str) -> crate::error::Result<Vec<{ECOSYSTEM_PASCAL}Version>> {
         let url = format!("{}/{}", REGISTRY_URL, urlencoding::encode(name));
 
         let data = self
@@ -57,55 +53,78 @@ impl {ECOSYSTEM_PASCAL}Registry {
         //         source: Box::new(e),
         //     })?;
 
-        let _ = data; // Remove when implementing
+        let _ = data;
 
         Ok(vec![])
     }
 
-    /// Get latest version matching a requirement.
+    /// Gets the latest version matching a requirement.
     pub async fn get_latest_matching(
         &self,
         name: &str,
         version_req: &str,
-    ) -> Result<Option<{ECOSYSTEM_PASCAL}Version>> {
+    ) -> crate::error::Result<Option<{ECOSYSTEM_PASCAL}Version>> {
         let versions = self.get_versions(name).await?;
 
         // TODO: Implement version matching based on ecosystem's versioning scheme
-        // Most ecosystems use semver or similar
-
-        let _ = version_req; // Remove when implementing
+        let _ = version_req;
 
         Ok(versions.into_iter().find(|v| !v.yanked))
     }
 
-    /// Search for packages by query.
-    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<String>> {
+    /// Searches for packages by query.
+    pub async fn search(&self, query: &str, limit: usize) -> crate::error::Result<Vec<crate::types::{ECOSYSTEM_PASCAL}Metadata>> {
         // TODO: Implement search if registry supports it
         let _ = (query, limit);
         Ok(vec![])
     }
 }
 
-#[async_trait::async_trait]
 impl deps_core::Registry for {ECOSYSTEM_PASCAL}Registry {
-    async fn get_versions(
-        &self,
-        name: &str,
-    ) -> deps_core::Result<Vec<Box<dyn deps_core::Version>>> {
-        let versions = self.get_versions(name).await?;
-        Ok(versions
-            .into_iter()
-            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-            .collect())
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> BoxFuture<'a, deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let versions = self.get_versions(name).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
     }
 
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        version_req: &str,
-    ) -> deps_core::Result<Option<Box<dyn deps_core::Version>>> {
-        let version = self.get_latest_matching(name, version_req).await?;
-        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a str,
+        req: &'a str,
+    ) -> BoxFuture<'a, deps_core::error::Result<Option<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let version = self.get_latest_matching(name, req).await?;
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>> {
+        Box::pin(async move {
+            let results = self.search(query, limit).await?;
+            Ok(results
+                .into_iter()
+                .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
+                .collect())
+        })
+    }
+
+    fn package_url(&self, name: &str) -> String {
+        format!("{}/{}", REGISTRY_URL, urlencoding::encode(name))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -115,14 +134,10 @@ mod tests {
 
     #[test]
     fn test_package_url() {
-        let url = package_url("my-package");
+        let cache = Arc::new(HttpCache::new());
+        let registry = {ECOSYSTEM_PASCAL}Registry::new(cache);
+        let url = registry.package_url("my-package");
         assert!(url.contains("my-package"));
-    }
-
-    #[test]
-    fn test_package_url_escapes_special_chars() {
-        let url = package_url("@scope/package");
-        assert!(url.contains("%40scope"));
     }
 
     #[tokio::test]

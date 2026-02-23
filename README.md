@@ -48,10 +48,10 @@ deps-lsp is optimized for responsiveness:
 | Ruby | Bundler | `Gemfile` | ✅ Supported |
 | Dart | Pub | `pubspec.yaml` | ✅ Supported |
 | Java | Maven | `pom.xml` | ✅ Supported |
-| Java | Gradle | `libs.versions.toml`, `build.gradle.kts`, `build.gradle` | ✅ Supported |
+| Java | Gradle | `libs.versions.toml`, `build.gradle.kts`, `build.gradle`, `settings.gradle` | ✅ Supported |
 
 > [!NOTE]
-> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`). Dart support includes hosted, git, path, and SDK dependency sources with caret version semantics. Maven support covers `dependencies`, `dependencyManagement`, and `build/plugins` sections with Maven qualifier-aware version comparison. Gradle support covers Version Catalogs (`libs.versions.toml`), Kotlin DSL (`build.gradle.kts`), and Groovy DSL (`build.gradle`) with version.ref resolution.
+> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`). Dart support includes hosted, git, path, and SDK dependency sources with caret version semantics. Maven support covers `dependencies`, `dependencyManagement`, and `build/plugins` sections with Maven qualifier-aware version comparison. Gradle support covers Version Catalogs (`libs.versions.toml`), Kotlin DSL (`build.gradle.kts`), Groovy DSL (`build.gradle`), and `settings.gradle` plugin declarations with version.ref resolution. Packages are resolved from Maven Central, Google Maven (Android), and Gradle Plugin Portal (fallback).
 
 ## Installation
 
@@ -61,7 +61,7 @@ deps-lsp is optimized for responsiveness:
 cargo install deps-lsp
 ```
 
-Latest published crate version: `0.7.1`.
+Latest published crate version: `0.8.0`.
 
 > [!TIP]
 > Use `cargo binstall deps-lsp` for faster installation without compilation.
