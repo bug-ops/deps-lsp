@@ -25,7 +25,6 @@
 //! - Lines with `h1:hash` are actual module content checksums (used for version resolution)
 //! - A module may appear multiple times with different versions
 
-use async_trait::async_trait;
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
@@ -70,21 +69,26 @@ impl GoSumParser {
     const LOCKFILE_NAMES: &'static [&'static str] = &["go.sum"];
 }
 
-#[async_trait]
 impl LockFileProvider for GoSumParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
-    async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {
-        let content = tokio::fs::read_to_string(lockfile_path)
-            .await
-            .map_err(|e| DepsError::ParseError {
-                file_type: format!("go.sum at {}", lockfile_path.display()),
-                source: Box::new(e),
-            })?;
+    fn parse_lockfile<'a>(
+        &'a self,
+        lockfile_path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let content = tokio::fs::read_to_string(lockfile_path)
+                .await
+                .map_err(|e| DepsError::ParseError {
+                    file_type: format!("go.sum at {}", lockfile_path.display()),
+                    source: Box::new(e),
+                })?;
 
-        Ok(parse_go_sum(&content))
+            Ok(parse_go_sum(&content))
+        })
     }
 }
 

@@ -301,94 +301,43 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<CrateInfo>> {
         .collect())
 }
 
-// Implement PackageRegistry trait for CratesIoRegistry
-#[async_trait::async_trait]
-impl deps_core::PackageRegistry for CratesIoRegistry {
-    type Version = CargoVersion;
-    type Metadata = CrateInfo;
-    type VersionReq = VersionReq;
-
-    async fn get_versions(&self, name: &str) -> Result<Vec<Self::Version>> {
-        self.get_versions(name).await
-    }
-
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &Self::VersionReq,
-    ) -> Result<Option<Self::Version>> {
-        self.get_latest_matching(name, &req.to_string()).await
-    }
-
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Self::Metadata>> {
-        self.search(query, limit).await
-    }
-}
-
-// Implement VersionInfo trait for CargoVersion
-impl deps_core::VersionInfo for CargoVersion {
-    fn version_string(&self) -> &str {
-        &self.num
-    }
-
-    fn is_yanked(&self) -> bool {
-        self.yanked
-    }
-
-    fn features(&self) -> Vec<String> {
-        self.features.keys().cloned().collect()
-    }
-}
-
-// Implement PackageMetadata trait for CrateInfo
-impl deps_core::PackageMetadata for CrateInfo {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
-    }
-
-    fn repository(&self) -> Option<&str> {
-        self.repository.as_deref()
-    }
-
-    fn documentation(&self) -> Option<&str> {
-        self.documentation.as_deref()
-    }
-
-    fn latest_version(&self) -> &str {
-        &self.max_version
-    }
-}
-
-// Implement new Registry trait for trait object support
-#[async_trait::async_trait]
 impl deps_core::Registry for CratesIoRegistry {
-    async fn get_versions(&self, name: &str) -> Result<Vec<Box<dyn deps_core::Version>>> {
-        let versions = self.get_versions(name).await?;
-        Ok(versions
-            .into_iter()
-            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-            .collect())
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let versions = self.get_versions(name).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
     }
 
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &str,
-    ) -> Result<Option<Box<dyn deps_core::Version>>> {
-        let version = self.get_latest_matching(name, req).await?;
-        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a str,
+        req: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let version = self.get_latest_matching(name, req).await?;
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn deps_core::Metadata>>> {
-        let results = self.search(query, limit).await?;
-        Ok(results
-            .into_iter()
-            .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
-            .collect())
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
+        Box::pin(async move {
+            let results = self.search(query, limit).await?;
+            Ok(results
+                .into_iter()
+                .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
+                .collect())
+        })
     }
 
     fn package_url(&self, name: &str) -> String {

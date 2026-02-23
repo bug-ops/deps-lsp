@@ -38,7 +38,6 @@
 //! ]
 //! ```
 
-use async_trait::async_trait;
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
@@ -86,78 +85,83 @@ impl PypiLockParser {
     const LOCKFILE_NAMES: &'static [&'static str] = &["poetry.lock", "uv.lock"];
 }
 
-#[async_trait]
 impl LockFileProvider for PypiLockParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
-    async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {
-        tracing::debug!("Parsing lock file: {}", lockfile_path.display());
+    fn parse_lockfile<'a>(
+        &'a self,
+        lockfile_path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            tracing::debug!("Parsing lock file: {}", lockfile_path.display());
 
-        let content = tokio::fs::read_to_string(lockfile_path)
-            .await
-            .map_err(|e| DepsError::ParseError {
-                file_type: format!("lock file at {}", lockfile_path.display()),
-                source: Box::new(e),
+            let content = tokio::fs::read_to_string(lockfile_path)
+                .await
+                .map_err(|e| DepsError::ParseError {
+                    file_type: format!("lock file at {}", lockfile_path.display()),
+                    source: Box::new(e),
+                })?;
+
+            let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
+                file_type: "Python lock file".into(),
+                source: Box::new(std::io::Error::other(e.to_string())),
             })?;
 
-        let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
-            file_type: "Python lock file".into(),
-            source: Box::new(std::io::Error::other(e.to_string())),
-        })?;
+            let mut packages = ResolvedPackages::new();
 
-        let mut packages = ResolvedPackages::new();
-
-        // [[package]] in TOML is an array of tables; toml-span represents it as an array of values
-        let Some(package_array) = doc
-            .as_table()
-            .and_then(|t| t.get("package"))
-            .and_then(|v| v.as_array())
-        else {
-            tracing::warn!("Lock file missing [[package]] array of tables");
-            return Ok(packages);
-        };
-
-        for item in package_array {
-            let Some(table) = item.as_table() else {
-                continue;
+            // [[package]] in TOML is an array of tables; toml-span represents it as an array of values
+            let Some(package_array) = doc
+                .as_table()
+                .and_then(|t| t.get("package"))
+                .and_then(|v| v.as_array())
+            else {
+                tracing::warn!("Lock file missing [[package]] array of tables");
+                return Ok(packages);
             };
 
-            // Extract required fields
-            let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
-                tracing::warn!("Package missing name field");
-                continue;
-            };
+            for item in package_array {
+                let Some(table) = item.as_table() else {
+                    continue;
+                };
 
-            let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
-                tracing::warn!("Package '{}' missing version field", name);
-                continue;
-            };
+                // Extract required fields
+                let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
+                    tracing::warn!("Package missing name field");
+                    continue;
+                };
 
-            // Parse source (format varies between poetry and uv)
-            let source = parse_pypi_source(table);
+                let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
+                    tracing::warn!("Package '{}' missing version field", name);
+                    continue;
+                };
 
-            // Parse dependencies (format varies between poetry and uv)
-            let dependencies = parse_pypi_dependencies(table);
+                // Parse source (format varies between poetry and uv)
+                let source = parse_pypi_source(table);
 
-            // Normalize name for consistent lookup (PyPI names are case-insensitive, - == _)
-            let normalized_name = name.to_lowercase().replace('-', "_");
-            packages.insert(ResolvedPackage {
-                name: normalized_name,
-                version: version.to_string(),
-                source,
-                dependencies,
-            });
-        }
+                // Parse dependencies (format varies between poetry and uv)
+                let dependencies = parse_pypi_dependencies(table);
 
-        tracing::info!(
-            "Parsed lock file: {} packages from {}",
-            packages.len(),
-            lockfile_path.display()
-        );
+                // Normalize name for consistent lookup (PyPI names are case-insensitive, - == _)
+                let normalized_name = name.to_lowercase().replace('-', "_");
+                packages.insert(ResolvedPackage {
+                    name: normalized_name,
+                    version: version.to_string(),
+                    source,
+                    dependencies,
+                });
+            }
 
-        Ok(packages)
+            tracing::info!(
+                "Parsed lock file: {} packages from {}",
+                packages.len(),
+                lockfile_path.display()
+            );
+
+            Ok(packages)
+        })
     }
 }
 

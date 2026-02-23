@@ -739,7 +739,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_with_timeout() {
-        use async_trait::async_trait;
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
         use std::time::Duration;
@@ -747,30 +746,39 @@ mod tests {
         // Mock registry that always times out
         struct TimeoutRegistry;
 
-        #[async_trait]
         impl Registry for TimeoutRegistry {
-            async fn get_versions(&self, _name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
-                // Sleep longer than timeout (10s default)
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                Ok(vec![])
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    // Sleep longer than timeout (10s default)
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(vec![])
+                })
             }
 
-            async fn get_latest_matching(
-                &self,
-                _name: &str,
-                _req: &str,
-            ) -> deps_core::Result<Option<Box<dyn Version>>> {
-                // Sleep longer than timeout
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                Ok(None)
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a str,
+                _req: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    // Sleep longer than timeout
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(None)
+                })
             }
 
-            async fn search(
-                &self,
-                _query: &str,
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
                 _limit: usize,
-            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
-                Ok(vec![])
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
             }
 
             fn package_url(&self, name: &str) -> String {
@@ -795,7 +803,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_fast_packages_not_blocked() {
-        use async_trait::async_trait;
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
         use std::time::Duration;
@@ -803,36 +810,45 @@ mod tests {
         // Mock registry with one slow, one fast package
         struct MixedRegistry;
 
-        #[async_trait]
         impl Registry for MixedRegistry {
-            async fn get_versions(&self, name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
-                if name == "slow-package" {
-                    // Sleep longer than timeout
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                }
-                // Fast package or unknown: return immediately
-                Ok(vec![])
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    if name == "slow-package" {
+                        // Sleep longer than timeout
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                    // Fast package or unknown: return immediately
+                    Ok(vec![])
+                })
             }
 
-            async fn get_latest_matching(
-                &self,
-                name: &str,
-                _req: &str,
-            ) -> deps_core::Result<Option<Box<dyn Version>>> {
-                if name == "slow-package" {
-                    // Sleep longer than timeout
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                }
-                // Fast package or unknown: return immediately (no versions)
-                Ok(None)
+            fn get_latest_matching<'a>(
+                &'a self,
+                name: &'a str,
+                _req: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    if name == "slow-package" {
+                        // Sleep longer than timeout
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                    // Fast package or unknown: return immediately (no versions)
+                    Ok(None)
+                })
             }
 
-            async fn search(
-                &self,
-                _query: &str,
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
                 _limit: usize,
-            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
-                Ok(vec![])
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
             }
 
             fn package_url(&self, name: &str) -> String {
@@ -871,7 +887,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_concurrency_limit() {
-        use async_trait::async_trait;
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -883,50 +898,59 @@ mod tests {
             max_seen: Arc<AtomicUsize>,
         }
 
-        #[async_trait]
         impl Registry for ConcurrencyTrackingRegistry {
-            async fn get_versions(&self, _name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
-                // Increment concurrent counter
-                let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    // Increment concurrent counter
+                    let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
 
-                // Track max concurrent
-                self.max_seen.fetch_max(current, Ordering::SeqCst);
+                    // Track max concurrent
+                    self.max_seen.fetch_max(current, Ordering::SeqCst);
 
-                // Simulate work
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                    // Simulate work
+                    tokio::time::sleep(Duration::from_millis(50)).await;
 
-                // Decrement counter
-                self.current.fetch_sub(1, Ordering::SeqCst);
+                    // Decrement counter
+                    self.current.fetch_sub(1, Ordering::SeqCst);
 
-                Ok(vec![])
+                    Ok(vec![])
+                })
             }
 
-            async fn get_latest_matching(
-                &self,
-                _name: &str,
-                _req: &str,
-            ) -> deps_core::Result<Option<Box<dyn Version>>> {
-                // Increment concurrent counter
-                let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a str,
+                _req: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    // Increment concurrent counter
+                    let current = self.current.fetch_add(1, Ordering::SeqCst) + 1;
 
-                // Track max concurrent
-                self.max_seen.fetch_max(current, Ordering::SeqCst);
+                    // Track max concurrent
+                    self.max_seen.fetch_max(current, Ordering::SeqCst);
 
-                // Simulate work
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                    // Simulate work
+                    tokio::time::sleep(Duration::from_millis(50)).await;
 
-                // Decrement counter
-                self.current.fetch_sub(1, Ordering::SeqCst);
+                    // Decrement counter
+                    self.current.fetch_sub(1, Ordering::SeqCst);
 
-                Ok(None)
+                    Ok(None)
+                })
             }
 
-            async fn search(
-                &self,
-                _query: &str,
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
                 _limit: usize,
-            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
-                Ok(vec![])
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
             }
 
             fn package_url(&self, name: &str) -> String {
@@ -962,7 +986,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_partial_success_with_mixed_outcomes() {
-        use async_trait::async_trait;
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
         use std::time::Duration;
@@ -997,57 +1020,66 @@ mod tests {
         // - "package-error" returns error
         struct MixedOutcomeRegistry;
 
-        #[async_trait]
         impl Registry for MixedOutcomeRegistry {
-            async fn get_versions(&self, name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
-                match name {
-                    "package-fast" => {
-                        // Return immediately with a stable version
-                        Ok(vec![Box::new(MockVersion {
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    match name {
+                        "package-fast" => {
+                            // Return immediately with a stable version
+                            Ok(vec![Box::new(MockVersion {
+                                version: "1.0.0".to_string(),
+                            }) as Box<dyn Version>])
+                        }
+                        "package-slow" => {
+                            // Sleep longer than timeout (test uses 1s timeout)
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            Ok(vec![])
+                        }
+                        "package-error" => {
+                            // Return cache error (simpler for testing)
+                            Err(deps_core::error::DepsError::CacheError(
+                                "Mock registry error".to_string(),
+                            ))
+                        }
+                        _ => Ok(vec![]),
+                    }
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                name: &'a str,
+                _req: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    match name {
+                        "package-fast" => Ok(Some(Box::new(MockVersion {
                             version: "1.0.0".to_string(),
-                        })])
-                    }
-                    "package-slow" => {
-                        // Sleep longer than timeout (test uses 1s timeout)
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                        Ok(vec![])
-                    }
-                    "package-error" => {
-                        // Return cache error (simpler for testing)
-                        Err(deps_core::error::DepsError::CacheError(
+                        }) as Box<dyn Version>)),
+                        "package-slow" => {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            Ok(None)
+                        }
+                        "package-error" => Err(deps_core::error::DepsError::CacheError(
                             "Mock registry error".to_string(),
-                        ))
+                        )),
+                        _ => Ok(None),
                     }
-                    _ => Ok(vec![]),
-                }
+                })
             }
 
-            async fn get_latest_matching(
-                &self,
-                name: &str,
-                _req: &str,
-            ) -> deps_core::Result<Option<Box<dyn Version>>> {
-                match name {
-                    "package-fast" => Ok(Some(Box::new(MockVersion {
-                        version: "1.0.0".to_string(),
-                    }))),
-                    "package-slow" => {
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                        Ok(None)
-                    }
-                    "package-error" => Err(deps_core::error::DepsError::CacheError(
-                        "Mock registry error".to_string(),
-                    )),
-                    _ => Ok(None),
-                }
-            }
-
-            async fn search(
-                &self,
-                _query: &str,
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
                 _limit: usize,
-            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
-                Ok(vec![])
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
             }
 
             fn package_url(&self, name: &str) -> String {
@@ -1092,39 +1124,47 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_registry_error_handled() {
-        use async_trait::async_trait;
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
 
         // Mock registry that returns errors for all packages
         struct ErrorRegistry;
 
-        #[async_trait]
         impl Registry for ErrorRegistry {
-            async fn get_versions(&self, name: &str) -> deps_core::Result<Vec<Box<dyn Version>>> {
-                Err(deps_core::error::DepsError::CacheError(format!(
-                    "Failed to fetch package: {}",
-                    name
-                )))
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Err(deps_core::error::DepsError::CacheError(format!(
+                        "Failed to fetch package: {}",
+                        name
+                    )))
+                })
             }
 
-            async fn get_latest_matching(
-                &self,
-                name: &str,
-                _req: &str,
-            ) -> deps_core::Result<Option<Box<dyn Version>>> {
-                Err(deps_core::error::DepsError::CacheError(format!(
-                    "Failed to fetch package: {}",
-                    name
-                )))
+            fn get_latest_matching<'a>(
+                &'a self,
+                name: &'a str,
+                _req: &'a str,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Err(deps_core::error::DepsError::CacheError(format!(
+                        "Failed to fetch package: {}",
+                        name
+                    )))
+                })
             }
 
-            async fn search(
-                &self,
-                _query: &str,
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
                 _limit: usize,
-            ) -> deps_core::Result<Vec<Box<dyn Metadata>>> {
-                Ok(vec![])
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
             }
 
             fn package_url(&self, name: &str) -> String {

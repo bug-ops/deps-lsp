@@ -25,7 +25,6 @@
 //! }
 //! ```
 
-use async_trait::async_trait;
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
@@ -101,66 +100,71 @@ struct PackageEntry {
     dependencies: HashMap<String, String>,
 }
 
-#[async_trait]
 impl LockFileProvider for NpmLockParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
-    async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {
-        tracing::debug!("Parsing package-lock.json: {}", lockfile_path.display());
+    fn parse_lockfile<'a>(
+        &'a self,
+        lockfile_path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            tracing::debug!("Parsing package-lock.json: {}", lockfile_path.display());
 
-        let content = tokio::fs::read_to_string(lockfile_path)
-            .await
-            .map_err(|e| DepsError::ParseError {
-                file_type: format!("package-lock.json at {}", lockfile_path.display()),
-                source: Box::new(e),
-            })?;
+            let content = tokio::fs::read_to_string(lockfile_path)
+                .await
+                .map_err(|e| DepsError::ParseError {
+                    file_type: format!("package-lock.json at {}", lockfile_path.display()),
+                    source: Box::new(e),
+                })?;
 
-        let lock_data: PackageLockJson =
-            serde_json::from_str(&content).map_err(|e| DepsError::ParseError {
-                file_type: "package-lock.json".into(),
-                source: Box::new(e),
-            })?;
+            let lock_data: PackageLockJson =
+                serde_json::from_str(&content).map_err(|e| DepsError::ParseError {
+                    file_type: "package-lock.json".into(),
+                    source: Box::new(e),
+                })?;
 
-        let mut packages = ResolvedPackages::new();
+            let mut packages = ResolvedPackages::new();
 
-        for (key, entry) in lock_data.packages {
-            // Skip root package (empty key)
-            if key.is_empty() {
-                continue;
+            for (key, entry) in lock_data.packages {
+                // Skip root package (empty key)
+                if key.is_empty() {
+                    continue;
+                }
+
+                // Extract package name from key (e.g., "node_modules/express" -> "express")
+                let name = extract_package_name(&key);
+
+                // Version is required for actual dependencies
+                let Some(ref version) = entry.version else {
+                    tracing::debug!("Skipping package '{}' with no version", name);
+                    continue;
+                };
+
+                // Parse source based on link, resolved, and integrity fields
+                let source = parse_npm_source(&entry);
+
+                // Extract dependency names
+                let dependencies: Vec<String> = entry.dependencies.keys().cloned().collect();
+
+                packages.insert(ResolvedPackage {
+                    name: name.to_string(),
+                    version: version.clone(),
+                    source,
+                    dependencies,
+                });
             }
 
-            // Extract package name from key (e.g., "node_modules/express" -> "express")
-            let name = extract_package_name(&key);
+            tracing::info!(
+                "Parsed package-lock.json: {} packages from {}",
+                packages.len(),
+                lockfile_path.display()
+            );
 
-            // Version is required for actual dependencies
-            let Some(ref version) = entry.version else {
-                tracing::debug!("Skipping package '{}' with no version", name);
-                continue;
-            };
-
-            // Parse source based on link, resolved, and integrity fields
-            let source = parse_npm_source(&entry);
-
-            // Extract dependency names
-            let dependencies: Vec<String> = entry.dependencies.keys().cloned().collect();
-
-            packages.insert(ResolvedPackage {
-                name: name.to_string(),
-                version: version.clone(),
-                source,
-                dependencies,
-            });
-        }
-
-        tracing::info!(
-            "Parsed package-lock.json: {} packages from {}",
-            packages.len(),
-            lockfile_path.display()
-        );
-
-        Ok(packages)
+            Ok(packages)
+        })
     }
 }
 

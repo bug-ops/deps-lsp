@@ -6,94 +6,15 @@
 //! # Architecture
 //!
 //! deps-core defines:
-//! - **Traits**: `PackageRegistry`, `ManifestParser`, `VersionInfo`, `PackageMetadata`
+//! - **Traits**: `Registry`, `Version`, `Metadata`, `Ecosystem`, `ParseResult`
 //! - **HTTP Cache**: Shared caching layer with ETag/Last-Modified validation
 //! - **Error Types**: Unified error handling across all ecosystems
-//!
-//! # Examples
-//!
-//! Implementing a registry for a new ecosystem:
-//!
-//! ```no_run
-//! use deps_core::{PackageRegistry, VersionInfo, PackageMetadata};
-//! use async_trait::async_trait;
-//!
-//! #[derive(Clone)]
-//! struct MyVersion {
-//!     version: String,
-//!     deprecated: bool,
-//! }
-//!
-//! impl VersionInfo for MyVersion {
-//!     fn version_string(&self) -> &str {
-//!         &self.version
-//!     }
-//!
-//!     fn is_yanked(&self) -> bool {
-//!         self.deprecated
-//!     }
-//! }
-//!
-//! #[derive(Clone)]
-//! struct MyMetadata {
-//!     name: String,
-//!     latest: String,
-//! }
-//!
-//! impl PackageMetadata for MyMetadata {
-//!     fn name(&self) -> &str {
-//!         &self.name
-//!     }
-//!
-//!     fn description(&self) -> Option<&str> {
-//!         None
-//!     }
-//!
-//!     fn repository(&self) -> Option<&str> {
-//!         None
-//!     }
-//!
-//!     fn documentation(&self) -> Option<&str> {
-//!         None
-//!     }
-//!
-//!     fn latest_version(&self) -> &str {
-//!         &self.latest
-//!     }
-//! }
-//!
-//! struct MyRegistry;
-//!
-//! #[async_trait]
-//! impl PackageRegistry for MyRegistry {
-//!     type Version = MyVersion;
-//!     type Metadata = MyMetadata;
-//!     type VersionReq = String;
-//!
-//!     async fn get_versions(&self, _name: &str) -> deps_core::error::Result<Vec<Self::Version>> {
-//!         Ok(vec![])
-//!     }
-//!
-//!     async fn get_latest_matching(
-//!         &self,
-//!         _name: &str,
-//!         _req: &Self::VersionReq,
-//!     ) -> deps_core::error::Result<Option<Self::Version>> {
-//!         Ok(None)
-//!     }
-//!
-//!     async fn search(&self, _query: &str, _limit: usize) -> deps_core::error::Result<Vec<Self::Metadata>> {
-//!         Ok(vec![])
-//!     }
-//! }
-//! ```
 
 pub mod cache;
 pub mod completion;
 pub mod ecosystem;
 pub mod ecosystem_registry;
 pub mod error;
-pub mod handler;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;
@@ -106,10 +27,6 @@ pub use cache::{CachedResponse, HttpCache};
 pub use ecosystem::{Dependency, Ecosystem, EcosystemConfig, ParseResult};
 pub use ecosystem_registry::EcosystemRegistry;
 pub use error::{DepsError, Result};
-pub use handler::{
-    DiagnosticsConfig, EcosystemHandler, InlayHintsConfig, VersionStringGetter, YankedChecker,
-    generate_code_actions, generate_diagnostics, generate_hover, generate_inlay_hints,
-};
 pub use lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
 pub use lsp_helpers::{
     EcosystemFormatter, LineOffsetTable, generate_code_actions as lsp_generate_code_actions,
@@ -118,9 +35,7 @@ pub use lsp_helpers::{
     ranges_overlap,
 };
 pub use parser::{DependencyInfo, DependencySource, LoadingState, ManifestParser, ParseResultInfo};
-pub use registry::{
-    Metadata, PackageMetadata, PackageRegistry, Registry, Version, VersionInfo, find_latest_stable,
-};
+pub use registry::{Metadata, Registry, Version, find_latest_stable};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version,

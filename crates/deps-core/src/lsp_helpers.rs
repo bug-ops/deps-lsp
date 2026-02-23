@@ -528,6 +528,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
 
     #[test]
     fn test_ranges_overlap_inside() {
@@ -636,6 +637,54 @@ mod tests {
         }
     }
 
+    struct MockParseResult {
+        deps: Vec<MockDep>,
+        uri: Uri,
+    }
+
+    impl ParseResult for MockParseResult {
+        fn dependencies(&self) -> Vec<&dyn Dependency> {
+            self.deps.iter().map(|d| d as &dyn Dependency).collect()
+        }
+        fn workspace_root(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn uri(&self) -> &Uri {
+            &self.uri
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct MockDep {
+        name: String,
+        version_req: String,
+        version_range: Range,
+        name_range: Range,
+    }
+
+    impl Dependency for MockDep {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn name_range(&self) -> Range {
+            self.name_range
+        }
+        fn version_requirement(&self) -> Option<&str> {
+            Some(&self.version_req)
+        }
+        fn version_range(&self) -> Option<Range> {
+            Some(self.version_range)
+        }
+        fn source(&self) -> crate::parser::DependencySource {
+            crate::parser::DependencySource::Registry
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
     #[test]
     fn test_ecosystem_formatter_defaults() {
         let formatter = MockFormatter;
@@ -699,7 +748,6 @@ mod tests {
 
     #[test]
     fn test_inlay_hint_exact_version_shows_update_needed() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -711,54 +759,6 @@ mod tests {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
         };
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -796,7 +796,6 @@ mod tests {
 
     #[test]
     fn test_inlay_hint_caret_version_up_to_date() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -808,54 +807,6 @@ mod tests {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
         };
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -897,7 +848,6 @@ mod tests {
 
     #[test]
     fn test_loading_hint_shows_when_no_cached_version() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -909,54 +859,6 @@ mod tests {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
         };
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -997,7 +899,6 @@ mod tests {
 
     #[test]
     fn test_loading_hint_disabled_when_config_false() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -1009,54 +910,6 @@ mod tests {
             loading_text: "⏳".to_string(),
             show_loading_hints: false,
         };
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -1127,7 +980,6 @@ mod tests {
 
     #[test]
     fn test_loading_hint_not_shown_when_cached_version_exists() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -1139,54 +991,6 @@ mod tests {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
         };
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -1229,59 +1033,10 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_unknown_package() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
         let formatter = MockFormatter;
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -1311,59 +1066,10 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_version() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
         let formatter = MockFormatter;
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -1395,59 +1101,10 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_up_to_date() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
         let formatter = MockFormatter;
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -1479,59 +1136,10 @@ mod tests {
 
     #[test]
     fn test_generate_diagnostics_from_cache_multiple_deps() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
         let formatter = MockFormatter;
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![
@@ -1585,7 +1193,6 @@ mod tests {
 
     #[test]
     fn test_inlay_hint_not_in_lockfile_but_satisfies_requirement() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -1597,54 +1204,6 @@ mod tests {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
         };
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -1686,7 +1245,6 @@ mod tests {
 
     #[test]
     fn test_inlay_hint_not_in_lockfile_and_outdated() {
-        use std::any::Any;
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range, Uri};
 
@@ -1698,54 +1256,6 @@ mod tests {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
         };
-
-        struct MockParseResult {
-            deps: Vec<MockDep>,
-            uri: Uri,
-        }
-
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockDep {
-            name: String,
-            version_req: String,
-            version_range: Range,
-            name_range: Range,
-        }
-
-        impl Dependency for MockDep {
-            fn name(&self) -> &str {
-                &self.name
-            }
-            fn name_range(&self) -> Range {
-                self.name_range
-            }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(&self.version_req)
-            }
-            fn version_range(&self) -> Option<Range> {
-                Some(self.version_range)
-            }
-            fn source(&self) -> crate::parser::DependencySource {
-                crate::parser::DependencySource::Registry
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {

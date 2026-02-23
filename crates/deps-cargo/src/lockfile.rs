@@ -22,7 +22,6 @@
 //! ]
 //! ```
 
-use async_trait::async_trait;
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
@@ -67,81 +66,86 @@ impl CargoLockParser {
     const LOCKFILE_NAMES: &'static [&'static str] = &["Cargo.lock"];
 }
 
-#[async_trait]
 impl LockFileProvider for CargoLockParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
-    async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {
-        tracing::debug!("Parsing Cargo.lock: {}", lockfile_path.display());
+    fn parse_lockfile<'a>(
+        &'a self,
+        lockfile_path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            tracing::debug!("Parsing Cargo.lock: {}", lockfile_path.display());
 
-        let content = tokio::fs::read_to_string(lockfile_path)
-            .await
-            .map_err(|e| DepsError::ParseError {
-                file_type: format!("Cargo.lock at {}", lockfile_path.display()),
-                source: Box::new(e),
+            let content = tokio::fs::read_to_string(lockfile_path)
+                .await
+                .map_err(|e| DepsError::ParseError {
+                    file_type: format!("Cargo.lock at {}", lockfile_path.display()),
+                    source: Box::new(e),
+                })?;
+
+            let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
+                file_type: "Cargo.lock".into(),
+                source: Box::new(std::io::Error::other(e.to_string())),
             })?;
 
-        let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
-            file_type: "Cargo.lock".into(),
-            source: Box::new(std::io::Error::other(e.to_string())),
-        })?;
+            let mut packages = ResolvedPackages::new();
 
-        let mut packages = ResolvedPackages::new();
-
-        let Some(root_table) = doc.as_table() else {
-            tracing::warn!("Cargo.lock root is not a table");
-            return Ok(packages);
-        };
-
-        let Some(package_array_val) = root_table.get("package") else {
-            tracing::warn!("Cargo.lock missing [[package]] array of tables");
-            return Ok(packages);
-        };
-
-        let Some(package_array) = package_array_val.as_array() else {
-            tracing::warn!("Cargo.lock [[package]] is not an array");
-            return Ok(packages);
-        };
-
-        for entry in package_array {
-            let Some(table) = entry.as_table() else {
-                continue;
+            let Some(root_table) = doc.as_table() else {
+                tracing::warn!("Cargo.lock root is not a table");
+                return Ok(packages);
             };
 
-            // Extract required fields
-            let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
-                tracing::warn!("Package missing name field");
-                continue;
+            let Some(package_array_val) = root_table.get("package") else {
+                tracing::warn!("Cargo.lock missing [[package]] array of tables");
+                return Ok(packages);
             };
 
-            let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
-                tracing::warn!("Package '{}' missing version field", name);
-                continue;
+            let Some(package_array) = package_array_val.as_array() else {
+                tracing::warn!("Cargo.lock [[package]] is not an array");
+                return Ok(packages);
             };
 
-            // Parse source (optional for path dependencies)
-            let source = parse_cargo_source(table.get("source").and_then(|v| v.as_str()));
+            for entry in package_array {
+                let Some(table) = entry.as_table() else {
+                    continue;
+                };
 
-            // Parse dependencies array (optional)
-            let dependencies = parse_cargo_dependencies_from_table(table);
+                // Extract required fields
+                let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
+                    tracing::warn!("Package missing name field");
+                    continue;
+                };
 
-            packages.insert(ResolvedPackage {
-                name: name.to_string(),
-                version: version.to_string(),
-                source,
-                dependencies,
-            });
-        }
+                let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
+                    tracing::warn!("Package '{}' missing version field", name);
+                    continue;
+                };
 
-        tracing::info!(
-            "Parsed Cargo.lock: {} packages from {}",
-            packages.len(),
-            lockfile_path.display()
-        );
+                // Parse source (optional for path dependencies)
+                let source = parse_cargo_source(table.get("source").and_then(|v| v.as_str()));
 
-        Ok(packages)
+                // Parse dependencies array (optional)
+                let dependencies = parse_cargo_dependencies_from_table(table);
+
+                packages.insert(ResolvedPackage {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    source,
+                    dependencies,
+                });
+            }
+
+            tracing::info!(
+                "Parsed Cargo.lock: {} packages from {}",
+                packages.len(),
+                lockfile_path.display()
+            );
+
+            Ok(packages)
+        })
     }
 }
 

@@ -1,6 +1,5 @@
 //! pubspec.lock file parsing.
 
-use async_trait::async_trait;
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
@@ -16,23 +15,28 @@ impl PubspecLockParser {
     const LOCKFILE_NAMES: &'static [&'static str] = &["pubspec.lock"];
 }
 
-#[async_trait]
 impl LockFileProvider for PubspecLockParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
-    async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {
-        tracing::debug!("Parsing pubspec.lock: {}", lockfile_path.display());
+    fn parse_lockfile<'a>(
+        &'a self,
+        lockfile_path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            tracing::debug!("Parsing pubspec.lock: {}", lockfile_path.display());
 
-        let content = tokio::fs::read_to_string(lockfile_path)
-            .await
-            .map_err(|e| DepsError::ParseError {
-                file_type: format!("pubspec.lock at {}", lockfile_path.display()),
-                source: Box::new(e),
-            })?;
+            let content = tokio::fs::read_to_string(lockfile_path)
+                .await
+                .map_err(|e| DepsError::ParseError {
+                    file_type: format!("pubspec.lock at {}", lockfile_path.display()),
+                    source: Box::new(e),
+                })?;
 
-        parse_pubspec_lock(&content)
+            parse_pubspec_lock(&content)
+        })
     }
 }
 

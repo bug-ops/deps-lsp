@@ -172,50 +172,6 @@ impl deps_core::Dependency for BundlerDependency {
     }
 }
 
-impl deps_core::Version for BundlerVersion {
-    fn version_string(&self) -> &str {
-        &self.number
-    }
-
-    fn is_yanked(&self) -> bool {
-        self.yanked
-    }
-
-    fn features(&self) -> Vec<String> {
-        vec![]
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl deps_core::Metadata for GemInfo {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> Option<&str> {
-        self.info.as_deref()
-    }
-
-    fn repository(&self) -> Option<&str> {
-        self.source_code_uri.as_deref()
-    }
-
-    fn documentation(&self) -> Option<&str> {
-        self.documentation_uri.as_deref()
-    }
-
-    fn latest_version(&self) -> &str {
-        &self.version
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -165,32 +165,7 @@ fn parse_gem_info(data: &[u8]) -> Result<GemInfo> {
     })
 }
 
-// Implement PackageRegistry trait
-#[async_trait::async_trait]
-impl deps_core::PackageRegistry for RubyGemsRegistry {
-    type Version = BundlerVersion;
-    type Metadata = GemInfo;
-    type VersionReq = String;
-
-    async fn get_versions(&self, name: &str) -> Result<Vec<Self::Version>> {
-        self.get_versions(name).await
-    }
-
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &Self::VersionReq,
-    ) -> Result<Option<Self::Version>> {
-        self.get_latest_matching(name, req).await
-    }
-
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Self::Metadata>> {
-        self.search(query, limit).await
-    }
-}
-
-// Implement VersionInfo trait
-impl deps_core::VersionInfo for BundlerVersion {
+impl deps_core::Version for BundlerVersion {
     fn version_string(&self) -> &str {
         &self.number
     }
@@ -199,13 +174,12 @@ impl deps_core::VersionInfo for BundlerVersion {
         self.yanked
     }
 
-    fn features(&self) -> Vec<String> {
-        vec![]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
-// Implement PackageMetadata trait
-impl deps_core::PackageMetadata for GemInfo {
+impl deps_core::Metadata for GemInfo {
     fn name(&self) -> &str {
         &self.name
     }
@@ -225,34 +199,50 @@ impl deps_core::PackageMetadata for GemInfo {
     fn latest_version(&self) -> &str {
         &self.version
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 // Implement Registry trait for trait object support
-#[async_trait::async_trait]
 impl deps_core::Registry for RubyGemsRegistry {
-    async fn get_versions(&self, name: &str) -> Result<Vec<Box<dyn deps_core::Version>>> {
-        let versions = self.get_versions(name).await?;
-        Ok(versions
-            .into_iter()
-            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-            .collect())
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let versions = self.get_versions(name).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
     }
 
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &str,
-    ) -> Result<Option<Box<dyn deps_core::Version>>> {
-        let version = self.get_latest_matching(name, req).await?;
-        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a str,
+        req: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let version = self.get_latest_matching(name, req).await?;
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn deps_core::Metadata>>> {
-        let results = self.search(query, limit).await?;
-        Ok(results
-            .into_iter()
-            .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
-            .collect())
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
+        Box::pin(async move {
+            let results = self.search(query, limit).await?;
+            Ok(results
+                .into_iter()
+                .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
+                .collect())
+        })
     }
 
     fn package_url(&self, name: &str) -> String {
@@ -471,8 +461,8 @@ mod tests {
     }
 
     #[test]
-    fn test_version_info_trait() {
-        use deps_core::VersionInfo;
+    fn test_version_trait() {
+        use deps_core::Version;
 
         let version = BundlerVersion {
             number: "1.0.0".into(),
@@ -488,8 +478,8 @@ mod tests {
     }
 
     #[test]
-    fn test_package_metadata_trait() {
-        use deps_core::PackageMetadata;
+    fn test_metadata_trait() {
+        use deps_core::Metadata;
 
         let gem = GemInfo {
             name: "test".into(),
@@ -511,8 +501,8 @@ mod tests {
     }
 
     #[test]
-    fn test_package_metadata_trait_empty_optionals() {
-        use deps_core::PackageMetadata;
+    fn test_metadata_trait_empty_optionals() {
+        use deps_core::Metadata;
 
         let gem = GemInfo {
             name: "empty".into(),

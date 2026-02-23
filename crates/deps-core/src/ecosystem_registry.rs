@@ -268,13 +268,20 @@ impl Default for EcosystemRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use std::any::Any;
-    use tower_lsp_server::ls_types::{
-        CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position,
-    };
+    use tower_lsp_server::ls_types::{CompletionItem, Position};
 
-    use crate::{EcosystemConfig, ParseResult, Registry};
+    use crate::{ParseResult, Registry, lsp_helpers::EcosystemFormatter};
+
+    struct MockFormatter;
+    impl EcosystemFormatter for MockFormatter {
+        fn format_version_for_code_action(&self, version: &str) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &str) -> String {
+            format!("https://example.com/{name}")
+        }
+    }
 
     // Mock ecosystem for testing
     struct MockEcosystem {
@@ -284,7 +291,6 @@ mod tests {
         lockfiles: &'static [&'static str],
     }
 
-    #[async_trait]
     impl Ecosystem for MockEcosystem {
         fn id(&self) -> &'static str {
             self.id
@@ -302,66 +308,29 @@ mod tests {
             self.lockfiles
         }
 
-        async fn parse_manifest(
-            &self,
-            _content: &str,
-            _uri: &Uri,
-        ) -> crate::error::Result<Box<dyn ParseResult>> {
-            unimplemented!()
+        fn parse_manifest<'a>(
+            &'a self,
+            _content: &'a str,
+            _uri: &'a Uri,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
+            Box::pin(async move { unimplemented!() })
         }
 
         fn registry(&self) -> Arc<dyn Registry> {
             unimplemented!()
         }
 
-        async fn generate_inlay_hints(
-            &self,
-            _parse_result: &dyn ParseResult,
-            _cached_versions: &std::collections::HashMap<String, String>,
-            _resolved_versions: &std::collections::HashMap<String, String>,
-            _loading_state: crate::LoadingState,
-            _config: &EcosystemConfig,
-        ) -> Vec<InlayHint> {
-            vec![]
+        fn formatter(&self) -> &dyn EcosystemFormatter {
+            &MockFormatter
         }
 
-        async fn generate_hover(
-            &self,
-            _parse_result: &dyn ParseResult,
+        fn generate_completions<'a>(
+            &'a self,
+            _parse_result: &'a dyn ParseResult,
             _position: Position,
-            _cached_versions: &std::collections::HashMap<String, String>,
-            _resolved_versions: &std::collections::HashMap<String, String>,
-        ) -> Option<Hover> {
-            None
-        }
-
-        async fn generate_code_actions(
-            &self,
-            _parse_result: &dyn ParseResult,
-            _position: Position,
-            _cached_versions: &std::collections::HashMap<String, String>,
-            _uri: &Uri,
-        ) -> Vec<CodeAction> {
-            vec![]
-        }
-
-        async fn generate_diagnostics(
-            &self,
-            _parse_result: &dyn ParseResult,
-            _cached_versions: &std::collections::HashMap<String, String>,
-            _resolved_versions: &std::collections::HashMap<String, String>,
-            _uri: &Uri,
-        ) -> Vec<Diagnostic> {
-            vec![]
-        }
-
-        async fn generate_completions(
-            &self,
-            _parse_result: &dyn ParseResult,
-            _position: Position,
-            _content: &str,
-        ) -> Vec<CompletionItem> {
-            vec![]
+            _content: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+            Box::pin(async move { vec![] })
         }
 
         fn as_any(&self) -> &dyn Any {

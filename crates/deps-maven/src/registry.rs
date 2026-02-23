@@ -213,32 +213,43 @@ fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<ArtifactInfo>>
     Ok(results)
 }
 
-// Registry trait (trait-object based)
-#[async_trait::async_trait]
 impl deps_core::Registry for MavenCentralRegistry {
-    async fn get_versions(&self, name: &str) -> Result<Vec<Box<dyn deps_core::Version>>> {
-        let versions = self.get_versions_typed(name).await?;
-        Ok(versions
-            .into_iter()
-            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-            .collect())
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let versions = self.get_versions_typed(name).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
     }
 
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &str,
-    ) -> Result<Option<Box<dyn deps_core::Version>>> {
-        let version = self.get_latest_matching_typed(name, req).await?;
-        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a str,
+        req: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let version = self.get_latest_matching_typed(name, req).await?;
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn deps_core::Metadata>>> {
-        let results = self.search_typed(query, limit).await?;
-        Ok(results
-            .into_iter()
-            .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
-            .collect())
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
+        Box::pin(async move {
+            let results = self.search_typed(query, limit).await?;
+            Ok(results
+                .into_iter()
+                .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
+                .collect())
+        })
     }
 
     fn package_url(&self, name: &str) -> String {
