@@ -39,6 +39,7 @@ impl EcosystemFormatter for ComposerFormatter {
     /// - `>=X <Y` — range (space = AND)
     /// - `X || Y` — OR combinator
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+        let version = version.strip_prefix('v').unwrap_or(version);
         let requirement = requirement.trim();
 
         if requirement.is_empty() || requirement == "*" {
@@ -319,5 +320,16 @@ mod tests {
         assert!(f.version_satisfies_requirement("1.2.3", "1"));
         assert!(f.version_satisfies_requirement("1.2.3", "1.2"));
         assert!(!f.version_satisfies_requirement("2.0.0", "1.2"));
+    }
+
+    #[test]
+    fn test_v_prefix_stripped() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement("v1.24.1", "^1.24"));
+        assert!(f.version_satisfies_requirement("v1.2.3", "~1.2.3"));
+        assert!(f.version_satisfies_requirement("v2.0.0", ">=2.0.0"));
+        assert!(f.version_satisfies_requirement("v1.0.5", "1.0.*"));
+        assert!(f.version_satisfies_requirement("v1.2.3", "1.2.3"));
+        assert!(!f.version_satisfies_requirement("v2.0.0", "^1.0"));
     }
 }
