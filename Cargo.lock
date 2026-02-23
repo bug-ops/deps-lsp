@@ -637,6 +637,7 @@ dependencies = [
  "deps-core",
  "insta",
  "regex",
+ "reqwest",
  "semver",
  "serde",
  "serde_json",

@@ -42,12 +42,37 @@ impl std::error::Error for InvalidOwnerRepo {}
 #[derive(Clone)]
 pub struct SwiftRegistry {
     cache: Arc<HttpCache>,
+    auth_headers: Vec<(reqwest::header::HeaderName, String)>,
 }
 
 impl SwiftRegistry {
     /// Creates a new Swift registry client with the given HTTP cache.
-    pub const fn new(cache: Arc<HttpCache>) -> Self {
-        Self { cache }
+    ///
+    /// Reads `GITHUB_TOKEN` from environment for authenticated requests
+    /// (5000 req/h vs 60 req/h unauthenticated).
+    pub fn new(cache: Arc<HttpCache>) -> Self {
+        let auth_headers = std::env::var("GITHUB_TOKEN")
+            .ok()
+            .map(|token| {
+                tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
+                vec![(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bearer {token}"),
+                )]
+            })
+            .unwrap_or_default();
+
+        Self {
+            cache,
+            auth_headers,
+        }
+    }
+
+    fn headers(&self) -> Vec<(reqwest::header::HeaderName, &str)> {
+        self.auth_headers
+            .iter()
+            .map(|(k, v): &(reqwest::header::HeaderName, String)| (k.clone(), v.as_str()))
+            .collect()
     }
 
     /// Fetches all semver-tagged versions for a package.
@@ -56,7 +81,10 @@ impl SwiftRegistry {
     pub async fn get_versions(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         validate_owner_repo(name)?;
         let url = format!("{GITHUB_API}/repos/{name}/tags?per_page=100");
-        let data = self.cache.get_cached(&url).await?;
+        let data = self
+            .cache
+            .get_cached_with_headers(&url, &self.headers())
+            .await?;
         parse_tags_response(&data)
     }
 
@@ -90,7 +118,10 @@ impl SwiftRegistry {
             "{GITHUB_API}/search/repositories?q={}+language:swift&per_page={limit}",
             urlencoding::encode(query)
         );
-        let data = self.cache.get_cached(&url).await?;
+        let data = self
+            .cache
+            .get_cached_with_headers(&url, &self.headers())
+            .await?;
         parse_search_response(&data)
     }
 }

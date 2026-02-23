@@ -172,6 +172,36 @@ impl HttpCache {
         self.fetch_and_store(url).await
     }
 
+    /// Fetches a URL with additional request headers, using the cache.
+    ///
+    /// Works the same as `get_cached` but injects extra headers (e.g., Authorization)
+    /// into every request. Useful for APIs that require authentication tokens.
+    pub async fn get_cached_with_headers(
+        &self,
+        url: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+    ) -> Result<Bytes> {
+        if self.entries.len() >= MAX_CACHE_ENTRIES {
+            self.evict_entries();
+        }
+
+        if let Some(cached) = self.entries.get(url).map(|r| r.clone()) {
+            match self
+                .conditional_request_with_headers(url, &cached, extra_headers)
+                .await
+            {
+                Ok(Some(new_body)) => return Ok(new_body),
+                Ok(None) => return Ok(cached.body),
+                Err(e) => {
+                    tracing::warn!("conditional request failed, using cache: {e}");
+                    return Ok(cached.body);
+                }
+            }
+        }
+
+        self.fetch_and_store_with_headers(url, extra_headers).await
+    }
+
     /// Performs conditional HTTP request using cached validation headers.
     ///
     /// Sends `If-None-Match` (ETag) and/or `If-Modified-Since` headers
@@ -283,6 +313,124 @@ impl HttpCache {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| DepsError::RegistryError {
+                package: url.to_string(),
+                source: e,
+            })?;
+
+        self.entries.insert(
+            url.to_string(),
+            CachedResponse {
+                body: body.clone(),
+                etag,
+                last_modified,
+                fetched_at: Instant::now(),
+            },
+        );
+
+        Ok(body)
+    }
+
+    async fn conditional_request_with_headers(
+        &self,
+        url: &str,
+        cached: &CachedResponse,
+        extra_headers: &[(header::HeaderName, &str)],
+    ) -> Result<Option<Bytes>> {
+        ensure_https(url)?;
+        let mut request = self.client.get(url);
+
+        for (name, value) in extra_headers {
+            request = request.header(name, *value);
+        }
+        if let Some(etag) = &cached.etag {
+            request = request.header(header::IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = &cached.last_modified {
+            request = request.header(header::IF_MODIFIED_SINCE, last_modified);
+        }
+
+        let response = request.send().await.map_err(|e| DepsError::RegistryError {
+            package: url.to_string(),
+            source: e,
+        })?;
+
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(DepsError::CacheError(format!("HTTP {status} for {url}")));
+        }
+
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let last_modified = response
+            .headers()
+            .get(header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| DepsError::RegistryError {
+                package: url.to_string(),
+                source: e,
+            })?;
+
+        self.entries.insert(
+            url.to_string(),
+            CachedResponse {
+                body: body.clone(),
+                etag,
+                last_modified,
+                fetched_at: Instant::now(),
+            },
+        );
+
+        Ok(Some(body))
+    }
+
+    async fn fetch_and_store_with_headers(
+        &self,
+        url: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+    ) -> Result<Bytes> {
+        ensure_https(url)?;
+        tracing::debug!("fetching fresh with headers: {url}");
+
+        let mut request = self.client.get(url);
+        for (name, value) in extra_headers {
+            request = request.header(name, *value);
+        }
+
+        let response = request.send().await.map_err(|e| DepsError::RegistryError {
+            package: url.to_string(),
+            source: e,
+        })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(DepsError::CacheError(format!("HTTP {status} for {url}")));
+        }
+
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let last_modified = response
+            .headers()
+            .get(header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
         let body = response
             .bytes()
             .await
