@@ -101,9 +101,26 @@ struct GithubTag {
     name: String,
 }
 
+/// GitHub API error response (rate limit, not found, etc.).
+#[derive(Deserialize)]
+struct GithubErrorResponse {
+    message: String,
+}
+
 /// Parses GitHub tags API response into SwiftVersion list.
+///
+/// GitHub returns an error object instead of array when rate-limited or on
+/// other errors. Detect this and return a descriptive error.
 fn parse_tags_response(data: &[u8]) -> Result<Vec<SwiftVersion>> {
-    let tags: Vec<GithubTag> = serde_json::from_slice(data)?;
+    let tags: Vec<GithubTag> = match serde_json::from_slice(data) {
+        Ok(t) => t,
+        Err(_) => {
+            if let Ok(err) = serde_json::from_slice::<GithubErrorResponse>(data) {
+                return Err(SwiftError::github_api_error(&err.message).into());
+            }
+            return Ok(vec![]);
+        }
+    };
 
     let mut versions_with_parsed: Vec<(SwiftVersion, semver::Version)> = tags
         .into_iter()
@@ -284,9 +301,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_tags_invalid_json_returns_error() {
-        let result = parse_tags_response(b"not json");
+    fn test_parse_tags_invalid_json_returns_empty() {
+        let result = parse_tags_response(b"not json").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tags_github_rate_limit_returns_error() {
+        let json = r#"{"message":"API rate limit exceeded for 1.2.3.4."}"#;
+        let result = parse_tags_response(json.as_bytes());
         assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("rate limit"));
     }
 
     #[test]

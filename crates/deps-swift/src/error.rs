@@ -49,6 +49,13 @@ impl SwiftError {
             message: message.into(),
         }
     }
+
+    pub fn github_api_error(message: impl Into<String>) -> Self {
+        Self::GitHubApiError {
+            status: 0,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<deps_core::DepsError> for SwiftError {
