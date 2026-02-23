@@ -29,7 +29,6 @@ use deps_core::lockfile::{
     locate_lockfile_for_manifest,
 };
 use std::path::{Path, PathBuf};
-use toml_edit::DocumentMut;
 use tower_lsp_server::ls_types::Uri;
 
 /// Cargo.lock file parser.
@@ -84,42 +83,46 @@ impl LockFileProvider for CargoLockParser {
                 source: Box::new(e),
             })?;
 
-        let doc: DocumentMut = content.parse().map_err(|e| DepsError::ParseError {
+        let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
             file_type: "Cargo.lock".into(),
-            source: Box::new(e),
+            source: Box::new(std::io::Error::other(e.to_string())),
         })?;
 
         let mut packages = ResolvedPackages::new();
 
-        let Some(package_array) = doc
-            .get("package")
-            .and_then(|v: &toml_edit::Item| v.as_array_of_tables())
-        else {
+        let Some(root_table) = doc.as_table() else {
+            tracing::warn!("Cargo.lock root is not a table");
+            return Ok(packages);
+        };
+
+        let Some(package_array_val) = root_table.get("package") else {
             tracing::warn!("Cargo.lock missing [[package]] array of tables");
             return Ok(packages);
         };
 
-        for table in package_array {
+        let Some(package_array) = package_array_val.as_array() else {
+            tracing::warn!("Cargo.lock [[package]] is not an array");
+            return Ok(packages);
+        };
+
+        for entry in package_array {
+            let Some(table) = entry.as_table() else {
+                continue;
+            };
+
             // Extract required fields
-            let Some(name) = table.get("name").and_then(|v: &toml_edit::Item| v.as_str()) else {
+            let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
                 tracing::warn!("Package missing name field");
                 continue;
             };
 
-            let Some(version) = table
-                .get("version")
-                .and_then(|v: &toml_edit::Item| v.as_str())
-            else {
+            let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
                 tracing::warn!("Package '{}' missing version field", name);
                 continue;
             };
 
             // Parse source (optional for path dependencies)
-            let source = parse_cargo_source(
-                table
-                    .get("source")
-                    .and_then(|v: &toml_edit::Item| v.as_str()),
-            );
+            let source = parse_cargo_source(table.get("source").and_then(|v| v.as_str()));
 
             // Parse dependencies array (optional)
             let dependencies = parse_cargo_dependencies_from_table(table);
@@ -182,7 +185,7 @@ fn parse_cargo_source(source_str: Option<&str>) -> ResolvedSource {
 /// ```toml
 /// dependencies = ["serde_derive", "syn"]
 /// ```
-fn parse_cargo_dependencies_from_table(table: &toml_edit::Table) -> Vec<String> {
+fn parse_cargo_dependencies_from_table(table: &toml_span::value::Table<'_>) -> Vec<String> {
     let Some(deps_value) = table.get("dependencies") else {
         return vec![];
     };
@@ -199,9 +202,9 @@ fn parse_cargo_dependencies_from_table(table: &toml_edit::Table) -> Vec<String> 
                 return Some(s.to_string());
             }
 
-            // Inline table format (rare, extract "name" field)
-            if let Some(table) = item.as_inline_table()
-                && let Some(name) = table.get("name").and_then(|v| v.as_str())
+            // Table format (rare, extract "name" field)
+            if let Some(t) = item.as_table()
+                && let Some(name) = t.get("name").and_then(|v| v.as_str())
             {
                 return Some(name.to_string());
             }

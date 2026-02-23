@@ -11,7 +11,7 @@ This crate provides parsing and registry integration for Rust's Cargo ecosystem.
 
 ## Features
 
-- **TOML Parsing** — Parse `Cargo.toml` with position tracking using `toml_edit`
+- **TOML Parsing** — Parse `Cargo.toml` with position tracking using `toml-span`
 - **Lock File Parsing** — Extract resolved versions from `Cargo.lock`
 - **crates.io Registry** — Sparse index client for package metadata
 - **Version Resolution** — Semver-aware version matching

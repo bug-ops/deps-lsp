@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Google Maven repository support** — Android packages (`androidx.*`, `com.google.firebase.*`, `com.google.android.*`, `com.android.*`) now resolve from Google Maven instead of Maven Central
 
 ### Changed
+- **Migrate deps-cargo and deps-pypi from toml_edit to toml-span** — Reliable span tracking for all values including inline tables; eliminates text-search fallbacks for position tracking
+- Remove `toml_edit` from workspace dependencies (all TOML parsers now use `toml-span`)
 - Extract `LineOffsetTable` and `position_in_range` to deps-core for reuse across ecosystems
 - Extract `complete_package_names_generic` to deps-core completion module
 
