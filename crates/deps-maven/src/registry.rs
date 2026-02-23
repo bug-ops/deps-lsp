@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
 const GOOGLE_MAVEN_BASE: &str = "https://dl.google.com/dl/android/maven2";
+const GRADLE_PLUGIN_PORTAL_BASE: &str = "https://plugins.gradle.org/m2";
 const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";
 
 const GOOGLE_PREFIXES: &[&str] = &[
@@ -71,19 +72,26 @@ impl MavenCentralRegistry {
     }
 
     pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
-        let Some(url) = metadata_url(name) else {
+        let urls = metadata_urls(name);
+        if urls.is_empty() {
             tracing::debug!(package = %name, "skipping: invalid groupId:artifactId format");
             return Ok(vec![]);
-        };
+        }
 
-        let data = match self.cache.get_cached(&url).await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(package = %name, url = %url, error = %e, "metadata fetch failed");
-                return Err(e);
+        let mut last_err = None;
+        for url in &urls {
+            match self.cache.get_cached(url).await {
+                Ok(data) => return parse_metadata_xml(&data),
+                Err(e) => {
+                    tracing::debug!(package = %name, url = %url, error = %e, "metadata fetch failed, trying next");
+                    last_err = Some(e);
+                }
             }
-        };
-        parse_metadata_xml(&data)
+        }
+
+        let e = last_err.expect("urls is non-empty");
+        tracing::warn!(package = %name, error = %e, "all metadata URLs failed");
+        Err(e)
     }
 
     pub async fn get_latest_matching_typed(
@@ -116,14 +124,26 @@ impl MavenCentralRegistry {
     }
 }
 
-/// Converts `groupId:artifactId` to maven-metadata.xml URL, routing to the correct repository.
-fn metadata_url(name: &str) -> Option<String> {
-    let (group_id, artifact_id) = name.split_once(':')?;
-    let base = repo_base_for_group(group_id);
+/// Returns ordered list of maven-metadata.xml URLs to try for the given package.
+///
+/// Non-Google packages get two URLs: Maven Central (primary) and Gradle Plugin Portal (fallback).
+/// Google-hosted packages get only the Google Maven URL — they are not mirrored elsewhere.
+fn metadata_urls(name: &str) -> Vec<String> {
+    let Some((group_id, artifact_id)) = name.split_once(':') else {
+        return vec![];
+    };
     let group_path = group_id.replace('.', "/");
-    Some(format!(
-        "{base}/{group_path}/{artifact_id}/maven-metadata.xml"
-    ))
+    let primary_base = repo_base_for_group(group_id);
+    let primary = format!("{primary_base}/{group_path}/{artifact_id}/maven-metadata.xml");
+
+    if is_google_group(group_id) {
+        vec![primary]
+    } else {
+        vec![
+            primary,
+            format!("{GRADLE_PLUGIN_PORTAL_BASE}/{group_path}/{artifact_id}/maven-metadata.xml"),
+        ]
+    }
 }
 
 /// Parses maven-metadata.xml to extract version list.
@@ -318,31 +338,39 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_url_central() {
+    fn test_metadata_urls_central_has_two_urls() {
+        let urls = metadata_urls("org.apache.commons:commons-lang3");
+        assert_eq!(urls.len(), 2);
         assert_eq!(
-            metadata_url("org.apache.commons:commons-lang3"),
-            Some("https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/maven-metadata.xml".into())
+            urls[0],
+            "https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/maven-metadata.xml"
+        );
+        assert_eq!(
+            urls[1],
+            "https://plugins.gradle.org/m2/org/apache/commons/commons-lang3/maven-metadata.xml"
         );
     }
 
     #[test]
-    fn test_metadata_url_google() {
+    fn test_metadata_urls_google_has_one_url() {
+        let urls = metadata_urls("androidx.core:core-ktx");
+        assert_eq!(urls.len(), 1);
         assert_eq!(
-            metadata_url("androidx.core:core-ktx"),
-            Some(
-                "https://dl.google.com/dl/android/maven2/androidx/core/core-ktx/maven-metadata.xml"
-                    .into()
-            )
+            urls[0],
+            "https://dl.google.com/dl/android/maven2/androidx/core/core-ktx/maven-metadata.xml"
         );
+
+        let urls = metadata_urls("com.google.firebase.crashlytics:firebase-crashlytics");
+        assert_eq!(urls.len(), 1);
         assert_eq!(
-            metadata_url("com.google.firebase.crashlytics:firebase-crashlytics"),
-            Some("https://dl.google.com/dl/android/maven2/com/google/firebase/crashlytics/firebase-crashlytics/maven-metadata.xml".into())
+            urls[0],
+            "https://dl.google.com/dl/android/maven2/com/google/firebase/crashlytics/firebase-crashlytics/maven-metadata.xml"
         );
     }
 
     #[test]
-    fn test_metadata_url_no_colon() {
-        assert_eq!(metadata_url("bad"), None);
+    fn test_metadata_urls_no_colon() {
+        assert!(metadata_urls("bad").is_empty());
     }
 
     #[test]
