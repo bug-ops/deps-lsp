@@ -539,7 +539,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
- "toml_edit",
+ "toml-span",
  "tower-lsp-server",
  "tracing",
 ]
@@ -2370,6 +2370,15 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "toml-span"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc07a8be6a2b3913e6dc6b250fb3b7c204437dcce7213a56244de2c92c538339"
+dependencies = [
+ "smallvec",
 ]
 
 [[package]]

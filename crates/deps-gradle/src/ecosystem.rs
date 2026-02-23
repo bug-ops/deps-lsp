@@ -165,7 +165,13 @@ impl Ecosystem for GradleEcosystem {
     }
 
     fn manifest_filenames(&self) -> &[&'static str] {
-        &["libs.versions.toml", "build.gradle.kts", "build.gradle"]
+        &[
+            "libs.versions.toml",
+            "build.gradle.kts",
+            "build.gradle",
+            "settings.gradle.kts",
+            "settings.gradle",
+        ]
     }
 
     fn lockfile_filenames(&self) -> &[&'static str] {
@@ -312,6 +318,8 @@ mod tests {
         assert!(eco.manifest_filenames().contains(&"libs.versions.toml"));
         assert!(eco.manifest_filenames().contains(&"build.gradle.kts"));
         assert!(eco.manifest_filenames().contains(&"build.gradle"));
+        assert!(eco.manifest_filenames().contains(&"settings.gradle.kts"));
+        assert!(eco.manifest_filenames().contains(&"settings.gradle"));
     }
 
     #[test]

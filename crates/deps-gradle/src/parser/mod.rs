@@ -5,10 +5,13 @@
 pub mod catalog;
 pub mod groovy;
 pub mod kotlin;
+pub mod properties;
+pub mod settings;
 
 use crate::error::Result;
 use crate::types::GradleDependency;
 use std::any::Any;
+use std::collections::HashMap;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 pub use deps_core::lsp_helpers::LineOffsetTable;
@@ -18,20 +21,61 @@ pub struct GradleParseResult {
     pub uri: Uri,
 }
 
+/// Resolves `$var` and `${var}` references in dependency versions using the given properties map.
+///
+/// If a version is a variable reference and the variable is found in `properties`,
+/// the version is replaced with the resolved value. The version_range is kept as-is
+/// (pointing to the variable reference in source).
+pub fn resolve_variables(deps: &mut [GradleDependency], properties: &HashMap<String, String>) {
+    for dep in deps.iter_mut() {
+        if let Some(ref ver) = dep.version_req
+            && let Some(resolved) = resolve_variable_ref(ver, properties)
+        {
+            dep.version_req = Some(resolved);
+        }
+    }
+}
+
+/// Returns the resolved value if `value` is a `$name` or `${name}` reference. Returns `None` otherwise.
+fn resolve_variable_ref(value: &str, properties: &HashMap<String, String>) -> Option<String> {
+    let trimmed = value.trim();
+    if let Some(name) = trimmed.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        properties.get(name).cloned()
+    } else if let Some(name) = trimmed.strip_prefix('$') {
+        properties.get(name).cloned()
+    } else {
+        None
+    }
+}
+
 pub fn parse_gradle(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let path = uri.path().to_string();
-    if path.ends_with("libs.versions.toml") {
-        catalog::parse_version_catalog(content, uri)
+    let mut result = if path.ends_with("libs.versions.toml") {
+        catalog::parse_version_catalog(content, uri)?
+    } else if path.ends_with("settings.gradle.kts") || path.ends_with("settings.gradle") {
+        settings::parse_settings(content, uri)?
     } else if path.ends_with(".gradle.kts") {
-        kotlin::parse_kotlin_dsl(content, uri)
+        kotlin::parse_kotlin_dsl(content, uri)?
     } else if path.ends_with(".gradle") {
-        groovy::parse_groovy_dsl(content, uri)
+        groovy::parse_groovy_dsl(content, uri)?
     } else {
-        Ok(GradleParseResult {
+        return Ok(GradleParseResult {
             dependencies: vec![],
             uri: uri.clone(),
-        })
+        });
+    };
+
+    // Resolve variable references for build files (not catalogs or settings)
+    if (path.ends_with("build.gradle.kts") || path.ends_with("build.gradle"))
+        && let Some(dir) = std::path::Path::new(&path).parent()
+    {
+        let props = properties::load_gradle_properties(dir);
+        if !props.is_empty() {
+            resolve_variables(&mut result.dependencies, &props);
+        }
     }
+
+    Ok(result)
 }
 
 impl deps_core::ParseResult for GradleParseResult {
@@ -136,10 +180,92 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_unknown() {
+    fn test_dispatch_settings_gradle() {
+        let content = "pluginManagement {\n    plugins {\n        id \"org.jetbrains.kotlin.jvm\" version \"2.1.10\"\n    }\n}\n";
         let uri = make_uri("/project/settings.gradle");
+        let result = parse_gradle(content, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn test_dispatch_settings_gradle_kts() {
+        let content = "pluginManagement {\n    plugins {\n        id(\"org.springframework.boot\") version \"3.2.0\"\n    }\n}\n";
+        let uri = make_uri("/project/settings.gradle.kts");
+        let result = parse_gradle(content, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn test_dispatch_unknown() {
+        let uri = make_uri("/project/something.xml");
         let result = parse_gradle("", &uri).unwrap();
         assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_variables_dollar_brace() {
+        let props: HashMap<String, String> =
+            [("kotlinVersion".to_string(), "2.1.10".to_string())].into();
+        let mut deps = vec![GradleDependency {
+            group_id: "org.jetbrains.kotlin".into(),
+            artifact_id: "kotlin-stdlib".into(),
+            name: "org.jetbrains.kotlin:kotlin-stdlib".into(),
+            name_range: Range::default(),
+            version_req: Some("${kotlinVersion}".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+        }];
+        resolve_variables(&mut deps, &props);
+        assert_eq!(deps[0].version_req, Some("2.1.10".into()));
+    }
+
+    #[test]
+    fn test_resolve_variables_dollar_plain() {
+        let props: HashMap<String, String> =
+            [("springVersion".to_string(), "3.2.0".to_string())].into();
+        let mut deps = vec![GradleDependency {
+            group_id: "org.springframework.boot".into(),
+            artifact_id: "spring-boot-starter".into(),
+            name: "org.springframework.boot:spring-boot-starter".into(),
+            name_range: Range::default(),
+            version_req: Some("$springVersion".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+        }];
+        resolve_variables(&mut deps, &props);
+        assert_eq!(deps[0].version_req, Some("3.2.0".into()));
+    }
+
+    #[test]
+    fn test_resolve_variables_not_found_keeps_raw() {
+        let props: HashMap<String, String> = HashMap::new();
+        let mut deps = vec![GradleDependency {
+            group_id: "com.example".into(),
+            artifact_id: "lib".into(),
+            name: "com.example:lib".into(),
+            name_range: Range::default(),
+            version_req: Some("$unknownVar".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+        }];
+        resolve_variables(&mut deps, &props);
+        assert_eq!(deps[0].version_req, Some("$unknownVar".into()));
+    }
+
+    #[test]
+    fn test_resolve_variables_literal_version_unchanged() {
+        let props: HashMap<String, String> = [("v".to_string(), "9.9.9".to_string())].into();
+        let mut deps = vec![GradleDependency {
+            group_id: "com.example".into(),
+            artifact_id: "lib".into(),
+            name: "com.example:lib".into(),
+            name_range: Range::default(),
+            version_req: Some("1.2.3".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+        }];
+        resolve_variables(&mut deps, &props);
+        assert_eq!(deps[0].version_req, Some("1.2.3".into()));
     }
 
     #[test]
