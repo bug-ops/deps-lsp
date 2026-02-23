@@ -139,6 +139,9 @@ pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResu
 }
 
 /// Parses a single dependency section and extracts positions, filtering platform packages.
+///
+/// Uses `search_start` to scope position lookups to the current section,
+/// preventing false matches when the same package name appears in multiple sections.
 fn parse_section(
     content: &str,
     deps: &serde_json::Map<String, Value>,
@@ -146,6 +149,7 @@ fn parse_section(
     line_table: &LineOffsetTable,
 ) -> Vec<ComposerDependency> {
     let mut result = Vec::new();
+    let mut search_start = 0;
 
     for (name, value) in deps {
         if is_platform_package(name) {
@@ -153,8 +157,15 @@ fn parse_section(
         }
 
         let version_req = value.as_str().map(String::from);
-        let (name_range, version_range) =
-            find_positions(content, name, version_req.as_ref(), line_table);
+        let (name_range, version_range, new_offset) = find_positions(
+            content,
+            name,
+            version_req.as_ref(),
+            line_table,
+            search_start,
+        );
+
+        search_start = new_offset;
 
         result.push(ComposerDependency {
             name: name.clone(),
@@ -169,17 +180,21 @@ fn parse_section(
 }
 
 /// Finds the byte positions of a dependency name and version in the source text.
+///
+/// Returns `(name_range, version_range, new_search_offset)` where `new_search_offset`
+/// is advanced past the current match to avoid false matches in subsequent lookups.
 fn find_positions(
     content: &str,
     name: &str,
     version_req: Option<&String>,
     line_table: &LineOffsetTable,
-) -> (Range, Option<Range>) {
+    search_from: usize,
+) -> (Range, Option<Range>, usize) {
     let mut name_range = Range::default();
     let mut version_range = None;
 
     let name_pattern = format!("\"{name}\"");
-    let mut search_start = 0;
+    let mut search_start = search_from;
 
     while let Some(rel_idx) = content[search_start..].find(&name_pattern) {
         let name_start_idx = search_start + rel_idx;
@@ -212,10 +227,14 @@ fn find_positions(
             }
         }
 
-        break;
+        return (
+            name_range,
+            version_range,
+            name_start_idx + name_pattern.len(),
+        );
     }
 
-    (name_range, version_range)
+    (name_range, version_range, search_start)
 }
 
 #[cfg(test)]

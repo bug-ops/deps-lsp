@@ -182,8 +182,18 @@ fn satisfies_caret(version: &str, req: &str) -> bool {
 ///
 /// Compares version strings by splitting on '.' and comparing each numeric segment.
 fn compare_versions(a: &str, b: &str) -> i32 {
-    let a_parts: Vec<u64> = a.split('.').map(|p| p.parse().unwrap_or(0)).collect();
-    let b_parts: Vec<u64> = b.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+    fn parse_segment(s: &str) -> u64 {
+        let digits: String = s
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().unwrap_or(0)
+    }
+    let a_trimmed = a.trim_start_matches(|c: char| !c.is_ascii_digit());
+    let b_trimmed = b.trim_start_matches(|c: char| !c.is_ascii_digit());
+    let a_parts: Vec<u64> = a_trimmed.split('.').map(parse_segment).collect();
+    let b_parts: Vec<u64> = b_trimmed.split('.').map(parse_segment).collect();
 
     let len = a_parts.len().max(b_parts.len());
     for i in 0..len {

@@ -143,7 +143,10 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
             continue;
         }
 
-        let abandoned = current.abandoned.as_ref().is_some_and(|v| !v.is_null());
+        let abandoned = current
+            .abandoned
+            .as_ref()
+            .is_some_and(|v| v.as_bool() == Some(true) || v.is_string());
 
         result.push(ComposerVersion {
             version: version.clone(),
