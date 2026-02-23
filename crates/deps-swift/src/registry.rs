@@ -55,10 +55,7 @@ impl SwiftRegistry {
             .ok()
             .map(|token| {
                 tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
-                vec![(
-                    reqwest::header::AUTHORIZATION,
-                    format!("Bearer {token}"),
-                )]
+                vec![(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))]
             })
             .unwrap_or_default();
 

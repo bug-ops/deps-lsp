@@ -95,14 +95,6 @@ Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/lat
 | Windows | x86_64 | `deps-lsp-x86_64-pc-windows-msvc.exe` |
 | Windows | ARM64 | `deps-lsp-aarch64-pc-windows-msvc.exe` |
 
-## Supported platforms
-
-Pre-built binaries are published for:
-
-- Linux (x86_64, aarch64)
-- macOS (x86_64, Apple Silicon)
-- Windows (x86_64, ARM64)
-
 ## Feature flags
 
 By default, all ecosystems are enabled. To build with specific ecosystems only:
@@ -254,6 +246,19 @@ Configure via LSP initialization options:
 
 > [!TIP]
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.
+
+### GitHub API token
+
+Some ecosystems (Swift) resolve versions via the GitHub API, which is limited to **60 requests/hour** without authentication. Set `GITHUB_TOKEN` to increase the limit to **5,000 requests/hour**:
+
+```bash
+# Using GitHub CLI (recommended)
+export GITHUB_TOKEN=$(gh auth token)
+
+# Or create a personal access token at https://github.com/settings/tokens
+# No scopes required for public repository access
+export GITHUB_TOKEN=ghp_...
+```
 
 ## Development
 
