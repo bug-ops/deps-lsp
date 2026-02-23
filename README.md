@@ -8,14 +8,14 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, and Gradle ecosystems.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, and Swift ecosystems.
 
 ## Features
 
 - **Intelligent autocomplete** — Package names, versions, and feature flags
 - **Version hints** — Inlay hints showing latest available versions
 - **Loading indicators** — Visual feedback during registry fetches with LSP progress support
-- **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock
+- **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
 - **Hover information** — Package descriptions with resolved version from lock file
 - **Code actions** — Quick fixes to update dependencies
@@ -49,9 +49,17 @@ deps-lsp is optimized for responsiveness:
 | Dart | Pub | `pubspec.yaml` | ✅ Supported |
 | Java | Maven | `pom.xml` | ✅ Supported |
 | Java | Gradle | `libs.versions.toml`, `build.gradle.kts`, `build.gradle`, `settings.gradle` | ✅ Supported |
+| Swift | SPM | `Package.swift` | ✅ Supported |
 
 > [!NOTE]
-> PyPI support includes PEP 621, PEP 735 (dependency-groups), and Poetry formats. Go support includes require, replace, and exclude directives with pseudo-version handling. Bundler support includes git, path, and GitHub sources plus pessimistic version requirements (`~>`). Dart support includes hosted, git, path, and SDK dependency sources with caret version semantics. Maven support covers `dependencies`, `dependencyManagement`, and `build/plugins` sections with Maven qualifier-aware version comparison. Gradle support covers Version Catalogs (`libs.versions.toml`), Kotlin DSL (`build.gradle.kts`), Groovy DSL (`build.gradle`), and `settings.gradle` plugin declarations with version.ref resolution. Packages are resolved from Maven Central, Google Maven (Android), and Gradle Plugin Portal (fallback).
+> **Ecosystem details:**
+> - **PyPI** — PEP 621, PEP 735 (dependency-groups), Poetry formats
+> - **Go** — `require`, `replace`, `exclude` directives, pseudo-version handling
+> - **Bundler** — git/path/GitHub sources, pessimistic operator (`~>`)
+> - **Dart** — hosted, git, path, SDK sources, caret version semantics
+> - **Maven** — `dependencies`, `dependencyManagement`, `build/plugins`, qualifier-aware version comparison
+> - **Gradle** — Version Catalogs, Kotlin/Groovy DSL, `settings.gradle` plugins; resolves from Maven Central, Google Maven, Gradle Plugin Portal
+> - **Swift** — all `.package()` forms (from, upToNextMajor/Minor, exact, range, branch, revision, path); versions via GitHub API tags
 
 ## Installation
 
@@ -87,14 +95,6 @@ Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/lat
 | Windows | x86_64 | `deps-lsp-x86_64-pc-windows-msvc.exe` |
 | Windows | ARM64 | `deps-lsp-aarch64-pc-windows-msvc.exe` |
 
-## Supported platforms
-
-Pre-built binaries are published for:
-
-- Linux (x86_64, aarch64)
-- macOS (x86_64, Apple Silicon)
-- Windows (x86_64, ARM64)
-
 ## Feature flags
 
 By default, all ecosystems are enabled. To build with specific ecosystems only:
@@ -117,6 +117,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `dart` | Dart | pubspec.yaml | ✅ |
 | `maven` | Java | pom.xml | ✅ |
 | `gradle` | Java | libs.versions.toml, build.gradle.kts, build.gradle | ✅ |
+| `swift` | Swift | Package.swift | ✅ |
 
 ## Usage
 
@@ -154,7 +155,7 @@ Enable inlay hints in Zed settings:
 ```lua
 require('lspconfig').deps_lsp.setup({
   cmd = { "deps-lsp", "--stdio" },
-  filetypes = { "toml", "json", "gomod", "ruby", "yaml", "xml" },
+  filetypes = { "toml", "json", "gomod", "ruby", "yaml", "xml", "swift" },
 })
 
 -- Enable inlay hints (Neovim 0.10+)
@@ -246,6 +247,32 @@ Configure via LSP initialization options:
 > [!TIP]
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.
 
+### GitHub API token
+
+Some ecosystems (Swift) resolve versions via the GitHub API, which is limited to **60 requests/hour** without authentication. Set `GITHUB_TOKEN` to increase the limit to **5,000 requests/hour**:
+
+```bash
+# Using GitHub CLI (recommended)
+export GITHUB_TOKEN=$(gh auth token)
+
+# Or create a personal access token at https://github.com/settings/tokens
+# No scopes required for public repository access
+export GITHUB_TOKEN=ghp_...
+```
+
+For **Zed**, launch with the token so the LSP process inherits it:
+
+```bash
+# bash / zsh
+alias zed='GITHUB_TOKEN="$(gh auth token)" command zed'
+
+# fish
+alias zed='env GITHUB_TOKEN=(gh auth token) command zed'
+```
+
+> [!TIP]
+> Add the alias to your shell profile (`~/.zshrc`, `~/.bashrc`, `~/.config/fish/config.fish`) for persistence.
+
 ## Development
 
 > [!IMPORTANT]
@@ -297,6 +324,7 @@ deps-lsp/
 │   ├── deps-dart/      # pubspec.yaml parser + pub.dev registry
 │   ├── deps-maven/     # pom.xml parser + Maven Central registry
 │   ├── deps-gradle/    # Gradle parser (Version Catalog, Kotlin/Groovy DSL)
+│   ├── deps-swift/     # Package.swift parser + GitHub API registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration

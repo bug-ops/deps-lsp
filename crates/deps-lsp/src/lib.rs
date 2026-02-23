@@ -152,6 +152,22 @@ ecosystem!(
     ]
 );
 
+ecosystem!(
+    "swift",
+    deps_swift,
+    SwiftEcosystem,
+    [
+        SwiftDependency,
+        SwiftParseResult,
+        SwiftVersion,
+        SwiftPackage,
+        SwiftFormatter,
+        SwiftRegistry,
+        SwiftLockParser,
+        parse_package_swift,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
     register!("cargo", CargoEcosystem, registry, &cache);
@@ -162,6 +178,7 @@ pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) 
     register!("dart", DartEcosystem, registry, &cache);
     register!("maven", MavenEcosystem, registry, &cache);
     register!("gradle", GradleEcosystem, registry, &cache);
+    register!("swift", SwiftEcosystem, registry, &cache);
 }
 
 #[cfg(test)]
