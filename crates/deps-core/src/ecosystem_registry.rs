@@ -275,7 +275,7 @@ mod tests {
 
     struct MockFormatter;
     impl EcosystemFormatter for MockFormatter {
-        fn format_version_for_code_action(&self, version: &str) -> String {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
             version.to_string()
         }
         fn package_url(&self, name: &str) -> String {
@@ -290,6 +290,8 @@ mod tests {
         filenames: &'static [&'static str],
         lockfiles: &'static [&'static str],
     }
+
+    impl crate::ecosystem::private::Sealed for MockEcosystem {}
 
     impl Ecosystem for MockEcosystem {
         fn id(&self) -> &'static str {

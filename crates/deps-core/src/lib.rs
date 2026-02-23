@@ -32,7 +32,6 @@ pub use lsp_helpers::{
     EcosystemFormatter, LineOffsetTable, generate_code_actions as lsp_generate_code_actions,
     generate_diagnostics as lsp_generate_diagnostics, generate_hover as lsp_generate_hover,
     generate_inlay_hints as lsp_generate_inlay_hints, is_same_major_minor, position_in_range,
-    ranges_overlap,
 };
 pub use parser::{DependencyInfo, DependencySource, LoadingState, ManifestParser, ParseResultInfo};
 pub use registry::{Metadata, Registry, Version, find_latest_stable};

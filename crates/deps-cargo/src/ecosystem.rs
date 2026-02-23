@@ -38,36 +38,9 @@ impl CargoEcosystem {
         }
     }
 
-    /// Completes package names by searching the crates.io registry.
-    ///
-    /// Requires at least 2 characters for search. Returns up to 20 results.
     async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
-        use deps_core::completion::build_package_completion;
-
-        // Security: reject too short or too long prefixes
-        if prefix.len() < 2 || prefix.len() > 100 {
-            return vec![];
-        }
-
-        // Search registry (limit to 20 results)
-        let results = match self.registry.search(prefix, 20).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Package search failed for '{}': {}", prefix, e);
-                return vec![];
-            }
-        };
-
-        // Use dummy range - completion will be inserted at cursor position
-        let insert_range = tower_lsp_server::ls_types::Range::default();
-
-        results
-            .into_iter()
-            .map(|metadata| {
-                let boxed: Box<dyn deps_core::Metadata> = Box::new(metadata);
-                build_package_completion(boxed.as_ref(), insert_range)
-            })
-            .collect()
+        deps_core::completion::complete_package_names_generic(self.registry.as_ref(), prefix, 20)
+            .await
     }
 
     async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
@@ -114,6 +87,8 @@ impl CargoEcosystem {
             .collect()
     }
 }
+
+impl deps_core::ecosystem::private::Sealed for CargoEcosystem {}
 
 impl Ecosystem for CargoEcosystem {
     fn id(&self) -> &'static str {
@@ -616,8 +591,8 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        // Prefix longer than 100 chars should return empty (security)
-        let long_prefix = "a".repeat(101);
+        // Prefix longer than 200 chars should return empty (security)
+        let long_prefix = "a".repeat(201);
         let results = ecosystem.complete_package_names(&long_prefix).await;
         assert!(results.is_empty());
 

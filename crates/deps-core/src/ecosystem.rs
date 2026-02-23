@@ -7,6 +7,10 @@ use tower_lsp_server::ls_types::{
 
 use crate::{Registry, lsp_helpers::EcosystemFormatter};
 
+pub mod private {
+    pub trait Sealed {}
+}
+
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Parse result trait containing dependencies and metadata.
@@ -104,7 +108,7 @@ impl Default for EcosystemConfig {
 ///
 /// struct MyFormatter;
 /// impl EcosystemFormatter for MyFormatter {
-///     fn format_version_for_code_action(&self, version: &str) -> String { version.to_string() }
+///     fn format_version_for_text_edit(&self, version: &str) -> String { version.to_string() }
 ///     fn package_url(&self, name: &str) -> String { format!("https://example.com/{name}") }
 /// }
 ///
@@ -112,6 +116,8 @@ impl Default for EcosystemConfig {
 ///     registry: Arc<dyn Registry>,
 ///     formatter: MyFormatter,
 /// }
+///
+/// impl deps_core::ecosystem::private::Sealed for MyEcosystem {}
 ///
 /// impl Ecosystem for MyEcosystem {
 ///     fn id(&self) -> &'static str { "my-ecosystem" }
@@ -142,7 +148,7 @@ impl Default for EcosystemConfig {
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
 /// ```
-pub trait Ecosystem: Send + Sync {
+pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Unique identifier (e.g., "cargo", "npm", "pypi")
     ///
     /// This identifier is used for ecosystem registration and routing.

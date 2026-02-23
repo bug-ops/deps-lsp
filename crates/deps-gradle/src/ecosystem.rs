@@ -150,6 +150,8 @@ fn detect_dsl_context<'a>(before_cursor: &str, line: &'a str) -> (&'static str, 
     }
 }
 
+impl deps_core::ecosystem::private::Sealed for GradleEcosystem {}
+
 impl Ecosystem for GradleEcosystem {
     fn id(&self) -> &'static str {
         "gradle"

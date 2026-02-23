@@ -14,7 +14,7 @@ impl EcosystemFormatter for PypiFormatter {
         name.to_lowercase().replace('-', "_")
     }
 
-    fn format_version_for_code_action(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &str) -> String {
         let next_major = version
             .split('.')
             .next()
@@ -78,15 +78,15 @@ mod tests {
     fn test_format_version() {
         let formatter = PypiFormatter;
         assert_eq!(
-            formatter.format_version_for_code_action("1.2.3"),
+            formatter.format_version_for_text_edit("1.2.3"),
             ">=1.2.3,<2"
         );
         assert_eq!(
-            formatter.format_version_for_code_action("2.28.0"),
+            formatter.format_version_for_text_edit("2.28.0"),
             ">=2.28.0,<3"
         );
         assert_eq!(
-            formatter.format_version_for_code_action("0.1.0"),
+            formatter.format_version_for_text_edit("0.1.0"),
             ">=0.1.0,<1"
         );
     }
@@ -96,7 +96,7 @@ mod tests {
         let formatter = PypiFormatter;
         // u32::MAX should not overflow, checked_add returns None
         assert_eq!(
-            formatter.format_version_for_code_action("4294967295.0.0"),
+            formatter.format_version_for_text_edit("4294967295.0.0"),
             ">=4294967295.0.0,<1"
         );
     }

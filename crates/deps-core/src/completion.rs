@@ -695,10 +695,8 @@ mod tests {
         }
 
         fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
-            // Create a dummy URL for testing
-            static URL_STR: &str = "file:///test/Cargo.toml";
-            static URL: once_cell::sync::Lazy<tower_lsp_server::ls_types::Uri> =
-                once_cell::sync::Lazy::new(|| URL_STR.parse().unwrap());
+            static URL: std::sync::LazyLock<tower_lsp_server::ls_types::Uri> =
+                std::sync::LazyLock::new(|| "file:///test/Cargo.toml".parse().unwrap());
             &URL
         }
 
