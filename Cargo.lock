@@ -461,6 +461,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "deps-composer"
+version = "0.8.0"
+dependencies = [
+ "deps-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower-lsp-server",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
 name = "deps-core"
 version = "0.8.0"
 dependencies = [
@@ -548,6 +563,7 @@ dependencies = [
  "dashmap",
  "deps-bundler",
  "deps-cargo",
+ "deps-composer",
  "deps-core",
  "deps-dart",
  "deps-go",

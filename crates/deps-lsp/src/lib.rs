@@ -168,6 +168,21 @@ ecosystem!(
     ]
 );
 
+ecosystem!(
+    "composer",
+    deps_composer,
+    ComposerEcosystem,
+    [
+        ComposerDependency,
+        ComposerSection,
+        ComposerPackage,
+        ComposerParseResult,
+        PackagistRegistry,
+        ComposerVersion,
+        parse_composer_json,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
     register!("cargo", CargoEcosystem, registry, &cache);
@@ -179,6 +194,7 @@ pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) 
     register!("maven", MavenEcosystem, registry, &cache);
     register!("gradle", GradleEcosystem, registry, &cache);
     register!("swift", SwiftEcosystem, registry, &cache);
+    register!("composer", ComposerEcosystem, registry, &cache);
 }
 
 #[cfg(test)]
@@ -205,5 +221,7 @@ mod tests {
         assert!(registry.get("dart").is_some());
         #[cfg(feature = "maven")]
         assert!(registry.get("maven").is_some());
+        #[cfg(feature = "composer")]
+        assert!(registry.get("composer").is_some());
     }
 }
