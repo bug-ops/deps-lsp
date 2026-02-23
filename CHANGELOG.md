@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Swift/SPM ecosystem support** — New `deps-swift` crate with full Package.swift and Package.resolved support
+  - Regex-based Package.swift parser covering all 9 `.package()` call signatures (from, upToNextMajor, upToNextMinor, exact, half-open range, closed range, branch, revision, path)
+  - Comment stripping with byte-offset preservation for accurate LSP positions
+  - Multiline `.package()` call support
+  - GitHub API registry — version resolution via repository tags, package search via GitHub Search API
+  - Package identity as `owner/repo` extracted from Git URLs
+  - Version requirements normalized to semver ranges at parse time
+  - Package.resolved lockfile support for all 3 schema versions (v1, v2, v3)
+  - Owner/repo validation to prevent URL injection in GitHub API calls
+  - Feature-gated registration in deps-lsp (`swift`)
+
 ## [0.8.0] - 2026-02-23
 
 ### Added
