@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Parses `[versions]`, `[libraries]` sections with `version.ref` resolution
   - Recognizes all Gradle configurations: implementation, api, compileOnly, runtimeOnly, testImplementation, etc.
   - Feature-gated registration in deps-lsp (`gradle`)
+- **Gradle variable resolution** — `$var` and `${var}` in `build.gradle`/`build.gradle.kts` resolved from `gradle.properties` (walks parent directories)
+- **settings.gradle parsing** — Extract plugin dependencies from `pluginManagement { plugins { } }` blocks (Groovy and Kotlin DSL)
 - **Google Maven repository support** — Android packages (`androidx.*`, `com.google.firebase.*`, `com.google.android.*`, `com.android.*`) now resolve from Google Maven instead of Maven Central
 
 ### Changed
