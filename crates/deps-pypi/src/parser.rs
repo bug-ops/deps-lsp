@@ -445,7 +445,11 @@ impl PypiParser {
                         ),
                     )
                 });
-                (Some(version_str), version_range, PypiDependencySource::PyPI)
+                (
+                    Some(version_str),
+                    version_range,
+                    PypiDependencySource::Registry,
+                )
             }
             Some(VersionOrUrl::Url(url)) => {
                 let url_str = url.to_string();
@@ -461,10 +465,10 @@ impl PypiParser {
                 } else if url_str.ends_with(".whl") || url_str.ends_with(".tar.gz") {
                     (None, None, PypiDependencySource::Url { url: url_str })
                 } else {
-                    (None, None, PypiDependencySource::PyPI)
+                    (None, None, PypiDependencySource::Registry)
                 }
             }
-            None => (None, None, PypiDependencySource::PyPI),
+            None => (None, None, PypiDependencySource::Registry),
         };
 
         let extras: Vec<String> = requirement
@@ -532,7 +536,7 @@ impl PypiParser {
                 markers: None,
                 markers_range: None,
                 section: PypiDependencySection::PoetryDependencies,
-                source: PypiDependencySource::PyPI,
+                source: PypiDependencySource::Registry,
             });
         }
 
@@ -583,7 +587,7 @@ impl PypiParser {
                         .to_string(),
                 }
             } else {
-                PypiDependencySource::PyPI
+                PypiDependencySource::Registry
             };
 
             return Ok(PypiDependency {
@@ -658,18 +662,7 @@ impl deps_core::DependencyInfo for PypiDependency {
     }
 
     fn source(&self) -> deps_core::DependencySource {
-        match &self.source {
-            PypiDependencySource::PyPI => deps_core::DependencySource::Registry,
-            PypiDependencySource::Git { url, rev } => deps_core::DependencySource::Git {
-                url: url.clone(),
-                rev: rev.clone(),
-            },
-            PypiDependencySource::Path { path } => {
-                deps_core::DependencySource::Path { path: path.clone() }
-            }
-            // URL dependencies are treated as Registry since they're still remote packages
-            PypiDependencySource::Url { .. } => deps_core::DependencySource::Registry,
-        }
+        self.source.clone()
     }
 
     fn features(&self) -> &[String] {

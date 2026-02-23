@@ -7,7 +7,7 @@ use deps_core::lsp_helpers::EcosystemFormatter;
 pub struct BundlerFormatter;
 
 impl EcosystemFormatter for BundlerFormatter {
-    fn format_version_for_code_action(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &str) -> String {
         format!("'{version}'")
     }
 
@@ -27,8 +27,8 @@ mod tests {
     #[test]
     fn test_format_version() {
         let formatter = BundlerFormatter;
-        assert_eq!(formatter.format_version_for_code_action("7.0.8"), "'7.0.8'");
-        assert_eq!(formatter.format_version_for_code_action("1.0.0"), "'1.0.0'");
+        assert_eq!(formatter.format_version_for_text_edit("7.0.8"), "'7.0.8'");
+        assert_eq!(formatter.format_version_for_text_edit("1.0.0"), "'1.0.0'");
     }
 
     #[test]

@@ -16,28 +16,7 @@ pub struct BundlerDependency {
     pub require: Option<String>,
 }
 
-/// Source location of a dependency.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DependencySource {
-    /// Default rubygems.org registry
-    Registry,
-    /// Git repository
-    Git {
-        url: String,
-        branch: Option<String>,
-        tag: Option<String>,
-        ref_: Option<String>,
-    },
-    /// Local filesystem path
-    Path { path: String },
-    /// GitHub shorthand (e.g., "rails/rails")
-    Github {
-        repo: String,
-        branch: Option<String>,
-    },
-    /// Custom gem source
-    Source { name: String, url: String },
-}
+pub use deps_core::parser::DependencySource;
 
 /// Gem group classification.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -106,21 +85,7 @@ impl deps_core::DependencyInfo for BundlerDependency {
     }
 
     fn source(&self) -> deps_core::parser::DependencySource {
-        match &self.source {
-            DependencySource::Registry => deps_core::parser::DependencySource::Registry,
-            DependencySource::Git { url, ref_, .. } => deps_core::parser::DependencySource::Git {
-                url: url.clone(),
-                rev: ref_.clone(),
-            },
-            DependencySource::Path { path } => {
-                deps_core::parser::DependencySource::Path { path: path.clone() }
-            }
-            DependencySource::Github { repo, .. } => deps_core::parser::DependencySource::Git {
-                url: format!("https://github.com/{repo}"),
-                rev: None,
-            },
-            DependencySource::Source { .. } => deps_core::parser::DependencySource::Registry,
-        }
+        self.source.clone()
     }
 
     fn features(&self) -> &[String] {
@@ -146,21 +111,7 @@ impl deps_core::Dependency for BundlerDependency {
     }
 
     fn source(&self) -> deps_core::parser::DependencySource {
-        match &self.source {
-            DependencySource::Registry => deps_core::parser::DependencySource::Registry,
-            DependencySource::Git { url, ref_, .. } => deps_core::parser::DependencySource::Git {
-                url: url.clone(),
-                rev: ref_.clone(),
-            },
-            DependencySource::Path { path } => {
-                deps_core::parser::DependencySource::Path { path: path.clone() }
-            }
-            DependencySource::Github { repo, .. } => deps_core::parser::DependencySource::Git {
-                url: format!("https://github.com/{repo}"),
-                rev: None,
-            },
-            DependencySource::Source { .. } => deps_core::parser::DependencySource::Registry,
-        }
+        self.source.clone()
     }
 
     fn features(&self) -> &[String] {
@@ -195,27 +146,19 @@ mod tests {
         let registry = DependencySource::Registry;
         let git = DependencySource::Git {
             url: "https://github.com/rails/rails".into(),
-            branch: Some("main".into()),
-            tag: None,
-            ref_: None,
+            rev: Some("main".into()),
         };
         let path = DependencySource::Path {
             path: "../local".into(),
         };
-        let github = DependencySource::Github {
-            repo: "rails/rails".into(),
-            branch: None,
-        };
-        let source = DependencySource::Source {
-            name: "custom".into(),
+        let custom = DependencySource::CustomRegistry {
             url: "https://custom.gem.source".into(),
         };
 
-        assert!(matches!(registry, DependencySource::Registry));
-        assert!(matches!(git, DependencySource::Git { .. }));
-        assert!(matches!(path, DependencySource::Path { .. }));
-        assert!(matches!(github, DependencySource::Github { .. }));
-        assert!(matches!(source, DependencySource::Source { .. }));
+        assert!(registry.is_registry());
+        assert!(!git.is_registry());
+        assert!(!path.is_registry());
+        assert!(custom.is_registry());
     }
 
     #[test]
@@ -311,10 +254,7 @@ mod tests {
         assert_eq!(dep.version_requirement(), Some("~> 1.0"));
         assert!(dep.version_range().is_some());
         assert!(dep.features().is_empty());
-        assert!(matches!(
-            dep.source(),
-            deps_core::parser::DependencySource::Registry
-        ));
+        assert!(dep.source().is_registry());
     }
 
     #[test]
@@ -323,9 +263,7 @@ mod tests {
 
         let dep = create_test_dependency(DependencySource::Git {
             url: "https://github.com/rails/rails".into(),
-            branch: Some("main".into()),
-            tag: None,
-            ref_: Some("abc123".into()),
+            rev: Some("abc123".into()),
         });
 
         match dep.source() {
@@ -354,36 +292,14 @@ mod tests {
     }
 
     #[test]
-    fn test_dependency_info_trait_github() {
-        use deps_core::DependencyInfo;
-
-        let dep = create_test_dependency(DependencySource::Github {
-            repo: "rails/rails".into(),
-            branch: Some("main".into()),
-        });
-
-        match dep.source() {
-            deps_core::parser::DependencySource::Git { url, rev } => {
-                assert_eq!(url, "https://github.com/rails/rails");
-                assert_eq!(rev, None);
-            }
-            _ => panic!("Expected Git source"),
-        }
-    }
-
-    #[test]
     fn test_dependency_info_trait_custom_source() {
         use deps_core::DependencyInfo;
 
-        let dep = create_test_dependency(DependencySource::Source {
-            name: "private".into(),
+        let dep = create_test_dependency(DependencySource::CustomRegistry {
             url: "https://gems.example.com".into(),
         });
 
-        assert!(matches!(
-            dep.source(),
-            deps_core::parser::DependencySource::Registry
-        ));
+        assert!(dep.source().is_registry());
     }
 
     #[test]
@@ -404,19 +320,12 @@ mod tests {
             DependencySource::Registry,
             DependencySource::Git {
                 url: "https://github.com/test/repo".into(),
-                branch: None,
-                tag: Some("v1.0".into()),
-                ref_: None,
+                rev: Some("v1.0".into()),
             },
             DependencySource::Path {
                 path: "./local".into(),
             },
-            DependencySource::Github {
-                repo: "test/repo".into(),
-                branch: None,
-            },
-            DependencySource::Source {
-                name: "custom".into(),
+            DependencySource::CustomRegistry {
                 url: "https://custom.example.com".into(),
             },
         ];

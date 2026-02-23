@@ -3,7 +3,7 @@ use deps_core::lsp_helpers::EcosystemFormatter;
 pub struct CargoFormatter;
 
 impl EcosystemFormatter for CargoFormatter {
-    fn format_version_for_code_action(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &str) -> String {
         format!("\"{version}\"")
     }
 
@@ -20,13 +20,10 @@ mod tests {
     fn test_format_version() {
         let formatter = CargoFormatter;
         assert_eq!(
-            formatter.format_version_for_code_action("1.0.214"),
+            formatter.format_version_for_text_edit("1.0.214"),
             "\"1.0.214\""
         );
-        assert_eq!(
-            formatter.format_version_for_code_action("0.1.0"),
-            "\"0.1.0\""
-        );
+        assert_eq!(formatter.format_version_for_text_edit("0.1.0"), "\"0.1.0\"");
     }
 
     #[test]

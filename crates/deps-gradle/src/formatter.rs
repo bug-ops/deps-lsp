@@ -5,7 +5,7 @@ use deps_core::lsp_helpers::EcosystemFormatter;
 pub struct GradleFormatter;
 
 impl EcosystemFormatter for GradleFormatter {
-    fn format_version_for_code_action(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &str) -> String {
         version.to_string()
     }
 
@@ -25,9 +25,9 @@ mod tests {
     #[test]
     fn test_format_version() {
         let f = GradleFormatter;
-        assert_eq!(f.format_version_for_code_action("3.2.0"), "3.2.0");
+        assert_eq!(f.format_version_for_text_edit("3.2.0"), "3.2.0");
         assert_eq!(
-            f.format_version_for_code_action("1.0.0-SNAPSHOT"),
+            f.format_version_for_text_edit("1.0.0-SNAPSHOT"),
             "1.0.0-SNAPSHOT"
         );
     }

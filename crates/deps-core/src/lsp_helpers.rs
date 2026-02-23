@@ -60,14 +60,6 @@ impl LineOffsetTable {
     }
 }
 
-/// Checks if a position overlaps with a range (inclusive start, exclusive end).
-pub fn ranges_overlap(range: Range, position: Position) -> bool {
-    !(range.end.line < position.line
-        || (range.end.line == position.line && range.end.character <= position.character)
-        || position.line < range.start.line
-        || (position.line == range.start.line && position.character < range.start.character))
-}
-
 /// Checks if two version strings have the same major and minor version.
 pub fn is_same_major_minor(v1: &str, v2: &str) -> bool {
     if v1.is_empty() || v2.is_empty() {
@@ -95,7 +87,7 @@ pub trait EcosystemFormatter: Send + Sync {
     }
 
     /// Format version string for code action text edit.
-    fn format_version_for_code_action(&self, version: &str) -> String;
+    fn format_version_for_text_edit(&self, version: &str) -> String;
 
     /// Check if a version satisfies a requirement string.
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -154,7 +146,7 @@ pub trait EcosystemFormatter: Send + Sync {
     /// Detect if cursor position is on a dependency for code actions.
     fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
         dep.version_range()
-            .is_some_and(|r| ranges_overlap(r, position))
+            .is_some_and(|r| position_in_range(position, r))
     }
 }
 
@@ -273,10 +265,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     use std::fmt::Write;
 
     let dep = parse_result.dependencies().into_iter().find(|d| {
-        let on_name = ranges_overlap(d.name_range(), position);
+        let on_name = position_in_range(position, d.name_range());
         let on_version = d
             .version_range()
-            .is_some_and(|r| ranges_overlap(r, position));
+            .is_some_and(|r| position_in_range(position, r));
         on_name || on_version
     })?;
 
@@ -364,7 +356,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     let display_items = prepare_version_display_items(&versions, dep.name());
 
     for item in display_items {
-        let new_text = formatter.format_version_for_code_action(&item.version);
+        let new_text = formatter.format_version_for_text_edit(&item.version);
 
         let mut edits = HashMap::new();
         edits.insert(
@@ -531,59 +523,59 @@ mod tests {
     use std::any::Any;
 
     #[test]
-    fn test_ranges_overlap_inside() {
+    fn test_position_in_range_inside() {
         let range = Range::new(Position::new(5, 10), Position::new(5, 20));
         let position = Position::new(5, 15);
-        assert!(ranges_overlap(range, position));
+        assert!(position_in_range(position, range));
     }
 
     #[test]
-    fn test_ranges_overlap_at_start() {
+    fn test_position_in_range_at_start() {
         let range = Range::new(Position::new(5, 10), Position::new(5, 20));
         let position = Position::new(5, 10);
-        assert!(ranges_overlap(range, position));
+        assert!(position_in_range(position, range));
     }
 
     #[test]
-    fn test_ranges_overlap_at_end() {
+    fn test_position_in_range_at_end() {
         let range = Range::new(Position::new(5, 10), Position::new(5, 20));
         let position = Position::new(5, 20);
-        assert!(!ranges_overlap(range, position));
+        assert!(position_in_range(position, range));
     }
 
     #[test]
-    fn test_ranges_overlap_before() {
+    fn test_position_in_range_before() {
         let range = Range::new(Position::new(5, 10), Position::new(5, 20));
         let position = Position::new(5, 5);
-        assert!(!ranges_overlap(range, position));
+        assert!(!position_in_range(position, range));
     }
 
     #[test]
-    fn test_ranges_overlap_after() {
+    fn test_position_in_range_after() {
         let range = Range::new(Position::new(5, 10), Position::new(5, 20));
         let position = Position::new(5, 25);
-        assert!(!ranges_overlap(range, position));
+        assert!(!position_in_range(position, range));
     }
 
     #[test]
-    fn test_ranges_overlap_different_line_before() {
+    fn test_position_in_range_different_line_before() {
         let range = Range::new(Position::new(5, 10), Position::new(5, 20));
         let position = Position::new(4, 15);
-        assert!(!ranges_overlap(range, position));
+        assert!(!position_in_range(position, range));
     }
 
     #[test]
-    fn test_ranges_overlap_different_line_after() {
+    fn test_position_in_range_different_line_after() {
         let range = Range::new(Position::new(5, 10), Position::new(5, 20));
         let position = Position::new(6, 15);
-        assert!(!ranges_overlap(range, position));
+        assert!(!position_in_range(position, range));
     }
 
     #[test]
-    fn test_ranges_overlap_multiline() {
+    fn test_position_in_range_multiline() {
         let range = Range::new(Position::new(5, 10), Position::new(7, 5));
         let position = Position::new(6, 0);
-        assert!(ranges_overlap(range, position));
+        assert!(position_in_range(position, range));
     }
 
     #[test]
@@ -628,7 +620,7 @@ mod tests {
     struct MockFormatter;
 
     impl EcosystemFormatter for MockFormatter {
-        fn format_version_for_code_action(&self, version: &str) -> String {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
             format!("\"{}\"", version)
         }
 
@@ -718,7 +710,7 @@ mod tests {
                 name.to_lowercase().replace('-', "_")
             }
 
-            fn format_version_for_code_action(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
                 format!(
                     ">={},<{}",
                     version,
@@ -737,7 +729,7 @@ mod tests {
             "test_package"
         );
         assert_eq!(
-            formatter.format_version_for_code_action("1.2.3"),
+            formatter.format_version_for_text_edit("1.2.3"),
             ">=1.2.3,<1"
         );
         assert_eq!(

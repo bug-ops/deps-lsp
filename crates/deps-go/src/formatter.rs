@@ -9,7 +9,7 @@ use deps_core::lsp_helpers::EcosystemFormatter;
 pub struct GoFormatter;
 
 impl EcosystemFormatter for GoFormatter {
-    fn format_version_for_code_action(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &str) -> String {
         // Go versions in go.mod are unquoted: v1.2.3
         // Return version as-is since it should already have "v" prefix from registry
         version.to_string()
@@ -52,21 +52,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_version_for_code_action() {
+    fn test_format_version_for_text_edit() {
         let formatter = GoFormatter;
 
         // Standard semantic version
-        assert_eq!(formatter.format_version_for_code_action("v1.2.3"), "v1.2.3");
+        assert_eq!(formatter.format_version_for_text_edit("v1.2.3"), "v1.2.3");
 
         // Pseudo-version
         assert_eq!(
-            formatter.format_version_for_code_action("v0.0.0-20191109021931-daa7c04131f5"),
+            formatter.format_version_for_text_edit("v0.0.0-20191109021931-daa7c04131f5"),
             "v0.0.0-20191109021931-daa7c04131f5"
         );
 
         // Version with +incompatible
         assert_eq!(
-            formatter.format_version_for_code_action("v2.0.0+incompatible"),
+            formatter.format_version_for_text_edit("v2.0.0+incompatible"),
             "v2.0.0+incompatible"
         );
     }

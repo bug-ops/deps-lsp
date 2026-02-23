@@ -3,7 +3,7 @@ use deps_core::lsp_helpers::EcosystemFormatter;
 pub struct NpmFormatter;
 
 impl EcosystemFormatter for NpmFormatter {
-    fn format_version_for_code_action(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &str) -> String {
         version.to_string()
     }
 
@@ -28,11 +28,8 @@ mod tests {
     fn test_format_version() {
         let formatter = NpmFormatter;
         // Version should not include quotes - parser's version_range excludes them
-        assert_eq!(
-            formatter.format_version_for_code_action("1.0.214"),
-            "1.0.214"
-        );
-        assert_eq!(formatter.format_version_for_code_action("18.3.1"), "18.3.1");
+        assert_eq!(formatter.format_version_for_text_edit("1.0.214"), "1.0.214");
+        assert_eq!(formatter.format_version_for_text_edit("18.3.1"), "18.3.1");
     }
 
     #[test]

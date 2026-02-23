@@ -23,7 +23,7 @@ use tower_lsp_server::ls_types::Range;
 ///     markers: Some("python_version>='3.8'".into()),
 ///     markers_range: None,
 ///     section: PypiDependencySection::Dependencies,
-///     source: PypiDependencySource::PyPI,
+///     source: PypiDependencySource::Registry,
 /// };
 ///
 /// assert_eq!(dep.name, "requests");
@@ -86,39 +86,7 @@ pub enum PypiDependencySection {
     PoetryGroup { group: String },
 }
 
-/// Source location of a Python dependency.
-///
-/// Python dependencies can come from PyPI, Git repositories, local paths, or direct URLs.
-/// This affects how the LSP server resolves version information and provides completions.
-///
-/// # Examples
-///
-/// ```
-/// use deps_pypi::types::PypiDependencySource;
-///
-/// let pypi = PypiDependencySource::PyPI;
-/// let git = PypiDependencySource::Git {
-///     url: "https://github.com/psf/requests.git".into(),
-///     rev: Some("v2.28.0".into()),
-/// };
-/// let path = PypiDependencySource::Path {
-///     path: "../local-package".into(),
-/// };
-/// let url = PypiDependencySource::Url {
-///     url: "https://example.com/package.whl".into(),
-/// };
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PypiDependencySource {
-    /// Dependency from PyPI registry
-    PyPI,
-    /// Dependency from Git repository
-    Git { url: String, rev: Option<String> },
-    /// Dependency from local filesystem path
-    Path { path: String },
-    /// Dependency from direct URL (wheel or source archive)
-    Url { url: String },
-}
+pub use deps_core::parser::DependencySource as PypiDependencySource;
 
 /// Version information for a package from PyPI.
 ///
@@ -236,17 +204,7 @@ impl deps_core::Dependency for PypiDependency {
     }
 
     fn source(&self) -> deps_core::parser::DependencySource {
-        match &self.source {
-            PypiDependencySource::PyPI => deps_core::parser::DependencySource::Registry,
-            PypiDependencySource::Git { url, rev } => deps_core::parser::DependencySource::Git {
-                url: url.clone(),
-                rev: rev.clone(),
-            },
-            PypiDependencySource::Path { path } => {
-                deps_core::parser::DependencySource::Path { path: path.clone() }
-            }
-            PypiDependencySource::Url { .. } => deps_core::parser::DependencySource::Registry,
-        }
+        self.source.clone()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -312,7 +270,7 @@ mod tests {
             markers: Some("python_version>='3.9'".into()),
             markers_range: None,
             section: PypiDependencySection::Dependencies,
-            source: PypiDependencySource::PyPI,
+            source: PypiDependencySource::Registry,
         };
 
         assert_eq!(dep.name, "flask");
@@ -355,7 +313,7 @@ mod tests {
 
     #[test]
     fn test_dependency_source_variants() {
-        let pypi = PypiDependencySource::PyPI;
+        let registry = PypiDependencySource::Registry;
         let git = PypiDependencySource::Git {
             url: "https://github.com/user/repo.git".into(),
             rev: Some("main".into()),
@@ -367,10 +325,10 @@ mod tests {
             url: "https://example.com/package.whl".into(),
         };
 
-        assert!(matches!(pypi, PypiDependencySource::PyPI));
+        assert!(registry.is_registry());
         assert!(matches!(git, PypiDependencySource::Git { .. }));
         assert!(matches!(path, PypiDependencySource::Path { .. }));
-        assert!(matches!(url, PypiDependencySource::Url { .. }));
+        assert!(!url.is_registry());
     }
 
     #[test]

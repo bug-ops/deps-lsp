@@ -11,6 +11,9 @@ pub struct DartDependency {
     pub version_range: Option<Range>,
     pub section: DependencySection,
     pub source: DependencySource,
+    /// Dart-specific Git sub-path (e.g., `path: packages/pkg` inside a repo).
+    /// Only meaningful when `source` is `DependencySource::Git`.
+    pub git_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -21,22 +24,7 @@ pub enum DependencySection {
     DependencyOverrides,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum DependencySource {
-    #[default]
-    Hosted,
-    Git {
-        url: String,
-        ref_: Option<String>,
-        path: Option<String>,
-    },
-    Path {
-        path: String,
-    },
-    Sdk {
-        sdk: String,
-    },
-}
+pub use deps_core::parser::DependencySource;
 
 #[derive(Debug, Clone)]
 pub struct DartVersion {
@@ -58,22 +46,6 @@ pub struct PackageInfo {
 
 // deps-core trait implementations
 
-impl DartDependency {
-    fn core_source(&self) -> deps_core::parser::DependencySource {
-        match &self.source {
-            DependencySource::Hosted => deps_core::parser::DependencySource::Registry,
-            DependencySource::Git { url, ref_, .. } => deps_core::parser::DependencySource::Git {
-                url: url.clone(),
-                rev: ref_.clone(),
-            },
-            DependencySource::Path { path } => {
-                deps_core::parser::DependencySource::Path { path: path.clone() }
-            }
-            DependencySource::Sdk { .. } => deps_core::parser::DependencySource::Registry,
-        }
-    }
-}
-
 impl deps_core::DependencyInfo for DartDependency {
     fn name(&self) -> &str {
         &self.name
@@ -92,7 +64,7 @@ impl deps_core::DependencyInfo for DartDependency {
     }
 
     fn source(&self) -> deps_core::parser::DependencySource {
-        self.core_source()
+        self.source.clone()
     }
 
     fn features(&self) -> &[String] {
@@ -118,7 +90,7 @@ impl deps_core::Dependency for DartDependency {
     }
 
     fn source(&self) -> deps_core::parser::DependencySource {
-        self.core_source()
+        self.source.clone()
     }
 
     fn features(&self) -> &[String] {
@@ -143,17 +115,20 @@ mod tests {
             version_range: Some(Range::new(Position::new(5, 16), Position::new(5, 22))),
             section: DependencySection::Dependencies,
             source,
+            git_path: None,
         }
     }
 
     #[test]
     fn test_dependency_source_variants() {
-        assert!(matches!(DependencySource::Hosted, DependencySource::Hosted));
+        assert!(matches!(
+            DependencySource::Registry,
+            DependencySource::Registry
+        ));
         assert!(matches!(
             DependencySource::Git {
                 url: "u".into(),
-                ref_: None,
-                path: None
+                rev: None
             },
             DependencySource::Git { .. }
         ));
@@ -181,20 +156,27 @@ mod tests {
     fn test_dependency_trait() {
         use deps_core::Dependency;
 
-        let dep = test_dep(DependencySource::Hosted);
+        let dep = test_dep(DependencySource::Registry);
         assert_eq!(dep.name(), "flutter_bloc");
         assert_eq!(dep.version_requirement(), Some("^8.1.0"));
         assert!(dep.as_any().is::<DartDependency>());
     }
 
     #[test]
-    fn test_dependency_info_source_hosted() {
+    fn test_dependency_info_source_registry() {
         use deps_core::DependencyInfo;
-        let dep = test_dep(DependencySource::Hosted);
-        assert!(matches!(
-            dep.source(),
-            deps_core::parser::DependencySource::Registry
-        ));
+        let dep = test_dep(DependencySource::Registry);
+        assert!(dep.source().is_registry());
+    }
+
+    #[test]
+    fn test_dependency_info_source_sdk() {
+        use deps_core::DependencyInfo;
+        let dep = test_dep(DependencySource::Sdk {
+            sdk: "flutter".into(),
+        });
+        assert!(!dep.source().is_registry());
+        assert!(matches!(dep.source(), DependencySource::Sdk { sdk } if sdk == "flutter"));
     }
 
     #[test]
@@ -202,8 +184,7 @@ mod tests {
         use deps_core::DependencyInfo;
         let dep = test_dep(DependencySource::Git {
             url: "https://github.com/test/repo".into(),
-            ref_: Some("main".into()),
-            path: None,
+            rev: Some("main".into()),
         });
         match dep.source() {
             deps_core::parser::DependencySource::Git { url, rev } => {
@@ -226,18 +207,6 @@ mod tests {
             }
             _ => panic!("Expected Path source"),
         }
-    }
-
-    #[test]
-    fn test_dependency_info_source_sdk() {
-        use deps_core::DependencyInfo;
-        let dep = test_dep(DependencySource::Sdk {
-            sdk: "flutter".into(),
-        });
-        assert!(matches!(
-            dep.source(),
-            deps_core::parser::DependencySource::Registry
-        ));
     }
 
     #[test]
@@ -309,7 +278,8 @@ mod tests {
             version_req: None,
             version_range: None,
             section: DependencySection::Dependencies,
-            source: DependencySource::Hosted,
+            source: DependencySource::Registry,
+            git_path: None,
         };
         assert!(dep.version_requirement().is_none());
         assert!(dep.version_range().is_none());

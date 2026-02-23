@@ -84,7 +84,7 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
         if let Yaml::Hash(map) = &doc[*key] {
             for (name_yaml, value) in map {
                 if let Some(name) = name_yaml.as_str() {
-                    let (name_range, version_req, version_range, source) =
+                    let (name_range, version_req, version_range, source, git_path) =
                         parse_dependency_entry(name, value, content, &line_table);
 
                     dependencies.push(DartDependency {
@@ -94,6 +94,7 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
                         version_range,
                         section: section.clone(),
                         source,
+                        git_path,
                     });
                 }
             }
@@ -112,7 +113,13 @@ fn parse_dependency_entry(
     value: &Yaml,
     content: &str,
     line_table: &LineOffsetTable,
-) -> (Range, Option<String>, Option<Range>, DependencySource) {
+) -> (
+    Range,
+    Option<String>,
+    Option<Range>,
+    DependencySource,
+    Option<String>,
+) {
     let name_range = find_key_range(name, content, line_table);
 
     match value {
@@ -123,14 +130,16 @@ fn parse_dependency_entry(
                 name_range,
                 Some(ver.clone()),
                 version_range,
-                DependencySource::Hosted,
+                DependencySource::Registry,
+                None,
             )
         }
         // Map form
         Yaml::Hash(map) => {
             let mut version_req = None;
             let mut version_range = None;
-            let mut source = DependencySource::Hosted;
+            let mut source = DependencySource::Registry;
+            let mut git_path = None;
 
             if let Some(Yaml::String(ver)) = map.get(&Yaml::String("version".into())) {
                 version_req = Some(ver.clone());
@@ -138,33 +147,38 @@ fn parse_dependency_entry(
             }
 
             if let Some(git_val) = map.get(&Yaml::String("git".into())) {
-                source = parse_git_source(git_val);
+                let (git_source, extracted_path) = parse_git_source(git_val);
+                source = git_source;
+                git_path = extracted_path;
             } else if let Some(Yaml::String(path)) = map.get(&Yaml::String("path".into())) {
                 source = DependencySource::Path { path: path.clone() };
             } else if let Some(Yaml::String(sdk)) = map.get(&Yaml::String("sdk".into())) {
                 source = DependencySource::Sdk { sdk: sdk.clone() };
             }
 
-            (name_range, version_req, version_range, source)
+            (name_range, version_req, version_range, source, git_path)
         }
-        _ => (name_range, None, None, DependencySource::Hosted),
+        _ => (name_range, None, None, DependencySource::Registry, None),
     }
 }
 
-fn parse_git_source(git_val: &Yaml) -> DependencySource {
+/// Returns `(DependencySource, git_subpath)`.
+fn parse_git_source(git_val: &Yaml) -> (DependencySource, Option<String>) {
     match git_val {
-        Yaml::String(url) => DependencySource::Git {
-            url: url.clone(),
-            ref_: None,
-            path: None,
-        },
+        Yaml::String(url) => (
+            DependencySource::Git {
+                url: url.clone(),
+                rev: None,
+            },
+            None,
+        ),
         Yaml::Hash(map) => {
             let url = map
                 .get(&Yaml::String("url".into()))
                 .and_then(Yaml::as_str)
                 .unwrap_or("")
                 .to_string();
-            let ref_ = map
+            let rev = map
                 .get(&Yaml::String("ref".into()))
                 .and_then(Yaml::as_str)
                 .map(String::from);
@@ -172,9 +186,9 @@ fn parse_git_source(git_val: &Yaml) -> DependencySource {
                 .get(&Yaml::String("path".into()))
                 .and_then(Yaml::as_str)
                 .map(String::from);
-            DependencySource::Git { url, ref_, path }
+            (DependencySource::Git { url, rev }, path)
         }
-        _ => DependencySource::Hosted,
+        _ => (DependencySource::Registry, None),
     }
 }
 
@@ -304,13 +318,16 @@ dependencies:
         let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         match &result.dependencies[0].source {
-            DependencySource::Git { url, ref_, path } => {
+            DependencySource::Git { url, rev } => {
                 assert_eq!(url, "https://github.com/user/repo.git");
-                assert_eq!(ref_, &Some("main".into()));
-                assert_eq!(path, &Some("packages/my_pkg".into()));
+                assert_eq!(rev, &Some("main".into()));
             }
             _ => panic!("Expected Git source"),
         }
+        assert_eq!(
+            result.dependencies[0].git_path,
+            Some("packages/my_pkg".into())
+        );
     }
 
     #[test]
@@ -388,13 +405,13 @@ dependencies:
 ";
         let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
         match &result.dependencies[0].source {
-            DependencySource::Git { url, ref_, path } => {
+            DependencySource::Git { url, rev } => {
                 assert_eq!(url, "https://github.com/user/repo.git");
-                assert!(ref_.is_none());
-                assert!(path.is_none());
+                assert!(rev.is_none());
             }
             _ => panic!("Expected Git source"),
         }
+        assert!(result.dependencies[0].git_path.is_none());
     }
 
     #[test]

@@ -34,32 +34,9 @@ impl BundlerEcosystem {
         }
     }
 
-    /// Completes gem names by searching rubygems.org.
     async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
-        use deps_core::completion::build_package_completion;
-
-        // Require at least 2 characters, max 100 for security
-        if prefix.len() < 2 || prefix.len() > 100 {
-            return vec![];
-        }
-
-        let results = match self.registry.search(prefix, 20).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("Gem search failed for '{}': {}", prefix, e);
-                return vec![];
-            }
-        };
-
-        let insert_range = tower_lsp_server::ls_types::Range::default();
-
-        results
-            .into_iter()
-            .map(|metadata| {
-                let boxed: Box<dyn deps_core::Metadata> = Box::new(metadata);
-                build_package_completion(boxed.as_ref(), insert_range)
-            })
-            .collect()
+        deps_core::completion::complete_package_names_generic(self.registry.as_ref(), prefix, 20)
+            .await
     }
 
     async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
@@ -72,6 +49,8 @@ impl BundlerEcosystem {
         .await
     }
 }
+
+impl deps_core::ecosystem::private::Sealed for BundlerEcosystem {}
 
 impl Ecosystem for BundlerEcosystem {
     fn id(&self) -> &'static str {
@@ -201,8 +180,8 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = BundlerEcosystem::new(cache);
 
-        // Prefix longer than 100 chars should return empty
-        let long_prefix = "a".repeat(101);
+        // Prefix longer than 200 chars should return empty
+        let long_prefix = "a".repeat(201);
         let results = ecosystem.complete_package_names(&long_prefix).await;
         assert!(results.is_empty());
     }
