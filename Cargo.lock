@@ -555,6 +555,7 @@ dependencies = [
  "deps-maven",
  "deps-npm",
  "deps-pypi",
+ "deps-swift",
  "futures",
  "insta",
  "mockito",
@@ -624,6 +625,25 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml-span",
+ "tower-lsp-server",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
+name = "deps-swift"
+version = "0.8.0"
+dependencies = [
+ "deps-core",
+ "insta",
+ "regex",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
  "tower-lsp-server",
  "tracing",
  "urlencoding",
