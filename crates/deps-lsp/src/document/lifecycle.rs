@@ -62,6 +62,8 @@ struct FetchResult {
     versions: HashMap<String, String>,
     /// Number of packages that failed to fetch (timeout or error)
     failed_count: usize,
+    /// First actionable error message (shown to user via `window/showMessage`)
+    first_error: Option<String>,
 }
 
 /// Fetches latest versions for multiple packages in parallel with progress reporting.
@@ -104,6 +106,7 @@ async fn fetch_latest_versions_parallel(
 
     let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first_error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let timeout = Duration::from_secs(timeout_secs);
 
     let results: Vec<_> = stream::iter(package_names)
@@ -111,6 +114,7 @@ async fn fetch_latest_versions_parallel(
             let registry = Arc::clone(&registry);
             let fetched = Arc::clone(&fetched);
             let failed = Arc::clone(&failed);
+            let first_error = Arc::clone(&first_error);
             let progress_sender = progress_sender.clone();
             async move {
                 let result =
@@ -128,6 +132,10 @@ async fn fetch_latest_versions_parallel(
                     Ok(Err(e)) => {
                         tracing::warn!(package = %name, error = %e, "fetch failed");
                         failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut fe = first_error.lock().unwrap_or_else(|p| p.into_inner());
+                        if fe.is_none() {
+                            *fe = Some(e.to_string());
+                        }
                         None
                     }
                     Err(_) => {
@@ -152,6 +160,7 @@ async fn fetch_latest_versions_parallel(
     FetchResult {
         versions: results.into_iter().flatten().collect(),
         failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
+        first_error: first_error.lock().unwrap_or_else(|p| p.into_inner()).take(),
     }
 }
 
@@ -298,14 +307,16 @@ pub async fn handle_document_open(
 
         // Notify user about failed packages
         if fetch_result.failed_count > 0 {
-            client_clone
-                .show_message(
-                    tower_lsp_server::ls_types::MessageType::WARNING,
-                    format!(
-                        "deps-lsp: {} package(s) failed to fetch (timeout or network error)",
-                        fetch_result.failed_count
-                    ),
+            let message = if let Some(err) = &fetch_result.first_error {
+                format!("deps-lsp: {err}")
+            } else {
+                format!(
+                    "deps-lsp: {} package(s) failed to fetch (timeout or network error)",
+                    fetch_result.failed_count
                 )
+            };
+            client_clone
+                .show_message(MessageType::WARNING, message)
                 .await;
         }
 
@@ -505,14 +516,16 @@ pub async fn handle_document_change(
 
         // Notify user about failed packages
         if fetch_result.failed_count > 0 {
-            client_clone
-                .show_message(
-                    tower_lsp_server::ls_types::MessageType::WARNING,
-                    format!(
-                        "deps-lsp: {} package(s) failed to fetch (timeout or network error)",
-                        fetch_result.failed_count
-                    ),
+            let message = if let Some(err) = &fetch_result.first_error {
+                format!("deps-lsp: {err}")
+            } else {
+                format!(
+                    "deps-lsp: {} package(s) failed to fetch (timeout or network error)",
+                    fetch_result.failed_count
                 )
+            };
+            client_clone
+                .show_message(MessageType::WARNING, message)
                 .await;
         }
 

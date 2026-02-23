@@ -43,6 +43,7 @@ impl std::error::Error for InvalidOwnerRepo {}
 pub struct SwiftRegistry {
     cache: Arc<HttpCache>,
     auth_headers: Vec<(reqwest::header::HeaderName, String)>,
+    has_token: bool,
 }
 
 impl SwiftRegistry {
@@ -51,8 +52,9 @@ impl SwiftRegistry {
     /// Reads `GITHUB_TOKEN` from environment for authenticated requests
     /// (5000 req/h vs 60 req/h unauthenticated).
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        let auth_headers = std::env::var("GITHUB_TOKEN")
-            .ok()
+        let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+        let has_token = token.is_some();
+        let auth_headers = token
             .map(|token| {
                 tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
                 vec![(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))]
@@ -62,6 +64,7 @@ impl SwiftRegistry {
         Self {
             cache,
             auth_headers,
+            has_token,
         }
     }
 
@@ -81,7 +84,17 @@ impl SwiftRegistry {
         let data = self
             .cache
             .get_cached_with_headers(&url, &self.headers())
-            .await?;
+            .await
+            .map_err(|e| {
+                if !self.has_token && e.to_string().contains("HTTP 403") {
+                    SwiftError::GitHubApiError {
+                        status: 403,
+                        message: "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)".into(),
+                    }.into()
+                } else {
+                    e
+                }
+            })?;
         parse_tags_response(&data)
     }
 

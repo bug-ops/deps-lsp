@@ -260,6 +260,19 @@ export GITHUB_TOKEN=$(gh auth token)
 export GITHUB_TOKEN=ghp_...
 ```
 
+For **Zed**, launch with the token so the LSP process inherits it:
+
+```bash
+# bash / zsh
+alias zed='GITHUB_TOKEN="$(gh auth token)" command zed'
+
+# fish
+alias zed='env GITHUB_TOKEN=(gh auth token) command zed'
+```
+
+> [!TIP]
+> Add the alias to your shell profile (`~/.zshrc`, `~/.bashrc`, `~/.config/fish/config.fish`) for persistence.
+
 ## Development
 
 > [!IMPORTANT]

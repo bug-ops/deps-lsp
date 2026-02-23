@@ -378,17 +378,21 @@ impl LanguageServer for Backend {
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         // Clone config before async call to release lock early
         let inlay_config = { self.config.read().await.inlay_hints.clone() };
+        let range = params.range;
 
-        Ok(Some(
-            inlay_hints::handle_inlay_hints(
-                Arc::clone(&self.state),
-                params,
-                &inlay_config,
-                self.client.clone(),
-                Arc::clone(&self.config),
-            )
-            .await,
-        ))
+        let hints: Vec<_> = inlay_hints::handle_inlay_hints(
+            Arc::clone(&self.state),
+            params,
+            &inlay_config,
+            self.client.clone(),
+            Arc::clone(&self.config),
+        )
+        .await
+        .into_iter()
+        .filter(|h| h.position.line >= range.start.line && h.position.line <= range.end.line)
+        .collect();
+
+        Ok(Some(hints))
     }
 
     async fn code_action(
