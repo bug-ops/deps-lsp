@@ -1,15 +1,11 @@
 //! Maven ecosystem implementation for deps-lsp.
 
-use async_trait::async_trait;
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{
-    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
-};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
 
 use deps_core::{
-    Ecosystem, EcosystemConfig, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
     position_in_range,
 };
 
@@ -99,7 +95,6 @@ impl MavenEcosystem {
     }
 }
 
-#[async_trait]
 impl Ecosystem for MavenEcosystem {
     fn id(&self) -> &'static str {
         "maven"
@@ -117,113 +112,52 @@ impl Ecosystem for MavenEcosystem {
         &[]
     }
 
-    async fn parse_manifest(&self, content: &str, uri: &Uri) -> Result<Box<dyn ParseResultTrait>> {
-        let result =
-            crate::parser::parse_pom_xml(content, uri).map_err(deps_core::DepsError::from)?;
-        Ok(Box::new(result))
+    fn parse_manifest<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Uri,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
+        Box::pin(async move {
+            let result =
+                crate::parser::parse_pom_xml(content, uri).map_err(deps_core::DepsError::from)?;
+            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
+        })
     }
 
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
     }
 
-    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
-        None
+    fn formatter(&self) -> &dyn EcosystemFormatter {
+        &self.formatter
     }
 
-    async fn generate_inlay_hints(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        cached_versions: &HashMap<String, String>,
-        resolved_versions: &HashMap<String, String>,
-        loading_state: deps_core::LoadingState,
-        config: &EcosystemConfig,
-    ) -> Vec<InlayHint> {
-        lsp_helpers::generate_inlay_hints(
-            parse_result,
-            cached_versions,
-            resolved_versions,
-            loading_state,
-            config,
-            &self.formatter,
-        )
-    }
-
-    async fn generate_hover(
-        &self,
-        parse_result: &dyn ParseResultTrait,
+    fn generate_completions<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
         position: Position,
-        cached_versions: &HashMap<String, String>,
-        resolved_versions: &HashMap<String, String>,
-    ) -> Option<Hover> {
-        lsp_helpers::generate_hover(
-            parse_result,
-            position,
-            cached_versions,
-            resolved_versions,
-            self.registry.as_ref(),
-            &self.formatter,
-        )
-        .await
-    }
+        content: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+        Box::pin(async move {
+            let (ctx_type, value) = Self::detect_xml_context(content, position, parse_result);
 
-    async fn generate_code_actions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        _cached_versions: &HashMap<String, String>,
-        uri: &Uri,
-    ) -> Vec<CodeAction> {
-        lsp_helpers::generate_code_actions(
-            parse_result,
-            position,
-            uri,
-            self.registry.as_ref(),
-            &self.formatter,
-        )
-        .await
-    }
-
-    async fn generate_diagnostics(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        cached_versions: &HashMap<String, String>,
-        resolved_versions: &HashMap<String, String>,
-        _uri: &Uri,
-    ) -> Vec<Diagnostic> {
-        lsp_helpers::generate_diagnostics_from_cache(
-            parse_result,
-            cached_versions,
-            resolved_versions,
-            &self.formatter,
-        )
-    }
-
-    async fn generate_completions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        content: &str,
-    ) -> Vec<CompletionItem> {
-        let (ctx_type, value) = Self::detect_xml_context(content, position, parse_result);
-
-        match ctx_type {
-            "version" => {
-                // Find package name from parse_result at this position
-                let dep = parse_result.dependencies().into_iter().find(|d| {
-                    d.version_range()
-                        .is_some_and(|r| position_in_range(position, r))
-                        || d.name_range().start.line == position.line
-                });
-                if let Some(dep) = dep {
-                    self.complete_versions(dep.name(), value).await
-                } else {
-                    vec![]
+            match ctx_type {
+                "version" => {
+                    let dep = parse_result.dependencies().into_iter().find(|d| {
+                        d.version_range()
+                            .is_some_and(|r| position_in_range(position, r))
+                            || d.name_range().start.line == position.line
+                    });
+                    if let Some(dep) = dep {
+                        self.complete_versions(dep.name(), value).await
+                    } else {
+                        vec![]
+                    }
                 }
+                "artifactId" | "groupId" => self.complete_package_names(value).await,
+                _ => vec![],
             }
-            "artifactId" | "groupId" => self.complete_package_names(value).await,
-            _ => vec![],
-        }
+        })
     }
 
     fn as_any(&self) -> &dyn Any {

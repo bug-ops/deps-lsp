@@ -7,7 +7,6 @@
 //! without network requests to registries.
 
 use crate::error::Result;
-use async_trait::async_trait;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -255,13 +254,11 @@ impl ResolvedPackages {
 ///
 /// ```no_run
 /// use deps_core::lockfile::{LockFileProvider, ResolvedPackages};
-/// use async_trait::async_trait;
 /// use std::path::{Path, PathBuf};
 /// use tower_lsp_server::ls_types::Uri;
 ///
 /// struct MyLockParser;
 ///
-/// #[async_trait]
 /// impl LockFileProvider for MyLockParser {
 ///     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
 ///         let manifest_path = manifest_uri.to_file_path()?;
@@ -269,13 +266,14 @@ impl ResolvedPackages {
 ///         lock_path.exists().then_some(lock_path)
 ///     }
 ///
-///     async fn parse_lockfile(&self, lockfile_path: &Path) -> deps_core::error::Result<ResolvedPackages> {
-///         // Parse lock file format and extract packages
-///         Ok(ResolvedPackages::new())
+///     fn parse_lockfile<'a>(&'a self, lockfile_path: &'a Path) -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<ResolvedPackages>> + Send + 'a>> {
+///         Box::pin(async move {
+///             // Parse lock file format and extract packages
+///             Ok(ResolvedPackages::new())
+///         })
 ///     }
 /// }
 /// ```
-#[async_trait]
 pub trait LockFileProvider: Send + Sync {
     /// Locates the lock file for a given manifest URI.
     ///
@@ -309,7 +307,10 @@ pub trait LockFileProvider: Send + Sync {
     /// - File cannot be read
     /// - File format is invalid
     /// - Required fields are missing
-    async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages>;
+    fn parse_lockfile<'a>(
+        &'a self,
+        lockfile_path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>;
 
     /// Checks if lock file has been modified since last parse.
     ///

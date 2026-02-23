@@ -170,19 +170,6 @@ impl UnifiedVersion {
     }
 }
 
-// Implement helper traits from deps-core for generic handler support
-impl deps_core::VersionStringGetter for UnifiedVersion {
-    fn version_string(&self) -> &str {
-        self.version_string()
-    }
-}
-
-impl deps_core::YankedChecker for UnifiedVersion {
-    fn is_yanked(&self) -> bool {
-        self.is_yanked()
-    }
-}
-
 // Re-export LoadingState from deps-core for convenience
 pub use deps_core::LoadingState;
 

@@ -105,7 +105,7 @@ macro_rules! impl_dependency {
     };
 }
 
-/// Implement `Version` and `VersionInfo` traits for a struct.
+/// Implement `Version` trait for a struct.
 ///
 /// # Arguments
 ///
@@ -134,16 +134,6 @@ macro_rules! impl_version {
         version: $version:ident,
         yanked: $yanked:ident $(,)?
     }) => {
-        impl $crate::registry::VersionInfo for $type {
-            fn version_string(&self) -> &str {
-                &self.$version
-            }
-
-            fn is_yanked(&self) -> bool {
-                self.$yanked
-            }
-        }
-
         impl $crate::registry::Version for $type {
             fn version_string(&self) -> &str {
                 &self.$version
@@ -160,7 +150,7 @@ macro_rules! impl_version {
     };
 }
 
-/// Implement `Metadata` and `PackageMetadata` traits for a struct.
+/// Implement `Metadata` trait for a struct.
 ///
 /// # Arguments
 ///
@@ -201,28 +191,6 @@ macro_rules! impl_metadata {
         documentation: $documentation:ident,
         latest_version: $latest_version:ident $(,)?
     }) => {
-        impl $crate::registry::PackageMetadata for $type {
-            fn name(&self) -> &str {
-                &self.$name
-            }
-
-            fn description(&self) -> Option<&str> {
-                self.$description.as_deref()
-            }
-
-            fn repository(&self) -> Option<&str> {
-                self.$repository.as_deref()
-            }
-
-            fn documentation(&self) -> Option<&str> {
-                self.$documentation.as_deref()
-            }
-
-            fn latest_version(&self) -> &str {
-                &self.$latest_version
-            }
-        }
-
         impl $crate::registry::Metadata for $type {
             fn name(&self) -> &str {
                 &self.$name

@@ -1,11 +1,13 @@
-use async_trait::async_trait;
 use std::any::Any;
+use std::pin::Pin;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
     CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
 };
 
-use crate::Registry;
+use crate::{Registry, lsp_helpers::EcosystemFormatter};
+
+pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Parse result trait containing dependencies and metadata.
 ///
@@ -95,101 +97,51 @@ impl Default for EcosystemConfig {
 ///
 /// ```no_run
 /// use deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig};
-/// use async_trait::async_trait;
+/// use deps_core::lsp_helpers::EcosystemFormatter;
 /// use std::sync::Arc;
 /// use std::any::Any;
-/// use tower_lsp_server::ls_types::{Uri, InlayHint, Hover, CodeAction, Diagnostic, CompletionItem, Position};
+/// use tower_lsp_server::ls_types::{Uri, CompletionItem, Position};
+///
+/// struct MyFormatter;
+/// impl EcosystemFormatter for MyFormatter {
+///     fn format_version_for_code_action(&self, version: &str) -> String { version.to_string() }
+///     fn package_url(&self, name: &str) -> String { format!("https://example.com/{name}") }
+/// }
 ///
 /// struct MyEcosystem {
 ///     registry: Arc<dyn Registry>,
+///     formatter: MyFormatter,
 /// }
 ///
-/// #[async_trait]
 /// impl Ecosystem for MyEcosystem {
-///     fn id(&self) -> &'static str {
-///         "my-ecosystem"
+///     fn id(&self) -> &'static str { "my-ecosystem" }
+///     fn display_name(&self) -> &'static str { "My Ecosystem" }
+///     fn manifest_filenames(&self) -> &[&'static str] { &["my-manifest.toml"] }
+///
+///     fn parse_manifest<'a>(
+///         &'a self,
+///         _content: &'a str,
+///         _uri: &'a Uri,
+///     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::error::Result<Box<dyn ParseResult>>> {
+///         Box::pin(async move { todo!() })
 ///     }
 ///
-///     fn display_name(&self) -> &'static str {
-///         "My Ecosystem"
+///     fn registry(&self) -> Arc<dyn Registry> { self.registry.clone() }
+///
+///     fn formatter(&self) -> &dyn EcosystemFormatter { &self.formatter }
+///
+///     fn generate_completions<'a>(
+///         &'a self,
+///         _parse_result: &'a dyn ParseResult,
+///         _position: Position,
+///         _content: &'a str,
+///     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+///         Box::pin(async move { vec![] })
 ///     }
 ///
-///     fn manifest_filenames(&self) -> &[&'static str] {
-///         &["my-manifest.toml"]
-///     }
-///
-///     async fn parse_manifest(
-///         &self,
-///         content: &str,
-///         uri: &Uri,
-///     ) -> deps_core::error::Result<Box<dyn ParseResult>> {
-///         // Implementation here
-///         todo!()
-///     }
-///
-///     fn registry(&self) -> Arc<dyn Registry> {
-///         self.registry.clone()
-///     }
-///
-///     async fn generate_inlay_hints(
-///         &self,
-///         parse_result: &dyn ParseResult,
-///         cached_versions: &std::collections::HashMap<String, String>,
-///         resolved_versions: &std::collections::HashMap<String, String>,
-///         loading_state: deps_core::LoadingState,
-///         config: &EcosystemConfig,
-///     ) -> Vec<InlayHint> {
-///         let _ = (resolved_versions, loading_state); // Use resolved versions for lock file support
-///         vec![]
-///     }
-///
-///     async fn generate_hover(
-///         &self,
-///         parse_result: &dyn ParseResult,
-///         position: Position,
-///         cached_versions: &std::collections::HashMap<String, String>,
-///         resolved_versions: &std::collections::HashMap<String, String>,
-///     ) -> Option<Hover> {
-///         let _ = resolved_versions; // Use resolved versions for lock file support
-///         None
-///     }
-///
-///     async fn generate_code_actions(
-///         &self,
-///         parse_result: &dyn ParseResult,
-///         position: Position,
-///         cached_versions: &std::collections::HashMap<String, String>,
-///         uri: &Uri,
-///     ) -> Vec<CodeAction> {
-///         vec![]
-///     }
-///
-///     async fn generate_diagnostics(
-///         &self,
-///         parse_result: &dyn ParseResult,
-///         cached_versions: &std::collections::HashMap<String, String>,
-///         resolved_versions: &std::collections::HashMap<String, String>,
-///         uri: &Uri,
-///     ) -> Vec<Diagnostic> {
-///         let _ = resolved_versions; // Use resolved versions for lock file support
-///         vec![]
-///     }
-///
-///     async fn generate_completions(
-///         &self,
-///         parse_result: &dyn ParseResult,
-///         position: Position,
-///         content: &str,
-///     ) -> Vec<CompletionItem> {
-///         vec![]
-///     }
-///
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
+///     fn as_any(&self) -> &dyn Any { self }
 /// }
 /// ```
-#[async_trait]
 pub trait Ecosystem: Send + Sync {
     /// Unique identifier (e.g., "cargo", "npm", "pypi")
     ///
@@ -230,11 +182,11 @@ pub trait Ecosystem: Send + Sync {
     /// # Errors
     ///
     /// Returns error if manifest cannot be parsed
-    async fn parse_manifest(
-        &self,
-        content: &str,
-        uri: &Uri,
-    ) -> crate::error::Result<Box<dyn ParseResult>>;
+    fn parse_manifest<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Uri,
+    ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>>;
 
     /// Get the registry client for this ecosystem
     ///
@@ -249,95 +201,115 @@ pub trait Ecosystem: Send + Sync {
         None
     }
 
-    /// Generate inlay hints for the document
+    /// Get the ecosystem-specific formatter for LSP response generation.
     ///
-    /// Inlay hints show additional version information inline in the editor.
+    /// The formatter handles version comparison, package URLs, and text formatting.
+    /// Override this to customize LSP response generation.
+    fn formatter(&self) -> &dyn EcosystemFormatter;
+
+    /// Generate inlay hints for the document.
     ///
-    /// # Arguments
-    ///
-    /// * `parse_result` - Parsed dependencies from manifest
-    /// * `cached_versions` - Pre-fetched version information (name -> latest version from registry)
-    /// * `resolved_versions` - Resolved versions from lock file (name -> locked version)
-    /// * `loading_state` - Current loading state for registry data
-    /// * `config` - User configuration for hint display
-    async fn generate_inlay_hints(
-        &self,
-        parse_result: &dyn ParseResult,
-        cached_versions: &std::collections::HashMap<String, String>,
-        resolved_versions: &std::collections::HashMap<String, String>,
+    /// Default implementation delegates to `lsp_helpers::generate_inlay_hints`
+    /// using `self.formatter()`. Override only if custom behavior is needed.
+    fn generate_inlay_hints<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResult,
+        cached_versions: &'a std::collections::HashMap<String, String>,
+        resolved_versions: &'a std::collections::HashMap<String, String>,
         loading_state: crate::LoadingState,
-        config: &EcosystemConfig,
-    ) -> Vec<InlayHint>;
+        config: &'a EcosystemConfig,
+    ) -> BoxFuture<'a, Vec<InlayHint>> {
+        Box::pin(async move {
+            crate::lsp_helpers::generate_inlay_hints(
+                parse_result,
+                cached_versions,
+                resolved_versions,
+                loading_state,
+                config,
+                self.formatter(),
+            )
+        })
+    }
 
-    /// Generate hover information for a position
+    /// Generate hover information for a position.
     ///
-    /// Shows package information when hovering over a dependency name or version.
-    ///
-    /// # Arguments
-    ///
-    /// * `parse_result` - Parsed dependencies from manifest
-    /// * `position` - Cursor position in document
-    /// * `cached_versions` - Pre-fetched latest version information from registry
-    /// * `resolved_versions` - Resolved versions from lock file (takes precedence for "Current" display)
-    async fn generate_hover(
-        &self,
-        parse_result: &dyn ParseResult,
+    /// Default implementation delegates to `lsp_helpers::generate_hover`
+    /// using `self.formatter()` and `self.registry()`.
+    fn generate_hover<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResult,
         position: Position,
-        cached_versions: &std::collections::HashMap<String, String>,
-        resolved_versions: &std::collections::HashMap<String, String>,
-    ) -> Option<Hover>;
+        cached_versions: &'a std::collections::HashMap<String, String>,
+        resolved_versions: &'a std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, Option<Hover>> {
+        Box::pin(async move {
+            let registry = self.registry();
+            crate::lsp_helpers::generate_hover(
+                parse_result,
+                position,
+                cached_versions,
+                resolved_versions,
+                registry.as_ref(),
+                self.formatter(),
+            )
+            .await
+        })
+    }
 
-    /// Generate code actions for a position
+    /// Generate code actions for a position.
     ///
-    /// Code actions provide quick fixes like "Update to latest version".
-    ///
-    /// # Arguments
-    ///
-    /// * `parse_result` - Parsed dependencies from manifest
-    /// * `position` - Cursor position in document
-    /// * `cached_versions` - Pre-fetched version information
-    /// * `uri` - Document URI for workspace edits
-    async fn generate_code_actions(
-        &self,
-        parse_result: &dyn ParseResult,
+    /// Default implementation delegates to `lsp_helpers::generate_code_actions`
+    /// using `self.formatter()` and `self.registry()`.
+    fn generate_code_actions<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResult,
         position: Position,
-        cached_versions: &std::collections::HashMap<String, String>,
-        uri: &Uri,
-    ) -> Vec<CodeAction>;
+        _cached_versions: &'a std::collections::HashMap<String, String>,
+        uri: &'a Uri,
+    ) -> BoxFuture<'a, Vec<CodeAction>> {
+        Box::pin(async move {
+            let registry = self.registry();
+            crate::lsp_helpers::generate_code_actions(
+                parse_result,
+                position,
+                uri,
+                registry.as_ref(),
+                self.formatter(),
+            )
+            .await
+        })
+    }
 
-    /// Generate diagnostics for the document
+    /// Generate diagnostics for the document.
     ///
-    /// Diagnostics highlight issues like outdated dependencies or unknown packages.
-    ///
-    /// # Arguments
-    ///
-    /// * `parse_result` - Parsed dependencies from manifest
-    /// * `cached_versions` - Pre-fetched latest version information from registry
-    /// * `resolved_versions` - Resolved versions from lock file
-    /// * `uri` - Document URI for diagnostic reporting
-    async fn generate_diagnostics(
-        &self,
-        parse_result: &dyn ParseResult,
-        cached_versions: &std::collections::HashMap<String, String>,
-        resolved_versions: &std::collections::HashMap<String, String>,
-        uri: &Uri,
-    ) -> Vec<Diagnostic>;
+    /// Default implementation delegates to `lsp_helpers::generate_diagnostics_from_cache`
+    /// using `self.formatter()`.
+    fn generate_diagnostics<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResult,
+        cached_versions: &'a std::collections::HashMap<String, String>,
+        resolved_versions: &'a std::collections::HashMap<String, String>,
+        _uri: &'a Uri,
+    ) -> BoxFuture<'a, Vec<Diagnostic>> {
+        Box::pin(async move {
+            crate::lsp_helpers::generate_diagnostics_from_cache(
+                parse_result,
+                cached_versions,
+                resolved_versions,
+                self.formatter(),
+            )
+        })
+    }
 
-    /// Generate completions for a position
+    /// Generate completions for a position.
     ///
     /// Provides autocomplete suggestions for package names and versions.
-    ///
-    /// # Arguments
-    ///
-    /// * `parse_result` - Parsed dependencies from manifest
-    /// * `position` - Cursor position in document
-    /// * `content` - Full document content for context analysis
-    async fn generate_completions(
-        &self,
-        parse_result: &dyn ParseResult,
+    fn generate_completions<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResult,
         position: Position,
-        content: &str,
-    ) -> Vec<CompletionItem>;
+        content: &'a str,
+    ) -> BoxFuture<'a, Vec<CompletionItem>>;
 
     /// Support for downcasting to concrete ecosystem type
     ///

@@ -8,8 +8,7 @@
 
 use crate::error::{PypiError, Result};
 use crate::types::{PypiPackage, PypiVersion};
-use async_trait::async_trait;
-use deps_core::{HttpCache, PackageRegistry};
+use deps_core::HttpCache;
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
 use std::any::Any;
@@ -235,78 +234,59 @@ impl PypiRegistry {
     }
 }
 
-#[async_trait]
-impl PackageRegistry for PypiRegistry {
-    type Version = PypiVersion;
-    type Metadata = PypiPackage;
-    type VersionReq = String;
-
-    async fn get_versions(&self, name: &str) -> deps_core::error::Result<Vec<Self::Version>> {
-        Self::get_versions(self, name)
-            .await
-            .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))
-    }
-
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &Self::VersionReq,
-    ) -> deps_core::error::Result<Option<Self::Version>> {
-        Self::get_latest_matching(self, name, req)
-            .await
-            .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))
-    }
-
-    async fn search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> deps_core::error::Result<Vec<Self::Metadata>> {
-        Self::search(self, query, limit)
-            .await
-            .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))
-    }
-}
-
 // Implement Registry trait for PypiRegistry
-#[async_trait]
 impl deps_core::Registry for PypiRegistry {
-    async fn get_versions(
-        &self,
-        name: &str,
-    ) -> deps_core::error::Result<Vec<Box<dyn deps_core::Version>>> {
-        let versions = Self::get_versions(self, name)
-            .await
-            .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
-        Ok(versions
-            .into_iter()
-            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-            .collect())
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<
+        'a,
+        deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
+    > {
+        Box::pin(async move {
+            let versions = Self::get_versions(self, name)
+                .await
+                .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
     }
 
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &str,
-    ) -> deps_core::error::Result<Option<Box<dyn deps_core::Version>>> {
-        let version = Self::get_latest_matching(self, name, req)
-            .await
-            .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
-        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a str,
+        req: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<
+        'a,
+        deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
+    > {
+        Box::pin(async move {
+            let version = Self::get_latest_matching(self, name, req)
+                .await
+                .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
     }
 
-    async fn search(
-        &self,
-        query: &str,
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
         limit: usize,
-    ) -> deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>> {
-        let packages = Self::search(self, query, limit)
-            .await
-            .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
-        Ok(packages
-            .into_iter()
-            .map(|p| Box::new(p) as Box<dyn deps_core::Metadata>)
-            .collect())
+    ) -> deps_core::ecosystem::BoxFuture<
+        'a,
+        deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>,
+    > {
+        Box::pin(async move {
+            let packages = Self::search(self, query, limit)
+                .await
+                .map_err(|e| deps_core::error::DepsError::CacheError(e.to_string()))?;
+            Ok(packages
+                .into_iter()
+                .map(|p| Box::new(p) as Box<dyn deps_core::Metadata>)
+                .collect())
+        })
     }
 
     fn package_url(&self, name: &str) -> String {

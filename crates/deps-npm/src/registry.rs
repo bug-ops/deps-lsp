@@ -245,56 +245,44 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<NpmPackage>> {
         .collect())
 }
 
-// Implement PackageRegistry trait for NpmRegistry
-#[async_trait::async_trait]
-impl deps_core::PackageRegistry for NpmRegistry {
-    type Version = NpmVersion;
-    type Metadata = NpmPackage;
-    type VersionReq = node_semver::Range;
-
-    async fn get_versions(&self, name: &str) -> Result<Vec<Self::Version>> {
-        self.get_versions(name).await
-    }
-
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &Self::VersionReq,
-    ) -> Result<Option<Self::Version>> {
-        self.get_latest_matching(name, &req.to_string()).await
-    }
-
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Self::Metadata>> {
-        self.search(query, limit).await
-    }
-}
-
 // Implement Registry trait for NpmRegistry
-#[async_trait::async_trait]
 impl deps_core::Registry for NpmRegistry {
-    async fn get_versions(&self, name: &str) -> Result<Vec<Box<dyn deps_core::Version>>> {
-        let versions = self.get_versions(name).await?;
-        Ok(versions
-            .into_iter()
-            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-            .collect())
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let versions = self.get_versions(name).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
     }
 
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &str,
-    ) -> Result<Option<Box<dyn deps_core::Version>>> {
-        let version = self.get_latest_matching(name, req).await?;
-        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a str,
+        req: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let version = self.get_latest_matching(name, req).await?;
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn deps_core::Metadata>>> {
-        let packages = self.search(query, limit).await?;
-        Ok(packages
-            .into_iter()
-            .map(|p| Box::new(p) as Box<dyn deps_core::Metadata>)
-            .collect())
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
+        Box::pin(async move {
+            let packages = self.search(query, limit).await?;
+            Ok(packages
+                .into_iter()
+                .map(|p| Box::new(p) as Box<dyn deps_core::Metadata>)
+                .collect())
+        })
     }
 
     fn package_url(&self, name: &str) -> String {

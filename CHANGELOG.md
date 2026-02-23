@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remove `toml_edit` from workspace dependencies (all TOML parsers now use `toml-span`)
 - Extract `LineOffsetTable` and `position_in_range` to deps-core for reuse across ecosystems
 - Extract `complete_package_names_generic` to deps-core completion module
+- **Architectural refactoring** — Remove legacy trait system and eliminate code duplication across 8 ecosystem crates (closes #68):
+  - Delete `handler.rs` and legacy `PackageRegistry`, `VersionInfo`, `PackageMetadata` traits from deps-core
+  - Add `fn formatter(&self)` required method to `Ecosystem` trait; default LSP handler implementations for `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics` — eliminating ~400 duplicate lines across ecosystems
+  - Replace `#[async_trait]` with `BoxFuture` pattern in `Ecosystem`, `Registry`, and `LockFileProvider` traits (dyn-safe, no async_trait allocations)
+  - Centralize `MockDep`/`MockParseResult` test helpers in `deps-core::lsp_helpers` tests (was duplicated 11 times)
+  - Remove conflicting duplicate `Version`/`Metadata` impls from `deps-dart` and `deps-bundler` types modules
 
 ## [0.7.1] - 2026-02-22
 

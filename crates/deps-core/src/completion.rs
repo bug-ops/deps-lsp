@@ -769,13 +769,13 @@ mod tests {
         versions: Vec<MockVersion>,
     }
 
-    #[async_trait::async_trait]
     impl crate::Registry for MockRegistry {
-        async fn get_versions(
-            &self,
-            _package_name: &str,
-        ) -> crate::error::Result<Vec<Box<dyn crate::Version>>> {
-            Ok(self
+        fn get_versions<'a>(
+            &'a self,
+            _package_name: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            let versions: Vec<Box<dyn crate::Version>> = self
                 .versions
                 .iter()
                 .map(|v| {
@@ -785,23 +785,26 @@ mod tests {
                         prerelease: v.prerelease,
                     }) as Box<dyn crate::Version>
                 })
-                .collect())
+                .collect();
+            Box::pin(async move { Ok(versions) })
         }
 
-        async fn get_latest_matching(
-            &self,
-            _name: &str,
-            _req: &str,
-        ) -> crate::error::Result<Option<Box<dyn crate::Version>>> {
-            Ok(None)
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a str,
+            _req: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(None) })
         }
 
-        async fn search(
-            &self,
-            _query: &str,
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
             _limit: usize,
-        ) -> crate::error::Result<Vec<Box<dyn crate::Metadata>>> {
-            Ok(vec![])
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(vec![]) })
         }
 
         fn package_url(&self, _name: &str) -> String {

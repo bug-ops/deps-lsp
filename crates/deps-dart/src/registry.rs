@@ -146,32 +146,7 @@ fn parse_package_info(data: &[u8]) -> Result<PackageInfo> {
     })
 }
 
-// PackageRegistry trait
-#[async_trait::async_trait]
-impl deps_core::PackageRegistry for PubDevRegistry {
-    type Version = DartVersion;
-    type Metadata = PackageInfo;
-    type VersionReq = String;
-
-    async fn get_versions(&self, name: &str) -> Result<Vec<Self::Version>> {
-        self.get_versions(name).await
-    }
-
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &Self::VersionReq,
-    ) -> Result<Option<Self::Version>> {
-        self.get_latest_matching(name, req).await
-    }
-
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Self::Metadata>> {
-        self.search(query, limit).await
-    }
-}
-
-// VersionInfo trait
-impl deps_core::VersionInfo for DartVersion {
+impl deps_core::Version for DartVersion {
     fn version_string(&self) -> &str {
         &self.version
     }
@@ -180,13 +155,12 @@ impl deps_core::VersionInfo for DartVersion {
         self.retracted
     }
 
-    fn features(&self) -> Vec<String> {
-        vec![]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
-// PackageMetadata trait
-impl deps_core::PackageMetadata for PackageInfo {
+impl deps_core::Metadata for PackageInfo {
     fn name(&self) -> &str {
         &self.name
     }
@@ -206,34 +180,50 @@ impl deps_core::PackageMetadata for PackageInfo {
     fn latest_version(&self) -> &str {
         &self.version
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 // Registry trait (trait object support)
-#[async_trait::async_trait]
 impl deps_core::Registry for PubDevRegistry {
-    async fn get_versions(&self, name: &str) -> Result<Vec<Box<dyn deps_core::Version>>> {
-        let versions = self.get_versions(name).await?;
-        Ok(versions
-            .into_iter()
-            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-            .collect())
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let versions = self.get_versions(name).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
     }
 
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &str,
-    ) -> Result<Option<Box<dyn deps_core::Version>>> {
-        let version = self.get_latest_matching(name, req).await?;
-        Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a str,
+        req: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let version = self.get_latest_matching(name, req).await?;
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn deps_core::Metadata>>> {
-        let results = self.search(query, limit).await?;
-        Ok(results
-            .into_iter()
-            .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
-            .collect())
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
+        Box::pin(async move {
+            let results = self.search(query, limit).await?;
+            Ok(results
+                .into_iter()
+                .map(|m| Box::new(m) as Box<dyn deps_core::Metadata>)
+                .collect())
+        })
     }
 
     fn package_url(&self, name: &str) -> String {
@@ -347,8 +337,8 @@ mod tests {
     }
 
     #[test]
-    fn test_version_info_trait() {
-        use deps_core::VersionInfo;
+    fn test_version_trait() {
+        use deps_core::Version;
         let ver = DartVersion {
             version: "1.0.0".into(),
             retracted: true,
@@ -360,8 +350,8 @@ mod tests {
     }
 
     #[test]
-    fn test_package_metadata_trait() {
-        use deps_core::PackageMetadata;
+    fn test_metadata_trait() {
+        use deps_core::Metadata;
         let info = PackageInfo {
             name: "test".into(),
             description: Some("A test package".into()),

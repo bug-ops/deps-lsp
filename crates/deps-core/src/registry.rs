@@ -1,6 +1,8 @@
 use crate::error::Result;
-use async_trait::async_trait;
 use std::any::Any;
+use std::pin::Pin;
+
+type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Generic package registry interface.
 ///
@@ -19,89 +21,58 @@ use std::any::Any;
 ///
 /// ```no_run
 /// use deps_core::{Registry, Version, Metadata};
-/// use async_trait::async_trait;
 /// use std::any::Any;
+/// use std::pin::Pin;
 ///
 /// struct MyRegistry;
 ///
 /// #[derive(Clone)]
-/// struct MyVersion {
-///     version: String,
-/// }
+/// struct MyVersion { version: String }
 ///
 /// impl Version for MyVersion {
-///     fn version_string(&self) -> &str {
-///         &self.version
-///     }
-///
-///     fn is_yanked(&self) -> bool {
-///         false
-///     }
-///
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
+///     fn version_string(&self) -> &str { &self.version }
+///     fn is_yanked(&self) -> bool { false }
+///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// #[derive(Clone)]
-/// struct MyMetadata {
-///     name: String,
-/// }
+/// struct MyMetadata { name: String }
 ///
 /// impl Metadata for MyMetadata {
-///     fn name(&self) -> &str {
-///         &self.name
-///     }
-///
-///     fn description(&self) -> Option<&str> {
-///         None
-///     }
-///
-///     fn repository(&self) -> Option<&str> {
-///         None
-///     }
-///
-///     fn documentation(&self) -> Option<&str> {
-///         None
-///     }
-///
-///     fn latest_version(&self) -> &str {
-///         "1.0.0"
-///     }
-///
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
+///     fn name(&self) -> &str { &self.name }
+///     fn description(&self) -> Option<&str> { None }
+///     fn repository(&self) -> Option<&str> { None }
+///     fn documentation(&self) -> Option<&str> { None }
+///     fn latest_version(&self) -> &str { "1.0.0" }
+///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
-/// #[async_trait]
 /// impl Registry for MyRegistry {
-///     async fn get_versions(&self, name: &str) -> deps_core::error::Result<Vec<Box<dyn Version>>> {
-///         Ok(vec![Box::new(MyVersion { version: "1.0.0".into() })])
+///     fn get_versions<'a>(&'a self, _name: &'a str)
+///         -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Version>>>> + Send + 'a>>
+///     {
+///         Box::pin(async move { Ok(vec![Box::new(MyVersion { version: "1.0.0".into() }) as Box<dyn Version>]) })
 ///     }
 ///
-///     async fn get_latest_matching(
-///         &self,
-///         _name: &str,
-///         _req: &str,
-///     ) -> deps_core::error::Result<Option<Box<dyn Version>>> {
-///         Ok(None)
+///     fn get_latest_matching<'a>(&'a self, _name: &'a str, _req: &'a str)
+///         -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Option<Box<dyn Version>>>> + Send + 'a>>
+///     {
+///         Box::pin(async move { Ok(None) })
 ///     }
 ///
-///     async fn search(&self, _query: &str, _limit: usize) -> deps_core::error::Result<Vec<Box<dyn Metadata>>> {
-///         Ok(vec![])
+///     fn search<'a>(&'a self, _query: &'a str, _limit: usize)
+///         -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Metadata>>>> + Send + 'a>>
+///     {
+///         Box::pin(async move { Ok(vec![]) })
 ///     }
 ///
 ///     fn package_url(&self, name: &str) -> String {
 ///         format!("https://example.com/packages/{}", name)
 ///     }
 ///
-///     fn as_any(&self) -> &dyn Any {
-///         self
-///     }
+///     fn as_any(&self) -> &dyn Any { self }
 /// }
 /// ```
-#[async_trait]
 pub trait Registry: Send + Sync {
     /// Fetches all available versions for a package.
     ///
@@ -113,7 +84,7 @@ pub trait Registry: Send + Sync {
     /// - Package does not exist
     /// - Network request fails
     /// - Response parsing fails
-    async fn get_versions(&self, name: &str) -> Result<Vec<Box<dyn Version>>>;
+    fn get_versions<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>>;
 
     /// Finds the latest version matching a version requirement.
     ///
@@ -130,7 +101,11 @@ pub trait Registry: Send + Sync {
     /// - `Ok(Some(version))` - Latest matching version found
     /// - `Ok(None)` - No matching version found
     /// - `Err(_)` - Network or parsing error
-    async fn get_latest_matching(&self, name: &str, req: &str) -> Result<Option<Box<dyn Version>>>;
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a str,
+        req: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>>;
 
     /// Searches for packages by name or keywords.
     ///
@@ -139,7 +114,11 @@ pub trait Registry: Send + Sync {
     /// # Errors
     ///
     /// Returns error if network request or parsing fails.
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn Metadata>>>;
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Box<dyn Metadata>>>>;
 
     /// Package URL for ecosystem (e.g., <https://crates.io/crates/serde>)
     ///
@@ -245,98 +224,6 @@ pub trait Metadata: Send + Sync {
 
     /// Downcast to concrete metadata type
     fn as_any(&self) -> &dyn Any;
-}
-
-// Legacy traits for backward compatibility during migration
-// DEPRECATED: Use Registry, Version, Metadata instead
-//
-// These traits will be removed in Phase 3 after all ecosystem implementations
-// are migrated to the new trait object-based system.
-
-/// Legacy package registry trait with associated types.
-///
-/// # Deprecation Notice
-///
-/// This trait is deprecated. Use `Registry` trait instead which uses
-/// trait objects (`Box<dyn Version>`) for better extensibility.
-#[async_trait]
-pub trait PackageRegistry: Send + Sync {
-    /// Version information type for this registry.
-    type Version: VersionInfo + Clone + Send + Sync;
-
-    /// Metadata type for search results.
-    type Metadata: PackageMetadata + Clone + Send + Sync;
-
-    /// Version requirement type (e.g., semver::VersionReq for Cargo, npm semver for npm).
-    type VersionReq: Clone + Send + Sync;
-
-    /// Fetches all available versions for a package.
-    async fn get_versions(&self, name: &str) -> Result<Vec<Self::Version>>;
-
-    /// Finds the latest version matching a version requirement.
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        req: &Self::VersionReq,
-    ) -> Result<Option<Self::Version>>;
-
-    /// Searches for packages by name or keywords.
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Self::Metadata>>;
-}
-
-/// Legacy version information trait.
-///
-/// # Deprecation Notice
-///
-/// This trait is deprecated. Use `Version` trait instead.
-pub trait VersionInfo {
-    /// Version string (e.g., "1.0.214", "14.21.3").
-    fn version_string(&self) -> &str;
-
-    /// Whether this version is yanked/deprecated.
-    fn is_yanked(&self) -> bool;
-
-    /// Whether this version is a pre-release (alpha, beta, rc, etc.).
-    ///
-    /// Default implementation checks for common pre-release patterns.
-    fn is_prerelease(&self) -> bool {
-        let v = self.version_string().to_lowercase();
-        v.contains("-alpha")
-            || v.contains("-beta")
-            || v.contains("-rc")
-            || v.contains("-dev")
-            || v.contains("-pre")
-            || v.contains("-snapshot")
-            || v.contains("-canary")
-            || v.contains("-nightly")
-    }
-
-    /// Available feature flags (empty if not supported by ecosystem).
-    fn features(&self) -> Vec<String> {
-        vec![]
-    }
-}
-
-/// Legacy package metadata trait.
-///
-/// # Deprecation Notice
-///
-/// This trait is deprecated. Use `Metadata` trait instead.
-pub trait PackageMetadata {
-    /// Package name.
-    fn name(&self) -> &str;
-
-    /// Short description (optional).
-    fn description(&self) -> Option<&str>;
-
-    /// Repository URL (optional).
-    fn repository(&self) -> Option<&str>;
-
-    /// Documentation URL (optional).
-    fn documentation(&self) -> Option<&str>;
-
-    /// Latest stable version.
-    fn latest_version(&self) -> &str;
 }
 
 #[cfg(test)]
@@ -487,80 +374,74 @@ mod tests {
         assert_eq!(meta.documentation(), Some("https://docs.rs/serde"));
     }
 
-    struct MockVersionInfo {
-        version: String,
-    }
-
-    impl VersionInfo for MockVersionInfo {
-        fn version_string(&self) -> &str {
-            &self.version
-        }
-
-        fn is_yanked(&self) -> bool {
-            false
-        }
-    }
-
     #[test]
     fn test_is_prerelease_alpha() {
-        let version = MockVersionInfo {
+        let version = MockVersion {
             version: "4.0.0-alpha.13".into(),
+            yanked: false,
         };
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_beta() {
-        let version = MockVersionInfo {
+        let version = MockVersion {
             version: "2.0.0-beta.1".into(),
+            yanked: false,
         };
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_rc() {
-        let version = MockVersionInfo {
+        let version = MockVersion {
             version: "1.5.0-rc.2".into(),
+            yanked: false,
         };
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_dev() {
-        let version = MockVersionInfo {
+        let version = MockVersion {
             version: "3.0.0-dev".into(),
+            yanked: false,
         };
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_canary() {
-        let version = MockVersionInfo {
+        let version = MockVersion {
             version: "5.0.0-canary".into(),
+            yanked: false,
         };
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_nightly() {
-        let version = MockVersionInfo {
+        let version = MockVersion {
             version: "6.0.0-nightly".into(),
+            yanked: false,
         };
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_not_prerelease_stable() {
-        let version = MockVersionInfo {
+        let version = MockVersion {
             version: "1.2.3".into(),
+            yanked: false,
         };
         assert!(!version.is_prerelease());
     }
 
     #[test]
     fn test_is_not_prerelease_patch() {
-        let version = MockVersionInfo {
+        let version = MockVersion {
             version: "1.0.214".into(),
+            yanked: false,
         };
         assert!(!version.is_prerelease());
     }

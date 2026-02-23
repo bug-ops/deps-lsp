@@ -138,7 +138,7 @@ deps_core::impl_metadata!(NpmPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::{PackageMetadata, VersionInfo};
+    use deps_core::{Metadata, Version};
     use tower_lsp_server::ls_types::Position;
 
     #[test]
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn test_npm_version_info_trait() {
+    fn test_npm_version_trait() {
         let version = NpmVersion {
             version: "2.0.0".into(),
             deprecated: true,

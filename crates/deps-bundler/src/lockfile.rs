@@ -2,7 +2,6 @@
 //!
 //! Parses Gemfile.lock files to extract resolved dependency versions.
 
-use async_trait::async_trait;
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
@@ -36,23 +35,28 @@ enum Section {
     RubyVersion,
 }
 
-#[async_trait]
 impl LockFileProvider for GemfileLockParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
     }
 
-    async fn parse_lockfile(&self, lockfile_path: &Path) -> Result<ResolvedPackages> {
-        tracing::debug!("Parsing Gemfile.lock: {}", lockfile_path.display());
+    fn parse_lockfile<'a>(
+        &'a self,
+        lockfile_path: &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            tracing::debug!("Parsing Gemfile.lock: {}", lockfile_path.display());
 
-        let content = tokio::fs::read_to_string(lockfile_path)
-            .await
-            .map_err(|e| DepsError::ParseError {
-                file_type: format!("Gemfile.lock at {}", lockfile_path.display()),
-                source: Box::new(e),
-            })?;
+            let content = tokio::fs::read_to_string(lockfile_path)
+                .await
+                .map_err(|e| DepsError::ParseError {
+                    file_type: format!("Gemfile.lock at {}", lockfile_path.display()),
+                    source: Box::new(e),
+                })?;
 
-        parse_gemfile_lock(&content)
+            parse_gemfile_lock(&content)
+        })
     }
 }
 

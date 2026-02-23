@@ -130,50 +130,6 @@ impl deps_core::Dependency for DartDependency {
     }
 }
 
-impl deps_core::Version for DartVersion {
-    fn version_string(&self) -> &str {
-        &self.version
-    }
-
-    fn is_yanked(&self) -> bool {
-        self.retracted
-    }
-
-    fn features(&self) -> Vec<String> {
-        vec![]
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-impl deps_core::Metadata for PackageInfo {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
-    }
-
-    fn repository(&self) -> Option<&str> {
-        self.repository.as_deref()
-    }
-
-    fn documentation(&self) -> Option<&str> {
-        self.documentation.as_deref()
-    }
-
-    fn latest_version(&self) -> &str {
-        &self.version
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

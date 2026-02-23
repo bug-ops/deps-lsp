@@ -254,42 +254,6 @@ impl deps_core::Dependency for PypiDependency {
     }
 }
 
-impl deps_core::PackageMetadata for PypiPackage {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> Option<&str> {
-        self.summary.as_deref()
-    }
-
-    fn repository(&self) -> Option<&str> {
-        self.project_urls
-            .iter()
-            .find(|(key, _)| {
-                key.eq_ignore_ascii_case("repository")
-                    || key.eq_ignore_ascii_case("source")
-                    || key.eq_ignore_ascii_case("code")
-            })
-            .map(|(_, url)| url.as_str())
-    }
-
-    fn documentation(&self) -> Option<&str> {
-        self.project_urls
-            .iter()
-            .find(|(key, _)| {
-                key.eq_ignore_ascii_case("documentation")
-                    || key.eq_ignore_ascii_case("docs")
-                    || key.eq_ignore_ascii_case("homepage")
-            })
-            .map(|(_, url)| url.as_str())
-    }
-
-    fn latest_version(&self) -> &str {
-        &self.latest_version
-    }
-}
-
 impl deps_core::Metadata for PypiPackage {
     fn name(&self) -> &str {
         &self.name
@@ -333,7 +297,7 @@ impl deps_core::Metadata for PypiPackage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::{PackageMetadata, VersionInfo};
+    use deps_core::{Metadata, Version};
     use tower_lsp_server::ls_types::Position;
 
     #[test]
@@ -447,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pypi_version_info_trait() {
+    fn test_pypi_version_trait() {
         let version = PypiVersion {
             version: "2.28.2".into(),
             yanked: true,

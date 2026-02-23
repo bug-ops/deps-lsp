@@ -385,43 +385,47 @@ fn parse_version_info(data: &[u8]) -> Result<GoVersion> {
     })
 }
 
-// Implement deps_core::Registry trait for trait object support
-#[async_trait::async_trait]
 impl deps_core::Registry for GoRegistry {
-    async fn get_versions(
-        &self,
-        name: &str,
-    ) -> deps_core::Result<Vec<Box<dyn deps_core::Version>>> {
-        let versions = self.get_versions(name).await?;
-        Ok(versions
-            .into_iter()
-            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
-            .collect())
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Version>>>>
+    {
+        Box::pin(async move {
+            let versions = self.get_versions(name).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
     }
 
-    async fn get_latest_matching(
-        &self,
-        name: &str,
-        _req: &str,
-    ) -> deps_core::Result<Option<Box<dyn deps_core::Version>>> {
-        // Try /@latest first (fast path)
-        if let Ok(version) = self.get_latest(name).await {
-            return Ok(Some(Box::new(version) as Box<dyn deps_core::Version>));
-        }
-        // Fallback to /@v/list (/@latest is optional per Go proxy spec)
-        let versions = self.get_versions(name).await?;
-        let latest = versions.into_iter().find(|v| !v.is_pseudo && !v.retracted);
-        Ok(latest.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a str,
+        _req: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn deps_core::Version>>>>
+    {
+        Box::pin(async move {
+            // Try /@latest first (fast path)
+            if let Ok(version) = self.get_latest(name).await {
+                return Ok(Some(Box::new(version) as Box<dyn deps_core::Version>));
+            }
+            // Fallback to /@v/list (/@latest is optional per Go proxy spec)
+            let versions = self.get_versions(name).await?;
+            let latest = versions.into_iter().find(|v| !v.is_pseudo && !v.retracted);
+            Ok(latest.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
     }
 
-    async fn search(
-        &self,
-        _query: &str,
+    fn search<'a>(
+        &'a self,
+        _query: &'a str,
         _limit: usize,
-    ) -> deps_core::Result<Vec<Box<dyn deps_core::Metadata>>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>>
+    {
         // proxy.golang.org doesn't support search
-        // Could integrate with pkg.go.dev API in future
-        Ok(vec![])
+        Box::pin(async move { Ok(vec![]) })
     }
 
     fn package_url(&self, name: &str) -> String {
