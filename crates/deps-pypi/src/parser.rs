@@ -1,9 +1,10 @@
 use crate::error::{PypiError, Result};
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
+use deps_core::lsp_helpers::LineOffsetTable;
 use pep508_rs::{Requirement, VersionOrUrl};
 use std::any::Any;
 use std::str::FromStr;
-use toml_edit::{DocumentMut, Item, Table};
+use toml_span::value::{Table, Value};
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 /// Parse result containing all dependencies from pyproject.toml.
@@ -43,7 +44,7 @@ impl deps_core::ParseResult for ParseResult {
 /// Parser for Python pyproject.toml files.
 ///
 /// Supports both PEP 621 standard format and Poetry format.
-/// Uses `toml_edit` to preserve source positions for LSP operations.
+/// Uses `toml-span` to preserve source positions for LSP operations.
 ///
 /// # Examples
 ///
@@ -90,52 +91,54 @@ impl PypiParser {
     /// let result = parser.parse_content(&content, &uri).unwrap();
     /// ```
     pub fn parse_content(&self, content: &str, uri: &Uri) -> Result<ParseResult> {
-        let doc = content
-            .parse::<DocumentMut>()
-            .map_err(|e| PypiError::TomlParseError { source: e })?;
+        let doc = toml_span::parse(content).map_err(|e| PypiError::TomlParseError {
+            message: e.to_string(),
+        })?;
 
+        let line_table = LineOffsetTable::new(content);
         let mut dependencies = Vec::new();
-        // Track used positions to handle duplicate dependency strings across sections
-        let mut used_positions = std::collections::HashSet::new();
+
+        let root_table = match doc.as_table() {
+            Some(t) => t,
+            None => {
+                return Ok(ParseResult {
+                    dependencies,
+                    workspace_root: None,
+                    uri: uri.clone(),
+                });
+            }
+        };
 
         // Parse build-system requires (PEP 517/518)
-        if let Some(build_system) = doc.get("build-system").and_then(|i| i.as_table()) {
+        if let Some(build_system) = get_table(root_table, "build-system") {
             dependencies.extend(self.parse_build_system_requires(
                 build_system,
                 content,
-                &mut used_positions,
+                &line_table,
             )?);
         }
 
         // Parse PEP 621 format
-        if let Some(project) = doc.get("project").and_then(|i| i.as_table()) {
-            dependencies.extend(self.parse_pep621_dependencies(
-                project,
-                content,
-                &mut used_positions,
-            )?);
+        if let Some(project) = get_table(root_table, "project") {
+            dependencies.extend(self.parse_pep621_dependencies(project, content, &line_table)?);
             dependencies.extend(self.parse_pep621_optional_dependencies(
                 project,
                 content,
-                &mut used_positions,
+                &line_table,
             )?);
         }
 
         // Parse PEP 735 dependency-groups format
-        if let Some(dep_groups) = doc.get("dependency-groups").and_then(|i| i.as_table()) {
-            dependencies.extend(self.parse_dependency_groups(
-                dep_groups,
-                content,
-                &mut used_positions,
-            )?);
+        if let Some(dep_groups) = get_table(root_table, "dependency-groups") {
+            dependencies.extend(self.parse_dependency_groups(dep_groups, content, &line_table)?);
         }
 
         // Parse Poetry format
-        if let Some(tool) = doc.get("tool").and_then(|i| i.as_table())
-            && let Some(poetry) = tool.get("poetry").and_then(|i| i.as_table())
+        if let Some(tool_table) = get_table(root_table, "tool")
+            && let Some(poetry) = get_table(tool_table, "poetry")
         {
-            dependencies.extend(self.parse_poetry_dependencies(poetry, content)?);
-            dependencies.extend(self.parse_poetry_groups(poetry, content)?);
+            dependencies.extend(self.parse_poetry_dependencies(poetry, content, &line_table)?);
+            dependencies.extend(self.parse_poetry_groups(poetry, content, &line_table)?);
         }
 
         Ok(ParseResult {
@@ -148,15 +151,15 @@ impl PypiParser {
     /// Parse PEP 517/518 `[build-system]` requires array.
     fn parse_build_system_requires(
         &self,
-        build_system: &Table,
+        build_system: &Table<'_>,
         content: &str,
-        used_positions: &mut std::collections::HashSet<usize>,
+        line_table: &LineOffsetTable,
     ) -> Result<Vec<PypiDependency>> {
-        let Some(requires_item) = build_system.get("requires") else {
+        let Some(requires_val) = build_system.get("requires") else {
             return Ok(Vec::new());
         };
 
-        let Some(requires_array) = requires_item.as_array() else {
+        let Some(requires_array) = requires_val.as_array() else {
             return Ok(Vec::new());
         };
 
@@ -164,12 +167,8 @@ impl PypiParser {
 
         for value in requires_array {
             if let Some(dep_str) = value.as_str() {
-                // Find exact position of this dependency string in content
-                let position = self
-                    .find_dependency_string_position(content, dep_str, used_positions)
-                    .map(|(p, _)| p);
-
-                match self.parse_pep508_requirement(dep_str, position) {
+                let position = span_start(content, line_table, value.span);
+                match self.parse_pep508_requirement(dep_str, Some(position)) {
                     Ok(mut dep) => {
                         dep.section = PypiDependencySection::BuildSystem;
                         dependencies.push(dep);
@@ -187,15 +186,15 @@ impl PypiParser {
     /// Parse PEP 621 `[project.dependencies]` array.
     fn parse_pep621_dependencies(
         &self,
-        project: &Table,
+        project: &Table<'_>,
         content: &str,
-        used_positions: &mut std::collections::HashSet<usize>,
+        line_table: &LineOffsetTable,
     ) -> Result<Vec<PypiDependency>> {
-        let Some(deps_item) = project.get("dependencies") else {
+        let Some(deps_val) = project.get("dependencies") else {
             return Ok(Vec::new());
         };
 
-        let Some(deps_array) = deps_item.as_array() else {
+        let Some(deps_array) = deps_val.as_array() else {
             return Ok(Vec::new());
         };
 
@@ -203,12 +202,8 @@ impl PypiParser {
 
         for value in deps_array {
             if let Some(dep_str) = value.as_str() {
-                // Find exact position of this dependency string in content
-                let position = self
-                    .find_dependency_string_position(content, dep_str, used_positions)
-                    .map(|(p, _)| p);
-
-                match self.parse_pep508_requirement(dep_str, position) {
+                let position = span_start(content, line_table, value.span);
+                match self.parse_pep508_requirement(dep_str, Some(position)) {
                     Ok(mut dep) => {
                         dep.section = PypiDependencySection::Dependencies;
                         dependencies.push(dep);
@@ -226,33 +221,29 @@ impl PypiParser {
     /// Parse PEP 621 `[project.optional-dependencies]` tables.
     fn parse_pep621_optional_dependencies(
         &self,
-        project: &Table,
+        project: &Table<'_>,
         content: &str,
-        used_positions: &mut std::collections::HashSet<usize>,
+        line_table: &LineOffsetTable,
     ) -> Result<Vec<PypiDependency>> {
-        let Some(opt_deps_item) = project.get("optional-dependencies") else {
+        let Some(opt_deps_val) = project.get("optional-dependencies") else {
             return Ok(Vec::new());
         };
 
-        let Some(opt_deps_table) = opt_deps_item.as_table() else {
+        let Some(opt_deps_table) = opt_deps_val.as_table() else {
             return Ok(Vec::new());
         };
 
         let mut dependencies = Vec::new();
 
-        for (group_name, group_item) in opt_deps_table {
-            if let Some(group_array) = group_item.as_array() {
+        for (group_key, group_val) in opt_deps_table {
+            if let Some(group_array) = group_val.as_array() {
                 for value in group_array {
                     if let Some(dep_str) = value.as_str() {
-                        // Find exact position of this dependency string in content
-                        let position = self
-                            .find_dependency_string_position(content, dep_str, used_positions)
-                            .map(|(p, _)| p);
-
-                        match self.parse_pep508_requirement(dep_str, position) {
+                        let position = span_start(content, line_table, value.span);
+                        match self.parse_pep508_requirement(dep_str, Some(position)) {
                             Ok(mut dep) => {
                                 dep.section = PypiDependencySection::OptionalDependencies {
-                                    group: group_name.to_string(),
+                                    group: group_key.name.to_string(),
                                 };
                                 dependencies.push(dep);
                             }
@@ -279,32 +270,28 @@ impl PypiParser {
     /// ```
     fn parse_dependency_groups(
         &self,
-        dep_groups: &Table,
+        dep_groups: &Table<'_>,
         content: &str,
-        used_positions: &mut std::collections::HashSet<usize>,
+        line_table: &LineOffsetTable,
     ) -> Result<Vec<PypiDependency>> {
         let mut dependencies = Vec::new();
 
-        for (group_name, group_item) in dep_groups {
-            if let Some(group_array) = group_item.as_array() {
+        for (group_key, group_val) in dep_groups {
+            if let Some(group_array) = group_val.as_array() {
                 for value in group_array {
                     if let Some(dep_str) = value.as_str() {
-                        // Find exact position of this dependency string in content
-                        let position = self
-                            .find_dependency_string_position(content, dep_str, used_positions)
-                            .map(|(p, _)| p);
-
-                        match self.parse_pep508_requirement(dep_str, position) {
+                        let position = span_start(content, line_table, value.span);
+                        match self.parse_pep508_requirement(dep_str, Some(position)) {
                             Ok(mut dep) => {
                                 dep.section = PypiDependencySection::DependencyGroup {
-                                    group: group_name.to_string(),
+                                    group: group_key.name.to_string(),
                                 };
                                 dependencies.push(dep);
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     "Failed to parse dependency group '{}' item '{}': {}",
-                                    group_name,
+                                    group_key.name,
                                     dep_str,
                                     e
                                 );
@@ -321,28 +308,30 @@ impl PypiParser {
     /// Parse Poetry `[tool.poetry.dependencies]` table.
     fn parse_poetry_dependencies(
         &self,
-        poetry: &Table,
+        poetry: &Table<'_>,
         content: &str,
+        line_table: &LineOffsetTable,
     ) -> Result<Vec<PypiDependency>> {
-        let Some(deps_item) = poetry.get("dependencies") else {
+        let Some(deps_val) = poetry.get("dependencies") else {
             return Ok(Vec::new());
         };
 
-        let Some(deps_table) = deps_item.as_table() else {
+        let Some(deps_table) = deps_val.as_table() else {
             return Ok(Vec::new());
         };
 
         let mut dependencies = Vec::new();
 
-        for (name, value) in deps_table {
+        for (name_key, value) in deps_table {
+            let name = &name_key.name;
             // Skip Python version constraint
             if name == "python" {
                 continue;
             }
 
-            let position = self.find_table_key_position(content, "tool.poetry.dependencies", name);
+            let position = span_start(content, line_table, name_key.span);
 
-            match self.parse_poetry_dependency(name, value, position) {
+            match self.parse_poetry_dependency(name, value, Some(position)) {
                 Ok(mut dep) => {
                     dep.section = PypiDependencySection::PoetryDependencies;
                     dependencies.push(dep);
@@ -357,27 +346,33 @@ impl PypiParser {
     }
 
     /// Parse Poetry `[tool.poetry.group.*.dependencies]` tables.
-    fn parse_poetry_groups(&self, poetry: &Table, content: &str) -> Result<Vec<PypiDependency>> {
-        let Some(group_item) = poetry.get("group") else {
+    fn parse_poetry_groups(
+        &self,
+        poetry: &Table<'_>,
+        content: &str,
+        line_table: &LineOffsetTable,
+    ) -> Result<Vec<PypiDependency>> {
+        let Some(group_val) = poetry.get("group") else {
             return Ok(Vec::new());
         };
 
-        let Some(groups_table) = group_item.as_table() else {
+        let Some(groups_table) = group_val.as_table() else {
             return Ok(Vec::new());
         };
 
         let mut dependencies = Vec::new();
 
-        for (group_name, group_item) in groups_table {
-            if let Some(group_table) = group_item.as_table()
-                && let Some(deps_item) = group_table.get("dependencies")
-                && let Some(deps_table) = deps_item.as_table()
+        for (group_name_key, group_val) in groups_table {
+            let group_name = &group_name_key.name;
+            if let Some(group_table) = group_val.as_table()
+                && let Some(deps_val) = group_table.get("dependencies")
+                && let Some(deps_table) = deps_val.as_table()
             {
-                for (name, value) in deps_table {
-                    let section_path = format!("tool.poetry.group.{group_name}.dependencies");
-                    let position = self.find_table_key_position(content, &section_path, name);
+                for (name_key, value) in deps_table {
+                    let name = &name_key.name;
+                    let position = span_start(content, line_table, name_key.span);
 
-                    match self.parse_poetry_dependency(name, value, position) {
+                    match self.parse_poetry_dependency(name, value, Some(position)) {
                         Ok(mut dep) => {
                             dep.section = PypiDependencySection::PoetryGroup {
                                 group: group_name.to_string(),
@@ -503,7 +498,7 @@ impl PypiParser {
     fn parse_poetry_dependency(
         &self,
         name: &str,
-        value: &Item,
+        value: &Value<'_>,
         base_position: Option<Position>,
     ) -> Result<PypiDependency> {
         let name_range = base_position
@@ -609,76 +604,19 @@ impl PypiParser {
             "Unsupported Poetry dependency format for '{name}'"
         )))
     }
+}
 
-    /// Find the exact position of a dependency string in the content.
-    /// Returns the position at the START of the package name (for name_range)
-    /// and can be used to calculate version_range.
-    ///
-    /// `used_positions` tracks byte offsets that have already been used,
-    /// allowing us to find duplicate strings at different positions.
-    /// Returns `(position, byte_offset)` where `byte_offset` is added to
-    /// `used_positions` to track this occurrence.
-    ///
-    /// Performance optimization: Single-pass search without allocations.
-    /// Instead of formatting quoted strings and searching twice, we search
-    /// for the dependency string once and validate quotes in place.
-    fn find_dependency_string_position(
-        &self,
-        content: &str,
-        dep_str: &str,
-        used_positions: &mut std::collections::HashSet<usize>,
-    ) -> Option<(Position, usize)> {
-        let bytes = content.as_bytes();
+/// Get a nested table value by key from a toml-span Table.
+fn get_table<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Table<'a>> {
+    table.get(key)?.as_table()
+}
 
-        // Single pass: search for the dependency string and validate quotes
-        for (pos, _) in content.match_indices(dep_str) {
-            if used_positions.contains(&pos) {
-                continue;
-            }
-
-            // Check if preceded by opening quote (either " or ')
-            if pos > 0 {
-                let opening_quote = bytes[pos - 1];
-                if opening_quote == b'"' || opening_quote == b'\'' {
-                    // Validate matching closing quote exists
-                    let end_pos = pos + dep_str.len();
-                    if end_pos < bytes.len() && bytes[end_pos] == opening_quote {
-                        // Calculate LSP position (line and character)
-                        // pos is now at the start of dep_str (after opening quote)
-                        let before = &content[..pos];
-                        let line = before.chars().filter(|&c| c == '\n').count() as u32;
-                        let last_newline = before.rfind('\n').map_or(0, |p| p + 1);
-                        let character = (pos - last_newline) as u32;
-
-                        used_positions.insert(pos);
-                        return Some((Position::new(line, character), pos));
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Find position of table key in source content.
-    fn find_table_key_position(&self, content: &str, section: &str, key: &str) -> Option<Position> {
-        // Find section first
-        let section_marker = format!("[{section}]");
-        let section_start = content.find(&section_marker)?;
-
-        // Find the key after the section
-        let after_section = &content[section_start..];
-        let key_pattern = format!("{key} = ");
-        let key_pos = after_section.find(&key_pattern)?;
-
-        let total_offset = section_start + key_pos;
-        let before_key = &content[..total_offset];
-        let line = before_key.chars().filter(|&c| c == '\n').count() as u32;
-        let last_newline = before_key.rfind('\n').map_or(0, |p| p + 1);
-        let character = (total_offset - last_newline) as u32;
-
-        Some(Position::new(line, character))
-    }
+/// Convert the start of a toml-span Span to an LSP Position.
+///
+/// toml-span string spans exclude surrounding quotes, so the span start
+/// points directly to the first character of the string content.
+fn span_start(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Position {
+    line_table.byte_offset_to_position(content, span.start)
 }
 
 impl Default for PypiParser {

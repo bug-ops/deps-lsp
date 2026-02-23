@@ -12,11 +12,8 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum CargoError {
     /// Failed to parse Cargo.toml
-    #[error("Failed to parse Cargo.toml: {source}")]
-    TomlParseError {
-        #[source]
-        source: toml_edit::TomlError,
-    },
+    #[error("Failed to parse Cargo.toml: {message}")]
+    TomlParseError { message: String },
 
     /// Invalid semver version specifier
     #[error("Invalid semver version specifier '{specifier}': {message}")]
@@ -157,9 +154,9 @@ impl From<deps_core::DepsError> for CargoError {
 impl From<CargoError> for deps_core::DepsError {
     fn from(err: CargoError) -> Self {
         match err {
-            CargoError::TomlParseError { source } => Self::ParseError {
+            CargoError::TomlParseError { message } => Self::ParseError {
                 file_type: "Cargo.toml".into(),
-                source: Box::new(source),
+                source: Box::new(std::io::Error::other(message)),
             },
             CargoError::InvalidVersionSpecifier { message, .. } => Self::InvalidVersionReq(message),
             CargoError::PackageNotFound { package } => {

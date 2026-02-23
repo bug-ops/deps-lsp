@@ -7,11 +7,8 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum PypiError {
     /// Failed to parse pyproject.toml
-    #[error("Failed to parse pyproject.toml: {source}")]
-    TomlParseError {
-        #[source]
-        source: toml_edit::TomlError,
-    },
+    #[error("Failed to parse pyproject.toml: {message}")]
+    TomlParseError { message: String },
 
     /// Invalid PEP 440 version specifier
     #[error("Invalid PEP 440 version specifier '{specifier}': {source}")]

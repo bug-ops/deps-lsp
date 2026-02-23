@@ -1,12 +1,12 @@
 //! Cargo.toml parser with position tracking.
 //!
-//! Parses Cargo.toml files using toml_edit to preserve formatting and extract
+//! Parses Cargo.toml files using toml-span to preserve formatting and extract
 //! precise LSP positions for every dependency field. Critical for features like
 //! hover, completion, and inlay hints.
 //!
 //! # Key Features
 //!
-//! - Position-preserving parsing via toml_edit spans
+//! - Position-preserving parsing via toml-span spans
 //! - Handles all dependency formats: inline, table, workspace inheritance
 //! - Extracts dependencies from all sections: dependencies, dev-dependencies, build-dependencies
 //! - Converts byte offsets to LSP Position (line, UTF-16 character)
@@ -32,8 +32,10 @@ use crate::error::{CargoError, Result};
 use crate::types::{DependencySection, DependencySource, ParsedDependency};
 use std::any::Any;
 use std::path::PathBuf;
-use toml_edit::{Document, DocumentMut, Item, Table, Value};
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use toml_span::value::{Table, Value};
+use tower_lsp_server::ls_types::{Range, Uri};
+
+pub use deps_core::lsp_helpers::LineOffsetTable;
 
 /// Result of parsing a Cargo.toml file.
 ///
@@ -47,38 +49,6 @@ pub struct ParseResult {
     pub workspace_root: Option<PathBuf>,
     /// Document URI
     pub uri: Uri,
-}
-
-/// Pre-computed line start byte offsets for O(1) position lookups.
-struct LineOffsetTable {
-    line_starts: Vec<usize>,
-}
-
-impl LineOffsetTable {
-    fn new(content: &str) -> Self {
-        let mut line_starts = vec![0];
-        for (i, c) in content.char_indices() {
-            if c == '\n' {
-                line_starts.push(i + 1);
-            }
-        }
-        Self { line_starts }
-    }
-
-    fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
-        let line = self
-            .line_starts
-            .partition_point(|&start| start <= offset)
-            .saturating_sub(1);
-        let line_start = self.line_starts[line];
-
-        let character = content[line_start..offset]
-            .chars()
-            .map(|c| c.len_utf16() as u32)
-            .sum();
-
-        Position::new(line as u32, character)
-    }
 }
 
 /// Parses a Cargo.toml file and extracts all dependencies with positions.
@@ -106,58 +76,62 @@ impl LineOffsetTable {
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
 pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
-    // Use Document (not DocumentMut) to preserve span information
-    let doc: Document<&str> =
-        Document::parse(content).map_err(|e| CargoError::TomlParseError { source: e })?;
+    let doc = toml_span::parse(content).map_err(|e| CargoError::TomlParseError {
+        message: e.to_string(),
+    })?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
 
-    if let Some(deps_item) = doc.get("dependencies")
-        && let Some(deps) = deps_item.as_table()
+    let root_table = doc.as_table().ok_or_else(|| CargoError::TomlParseError {
+        message: "root is not a table".into(),
+    })?;
+
+    if let Some(deps_val) = get_val(root_table, "dependencies")
+        && let Some(deps) = deps_val.as_table()
     {
         dependencies.extend(parse_dependencies_section(
             deps,
             content,
             &line_table,
             DependencySection::Dependencies,
-        )?);
+        ));
     }
 
-    if let Some(dev_deps_item) = doc.get("dev-dependencies")
-        && let Some(dev_deps) = dev_deps_item.as_table()
+    if let Some(dev_deps_val) = get_val(root_table, "dev-dependencies")
+        && let Some(dev_deps) = dev_deps_val.as_table()
     {
         dependencies.extend(parse_dependencies_section(
             dev_deps,
             content,
             &line_table,
             DependencySection::DevDependencies,
-        )?);
+        ));
     }
 
-    if let Some(build_deps_item) = doc.get("build-dependencies")
-        && let Some(build_deps) = build_deps_item.as_table()
+    if let Some(build_deps_val) = get_val(root_table, "build-dependencies")
+        && let Some(build_deps) = build_deps_val.as_table()
     {
         dependencies.extend(parse_dependencies_section(
             build_deps,
             content,
             &line_table,
             DependencySection::BuildDependencies,
-        )?);
+        ));
     }
 
     // Parse workspace dependencies (for workspace root Cargo.toml)
-    if let Some(workspace_item) = doc.get("workspace")
-        && let Some(workspace_table) = workspace_item.as_table()
-        && let Some(workspace_deps_item) = workspace_table.get("dependencies")
-        && let Some(workspace_deps) = workspace_deps_item.as_table()
+    if let Some(workspace_val) = get_val(root_table, "workspace")
+        && let Some(workspace_table) = workspace_val.as_table()
+        && let Some(workspace_deps_val) = get_val(workspace_table, "dependencies")
+        && let Some(workspace_deps) = workspace_deps_val.as_table()
     {
         dependencies.extend(parse_dependencies_section(
             workspace_deps,
             content,
             &line_table,
             DependencySection::WorkspaceDependencies,
-        )?);
+        ));
     }
 
     let workspace_root = find_workspace_root(doc_uri)?;
@@ -169,19 +143,22 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
     })
 }
 
+fn get_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
+    table.get(key)
+}
+
 /// Parses a single dependency section (dependencies, dev-dependencies, or build-dependencies).
 fn parse_dependencies_section(
-    table: &Table,
+    table: &Table<'_>,
     content: &str,
     line_table: &LineOffsetTable,
     section: DependencySection,
-) -> Result<Vec<ParsedDependency>> {
+) -> Vec<ParsedDependency> {
     let mut deps = Vec::new();
 
     for (key, value) in table {
-        let name = key.to_string();
-
-        let name_range = compute_name_range_from_value(content, line_table, &name, value);
+        let name = key.name.to_string();
+        let name_range = span_to_range(content, line_table, key.span);
 
         let mut dep = ParsedDependency {
             name,
@@ -195,155 +172,36 @@ fn parse_dependencies_section(
             section,
         };
 
-        match value {
-            Item::Value(Value::String(s)) => {
-                dep.version_req = Some(s.value().clone());
-                if let Some(span) = s.span() {
-                    dep.version_range = Some(span_to_range_with_table(
-                        content, line_table, span.start, span.end,
-                    ));
-                }
-            }
-            Item::Value(Value::InlineTable(t)) => {
-                parse_inline_table_dependency(&mut dep, t, content, line_table)?;
-            }
-            Item::Table(t) => {
-                parse_table_dependency(&mut dep, t, content, line_table)?;
-            }
-            _ => continue,
+        if let Some(s) = value.as_str() {
+            // Simple string version: serde = "1.0"
+            dep.version_req = Some(s.to_string());
+            dep.version_range = Some(span_to_range(content, line_table, value.span));
+        } else if let Some(t) = value.as_table() {
+            // Inline table or full table: serde = { version = "1.0" }
+            parse_table_dependency(&mut dep, t, content, line_table);
+        } else {
+            continue;
         }
 
         deps.push(dep);
     }
 
-    Ok(deps)
+    deps
 }
 
-/// Computes the name range by searching backwards from the value position.
-fn compute_name_range_from_value(
-    content: &str,
-    line_table: &LineOffsetTable,
-    name: &str,
-    value: &Item,
-) -> Range {
-    let value_span = match value {
-        Item::Value(v) => v.span(),
-        Item::Table(t) => t.span(),
-        _ => None,
-    };
-
-    if let Some(span) = value_span {
-        let mut search_start = span.start.saturating_sub(name.len() + 100);
-        while search_start > 0 && !content.is_char_boundary(search_start) {
-            search_start -= 1;
-        }
-        let search_end = span.start;
-
-        if search_start < content.len() && search_end <= content.len() {
-            let search_slice = &content[search_start..search_end];
-
-            if let Some(pos) = search_slice.rfind(name) {
-                let name_start = search_start + pos;
-                let name_end = name_start + name.len();
-
-                if name_end <= search_end && name_start < content.len() && name_end <= content.len()
-                {
-                    return span_to_range_with_table(content, line_table, name_start, name_end);
-                }
-            }
-        }
-    } else {
-        // Fallback: search for the name in the entire content
-        if let Some(pos) = content.find(name) {
-            let name_start = pos;
-            let name_end = pos + name.len();
-            if name_end <= content.len() {
-                return span_to_range_with_table(content, line_table, name_start, name_end);
-            }
-        }
-    }
-
-    Range::default()
-}
-
-/// Parses an inline table dependency.
-fn parse_inline_table_dependency(
-    dep: &mut ParsedDependency,
-    table: &toml_edit::InlineTable,
-    content: &str,
-    line_table: &LineOffsetTable,
-) -> Result<()> {
-    for (key, value) in table {
-        match key {
-            "version" => {
-                if let Some(s) = value.as_str() {
-                    dep.version_req = Some(s.to_string());
-                    if let Some(span) = value.span() {
-                        dep.version_range = Some(span_to_range_with_table(
-                            content, line_table, span.start, span.end,
-                        ));
-                    }
-                }
-            }
-            "features" => {
-                if let Some(arr) = value.as_array() {
-                    dep.features = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-                    if let Some(span) = value.span() {
-                        dep.features_range = Some(span_to_range_with_table(
-                            content, line_table, span.start, span.end,
-                        ));
-                    }
-                }
-            }
-            "workspace" if value.as_bool() == Some(true) => {
-                dep.workspace_inherited = true;
-            }
-            "git" => {
-                if let Some(url) = value.as_str() {
-                    dep.source = DependencySource::Git {
-                        url: url.to_string(),
-                        rev: None,
-                    };
-                }
-            }
-            "path" => {
-                if let Some(path) = value.as_str() {
-                    dep.source = DependencySource::Path {
-                        path: path.to_string(),
-                    };
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
-
-/// Parses a full table dependency.
+/// Parses a table (inline or full) dependency entry.
 fn parse_table_dependency(
     dep: &mut ParsedDependency,
-    table: &Table,
+    table: &Table<'_>,
     content: &str,
     line_table: &LineOffsetTable,
-) -> Result<()> {
-    for (key, item) in table {
-        let Item::Value(value) = item else {
-            continue;
-        };
-
-        match key {
+) {
+    for (key, value) in table {
+        match key.name.as_ref() {
             "version" => {
                 if let Some(s) = value.as_str() {
                     dep.version_req = Some(s.to_string());
-                    if let Some(span) = value.span() {
-                        dep.version_range = Some(span_to_range_with_table(
-                            content, line_table, span.start, span.end,
-                        ));
-                    }
+                    dep.version_range = Some(span_to_range(content, line_table, value.span));
                 }
             }
             "features" => {
@@ -352,15 +210,13 @@ fn parse_table_dependency(
                         .iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
-                    if let Some(span) = value.span() {
-                        dep.features_range = Some(span_to_range_with_table(
-                            content, line_table, span.start, span.end,
-                        ));
-                    }
+                    dep.features_range = Some(span_to_range(content, line_table, value.span));
                 }
             }
-            "workspace" if value.as_bool() == Some(true) => {
-                dep.workspace_inherited = true;
+            "workspace" => {
+                if value.as_bool() == Some(true) {
+                    dep.workspace_inherited = true;
+                }
             }
             "git" => {
                 if let Some(url) = value.as_str() {
@@ -380,20 +236,13 @@ fn parse_table_dependency(
             _ => {}
         }
     }
-
-    Ok(())
 }
 
-/// Converts toml_edit byte offsets to LSP Range using pre-computed line table.
-fn span_to_range_with_table(
-    content: &str,
-    line_table: &LineOffsetTable,
-    start: usize,
-    end: usize,
-) -> Range {
-    let start_pos = line_table.byte_offset_to_position(content, start);
-    let end_pos = line_table.byte_offset_to_position(content, end);
-    Range::new(start_pos, end_pos)
+/// Converts toml-span byte offsets to LSP Range using pre-computed line table.
+fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Range {
+    let start = line_table.byte_offset_to_position(content, span.start);
+    let end = line_table.byte_offset_to_position(content, span.end);
+    Range::new(start, end)
 }
 
 /// Finds the workspace root by walking up the directory tree.
@@ -411,8 +260,11 @@ fn find_workspace_root(doc_uri: &Uri) -> Result<Option<PathBuf>> {
 
         if workspace_toml.exists()
             && let Ok(content) = std::fs::read_to_string(&workspace_toml)
-            && let Ok(doc) = content.parse::<DocumentMut>()
-            && doc.get("workspace").is_some()
+            && let Ok(doc) = toml_span::parse(&content)
+            && doc
+                .as_table()
+                .and_then(|t| get_val(t, "workspace"))
+                .is_some()
         {
             return Ok(Some(dir.to_path_buf()));
         }

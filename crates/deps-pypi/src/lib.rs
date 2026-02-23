@@ -16,7 +16,7 @@
 //!
 //! deps-pypi follows the same architecture as deps-cargo and deps-npm:
 //! - **Types**: `PypiDependency`, `PypiVersion`, `PypiPackage` with LSP range tracking
-//! - **Parser**: Parse both PEP 621 and Poetry formats using `toml_edit`
+//! - **Parser**: Parse both PEP 621 and Poetry formats using `toml-span`
 //! - **Registry**: PyPI JSON API client with HTTP caching
 //! - **Error Handling**: Typed errors with `thiserror`
 //!

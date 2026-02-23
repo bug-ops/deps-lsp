@@ -45,7 +45,7 @@ use deps_core::lockfile::{
     locate_lockfile_for_manifest,
 };
 use std::path::{Path, PathBuf};
-use toml_edit::DocumentMut;
+use toml_span::value::Table;
 use tower_lsp_server::ls_types::Uri;
 
 /// PyPI lock file parser.
@@ -102,32 +102,35 @@ impl LockFileProvider for PypiLockParser {
                 source: Box::new(e),
             })?;
 
-        let doc: DocumentMut = content.parse().map_err(|e| DepsError::ParseError {
+        let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
             file_type: "Python lock file".into(),
-            source: Box::new(e),
+            source: Box::new(std::io::Error::other(e.to_string())),
         })?;
 
         let mut packages = ResolvedPackages::new();
 
+        // [[package]] in TOML is an array of tables; toml-span represents it as an array of values
         let Some(package_array) = doc
-            .get("package")
-            .and_then(|v: &toml_edit::Item| v.as_array_of_tables())
+            .as_table()
+            .and_then(|t| t.get("package"))
+            .and_then(|v| v.as_array())
         else {
             tracing::warn!("Lock file missing [[package]] array of tables");
             return Ok(packages);
         };
 
-        for table in package_array {
+        for item in package_array {
+            let Some(table) = item.as_table() else {
+                continue;
+            };
+
             // Extract required fields
-            let Some(name) = table.get("name").and_then(|v: &toml_edit::Item| v.as_str()) else {
+            let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
                 tracing::warn!("Package missing name field");
                 continue;
             };
 
-            let Some(version) = table
-                .get("version")
-                .and_then(|v: &toml_edit::Item| v.as_str())
-            else {
+            let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
                 tracing::warn!("Package '{}' missing version field", name);
                 continue;
             };
@@ -173,8 +176,8 @@ impl LockFileProvider for PypiLockParser {
 /// - `source.registry = "https://pypi.org/simple"` → Registry
 /// - `source.git = "https://github.com/..."` → Git
 /// - `source.path = "..."` → Path
-fn parse_pypi_source(table: &toml_edit::Table) -> ResolvedSource {
-    let Some(source_item) = table.get("source") else {
+fn parse_pypi_source(table: &Table<'_>) -> ResolvedSource {
+    let Some(source_val) = table.get("source") else {
         // No source field = PyPI registry (poetry default)
         return ResolvedSource::Registry {
             url: "https://pypi.org/simple".to_string(),
@@ -182,8 +185,8 @@ fn parse_pypi_source(table: &toml_edit::Table) -> ResolvedSource {
         };
     };
 
-    // Handle inline table format (uv style)
-    if let Some(source_table) = source_item.as_inline_table() {
+    // In toml-span, both inline tables and regular tables are represented as Table
+    if let Some(source_table) = source_val.as_table() {
         // uv: source = { registry = "https://pypi.org/simple" }
         if let Some(registry) = source_table.get("registry").and_then(|v| v.as_str()) {
             return ResolvedSource::Registry {
@@ -212,10 +215,7 @@ fn parse_pypi_source(table: &toml_edit::Table) -> ResolvedSource {
                 path: path.to_string(),
             };
         }
-    }
 
-    // Handle table format (poetry style)
-    if let Some(source_table) = source_item.as_table() {
         // poetry: [package.source] type = "git"
         if let Some(source_type) = source_table.get("type").and_then(|v| v.as_str()) {
             match source_type {
@@ -276,39 +276,33 @@ fn parse_pypi_source(table: &toml_edit::Table) -> ResolvedSource {
 ///     { name = "charset-normalizer" },
 /// ]
 /// ```
-fn parse_pypi_dependencies(table: &toml_edit::Table) -> Vec<String> {
-    // Try uv format first (dependencies array)
-    if let Some(deps_value) = table.get("dependencies")
-        && let Some(deps_array) = deps_value.as_array()
-    {
+fn parse_pypi_dependencies(table: &Table<'_>) -> Vec<String> {
+    let Some(deps_val) = table.get("dependencies") else {
+        return vec![];
+    };
+
+    // uv format: dependencies as array of inline tables [{ name = "certifi" }]
+    if let Some(deps_array) = deps_val.as_array() {
         return deps_array
             .iter()
             .filter_map(|item| {
                 // uv format: { name = "certifi" }
-                if let Some(dep_table) = item.as_inline_table()
-                    && let Some(name) = dep_table.get("name").and_then(|v| v.as_str())
-                {
-                    return Some(name.to_string());
+                if let Some(dep_table) = item.as_table() {
+                    return dep_table
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                 }
 
                 // Simple string format (fallback)
-                if let Some(s) = item.as_str() {
-                    return Some(s.to_string());
-                }
-
-                None
+                item.as_str().map(String::from)
             })
             .collect();
     }
 
-    // Try poetry format (package.dependencies table)
-    if let Some(deps_item) = table.get("dependencies")
-        && let Some(deps_table) = deps_item.as_table()
-    {
-        return deps_table
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect();
+    // Poetry format: dependencies as table with package names as keys
+    if let Some(deps_table) = deps_val.as_table() {
+        return deps_table.keys().map(|key| key.name.to_string()).collect();
     }
 
     vec![]
