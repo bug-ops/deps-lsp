@@ -99,22 +99,19 @@ impl UnifiedDependency {
         }
     }
 
-    /// Returns true if this is a registry dependency (not Git/Path).
+    /// Returns true if this is a registry dependency (not Git/Path/Workspace/etc).
     #[allow(unreachable_patterns)]
     pub fn is_registry(&self) -> bool {
+        use deps_core::Dependency;
         match self {
             #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => {
-                matches!(dep.source, deps_cargo::DependencySource::Registry)
-            }
+            Self::Cargo(dep) => dep.source().is_registry(),
             #[cfg(feature = "npm")]
-            Self::Npm(_) => true,
+            Self::Npm(dep) => dep.source().is_registry(),
             #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => {
-                matches!(dep.source, deps_pypi::PypiDependencySource::PyPI)
-            }
+            Self::Pypi(dep) => dep.source().is_registry(),
             #[cfg(feature = "go")]
-            Self::Go(_) => true,
+            Self::Go(dep) => dep.source().is_registry(),
             _ => unreachable!("no ecosystem features enabled"),
         }
     }
@@ -259,7 +256,6 @@ impl Ecosystem {
 ///     features: vec![],
 ///     features_range: None,
 ///     source: DependencySource::Registry,
-///     workspace_inherited: false,
 ///     section: DependencySection::Dependencies,
 /// };
 ///
@@ -1241,7 +1237,6 @@ mod tests {
                 features: vec![],
                 features_range: None,
                 source: DependencySource::Registry,
-                workspace_inherited: false,
                 section: DependencySection::Dependencies,
             })
         }
@@ -1317,10 +1312,24 @@ mod tests {
                     url: "https://github.com/user/repo".into(),
                     rev: None,
                 },
-                workspace_inherited: false,
                 section: DependencySection::Dependencies,
             });
             assert!(!git_dep.is_registry());
+        }
+
+        #[test]
+        fn test_unified_dependency_workspace_source() {
+            let ws_dep = UnifiedDependency::Cargo(ParsedDependency {
+                name: "serde".into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                version_req: None,
+                version_range: None,
+                features: vec![],
+                features_range: None,
+                source: DependencySource::Workspace,
+                section: DependencySection::Dependencies,
+            });
+            assert!(!ws_dep.is_registry());
         }
 
         #[test]
@@ -1488,7 +1497,7 @@ mod tests {
                 extras_range: None,
                 markers: None,
                 markers_range: None,
-                source: PypiDependencySource::PyPI,
+                source: PypiDependencySource::Registry,
                 section: PypiDependencySection::Dependencies,
             });
 

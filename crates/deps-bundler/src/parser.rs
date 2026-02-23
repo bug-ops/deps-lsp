@@ -231,16 +231,14 @@ fn extract_source(line: &str) -> DependencySource {
     if let Some(caps) = GIT_OPTION.captures(line) {
         return DependencySource::Git {
             url: caps[1].to_string(),
-            branch: None,
-            tag: None,
-            ref_: None,
+            rev: None,
         };
     }
 
     if let Some(caps) = GITHUB_OPTION.captures(line) {
-        return DependencySource::Github {
-            repo: caps[1].to_string(),
-            branch: None,
+        return DependencySource::Git {
+            url: format!("https://github.com/{}", &caps[1]),
+            rev: None,
         };
     }
 
@@ -421,10 +419,12 @@ gem 'rails', git: 'https://github.com/rails/rails.git'";
         let gemfile = r"source 'https://rubygems.org'
 gem 'rails', github: 'rails/rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Github { .. }
-        ));
+        match &result.dependencies[0].source {
+            DependencySource::Git { url, .. } => {
+                assert!(url.contains("github.com/rails/rails"));
+            }
+            _ => panic!("Expected Git source"),
+        }
     }
 
     #[test]

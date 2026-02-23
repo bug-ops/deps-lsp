@@ -2,6 +2,8 @@ use std::any::Any;
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::Range;
 
+pub use deps_core::parser::DependencySource;
+
 /// Parsed dependency from Cargo.toml with position tracking.
 ///
 /// Stores all information about a dependency declaration, including its name,
@@ -11,7 +13,8 @@ use tower_lsp_server::ls_types::Range;
 /// # Examples
 ///
 /// ```
-/// use deps_cargo::types::{ParsedDependency, DependencySource, DependencySection};
+/// use deps_cargo::types::{ParsedDependency, DependencySection};
+/// use deps_cargo::DependencySource;
 /// use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// let dep = ParsedDependency {
@@ -22,7 +25,6 @@ use tower_lsp_server::ls_types::Range;
 ///     features: vec!["derive".into()],
 ///     features_range: None,
 ///     source: DependencySource::Registry,
-///     workspace_inherited: false,
 ///     section: DependencySection::Dependencies,
 /// };
 ///
@@ -38,38 +40,7 @@ pub struct ParsedDependency {
     pub features: Vec<String>,
     pub features_range: Option<Range>,
     pub source: DependencySource,
-    pub workspace_inherited: bool,
     pub section: DependencySection,
-}
-
-/// Source location of a dependency.
-///
-/// Dependencies can come from the crates.io registry, a Git repository,
-/// or a local filesystem path. This affects how the LSP server resolves
-/// version information and provides completions.
-///
-/// # Examples
-///
-/// ```
-/// use deps_cargo::types::DependencySource;
-///
-/// let registry = DependencySource::Registry;
-/// let git = DependencySource::Git {
-///     url: "https://github.com/serde-rs/serde".into(),
-///     rev: Some("v1.0.0".into()),
-/// };
-/// let path = DependencySource::Path {
-///     path: "../local-crate".into(),
-/// };
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DependencySource {
-    /// Dependency from crates.io registry
-    Registry,
-    /// Dependency from Git repository
-    Git { url: String, rev: Option<String> },
-    /// Dependency from local filesystem path
-    Path { path: String },
 }
 
 /// Section in Cargo.toml where a dependency is declared.
@@ -180,16 +151,7 @@ impl deps_core::Dependency for ParsedDependency {
     }
 
     fn source(&self) -> deps_core::parser::DependencySource {
-        match &self.source {
-            DependencySource::Registry => deps_core::parser::DependencySource::Registry,
-            DependencySource::Git { url, rev } => deps_core::parser::DependencySource::Git {
-                url: url.clone(),
-                rev: rev.clone(),
-            },
-            DependencySource::Path { path } => {
-                deps_core::parser::DependencySource::Path { path: path.clone() }
-            }
-        }
+        self.source.clone()
     }
 
     fn features(&self) -> &[String] {
@@ -251,18 +213,25 @@ mod tests {
 
     #[test]
     fn test_dependency_source_variants() {
-        let registry = DependencySource::Registry;
-        let git = DependencySource::Git {
-            url: "https://github.com/user/repo".into(),
-            rev: Some("main".into()),
-        };
-        let path = DependencySource::Path {
-            path: "../local".into(),
-        };
-
-        assert!(matches!(registry, DependencySource::Registry));
-        assert!(matches!(git, DependencySource::Git { .. }));
-        assert!(matches!(path, DependencySource::Path { .. }));
+        assert!(matches!(
+            DependencySource::Registry,
+            DependencySource::Registry
+        ));
+        assert!(matches!(
+            DependencySource::Git {
+                url: "u".into(),
+                rev: None
+            },
+            DependencySource::Git { .. }
+        ));
+        assert!(matches!(
+            DependencySource::Path { path: "p".into() },
+            DependencySource::Path { .. }
+        ));
+        assert!(matches!(
+            DependencySource::Workspace,
+            DependencySource::Workspace
+        ));
     }
 
     #[test]

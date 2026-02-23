@@ -194,7 +194,6 @@ mod tests {
             features: vec![],
             features_range: None,
             source: DependencySource::Registry,
-            workspace_inherited: false,
             section: DependencySection::Dependencies,
         }
     }

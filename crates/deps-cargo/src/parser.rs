@@ -168,7 +168,6 @@ fn parse_dependencies_section(
             features: Vec::new(),
             features_range: None,
             source: DependencySource::Registry,
-            workspace_inherited: false,
             section,
         };
 
@@ -215,7 +214,7 @@ fn parse_table_dependency(
             }
             "workspace" => {
                 if value.as_bool() == Some(true) {
-                    dep.workspace_inherited = true;
+                    dep.source = DependencySource::Workspace;
                 }
             }
             "git" => {
@@ -306,16 +305,7 @@ impl deps_core::DependencyInfo for ParsedDependency {
     }
 
     fn source(&self) -> deps_core::DependencySource {
-        match &self.source {
-            DependencySource::Registry => deps_core::DependencySource::Registry,
-            DependencySource::Git { url, rev } => deps_core::DependencySource::Git {
-                url: url.clone(),
-                rev: rev.clone(),
-            },
-            DependencySource::Path { path } => {
-                deps_core::DependencySource::Path { path: path.clone() }
-            }
-        }
+        self.source.clone()
     }
 
     fn features(&self) -> &[String] {
@@ -400,7 +390,10 @@ serde = { version = "1.0", features = ["derive"] }"#;
 serde = { workspace = true }";
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(result.dependencies[0].workspace_inherited);
+        assert!(matches!(
+            result.dependencies[0].source,
+            DependencySource::Workspace
+        ));
     }
 
     #[test]

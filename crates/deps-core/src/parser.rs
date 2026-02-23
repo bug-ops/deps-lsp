@@ -73,15 +73,55 @@ pub trait ParseResultInfo {
     fn workspace_root(&self) -> Option<&std::path::Path>;
 }
 
-/// Dependency source (shared across ecosystems).
-#[derive(Debug, Clone, PartialEq)]
+/// Dependency source location (shared across all ecosystems).
+///
+/// Covers the union of all source types across Cargo, npm, PyPI, Go,
+/// Dart, Bundler, Maven, and Gradle ecosystems.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DependencySource {
-    /// Dependency from default registry (crates.io, npm, PyPI).
+    /// Default package registry (crates.io, npm, PyPI, pub.dev, rubygems.org, Maven Central).
     Registry,
-    /// Dependency from Git repository.
-    Git { url: String, rev: Option<String> },
-    /// Dependency from local filesystem path.
+
+    /// Git repository dependency.
+    Git {
+        url: String,
+        /// Git ref: commit SHA, tag, or branch name (ecosystem-specific semantics).
+        rev: Option<String>,
+    },
+
+    /// Local filesystem path dependency.
     Path { path: String },
+
+    /// Direct URL to artifact (PyPI wheels, npm tarballs).
+    Url { url: String },
+
+    /// SDK-provided dependency (Dart: `sdk: flutter`).
+    Sdk { sdk: String },
+
+    /// Workspace-inherited dependency (Cargo: `workspace = true`).
+    Workspace,
+
+    /// Custom/alternative registry (Bundler custom sources, private registries).
+    CustomRegistry { url: String },
+}
+
+impl DependencySource {
+    /// Returns true if this dependency comes from any registry (default or custom).
+    ///
+    /// Registry dependencies support version fetching and update checks.
+    /// Git, Path, Url, Sdk, and Workspace dependencies do not.
+    pub fn is_registry(&self) -> bool {
+        matches!(self, Self::Registry | Self::CustomRegistry { .. })
+    }
+
+    /// Returns true if version resolution is possible for this source.
+    ///
+    /// Currently equivalent to `is_registry()`, but semantically distinct
+    /// for future extensibility (e.g., Git tags could support version listing).
+    pub fn is_version_resolvable(&self) -> bool {
+        self.is_registry()
+    }
 }
 
 /// Loading state for registry data fetching.
@@ -165,6 +205,8 @@ mod tests {
     fn test_dependency_source_registry() {
         let source = DependencySource::Registry;
         assert_eq!(source, DependencySource::Registry);
+        assert!(source.is_registry());
+        assert!(source.is_version_resolvable());
     }
 
     #[test]
@@ -173,6 +215,9 @@ mod tests {
             url: "https://github.com/user/repo".into(),
             rev: Some("main".into()),
         };
+
+        assert!(!source.is_registry());
+        assert!(!source.is_version_resolvable());
 
         match source {
             DependencySource::Git { url, rev } => {
@@ -205,12 +250,47 @@ mod tests {
             path: "../local-crate".into(),
         };
 
+        assert!(!source.is_registry());
+
         match source {
             DependencySource::Path { path } => {
                 assert_eq!(path, "../local-crate");
             }
             _ => panic!("Expected Path source"),
         }
+    }
+
+    #[test]
+    fn test_dependency_source_url() {
+        let source = DependencySource::Url {
+            url: "https://example.com/package.whl".into(),
+        };
+        assert!(!source.is_registry());
+        assert!(!source.is_version_resolvable());
+    }
+
+    #[test]
+    fn test_dependency_source_sdk() {
+        let source = DependencySource::Sdk {
+            sdk: "flutter".into(),
+        };
+        assert!(!source.is_registry());
+    }
+
+    #[test]
+    fn test_dependency_source_workspace() {
+        let source = DependencySource::Workspace;
+        assert!(!source.is_registry());
+        assert!(!source.is_version_resolvable());
+    }
+
+    #[test]
+    fn test_dependency_source_custom_registry() {
+        let source = DependencySource::CustomRegistry {
+            url: "https://gems.example.com".into(),
+        };
+        assert!(source.is_registry());
+        assert!(source.is_version_resolvable());
     }
 
     #[test]
