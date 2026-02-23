@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-02-23
+
 ### Added
 - **PHP/Composer ecosystem support** — New `deps-composer` crate with full composer.json and composer.lock support
   - JSON parser for `require` and `require-dev` sections with position tracking
@@ -391,7 +393,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/bug-ops/deps-lsp/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/bug-ops/deps-lsp/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/bug-ops/deps-lsp/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/bug-ops/deps-lsp/compare/v0.6.1...v0.7.0
