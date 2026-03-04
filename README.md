@@ -71,7 +71,7 @@ deps-lsp is optimized for responsiveness:
 cargo install deps-lsp
 ```
 
-Latest published crate version: `0.9.0`.
+Latest published crate version: `0.9.1`.
 
 > [!TIP]
 > Use `cargo binstall deps-lsp` for faster installation without compilation.
