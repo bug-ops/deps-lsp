@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-03-04
+
+### Security
+- Update `aws-lc-sys` 0.37.1 -> 0.38.0 (via `aws-lc-rs` 1.15.4 -> 1.16.1) to fix three high-severity vulnerabilities:
+  - GHSA-hfpc-8r3f-gw53: PKCS7_verify Signature Validation Bypass
+  - GHSA-65p9-r9h6-22vj: Timing Side-Channel in AES-CCM Tag Verification
+  - GHSA-vw5v-4f2q-w9xf: PKCS7_verify Certificate Chain Validation Bypass
+
 ## [0.9.0] - 2026-02-23
 
 ### Added
@@ -393,7 +401,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/bug-ops/deps-lsp/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/bug-ops/deps-lsp/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/bug-ops/deps-lsp/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/bug-ops/deps-lsp/compare/v0.7.0...v0.7.1
