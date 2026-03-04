@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["RUBYGEMS_URL"],"fn":["gem_url"],"struct":["RubyGemsRegistry"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["is_platform_package","parse_composer_json"],"struct":["ComposerParseResult"]};
