@@ -2,30 +2,35 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deps-go)](https://crates.io/crates/deps-go)
 [![docs.rs](https://img.shields.io/docsrs/deps-go)](https://docs.rs/deps-go)
+[![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-go)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Go modules support for deps-lsp.
 
-This crate provides parsing and registry integration for Go's module ecosystem.
+This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It provides parsing and registry integration for Go's module ecosystem and implements `deps_core::Ecosystem`.
 
 ## Features
 
-- **go.mod Parsing** — Parse `go.mod` with position tracking for all directives
-- **go.sum Lock File** — Extract resolved versions from `go.sum`
-- **Directive Support** — Handle `require`, `replace`, `exclude`, and `retract` directives
-- **Indirect Dependencies** — Detect and mark indirect dependencies (`// indirect`)
-- **Pseudo-versions** — Parse and validate Go pseudo-version format
-- **proxy.golang.org** — Fetch module versions from Go module proxy
-- **Module Path Escaping** — Proper URL encoding for uppercase characters
-- **EcosystemHandler** — Implements `deps_core::EcosystemHandler` trait
+- **go.mod parsing** — Parse all directives with byte-accurate position tracking
+- **go.sum lock file** — Extract resolved versions from `go.sum`
+- **Directive support** — Handle `require`, `replace`, `exclude`, and `retract` directives
+- **Indirect dependencies** — Detect and mark `// indirect` annotations
+- **Pseudo-versions** — Parse and validate the `v0.0.0-YYYYMMDDHHMMSS-hash` format
+- **proxy.golang.org** — Fetch module versions from the Go module proxy
+- **Module path escaping** — Proper URL encoding for uppercase characters per Go spec
 
-## Usage
+## Installation
 
 ```toml
 [dependencies]
-deps-go = "0.5"
+deps-go = "0.9.2"
 ```
+
+> [!IMPORTANT]
+> Requires Rust 1.89 or later.
+
+## Usage
 
 ```rust
 use deps_go::{parse_go_mod, GoRegistry};
@@ -35,7 +40,7 @@ let registry = GoRegistry::new(cache);
 let versions = registry.get_versions("github.com/gin-gonic/gin").await?;
 ```
 
-## Supported Directives
+## Supported directives
 
 ### require
 
@@ -60,7 +65,7 @@ replace github.com/local/module => ../local/module
 exclude github.com/pkg/module v1.2.3
 ```
 
-## Pseudo-version Support
+## Pseudo-version support
 
 Handles Go's pseudo-version format for unreleased commits:
 

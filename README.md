@@ -1,14 +1,15 @@
 # deps-lsp
 
 [![Crates.io](https://img.shields.io/crates/v/deps-lsp)](https://crates.io/crates/deps-lsp)
-[![docs.rs](https://img.shields.io/docsrs/deps-lsp)](https://docs.rs/deps-lsp)
+[![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ)](https://codecov.io/gh/bug-ops/deps-lsp)
-[![CI](https://img.shields.io/github/actions/workflow/status/bug-ops/deps-lsp/ci.yml?branch=main)](https://github.com/bug-ops/deps-lsp/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.89-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
 A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, and Composer ecosystems.
+
+![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
 
 ## Features
 
@@ -21,36 +22,20 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Code actions** — Quick fixes to update dependencies
 - **High performance** — Parallel fetching with per-dependency timeouts, optimized caching
 
-![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
-
-## Performance
-
-deps-lsp is optimized for responsiveness:
-
-| Operation | Latency | Notes |
-| ----------- | --------- | ------- |
-| Document open (50 deps) | ~150ms | Parallel registry fetching |
-| Inlay hints | <100ms | Cached version lookups |
-| Hover | <50ms | Pre-fetched metadata |
-| Code actions | <50ms | No network calls |
-
-> [!TIP]
-> Lock file support provides instant resolved versions without network requests.
-
 ## Supported ecosystems
 
 | Language | Ecosystem | Manifest file | Status |
 | ---------- | ----------- | --------------- | -------- |
-| Rust | Cargo | `Cargo.toml` | ✅ Supported |
-| JavaScript | npm | `package.json` | ✅ Supported |
-| Python | PyPI | `pyproject.toml` | ✅ Supported |
-| Go | Go Modules | `go.mod` | ✅ Supported |
-| Ruby | Bundler | `Gemfile` | ✅ Supported |
-| Dart | Pub | `pubspec.yaml` | ✅ Supported |
-| Java | Maven | `pom.xml` | ✅ Supported |
-| Java | Gradle | `libs.versions.toml`, `build.gradle.kts`, `build.gradle`, `settings.gradle` | ✅ Supported |
-| Swift | SPM | `Package.swift` | ✅ Supported |
-| PHP | Composer | `composer.json` | ✅ Supported |
+| Rust | Cargo | `Cargo.toml` | Supported |
+| JavaScript | npm | `package.json` | Supported |
+| Python | PyPI | `pyproject.toml` | Supported |
+| Go | Go Modules | `go.mod` | Supported |
+| Ruby | Bundler | `Gemfile` | Supported |
+| Dart | Pub | `pubspec.yaml` | Supported |
+| Java | Maven | `pom.xml` | Supported |
+| Java | Gradle | `libs.versions.toml`, `build.gradle.kts`, `build.gradle`, `settings.gradle` | Supported |
+| Swift | SPM | `Package.swift` | Supported |
+| PHP | Composer | `composer.json` | Supported |
 
 > [!NOTE]
 > **Ecosystem details:**
@@ -71,18 +56,8 @@ deps-lsp is optimized for responsiveness:
 cargo install deps-lsp
 ```
 
-Latest published crate version: `0.9.1`.
-
 > [!TIP]
 > Use `cargo binstall deps-lsp` for faster installation without compilation.
-
-### From source
-
-```bash
-git clone https://github.com/bug-ops/deps-lsp
-cd deps-lsp
-cargo install --path crates/deps-lsp
-```
 
 ### Pre-built binaries
 
@@ -96,6 +71,14 @@ Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/lat
 | macOS | Apple Silicon | `deps-lsp-aarch64-apple-darwin` |
 | Windows | x86_64 | `deps-lsp-x86_64-pc-windows-msvc.exe` |
 | Windows | ARM64 | `deps-lsp-aarch64-pc-windows-msvc.exe` |
+
+### From source
+
+```bash
+git clone https://github.com/bug-ops/deps-lsp
+cd deps-lsp
+cargo install --path crates/deps-lsp
+```
 
 ## Feature flags
 
@@ -111,16 +94,16 @@ cargo install deps-lsp --no-default-features --features "pypi"
 
 | Feature | Language | Manifest | Default |
 | --------- | ---------- | ----------- | ------- |
-| `cargo` | Rust | Cargo.toml | ✅ |
-| `npm` | JavaScript | package.json | ✅ |
-| `pypi` | Python | pyproject.toml | ✅ |
-| `go` | Go | go.mod | ✅ |
-| `bundler` | Ruby | Gemfile | ✅ |
-| `dart` | Dart | pubspec.yaml | ✅ |
-| `maven` | Java | pom.xml | ✅ |
-| `gradle` | Java | libs.versions.toml, build.gradle.kts, build.gradle | ✅ |
-| `swift` | Swift | Package.swift | ✅ |
-| `composer` | PHP | composer.json | ✅ |
+| `cargo` | Rust | Cargo.toml | Yes |
+| `npm` | JavaScript | package.json | Yes |
+| `pypi` | Python | pyproject.toml | Yes |
+| `go` | Go | go.mod | Yes |
+| `bundler` | Ruby | Gemfile | Yes |
+| `dart` | Dart | pubspec.yaml | Yes |
+| `maven` | Java | pom.xml | Yes |
+| `gradle` | Java | libs.versions.toml, build.gradle.kts, build.gradle | Yes |
+| `swift` | Swift | Package.swift | Yes |
+| `composer` | PHP | composer.json | Yes |
 
 ## Usage
 
@@ -145,7 +128,6 @@ Install the **Deps** extension from Zed Extensions marketplace. Ruby support is 
 Enable inlay hints in Zed settings:
 
 ```json
-// settings.json
 {
   "inlay_hints": {
     "enabled": true
@@ -197,7 +179,6 @@ display-inlay-hints = true
 Install an LSP client extension and configure deps-lsp. Enable inlay hints:
 
 ```json
-// settings.json
 {
   "editor.inlayHints.enabled": "on"
 }
@@ -228,7 +209,7 @@ Configure via LSP initialization options:
   "loading_indicator": {
     "enabled": true,
     "fallback_to_hints": true,
-    "loading_text": "⏳"
+    "loading_text": "..."
   },
   "cold_start": {
     "enabled": true,
@@ -245,7 +226,7 @@ Configure via LSP initialization options:
 | `cache` | `max_concurrent_fetches` | `20` | Concurrent registry requests (1-100) |
 | `loading_indicator` | `enabled` | `true` | Show loading feedback during fetches |
 | `loading_indicator` | `fallback_to_hints` | `true` | Show loading in inlay hints if LSP progress unsupported |
-| `loading_indicator` | `loading_text` | `"⏳"` | Text shown during loading (max 100 chars) |
+| `loading_indicator` | `loading_text` | `"..."` | Text shown during loading (max 100 chars) |
 
 > [!TIP]
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.
@@ -275,6 +256,20 @@ alias zed='env GITHUB_TOKEN=(gh auth token) command zed'
 
 > [!TIP]
 > Add the alias to your shell profile (`~/.zshrc`, `~/.bashrc`, `~/.config/fish/config.fish`) for persistence.
+
+## Performance
+
+deps-lsp is optimized for responsiveness:
+
+| Operation | Latency | Notes |
+| ----------- | --------- | ------- |
+| Document open (50 deps) | ~150ms | Parallel registry fetching |
+| Inlay hints | <100ms | Cached version lookups |
+| Hover | <50ms | Pre-fetched metadata |
+| Code actions | <50ms | No network calls |
+
+> [!TIP]
+> Lock file support provides instant resolved versions without network requests.
 
 ## Development
 

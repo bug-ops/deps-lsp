@@ -2,29 +2,34 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deps-maven)](https://crates.io/crates/deps-maven)
 [![docs.rs](https://img.shields.io/docsrs/deps-maven)](https://docs.rs/deps-maven)
+[![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-maven)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 pom.xml support for deps-lsp.
 
-This crate provides Maven/JVM ecosystem support for the deps-lsp server, including pom.xml parsing, dependency extraction, and Maven Central registry integration.
+This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It provides Maven/JVM ecosystem support including pom.xml parsing, dependency extraction, and Maven Central registry integration, and implements `deps_core::Ecosystem`.
 
 ## Features
 
-- **XML Parsing** — Parse `pom.xml` with byte-accurate position tracking using `quick-xml` SAX reader
-- **Dependency Sections** — Handle `<dependencies>`, `<dependencyManagement>`, and `<build><plugins>` blocks
-- **Maven Central Registry** — Solr API client for version lookups and artifact search
-- **Version Comparison** — Maven version qualifier support (`alpha`, `beta`, `RC`, `SNAPSHOT`, `GA`)
-- **Property Resolution** — Resolve `${property}` placeholders defined in `<properties>`
-- **Scope Handling** — Recognise `compile`, `test`, `provided`, `runtime`, and `import` scopes
-- **Ecosystem Trait** — Implements `deps_core::Ecosystem` trait
+- **XML parsing** — Parse `pom.xml` with byte-accurate position tracking via the `quick-xml` SAX reader
+- **Dependency sections** — Handle `<dependencies>`, `<dependencyManagement>`, and `<build><plugins>` blocks
+- **Maven Central registry** — Solr API client for version lookups and artifact search
+- **Version comparison** — Maven version qualifier support (`alpha`, `beta`, `RC`, `SNAPSHOT`, `GA`)
+- **Property resolution** — Resolve `${property}` placeholders defined in `<properties>`
+- **Scope handling** — Recognise `compile`, `test`, `provided`, `runtime`, and `import` scopes
 
-## Usage
+## Installation
 
 ```toml
 [dependencies]
-deps-maven = "0.7"
+deps-maven = "0.9.2"
 ```
+
+> [!IMPORTANT]
+> Requires Rust 1.89 or later.
+
+## Usage
 
 ```rust
 use deps_maven::{parse_pom_xml, MavenCentralRegistry};
@@ -34,7 +39,7 @@ let registry = MavenCentralRegistry::new(cache);
 let versions = registry.get_versions_typed("org.springframework:spring-core").await?;
 ```
 
-## Supported pom.xml Syntax
+## Supported pom.xml syntax
 
 ```xml
 <project>
