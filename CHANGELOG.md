@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-03-21
+
+### Fixed
+- Add missing `offset_encoding` field to `InitializeResult` in LSP server
+
+### Security
+- Update `quinn-proto` 0.11.13 -> 0.11.14
+
 ## [0.9.1] - 2026-03-04
 
 ### Security
@@ -401,7 +409,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/bug-ops/deps-lsp/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/bug-ops/deps-lsp/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/bug-ops/deps-lsp/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/bug-ops/deps-lsp/compare/v0.7.1...v0.8.0
