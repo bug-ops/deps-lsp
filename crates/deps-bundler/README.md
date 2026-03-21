@@ -2,29 +2,34 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deps-bundler)](https://crates.io/crates/deps-bundler)
 [![docs.rs](https://img.shields.io/docsrs/deps-bundler)](https://docs.rs/deps-bundler)
+[![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-bundler)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Gemfile support for deps-lsp.
 
-This crate provides Bundler-specific functionality for the deps-lsp server, including Gemfile DSL parsing, dependency extraction, and rubygems.org registry integration.
+This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It provides Bundler-specific functionality including Gemfile DSL parsing, dependency extraction, and rubygems.org registry integration, and implements `deps_core::Ecosystem`.
 
 ## Features
 
-- **Gemfile Parsing** — Parse `Gemfile` with position tracking using regex-based DSL parser
-- **Lock File Parsing** — Extract resolved versions from `Gemfile.lock`
-- **rubygems.org Registry** — HTTP client for version lookups and package search
-- **Version Resolution** — Ruby-aware version matching with pessimistic operator (`~>`)
-- **Dependency Sources** — Support for registry, git, path, and github dependencies
-- **Group Handling** — Handle `:development`, `:test`, `:production` groups
-- **Ecosystem Trait** — Implements `deps_core::Ecosystem` trait
+- **Gemfile parsing** — Parse `Gemfile` with position tracking via a regex-based DSL parser
+- **Lock file parsing** — Extract resolved versions from `Gemfile.lock`
+- **rubygems.org registry** — HTTP client for version lookups and package search
+- **Version resolution** — Ruby-aware version matching with pessimistic operator (`~>`)
+- **Dependency sources** — Support for registry, git, path, and github dependencies
+- **Group handling** — Handle `:development`, `:test`, `:production` groups
 
-## Usage
+## Installation
 
 ```toml
 [dependencies]
-deps-bundler = "0.5"
+deps-bundler = "0.9.2"
 ```
+
+> [!IMPORTANT]
+> Requires Rust 1.89 or later.
+
+## Usage
 
 ```rust
 use deps_bundler::{parse_gemfile, RubyGemsRegistry};
@@ -34,7 +39,7 @@ let registry = RubyGemsRegistry::new(cache);
 let versions = registry.get_versions("rails").await?;
 ```
 
-## Supported Gemfile Syntax
+## Supported Gemfile syntax
 
 ```ruby
 source "https://rubygems.org"

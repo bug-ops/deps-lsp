@@ -2,28 +2,33 @@
 
 [![Crates.io](https://img.shields.io/crates/v/deps-cargo)](https://crates.io/crates/deps-cargo)
 [![docs.rs](https://img.shields.io/docsrs/deps-cargo)](https://docs.rs/deps-cargo)
+[![CI](https://github.com/bug-ops/deps-lsp/actions/workflows/ci.yml/badge.svg)](https://github.com/bug-ops/deps-lsp/actions)
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-cargo)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 Cargo.toml support for deps-lsp.
 
-This crate provides parsing and registry integration for Rust's Cargo ecosystem.
+This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It provides parsing and registry integration for the Rust/Cargo ecosystem and implements `deps_core::Ecosystem`.
 
 ## Features
 
-- **TOML Parsing** — Parse `Cargo.toml` with position tracking using `toml-span`
-- **Lock File Parsing** — Extract resolved versions from `Cargo.lock`
-- **crates.io Registry** — Sparse index client for package metadata
-- **Version Resolution** — Semver-aware version matching
-- **Workspace Support** — Handle `workspace.dependencies` inheritance
-- **EcosystemHandler** — Implements `deps_core::EcosystemHandler` trait
+- **TOML parsing** — Parse `Cargo.toml` with byte-accurate position tracking via `toml-span`
+- **Lock file parsing** — Extract resolved versions from `Cargo.lock`
+- **crates.io registry** — Sparse index client for version lookups and package metadata
+- **Semver resolution** — Resolve `^`, `~`, `*`, and range specifiers against available versions
+- **Workspace support** — Handle `workspace.dependencies` inheritance and `version.workspace = true`
 
-## Usage
+## Installation
 
 ```toml
 [dependencies]
-deps-cargo = "0.5"
+deps-cargo = "0.9.2"
 ```
+
+> [!IMPORTANT]
+> Requires Rust 1.89 or later.
+
+## Usage
 
 ```rust
 use deps_cargo::{parse_cargo_toml, CratesIoRegistry};
@@ -39,7 +44,7 @@ let versions = registry.get_versions("serde").await?;
 cargo bench -p deps-cargo
 ```
 
-Parsing performance: ~4μs for small files, ~55μs for large files (100+ dependencies).
+Parsing performance: ~4 us for small files, ~55 us for large files (100+ dependencies).
 
 ## License
 
