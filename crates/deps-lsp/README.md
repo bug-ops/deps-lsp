@@ -40,7 +40,7 @@ All ecosystems are enabled by default. Disable unused ones to reduce binary size
 
 ```toml
 [dependencies]
-deps-lsp = { version = "0.9.2", default-features = false, features = ["cargo", "npm"] }
+deps-lsp = { version = "0.9.3", default-features = false, features = ["cargo", "npm"] }
 ```
 
 | Feature | Ecosystem | Default |

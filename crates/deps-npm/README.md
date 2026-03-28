@@ -22,7 +22,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-npm = "0.9.2"
+deps-npm = "0.9.3"
 ```
 
 > [!IMPORTANT]
