@@ -71,11 +71,11 @@ impl MavenCentralRegistry {
         Self { cache }
     }
 
-    pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
+    async fn get_metadata(&self, name: &str) -> Result<(Vec<MavenVersion>, Option<String>)> {
         let urls = metadata_urls(name);
         if urls.is_empty() {
             tracing::debug!(package = %name, "skipping: invalid groupId:artifactId format");
-            return Ok(vec![]);
+            return Ok((vec![], None));
         }
 
         let mut last_err = None;
@@ -94,14 +94,31 @@ impl MavenCentralRegistry {
         Err(e)
     }
 
+    pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
+        let (versions, _release) = self.get_metadata(name).await?;
+        Ok(versions)
+    }
+
     pub async fn get_latest_matching_typed(
         &self,
         name: &str,
         req: &str,
     ) -> Result<Option<MavenVersion>> {
-        let versions = self.get_versions_typed(name).await?;
+        let (versions, release) = self.get_metadata(name).await?;
         // For Maven MVP: exact string match, or latest stable if req is empty/wildcard
         if req.is_empty() || req == "*" {
+            // Use <release> from maven-metadata.xml as the authoritative latest stable version.
+            // Fall back to sort-based selection only when <release> is absent.
+            if let Some(rel) = release {
+                let mv = versions
+                    .into_iter()
+                    .find(|v| v.version == rel)
+                    .or(Some(MavenVersion {
+                        version: rel,
+                        timestamp: None,
+                    }));
+                return Ok(mv);
+            }
             // Prefer latest stable; fall back to latest pre-release if no stable exists
             let latest = versions
                 .iter()
@@ -146,12 +163,18 @@ fn metadata_urls(name: &str) -> Vec<String> {
     }
 }
 
-/// Parses maven-metadata.xml to extract version list.
-fn parse_metadata_xml(data: &[u8]) -> Result<Vec<MavenVersion>> {
+/// Parses maven-metadata.xml to extract version list and the authoritative release version.
+///
+/// Returns `(versions, release)` where `release` is the `<release>` element from
+/// `<versioning>`, if present. Use `release` as the authoritative latest stable version
+/// instead of sorting all versions.
+fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)> {
     let mut reader = Reader::from_reader(data);
     let mut versions = Vec::new();
+    let mut release: Option<String> = None;
     let mut in_versions = false;
     let mut in_version = false;
+    let mut in_release = false;
     let mut buf = Vec::new();
 
     loop {
@@ -159,24 +182,33 @@ fn parse_metadata_xml(data: &[u8]) -> Result<Vec<MavenVersion>> {
             Ok(Event::Start(e)) => match e.name().as_ref() {
                 b"versions" => in_versions = true,
                 b"version" if in_versions => in_version = true,
+                b"release" if !in_versions => in_release = true,
                 _ => {}
             },
             Ok(Event::End(e)) => match e.name().as_ref() {
                 b"versions" => in_versions = false,
                 b"version" => in_version = false,
+                b"release" => in_release = false,
                 _ => {}
             },
-            Ok(Event::Text(e)) if in_version => {
+            Ok(Event::Text(e)) => {
                 let Ok(decoded) = e.decode() else {
+                    buf.clear();
                     continue;
                 };
                 let text = quick_xml::escape::unescape(&decoded).unwrap_or_default();
-                let version = text.trim().to_string();
-                if !version.is_empty() {
+                let s = text.trim().to_string();
+                if s.is_empty() {
+                    buf.clear();
+                    continue;
+                }
+                if in_version {
                     versions.push(MavenVersion {
-                        version,
+                        version: s,
                         timestamp: None,
                     });
+                } else if in_release {
+                    release = Some(s);
                 }
             }
             Ok(Event::Eof) => break,
@@ -187,7 +219,7 @@ fn parse_metadata_xml(data: &[u8]) -> Result<Vec<MavenVersion>> {
     }
 
     versions.sort_by(|a, b| compare_versions(&b.version, &a.version));
-    Ok(versions)
+    Ok((versions, release))
 }
 
 #[derive(Deserialize)]
@@ -390,18 +422,50 @@ mod tests {
   </versioning>
 </metadata>"#;
 
-        let versions = parse_metadata_xml(xml.as_bytes()).unwrap();
+        let (versions, release) = parse_metadata_xml(xml.as_bytes()).unwrap();
         assert_eq!(versions.len(), 3);
         assert_eq!(versions[0].version, "3.14.0");
         assert_eq!(versions[1].version, "3.13.0");
         assert_eq!(versions[2].version, "3.12.0");
+        assert_eq!(release.as_deref(), Some("3.14.0"));
     }
 
     #[test]
     fn test_parse_metadata_xml_empty() {
         let xml = r#"<?xml version="1.0"?><metadata><versioning><versions></versions></versioning></metadata>"#;
-        let versions = parse_metadata_xml(xml.as_bytes()).unwrap();
+        let (versions, release) = parse_metadata_xml(xml.as_bytes()).unwrap();
         assert!(versions.is_empty());
+        assert!(release.is_none());
+    }
+
+    #[test]
+    fn test_parse_metadata_xml_legacy_versions_release_wins() {
+        // Guava scenario: legacy r03-r09 versions sort higher than semver versions
+        // lexicographically, but <release> must be used as authoritative latest stable.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.google.guava</groupId>
+  <artifactId>guava</artifactId>
+  <versioning>
+    <latest>33.5.0-jre</latest>
+    <release>33.5.0-jre</release>
+    <versions>
+      <version>r03</version>
+      <version>r05</version>
+      <version>r09</version>
+      <version>14.0</version>
+      <version>33.4.0-jre</version>
+      <version>33.5.0-jre</version>
+    </versions>
+  </versioning>
+</metadata>"#;
+
+        let (versions, release) = parse_metadata_xml(xml.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 6);
+        assert_eq!(release.as_deref(), Some("33.5.0-jre"));
+        // versions are sorted descending by compare_versions; r09 may sort to top due to
+        // lexicographic fallback — the release field must override this
+        assert_ne!(versions[0].version, "33.5.0-jre", "sort puts r09 first");
     }
 
     #[test]
