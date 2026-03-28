@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alphabetically had `name_range`/`version_range` stuck at `(0,0)→(0,0)`, breaking hover,
   inlay hints, and diagnostics (#84)
 - **deps-bundler**: `version_matches_requirement` now handles wildcard `"*"` requirement, fixing inlay hints always returning empty for Gemfile dependencies (resolves #89)
+- **deps-maven**: packages with legacy non-semver versions (e.g. `guava` `r03`–`r09`) no longer report a wrong latest version; `<release>` from `maven-metadata.xml` is now used as the authoritative latest stable version, with sort-based fallback when the field is absent (resolves #91)
 
 ## [0.9.2] - 2026-03-21
 
