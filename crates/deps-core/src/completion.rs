@@ -299,14 +299,19 @@ pub fn extract_prefix(content: &str, position: Position, range: Range) -> String
 /// Scans backwards from the cursor on the current line to find the start of
 /// the feature string being typed. Handles both inline and multi-line arrays.
 ///
+/// Returns an empty string when the cursor is not inside a quoted string
+/// (e.g. right after `[` or between `, ` and the next `"`).
+///
 /// # Examples
 ///
-/// ```
+/// ```no_run
 /// # use deps_core::completion::extract_feature_prefix;
 /// # use tower_lsp_server::ls_types::Position;
 /// // Cursor inside: features = ["derive", "std", "ser|"]
 /// let content = r#"serde = { version = "1", features = ["derive", "std", "ser"] }"#;
-/// let pos = Position { line: 0, character: 58 }; // after "ser
+/// // cursor_char = index after "ser" inside the last quoted element
+/// let ser_start = content.find(r#""ser""#).unwrap() + 1; // skip opening quote
+/// let pos = Position { line: 0, character: (ser_start + "ser".len()) as u32 };
 /// let prefix = extract_feature_prefix(content, pos);
 /// assert_eq!(prefix, "ser");
 /// ```
@@ -323,13 +328,22 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 
     let before_cursor = &line[..cursor_byte];
 
-    // Find the last opening quote that is not closed before the cursor.
-    // Walk backwards to find the nearest unescaped `"`.
-    let last_quote = before_cursor.rfind('"');
+    // Use the text after the last '[' on this line as the relevant segment
+    // (handles inline arrays; for multi-line arrays there is no '[' and we
+    // use the whole line up to the cursor).
+    let segment_start = before_cursor.rfind('[').map_or(0, |i| i + 1);
+    let segment = &before_cursor[segment_start..];
 
-    match last_quote {
-        Some(pos) => before_cursor[pos + 1..].to_string(),
-        // No quote found — cursor may be right after `[` or after a comma with no quote yet
+    // Count '"' characters to determine whether the cursor is inside a string.
+    // An odd count means the cursor is inside an open string literal.
+    let quote_count = segment.chars().filter(|&c| c == '"').count();
+    if quote_count % 2 == 0 {
+        return String::new();
+    }
+
+    // Find the last opening quote and return the text after it.
+    match segment.rfind('"') {
+        Some(pos) => segment[pos + 1..].to_string(),
         None => String::new(),
     }
 }
@@ -2261,6 +2275,32 @@ mod tests {
         let position = Position {
             line: 1,
             character: 4,
+        };
+        let prefix = extract_feature_prefix(content, position);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_extract_feature_prefix_between_items_no_quote() {
+        // Cursor between a comma and the next opening quote: ["full", |]
+        // After "full" the quote count is 2 (even) → not inside a string → empty prefix
+        let content = r#"features = ["full", ]"#;
+        // Cursor after ", " at character 19 (before `]`)
+        let position = Position {
+            line: 0,
+            character: 19,
+        };
+        let prefix = extract_feature_prefix(content, position);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_extract_feature_prefix_cursor_after_opening_bracket() {
+        // Cursor right after `[`, before any quote: features = [|]
+        let content = "features = []";
+        let position = Position {
+            line: 0,
+            character: 12,
         };
         let prefix = extract_feature_prefix(content, position);
         assert_eq!(prefix, "");
