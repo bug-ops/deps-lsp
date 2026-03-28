@@ -8,7 +8,7 @@ pub struct BundlerFormatter;
 
 impl EcosystemFormatter for BundlerFormatter {
     fn format_version_for_text_edit(&self, version: &str) -> String {
-        format!("'{version}'")
+        version.to_string()
     }
 
     fn package_url(&self, name: &str) -> String {
@@ -27,8 +27,8 @@ mod tests {
     #[test]
     fn test_format_version() {
         let formatter = BundlerFormatter;
-        assert_eq!(formatter.format_version_for_text_edit("7.0.8"), "'7.0.8'");
-        assert_eq!(formatter.format_version_for_text_edit("1.0.0"), "'1.0.0'");
+        assert_eq!(formatter.format_version_for_text_edit("7.0.8"), "7.0.8");
+        assert_eq!(formatter.format_version_for_text_edit("1.0.0"), "1.0.0");
     }
 
     #[test]

@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Cargo feature completion** — LSP now provides auto-completion for feature names inside `features = [...]` arrays in Cargo.toml dependency entries (resolves #82)
 
+### Fixed
+- Code action version update no longer produces doubled quotes in Cargo.toml (`""1.0.0""`) or doubled single quotes in Gemfile (`''1.0.0''`); `format_version_for_text_edit` now returns the bare version string since the TextEdit range already excludes delimiters
+
 ## [0.9.2] - 2026-03-21
 
 ### Fixed
