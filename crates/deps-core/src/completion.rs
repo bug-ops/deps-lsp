@@ -138,7 +138,16 @@ pub fn detect_completion_context(
             };
         }
 
-        // TODO: Feature detection - ecosystem-specific, requires more context
+        // Check if position is within the features array range
+        if let Some(features_range) = dep.features_range()
+            && position_in_range(position, features_range)
+        {
+            let prefix = extract_feature_prefix(content, position);
+            return CompletionContext::Feature {
+                package_name: dep.name().to_string(),
+                prefix,
+            };
+        }
     }
 
     CompletionContext::None
@@ -283,6 +292,60 @@ pub fn extract_prefix(content: &str, position: Position, range: Range) -> String
         .trim_matches('\'')
         .trim()
         .to_string()
+}
+
+/// Extracts the partial feature name typed at the cursor position.
+///
+/// Scans backwards from the cursor on the current line to find the start of
+/// the feature string being typed. Handles both inline and multi-line arrays.
+///
+/// Returns an empty string when the cursor is not inside a quoted string
+/// (e.g. right after `[` or between `, ` and the next `"`).
+///
+/// # Examples
+///
+/// ```no_run
+/// # use deps_core::completion::extract_feature_prefix;
+/// # use tower_lsp_server::ls_types::Position;
+/// // Cursor inside: features = ["derive", "std", "ser|"]
+/// let content = r#"serde = { version = "1", features = ["derive", "std", "ser"] }"#;
+/// // cursor_char = index after "ser" inside the last quoted element
+/// let ser_start = content.find(r#""ser""#).unwrap() + 1; // skip opening quote
+/// let pos = Position { line: 0, character: (ser_start + "ser".len()) as u32 };
+/// let prefix = extract_feature_prefix(content, pos);
+/// assert_eq!(prefix, "ser");
+/// ```
+pub fn extract_feature_prefix(content: &str, position: Position) -> String {
+    let line = match content.lines().nth(position.line as usize) {
+        Some(l) => l,
+        None => return String::new(),
+    };
+
+    let cursor_byte = match utf16_to_byte_offset(line, position.character) {
+        Some(offset) => offset.min(line.len()),
+        None => return String::new(),
+    };
+
+    let before_cursor = &line[..cursor_byte];
+
+    // Use the text after the last '[' on this line as the relevant segment
+    // (handles inline arrays; for multi-line arrays there is no '[' and we
+    // use the whole line up to the cursor).
+    let segment_start = before_cursor.rfind('[').map_or(0, |i| i + 1);
+    let segment = &before_cursor[segment_start..];
+
+    // Count '"' characters to determine whether the cursor is inside a string.
+    // An odd count means the cursor is inside an open string literal.
+    let quote_count = segment.chars().filter(|&c| c == '"').count();
+    if quote_count % 2 == 0 {
+        return String::new();
+    }
+
+    // Find the last opening quote and return the text after it.
+    match segment.rfind('"') {
+        Some(pos) => segment[pos + 1..].to_string(),
+        None => String::new(),
+    }
 }
 
 /// Builds a completion item for a package name.
@@ -650,6 +713,7 @@ mod tests {
         name: String,
         name_range: Range,
         version_range: Option<Range>,
+        features_range: Option<Range>,
     }
 
     impl crate::ecosystem::Dependency for MockDependency {
@@ -667,6 +731,10 @@ mod tests {
 
         fn version_range(&self) -> Option<Range> {
             self.version_range
+        }
+
+        fn features_range(&self) -> Option<Range> {
+            self.features_range
         }
 
         fn source(&self) -> crate::parser::DependencySource {
@@ -832,6 +900,7 @@ mod tests {
                     },
                 },
                 version_range: None,
+                features_range: None,
             }],
         };
 
@@ -867,6 +936,7 @@ mod tests {
                     },
                 },
                 version_range: None,
+                features_range: None,
             }],
         };
 
@@ -911,6 +981,7 @@ mod tests {
                         character: 14,
                     },
                 }),
+                features_range: None,
             }],
         };
 
@@ -950,6 +1021,7 @@ mod tests {
                     },
                 },
                 version_range: None,
+                features_range: None,
             }],
         };
 
@@ -1963,5 +2035,274 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "v1.9.0 (latest)");
         assert_eq!(items[1].label, "v1.9.1");
+    }
+
+    // --- Feature completion detection tests ---
+
+    fn make_dep_with_features_range(
+        name: &str,
+        name_range: Range,
+        features_range: Range,
+    ) -> MockDependency {
+        MockDependency {
+            name: name.to_string(),
+            name_range,
+            version_range: None,
+            features_range: Some(features_range),
+        }
+    }
+
+    #[test]
+    fn test_detect_feature_context_inline() {
+        // serde = { version = "1", features = ["derive", "std"] }
+        // col:                                 36              52
+        let features_range = Range {
+            start: Position {
+                line: 0,
+                character: 36,
+            },
+            end: Position {
+                line: 0,
+                character: 52,
+            },
+        };
+        let dep = make_dep_with_features_range(
+            "serde",
+            Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            features_range,
+        );
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
+
+        let content = r#"serde = { version = "1", features = ["derive", "std"] }"#;
+
+        // Content: ...["derive",...  => '"' is at char 37, 'd'=38, 'e'=39, 'r'=40
+        // Cursor after 'r' (insertion point) = character 41
+        let position = Position {
+            line: 0,
+            character: 41,
+        };
+        let context = detect_completion_context(&parse_result, position, content);
+        assert!(
+            matches!(context, CompletionContext::Feature { ref package_name, ref prefix }
+                if package_name == "serde" && prefix == "der"),
+            "Expected Feature context with prefix 'der', got {context:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_feature_context_empty_prefix() {
+        // Cursor right after opening quote: features = ["|"]
+        let features_range = Range {
+            start: Position {
+                line: 0,
+                character: 11,
+            },
+            end: Position {
+                line: 0,
+                character: 15,
+            },
+        };
+        let dep = make_dep_with_features_range(
+            "tokio",
+            Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            features_range,
+        );
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
+
+        let content = r#"features = [""]"#;
+        // Cursor between the two quotes: position character 13
+        let position = Position {
+            line: 0,
+            character: 13,
+        };
+        let context = detect_completion_context(&parse_result, position, content);
+        assert!(
+            matches!(context, CompletionContext::Feature { ref package_name, ref prefix }
+                if package_name == "tokio" && prefix.is_empty()),
+            "Expected Feature context with empty prefix, got {context:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_feature_context_second_item() {
+        // features = ["full", "rt-|"]
+        let features_range = Range {
+            start: Position {
+                line: 0,
+                character: 11,
+            },
+            end: Position {
+                line: 0,
+                character: 28,
+            },
+        };
+        let dep = make_dep_with_features_range(
+            "tokio",
+            Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 5,
+                },
+            },
+            features_range,
+        );
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
+
+        let content = r#"features = ["full", "rt-"]"#;
+        // Cursor after "rt-": character 24
+        let position = Position {
+            line: 0,
+            character: 24,
+        };
+        let context = detect_completion_context(&parse_result, position, content);
+        assert!(
+            matches!(context, CompletionContext::Feature { ref package_name, ref prefix }
+                if package_name == "tokio" && prefix == "rt-"),
+            "Expected Feature context with prefix 'rt-', got {context:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_no_feature_context_outside_range() {
+        let features_range = Range {
+            start: Position {
+                line: 2,
+                character: 11,
+            },
+            end: Position {
+                line: 2,
+                character: 20,
+            },
+        };
+        let dep = make_dep_with_features_range(
+            "serde",
+            Range {
+                start: Position {
+                    line: 2,
+                    character: 0,
+                },
+                end: Position {
+                    line: 2,
+                    character: 5,
+                },
+            },
+            features_range,
+        );
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
+
+        // Cursor is on line 0, not line 2 where features are
+        let content = "[package]\nname = \"test\"\nfeatures = [\"full\"]";
+        let position = Position {
+            line: 0,
+            character: 5,
+        };
+        let context = detect_completion_context(&parse_result, position, content);
+        assert_eq!(context, CompletionContext::None);
+    }
+
+    #[test]
+    fn test_extract_feature_prefix_basic() {
+        let content = r#"serde = { features = ["derive"] }"#;
+        // '"' is at char 22, 'd'=23, 'e'=24, 'r'=25, 'i'=26
+        // Cursor after 'i' (insertion point) = character 27
+        let position = Position {
+            line: 0,
+            character: 27,
+        };
+        let prefix = extract_feature_prefix(content, position);
+        assert_eq!(prefix, "deri");
+    }
+
+    #[test]
+    fn test_extract_feature_prefix_empty() {
+        let content = r#"features = [""]"#;
+        // Cursor between opening and closing quote at character 13
+        let position = Position {
+            line: 0,
+            character: 13,
+        };
+        let prefix = extract_feature_prefix(content, position);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_extract_feature_prefix_multiline() {
+        let content = "features = [\n    \"rt-multi-thread\",\n    \"mac\"\n]";
+        // Line 2: `    "mac"` — '"' at char 4, 'm'=5, 'a'=6, 'c'=7
+        // Cursor after 'c' (insertion point) = character 8
+        let position = Position {
+            line: 2,
+            character: 8,
+        };
+        let prefix = extract_feature_prefix(content, position);
+        assert_eq!(prefix, "mac");
+    }
+
+    #[test]
+    fn test_extract_feature_prefix_no_quote() {
+        let content = "features = [\n    \n]";
+        // Cursor on blank line inside array
+        let position = Position {
+            line: 1,
+            character: 4,
+        };
+        let prefix = extract_feature_prefix(content, position);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_extract_feature_prefix_between_items_no_quote() {
+        // Cursor between a comma and the next opening quote: ["full", |]
+        // After "full" the quote count is 2 (even) → not inside a string → empty prefix
+        let content = r#"features = ["full", ]"#;
+        // Cursor after ", " at character 19 (before `]`)
+        let position = Position {
+            line: 0,
+            character: 19,
+        };
+        let prefix = extract_feature_prefix(content, position);
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn test_extract_feature_prefix_cursor_after_opening_bracket() {
+        // Cursor right after `[`, before any quote: features = [|]
+        let content = "features = []";
+        let position = Position {
+            line: 0,
+            character: 12,
+        };
+        let prefix = extract_feature_prefix(content, position);
+        assert_eq!(prefix, "");
     }
 }

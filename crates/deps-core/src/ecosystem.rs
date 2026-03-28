@@ -55,6 +55,11 @@ pub trait Dependency: Send + Sync {
         &[]
     }
 
+    /// LSP range of the features array (ecosystem-specific, None if not supported)
+    fn features_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+        None
+    }
+
     /// Downcast to concrete type
     fn as_any(&self) -> &dyn Any;
 }

@@ -158,6 +158,10 @@ impl deps_core::Dependency for ParsedDependency {
         &self.features
     }
 
+    fn features_range(&self) -> Option<Range> {
+        self.features_range
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
