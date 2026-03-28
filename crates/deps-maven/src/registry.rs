@@ -110,10 +110,13 @@ impl MavenCentralRegistry {
             // Use <release> from maven-metadata.xml as the authoritative latest stable version.
             // Fall back to sort-based selection only when <release> is absent.
             if let Some(rel) = release {
-                let mv = versions.into_iter().find(|v| v.version == rel).or(Some(MavenVersion {
-                    version: rel,
-                    timestamp: None,
-                }));
+                let mv = versions
+                    .into_iter()
+                    .find(|v| v.version == rel)
+                    .or(Some(MavenVersion {
+                        version: rel,
+                        timestamp: None,
+                    }));
                 return Ok(mv);
             }
             // Prefer latest stable; fall back to latest pre-release if no stable exists
