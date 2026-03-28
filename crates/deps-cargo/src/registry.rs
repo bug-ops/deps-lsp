@@ -165,7 +165,7 @@ impl CratesIoRegistry {
     /// ```
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<CrateInfo>> {
         let url = format!(
-            "{}/crates?q={}&per_page={}",
+            "{}/crates?q={}&per_page={}&sort=downloads",
             SEARCH_API_BASE,
             urlencoding::encode(query),
             limit
