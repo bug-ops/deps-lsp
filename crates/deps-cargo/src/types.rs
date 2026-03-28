@@ -158,6 +158,10 @@ impl deps_core::Dependency for ParsedDependency {
         &self.features
     }
 
+    fn features_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+        self.features_range
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
