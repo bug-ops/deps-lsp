@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cargo feature completion** — LSP now provides auto-completion for feature names inside `features = [...]` arrays in Cargo.toml dependency entries (resolves #82)
 
 ### Fixed
+- **deps-cargo**: crate name completion now sorts search results by download count, so popular crates like `sqlx` and `thiserror` appear at the top instead of being buried or absent (resolves #95)
 - Code action version update no longer produces doubled quotes in Cargo.toml (`""1.0.0""`) or doubled single quotes in Gemfile (`''1.0.0''`); `format_version_for_text_edit` now returns the bare version string since the TextEdit range already excludes delimiters
 - **Cargo feature completion** — completion items no longer carry a `textEdit` with `range (0,0)-(0,0)`; the range was incorrect and caused strict LSP clients to insert text at the beginning of the file instead of at the cursor. `build_feature_completion` now accepts `Option<Range>` and omits `textEdit` when no range is provided, matching the behaviour of version completion (resolves #88)
 - `deps-composer`: position tracking for packages out of alphabetical order — enable `serde_json`
