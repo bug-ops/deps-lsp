@@ -381,4 +381,58 @@ mod tests {
         let result = parse_composer_json(json, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 0);
     }
+
+    /// Regression test for https://github.com/bug-ops/deps-lsp/issues/84
+    ///
+    /// BTreeMap iterates alphabetically: guzzlehttp/guzzle → laravel/framework →
+    /// symfony/console. Without preserve_order, laravel/framework (file line 2) was
+    /// searched after search_start had advanced past line 3, so its name_range and
+    /// version_range were left at (0,0)→(0,0).
+    #[test]
+    fn test_position_tracking_out_of_alphabetical_order() {
+        let json = r#"{
+    "require": {
+        "laravel/framework": "^10.0",
+        "guzzlehttp/guzzle": "^7.5",
+        "symfony/console": "~6.0"
+    }
+}"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+
+        for dep in &result.dependencies {
+            // Every dependency must have a valid (non-zero) name position.
+            assert!(
+                dep.name_range.start.line > 0,
+                "name_range for '{}' is at line 0 — position tracking regressed",
+                dep.name
+            );
+            assert!(
+                dep.version_range.is_some(),
+                "version_range for '{}' is missing",
+                dep.name
+            );
+        }
+
+        let laravel = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "laravel/framework")
+            .unwrap();
+        assert_eq!(laravel.name_range.start.line, 2);
+
+        let guzzle = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "guzzlehttp/guzzle")
+            .unwrap();
+        assert_eq!(guzzle.name_range.start.line, 3);
+
+        let symfony = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "symfony/console")
+            .unwrap();
+        assert_eq!(symfony.name_range.start.line, 4);
+    }
 }
