@@ -76,14 +76,12 @@ impl CargoEcosystem {
             }
         };
 
-        let insert_range = tower_lsp_server::ls_types::Range::default();
-
         // Get features and filter by prefix
         let features = latest.features();
         features
             .into_iter()
             .filter(|f| f.starts_with(prefix))
-            .map(|feature| build_feature_completion(&feature, package_name, insert_range))
+            .map(|feature| build_feature_completion(&feature, package_name, None))
             .collect()
     }
 }
