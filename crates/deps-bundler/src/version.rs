@@ -33,6 +33,10 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 pub fn version_matches_requirement(version: &str, requirement: &str) -> bool {
     let req = requirement.trim();
 
+    if req == "*" {
+        return true;
+    }
+
     // Pessimistic operator (~>)
     if req.starts_with("~>") {
         let req_ver = req.trim_start_matches("~>").trim();
@@ -176,5 +180,10 @@ mod tests {
         // Not equal
         assert!(version_matches_requirement("1.0.1", "!= 1.0.0"));
         assert!(!version_matches_requirement("1.0.0", "!= 1.0.0"));
+
+        // Wildcard
+        assert!(version_matches_requirement("1.0.0", "*"));
+        assert!(version_matches_requirement("0.0.1", "*"));
+        assert!(version_matches_requirement("99.99.99", "*"));
     }
 }

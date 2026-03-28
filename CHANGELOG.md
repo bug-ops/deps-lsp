@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BTreeMap` alphabetical order; previously, packages appearing earlier in the file but later
   alphabetically had `name_range`/`version_range` stuck at `(0,0)→(0,0)`, breaking hover,
   inlay hints, and diagnostics (#84)
+- **deps-bundler**: `version_matches_requirement` now handles wildcard `"*"` requirement, fixing inlay hints always returning empty for Gemfile dependencies (resolves #89)
 
 ## [0.9.2] - 2026-03-21
 
