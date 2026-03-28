@@ -556,7 +556,8 @@ pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
 ///
 /// * `feature_name` - Name of the feature flag
 /// * `package_name` - Name of the package this feature belongs to
-/// * `insert_range` - LSP range where the completion should be inserted
+/// * `insert_range` - LSP range where the completion should be inserted, or `None` to omit
+///   `textEdit` and let the client insert at cursor position via `insertText`
 ///
 /// # Returns
 ///
@@ -566,16 +567,14 @@ pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
 ///
 /// ```no_run
 /// use deps_core::completion::build_feature_completion;
-/// use tower_lsp_server::ls_types::Range;
 ///
-/// let range = Range::default();
-/// let item = build_feature_completion("derive", "serde", range);
+/// let item = build_feature_completion("derive", "serde", None);
 /// assert_eq!(item.label, "derive");
 /// ```
 pub fn build_feature_completion(
     feature_name: &str,
     package_name: &str,
-    insert_range: Range,
+    insert_range: Option<Range>,
 ) -> CompletionItem {
     CompletionItem {
         label: feature_name.to_string(),
@@ -583,10 +582,12 @@ pub fn build_feature_completion(
         detail: Some(format!("Feature of {}", package_name)),
         documentation: None,
         insert_text: Some(feature_name.to_string()),
-        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-            range: insert_range,
-            new_text: feature_name.to_string(),
-        })),
+        text_edit: insert_range.map(|range| {
+            CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: feature_name.to_string(),
+            })
+        }),
         sort_text: Some(feature_name.to_string()),
         ..Default::default()
     }
@@ -1515,14 +1516,23 @@ mod tests {
 
     #[test]
     fn test_build_feature_completion() {
-        let range = Range::default();
-        let item = build_feature_completion("derive", "serde", range);
+        let item = build_feature_completion("derive", "serde", None);
 
         assert_eq!(item.label, "derive");
         assert_eq!(item.kind, Some(CompletionItemKind::PROPERTY));
         assert_eq!(item.detail, Some("Feature of serde".to_string()));
         assert!(item.documentation.is_none());
+        assert!(item.text_edit.is_none());
         assert_eq!(item.sort_text, Some("derive".to_string()));
+    }
+
+    #[test]
+    fn test_build_feature_completion_with_range() {
+        let range = Range::default();
+        let item = build_feature_completion("derive", "serde", Some(range));
+
+        assert_eq!(item.label, "derive");
+        assert!(item.text_edit.is_some());
     }
 
     #[test]
