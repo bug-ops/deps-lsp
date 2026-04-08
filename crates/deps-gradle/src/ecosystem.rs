@@ -61,9 +61,9 @@ impl GradleEcosystem {
         let before_cursor = &line[..col_idx.min(line.len())];
 
         if path.ends_with("libs.versions.toml") {
-            detect_catalog_context(before_cursor, line)
+            detect_catalog_context(before_cursor, line, col_idx)
         } else if path.ends_with(".gradle.kts") || path.ends_with(".gradle") {
-            detect_dsl_context(before_cursor, line)
+            detect_dsl_context(before_cursor, line, col_idx)
         } else {
             ("", "")
         }
@@ -71,7 +71,12 @@ impl GradleEcosystem {
 }
 
 /// Detects completion context in version catalog files.
-fn detect_catalog_context<'a>(before_cursor: &str, line: &'a str) -> (&'static str, &'a str) {
+fn detect_catalog_context<'a>(
+    before_cursor: &str,
+    line: &'a str,
+    col_idx: usize,
+) -> (&'static str, &'a str) {
+    let cursor = col_idx.min(line.len());
     // version = "..." or version.ref = "..."
     if let Some(eq_pos) = before_cursor.rfind("version")
         && let after = &before_cursor[eq_pos..]
@@ -79,11 +84,8 @@ fn detect_catalog_context<'a>(before_cursor: &str, line: &'a str) -> (&'static s
         && let Some(quote_start) = after.rfind('"')
     {
         let value_start = eq_pos + quote_start + 1;
-        if value_start <= line.len() {
-            let quote_end = line[value_start..]
-                .find('"')
-                .map_or(line.len(), |i| value_start + i);
-            return ("version", &line[value_start..quote_end]);
+        if value_start <= cursor {
+            return ("version", &line[value_start..cursor]);
         }
     }
 
@@ -94,11 +96,8 @@ fn detect_catalog_context<'a>(before_cursor: &str, line: &'a str) -> (&'static s
         && let Some(quote_start) = after.rfind('"')
     {
         let value_start = eq_pos + quote_start + 1;
-        if value_start <= line.len() {
-            let quote_end = line[value_start..]
-                .find('"')
-                .map_or(line.len(), |i| value_start + i);
-            return ("package", &line[value_start..quote_end]);
+        if value_start <= cursor {
+            return ("package", &line[value_start..cursor]);
         }
     }
 
@@ -106,7 +105,12 @@ fn detect_catalog_context<'a>(before_cursor: &str, line: &'a str) -> (&'static s
 }
 
 /// Detects completion context in Kotlin/Groovy DSL files.
-fn detect_dsl_context<'a>(before_cursor: &str, line: &'a str) -> (&'static str, &'a str) {
+fn detect_dsl_context<'a>(
+    before_cursor: &str,
+    line: &'a str,
+    col_idx: usize,
+) -> (&'static str, &'a str) {
+    let cursor = col_idx.min(line.len());
     let in_string = before_cursor
         .chars()
         .filter(|&c| c == '"' || c == '\'')
@@ -129,12 +133,7 @@ fn detect_dsl_context<'a>(before_cursor: &str, line: &'a str) -> (&'static str, 
     };
 
     match colon_count {
-        0 | 1 => {
-            let close = line[open_pos + 1..]
-                .find(['"', '\''])
-                .map_or(line.len(), |i| open_pos + 1 + i);
-            ("package", &line[open_pos + 1..close])
-        }
+        0 | 1 => ("package", &line[open_pos + 1..cursor]),
         _ => {
             let version_start = before_cursor
                 .char_indices()
@@ -142,10 +141,7 @@ fn detect_dsl_context<'a>(before_cursor: &str, line: &'a str) -> (&'static str, 
                 .nth(1)
                 .map(|(i, _)| i + 1)
                 .unwrap_or(before_cursor.len());
-            let close = line[version_start..]
-                .find(['"', '\''])
-                .map_or(line.len(), |i| version_start + i);
-            ("version", &line[version_start..close])
+            ("version", &line[version_start..cursor])
         }
     }
 }
@@ -291,6 +287,91 @@ mod tests {
         let uri = Uri::from_file_path("/project/build.gradle.kts").unwrap();
         let result = eco.parse_manifest(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
+    }
+
+    #[test]
+    fn test_detect_catalog_context_version_cursor_at_start() {
+        // version = "|1.0.0"
+        let line = r#"version = "1.0.0""#;
+        // before_cursor = `version = "`, cursor at 11 (right after '"')
+        let col = 11;
+        let before = &line[..col];
+        let (t, v) = detect_catalog_context(before, line, col);
+        assert_eq!(t, "version");
+        assert_eq!(v, "");
+    }
+
+    #[test]
+    fn test_detect_catalog_context_version_cursor_mid() {
+        // version = "1.0|.0"
+        let line = r#"version = "1.0.0""#;
+        // value_start = 11, "1.0" = 3 chars, cursor at 14
+        let col = 14;
+        let before = &line[..col];
+        let (t, v) = detect_catalog_context(before, line, col);
+        assert_eq!(t, "version");
+        assert_eq!(v, "1.0");
+    }
+
+    #[test]
+    fn test_detect_catalog_context_version_cursor_at_end() {
+        // version = "1.0.0|"
+        let line = r#"version = "1.0.0""#;
+        // value_start = 11, "1.0.0" = 5 chars, cursor at 16
+        let col = 16;
+        let before = &line[..col];
+        let (t, v) = detect_catalog_context(before, line, col);
+        assert_eq!(t, "version");
+        assert_eq!(v, "1.0.0");
+    }
+
+    #[test]
+    fn test_detect_catalog_context_module_prefix() {
+        // module = "com.ex|ample:lib"
+        let line = r#"module = "com.example:lib""#;
+        // value_start = 9 + 1 = 10 (after `module = "`), "com.ex" = 6 chars, cursor at 16
+        let col = 16;
+        let before = &line[..col];
+        let (t, v) = detect_catalog_context(before, line, col);
+        assert_eq!(t, "package");
+        assert_eq!(v, "com.ex");
+    }
+
+    #[test]
+    fn test_detect_dsl_context_package_cursor_mid() {
+        // implementation("junit|:junit:4.13.2")
+        let line = r#"implementation("junit:junit:4.13.2")"#;
+        // open_pos=15 ('"'), "junit" = 5 chars, cursor at 21 (after 5 chars)
+        // before_cursor = `implementation("junit`
+        let col = 21;
+        let before = &line[..col];
+        let (t, v) = detect_dsl_context(before, line, col);
+        assert_eq!(t, "package");
+        assert_eq!(v, "junit");
+    }
+
+    #[test]
+    fn test_detect_dsl_context_version_cursor_mid() {
+        // implementation("junit:junit:4.1|3.2")
+        let line = r#"implementation("junit:junit:4.13.2")"#;
+        // second ':' at index 27; version_start=28, "4.1"=3 chars, cursor at 31
+        let col = 31;
+        let before = &line[..col];
+        let (t, v) = detect_dsl_context(before, line, col);
+        assert_eq!(t, "version");
+        assert_eq!(v, "4.1");
+    }
+
+    #[test]
+    fn test_detect_dsl_context_version_cursor_at_start() {
+        // implementation("junit:junit:|4.13.2")
+        let line = r#"implementation("junit:junit:4.13.2")"#;
+        // second ':' at index 27, cursor at 28 (right after it)
+        let col = 28;
+        let before = &line[..col];
+        let (t, v) = detect_dsl_context(before, line, col);
+        assert_eq!(t, "version");
+        assert_eq!(v, "");
     }
 
     #[tokio::test]
