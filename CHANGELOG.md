@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **deps-maven, deps-gradle**: version completion now returns all available versions instead of only the current one — prefix extraction was slicing to value-end instead of cursor position (resolves #98)
+
 ## [0.9.3] - 2026-03-28
 
 ### Added

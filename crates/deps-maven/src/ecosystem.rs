@@ -82,10 +82,7 @@ impl MavenEcosystem {
                 if !between.contains("</") {
                     // Check if cursor is on a dependency line (use parse_result for context)
                     let _ = parse_result;
-                    let full_value_end = line[value_start..]
-                        .find("</")
-                        .map_or(line.len(), |i| value_start + i);
-                    let value = &line[value_start..full_value_end];
+                    let value = &line[value_start..col_idx.min(line.len())];
                     return (tag, value);
                 }
             }
@@ -211,6 +208,83 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = MavenEcosystem::new(cache);
         assert!(eco.as_any().is::<MavenEcosystem>());
+    }
+
+    struct NoopParseResult;
+    impl deps_core::ParseResult for NoopParseResult {
+        fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+            vec![]
+        }
+        fn workspace_root(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn uri(&self) -> &tower_lsp_server::ls_types::Uri {
+            unimplemented!()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn make_position(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    fn xml_context(line_content: &str, col: u32) -> (&'static str, String) {
+        let content = format!("    {line_content}\n");
+        let col_in_content = col + 4; // 4 spaces indent
+        let (t, v) = MavenEcosystem::detect_xml_context(
+            &content,
+            make_position(0, col_in_content),
+            &NoopParseResult,
+        );
+        (t, v.to_owned())
+    }
+
+    #[test]
+    fn test_detect_xml_context_version_cursor_at_start() {
+        // <version>|4.13.2</version> — cursor right after '>'
+        let line = "<version>4.13.2</version>";
+        // col 0..8 is "<version", col 9 is '4'
+        let (t, v) = xml_context(line, 9); // col at value_start
+        assert_eq!(t, "version");
+        assert_eq!(v, "");
+    }
+
+    #[test]
+    fn test_detect_xml_context_version_cursor_mid() {
+        // <version>4.1|3.2</version>
+        let line = "<version>4.13.2</version>";
+        let (t, v) = xml_context(line, 12); // "4.1" = 3 chars after value_start (9)
+        assert_eq!(t, "version");
+        assert_eq!(v, "4.1");
+    }
+
+    #[test]
+    fn test_detect_xml_context_version_cursor_at_end() {
+        // <version>4.13.2|</version>
+        let line = "<version>4.13.2</version>";
+        let (t, v) = xml_context(line, 15); // value_start=9, end=15
+        assert_eq!(t, "version");
+        assert_eq!(v, "4.13.2");
+    }
+
+    #[test]
+    fn test_detect_xml_context_version_empty_value() {
+        // <version>|</version>
+        let line = "<version></version>";
+        let (t, v) = xml_context(line, 9);
+        assert_eq!(t, "version");
+        assert_eq!(v, "");
+    }
+
+    #[test]
+    fn test_detect_xml_context_artifact_id_prefix() {
+        // <artifactId>jun|it</artifactId>
+        let line = "<artifactId>junit</artifactId>";
+        let (t, v) = xml_context(line, 15); // value_start=12, cursor at 15 = "jun"
+        assert_eq!(t, "artifactId");
+        assert_eq!(v, "jun");
     }
 
     #[tokio::test]
