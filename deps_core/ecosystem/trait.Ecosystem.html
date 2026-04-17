@@ -1,0 +1,189 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Main trait that all ecosystem implementations must implement."><title>Ecosystem in deps_core::ecosystem - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-b7b9f40b.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Ecosystem</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.9.3</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Ecosystem</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#type-erasure" title="Type Erasure">Type Erasure</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.as_any" title="as_any">as_any</a></li><li><a href="#tymethod.display_name" title="display_name">display_name</a></li><li><a href="#tymethod.formatter" title="formatter">formatter</a></li><li><a href="#tymethod.generate_completions" title="generate_completions">generate_completions</a></li><li><a href="#tymethod.id" title="id">id</a></li><li><a href="#tymethod.manifest_filenames" title="manifest_filenames">manifest_filenames</a></li><li><a href="#tymethod.parse_manifest" title="parse_manifest">parse_manifest</a></li><li><a href="#tymethod.registry" title="registry">registry</a></li></ul><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.generate_code_actions" title="generate_code_actions">generate_code_actions</a></li><li><a href="#method.generate_diagnostics" title="generate_diagnostics">generate_diagnostics</a></li><li><a href="#method.generate_hover" title="generate_hover">generate_hover</a></li><li><a href="#method.generate_inlay_hints" title="generate_inlay_hints">generate_inlay_hints</a></li><li><a href="#method.lockfile_filenames" title="lockfile_filenames">lockfile_filenames</a></li><li><a href="#method.lockfile_provider" title="lockfile_provider">lockfile_provider</a></li></ul><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>ecosystem</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">ecosystem</a></div><h1>Trait <span class="trait">Ecosystem</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/ecosystem.rs.html#156-329">Source</a> </span></div><pre class="rust item-decl"><code>pub trait Ecosystem:
+    <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a>
+    + <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/marker/trait.Sync.html" title="trait core::marker::Sync">Sync</a>
+    + <a class="trait" href="private/trait.Sealed.html" title="trait deps_core::ecosystem::private::Sealed">Sealed</a> {
+<details class="toggle type-contents-toggle"><summary class="hideme"><span>Show 14 methods</span></summary>    // Required methods
+    fn <a href="#tymethod.id" class="fn">id</a>(&amp;self) -&gt; &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.display_name" class="fn">display_name</a>(&amp;self) -&gt; &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.manifest_filenames" class="fn">manifest_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>];
+<span class="item-spacer"></span>    fn <a href="#tymethod.parse_manifest" class="fn">parse_manifest</a>&lt;'a&gt;(
+        &amp;'a self,
+        content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+        uri: &amp;'a Uri,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>&gt;&gt;&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.registry" class="fn">registry</a>(&amp;self) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;dyn <a class="trait" href="../registry/trait.Registry.html" title="trait deps_core::registry::Registry">Registry</a>&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.formatter" class="fn">formatter</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="../lsp_helpers/trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter">EcosystemFormatter</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.generate_completions" class="fn">generate_completions</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        position: Position,
+        content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CompletionItem&gt;&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.as_any" class="fn">as_any</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/any/trait.Any.html" title="trait core::any::Any">Any</a>;
+
+    // Provided methods
+    fn <a href="#method.lockfile_filenames" class="fn">lockfile_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>] { ... }
+<span class="item-spacer"></span>    fn <a href="#method.lockfile_provider" class="fn">lockfile_provider</a>(&amp;self) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;dyn <a class="trait" href="../lockfile/trait.LockFileProvider.html" title="trait deps_core::lockfile::LockFileProvider">LockFileProvider</a>&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_inlay_hints" class="fn">generate_inlay_hints</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        cached_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+        resolved_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+        loading_state: <a class="enum" href="../parser/enum.LoadingState.html" title="enum deps_core::parser::LoadingState">LoadingState</a>,
+        config: &amp;'a <a class="struct" href="struct.EcosystemConfig.html" title="struct deps_core::ecosystem::EcosystemConfig">EcosystemConfig</a>,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;InlayHint&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_hover" class="fn">generate_hover</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        position: Position,
+        cached_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+        resolved_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;Hover&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_code_actions" class="fn">generate_code_actions</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        position: Position,
+        _cached_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+        uri: &amp;'a Uri,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CodeAction&gt;&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.generate_diagnostics" class="fn">generate_diagnostics</a>&lt;'a&gt;(
+        &amp;'a self,
+        parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+        cached_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+        resolved_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+        _uri: &amp;'a Uri,
+    ) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;Diagnostic&gt;&gt; { ... }
+</details>}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Main trait that all ecosystem implementations must implement.</p>
+<p>Each ecosystem (Cargo, npm, PyPI, etc.) provides its own implementation.
+This trait defines the contract for parsing manifests, fetching registry data,
+and generating LSP responses.</p>
+<h2 id="type-erasure"><a class="doc-anchor" href="#type-erasure">§</a>Type Erasure</h2>
+<p>This trait uses <code>Box&lt;dyn Trait&gt;</code> instead of associated types to allow
+runtime polymorphism and dynamic ecosystem registration.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig};
+<span class="kw">use </span>deps_core::lsp_helpers::EcosystemFormatter;
+<span class="kw">use </span>std::sync::Arc;
+<span class="kw">use </span>std::any::Any;
+<span class="kw">use </span>tower_lsp_server::ls_types::{Uri, CompletionItem, Position};
+
+<span class="kw">struct </span>MyFormatter;
+<span class="kw">impl </span>EcosystemFormatter <span class="kw">for </span>MyFormatter {
+    <span class="kw">fn </span>format_version_for_text_edit(<span class="kw-2">&amp;</span><span class="self">self</span>, version: <span class="kw-2">&amp;</span>str) -&gt; String { version.to_string() }
+    <span class="kw">fn </span>package_url(<span class="kw-2">&amp;</span><span class="self">self</span>, name: <span class="kw-2">&amp;</span>str) -&gt; String { <span class="macro">format!</span>(<span class="string">"https://example.com/{name}"</span>) }
+}
+
+<span class="kw">struct </span>MyEcosystem {
+    registry: Arc&lt;<span class="kw">dyn </span>Registry&gt;,
+    formatter: MyFormatter,
+}
+
+<span class="kw">impl </span>deps_core::ecosystem::private::Sealed <span class="kw">for </span>MyEcosystem {}
+
+<span class="kw">impl </span>Ecosystem <span class="kw">for </span>MyEcosystem {
+    <span class="kw">fn </span>id(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str { <span class="string">"my-ecosystem" </span>}
+    <span class="kw">fn </span>display_name(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="lifetime">'static </span>str { <span class="string">"My Ecosystem" </span>}
+    <span class="kw">fn </span>manifest_filenames(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str] { <span class="kw-2">&amp;</span>[<span class="string">"my-manifest.toml"</span>] }
+
+    <span class="kw">fn </span>parse_manifest&lt;<span class="lifetime">'a</span>&gt;(
+        <span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>,
+        _content: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>str,
+        _uri: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>Uri,
+    ) -&gt; deps_core::ecosystem::BoxFuture&lt;<span class="lifetime">'a</span>, deps_core::error::Result&lt;Box&lt;<span class="kw">dyn </span>ParseResult&gt;&gt;&gt; {
+        Box::pin(<span class="kw">async move </span>{ <span class="macro">todo!</span>() })
+    }
+
+    <span class="kw">fn </span>registry(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; Arc&lt;<span class="kw">dyn </span>Registry&gt; { <span class="self">self</span>.registry.clone() }
+
+    <span class="kw">fn </span>formatter(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>EcosystemFormatter { <span class="kw-2">&amp;</span><span class="self">self</span>.formatter }
+
+    <span class="kw">fn </span>generate_completions&lt;<span class="lifetime">'a</span>&gt;(
+        <span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="self">self</span>,
+        _parse_result: <span class="kw-2">&amp;</span><span class="lifetime">'a </span><span class="kw">dyn </span>ParseResult,
+        _position: Position,
+        _content: <span class="kw-2">&amp;</span><span class="lifetime">'a </span>str,
+    ) -&gt; deps_core::ecosystem::BoxFuture&lt;<span class="lifetime">'a</span>, Vec&lt;CompletionItem&gt;&gt; {
+        Box::pin(<span class="kw">async move </span>{ <span class="macro">vec!</span>[] })
+    }
+
+    <span class="kw">fn </span>as_any(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="kw-2">&amp;</span><span class="kw">dyn </span>Any { <span class="self">self </span>}
+}</code></pre></div></div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.id" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#160">Source</a><h4 class="code-header">fn <a href="#tymethod.id" class="fn">id</a>(&amp;self) -&gt; &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a></h4></section></summary><div class="docblock"><p>Unique identifier (e.g., “cargo”, “npm”, “pypi”)</p>
+<p>This identifier is used for ecosystem registration and routing.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.display_name" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#165">Source</a><h4 class="code-header">fn <a href="#tymethod.display_name" class="fn">display_name</a>(&amp;self) -&gt; &amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a></h4></section></summary><div class="docblock"><p>Human-readable name (e.g., “Cargo (Rust)”, “npm (JavaScript)”)</p>
+<p>This name is displayed in diagnostic messages and logs.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.manifest_filenames" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#171">Source</a><h4 class="code-header">fn <a href="#tymethod.manifest_filenames" class="fn">manifest_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>]</h4></section></summary><div class="docblock"><p>Manifest filenames this ecosystem handles (e.g., [“Cargo.toml”])</p>
+<p>The ecosystem registry uses these filenames to route file URIs
+to the appropriate ecosystem implementation.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.parse_manifest" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#196-200">Source</a><h4 class="code-header">fn <a href="#tymethod.parse_manifest" class="fn">parse_manifest</a>&lt;'a&gt;(
+    &amp;'a self,
+    content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+    uri: &amp;'a Uri,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="type" href="../error/type.Result.html" title="type deps_core::error::Result">Result</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/boxed/struct.Box.html" title="struct alloc::boxed::Box">Box</a>&lt;dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>&gt;&gt;&gt;</h4></section></summary><div class="docblock"><p>Parse a manifest file and return parsed result</p>
+<h5 id="arguments"><a class="doc-anchor" href="#arguments">§</a>Arguments</h5>
+<ul>
+<li><code>content</code> - Raw file content</li>
+<li><code>uri</code> - Document URI for position tracking</li>
+</ul>
+<h5 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h5>
+<p>Returns error if manifest cannot be parsed</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.registry" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#205">Source</a><h4 class="code-header">fn <a href="#tymethod.registry" class="fn">registry</a>(&amp;self) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;dyn <a class="trait" href="../registry/trait.Registry.html" title="trait deps_core::registry::Registry">Registry</a>&gt;</h4></section></summary><div class="docblock"><p>Get the registry client for this ecosystem</p>
+<p>The registry provides version lookup and package search capabilities.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.formatter" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#219">Source</a><h4 class="code-header">fn <a href="#tymethod.formatter" class="fn">formatter</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="../lsp_helpers/trait.EcosystemFormatter.html" title="trait deps_core::lsp_helpers::EcosystemFormatter">EcosystemFormatter</a></h4></section></summary><div class="docblock"><p>Get the ecosystem-specific formatter for LSP response generation.</p>
+<p>The formatter handles version comparison, package URLs, and text formatting.
+Override this to customize LSP response generation.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.generate_completions" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#318-323">Source</a><h4 class="code-header">fn <a href="#tymethod.generate_completions" class="fn">generate_completions</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    position: Position,
+    content: &amp;'a <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CompletionItem&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate completions for a position.</p>
+<p>Provides autocomplete suggestions for package names and versions.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.as_any" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#328">Source</a><h4 class="code-header">fn <a href="#tymethod.as_any" class="fn">as_any</a>(&amp;self) -&gt; &amp;dyn <a class="trait" href="https://doc.rust-lang.org/1.95.0/core/any/trait.Any.html" title="trait core::any::Any">Any</a></h4></section></summary><div class="docblock"><p>Support for downcasting to concrete ecosystem type</p>
+<p>This allows ecosystem-specific operations when needed.</p>
+</div></details></div><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.lockfile_filenames" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#182-184">Source</a><h4 class="code-header">fn <a href="#method.lockfile_filenames" class="fn">lockfile_filenames</a>(&amp;self) -&gt; &amp;[&amp;'static <a class="primitive" href="https://doc.rust-lang.org/1.95.0/std/primitive.str.html">str</a>]</h4></section></summary><div class="docblock"><p>Lock file filenames this ecosystem uses (e.g., [“Cargo.lock”])</p>
+<p>Used for file watching - LSP will monitor changes to these files
+and refresh UI when they change. Returns empty slice if ecosystem
+doesn’t use lock files.</p>
+<h5 id="default-implementation"><a class="doc-anchor" href="#default-implementation">§</a>Default Implementation</h5>
+<p>Returns empty slice by default, indicating no lock files are used.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.lockfile_provider" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#211-213">Source</a><h4 class="code-header">fn <a href="#method.lockfile_provider" class="fn">lockfile_provider</a>(&amp;self) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">Arc</a>&lt;dyn <a class="trait" href="../lockfile/trait.LockFileProvider.html" title="trait deps_core::lockfile::LockFileProvider">LockFileProvider</a>&gt;&gt;</h4></section></summary><div class="docblock"><p>Get the lock file provider for this ecosystem.</p>
+<p>Returns <code>None</code> if the ecosystem doesn’t support lock files.
+Lock files provide resolved dependency versions without network requests.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_inlay_hints" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#225-243">Source</a><h4 class="code-header">fn <a href="#method.generate_inlay_hints" class="fn">generate_inlay_hints</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    cached_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+    resolved_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+    loading_state: <a class="enum" href="../parser/enum.LoadingState.html" title="enum deps_core::parser::LoadingState">LoadingState</a>,
+    config: &amp;'a <a class="struct" href="struct.EcosystemConfig.html" title="struct deps_core::ecosystem::EcosystemConfig">EcosystemConfig</a>,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;InlayHint&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate inlay hints for the document.</p>
+<p>Default implementation delegates to <code>lsp_helpers::generate_inlay_hints</code>
+using <code>self.formatter()</code>. Override only if custom behavior is needed.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_hover" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#249-268">Source</a><h4 class="code-header">fn <a href="#method.generate_hover" class="fn">generate_hover</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    position: Position,
+    cached_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+    resolved_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="enum" href="https://doc.rust-lang.org/1.95.0/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;Hover&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate hover information for a position.</p>
+<p>Default implementation delegates to <code>lsp_helpers::generate_hover</code>
+using <code>self.formatter()</code> and <code>self.registry()</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_code_actions" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#274-292">Source</a><h4 class="code-header">fn <a href="#method.generate_code_actions" class="fn">generate_code_actions</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    position: Position,
+    _cached_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+    uri: &amp;'a Uri,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;CodeAction&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate code actions for a position.</p>
+<p>Default implementation delegates to <code>lsp_helpers::generate_code_actions</code>
+using <code>self.formatter()</code> and <code>self.registry()</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.generate_diagnostics" class="method"><a class="src rightside" href="../../src/deps_core/ecosystem.rs.html#298-313">Source</a><h4 class="code-header">fn <a href="#method.generate_diagnostics" class="fn">generate_diagnostics</a>&lt;'a&gt;(
+    &amp;'a self,
+    parse_result: &amp;'a dyn <a class="trait" href="trait.ParseResult.html" title="trait deps_core::ecosystem::ParseResult">ParseResult</a>,
+    cached_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+    resolved_versions: &amp;'a <a class="struct" href="https://doc.rust-lang.org/1.95.0/std/collections/hash/map/struct.HashMap.html" title="struct std::collections::hash::map::HashMap">HashMap</a>&lt;<a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/string/struct.String.html" title="struct alloc::string::String">String</a>&gt;,
+    _uri: &amp;'a Uri,
+) -&gt; <a class="type" href="type.BoxFuture.html" title="type deps_core::ecosystem::BoxFuture">BoxFuture</a>&lt;'a, <a class="struct" href="https://doc.rust-lang.org/1.95.0/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;Diagnostic&gt;&gt;</h4></section></summary><div class="docblock"><p>Generate diagnostics for the document.</p>
+<p>Default implementation delegates to <code>lsp_helpers::generate_diagnostics_from_cache</code>
+using <code>self.formatter()</code>.</p>
+</div></details></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/deps_core/ecosystem/trait.Ecosystem.js" async></script></section></div></main></body></html>

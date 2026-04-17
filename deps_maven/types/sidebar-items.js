@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["MavenScope"],"struct":["ArtifactInfo","MavenDependency","MavenVersion"]};

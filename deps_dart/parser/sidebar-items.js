@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["parse_pubspec_yaml"],"struct":["DartParseResult"]};

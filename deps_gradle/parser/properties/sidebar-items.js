@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["load_gradle_properties","parse_properties"]};

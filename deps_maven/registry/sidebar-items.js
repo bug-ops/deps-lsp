@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["package_url"],"struct":["MavenCentralRegistry"]};
