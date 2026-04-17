@@ -212,11 +212,10 @@ fn parse_table_dependency(
                     dep.features_range = Some(span_to_range(content, line_table, value.span));
                 }
             }
-            "workspace" => {
-                if value.as_bool() == Some(true) {
-                    dep.source = DependencySource::Workspace;
-                }
+            "workspace" if value.as_bool() == Some(true) => {
+                dep.source = DependencySource::Workspace;
             }
+            "workspace" => {}
             "git" => {
                 if let Some(url) = value.as_str() {
                     dep.source = DependencySource::Git {
