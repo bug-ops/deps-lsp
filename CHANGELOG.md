@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-06-29
+
 ### Fixed
 - **deps-maven, deps-gradle**: version completion now returns all available versions instead of only the current one — prefix extraction was slicing to value-end instead of cursor position (resolves #98)
+
+### Security
+- Upgrade `rustls-webpki` 0.103.11 → 0.103.12 to address RUSTSEC-2025-0174 and RUSTSEC-2025-0175
+- Bump `rustls-webpki` 0.103.12 → 0.103.13
+- Bump `rand` 0.9.2 → 0.9.4
 
 ## [0.9.3] - 2026-03-28
 
@@ -429,7 +436,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/bug-ops/deps-lsp/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/bug-ops/deps-lsp/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/bug-ops/deps-lsp/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/bug-ops/deps-lsp/compare/v0.9.0...v0.9.1
