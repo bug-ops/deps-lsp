@@ -23,7 +23,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-bundler = "0.9.3"
+deps-bundler = "0.9.4"
 ```
 
 > [!IMPORTANT]
