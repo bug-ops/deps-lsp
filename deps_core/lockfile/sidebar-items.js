@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ResolvedSource"],"fn":["locate_lockfile_for_manifest"],"struct":["LockFileCache","ResolvedPackage","ResolvedPackages"],"trait":["LockFileProvider"]};

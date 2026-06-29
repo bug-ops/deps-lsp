@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DependencySource"],"mod":["ecosystem","error","formatter","lockfile","parser","registry","types","version"]};

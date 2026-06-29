@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["parse_gemfile_lock"],"struct":["GemfileLockParser"]};

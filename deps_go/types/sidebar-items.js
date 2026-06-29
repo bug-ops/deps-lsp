@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["GoDirective"],"struct":["GoDependency","GoMetadata","GoVersion"]};
