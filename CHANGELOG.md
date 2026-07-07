@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **deps-npm**: version completion tests no longer assume `nonexistent-package`/`nonexistent-pkg` are unregistered on the live npm registry — npm now publishes a security-holding package under that exact name, which made `test_complete_versions_empty_prefix` flaky in CI. Tests use the same `this-package-does-not-exist-12345` placeholder already used elsewhere in the suite
 
+### Security
+- Upgrade `quick-xml` 0.39.4 → 0.41.0 to address RUSTSEC-2026-0195 (unbounded namespace-declaration allocation in `NsReader`)
+- Upgrade `crossbeam-epoch` 0.9.18 → 0.9.20 to address RUSTSEC-2026-0204 (invalid pointer dereference in `fmt::Pointer` for `Atomic`/`Shared`)
+
 ## [0.9.4] - 2026-06-29
 
 ### Fixed
