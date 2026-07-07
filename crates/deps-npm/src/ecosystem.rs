@@ -490,7 +490,9 @@ mod tests {
         let ecosystem = NpmEcosystem::new(cache);
 
         // Empty prefix should show non-deprecated versions (up to 20)
-        let results = ecosystem.complete_versions("nonexistent-package", "").await;
+        let results = ecosystem
+            .complete_versions("this-package-does-not-exist-12345", "")
+            .await;
         // Should not panic, returns empty for unknown package
         assert!(results.is_empty());
     }
@@ -501,7 +503,9 @@ mod tests {
         let ecosystem = NpmEcosystem::new(cache);
 
         // Test ~ operator stripping
-        let results = ecosystem.complete_versions("nonexistent-pkg", "~4.0").await;
+        let results = ecosystem
+            .complete_versions("this-package-does-not-exist-12345", "~4.0")
+            .await;
         assert!(results.is_empty());
     }
 
@@ -511,7 +515,9 @@ mod tests {
         let ecosystem = NpmEcosystem::new(cache);
 
         // Test * wildcard stripping
-        let results = ecosystem.complete_versions("nonexistent-pkg", "*").await;
+        let results = ecosystem
+            .complete_versions("this-package-does-not-exist-12345", "*")
+            .await;
         assert!(results.is_empty());
     }
 
@@ -521,7 +527,9 @@ mod tests {
         let ecosystem = NpmEcosystem::new(cache);
 
         // Test < and > operator stripping
-        let results = ecosystem.complete_versions("nonexistent-pkg", "<2.0").await;
+        let results = ecosystem
+            .complete_versions("this-package-does-not-exist-12345", "<2.0")
+            .await;
         assert!(results.is_empty());
     }
 }
