@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **deps-npm**: version completion tests no longer assume `nonexistent-package`/`nonexistent-pkg` are unregistered on the live npm registry — npm now publishes a security-holding package under that exact name, which made `test_complete_versions_empty_prefix` flaky in CI. Tests use the same `this-package-does-not-exist-12345` placeholder already used elsewhere in the suite
+
 ## [0.9.4] - 2026-06-29
 
 ### Fixed
