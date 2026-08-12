@@ -25,7 +25,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-swift = "0.9.4"
+deps-swift = "0.9"
 ```
 
 > [!IMPORTANT]

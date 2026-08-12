@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-08-12
+
 ### Added
 - **Release/CI**: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` release binaries, built via `cross`, covering musl-based Linux distributions (e.g. Alpine) alongside the existing glibc targets. CI gained matching build-only cross-compile checks for both musl targets
 
@@ -446,7 +448,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/bug-ops/deps-lsp/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/bug-ops/deps-lsp/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/bug-ops/deps-lsp/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/bug-ops/deps-lsp/compare/v0.9.1...v0.9.2
