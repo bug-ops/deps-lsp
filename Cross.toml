@@ -5,12 +5,17 @@
 # in addition to a C compiler, which is not guaranteed to be preinstalled in
 # the default cross-rs musl images. Install it explicitly before the build
 # to avoid non-deterministic musl cross-compile failures.
+#
+# DEBIAN_FRONTEND=noninteractive is required: installing cmake transitively
+# pulls in tzdata, whose postinst script prompts interactively for a
+# timezone. Without it, the build hangs indefinitely waiting for input that
+# never arrives in a CI container (observed on x86_64-unknown-linux-musl).
 [target.x86_64-unknown-linux-musl]
 pre-build = [
-    "apt-get update && apt-get install --assume-yes cmake",
+    "export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install --assume-yes cmake",
 ]
 
 [target.aarch64-unknown-linux-musl]
 pre-build = [
-    "apt-get update && apt-get install --assume-yes cmake",
+    "export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install --assume-yes cmake",
 ]
