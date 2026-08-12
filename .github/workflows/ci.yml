@@ -127,6 +127,16 @@ jobs:
             rust: stable
             target: aarch64-pc-windows-msvc
             cross: true
+          - os: ubuntu-latest
+            rust: stable
+            target: x86_64-unknown-linux-musl
+            cross: true
+            use_cross_tool: true
+          - os: ubuntu-latest
+            rust: stable
+            target: aarch64-unknown-linux-musl
+            cross: true
+            use_cross_tool: true
 
     steps:
       - uses: actions/checkout@v6
@@ -145,6 +155,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
 
+      - name: Install cross
+        if: matrix.use_cross_tool
+        uses: taiki-e/install-action@cross
+
       - name: Run tests
         if: ${{ !matrix.cross }}
         run: cargo nextest run --workspace --all-features --no-fail-fast
@@ -154,8 +168,12 @@ jobs:
         run: cargo test --workspace --doc --all-features
 
       - name: Build for cross-compile target
-        if: ${{ matrix.cross }}
+        if: ${{ matrix.cross && !matrix.use_cross_tool }}
         run: cargo build --workspace --target ${{ matrix.target }}
+
+      - name: Build for cross-compile target (musl via cross)
+        if: matrix.use_cross_tool
+        run: cross build --workspace --target ${{ matrix.target }}
 
   coverage:
     name: Code Coverage
@@ -260,6 +278,7 @@ jobs:
   release-check:
     name: Release Build Check
     needs: [test]
+    if: success() && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

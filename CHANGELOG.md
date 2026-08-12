@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Release/CI**: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` release binaries, built via `cross`, covering musl-based Linux distributions (e.g. Alpine) alongside the existing glibc targets. CI gained matching build-only cross-compile checks for both musl targets
+
 ### Fixed
 - **deps-npm**: version completion tests no longer assume `nonexistent-package`/`nonexistent-pkg` are unregistered on the live npm registry — npm now publishes a security-holding package under that exact name, which made `test_complete_versions_empty_prefix` flaky in CI. Tests use the same `this-package-does-not-exist-12345` placeholder already used elsewhere in the suite
 
