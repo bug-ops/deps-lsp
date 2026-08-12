@@ -29,7 +29,7 @@ deps-swift = "0.9"
 ```
 
 > [!IMPORTANT]
-> Requires Rust 1.89 or later.
+> Requires Rust 1.91 or later.
 
 ## Usage
 

@@ -26,7 +26,7 @@ cargo install deps-lsp
 ```
 
 > [!IMPORTANT]
-> Requires Rust 1.89 or later.
+> Requires Rust 1.91 or later.
 
 ## Usage
 

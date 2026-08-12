@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.5] - 2026-08-12
 
+### Changed
+- **MSRV bumped to 1.91** — unlocks `str::floor_char_boundary`, used to simplify description truncation in `deps-core`
+
 ### Added
 - **Release/CI**: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` release binaries, built via `cross`, covering musl-based Linux distributions (e.g. Alpine) alongside the existing glibc targets. CI gained matching build-only cross-compile checks for both musl targets
 

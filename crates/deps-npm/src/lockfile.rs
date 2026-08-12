@@ -630,7 +630,7 @@ mod tests {
         std::fs::write(&lockfile_path, r#"{"lockfileVersion": 3}"#).unwrap();
 
         // Use a time far in the future
-        let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(86400); // +1 day
+        let future_time = std::time::SystemTime::now() + std::time::Duration::from_hours(24);
         let parser = NpmLockParser;
 
         assert!(
