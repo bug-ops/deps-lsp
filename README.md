@@ -65,8 +65,10 @@ Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/lat
 
 | Platform | Architecture | Binary |
 | ---------- | -------------- | -------- |
-| Linux | x86_64 | `deps-lsp-x86_64-unknown-linux-gnu` |
-| Linux | aarch64 | `deps-lsp-aarch64-unknown-linux-gnu` |
+| Linux | x86_64 (glibc) | `deps-lsp-x86_64-unknown-linux-gnu` |
+| Linux | aarch64 (glibc) | `deps-lsp-aarch64-unknown-linux-gnu` |
+| Linux | x86_64 (musl) | `deps-lsp-x86_64-unknown-linux-musl` |
+| Linux | aarch64 (musl) | `deps-lsp-aarch64-unknown-linux-musl` |
 | macOS | x86_64 | `deps-lsp-x86_64-apple-darwin` |
 | macOS | Apple Silicon | `deps-lsp-aarch64-apple-darwin` |
 | Windows | x86_64 | `deps-lsp-x86_64-pc-windows-msvc.exe` |
