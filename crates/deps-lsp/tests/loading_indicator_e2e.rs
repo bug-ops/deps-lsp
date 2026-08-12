@@ -7,14 +7,13 @@ use deps_lsp::config::{DepsConfig, LoadingIndicatorConfig};
 use deps_lsp::document::{DocumentState, LoadingState, ServerState};
 use std::sync::Arc;
 use std::time::Duration;
-use tower_lsp_server::ls_types::Uri;
 
 /// Test loading state lifecycle for Cargo ecosystem.
 #[cfg(feature = "cargo")]
 #[tokio::test]
 async fn test_loading_state_lifecycle_cargo() {
     let state = Arc::new(ServerState::new());
-    let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+    let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
     let content = r#"[dependencies]
 serde = "1.0.0"
 tokio = { version = "1.0", features = ["full"] }
@@ -127,8 +126,8 @@ fn test_progress_only_mode() {
 async fn test_concurrent_loading_multiple_documents() {
     let state = Arc::new(ServerState::new());
 
-    let uri1 = Uri::from_file_path("/test/Cargo1.toml").unwrap();
-    let uri2 = Uri::from_file_path("/test/Cargo2.toml").unwrap();
+    let uri1 = deps_core::test_util::test_uri("/test/Cargo1.toml");
+    let uri2 = deps_core::test_util::test_uri("/test/Cargo2.toml");
 
     let content = r#"[dependencies]
 serde = "1.0.0"
@@ -371,7 +370,7 @@ fn test_combined_config() {
 #[test]
 fn test_server_state_document_has_loading_state() {
     let state = ServerState::new();
-    let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+    let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
     let doc = DocumentState::new_without_parse_result("cargo", String::new());
 
@@ -453,7 +452,7 @@ async fn test_loading_timeout_scenario() {
 #[tokio::test]
 async fn test_rapid_set_loading_calls() {
     let state = Arc::new(ServerState::new());
-    let uri = Uri::from_file_path("/test/rapid.toml").unwrap();
+    let uri = deps_core::test_util::test_uri("/test/rapid.toml");
 
     let doc = DocumentState::new_without_parse_result("cargo", String::new());
     state.update_document(uri.clone(), doc);

@@ -177,7 +177,7 @@ mod tests {
     async fn test_parse_manifest_valid() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/Package.swift").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
         let content = r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#;
         let result = eco.parse_manifest(content, &uri).await;
         assert!(result.is_ok());
@@ -188,7 +188,7 @@ mod tests {
     async fn test_parse_manifest_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = SwiftEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/Package.swift").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
         let result = eco.parse_manifest("// empty file", &uri).await;
         assert!(result.is_ok());
         assert!(result.unwrap().dependencies().is_empty());

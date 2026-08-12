@@ -82,7 +82,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_diagnostics_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
         let config = DiagnosticsConfig::default();
 
         let (client, full_config) = create_test_client_and_config();
@@ -99,7 +99,7 @@ mod tests {
         #[tokio::test]
         async fn test_handle_diagnostics() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
@@ -124,7 +124,7 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics_no_parse_result() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
 
             let doc_state = DocumentState::new(Ecosystem::Cargo, String::new(), vec![]);
@@ -145,7 +145,7 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/package.json").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/package.json");
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("npm").unwrap();
@@ -174,7 +174,7 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_diagnostics() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
             let config = DiagnosticsConfig::default();
 
             let ecosystem = state.ecosystem_registry.get("pypi").unwrap();

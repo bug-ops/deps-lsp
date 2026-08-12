@@ -55,14 +55,14 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
-    use tower_lsp_server::ls_types::{Position, Range, TextDocumentIdentifier, Uri};
+    use tower_lsp_server::ls_types::{Position, Range, TextDocumentIdentifier};
 
     // Generic tests (no feature flag required)
 
     #[tokio::test]
     async fn test_handle_code_actions_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
         let params = CodeActionParams {
             text_document: TextDocumentIdentifier { uri },
@@ -86,7 +86,7 @@ mod tests {
         #[tokio::test]
         async fn test_handle_code_actions() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = r#"[dependencies]
@@ -118,7 +118,7 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_code_actions_no_parse_result() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
             let doc_state = DocumentState::new(Ecosystem::Cargo, String::new(), vec![]);
             state.update_document(uri.clone(), doc_state);
@@ -146,7 +146,7 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_code_actions() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/package.json").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/package.json");
 
             let ecosystem = state.ecosystem_registry.get("npm").unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();

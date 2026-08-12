@@ -284,7 +284,7 @@ mod tests {
     async fn test_parse_manifest_kts() {
         let eco = GradleEcosystem::new(make_cache());
         let content = "dependencies {\n    implementation(\"junit:junit:4.13.2\")\n}\n";
-        let uri = Uri::from_file_path("/project/build.gradle.kts").unwrap();
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
         let result = eco.parse_manifest(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
     }
@@ -378,7 +378,7 @@ mod tests {
     async fn test_parse_manifest_groovy() {
         let eco = GradleEcosystem::new(make_cache());
         let content = "dependencies {\n    implementation 'junit:junit:4.13.2'\n}\n";
-        let uri = Uri::from_file_path("/project/build.gradle").unwrap();
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
         let result = eco.parse_manifest(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
     }

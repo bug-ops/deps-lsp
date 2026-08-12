@@ -284,7 +284,7 @@ mod tests {
     async fn test_parse_manifest_valid_json() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
 
         let content = r#"{"dependencies": {"express": "^4.18.0"}}"#;
 
@@ -299,7 +299,7 @@ mod tests {
     async fn test_parse_manifest_invalid_json() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
 
         let invalid_content = r#"{"dependencies": invalid json"#;
 
@@ -311,7 +311,7 @@ mod tests {
     async fn test_parse_manifest_empty_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
 
         let content = r#"{"dependencies": {}}"#;
 
@@ -344,7 +344,7 @@ mod tests {
     async fn test_generate_inlay_hints_empty_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
 
         let content = r#"{"dependencies": {}}"#;
 
@@ -370,7 +370,7 @@ mod tests {
     async fn test_generate_completions_no_context() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
 
         let content = r#"{"name": "test"}"#;
 
@@ -394,7 +394,7 @@ mod tests {
 
         // npm doesn't have features, so this should always return empty
         let content = r#"{"dependencies": {"express": "4.0.0"}}"#;
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
 
         let position = Position {
@@ -414,7 +414,7 @@ mod tests {
     async fn test_generate_hover_no_dependency_at_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
 
         let content = r#"{"name": "test"}"#;
 
@@ -442,7 +442,7 @@ mod tests {
     async fn test_generate_code_actions_no_actions() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
 
         let content = r#"{"name": "test"}"#;
 
@@ -464,7 +464,7 @@ mod tests {
     async fn test_generate_diagnostics_no_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
 
         let content = r#"{"dependencies": {}}"#;
 

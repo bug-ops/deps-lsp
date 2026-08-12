@@ -215,7 +215,7 @@ mod tests {
 
         fn uri(&self) -> &Uri {
             static URI: std::sync::LazyLock<Uri> =
-                std::sync::LazyLock::new(|| Uri::from_file_path("/test/Cargo.toml").unwrap());
+                std::sync::LazyLock::new(|| deps_core::test_util::test_uri("/test/Cargo.toml"));
             &URI
         }
 

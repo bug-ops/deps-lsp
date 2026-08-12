@@ -232,7 +232,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![mock_dependency(
                 "github.com/gin-gonic/gin",
@@ -276,7 +276,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![mock_dependency(
                 "github.com/gin-gonic/gin",
@@ -318,7 +318,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![mock_dependency(
                 "github.com/gin-gonic/gin",
@@ -361,7 +361,7 @@ mod tests {
         let mut dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.9.1"), 5);
         dep.version_range = None;
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![dep],
             uri,
@@ -465,7 +465,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![mock_dependency(
                 "github.com/gin-gonic/gin",
@@ -500,7 +500,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![mock_dependency(
                 "github.com/gin-gonic/gin",
@@ -531,7 +531,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![mock_dependency(
                 "github.com/gin-gonic/gin",
@@ -558,7 +558,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = GoEcosystem::new(cache);
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![mock_dependency(
                 "github.com/gin-gonic/gin",
@@ -599,7 +599,7 @@ go 1.21
 require github.com/
 ";
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![],
             uri,
@@ -625,7 +625,7 @@ require github.com/
 go 1.21
 ";
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
         let parse_result = MockParseResult {
             dependencies: vec![],
             uri,
@@ -652,7 +652,7 @@ go 1.21
 require github.com/gin-gonic/gin v1.9.1
 ";
 
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
 
         let result = ecosystem.parse_manifest(content, &uri).await;
         assert!(result.is_ok());
@@ -671,7 +671,7 @@ require github.com/gin-gonic/gin v1.9.1
         let ecosystem = GoEcosystem::new(cache);
 
         let content = "";
-        let uri = Uri::from_file_path("/test/go.mod").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
 
         let result = ecosystem.parse_manifest(content, &uri).await;
         assert!(result.is_ok());

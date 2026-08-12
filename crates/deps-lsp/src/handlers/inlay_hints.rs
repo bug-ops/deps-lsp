@@ -84,7 +84,7 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
-    use tower_lsp_server::ls_types::{TextDocumentIdentifier, Uri};
+    use tower_lsp_server::ls_types::TextDocumentIdentifier;
 
     // Generic tests (no feature flag required)
 
@@ -102,7 +102,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_inlay_hints_disabled_returns_empty() {
         let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
         let config = InlayHintsConfig {
             enabled: false,
             up_to_date_text: "✅".to_string(),
@@ -126,7 +126,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_inlay_hints_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
         let config = InlayHintsConfig {
             enabled: true,
             up_to_date_text: "✅".to_string(),
@@ -156,7 +156,7 @@ mod tests {
         #[tokio::test]
         async fn test_handle_inlay_hints() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "✅".to_string(),
@@ -194,7 +194,7 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_inlay_hints_no_parse_result() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "✅".to_string(),
@@ -221,7 +221,7 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_inlay_hints_custom_config() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "OK".to_string(),
@@ -266,7 +266,7 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_inlay_hints() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/package.json").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/package.json");
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "✅".to_string(),
@@ -308,7 +308,7 @@ serde = "1.0.0"
         #[tokio::test]
         async fn test_handle_inlay_hints() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
             let config = InlayHintsConfig {
                 enabled: true,
                 up_to_date_text: "✅".to_string(),

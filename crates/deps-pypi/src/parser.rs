@@ -687,7 +687,7 @@ mod tests {
     use super::*;
 
     fn test_uri() -> Uri {
-        Uri::from_file_path("/test/pyproject.toml").unwrap()
+        deps_core::test_util::test_uri("/test/pyproject.toml")
     }
 
     #[test]

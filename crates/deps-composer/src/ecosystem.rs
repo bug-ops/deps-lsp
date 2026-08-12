@@ -163,7 +163,7 @@ mod tests {
     async fn test_parse_manifest_valid() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = ComposerEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/composer.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
 
         let content = r#"{"require": {"symfony/console": "^6.0"}}"#;
         let result = ecosystem.parse_manifest(content, &uri).await;
@@ -177,7 +177,7 @@ mod tests {
     async fn test_parse_manifest_invalid() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = ComposerEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/composer.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
 
         let result = ecosystem.parse_manifest("{invalid json}", &uri).await;
         assert!(result.is_err());
@@ -196,7 +196,7 @@ mod tests {
     async fn test_generate_inlay_hints_empty() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = ComposerEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/composer.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
 
         let content = r#"{"require": {}}"#;
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
@@ -218,7 +218,7 @@ mod tests {
     async fn test_generate_completions_no_context() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = ComposerEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/composer.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
 
         let content = r#"{"name": "test/project"}"#;
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();

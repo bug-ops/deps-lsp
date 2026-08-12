@@ -136,7 +136,7 @@ mod tests {
     use super::*;
 
     fn make_uri(name: &str) -> Uri {
-        Uri::from_file_path(format!("/project/{name}")).unwrap()
+        deps_core::test_util::test_uri(&format!("/project/{name}"))
     }
 
     #[test]

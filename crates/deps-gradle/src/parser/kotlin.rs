@@ -154,7 +154,7 @@ mod tests {
     use super::*;
 
     fn make_uri() -> Uri {
-        Uri::from_file_path("/project/build.gradle.kts").unwrap()
+        deps_core::test_util::test_uri("/project/build.gradle.kts")
     }
 
     #[test]

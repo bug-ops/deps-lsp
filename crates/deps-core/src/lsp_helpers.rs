@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn test_inlay_hint_exact_version_shows_update_needed() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let config = EcosystemConfig {
@@ -759,7 +759,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let mut cached_versions = HashMap::new();
@@ -789,7 +789,7 @@ mod tests {
     #[test]
     fn test_inlay_hint_caret_version_up_to_date() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let config = EcosystemConfig {
@@ -807,7 +807,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let mut cached_versions = HashMap::new();
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn test_loading_hint_shows_when_no_cached_version() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let config = EcosystemConfig {
@@ -859,7 +859,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let cached_versions = HashMap::new();
@@ -892,7 +892,7 @@ mod tests {
     #[test]
     fn test_loading_hint_disabled_when_config_false() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let config = EcosystemConfig {
@@ -910,7 +910,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let cached_versions = HashMap::new();
@@ -973,7 +973,7 @@ mod tests {
     #[test]
     fn test_loading_hint_not_shown_when_cached_version_exists() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let config = EcosystemConfig {
@@ -991,7 +991,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let mut cached_versions = HashMap::new();
@@ -1026,7 +1026,7 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_unknown_package() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -1037,7 +1037,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let cached_versions = HashMap::new();
@@ -1059,7 +1059,7 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_version() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -1070,7 +1070,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let mut cached_versions = HashMap::new();
@@ -1094,7 +1094,7 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_up_to_date() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -1105,7 +1105,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let mut cached_versions = HashMap::new();
@@ -1129,7 +1129,7 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_multiple_deps() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
 
@@ -1154,7 +1154,7 @@ mod tests {
                     name_range: Range::new(Position::new(2, 0), Position::new(2, 7)),
                 },
             ],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let mut cached_versions = HashMap::new();
@@ -1186,7 +1186,7 @@ mod tests {
     #[test]
     fn test_inlay_hint_not_in_lockfile_but_satisfies_requirement() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let config = EcosystemConfig {
@@ -1204,7 +1204,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 9)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let mut cached_versions = HashMap::new();
@@ -1238,7 +1238,7 @@ mod tests {
     #[test]
     fn test_inlay_hint_not_in_lockfile_and_outdated() {
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::{Position, Range, Uri};
+        use tower_lsp_server::ls_types::{Position, Range};
 
         let formatter = MockFormatter;
         let config = EcosystemConfig {
@@ -1256,7 +1256,7 @@ mod tests {
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 9)),
             }],
-            uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
 
         let mut cached_versions = HashMap::new();
