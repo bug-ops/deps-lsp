@@ -315,7 +315,9 @@ serde = ""
     temp_file.write_all(content.as_bytes()).unwrap();
     temp_file.flush().unwrap();
 
-    let uri = format!("file://{}", temp_file.path().display());
+    let uri = tower_lsp_server::ls_types::Uri::from_file_path(temp_file.path())
+        .unwrap()
+        .to_string();
 
     let mut client = LspClient::spawn();
     client.initialize();
@@ -347,7 +349,9 @@ serde = "1.0"
     temp_file.write_all(content.as_bytes()).unwrap();
     temp_file.flush().unwrap();
 
-    let uri = format!("file://{}", temp_file.path().display());
+    let uri = tower_lsp_server::ls_types::Uri::from_file_path(temp_file.path())
+        .unwrap()
+        .to_string();
 
     let mut client = LspClient::spawn();
     client.initialize();
@@ -376,7 +380,9 @@ serde = "1.0"
     temp_file.write_all(content.as_bytes()).unwrap();
     temp_file.flush().unwrap();
 
-    let uri = format!("file://{}", temp_file.path().display());
+    let uri = tower_lsp_server::ls_types::Uri::from_file_path(temp_file.path())
+        .unwrap()
+        .to_string();
 
     let mut client = LspClient::spawn();
     client.initialize();
@@ -409,7 +415,9 @@ serde = "1.0"
     temp_file.write_all(content.as_bytes()).unwrap();
     temp_file.flush().unwrap();
 
-    let uri = format!("file://{}", temp_file.path().display());
+    let uri = tower_lsp_server::ls_types::Uri::from_file_path(temp_file.path())
+        .unwrap()
+        .to_string();
 
     let mut client = LspClient::spawn();
     client.initialize();
@@ -487,7 +495,9 @@ serde = "1.0"
     temp_file.write_all(content.as_bytes()).unwrap();
     temp_file.flush().unwrap();
 
-    let uri = format!("file://{}", temp_file.path().display());
+    let uri = tower_lsp_server::ls_types::Uri::from_file_path(temp_file.path())
+        .unwrap()
+        .to_string();
 
     let mut client = LspClient::spawn();
     client.initialize();

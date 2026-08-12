@@ -152,7 +152,7 @@ mod tests {
     use super::*;
 
     fn make_uri(path: &str) -> Uri {
-        Uri::from_file_path(path).unwrap()
+        deps_core::test_util::test_uri(path)
     }
 
     #[test]
