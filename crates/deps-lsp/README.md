@@ -26,7 +26,7 @@ cargo install deps-lsp
 ```
 
 > [!IMPORTANT]
-> Requires Rust 1.89 or later.
+> Requires Rust 1.91 or later.
 
 ## Usage
 
@@ -40,7 +40,7 @@ All ecosystems are enabled by default. Disable unused ones to reduce binary size
 
 ```toml
 [dependencies]
-deps-lsp = { version = "0.9.4", default-features = false, features = ["cargo", "npm"] }
+deps-lsp = { version = "0.9", default-features = false, features = ["cargo", "npm"] }
 ```
 
 | Feature | Ecosystem | Default |

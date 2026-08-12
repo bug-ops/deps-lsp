@@ -447,7 +447,7 @@ golang.org/x/sync v0.5.0/go.mod h1:RxMgew5V=
         std::fs::write(&lockfile_path, "").unwrap();
 
         // Use a time far in the future
-        let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(86400); // +1 day
+        let future_time = std::time::SystemTime::now() + std::time::Duration::from_hours(24);
         let parser = GoSumParser;
 
         assert!(

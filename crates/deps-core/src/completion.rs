@@ -384,10 +384,7 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
     if let Some(desc) = metadata.description() {
         doc_parts.push(String::new()); // Empty line
         let truncated = if desc.len() > 200 {
-            let mut end = 200;
-            while end > 0 && !desc.is_char_boundary(end) {
-                end -= 1;
-            }
+            let end = desc.floor_char_boundary(200);
             format!("{}...", &desc[..end])
         } else {
             desc.to_string()

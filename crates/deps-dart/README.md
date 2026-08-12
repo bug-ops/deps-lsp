@@ -23,11 +23,11 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-dart = "0.9.4"
+deps-dart = "0.9"
 ```
 
 > [!IMPORTANT]
-> Requires Rust 1.89 or later.
+> Requires Rust 1.91 or later.
 
 ## Usage
 
