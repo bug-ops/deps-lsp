@@ -145,7 +145,7 @@ jobs:
         with:
           channel: ${{ matrix.rust }}
           targets: ${{ matrix.target }}
-          bins: cargo-nextest
+          bins: ${{ !matrix.cross && 'cargo-nextest' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
