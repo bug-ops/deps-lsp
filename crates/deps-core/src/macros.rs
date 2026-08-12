@@ -453,7 +453,7 @@ mod tests {
                 version_req: None,
                 version_range: None,
             }],
-            uri: Uri::from_file_path("/test").unwrap(),
+            uri: crate::test_util::test_uri("/test"),
         };
 
         assert_eq!(result.dependencies().len(), 1);

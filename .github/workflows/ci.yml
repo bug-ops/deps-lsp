@@ -110,7 +110,7 @@ jobs:
         run: cargo deny check
 
   test:
-    name: Test (${{ matrix.os }}${{ matrix.target && format(' / {0}', matrix.target) || '' }})
+    name: Test (${{ matrix.os }}${{ matrix.rust != 'stable' && format(' / {0}', matrix.rust) || '' }})
     needs: [changes, fmt, check]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ${{ matrix.os }}
@@ -123,20 +123,6 @@ jobs:
         include:
           - os: ubuntu-latest
             rust: beta
-          - os: windows-latest
-            rust: stable
-            target: aarch64-pc-windows-msvc
-            cross: true
-          - os: ubuntu-latest
-            rust: stable
-            target: x86_64-unknown-linux-musl
-            cross: true
-            use_cross_tool: true
-          - os: ubuntu-latest
-            rust: stable
-            target: aarch64-unknown-linux-musl
-            cross: true
-            use_cross_tool: true
 
     steps:
       - uses: actions/checkout@v6
@@ -144,8 +130,48 @@ jobs:
       - uses: moonrepo/setup-rust@v1
         with:
           channel: ${{ matrix.rust }}
+          bins: cargo-nextest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Run tests
+        run: cargo nextest run --workspace --all-features --no-fail-fast
+
+      - name: Run doctests
+        run: cargo test --workspace --doc --all-features
+
+  cross-check:
+    name: Cross-compile Check (${{ matrix.target }})
+    needs: [changes, fmt, check]
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            use_cross_tool: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross_tool: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross_tool: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: moonrepo/setup-rust@v1
+        with:
           targets: ${{ matrix.target }}
-          bins: ${{ !matrix.cross && 'cargo-nextest' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -159,16 +185,8 @@ jobs:
         if: matrix.use_cross_tool
         uses: taiki-e/install-action@cross
 
-      - name: Run tests
-        if: ${{ !matrix.cross }}
-        run: cargo nextest run --workspace --all-features --no-fail-fast
-
-      - name: Run doctests
-        if: ${{ !matrix.cross }}
-        run: cargo test --workspace --doc --all-features
-
       - name: Build for cross-compile target
-        if: ${{ matrix.cross && !matrix.use_cross_tool }}
+        if: ${{ !matrix.use_cross_tool }}
         run: cargo build --workspace --target ${{ matrix.target }}
 
       - name: Build for cross-compile target (musl via cross)
@@ -300,7 +318,19 @@ jobs:
 
   ci-success:
     name: CI Success
-    needs: [changes, fmt, check, security, test, coverage, msrv, wasm, benchmark]
+    needs:
+      [
+        changes,
+        fmt,
+        check,
+        security,
+        test,
+        cross-check,
+        coverage,
+        msrv,
+        wasm,
+        benchmark,
+      ]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -326,6 +356,7 @@ jobs:
           check_job "${{ needs.check.result }}" "check" || failed=1
           check_job "${{ needs.security.result }}" "security" || failed=1
           check_job "${{ needs.test.result }}" "test" || failed=1
+          check_job "${{ needs.cross-check.result }}" "cross-check" || failed=1
           check_job "${{ needs.coverage.result }}" "coverage" || failed=1
           check_job "${{ needs.msrv.result }}" "msrv" || failed=1
           check_job "${{ needs.wasm.result }}" "wasm" || failed=1

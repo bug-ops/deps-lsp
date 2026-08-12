@@ -12,6 +12,12 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Exposes `test_util` to other workspace crates' own test builds, where
+# `cfg(test)` alone would not apply (deps-core is a normal, non-dev
+# dependency there).
+test-util = []
+
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }

@@ -4,7 +4,7 @@ use deps_gradle::parser::{GradleParseResult, parse_gradle};
 use tower_lsp_server::ls_types::Uri;
 
 fn make_uri(path: &str) -> Uri {
-    Uri::from_file_path(path).unwrap()
+    deps_core::test_util::test_uri(path)
 }
 
 // --- Version Catalog ---

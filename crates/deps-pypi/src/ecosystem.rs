@@ -289,7 +289,7 @@ mod tests {
     async fn test_parse_manifest_valid_content() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
         let content = r#"[project]
 name = "test"
@@ -307,7 +307,7 @@ dependencies = ["requests>=2.0.0"]
     async fn test_parse_manifest_invalid_toml() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
         let invalid_content = "[project\nname = invalid";
 
@@ -319,7 +319,7 @@ dependencies = ["requests>=2.0.0"]
     async fn test_parse_manifest_empty_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
         let content = r#"[project]
 name = "test"
@@ -355,7 +355,7 @@ dependencies = []
     async fn test_generate_inlay_hints_empty_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
         let content = r"[project]
 dependencies = []
@@ -383,7 +383,7 @@ dependencies = []
     async fn test_generate_completions_no_context() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
         let content = r#"[project]
 name = "test"
@@ -413,7 +413,7 @@ name = "test"
         let content = r#"[project]
 dependencies = ["requests"]
 "#;
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
         let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
 
         // Test with any position - feature context should return empty
@@ -434,7 +434,7 @@ dependencies = ["requests"]
     async fn test_generate_hover_no_dependency_at_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
         let content = r#"[project]
 name = "test"
@@ -464,7 +464,7 @@ name = "test"
     async fn test_generate_code_actions_no_actions() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
         let content = r#"[project]
 name = "test"
@@ -488,7 +488,7 @@ name = "test"
     async fn test_generate_diagnostics_no_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
-        let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
 
         let content = r#"[project]
 name = "test"

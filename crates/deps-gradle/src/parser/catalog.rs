@@ -145,7 +145,7 @@ mod tests {
     use super::*;
 
     fn make_uri() -> Uri {
-        Uri::from_file_path("/project/gradle/libs.versions.toml").unwrap()
+        deps_core::test_util::test_uri("/project/gradle/libs.versions.toml")
     }
 
     #[test]

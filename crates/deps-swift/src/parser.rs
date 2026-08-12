@@ -493,7 +493,7 @@ mod tests {
     use deps_core::Dependency;
 
     fn test_uri() -> Uri {
-        Uri::from_file_path("/test/Package.swift").unwrap()
+        deps_core::test_util::test_uri("/test/Package.swift")
     }
 
     #[test]

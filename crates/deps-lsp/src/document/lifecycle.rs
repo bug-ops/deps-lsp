@@ -716,8 +716,7 @@ mod tests {
     #[test]
     fn test_ecosystem_registry_unknown_file() {
         let state = ServerState::new();
-        let unknown_uri =
-            tower_lsp_server::ls_types::Uri::from_file_path("/test/unknown.txt").unwrap();
+        let unknown_uri = deps_core::test_util::test_uri("/test/unknown.txt");
         assert!(state.ecosystem_registry.get_for_uri(&unknown_uri).is_none());
     }
 
@@ -725,7 +724,7 @@ mod tests {
     async fn test_ensure_document_loaded_unsupported_file_check() {
         // Returns false for unknown file types (e.g., README.md)
         let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/README.md").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/README.md");
 
         // Verify ecosystem registry correctly identifies unsupported files
         assert!(
@@ -742,7 +741,7 @@ mod tests {
         // Test that load_document_from_disk fails gracefully for missing files
         use super::load_document_from_disk;
 
-        let uri = Uri::from_file_path("/nonexistent/Cargo.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/nonexistent/Cargo.toml");
         let result = load_document_from_disk(&uri).await;
 
         assert!(result.is_err(), "Should fail for missing files");
@@ -1218,15 +1217,14 @@ mod tests {
         #[test]
         fn test_ecosystem_registry_lookup() {
             let state = ServerState::new();
-            let cargo_uri =
-                tower_lsp_server::ls_types::Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let cargo_uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             assert!(state.ecosystem_registry.get_for_uri(&cargo_uri).is_some());
         }
 
         #[tokio::test]
         async fn test_document_parsing() {
             let state = Arc::new(ServerState::new());
-            let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = r#"[dependencies]
 serde = "1.0"
 "#;
@@ -1254,7 +1252,7 @@ serde = "1.0"
         #[tokio::test]
         async fn test_document_stored_even_when_parsing_fails() {
             let state = Arc::new(ServerState::new());
-            let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             // Invalid TOML that will fail parsing
             let content = r#"[dependencies
 serde = "1.0"
@@ -1301,7 +1299,7 @@ serde = "1.0"
         async fn test_ensure_document_loaded_fast_path() {
             // Fast path: document already loaded, should return true without loading
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = r#"[dependencies]
 serde = "1.0""#;
 
@@ -1368,7 +1366,7 @@ serde = "1.0"
         async fn test_ensure_document_loaded_idempotent_check() {
             // Test that repeated loads are idempotent at the state level
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = r#"[dependencies]
 serde = "1.0""#;
 
@@ -1407,16 +1405,14 @@ serde = "1.0""#;
         #[test]
         fn test_ecosystem_registry_lookup() {
             let state = ServerState::new();
-            let npm_uri =
-                tower_lsp_server::ls_types::Uri::from_file_path("/test/package.json").unwrap();
+            let npm_uri = deps_core::test_util::test_uri("/test/package.json");
             assert!(state.ecosystem_registry.get_for_uri(&npm_uri).is_some());
         }
 
         #[tokio::test]
         async fn test_document_parsing() {
             let state = Arc::new(ServerState::new());
-            let uri =
-                tower_lsp_server::ls_types::Uri::from_file_path("/test/package.json").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/package.json");
             let content = r#"{"dependencies": {"express": "^4.18.0"}}"#;
 
             let ecosystem = state
@@ -1447,16 +1443,14 @@ serde = "1.0""#;
         #[test]
         fn test_ecosystem_registry_lookup() {
             let state = ServerState::new();
-            let pypi_uri =
-                tower_lsp_server::ls_types::Uri::from_file_path("/test/pyproject.toml").unwrap();
+            let pypi_uri = deps_core::test_util::test_uri("/test/pyproject.toml");
             assert!(state.ecosystem_registry.get_for_uri(&pypi_uri).is_some());
         }
 
         #[tokio::test]
         async fn test_document_parsing() {
             let state = Arc::new(ServerState::new());
-            let uri =
-                tower_lsp_server::ls_types::Uri::from_file_path("/test/pyproject.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
             let content = r#"[project]
 dependencies = ["requests>=2.0.0"]
 "#;
@@ -1489,14 +1483,14 @@ dependencies = ["requests>=2.0.0"]
         #[test]
         fn test_ecosystem_registry_lookup() {
             let state = ServerState::new();
-            let go_uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/go.mod").unwrap();
+            let go_uri = deps_core::test_util::test_uri("/test/go.mod");
             assert!(state.ecosystem_registry.get_for_uri(&go_uri).is_some());
         }
 
         #[tokio::test]
         async fn test_document_parsing() {
             let state = Arc::new(ServerState::new());
-            let uri = tower_lsp_server::ls_types::Uri::from_file_path("/test/go.mod").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
             let content = r"module example.com/mymodule
 
 go 1.21
@@ -1532,7 +1526,7 @@ require github.com/gorilla/mux v1.8.0
         #[tokio::test]
         async fn test_preserve_cached_versions_on_change() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
             // Initial document with 2 dependencies
             let content1 = r#"[dependencies]
@@ -1611,7 +1605,7 @@ tokio = "1.0"
         #[tokio::test]
         async fn test_first_open_has_empty_cache() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
             let content = r#"[dependencies]
 serde = "1.0"
@@ -1635,7 +1629,7 @@ serde = "1.0"
         #[tokio::test]
         async fn test_preserve_cache_on_parse_failure() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
             // Valid initial document
             let content1 = r#"[dependencies]
@@ -1747,7 +1741,7 @@ serde = "1.0"
         #[tokio::test]
         async fn test_cache_pruned_on_dependency_removal() {
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
             // Initial document with 3 dependencies
             let content1 = r#"[dependencies]

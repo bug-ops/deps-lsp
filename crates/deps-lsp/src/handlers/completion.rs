@@ -325,13 +325,13 @@ mod tests {
     use crate::document::DocumentState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
     use tower_lsp_server::ls_types::{
-        Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+        Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
 
     #[tokio::test]
     async fn test_completion_returns_empty_for_missing_document() {
         let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
         let params = CompletionParams {
             text_document_position: TextDocumentPositionParams {
@@ -353,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn test_completion_delegates_to_ecosystem() {
         let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
         let content = "[dependencies]\nserde = \"1.0\"".to_string();
 
@@ -674,7 +674,7 @@ something
         use crate::document::Ecosystem;
 
         let state = Arc::new(ServerState::new());
-        let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
         // Malformed content that will fail to parse
         let content = r"[dependencies]

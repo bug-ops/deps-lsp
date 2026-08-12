@@ -325,11 +325,10 @@ impl Clone for DocumentState {
 ///
 /// ```
 /// use deps_lsp::document::ColdStartLimiter;
-/// use tower_lsp_server::ls_types::Uri;
 /// use std::time::Duration;
 ///
 /// let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-/// let uri = Uri::from_file_path("/test.toml").unwrap();
+/// let uri = deps_core::test_util::test_uri("/test.toml");
 ///
 /// assert!(limiter.allow_cold_start(&uri));
 /// assert!(!limiter.allow_cold_start(&uri)); // Rate limited
@@ -890,7 +889,7 @@ mod tests {
             use tokio::sync::Barrier;
 
             let state = Arc::new(ServerState::new());
-            let uri = Uri::from_file_path("/concurrent-loading-test.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/concurrent-loading-test.toml");
 
             let doc = DocumentState::new_without_parse_result("cargo", String::new());
             state.update_document(uri.clone(), doc);
@@ -1024,25 +1023,25 @@ mod tests {
     fn test_ecosystem_from_uri() {
         #[cfg(feature = "cargo")]
         {
-            let cargo_uri = Uri::from_file_path("/path/to/Cargo.toml").unwrap();
+            let cargo_uri = deps_core::test_util::test_uri("/path/to/Cargo.toml");
             assert_eq!(Ecosystem::from_uri(&cargo_uri), Some(Ecosystem::Cargo));
         }
         #[cfg(feature = "npm")]
         {
-            let npm_uri = Uri::from_file_path("/path/to/package.json").unwrap();
+            let npm_uri = deps_core::test_util::test_uri("/path/to/package.json");
             assert_eq!(Ecosystem::from_uri(&npm_uri), Some(Ecosystem::Npm));
         }
         #[cfg(feature = "pypi")]
         {
-            let pypi_uri = Uri::from_file_path("/path/to/pyproject.toml").unwrap();
+            let pypi_uri = deps_core::test_util::test_uri("/path/to/pyproject.toml");
             assert_eq!(Ecosystem::from_uri(&pypi_uri), Some(Ecosystem::Pypi));
         }
         #[cfg(feature = "go")]
         {
-            let go_uri = Uri::from_file_path("/path/to/go.mod").unwrap();
+            let go_uri = deps_core::test_util::test_uri("/path/to/go.mod");
             assert_eq!(Ecosystem::from_uri(&go_uri), Some(Ecosystem::Go));
         }
-        let unknown_uri = Uri::from_file_path("/path/to/README.md").unwrap();
+        let unknown_uri = deps_core::test_util::test_uri("/path/to/README.md");
         assert_eq!(Ecosystem::from_uri(&unknown_uri), None);
     }
 
@@ -1070,7 +1069,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_state_background_tasks() {
         let state = ServerState::new();
-        let uri = Uri::from_file_path("/test.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test.toml");
 
         let task = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1083,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_background_task_cancels_previous() {
         let state = ServerState::new();
-        let uri = Uri::from_file_path("/test.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test.toml");
 
         let task1 = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -1100,7 +1099,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_background_task_nonexistent() {
         let state = ServerState::new();
-        let uri = Uri::from_file_path("/test.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/test.toml");
         state.cancel_background_task(&uri).await;
     }
 
@@ -1115,7 +1114,7 @@ mod tests {
         #[test]
         fn test_allows_first_request() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-            let uri = Uri::from_file_path("/test.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test.toml");
             assert!(
                 limiter.allow_cold_start(&uri),
                 "First request should be allowed"
@@ -1125,7 +1124,7 @@ mod tests {
         #[test]
         fn test_blocks_rapid_requests() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-            let uri = Uri::from_file_path("/test.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test.toml");
 
             assert!(limiter.allow_cold_start(&uri), "First request allowed");
             assert!(
@@ -1137,7 +1136,7 @@ mod tests {
         #[tokio::test]
         async fn test_allows_after_interval() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(50));
-            let uri = Uri::from_file_path("/test.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test.toml");
 
             assert!(limiter.allow_cold_start(&uri), "First request allowed");
             tokio::time::sleep(Duration::from_millis(60)).await;
@@ -1150,8 +1149,8 @@ mod tests {
         #[test]
         fn test_different_uris_independent() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-            let uri1 = Uri::from_file_path("/test1.toml").unwrap();
-            let uri2 = Uri::from_file_path("/test2.toml").unwrap();
+            let uri1 = deps_core::test_util::test_uri("/test1.toml");
+            let uri2 = deps_core::test_util::test_uri("/test2.toml");
 
             assert!(limiter.allow_cold_start(&uri1), "URI 1 first request");
             assert!(limiter.allow_cold_start(&uri2), "URI 2 first request");
@@ -1168,8 +1167,8 @@ mod tests {
         #[test]
         fn test_cleanup() {
             let limiter = ColdStartLimiter::new(Duration::from_millis(100));
-            let uri1 = Uri::from_file_path("/test1.toml").unwrap();
-            let uri2 = Uri::from_file_path("/test2.toml").unwrap();
+            let uri1 = deps_core::test_util::test_uri("/test1.toml");
+            let uri2 = deps_core::test_util::test_uri("/test2.toml");
 
             limiter.allow_cold_start(&uri1);
             limiter.allow_cold_start(&uri2);
@@ -1188,7 +1187,7 @@ mod tests {
             use std::sync::Arc;
 
             let limiter = Arc::new(ColdStartLimiter::new(Duration::from_millis(100)));
-            let uri = Uri::from_file_path("/concurrent-test.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/concurrent-test.toml");
 
             let mut handles = vec![];
             const CONCURRENT_TASKS: usize = 10;
@@ -1275,7 +1274,7 @@ mod tests {
         #[test]
         fn test_server_state_document_operations() {
             let state = ServerState::new();
-            let uri = Uri::from_file_path("/test.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test.toml");
             let deps = vec![create_test_dependency()];
             let doc_state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
 
@@ -1346,7 +1345,7 @@ mod tests {
         #[test]
         fn test_document_state_new_from_parse_result() {
             let state = ServerState::new();
-            let uri = Uri::from_file_path("/test/Cargo.toml").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
 
@@ -1662,7 +1661,7 @@ mod tests {
         #[test]
         fn test_document_state_new_from_parse_result() {
             let state = ServerState::new();
-            let uri = Uri::from_file_path("/test/go.mod").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
             let ecosystem = state.ecosystem_registry.get("go").unwrap();
             let content =
                 "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n"

@@ -20,6 +20,8 @@ pub mod lsp_helpers;
 pub mod macros;
 pub mod parser;
 pub mod registry;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 pub mod version_matcher;
 
 // Re-export commonly used types

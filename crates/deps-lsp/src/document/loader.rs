@@ -178,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_nonexistent_file() {
-        let uri = Uri::from_file_path("/nonexistent/file/path.toml").unwrap();
+        let uri = deps_core::test_util::test_uri("/nonexistent/file/path.toml");
         let result = load_document_from_disk(&uri).await;
 
         assert!(result.is_err());

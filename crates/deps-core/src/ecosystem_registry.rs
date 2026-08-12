@@ -412,11 +412,11 @@ mod tests {
 
         registry.register(ecosystem);
 
-        let uri = Uri::from_file_path("/home/user/project/test.toml").unwrap();
+        let uri = crate::test_util::test_uri("/home/user/project/test.toml");
         let retrieved = registry.get_for_uri(&uri).unwrap();
         assert_eq!(retrieved.id(), "test");
 
-        let unknown_uri = Uri::from_file_path("/home/user/project/unknown.toml").unwrap();
+        let unknown_uri = crate::test_util::test_uri("/home/user/project/unknown.toml");
         assert!(registry.get_for_uri(&unknown_uri).is_none());
     }
 

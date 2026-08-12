@@ -253,8 +253,7 @@ github.com/pkg/errors v0.9.1 h1:hash2=
     #[test]
     fn test_lockfile_provider_trait() {
         let parser = GoSumParser;
-        let manifest_path = "/test/go.mod";
-        let uri = Uri::from_file_path(manifest_path).unwrap();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
 
         // Just verify the trait methods are callable
         let _ = parser.locate_lockfile(&uri);
