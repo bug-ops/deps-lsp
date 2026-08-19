@@ -898,8 +898,7 @@ mod tests {
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2),
-            &HashMap::new(),
-            &HashMap::new(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
         )
@@ -933,8 +932,7 @@ mod tests {
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2),
-            &HashMap::new(),
-            &HashMap::new(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
         )
