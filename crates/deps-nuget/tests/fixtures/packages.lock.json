@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[13.0.3, )",
+        "resolved": "13.0.3",
+        "contentHash": "HrC5BXBEziyloDdCoLBjs1uCOWMlt/0oaVjA3czqISVMi1u5D9tPtC1XSf+7A0ndowVI30Xj9tspZeVj+lPd0g=="
+      },
+      "Serilog": {
+        "type": "Direct",
+        "requested": "[3.1.1, )",
+        "resolved": "3.1.1",
+        "contentHash": "P6yxIe5BQKhPfrOMBBEz9zvT6yn/gBqSjxfQ9Ex+8Ilo0+KcRSY6P+iXqTNAvsdWkBaSPUJIAMg1kdgHUqvxKw=="
+      },
+      "MyCompany.Shared": {
+        "type": "Project"
+      }
+    },
+    "net472": {
+      "Newtonsoft.Json": {
+        "type": "Direct",
+        "requested": "[13.0.3, )",
+        "resolved": "13.0.3",
+        "contentHash": "HrC5BXBEziyloDdCoLBjs1uCOWMlt/0oaVjA3czqISVMi1u5D9tPtC1XSf+7A0ndowVI30Xj9tspZeVj+lPd0g=="
+      }
+    }
+  }
+}

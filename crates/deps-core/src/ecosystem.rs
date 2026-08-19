@@ -170,6 +170,17 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// to the appropriate ecosystem implementation.
     fn manifest_filenames(&self) -> &[&'static str];
 
+    /// File extensions this ecosystem handles when the manifest basename is
+    /// not fixed (e.g. `[".csproj", ".fsproj"]` for NuGet project files).
+    ///
+    /// Consulted by [`crate::EcosystemRegistry::get_for_filename`] only after
+    /// an exact [`manifest_filenames`](Ecosystem::manifest_filenames) match
+    /// fails. Empty by default, indicating this ecosystem is routed solely by
+    /// exact filename.
+    fn manifest_extensions(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Lock file filenames this ecosystem uses (e.g., ["Cargo.lock"])
     ///
     /// Used for file watching - LSP will monitor changes to these files

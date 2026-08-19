@@ -37,6 +37,17 @@ pub struct EcosystemRegistry {
     ecosystems: DashMap<&'static str, Arc<dyn Ecosystem>>,
     /// Map from filename to ecosystem ID (for fast lookup)
     filename_map: DashMap<&'static str, &'static str>,
+    /// Map from lowercased file extension (e.g. ".csproj") to ecosystem ID.
+    ///
+    /// Consulted only when an exact `filename_map` lookup misses. Kept as a
+    /// separate `DashMap` rather than folded into `filename_map` so extension
+    /// routing cannot silently shadow an exact filename. Two ecosystems
+    /// claiming the same extension is a configuration error caught by a
+    /// `debug_assert!` in [`register`](EcosystemRegistry::register) — in a
+    /// release build (or if the assertion is otherwise skipped) `DashMap::insert`
+    /// silently last-write-wins, so the outcome is registration-order-dependent,
+    /// not deterministic.
+    extension_map: DashMap<&'static str, &'static str>,
 }
 
 impl EcosystemRegistry {
@@ -54,6 +65,7 @@ impl EcosystemRegistry {
         Self {
             ecosystems: DashMap::new(),
             filename_map: DashMap::new(),
+            extension_map: DashMap::new(),
         }
     }
 
@@ -81,6 +93,18 @@ impl EcosystemRegistry {
         // Register filename mappings
         for filename in ecosystem.manifest_filenames() {
             self.filename_map.insert(*filename, id);
+        }
+
+        // Register extension mappings (fallback for unbounded basenames, e.g. *.csproj)
+        for extension in ecosystem.manifest_extensions() {
+            debug_assert!(
+                self.extension_map
+                    .get(extension)
+                    .is_none_or(|owner| *owner == id),
+                "extension {extension:?} already claimed by ecosystem {:?}, cannot also assign it to {id:?}",
+                self.extension_map.get(extension).map(|o| *o),
+            );
+            self.extension_map.insert(*extension, id);
         }
 
         // Register ecosystem
@@ -114,6 +138,17 @@ impl EcosystemRegistry {
 
     /// Get ecosystem for a filename
     ///
+    /// Lookup is two-stage: an exact, case-sensitive match against
+    /// registered manifest filenames (e.g. `"Cargo.toml"`) is tried first;
+    /// if that misses, the filename's extension is matched case-insensitively
+    /// against registered [`Ecosystem::manifest_extensions`]. This asymmetry
+    /// is deliberate — exact filenames are canonical and case-sensitive on
+    /// Unix filesystems, while extensions on unbounded basenames (e.g.
+    /// `*.csproj`) come from MSBuild/Windows projects that commonly vary
+    /// case (`MyApp.CSPROJ`). So `MyApp.CSPROJ` routes via the extension
+    /// fallback, but `packages.Config` does **not** match the exact-name
+    /// entry for `packages.config`.
+    ///
     /// # Arguments
     ///
     /// * `filename` - Manifest filename (e.g., "Cargo.toml", "package.json")
@@ -134,7 +169,20 @@ impl EcosystemRegistry {
     /// }
     /// ```
     pub fn get_for_filename(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
-        let id = self.filename_map.get(filename)?;
+        if let Some(id) = self.filename_map.get(filename) {
+            return self.get(*id);
+        }
+
+        // Avoid the rsplit_once/format! allocation below when no ecosystem has registered
+        // an extension (extension routing is only used by nuget today) — this runs on
+        // every exact-match miss, including every did_open/did_change via get_for_uri.
+        if self.extension_map.is_empty() {
+            return None;
+        }
+
+        let (_, extension) = filename.rsplit_once('.')?;
+        let lowercased = format!(".{}", extension.to_lowercase());
+        let id = self.extension_map.get(lowercased.as_str())?;
         self.get(*id)
     }
 
@@ -308,6 +356,62 @@ mod tests {
 
         fn lockfile_filenames(&self) -> &[&'static str] {
             self.lockfiles
+        }
+
+        fn parse_manifest<'a>(
+            &'a self,
+            _content: &'a str,
+            _uri: &'a Uri,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
+            Box::pin(async move { unimplemented!() })
+        }
+
+        fn registry(&self) -> Arc<dyn Registry> {
+            unimplemented!()
+        }
+
+        fn formatter(&self) -> &dyn EcosystemFormatter {
+            &MockFormatter
+        }
+
+        fn generate_completions<'a>(
+            &'a self,
+            _parse_result: &'a dyn ParseResult,
+            _position: Position,
+            _content: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+            Box::pin(async move { vec![] })
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    // Mock ecosystem with unbounded-basename extension routing (mirrors NuGet's *.csproj)
+    struct MockExtEcosystem {
+        id: &'static str,
+        filenames: &'static [&'static str],
+        extensions: &'static [&'static str],
+    }
+
+    impl crate::ecosystem::private::Sealed for MockExtEcosystem {}
+
+    impl Ecosystem for MockExtEcosystem {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn display_name(&self) -> &'static str {
+            self.id
+        }
+
+        fn manifest_filenames(&self) -> &[&'static str] {
+            self.filenames
+        }
+
+        fn manifest_extensions(&self) -> &[&'static str] {
+            self.extensions
         }
 
         fn parse_manifest<'a>(
@@ -566,5 +670,68 @@ mod tests {
 
         let patterns = registry.all_lockfile_patterns();
         assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn test_get_for_filename_extension_fallback() {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockExtEcosystem {
+            id: "nuget",
+            filenames: &["Directory.Packages.props"],
+            extensions: &[".csproj", ".fsproj"],
+        }));
+
+        assert_eq!(
+            registry.get_for_filename("MyApp.csproj").unwrap().id(),
+            "nuget"
+        );
+        assert_eq!(
+            registry
+                .get_for_filename("Directory.Packages.props")
+                .unwrap()
+                .id(),
+            "nuget"
+        );
+        assert!(registry.get_for_filename("unrelated.txt").is_none());
+    }
+
+    #[test]
+    fn test_get_for_filename_extension_fallback_case_insensitive() {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockExtEcosystem {
+            id: "nuget",
+            filenames: &["Directory.Packages.props"],
+            extensions: &[".csproj"],
+        }));
+
+        assert_eq!(
+            registry.get_for_filename("MyApp.CSPROJ").unwrap().id(),
+            "nuget"
+        );
+    }
+
+    #[test]
+    fn test_get_for_filename_exact_match_case_sensitive_not_shadowed_by_extension() {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockExtEcosystem {
+            id: "nuget",
+            filenames: &["packages.config"],
+            extensions: &[],
+        }));
+
+        // Exact filenames stay case-sensitive: differently-cased basename does not match.
+        assert!(registry.get_for_filename("packages.Config").is_none());
+    }
+
+    #[test]
+    fn test_get_for_filename_no_extension_returns_none() {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockExtEcosystem {
+            id: "nuget",
+            filenames: &[],
+            extensions: &[".csproj"],
+        }));
+
+        assert!(registry.get_for_filename("README").is_none());
     }
 }

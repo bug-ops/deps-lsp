@@ -677,6 +677,7 @@ See existing implementations for reference:
 - `crates/deps-dart/` - Dart/pubspec.yaml with pub.dev
 - `crates/deps-maven/` - Java/pom.xml with Maven Central
 - `crates/deps-gradle/` - Kotlin/Gradle version catalogs
+- `crates/deps-nuget/` - C#/.csproj with NuGet V3
 
 ## Key API Contracts
 

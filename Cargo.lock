@@ -578,6 +578,7 @@ dependencies = [
  "deps-gradle",
  "deps-maven",
  "deps-npm",
+ "deps-nuget",
  "deps-pypi",
  "deps-swift",
  "futures",
@@ -627,6 +628,26 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tower-lsp-server",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
+name = "deps-nuget"
+version = "0.9.5"
+dependencies = [
+ "criterion",
+ "deps-core",
+ "insta",
+ "mockito",
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-test",
  "tower-lsp-server",
  "tracing",
  "urlencoding",

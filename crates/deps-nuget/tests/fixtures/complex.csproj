@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net472</TargetFrameworks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Attribute form -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+
+    <!-- Child-element metadata form -->
+    <PackageReference Include="Serilog">
+      <Version>3.1.1</Version>
+    </PackageReference>
+
+    <!-- Central package management: no Version at all -->
+    <PackageReference Include="MyCompany.Shared" />
+
+    <!-- Unresolvable MSBuild property expression -->
+    <PackageReference Include="AutoMapper" Version="$(AutoMapperVersion)" />
+
+    <!-- Condition attribute containing a literal 'Version="' trap -->
+    <PackageReference Include="System.Text.Json" Condition="'$(TargetFramework)' == 'net472' AND '$(Foo)' == 'Version=&quot;1.0.0&quot;'" Version="8.0.5" />
+
+    <!-- Single-quoted attributes -->
+    <PackageReference Include='Polly' Version='8.4.1' />
+  </ItemGroup>
+
+</Project>
