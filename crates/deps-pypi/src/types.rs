@@ -208,6 +208,14 @@ impl deps_core::Dependency for PypiDependency {
         self.source.clone()
     }
 
+    fn markers(&self) -> Option<&str> {
+        self.markers.as_deref()
+    }
+
+    fn markers_range(&self) -> Option<Range> {
+        self.markers_range
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
