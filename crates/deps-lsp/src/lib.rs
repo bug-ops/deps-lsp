@@ -256,7 +256,7 @@ mod tests {
     /// by `register_ecosystems` round-trips through `EcosystemId::from_str`/`id()`,
     /// and that every `EcosystemId` variant resolves back to a registered ecosystem —
     /// so a future rename fails this test instead of panicking at document-open time
-    /// (see the `.expect()` in `DocumentState::new_from_parse_result`).
+    /// (see the `.expect()` in `document::lifecycle::resolve_ecosystem_id`).
     #[test]
     fn test_ecosystem_id_matches_registered_ecosystems() {
         let registry = Arc::new(EcosystemRegistry::new());

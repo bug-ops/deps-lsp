@@ -3,6 +3,7 @@
 //! Tests the complete flow from document open through loading state
 //! transitions to final hint display across all ecosystems.
 
+use deps_core::EcosystemId;
 use deps_lsp::config::{DepsConfig, LoadingIndicatorConfig};
 use deps_lsp::document::{DocumentState, LoadingState, ServerState};
 use std::sync::Arc;
@@ -23,7 +24,8 @@ tokio = { version = "1.0", features = ["full"] }
     let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
 
     // Phase 1: Initial state - document created with Idle loading state
-    let doc = DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result);
+    let doc =
+        DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse_result);
     assert_eq!(doc.loading_state, LoadingState::Idle);
     assert!(doc.loading_started_at.is_none());
     state.update_document(uri.clone(), doc);
@@ -139,8 +141,10 @@ serde = "1.0.0"
     let parse1 = ecosystem.parse_manifest(content, &uri1).await.unwrap();
     let parse2 = ecosystem.parse_manifest(content, &uri2).await.unwrap();
 
-    let mut doc1 = DocumentState::new_from_parse_result("cargo", content.to_string(), parse1);
-    let mut doc2 = DocumentState::new_from_parse_result("cargo", content.to_string(), parse2);
+    let mut doc1 =
+        DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse1);
+    let mut doc2 =
+        DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse2);
 
     // Both start loading
     doc1.set_loading();
@@ -178,7 +182,7 @@ serde = "1.0.0"
 /// Test loading duration tracking.
 #[tokio::test]
 async fn test_loading_duration_tracking() {
-    let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+    let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
     // Not loading initially - no duration
     assert!(doc.loading_duration().is_none());
@@ -200,7 +204,7 @@ async fn test_loading_duration_tracking() {
 /// Test failed loading state.
 #[tokio::test]
 async fn test_failed_loading_state() {
-    let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+    let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
     doc.set_loading();
     assert_eq!(doc.loading_state, LoadingState::Loading);
@@ -214,7 +218,7 @@ async fn test_failed_loading_state() {
 /// Test that set_loading resets the timer on repeated calls.
 #[test]
 fn test_set_loading_resets_timer() {
-    let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+    let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
     // Multiple set_loading calls should be safe
     doc.set_loading();
@@ -372,7 +376,7 @@ fn test_server_state_document_has_loading_state() {
     let state = ServerState::new();
     let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
-    let doc = DocumentState::new_without_parse_result("cargo", String::new());
+    let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
     // New document should start in Idle state
     assert_eq!(doc.loading_state, LoadingState::Idle);
@@ -387,7 +391,7 @@ fn test_server_state_document_has_loading_state() {
 /// Test document state cloning preserves loading state.
 #[test]
 fn test_document_state_clone_preserves_loading() {
-    let mut original = DocumentState::new_without_parse_result("cargo", String::new());
+    let mut original = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
     original.set_loading();
 
     let cloned = original.clone();
@@ -399,7 +403,7 @@ fn test_document_state_clone_preserves_loading() {
 /// Test loading state transitions in correct order.
 #[test]
 fn test_loading_state_transition_order() {
-    let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+    let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
     // 1. Start in Idle
     assert_eq!(doc.loading_state, LoadingState::Idle);
@@ -428,7 +432,7 @@ fn test_loading_state_transition_order() {
 /// Test loading timeout scenario (>5 seconds).
 #[tokio::test]
 async fn test_loading_timeout_scenario() {
-    let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+    let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
     doc.set_loading();
 
     // Wait a small amount to verify duration increases
@@ -454,7 +458,7 @@ async fn test_rapid_set_loading_calls() {
     let state = Arc::new(ServerState::new());
     let uri = deps_core::test_util::test_uri("/test/rapid.toml");
 
-    let doc = DocumentState::new_without_parse_result("cargo", String::new());
+    let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
     state.update_document(uri.clone(), doc);
 
     // Rapid fire set_loading() calls

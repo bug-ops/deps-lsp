@@ -306,31 +306,6 @@ macro_rules! impl_parse_result {
     };
 }
 
-/// Delegate a method call to all enum variants.
-///
-/// This macro generates a match expression that delegates to the same
-/// method on each enum variant, eliminating boilerplate.
-///
-/// # Examples
-///
-/// ```ignore
-/// impl UnifiedDependency {
-///     pub fn name(&self) -> &str {
-///         delegate_to_variants!(self, name)
-///     }
-/// }
-/// ```
-#[macro_export]
-macro_rules! delegate_to_variants {
-    ($self:ident, $method:ident $(, $arg:expr)*) => {
-        match $self {
-            Self::Cargo(dep) => dep.$method($($arg),*),
-            Self::Npm(dep) => dep.$method($($arg),*),
-            Self::Pypi(dep) => dep.$method($($arg),*),
-        }
-    };
-}
-
 #[cfg(test)]
 mod tests {
     use tower_lsp_server::ls_types::{Position, Range, Uri};

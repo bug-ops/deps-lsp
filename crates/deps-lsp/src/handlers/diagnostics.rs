@@ -76,6 +76,7 @@ mod tests {
     use crate::config::DiagnosticsConfig;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
+    use deps_core::EcosystemId;
 
     // Generic tests (no feature flag required)
 
@@ -95,7 +96,6 @@ mod tests {
     mod cargo_tests {
         use super::*;
         use crate::document::DocumentState;
-        use deps_core::EcosystemId;
 
         #[tokio::test]
         async fn test_handle_diagnostics() {
@@ -114,7 +114,8 @@ serde = "1.0.0"
                 .await
                 .expect("Failed to parse manifest");
 
-            let doc_state = DocumentState::new_from_parse_result("cargo", content, parse_result);
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
@@ -128,7 +129,8 @@ serde = "1.0.0"
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let config = DiagnosticsConfig::default();
 
-            let doc_state = DocumentState::new(EcosystemId::Cargo, String::new(), vec![]);
+            let doc_state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
@@ -157,7 +159,8 @@ serde = "1.0.0"
                 .await
                 .expect("Failed to parse manifest");
 
-            let doc_state = DocumentState::new_from_parse_result("npm", content, parse_result);
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();
@@ -189,7 +192,8 @@ dependencies = ["requests>=2.0.0"]
                 .await
                 .expect("Failed to parse manifest");
 
-            let doc_state = DocumentState::new_from_parse_result("pypi", content, parse_result);
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Pypi, content, parse_result);
             state.update_document(uri.clone(), doc_state);
 
             let (client, full_config) = create_test_client_and_config();

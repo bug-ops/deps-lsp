@@ -44,6 +44,7 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
+    use deps_core::EcosystemId;
     use tower_lsp_server::ls_types::{
         Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
@@ -73,7 +74,6 @@ mod tests {
     mod cargo_tests {
         use super::*;
         use crate::document::DocumentState;
-        use deps_core::EcosystemId;
 
         #[tokio::test]
         async fn test_handle_hover() {
@@ -91,7 +91,8 @@ serde = "1.0.0"
                 .await
                 .expect("Failed to parse manifest");
 
-            let doc_state = DocumentState::new_from_parse_result("cargo", content, parse_result);
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
             state.update_document(uri.clone(), doc_state);
 
             let params = HoverParams {
@@ -112,7 +113,8 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
-            let doc_state = DocumentState::new(EcosystemId::Cargo, String::new(), vec![]);
+            let doc_state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             state.update_document(uri.clone(), doc_state);
 
             let params = HoverParams {
@@ -148,7 +150,8 @@ serde = "1.0.0"
                 .await
                 .expect("Failed to parse manifest");
 
-            let doc_state = DocumentState::new_from_parse_result("npm", content, parse_result);
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
             state.update_document(uri.clone(), doc_state);
 
             let params = HoverParams {

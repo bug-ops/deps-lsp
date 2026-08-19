@@ -9,6 +9,7 @@ use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
 use crate::progress::{ProgressSender, RegistryProgress};
 use deps_core::Ecosystem;
+use deps_core::EcosystemId;
 use deps_core::Registry;
 use deps_core::Result;
 use std::collections::{HashMap, HashSet};
@@ -17,6 +18,18 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{MessageType, Uri};
+
+/// Resolves the typed `EcosystemId` for an ecosystem trait object.
+///
+/// `ecosystem.id()` always originates from a statically registered ecosystem
+/// (see `crate::register_ecosystems`), so parsing it back to `EcosystemId` can
+/// only fail on an internal registration bug, not on user input.
+fn resolve_ecosystem_id(ecosystem: &dyn Ecosystem) -> EcosystemId {
+    ecosystem
+        .id()
+        .parse()
+        .expect("ecosystem.id() must be a registered EcosystemId")
+}
 
 /// Preserves cached version data from old document state to new state.
 /// Called during document updates to avoid re-fetching versions for unchanged deps.
@@ -197,10 +210,10 @@ pub async fn handle_document_open(
 
     // Create document state (parse_result may be None)
     let doc_state = if let Some(pr) = parse_result {
-        DocumentState::new_from_parse_result(ecosystem.id(), content, pr)
+        DocumentState::new_from_parse_result(resolve_ecosystem_id(&*ecosystem), content, pr)
     } else {
         tracing::debug!("Failed to parse manifest, storing document without parse result");
-        DocumentState::new_without_parse_result(ecosystem.id(), content)
+        DocumentState::new_without_parse_result(resolve_ecosystem_id(&*ecosystem), content)
     };
 
     state.update_document(uri.clone(), doc_state);
@@ -396,10 +409,10 @@ pub async fn handle_document_change(
     );
 
     let mut doc_state = if let Some(pr) = parse_result {
-        DocumentState::new_from_parse_result(ecosystem.id(), content, pr)
+        DocumentState::new_from_parse_result(resolve_ecosystem_id(&*ecosystem), content, pr)
     } else {
         tracing::debug!("Failed to parse manifest, storing document without parse result");
-        DocumentState::new_without_parse_result(ecosystem.id(), content)
+        DocumentState::new_without_parse_result(resolve_ecosystem_id(&*ecosystem), content)
     };
 
     if let Some(old_doc) = state.get_document(&uri) {
@@ -1238,7 +1251,7 @@ serde = "1.0"
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
-                "cargo",
+                EcosystemId::Cargo,
                 content.to_string(),
                 parse_result.unwrap(),
             );
@@ -1272,9 +1285,9 @@ serde = "1.0"
 
             // Create document state without parse result
             let doc_state = if let Some(pr) = parse_result {
-                DocumentState::new_from_parse_result("cargo", content.to_string(), pr)
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), pr)
             } else {
-                DocumentState::new_without_parse_result("cargo", content.to_string())
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, content.to_string())
             };
 
             state.update_document(uri.clone(), doc_state);
@@ -1309,8 +1322,11 @@ serde = "1.0""#;
                 .get_for_uri(&uri)
                 .expect("Cargo ecosystem");
             let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let doc_state =
-                DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result);
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.to_string(),
+                parse_result,
+            );
             state.update_document(uri.clone(), doc_state);
 
             // Fast path check: document exists
@@ -1380,14 +1396,20 @@ serde = "1.0""#;
             let parse_result2 = ecosystem.parse_manifest(content, &uri).await.unwrap();
 
             // First update
-            let doc_state1 =
-                DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result1);
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.to_string(),
+                parse_result1,
+            );
             state.update_document(uri.clone(), doc_state1);
             assert_eq!(state.document_count(), 1);
 
             // Second update (idempotent)
-            let doc_state2 =
-                DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result2);
+            let doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.to_string(),
+                parse_result2,
+            );
             state.update_document(uri.clone(), doc_state2);
             assert_eq!(
                 state.document_count(),
@@ -1424,7 +1446,7 @@ serde = "1.0""#;
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
-                "npm",
+                EcosystemId::Npm,
                 content.to_string(),
                 parse_result.unwrap(),
             );
@@ -1464,7 +1486,7 @@ dependencies = ["requests>=2.0.0"]
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
-                "pypi",
+                EcosystemId::Pypi,
                 content.to_string(),
                 parse_result.unwrap(),
             );
@@ -1507,7 +1529,7 @@ require github.com/gorilla/mux v1.8.0
             assert!(parse_result.is_ok());
 
             let doc_state = DocumentState::new_from_parse_result(
-                "go",
+                EcosystemId::Go,
                 content.to_string(),
                 parse_result.unwrap(),
             );
@@ -1536,8 +1558,11 @@ tokio = "1.0"
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
-            let doc_state1 =
-                DocumentState::new_from_parse_result("cargo", content1.to_string(), parse_result1);
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
             state.update_document(uri.clone(), doc_state1);
 
             // Manually populate cache (simulating background fetch)
@@ -1567,8 +1592,11 @@ tokio = "1.0"
 "#;
 
             let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
-            let mut doc_state2 =
-                DocumentState::new_from_parse_result("cargo", content2.to_string(), parse_result2);
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
 
             if let Some(old_doc) = state.get_document(&uri) {
                 preserve_cache(&mut doc_state2, &old_doc);
@@ -1613,8 +1641,11 @@ serde = "1.0"
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-            let doc_state =
-                DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result);
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.to_string(),
+                parse_result,
+            );
             state.update_document(uri.clone(), doc_state);
 
             // First open: cache should be empty (no old state to preserve)
@@ -1638,8 +1669,11 @@ serde = "1.0"
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
-            let doc_state1 =
-                DocumentState::new_from_parse_result("cargo", content1.to_string(), parse_result1);
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
             state.update_document(uri.clone(), doc_state1);
 
             // Populate cache
@@ -1661,7 +1695,7 @@ serde = "1.0"
             );
 
             let mut doc_state2 =
-                DocumentState::new_without_parse_result("cargo", content2.to_string());
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, content2.to_string());
 
             if let Some(old_doc) = state.get_document(&uri) {
                 preserve_cache(&mut doc_state2, &old_doc);
@@ -1752,8 +1786,11 @@ anyhow = "1.0"
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
-            let doc_state1 =
-                DocumentState::new_from_parse_result("cargo", content1.to_string(), parse_result1);
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
             state.update_document(uri.clone(), doc_state1);
 
             // Populate cache for all 3 deps
@@ -1783,8 +1820,11 @@ tokio = "1.0"
             let diff = DependencyDiff::compute(&old_dep_names, &new_dep_names);
 
             let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
-            let mut doc_state2 =
-                DocumentState::new_from_parse_result("cargo", content2.to_string(), parse_result2);
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
 
             if let Some(old_doc) = state.get_document(&uri) {
                 preserve_cache(&mut doc_state2, &old_doc);

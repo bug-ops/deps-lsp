@@ -609,7 +609,7 @@ mod tests {
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
         let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
 
-        let doc = DocumentState::new_from_parse_result("cargo", content, parse_result);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
@@ -1059,8 +1059,6 @@ requests
 
     #[tokio::test]
     async fn test_fallback_triggered_when_parse_fails() {
-        use deps_core::EcosystemId;
-
         let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -1070,7 +1068,7 @@ ser"
         .to_string();
 
         // Create document without parse result (simulating parse failure)
-        let doc = DocumentState::new(EcosystemId::Cargo, content.clone(), vec![]);
+        let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content.clone());
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
@@ -1414,7 +1412,7 @@ serde
 
         let content = "[dependencies]\nserde = \"1\"\n".to_string();
         let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
-        let doc = DocumentState::new_from_parse_result("cargo", content, parse_result);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {

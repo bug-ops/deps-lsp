@@ -5,117 +5,17 @@ use deps_core::{EcosystemId, EcosystemRegistry, ParseResult};
 use std::collections::HashMap;
 
 #[cfg(feature = "cargo")]
-use deps_cargo::{CargoVersion, ParsedDependency};
+use deps_cargo::CargoVersion;
 #[cfg(feature = "go")]
-use deps_go::{GoDependency, GoVersion};
+use deps_go::GoVersion;
 #[cfg(feature = "npm")]
-use deps_npm::{NpmDependency, NpmVersion};
+use deps_npm::NpmVersion;
 #[cfg(feature = "pypi")]
-use deps_pypi::{PypiDependency, PypiVersion};
+use deps_pypi::PypiVersion;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tower_lsp_server::ls_types::Uri;
-
-/// Unified dependency enum for multi-ecosystem support.
-///
-/// Wraps ecosystem-specific dependency types to allow storing
-/// dependencies from different ecosystems in the same document state.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum UnifiedDependency {
-    #[cfg(feature = "cargo")]
-    Cargo(ParsedDependency),
-    #[cfg(feature = "npm")]
-    Npm(NpmDependency),
-    #[cfg(feature = "pypi")]
-    Pypi(PypiDependency),
-    #[cfg(feature = "go")]
-    Go(GoDependency),
-}
-
-impl UnifiedDependency {
-    /// Returns the dependency name.
-    #[allow(unreachable_patterns)]
-    pub fn name(&self) -> &str {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => &dep.name,
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => &dep.name,
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => &dep.name,
-            #[cfg(feature = "go")]
-            Self::Go(dep) => &dep.module_path,
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-
-    /// Returns the name range for LSP operations.
-    #[allow(unreachable_patterns)]
-    pub fn name_range(&self) -> tower_lsp_server::ls_types::Range {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => dep.name_range,
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => dep.name_range,
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => dep.name_range,
-            #[cfg(feature = "go")]
-            Self::Go(dep) => dep.module_path_range,
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-
-    /// Returns the version requirement string if present.
-    #[allow(unreachable_patterns)]
-    pub fn version_req(&self) -> Option<&str> {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => dep.version_req.as_deref(),
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => dep.version_req.as_deref(),
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => dep.version_req.as_deref(),
-            #[cfg(feature = "go")]
-            Self::Go(dep) => dep.version.as_deref(),
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-
-    /// Returns the version range for LSP operations if present.
-    #[allow(unreachable_patterns)]
-    pub fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => dep.version_range,
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => dep.version_range,
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => dep.version_range,
-            #[cfg(feature = "go")]
-            Self::Go(dep) => dep.version_range,
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-
-    /// Returns true if this is a registry dependency (not Git/Path/Workspace/etc).
-    #[allow(unreachable_patterns)]
-    pub fn is_registry(&self) -> bool {
-        use deps_core::Dependency;
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => dep.source().is_registry(),
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => dep.source().is_registry(),
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => dep.source().is_registry(),
-            #[cfg(feature = "go")]
-            Self::Go(dep) => dep.source().is_registry(),
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-}
 
 /// Unified version information enum for multi-ecosystem support.
 ///
@@ -176,37 +76,20 @@ pub use deps_core::LoadingState;
 /// version data for a single file. The state is updated when the document
 /// changes or when version information is fetched from the registry.
 ///
-/// Supports multiple package ecosystems (Cargo, npm) with unified dependency
-/// and version storage.
+/// Supports multiple package ecosystems via the trait-based `ParseResult`.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use deps_lsp::document::{DocumentState, UnifiedDependency};
-/// use deps_lsp::ParsedDependency;
 /// use deps_core::EcosystemId;
-/// use deps_cargo::{DependencySection, DependencySource};
-/// use tower_lsp_server::ls_types::{Position, Range};
+/// use deps_lsp::document::DocumentState;
 ///
-/// let dep = ParsedDependency {
-///     name: "serde".into(),
-///     name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-///     version_req: Some("1.0".into()),
-///     version_range: Some(Range::new(Position::new(0, 8), Position::new(0, 12))),
-///     features: vec![],
-///     features_range: None,
-///     source: DependencySource::Registry,
-///     section: DependencySection::Dependencies,
-/// };
-///
-/// let state = DocumentState::new(
+/// let state = DocumentState::new_without_parse_result(
 ///     EcosystemId::Cargo,
 ///     "[dependencies]\nserde = \"1.0\"".into(),
-///     vec![UnifiedDependency::Cargo(dep)],
 /// );
 ///
 /// assert!(state.versions.is_empty());
-/// assert_eq!(state.dependencies.len(), 1);
 /// ```
 pub struct DocumentState {
     /// Package ecosystem identifier, exhaustively typed.
@@ -217,8 +100,6 @@ pub struct DocumentState {
     pub ecosystem_id: &'static str,
     /// Original document content
     pub content: String,
-    /// Parsed dependencies with positions (legacy)
-    pub dependencies: Vec<UnifiedDependency>,
     /// Parsed result as trait object (new architecture)
     /// Note: This is not cloned when DocumentState is cloned
     #[allow(dead_code)]
@@ -243,7 +124,6 @@ impl Clone for DocumentState {
             ecosystem: self.ecosystem,
             ecosystem_id: self.ecosystem_id,
             content: self.content.clone(),
-            dependencies: self.dependencies.clone(),
             parse_result: None, // Don't clone trait object
             versions: self.versions.clone(),
             cached_versions: self.cached_versions.clone(),
@@ -341,7 +221,6 @@ impl std::fmt::Debug for DocumentState {
             .field("ecosystem", &self.ecosystem)
             .field("ecosystem_id", &self.ecosystem_id)
             .field("content_len", &self.content.len())
-            .field("dependencies_count", &self.dependencies.len())
             .field("has_parse_result", &self.parse_result.is_some())
             .field("versions_count", &self.versions.len())
             .field("cached_versions_count", &self.cached_versions.len())
@@ -354,14 +233,13 @@ impl std::fmt::Debug for DocumentState {
 }
 
 impl DocumentState {
-    /// Creates a new document state (legacy constructor).
+    /// Creates a new document state using trait objects (new architecture).
     ///
-    /// Initializes with the given ecosystem, content, and parsed dependencies.
-    /// Version information starts empty and is populated asynchronously.
-    pub fn new(
+    /// This is the preferred constructor for Phase 3+ implementations.
+    pub fn new_from_parse_result(
         ecosystem: EcosystemId,
         content: String,
-        dependencies: Vec<UnifiedDependency>,
+        parse_result: Box<dyn ParseResult>,
     ) -> Self {
         let ecosystem_id = ecosystem.id();
 
@@ -369,37 +247,6 @@ impl DocumentState {
             ecosystem,
             ecosystem_id,
             content,
-            dependencies,
-            parse_result: None,
-            versions: HashMap::new(),
-            cached_versions: HashMap::new(),
-            resolved_versions: HashMap::new(),
-            parsed_at: Instant::now(),
-            loading_state: LoadingState::Idle,
-            loading_started_at: None,
-        }
-    }
-
-    /// Creates a new document state using trait objects (new architecture).
-    ///
-    /// This is the preferred constructor for Phase 3+ implementations.
-    pub fn new_from_parse_result(
-        ecosystem_id: &'static str,
-        content: String,
-        parse_result: Box<dyn ParseResult>,
-    ) -> Self {
-        // `ecosystem_id` always originates from a statically registered ecosystem
-        // (see `crate::register_ecosystems`), so parsing it back to `EcosystemId` can
-        // only fail on an internal registration bug, not on user input.
-        let ecosystem = ecosystem_id
-            .parse::<EcosystemId>()
-            .expect("ecosystem_id must be a registered EcosystemId");
-
-        Self {
-            ecosystem,
-            ecosystem_id,
-            content,
-            dependencies: vec![],
             parse_result: Some(parse_result),
             versions: HashMap::new(),
             cached_versions: HashMap::new(),
@@ -414,17 +261,13 @@ impl DocumentState {
     ///
     /// Used when parsing fails but the document should still be stored
     /// to enable fallback completion and other LSP features.
-    pub fn new_without_parse_result(ecosystem_id: &'static str, content: String) -> Self {
-        // See `new_from_parse_result`: `ecosystem_id` is always a registered ecosystem id.
-        let ecosystem = ecosystem_id
-            .parse::<EcosystemId>()
-            .expect("ecosystem_id must be a registered EcosystemId");
+    pub fn new_without_parse_result(ecosystem: EcosystemId, content: String) -> Self {
+        let ecosystem_id = ecosystem.id();
 
         Self {
             ecosystem,
             ecosystem_id,
             content,
-            dependencies: vec![],
             parse_result: None,
             versions: HashMap::new(),
             cached_versions: HashMap::new(),
@@ -460,9 +303,10 @@ impl DocumentState {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_lsp::document::DocumentState;
     ///
-    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// doc.set_loading();
     /// assert!(doc.loading_started_at.is_some());
     /// ```
@@ -482,9 +326,10 @@ impl DocumentState {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_lsp::document::{DocumentState, LoadingState};
     ///
-    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// doc.set_loading();
     /// doc.set_loaded();
     /// assert_eq!(doc.loading_state, LoadingState::Loaded);
@@ -500,9 +345,10 @@ impl DocumentState {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_lsp::document::{DocumentState, LoadingState};
     ///
-    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// doc.set_loading();
     /// doc.set_failed();
     /// assert_eq!(doc.loading_state, LoadingState::Failed);
@@ -521,9 +367,10 @@ impl DocumentState {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_lsp::document::DocumentState;
     ///
-    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// assert!(doc.loading_duration().is_none());
     ///
     /// doc.set_loading();
@@ -717,7 +564,7 @@ mod tests {
             use std::time::Duration;
 
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             // Initial state
             assert_eq!(doc.loading_state, LoadingState::Idle);
@@ -746,7 +593,7 @@ mod tests {
         #[test]
         fn test_loading_state_failed_transition() {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             doc.set_loading();
             assert_eq!(doc.loading_state, LoadingState::Loading);
@@ -759,7 +606,7 @@ mod tests {
         #[test]
         fn test_loading_state_clone() {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             doc.set_loading();
             let cloned = doc.clone();
@@ -771,7 +618,7 @@ mod tests {
         #[test]
         fn test_loading_state_debug() {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
             doc.set_loading();
 
             let debug_str = format!("{:?}", doc);
@@ -782,7 +629,7 @@ mod tests {
         #[test]
         fn test_loading_duration_none_when_idle() {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let doc = DocumentState::new_without_parse_result("cargo", content);
+            let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             assert_eq!(doc.loading_state, LoadingState::Idle);
             assert!(doc.loading_duration().is_none());
@@ -804,7 +651,7 @@ mod tests {
             use std::time::Duration;
 
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             doc.set_loading();
 
@@ -824,7 +671,7 @@ mod tests {
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/concurrent-loading-test.toml");
 
-            let doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             state.update_document(uri.clone(), doc);
 
             let barrier = Arc::new(Barrier::new(10));
@@ -865,7 +712,8 @@ mod tests {
 
         #[test]
         fn test_set_loaded_idempotent() {
-            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
             doc.set_loading();
             doc.set_loaded();
@@ -879,7 +727,8 @@ mod tests {
 
         #[test]
         fn test_set_loading_resets_timer() {
-            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
             doc.set_loading();
             let first_start = doc.loading_started_at.unwrap();
@@ -896,7 +745,8 @@ mod tests {
 
         #[test]
         fn test_retry_after_failure() {
-            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
             doc.set_loading();
             doc.set_failed();
@@ -914,7 +764,8 @@ mod tests {
 
         #[test]
         fn test_refresh_after_loaded() {
-            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
             doc.set_loading();
             doc.set_loaded();
@@ -1100,9 +951,11 @@ mod tests {
 
     /// Regression test for issue #118: before the `EcosystemId` refactor, any
     /// `ecosystem_id` outside `{cargo, npm, pypi, go}` silently fell back to
-    /// `Ecosystem::Cargo` in `new_without_parse_result`/`new_from_parse_result`.
-    /// Exercises the constructors directly (not just `EcosystemId::from_str`) for
-    /// every previously-misclassified ecosystem.
+    /// `Ecosystem::Cargo`. The constructors are now infallible (`DocumentState`
+    /// takes `EcosystemId` directly, see the #144 follow-up), so the resolution
+    /// risk now lives entirely in `str::parse::<EcosystemId>()` — exercised here
+    /// for every registered ecosystem, alongside the constructor's derivation of
+    /// `ecosystem_id` back from `EcosystemId::id()`.
     #[test]
     fn test_document_state_new_without_parse_result_resolves_all_ecosystems() {
         for (id, expected) in [
@@ -1118,15 +971,21 @@ mod tests {
             ("swift", EcosystemId::Swift),
             ("nuget", EcosystemId::NuGet),
         ] {
-            let doc = DocumentState::new_without_parse_result(id, String::new());
-            assert_eq!(doc.ecosystem, expected, "ecosystem_id {id:?} misresolved");
+            let parsed: EcosystemId = id
+                .parse()
+                .unwrap_or_else(|_| panic!("ecosystem_id {id:?} failed to parse"));
+            assert_eq!(parsed, expected, "ecosystem_id {id:?} misresolved");
+
+            let doc = DocumentState::new_without_parse_result(expected, String::new());
+            assert_eq!(doc.ecosystem, expected);
             assert_eq!(doc.ecosystem_id, id);
         }
     }
 
     /// Same regression as above, but through `new_from_parse_result` with a real
-    /// `ParseResult` for one of the previously-misclassified ecosystems (maven),
-    /// exercising the exact call path `document::lifecycle` uses in production.
+    /// `ParseResult` for one of the previously-misclassified ecosystems (maven).
+    /// Parses `"maven"` explicitly first, mirroring the parse-then-construct
+    /// sequence `document::lifecycle::resolve_ecosystem_id` performs in production.
     #[cfg(feature = "maven")]
     #[test]
     fn test_document_state_new_from_parse_result_maven_not_misclassified_as_cargo() {
@@ -1150,7 +1009,10 @@ mod tests {
             .block_on(ecosystem.parse_manifest(&content, &uri))
             .unwrap();
 
-        let doc_state = DocumentState::new_from_parse_result("maven", content, parse_result);
+        let ecosystem_id: EcosystemId = "maven"
+            .parse()
+            .expect("maven must resolve to an EcosystemId");
+        let doc_state = DocumentState::new_from_parse_result(ecosystem_id, content, parse_result);
 
         assert_eq!(doc_state.ecosystem_id, "maven");
         assert_eq!(doc_state.ecosystem, EcosystemId::Maven);
@@ -1163,37 +1025,21 @@ mod tests {
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
-        use deps_cargo::{DependencySection, DependencySource};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        fn create_test_dependency() -> UnifiedDependency {
-            UnifiedDependency::Cargo(ParsedDependency {
-                name: "serde".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-                version_req: Some("1.0".into()),
-                version_range: Some(Range::new(Position::new(0, 9), Position::new(0, 14))),
-                features: vec![],
-                features_range: None,
-                source: DependencySource::Registry,
-                section: DependencySection::Dependencies,
-            })
-        }
 
         #[test]
         fn test_document_state_creation() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Cargo, "test content".into(), deps);
+            let state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test content".into());
 
             assert_eq!(state.ecosystem, EcosystemId::Cargo);
             assert_eq!(state.content, "test content");
-            assert_eq!(state.dependencies.len(), 1);
             assert!(state.versions.is_empty());
         }
 
         #[test]
         fn test_document_state_update_versions() {
-            let deps = vec![create_test_dependency()];
-            let mut state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let mut state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             let mut versions = HashMap::new();
             versions.insert(
@@ -1214,8 +1060,8 @@ mod tests {
         fn test_server_state_document_operations() {
             let state = ServerState::new();
             let uri = deps_core::test_util::test_uri("/test.toml");
-            let deps = vec![create_test_dependency()];
-            let doc_state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let doc_state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             state.update_document(uri.clone(), doc_state);
             assert_eq!(state.document_count(), 1);
@@ -1227,47 +1073,6 @@ mod tests {
             let removed = state.remove_document(&uri);
             assert!(removed.is_some());
             assert_eq!(state.document_count(), 0);
-        }
-
-        #[test]
-        fn test_unified_dependency_name() {
-            let cargo_dep = create_test_dependency();
-            assert_eq!(cargo_dep.name(), "serde");
-            assert_eq!(cargo_dep.version_req(), Some("1.0"));
-            assert!(cargo_dep.is_registry());
-        }
-
-        #[test]
-        fn test_unified_dependency_git_source() {
-            let git_dep = UnifiedDependency::Cargo(ParsedDependency {
-                name: "custom".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 6)),
-                version_req: None,
-                version_range: None,
-                features: vec![],
-                features_range: None,
-                source: DependencySource::Git {
-                    url: "https://github.com/user/repo".into(),
-                    rev: None,
-                },
-                section: DependencySection::Dependencies,
-            });
-            assert!(!git_dep.is_registry());
-        }
-
-        #[test]
-        fn test_unified_dependency_workspace_source() {
-            let ws_dep = UnifiedDependency::Cargo(ParsedDependency {
-                name: "serde".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-                version_req: None,
-                version_range: None,
-                features: vec![],
-                features_range: None,
-                source: DependencySource::Workspace,
-                section: DependencySection::Dependencies,
-            });
-            assert!(!ws_dep.is_registry());
         }
 
         #[test]
@@ -1293,8 +1098,11 @@ mod tests {
                 .block_on(ecosystem.parse_manifest(&content, &uri))
                 .unwrap();
 
-            let doc_state =
-                DocumentState::new_from_parse_result("cargo", content.clone(), parse_result);
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.clone(),
+                parse_result,
+            );
 
             assert_eq!(doc_state.ecosystem_id, "cargo");
             assert_eq!(doc_state.content, content);
@@ -1304,18 +1112,17 @@ mod tests {
         #[test]
         fn test_document_state_new_without_parse_result() {
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-            let doc_state = DocumentState::new_without_parse_result("cargo", content);
+            let doc_state = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             assert_eq!(doc_state.ecosystem_id, "cargo");
             assert_eq!(doc_state.ecosystem, EcosystemId::Cargo);
             assert!(doc_state.parse_result.is_none());
-            assert!(doc_state.dependencies.is_empty());
         }
 
         #[test]
         fn test_document_state_update_resolved_versions() {
-            let deps = vec![create_test_dependency()];
-            let mut state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let mut state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             let mut resolved = HashMap::new();
             resolved.insert("serde".into(), "1.0.195".into());
@@ -1330,8 +1137,8 @@ mod tests {
 
         #[test]
         fn test_document_state_update_cached_versions() {
-            let deps = vec![create_test_dependency()];
-            let mut state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let mut state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             let mut cached = HashMap::new();
             cached.insert("serde".into(), "1.0.210".into());
@@ -1342,27 +1149,24 @@ mod tests {
 
         #[test]
         fn test_document_state_parse_result_accessor() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let state = DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
             assert!(state.parse_result().is_none());
         }
 
         #[test]
         fn test_document_state_clone() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Cargo, "test content".into(), deps);
+            let state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test content".into());
             let cloned = state.clone();
 
             assert_eq!(cloned.ecosystem, state.ecosystem);
             assert_eq!(cloned.content, state.content);
-            assert_eq!(cloned.dependencies.len(), state.dependencies.len());
             assert!(cloned.parse_result.is_none());
         }
 
         #[test]
         fn test_document_state_debug() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let state = DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
             let debug_str = format!("{state:?}");
             assert!(debug_str.contains("DocumentState"));
         }
@@ -1375,23 +1179,6 @@ mod tests {
     #[cfg(feature = "npm")]
     mod npm_tests {
         use super::*;
-        use deps_npm::{NpmDependency, NpmDependencySection};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        #[test]
-        fn test_unified_dependency() {
-            let npm_dep = UnifiedDependency::Npm(NpmDependency {
-                name: "express".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
-                version_req: Some("^4.0.0".into()),
-                version_range: Some(Range::new(Position::new(0, 11), Position::new(0, 18))),
-                section: NpmDependencySection::Dependencies,
-            });
-
-            assert_eq!(npm_dep.name(), "express");
-            assert_eq!(npm_dep.version_req(), Some("^4.0.0"));
-            assert!(npm_dep.is_registry());
-        }
 
         #[test]
         fn test_unified_version() {
@@ -1406,7 +1193,7 @@ mod tests {
         #[test]
         fn test_document_state_new_without_parse_result() {
             let content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
-            let doc_state = DocumentState::new_without_parse_result("npm", content);
+            let doc_state = DocumentState::new_without_parse_result(EcosystemId::Npm, content);
 
             assert_eq!(doc_state.ecosystem_id, "npm");
             assert_eq!(doc_state.ecosystem, EcosystemId::Npm);
@@ -1421,28 +1208,6 @@ mod tests {
     #[cfg(feature = "pypi")]
     mod pypi_tests {
         use super::*;
-        use deps_pypi::{PypiDependency, PypiDependencySection, PypiDependencySource};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        #[test]
-        fn test_unified_dependency() {
-            let pypi_dep = UnifiedDependency::Pypi(PypiDependency {
-                name: "requests".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
-                version_req: Some(">=2.0.0".into()),
-                version_range: Some(Range::new(Position::new(0, 10), Position::new(0, 18))),
-                extras: vec![],
-                extras_range: None,
-                markers: None,
-                markers_range: None,
-                source: PypiDependencySource::Registry,
-                section: PypiDependencySection::Dependencies,
-            });
-
-            assert_eq!(pypi_dep.name(), "requests");
-            assert_eq!(pypi_dep.version_req(), Some(">=2.0.0"));
-            assert!(pypi_dep.is_registry());
-        }
 
         #[test]
         fn test_unified_version() {
@@ -1457,7 +1222,7 @@ mod tests {
         #[test]
         fn test_document_state_new_without_parse_result() {
             let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n".to_string();
-            let doc_state = DocumentState::new_without_parse_result("pypi", content);
+            let doc_state = DocumentState::new_without_parse_result(EcosystemId::Pypi, content);
 
             assert_eq!(doc_state.ecosystem_id, "pypi");
             assert_eq!(doc_state.ecosystem, EcosystemId::Pypi);
@@ -1472,69 +1237,7 @@ mod tests {
     #[cfg(feature = "go")]
     mod go_tests {
         use super::*;
-        use deps_go::{GoDependency, GoDirective, GoVersion};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        fn create_test_dependency() -> UnifiedDependency {
-            UnifiedDependency::Go(GoDependency {
-                module_path: "github.com/gin-gonic/gin".into(),
-                module_path_range: Range::new(Position::new(0, 0), Position::new(0, 25)),
-                version: Some("v1.9.1".into()),
-                version_range: Some(Range::new(Position::new(0, 26), Position::new(0, 32))),
-                directive: GoDirective::Require,
-                indirect: false,
-            })
-        }
-
-        #[test]
-        fn test_unified_dependency() {
-            let go_dep = create_test_dependency();
-            assert_eq!(go_dep.name(), "github.com/gin-gonic/gin");
-            assert_eq!(go_dep.version_req(), Some("v1.9.1"));
-            assert!(go_dep.is_registry());
-        }
-
-        #[test]
-        fn test_unified_dependency_name_range() {
-            let range = Range::new(Position::new(5, 10), Position::new(5, 35));
-            let go_dep = UnifiedDependency::Go(GoDependency {
-                module_path: "github.com/example/pkg".into(),
-                module_path_range: range,
-                version: Some("v1.0.0".into()),
-                version_range: Some(Range::new(Position::new(5, 36), Position::new(5, 42))),
-                directive: GoDirective::Require,
-                indirect: false,
-            });
-            assert_eq!(go_dep.name_range(), range);
-        }
-
-        #[test]
-        fn test_unified_dependency_version_range() {
-            let version_range = Range::new(Position::new(5, 36), Position::new(5, 42));
-            let go_dep = UnifiedDependency::Go(GoDependency {
-                module_path: "github.com/example/pkg".into(),
-                module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
-                version: Some("v1.0.0".into()),
-                version_range: Some(version_range),
-                directive: GoDirective::Require,
-                indirect: false,
-            });
-            assert_eq!(go_dep.version_range(), Some(version_range));
-        }
-
-        #[test]
-        fn test_unified_dependency_no_version() {
-            let go_dep = UnifiedDependency::Go(GoDependency {
-                module_path: "github.com/example/pkg".into(),
-                module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
-                version: None,
-                version_range: None,
-                directive: GoDirective::Require,
-                indirect: false,
-            });
-            assert_eq!(go_dep.version_req(), None);
-            assert_eq!(go_dep.version_range(), None);
-        }
+        use deps_go::GoVersion;
 
         #[test]
         fn test_unified_version() {
@@ -1576,21 +1279,11 @@ mod tests {
         }
 
         #[test]
-        fn test_document_state_new() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Go, "test content".into(), deps);
-
-            assert_eq!(state.ecosystem, EcosystemId::Go);
-            assert_eq!(state.ecosystem_id, "go");
-            assert_eq!(state.dependencies.len(), 1);
-        }
-
-        #[test]
         fn test_document_state_new_without_parse_result() {
             let content =
                 "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n"
                     .to_string();
-            let doc_state = DocumentState::new_without_parse_result("go", content);
+            let doc_state = DocumentState::new_without_parse_result(EcosystemId::Go, content);
 
             assert_eq!(doc_state.ecosystem_id, "go");
             assert_eq!(doc_state.ecosystem, EcosystemId::Go);
@@ -1611,8 +1304,11 @@ mod tests {
                 .block_on(ecosystem.parse_manifest(&content, &uri))
                 .unwrap();
 
-            let doc_state =
-                DocumentState::new_from_parse_result("go", content.clone(), parse_result);
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Go,
+                content.clone(),
+                parse_result,
+            );
 
             assert_eq!(doc_state.ecosystem_id, "go");
             assert!(doc_state.parse_result.is_some());
