@@ -20,7 +20,7 @@ use tower_lsp_server::ls_types::Range;
 ///     version_range: Some(Range::new(Position::new(5, 13), Position::new(5, 27))),
 ///     extras: vec!["security".into()],
 ///     extras_range: None,
-///     markers: Some("python_version>='3.8'".into()),
+///     markers: Some("python_full_version >= '3.8'".into()),
 ///     markers_range: None,
 ///     section: PypiDependencySection::Dependencies,
 ///     source: PypiDependencySource::Registry,
@@ -43,7 +43,8 @@ pub struct PypiDependency {
     pub extras: Vec<String>,
     /// LSP range of the extras specification
     pub extras_range: Option<Range>,
-    /// PEP 508 environment markers (e.g., "python_version>='3.8'")
+    /// PEP 508 environment markers (e.g., "python_full_version >= '3.8'"; `pep508_rs`
+    /// canonicalizes `python_version` comparisons to `python_full_version` on serialization)
     pub markers: Option<String>,
     /// LSP range of the markers specification
     pub markers_range: Option<Range>,

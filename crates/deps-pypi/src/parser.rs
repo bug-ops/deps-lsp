@@ -476,9 +476,7 @@ impl PypiParser {
             .into_iter()
             .map(|e| e.to_string())
             .collect();
-        // For now, skip markers - we'll implement proper MarkerTree serialization later
-        // TODO: Implement proper marker serialization
-        let markers = None;
+        let markers = requirement.marker.try_to_string();
 
         Ok(PypiDependency {
             name,
@@ -841,9 +839,51 @@ dependencies = [
 
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "numpy");
-        // TODO: Implement proper marker serialization from MarkerTree
-        // assert_eq!(deps[0].markers, Some("python_version >= '3.9'".to_string()));
+        // pep508_rs's marker algebra canonicalizes `python_version` comparisons
+        // into `python_full_version` form when serializing back to a string.
+        assert_eq!(
+            deps[0].markers,
+            Some("python_full_version >= '3.9'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_pep508_without_markers() {
+        let content = r#"
+[project]
+dependencies = [
+    "requests>=2.28.0",
+]
+"#;
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "requests");
         assert_eq!(deps[0].markers, None);
+    }
+
+    #[test]
+    fn test_parse_pep508_with_compound_marker() {
+        let content = r#"
+[project]
+dependencies = [
+    "colorama>=0.4; sys_platform == 'win32' and python_version >= '3.8'",
+]
+"#;
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "colorama");
+        assert_eq!(
+            deps[0].markers,
+            Some("python_full_version >= '3.8' and sys_platform == 'win32'".to_string())
+        );
     }
 
     #[test]
