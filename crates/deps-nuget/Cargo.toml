@@ -1,0 +1,37 @@
+[package]
+name = "deps-nuget"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NuGet/.NET project file support for deps-lsp"
+publish = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deps-core = { workspace = true }
+quick-xml = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "sync"] }
+tower-lsp-server = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
+deps-core = { workspace = true, features = ["test-util"] }
+insta = { workspace = true, features = ["json"] }
+mockito = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test = { workspace = true }
+
+[[bench]]
+name = "nuget_benchmarks"
+harness = false

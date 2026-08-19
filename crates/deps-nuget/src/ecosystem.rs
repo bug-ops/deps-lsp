@@ -1,0 +1,265 @@
+//! NuGet ecosystem implementation for deps-lsp.
+//!
+//! # Unknown/unresolvable packages
+//!
+//! Only `api.nuget.org` is queried — private feeds (`NuGet.config` `<packageSources>`,
+//! Azure Artifacts, GitHub Packages, internal Artifactory) are out of scope (D4). A 404 or
+//! otherwise-unknown package must degrade to **no diagnostic, no inlay hint, no error
+//! marker** (S4) — this already falls out of `deps-lsp`'s generic error handling around
+//! `Registry::get_latest_matching` (a fetch error or `Ok(None)` both simply omit the
+//! package from `cached_versions`), so no special-casing is needed here.
+
+use std::any::Any;
+use std::sync::Arc;
+use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
+
+use deps_core::{
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
+};
+
+use crate::formatter::NuGetFormatter;
+use crate::lockfile::NuGetLockParser;
+use crate::registry::NuGetRegistry;
+use crate::types::NuGetParseResult;
+
+/// NuGet/.NET ecosystem implementation.
+///
+/// Provides LSP functionality for `.csproj`/`.fsproj`/`.vbproj`, `Directory.Packages.props`,
+/// and `packages.config` files, backed by the NuGet V3 registry API.
+pub struct NuGetEcosystem {
+    registry: Arc<NuGetRegistry>,
+    formatter: NuGetFormatter,
+    lockfile_provider: Arc<NuGetLockParser>,
+}
+
+impl NuGetEcosystem {
+    pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
+        Self {
+            registry: Arc::new(NuGetRegistry::new(cache)),
+            formatter: NuGetFormatter,
+            lockfile_provider: Arc::new(NuGetLockParser),
+        }
+    }
+
+    async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
+        deps_core::completion::complete_package_names_generic(self.registry.as_ref(), prefix, 20)
+            .await
+    }
+
+    async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
+        deps_core::completion::complete_versions_generic(
+            self.registry.as_ref(),
+            package_name,
+            prefix,
+            &[],
+        )
+        .await
+    }
+
+    /// Dispatches to the manifest-kind-specific parser based on the URI's basename.
+    /// `.csproj`/`.fsproj`/`.vbproj` (routed to this ecosystem via `manifest_extensions`)
+    /// all share the `PackageReference` MSBuild schema, so anything not matching one of the
+    /// two fixed filenames falls through to the project-file parser.
+    fn parse_by_filename(content: &str, uri: &Uri) -> crate::error::Result<NuGetParseResult> {
+        let path = uri.path().as_str();
+        let filename = path.rsplit('/').next().unwrap_or(path);
+
+        match filename.to_lowercase().as_str() {
+            "directory.packages.props" => {
+                crate::parser::parse_directory_packages_props(content, uri)
+            }
+            "packages.config" => crate::parser::parse_packages_config(content, uri),
+            _ => crate::parser::parse_project_file(content, uri),
+        }
+    }
+}
+
+impl deps_core::ecosystem::private::Sealed for NuGetEcosystem {}
+
+impl Ecosystem for NuGetEcosystem {
+    fn id(&self) -> &'static str {
+        "nuget"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "NuGet (.NET)"
+    }
+
+    fn manifest_filenames(&self) -> &[&'static str] {
+        &["Directory.Packages.props", "packages.config"]
+    }
+
+    fn manifest_extensions(&self) -> &[&'static str] {
+        &[".csproj", ".fsproj", ".vbproj"]
+    }
+
+    fn lockfile_filenames(&self) -> &[&'static str] {
+        &["packages.lock.json"]
+    }
+
+    fn parse_manifest<'a>(
+        &'a self,
+        content: &'a str,
+        uri: &'a Uri,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
+        Box::pin(async move {
+            let result =
+                Self::parse_by_filename(content, uri).map_err(deps_core::DepsError::from)?;
+            Ok(Box::new(result) as Box<dyn ParseResultTrait>)
+        })
+    }
+
+    fn registry(&self) -> Arc<dyn Registry> {
+        self.registry.clone() as Arc<dyn Registry>
+    }
+
+    fn lockfile_provider(&self) -> Option<Arc<dyn deps_core::lockfile::LockFileProvider>> {
+        Some(self.lockfile_provider.clone() as Arc<dyn deps_core::lockfile::LockFileProvider>)
+    }
+
+    fn formatter(&self) -> &dyn EcosystemFormatter {
+        &self.formatter
+    }
+
+    fn generate_completions<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        position: Position,
+        content: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+        Box::pin(async move {
+            use deps_core::completion::{CompletionContext, detect_completion_context};
+
+            match detect_completion_context(parse_result, position, content) {
+                CompletionContext::PackageName { prefix } => {
+                    self.complete_package_names(&prefix).await
+                }
+                CompletionContext::Version {
+                    package_name,
+                    prefix,
+                } => self.complete_versions(&package_name, &prefix).await,
+                CompletionContext::Feature { .. } | CompletionContext::None => vec![],
+            }
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ecosystem_id() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        assert_eq!(eco.id(), "nuget");
+    }
+
+    #[test]
+    fn test_ecosystem_display_name() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        assert_eq!(eco.display_name(), "NuGet (.NET)");
+    }
+
+    #[test]
+    fn test_manifest_filenames_and_extensions() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        assert_eq!(
+            eco.manifest_filenames(),
+            &["Directory.Packages.props", "packages.config"]
+        );
+        assert_eq!(
+            eco.manifest_extensions(),
+            &[".csproj", ".fsproj", ".vbproj"]
+        );
+    }
+
+    #[test]
+    fn test_lockfile_filenames() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        assert_eq!(eco.lockfile_filenames(), &["packages.lock.json"]);
+    }
+
+    #[test]
+    fn test_lockfile_provider_some() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        assert!(eco.lockfile_provider().is_some());
+    }
+
+    #[test]
+    fn test_as_any() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        assert!(eco.as_any().is::<NuGetEcosystem>());
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_csproj() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+        let result = eco.parse_manifest(content, &uri).await.unwrap();
+        assert_eq!(result.dependencies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_fsproj_routes_as_project_file() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/App.fsproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+        let result = eco.parse_manifest(content, &uri).await.unwrap();
+        assert_eq!(result.dependencies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_directory_packages_props() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/Directory.Packages.props");
+        let content = r#"<Project><ItemGroup><PackageVersion Include="Serilog" Version="3.1.1" /></ItemGroup></Project>"#;
+
+        let result = eco.parse_manifest(content, &uri).await.unwrap();
+        assert_eq!(result.dependencies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_packages_config() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/packages.config");
+        let content = r#"<packages><package id="Newtonsoft.Json" version="13.0.3" targetFramework="net48" /></packages>"#;
+
+        let result = eco.parse_manifest(content, &uri).await.unwrap();
+        assert_eq!(result.dependencies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_invalid_xml_errors() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/App.csproj");
+        let content = r#"<Project attr="unclosed></Project>"#;
+
+        let result = eco.parse_manifest(content, &uri).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_min_prefix() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        assert!(eco.complete_package_names("").await.is_empty());
+    }
+}

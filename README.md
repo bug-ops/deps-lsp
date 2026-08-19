@@ -7,7 +7,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.91-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, and Composer ecosystems.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, and NuGet ecosystems.
 
 ![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
 
@@ -36,6 +36,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | Java | Gradle | `libs.versions.toml`, `build.gradle.kts`, `build.gradle`, `settings.gradle` | Supported |
 | Swift | SPM | `Package.swift` | Supported |
 | PHP | Composer | `composer.json` | Supported |
+| C# | NuGet | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | Supported |
 
 > [!NOTE]
 > **Ecosystem details:**
@@ -47,6 +48,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 > - **Gradle** — Version Catalogs, Kotlin/Groovy DSL, `settings.gradle` plugins; resolves from Maven Central, Google Maven, Gradle Plugin Portal
 > - **Swift** — all `.package()` forms (from, upToNextMajor/Minor, exact, range, branch, revision, path); versions via GitHub API tags
 > - **Composer** — `require`/`require-dev` sections, Packagist v2 API with metadata de-minification, Composer-specific tilde semantics (`~1.2` = `>=1.2.0 <2.0.0`)
+> - **NuGet** — `PackageReference` (attribute and child-element form), Central Package Management (`Directory.Packages.props`), legacy `packages.config`, `packages.lock.json`; NuGet V3 registry (service index, flat container, search)
 
 ## Installation
 
@@ -106,6 +108,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `gradle` | Java | libs.versions.toml, build.gradle.kts, build.gradle | Yes |
 | `swift` | Swift | Package.swift | Yes |
 | `composer` | PHP | composer.json | Yes |
+| `nuget` | C# | .csproj, Directory.Packages.props, packages.config | Yes |
 
 ## Usage
 
@@ -326,6 +329,7 @@ deps-lsp/
 │   ├── deps-gradle/    # Gradle parser (Version Catalog, Kotlin/Groovy DSL)
 │   ├── deps-swift/     # Package.swift parser + GitHub API registry
 │   ├── deps-composer/  # composer.json parser + Packagist registry
+│   ├── deps-nuget/     # .csproj/packages.config parser + NuGet V3 registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration

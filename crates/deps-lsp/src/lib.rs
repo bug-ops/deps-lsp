@@ -183,6 +183,24 @@ ecosystem!(
     ]
 );
 
+// Note: `PackageInfo` is deliberately omitted from this re-export list — it collides with
+// `deps_dart::PackageInfo`, already re-exported above. Reachable directly as
+// `deps_nuget::PackageInfo` for anything that needs it.
+ecosystem!(
+    "nuget",
+    deps_nuget,
+    NuGetEcosystem,
+    [
+        NuGetDependency,
+        NuGetParseResult,
+        NuGetVersion,
+        NuGetFormatter,
+        NuGetRegistry,
+        NuGetLockParser,
+        parse_project_file,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
     register!("cargo", CargoEcosystem, registry, &cache);
@@ -195,6 +213,7 @@ pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) 
     register!("gradle", GradleEcosystem, registry, &cache);
     register!("swift", SwiftEcosystem, registry, &cache);
     register!("composer", ComposerEcosystem, registry, &cache);
+    register!("nuget", NuGetEcosystem, registry, &cache);
 }
 
 #[cfg(test)]
@@ -223,5 +242,7 @@ mod tests {
         assert!(registry.get("maven").is_some());
         #[cfg(feature = "composer")]
         assert!(registry.get("composer").is_some());
+        #[cfg(feature = "nuget")]
+        assert!(registry.get("nuget").is_some());
     }
 }

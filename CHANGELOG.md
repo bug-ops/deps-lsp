@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **New ecosystem: NuGet (.NET)** — `deps-nuget` adds support for `.csproj`/`.fsproj`/`.vbproj` (`PackageReference`, both attribute and child-element form, with central package management entries degrading to no version requirement), `Directory.Packages.props` (`PackageVersion`), `packages.config` (normalized to an exact-pin range at parse time), and `packages.lock.json` lock files. Backed by the NuGet V3 registry API (service index resolution, flat-container version enumeration, `SearchQueryService` search). Version comparison is hand-rolled (4-component `Major.Minor.Patch.Revision`, SemVer2 prerelease precedence with case-insensitive labels, interval and floating-version syntax) since no maintained crate supports NuGet's scheme
+- `deps_core::Ecosystem` gained `manifest_extensions()`, a defaulted trait method (empty by default, zero behavior change for existing ecosystems) letting an ecosystem route by file extension when the manifest basename is unbounded (e.g. `*.csproj`). `EcosystemRegistry::get_for_filename` now falls back to a case-insensitive extension lookup after an exact filename match misses
+
 ### Changed
 - Bump `yaml-rust2` 0.11 → 0.12 (routine dependency update, no functional changes) (resolves #115)
 - Bump `h2` (transitive, via `reqwest`/`hyper`) 0.4.15 → 0.4.17, patching RUSTSEC-2026-0258 (unbounded empty DATA frames) (resolves #116)
