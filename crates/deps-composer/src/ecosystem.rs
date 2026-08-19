@@ -128,7 +128,7 @@ impl Ecosystem for ComposerEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::EcosystemConfig;
+    use deps_core::{EcosystemConfig, VersionData};
     use std::collections::HashMap;
 
     #[test]
@@ -204,8 +204,7 @@ mod tests {
         let hints = ecosystem
             .generate_inlay_hints(
                 parse_result.as_ref(),
-                &HashMap::new(),
-                &HashMap::new(),
+                VersionData::new(&HashMap::new(), &HashMap::new()),
                 deps_core::LoadingState::Loaded,
                 &EcosystemConfig::default(),
             )

@@ -6,7 +6,7 @@
 //! Lock files contain resolved dependency versions, allowing instant display
 //! without network requests to registries.
 
-use crate::error::Result;
+use crate::error::{DepsError, Result};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,39 @@ use tower_lsp_server::ls_types::Uri;
 
 /// Maximum depth to search for workspace root lock file.
 const MAX_WORKSPACE_DEPTH: usize = 5;
+
+/// Reads a lock file's contents, wrapping any I/O failure into a [`DepsError::ParseError`]
+/// tagged with the ecosystem's `file_type` label and the file's path.
+///
+/// Every `LockFileProvider::parse_lockfile` implementation reads its lock file the same
+/// way; this shares that boilerplate and keeps the error message format consistent
+/// across ecosystems.
+///
+/// # Errors
+///
+/// Returns [`DepsError::ParseError`] if the file cannot be read (e.g. missing, unreadable,
+/// invalid UTF-8).
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::lockfile::read_lockfile_content;
+/// use std::path::Path;
+///
+/// # async fn example() -> deps_core::error::Result<()> {
+/// let content = read_lockfile_content(Path::new("Cargo.lock"), "Cargo.lock").await?;
+/// println!("{} bytes read", content.len());
+/// # Ok(())
+/// # }
+/// ```
+pub async fn read_lockfile_content(path: &Path, file_type: &str) -> Result<String> {
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| DepsError::ParseError {
+            file_type: format!("{file_type} at {}", path.display()),
+            source: Box::new(e),
+        })
+}
 
 /// Generic lock file locator.
 ///
@@ -453,6 +486,36 @@ impl Default for LockFileCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_read_lockfile_content_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(&lock_path, "version = 4").unwrap();
+
+        let content = read_lockfile_content(&lock_path, "Cargo.lock")
+            .await
+            .unwrap();
+
+        assert_eq!(content, "version = 4");
+    }
+
+    #[tokio::test]
+    async fn test_read_lockfile_content_missing_file_wraps_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("Cargo.lock");
+
+        let err = read_lockfile_content(&lock_path, "Cargo.lock")
+            .await
+            .unwrap_err();
+
+        match err {
+            DepsError::ParseError { file_type, .. } => {
+                assert_eq!(file_type, format!("Cargo.lock at {}", lock_path.display()));
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
+        }
+    }
 
     #[test]
     fn test_resolved_packages_new() {

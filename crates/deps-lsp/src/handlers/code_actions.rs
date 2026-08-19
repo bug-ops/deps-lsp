@@ -41,7 +41,7 @@ pub async fn handle_code_actions(
 
     // Generate code actions while holding the lock
     let actions = ecosystem
-        .generate_code_actions(parse_result, position, &doc.cached_versions, uri)
+        .generate_code_actions(parse_result, position, uri)
         .await;
 
     actions

@@ -5,7 +5,10 @@ use tower_lsp_server::ls_types::{
     CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
 };
 
-use crate::{Registry, lsp_helpers::EcosystemFormatter};
+use crate::{
+    Registry,
+    lsp_helpers::{EcosystemFormatter, VersionData},
+};
 
 pub mod private {
     pub trait Sealed {}
@@ -334,16 +337,14 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     fn generate_inlay_hints<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
-        cached_versions: &'a std::collections::HashMap<String, String>,
-        resolved_versions: &'a std::collections::HashMap<String, String>,
+        versions: VersionData<'a>,
         loading_state: crate::LoadingState,
         config: &'a EcosystemConfig,
     ) -> BoxFuture<'a, Vec<InlayHint>> {
         Box::pin(async move {
             crate::lsp_helpers::generate_inlay_hints(
                 parse_result,
-                cached_versions,
-                resolved_versions,
+                versions,
                 loading_state,
                 config,
                 self.formatter(),
@@ -359,16 +360,14 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &'a self,
         parse_result: &'a dyn ParseResult,
         position: Position,
-        cached_versions: &'a std::collections::HashMap<String, String>,
-        resolved_versions: &'a std::collections::HashMap<String, String>,
+        versions: VersionData<'a>,
     ) -> BoxFuture<'a, Option<Hover>> {
         Box::pin(async move {
             let registry = self.registry();
             crate::lsp_helpers::generate_hover(
                 parse_result,
                 position,
-                cached_versions,
-                resolved_versions,
+                versions,
                 registry.as_ref(),
                 self.formatter(),
             )
@@ -384,7 +383,6 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &'a self,
         parse_result: &'a dyn ParseResult,
         position: Position,
-        _cached_versions: &'a std::collections::HashMap<String, String>,
         uri: &'a Uri,
     ) -> BoxFuture<'a, Vec<CodeAction>> {
         Box::pin(async move {
@@ -407,15 +405,13 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     fn generate_diagnostics<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
-        cached_versions: &'a std::collections::HashMap<String, String>,
-        resolved_versions: &'a std::collections::HashMap<String, String>,
+        versions: VersionData<'a>,
         _uri: &'a Uri,
     ) -> BoxFuture<'a, Vec<Diagnostic>> {
         Box::pin(async move {
             crate::lsp_helpers::generate_diagnostics_from_cache(
                 parse_result,
-                cached_versions,
-                resolved_versions,
+                versions,
                 self.formatter(),
             )
         })

@@ -28,7 +28,7 @@
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest,
+    locate_lockfile_for_manifest, read_lockfile_content,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -113,12 +113,7 @@ impl LockFileProvider for NpmLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing package-lock.json: {}", lockfile_path.display());
 
-            let content = tokio::fs::read_to_string(lockfile_path)
-                .await
-                .map_err(|e| DepsError::ParseError {
-                    file_type: format!("package-lock.json at {}", lockfile_path.display()),
-                    source: Box::new(e),
-                })?;
+            let content = read_lockfile_content(lockfile_path, "package-lock.json").await?;
 
             let lock_data: PackageLockJson =
                 serde_json::from_str(&content).map_err(|e| DepsError::ParseError {

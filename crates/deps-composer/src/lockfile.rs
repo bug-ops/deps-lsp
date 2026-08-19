@@ -6,7 +6,7 @@
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest,
+    locate_lockfile_for_manifest, read_lockfile_content,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -68,12 +68,7 @@ impl LockFileProvider for ComposerLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing composer.lock: {}", lockfile_path.display());
 
-            let content = tokio::fs::read_to_string(lockfile_path)
-                .await
-                .map_err(|e| DepsError::ParseError {
-                    file_type: "composer.lock".into(),
-                    source: Box::new(e),
-                })?;
+            let content = read_lockfile_content(lockfile_path, "composer.lock").await?;
 
             let lock_data: ComposerLock =
                 serde_json::from_str(&content).map_err(|e| DepsError::ParseError {

@@ -2,6 +2,7 @@
 
 use crate::config::{DepsConfig, DiagnosticsConfig};
 use crate::document::{ServerState, ensure_document_loaded};
+use deps_core::VersionData;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -63,8 +64,7 @@ pub(crate) async fn generate_diagnostics_internal(
     ecosystem
         .generate_diagnostics(
             parse_result,
-            &doc.cached_versions,
-            &doc.resolved_versions,
+            VersionData::new(&doc.cached_versions, &doc.resolved_versions),
             uri,
         )
         .await

@@ -5,7 +5,7 @@
 
 use crate::config::{DepsConfig, InlayHintsConfig};
 use crate::document::{ServerState, ensure_document_loaded};
-use deps_core::EcosystemConfig;
+use deps_core::{EcosystemConfig, VersionData};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -71,8 +71,7 @@ pub async fn handle_inlay_hints(
     ecosystem
         .generate_inlay_hints(
             parse_result,
-            &doc.cached_versions,
-            &doc.resolved_versions,
+            VersionData::new(&doc.cached_versions, &doc.resolved_versions),
             doc.loading_state,
             &ecosystem_config,
         )
