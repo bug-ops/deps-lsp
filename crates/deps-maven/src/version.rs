@@ -35,12 +35,12 @@ fn contains_milestone_qualifier(upper: &str) -> bool {
 /// non-numeric qualifier. A numeric segment always outranks a non-numeric
 /// qualifier at the same position, which keeps legacy Maven identifiers such
 /// as Guava's bare `r03`..`r09` release tags below properly-formed numeric
-/// releases (e.g. `33.7.1-jre`). Two numeric segments compare by magnitude
-/// (leading zeros ignored, no size limit); two non-numeric segments compare
-/// lexicographically.
-// TODO(critic): qualifier segments still outrank the empty padding segment,
-// so `1.0.0-RC1` compares Greater than `1.0.0`; see #127 for
-// prerelease-vs-base-release ordering.
+/// releases (e.g. `33.7.1-jre`). A missing segment (the shorter version ran
+/// out of components) outranks a non-numeric qualifier at that position, so
+/// a version's own trailing dash-qualifier (e.g. `-RC1`, `-SNAPSHOT`) sorts
+/// below its base release (`6.1.0-RC1` < `6.1.0`). Two numeric segments
+/// compare by magnitude (leading zeros ignored, no size limit); two
+/// non-numeric segments compare lexicographically.
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
     let a_parts = split_version(a);
     let b_parts = split_version(b);
@@ -72,14 +72,23 @@ fn split_version(v: &str) -> Vec<String> {
 /// qualifiers such as Guava's bare `r03`..`r09` identifiers must sort below
 /// properly-formed numeric releases (e.g. `33.7.1-jre`), not above them via a
 /// raw ASCII string comparison (`'r' > '3'`). When neither segment is
-/// numeric, they fall back to lexicographic order, which still ranks
-/// `r09 > r08 > ... > r03` correctly relative to each other.
+/// numeric, an empty segment (produced by padding a shorter version out to
+/// the longer one's length — `split_version` never yields empty segments
+/// itself) represents "no further qualifier" and outranks a real qualifier,
+/// so a dash-qualifier segment like `RC1` or `SNAPSHOT` sorts below the base
+/// release it padded against. Two real qualifiers fall back to lexicographic
+/// order, which still ranks `r09 > r08 > ... > r03` correctly relative to
+/// each other.
 fn compare_segment(a: &str, b: &str) -> Ordering {
     match (is_numeric_segment(a), is_numeric_segment(b)) {
         (true, true) => compare_numeric_segments(a, b),
         (true, false) => Ordering::Greater,
         (false, true) => Ordering::Less,
-        (false, false) => a.cmp(b),
+        (false, false) => match (a.is_empty(), b.is_empty()) {
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ => a.cmp(b),
+        },
     }
 }
 
@@ -161,6 +170,36 @@ mod tests {
         // "1.0-final" has a non-numeric third segment; a numeric segment at
         // the same position must still outrank it.
         assert_eq!(compare_versions("1.0.1", "1.0-final"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_prerelease_sorts_below_own_base_release() {
+        // junit-jupiter maven-metadata.xml case. "M1" < "RC1" here is ASCII
+        // ('M' < 'R'), not a maintained alpha/beta/milestone/rc rank table;
+        // both real qualifiers sort below the missing-segment base release.
+        assert_eq!(compare_versions("6.1.0-M1", "6.1.0-RC1"), Ordering::Less);
+        assert_eq!(compare_versions("6.1.0-RC1", "6.1.0"), Ordering::Less);
+        assert_eq!(compare_versions("6.1.0-M1", "6.1.0"), Ordering::Less);
+        assert_eq!(compare_versions("6.1.0", "6.1.0-RC1"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_prerelease_sort_matches_junit_jupiter_metadata_order() {
+        // Real maven-metadata.xml version list order for junit-jupiter:
+        // both qualifiers sort below the base release via `.sort_by`, not
+        // just in isolated two-way comparisons ("M1" < "RC1" is coincidental
+        // ASCII order, not a semantic qualifier rank).
+        let mut versions = vec!["6.1.0", "6.1.0-M1", "6.1.0-RC1"];
+        versions.sort_by(|a, b| compare_versions(a, b));
+        assert_eq!(versions, vec!["6.1.0-M1", "6.1.0-RC1", "6.1.0"]);
+    }
+
+    #[test]
+    fn test_prerelease_ordering_independent_of_segment_count() {
+        // "1.0-SNAPSHOT" vs "1.0" (padding) must agree with the already
+        // component-count-matched "1.0-SNAPSHOT" vs "1.0.0" comparison.
+        assert_eq!(compare_versions("1.0-SNAPSHOT", "1.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.0-SNAPSHOT", "1.0.0"), Ordering::Less);
     }
 
     #[test]
