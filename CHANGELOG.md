@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Bump `yaml-rust2` 0.11 → 0.12 (routine dependency update, no functional changes) (resolves #115)
+
 ### Fixed
 - **CI**: the `test` job's matrix `include` entries for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` matched the same base `(ubuntu-latest, stable)` combination, so the second silently overwrote the first — `x86_64-unknown-linux-musl` was never actually checked in CI. Cross-compile checks (both musl targets plus `aarch64-pc-windows-msvc`) now run in a dedicated `cross-check` job with no shared base matrix axis, so `include` entries can no longer collide (resolves #109)
 - **tests**: native Windows test runs were never exercised in CI (the `windows-latest`/stable slot was always absorbed by the `aarch64-pc-windows-msvc` cross-compile job above), which hid that most test fixtures built `Uri`s from Unix-style absolute paths — not recognized as absolute on Windows, causing `Uri::from_file_path(...).unwrap()` to panic. Added `deps_core::test_util::test_uri`, a cross-platform test helper (feature-gated via `test-util`), and switched all executed test/doctest call sites to it
