@@ -1412,7 +1412,7 @@ serde
 
         let content = "[dependencies]\nserde = \"1\"\n".to_string();
         let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
-        let doc = DocumentState::new_from_parse_result("cargo", content, parse_result);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
