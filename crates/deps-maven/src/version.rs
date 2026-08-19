@@ -15,8 +15,12 @@ pub fn is_prerelease(version: &str) -> bool {
         if is_numeric_segment(segment) {
             return false;
         }
-        let (prefix, suffix) = split_trailing_digits(segment);
-        qualifier_rank(&normalize_qualifier(prefix, suffix.is_some())) < qualifier_rank("")
+        let tokens = tokenize_qualifier(segment);
+        let Some(QualToken::Alpha(prefix)) = tokens.first() else {
+            return false;
+        };
+        let has_numeric_suffix = matches!(tokens.get(1), Some(QualToken::Digits(_)));
+        qualifier_rank(&normalize_qualifier(prefix, has_numeric_suffix)) < qualifier_rank("")
     })
 }
 
@@ -27,12 +31,15 @@ pub fn is_prerelease(version: &str) -> bool {
 /// qualifier at the same position, which keeps legacy Maven identifiers such
 /// as Guava's bare `r03`..`r09` release tags below properly-formed numeric
 /// releases (e.g. `33.7.1-jre`). A missing segment (the shorter version ran
-/// out of components) outranks a non-numeric qualifier at that position, so
-/// a version's own trailing dash-qualifier (e.g. `-RC1`, `-SNAPSHOT`) sorts
-/// below its base release (`6.1.0-RC1` < `6.1.0`). Two numeric segments
-/// compare by magnitude (leading zeros ignored, no size limit); two real
-/// non-numeric segments are ranked by Maven qualifier precedence (see
-/// `compare_qualifiers`).
+/// out of components) is ranked against a non-numeric qualifier at that
+/// position by the same Maven qualifier precedence used for two real
+/// qualifiers (see `compare_qualifiers`): a version's own trailing
+/// dash-qualifier that ranks below release (e.g. `-RC1`, `-SNAPSHOT`) sorts
+/// below its base release (`6.1.0-RC1` < `6.1.0`), while one that ranks above
+/// release (e.g. `-sp`, or an unrecognized vendor suffix) sorts above it.
+/// Two numeric segments compare by magnitude (leading zeros ignored, no size
+/// limit); two real non-numeric segments are ranked by Maven qualifier
+/// precedence (see `compare_qualifiers`).
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
     let a_parts = split_version(a);
     let b_parts = split_version(b);
@@ -99,80 +106,146 @@ fn compare_numeric_segments(a: &str, b: &str) -> Ordering {
 ///
 /// A missing segment is padded to `""` by [`compare_versions`] (`split_version`
 /// never yields empty segments itself) and represents "no further
-/// qualifier", so it outranks every real qualifier: a dash-qualifier segment
-/// like `RC1` or `SNAPSHOT` sorts below the base release it padded against.
+/// qualifier", i.e. the release rank: a dash-qualifier segment ranking below
+/// release (`alpha`, `beta`, `milestone`, `rc`/`cr`, `snapshot`, e.g. `RC1`
+/// or `SNAPSHOT`) sorts below the base release it padded against, while one
+/// ranking above release (`sp`, or any unrecognized qualifier such as a
+/// vendor suffix) sorts above it — the same per-token rank comparison used
+/// for two real qualifiers, not a special case.
 ///
-/// Segments that are not recognized qualifier words rank above every known
-/// qualifier, including `sp` — matching `ComparableVersion`, which compares
-/// an unrecognized qualifier's index (`QUALIFIERS.size()`) as a string
-/// against the known indices, so it always sorts last. When both sides share
-/// the same normalized prefix and end in a glued numeric suffix (e.g. `M2`
-/// vs `M10`, `alpha9` vs `alpha15`), the suffix is compared numerically
-/// rather than lexicographically. A present-but-zero suffix (e.g. `r0` vs
-/// `r`) is treated as equivalent to a missing one, mirroring Maven's
-/// `IntItem.compareTo(null)`, which returns `0` for a zero-valued item
-/// compared against an absent one.
+/// Both segments are tokenized into maximal alpha/digit runs (see
+/// [`tokenize_qualifier`]) and compared positionally, token by token,
+/// returning the first non-equal ordering — matching Maven's
+/// `ComparableVersion`, which splits a qualifier on every alpha/digit
+/// transition rather than just the trailing one (e.g. `rc1a` becomes `rc`,
+/// `1`, `a`), so a leading unrecognized run like `a` in `rc1a` never
+/// overrides the qualifier rank carried by the leading `rc` token. Each
+/// position is compared as follows:
+/// - alpha vs alpha: ranked by Maven qualifier precedence (see
+///   [`qualifier_rank`]); segments that are not recognized qualifier words
+///   rank above every known qualifier, including `sp`, matching
+///   `ComparableVersion`, which compares an unrecognized qualifier's index
+///   (`QUALIFIERS.size()`) as a string against the known indices, so it
+///   always sorts last.
+/// - digits vs digits: compared numerically rather than lexicographically
+///   (e.g. `M2` vs `M10`, `alpha9` vs `alpha15`).
+/// - digits vs alpha at the same position: digits always outrank alpha,
+///   mirroring the numeric-outranks-non-numeric rule [`compare_segment`]
+///   applies at the top level.
+/// - alpha vs a missing token (one side ran out): ranked against the empty
+///   qualifier, same as the alpha-vs-alpha case with `""` on the missing
+///   side.
+/// - digits vs a missing token: a present-but-zero digit run (e.g. `r0` vs
+///   `r`) is treated as equivalent to a missing one, mirroring Maven's
+///   `IntItem.compareTo(null)`, which returns `0` for a zero-valued item
+///   compared against an absent one; any other digit run outranks a missing
+///   token.
 fn compare_qualifiers(a: &str, b: &str) -> Ordering {
-    match (a.is_empty(), b.is_empty()) {
-        (true, true) => return Ordering::Equal,
-        (true, false) => return Ordering::Greater,
-        (false, true) => return Ordering::Less,
-        (false, false) => {}
+    let a_tokens = tokenize_qualifier(a);
+    let b_tokens = tokenize_qualifier(b);
+    let max_len = a_tokens.len().max(b_tokens.len());
+
+    for i in 0..max_len {
+        let ord = compare_qualifier_tokens(
+            a_tokens.get(i),
+            a_tokens.get(i + 1),
+            b_tokens.get(i),
+            b_tokens.get(i + 1),
+        );
+        if ord != Ordering::Equal {
+            return ord;
+        }
     }
 
-    let (a_prefix, a_suffix) = split_trailing_digits(a);
-    let (b_prefix, b_suffix) = split_trailing_digits(b);
-    let a_norm = normalize_qualifier(a_prefix, a_suffix.is_some());
-    let b_norm = normalize_qualifier(b_prefix, b_suffix.is_some());
+    Ordering::Equal
+}
 
-    qualifier_rank(&a_norm)
-        .cmp(&qualifier_rank(&b_norm))
-        .then_with(|| {
-            if a_norm != b_norm {
-                return a_norm.cmp(&b_norm);
+/// Compares a single positional pair of qualifier tokens; `a_next`/`b_next`
+/// are the tokens immediately following each, needed to decide
+/// `has_numeric_suffix` when normalizing an `Alpha` token.
+fn compare_qualifier_tokens(
+    a: Option<&QualToken<'_>>,
+    a_next: Option<&QualToken<'_>>,
+    b: Option<&QualToken<'_>>,
+    b_next: Option<&QualToken<'_>>,
+) -> Ordering {
+    match (a, b) {
+        (Some(QualToken::Alpha(p)), Some(QualToken::Alpha(q))) => {
+            let a_norm = normalize_qualifier(p, matches!(a_next, Some(QualToken::Digits(_))));
+            let b_norm = normalize_qualifier(q, matches!(b_next, Some(QualToken::Digits(_))));
+            qualifier_rank(&a_norm)
+                .cmp(&qualifier_rank(&b_norm))
+                .then_with(|| a_norm.cmp(&b_norm))
+        }
+        (Some(QualToken::Digits(p)), Some(QualToken::Digits(q))) => compare_numeric_segments(p, q),
+        (Some(QualToken::Digits(_)), Some(QualToken::Alpha(_))) => Ordering::Greater,
+        (Some(QualToken::Alpha(_)), Some(QualToken::Digits(_))) => Ordering::Less,
+        (Some(QualToken::Alpha(p)), None) => {
+            let a_norm = normalize_qualifier(p, matches!(a_next, Some(QualToken::Digits(_))));
+            qualifier_rank(&a_norm).cmp(&qualifier_rank(""))
+        }
+        (None, Some(QualToken::Alpha(q))) => {
+            let b_norm = normalize_qualifier(q, matches!(b_next, Some(QualToken::Digits(_))));
+            qualifier_rank("").cmp(&qualifier_rank(&b_norm))
+        }
+        (Some(QualToken::Digits(p)), None) => {
+            if is_zero_digits(p) {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
             }
-            match (a_suffix, b_suffix) {
-                (Some(an), Some(bn)) => compare_numeric_segments(an, bn),
-                (Some(an), None) => {
-                    if is_zero_digits(an) {
-                        Ordering::Equal
-                    } else {
-                        Ordering::Greater
-                    }
-                }
-                (None, Some(bn)) => {
-                    if is_zero_digits(bn) {
-                        Ordering::Equal
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                (None, None) => Ordering::Equal,
+        }
+        (None, Some(QualToken::Digits(q))) => {
+            if is_zero_digits(q) {
+                Ordering::Equal
+            } else {
+                Ordering::Less
             }
-        })
+        }
+        (None, None) => Ordering::Equal,
+    }
 }
 
 /// Whether a digit string's value is zero (all-zero, including `"0"`,
-/// `"00"`, or empty — the latter cannot occur from [`split_trailing_digits`]
+/// `"00"`, or empty — the latter cannot occur from [`tokenize_qualifier`]
 /// but is handled the same way for safety).
 fn is_zero_digits(digits: &str) -> bool {
     digits.bytes().all(|b| b == b'0')
 }
 
-/// Splits a qualifier into its leading prefix and a trailing run of ASCII
-/// digits, if any (e.g. `"M10"` -> `("M", Some("10"))`, `"beta"` -> `("beta",
-/// None)`). Only called on segments already known to be non-numeric, so the
-/// prefix returned is never empty.
-fn split_trailing_digits(s: &str) -> (&str, Option<&str>) {
-    let prefix_len = s
-        .bytes()
-        .rposition(|b| !b.is_ascii_digit())
-        .map_or(0, |i| i + 1);
-    if prefix_len == s.len() {
-        (s, None)
-    } else {
-        (&s[..prefix_len], Some(&s[prefix_len..]))
+/// A maximal alpha or digit run produced by [`tokenize_qualifier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QualToken<'a> {
+    Alpha(&'a str),
+    Digits(&'a str),
+}
+
+/// Splits a qualifier into maximal alternating alpha/digit runs, at every
+/// ASCII-digit/non-digit boundary (e.g. `"rc1a"` -> `[Alpha("rc"),
+/// Digits("1"), Alpha("a")]`, `"M10"` -> `[Alpha("M"), Digits("10")]`,
+/// `"beta"` -> `[Alpha("beta")]`). Either kind may appear first; only called
+/// on segments already known to be non-numeric, so the result is never
+/// empty. Mirrors Maven's `ComparableVersion` tokenizer, which splits a
+/// qualifier on every alpha/digit transition, not just the trailing one.
+fn tokenize_qualifier(s: &str) -> Vec<QualToken<'_>> {
+    let mut tokens = Vec::new();
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        let is_digit = bytes[start].is_ascii_digit();
+        let end = bytes[start..]
+            .iter()
+            .position(|b| b.is_ascii_digit() != is_digit)
+            .map_or(bytes.len(), |i| start + i);
+        let run = &s[start..end];
+        tokens.push(if is_digit {
+            QualToken::Digits(run)
+        } else {
+            QualToken::Alpha(run)
+        });
+        start = end;
     }
+    tokens
 }
 
 /// Lowercases a qualifier prefix and resolves it to Maven's canonical
@@ -234,6 +307,7 @@ mod tests {
         assert!(is_prerelease("1.0.0-RC1"));
         assert!(is_prerelease("2.0.0-M1"));
         assert!(is_prerelease("2.0.0-M10"));
+        assert!(is_prerelease("1.0.0-rc1a"));
     }
 
     #[test]
@@ -397,7 +471,7 @@ mod tests {
     #[test]
     fn test_single_letter_qualifier_aliases_gated_on_trailing_digit() {
         // Maven aliases a/b/m to alpha/beta/milestone only when the letter
-        // is immediately followed by a digit (the same split_trailing_digits
+        // is immediately followed by a digit (the same alpha/digit token
         // boundary #130 already computes); a bare letter with no digit stays
         // an unrecognized qualifier instead of silently matching the word.
         assert_eq!(compare_versions("1.0-a1", "1.0-alpha1"), Ordering::Equal);
@@ -414,12 +488,44 @@ mod tests {
     }
 
     #[test]
-    fn test_digit_not_at_trailing_position_falls_through_to_unknown() {
-        // split_trailing_digits only peels a run of digits at the very end;
-        // "rc1a" doesn't end in a digit, so it is not recognized as `rc`
-        // plus a numeric suffix and ranks as an unrecognized qualifier
-        // (above every known qualifier, sp included) rather than as `rc`.
+    fn test_non_trailing_digit_run_uses_leading_qualifier_prefix() {
+        // The qualifier tokenizer splits on every alpha/digit transition, not
+        // just the trailing one, so "rc1a" becomes ["rc", "1", "a"] and is
+        // ranked by its leading "rc" token, not treated as one unrecognized
+        // unit.
         assert_eq!(compare_versions("1.0-rc1a", "1.0-rc"), Ordering::Greater);
-        assert_eq!(compare_versions("1.0-rc1a", "1.0-sp"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0-rc1a", "1.0-sp"), Ordering::Less);
+        assert_eq!(compare_versions("1.0-rc1a", "1.0-rc1"), Ordering::Greater);
+        assert_eq!(
+            compare_versions("1.0-alpha2beta", "1.0-alpha2"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0-alpha2beta", "1.0-alpha3"),
+            Ordering::Less
+        );
+        // Mismatched token kind at the same position: digits always outrank
+        // alpha, mirroring the top-level numeric-outranks-non-numeric rule.
+        assert_eq!(
+            compare_versions("1.0-2beta", "1.0-beta2"),
+            Ordering::Greater
+        );
+        assert_eq!(compare_versions("1.0-beta2", "1.0-2beta"), Ordering::Less);
+        // Deeper chain: exercises numeric comparison at token index 3.
+        assert_eq!(compare_versions("1.0-rc1a2", "1.0-rc1a10"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_qualifier_missing_segment_ranked_by_token_rank_not_shortcut() {
+        // A missing segment pads to rank(""), the same per-token rank used
+        // for two real qualifiers: only qualifiers below release rank
+        // (alpha/beta/milestone/rc/snapshot) lose to the missing segment.
+        // `sp` and unrecognized qualifiers rank above release, so they
+        // outrank a missing segment too — there is no blanket rule that a
+        // missing segment always outranks every real qualifier.
+        assert_eq!(compare_versions("1.0-sp", "1.0"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0-ga", "1.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0-vaadin", "1.0"), Ordering::Greater);
+        assert_eq!(compare_versions("9.9", "9.9-vaadin"), Ordering::Less);
     }
 }
