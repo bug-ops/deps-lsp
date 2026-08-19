@@ -29,9 +29,12 @@ pub use cache::{CachedResponse, HttpCache};
 pub use ecosystem::{Dependency, Ecosystem, EcosystemConfig, EcosystemId, ParseResult};
 pub use ecosystem_registry::EcosystemRegistry;
 pub use error::{DepsError, Result};
-pub use lockfile::{LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource};
+pub use lockfile::{
+    LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,
+};
 pub use lsp_helpers::{
-    EcosystemFormatter, LineOffsetTable, generate_code_actions as lsp_generate_code_actions,
+    EcosystemFormatter, LineOffsetTable, VersionData,
+    generate_code_actions as lsp_generate_code_actions,
     generate_diagnostics as lsp_generate_diagnostics, generate_hover as lsp_generate_hover,
     generate_inlay_hints as lsp_generate_inlay_hints, is_same_major_minor, position_in_range,
 };

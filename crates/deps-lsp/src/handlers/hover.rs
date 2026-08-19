@@ -2,6 +2,7 @@
 
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
+use deps_core::VersionData;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -33,8 +34,7 @@ pub async fn handle_hover(
         .generate_hover(
             parse_result,
             position,
-            &doc.cached_versions,
-            &doc.resolved_versions,
+            VersionData::new(&doc.cached_versions, &doc.resolved_versions),
         )
         .await
 }

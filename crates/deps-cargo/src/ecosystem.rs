@@ -165,7 +165,7 @@ impl Ecosystem for CargoEcosystem {
 mod tests {
     use super::*;
     use crate::types::{DependencySection, DependencySource, ParsedDependency};
-    use deps_core::EcosystemConfig;
+    use deps_core::{EcosystemConfig, VersionData};
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
@@ -277,8 +277,7 @@ mod tests {
         resolved_versions.insert("serde".to_string(), "1.0.214".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -315,8 +314,7 @@ mod tests {
         resolved_versions.insert("serde".to_string(), "1.0.214".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -351,8 +349,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -389,8 +386,7 @@ mod tests {
         resolved_versions.insert("serde".to_string(), "1.0.214".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -424,8 +420,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -460,8 +455,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -658,8 +652,7 @@ mod tests {
 
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loading,
             &config,
         ));

@@ -2,10 +2,10 @@
 //!
 //! Parses Gemfile.lock files to extract resolved dependency versions.
 
-use deps_core::error::{DepsError, Result};
+use deps_core::error::Result;
 use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
-    locate_lockfile_for_manifest,
+    locate_lockfile_for_manifest, read_lockfile_content,
 };
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -48,12 +48,7 @@ impl LockFileProvider for GemfileLockParser {
         Box::pin(async move {
             tracing::debug!("Parsing Gemfile.lock: {}", lockfile_path.display());
 
-            let content = tokio::fs::read_to_string(lockfile_path)
-                .await
-                .map_err(|e| DepsError::ParseError {
-                    file_type: format!("Gemfile.lock at {}", lockfile_path.display()),
-                    source: Box::new(e),
-                })?;
+            let content = read_lockfile_content(lockfile_path, "Gemfile.lock").await?;
 
             parse_gemfile_lock(&content)
         })

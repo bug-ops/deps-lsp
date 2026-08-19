@@ -9,6 +9,56 @@ use tower_lsp_server::ls_types::{
 
 use crate::{Dependency, EcosystemConfig, ParseResult, Registry};
 
+/// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
+/// together everywhere.
+///
+/// Grouping them prevents accidentally swapping the two `&HashMap<String, String>`
+/// arguments at a call site, since the compiler can no longer typecheck them positionally.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::VersionData;
+/// use std::collections::HashMap;
+///
+/// let mut cached = HashMap::new();
+/// cached.insert("serde".to_string(), "1.0.214".to_string());
+///
+/// let mut resolved = HashMap::new();
+/// resolved.insert("serde".to_string(), "1.0.200".to_string());
+///
+/// let versions = VersionData::new(&cached, &resolved);
+///
+/// assert_eq!(versions.cached.get("serde"), Some(&"1.0.214".to_string()));
+/// assert_eq!(versions.resolved.get("serde"), Some(&"1.0.200".to_string()));
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct VersionData<'a> {
+    /// Latest versions known from the registry, keyed by package name.
+    pub cached: &'a HashMap<String, String>,
+    /// Versions actually resolved in the lock file, keyed by package name.
+    pub resolved: &'a HashMap<String, String>,
+}
+
+impl<'a> VersionData<'a> {
+    /// Creates a new `VersionData` from the cached and resolved version maps.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let versions = VersionData::new(&cached, &resolved);
+    /// assert!(versions.cached.is_empty());
+    /// ```
+    pub fn new(cached: &'a HashMap<String, String>, resolved: &'a HashMap<String, String>) -> Self {
+        Self { cached, resolved }
+    }
+}
+
 /// Checks whether a cursor position falls within an LSP range (inclusive on both ends).
 pub fn position_in_range(pos: Position, range: Range) -> bool {
     if pos.line < range.start.line || pos.line > range.end.line {
@@ -152,8 +202,7 @@ pub trait EcosystemFormatter: Send + Sync {
 
 pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
-    cached_versions: &HashMap<String, String>,
-    resolved_versions: &HashMap<String, String>,
+    versions: VersionData<'_>,
     loading_state: crate::LoadingState,
     config: &EcosystemConfig,
     formatter: &dyn EcosystemFormatter,
@@ -167,12 +216,14 @@ pub fn generate_inlay_hints(
         };
 
         let normalized_name = formatter.normalize_package_name(dep.name());
-        let latest_version = cached_versions
+        let latest_version = versions
+            .cached
             .get(&normalized_name)
-            .or_else(|| cached_versions.get(dep.name()));
-        let resolved_version = resolved_versions
+            .or_else(|| versions.cached.get(dep.name()));
+        let resolved_version = versions
+            .resolved
             .get(&normalized_name)
-            .or_else(|| resolved_versions.get(dep.name()));
+            .or_else(|| versions.resolved.get(dep.name()));
 
         // Show loading hint if loading and no cached version
         if loading_state == crate::LoadingState::Loading
@@ -257,8 +308,7 @@ pub fn generate_inlay_hints(
 pub async fn generate_hover<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
-    cached_versions: &HashMap<String, String>,
-    resolved_versions: &HashMap<String, String>,
+    versions: VersionData<'_>,
     registry: &R,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<Hover> {
@@ -272,7 +322,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         on_name || on_version
     })?;
 
-    let versions = registry.get_versions(dep.name()).await.ok()?;
+    let available_versions = registry.get_versions(dep.name()).await.ok()?;
 
     let url = formatter.package_url(dep.name());
 
@@ -282,9 +332,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     let normalized_name = formatter.normalize_package_name(dep.name());
 
-    let resolved = resolved_versions
+    let resolved = versions
+        .resolved
         .get(&normalized_name)
-        .or_else(|| resolved_versions.get(dep.name()));
+        .or_else(|| versions.resolved.get(dep.name()));
     if let Some(resolved_ver) = resolved {
         write!(&mut markdown, "**Current**: `{}`\n\n", resolved_ver).unwrap();
     } else if let Some(version_req) = dep.version_requirement() {
@@ -295,15 +346,16 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         write!(&mut markdown, "**Active when**: `{}`\n\n", marker_expr).unwrap();
     }
 
-    let latest = cached_versions
+    let latest = versions
+        .cached
         .get(&normalized_name)
-        .or_else(|| cached_versions.get(dep.name()));
+        .or_else(|| versions.cached.get(dep.name()));
     if let Some(latest_ver) = latest {
         write!(&mut markdown, "**Latest**: `{}`\n\n", latest_ver).unwrap();
     }
 
     markdown.push_str("**Recent versions**:\n");
-    for (i, version) in versions.iter().take(8).enumerate() {
+    for (i, version) in available_versions.iter().take(8).enumerate() {
         if i == 0 {
             writeln!(&mut markdown, "- {} *(latest)*", version.version_string()).unwrap();
         } else if version.is_yanked() {
@@ -394,13 +446,11 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 /// # Arguments
 ///
 /// * `parse_result` - Parsed dependencies from manifest
-/// * `cached_versions` - Latest versions from registry (name -> latest version)
-/// * `resolved_versions` - Resolved versions from lock file (name -> installed version)
+/// * `versions` - Latest (registry) and resolved (lock file) version maps, keyed by package name
 /// * `formatter` - Ecosystem-specific formatting and comparison logic
 pub fn generate_diagnostics_from_cache(
     parse_result: &dyn ParseResult,
-    cached_versions: &HashMap<String, String>,
-    resolved_versions: &HashMap<String, String>,
+    versions: VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
@@ -408,15 +458,16 @@ pub fn generate_diagnostics_from_cache(
 
     for dep in deps {
         let normalized_name = formatter.normalize_package_name(dep.name());
-        let latest_version = cached_versions
+        let latest_version = versions
+            .cached
             .get(&normalized_name)
-            .or_else(|| cached_versions.get(dep.name()));
+            .or_else(|| versions.cached.get(dep.name()));
 
         let Some(latest) = latest_version else {
             // Skip "unknown" diagnostic if package exists in lock file
             // (registry fetch may have failed due to rate limiting)
-            let in_lockfile = resolved_versions.contains_key(&normalized_name)
-                || resolved_versions.contains_key(dep.name());
+            let in_lockfile = versions.resolved.contains_key(&normalized_name)
+                || versions.resolved.contains_key(dep.name());
             if !in_lockfile {
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
@@ -847,8 +898,7 @@ mod tests {
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2),
-            &HashMap::new(),
-            &HashMap::new(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
         )
@@ -882,8 +932,7 @@ mod tests {
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2),
-            &HashMap::new(),
-            &HashMap::new(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
         )
@@ -928,8 +977,7 @@ mod tests {
 
         let hints = generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -976,8 +1024,7 @@ mod tests {
 
         let hints = generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -1025,8 +1072,7 @@ mod tests {
 
         let hints = generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             crate::LoadingState::Loading,
             &config,
             &formatter,
@@ -1076,8 +1122,7 @@ mod tests {
 
         let hints = generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             crate::LoadingState::Loading,
             &config,
             &formatter,
@@ -1161,8 +1206,7 @@ mod tests {
 
         let hints = generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             crate::LoadingState::Loading,
             &config,
             &formatter,
@@ -1203,8 +1247,7 @@ mod tests {
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
         );
 
@@ -1238,8 +1281,7 @@ mod tests {
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
         );
 
@@ -1273,8 +1315,7 @@ mod tests {
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
         );
 
@@ -1323,8 +1364,7 @@ mod tests {
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
         );
 
@@ -1373,8 +1413,7 @@ mod tests {
 
         let hints = generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             crate::LoadingState::Loaded,
             &config,
             &formatter,
@@ -1425,8 +1464,7 @@ mod tests {
 
         let hints = generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             crate::LoadingState::Loaded,
             &config,
             &formatter,

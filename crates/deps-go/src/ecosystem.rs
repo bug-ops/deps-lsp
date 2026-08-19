@@ -152,7 +152,7 @@ impl Ecosystem for GoEcosystem {
 mod tests {
     use super::*;
     use crate::types::{GoDependency, GoDirective};
-    use deps_core::{Dependency, EcosystemConfig};
+    use deps_core::{Dependency, EcosystemConfig, VersionData};
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
@@ -258,8 +258,7 @@ mod tests {
         resolved_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -300,8 +299,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -344,8 +342,7 @@ mod tests {
         resolved_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -381,8 +378,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
-            &cached_versions,
-            &resolved_versions,
+            VersionData::new(&cached_versions, &resolved_versions),
             deps_core::LoadingState::Loaded,
             &config,
         ));
@@ -483,8 +479,7 @@ mod tests {
             .generate_hover(
                 &parse_result,
                 position,
-                &cached_versions,
-                &resolved_versions,
+                VersionData::new(&cached_versions, &resolved_versions),
             )
             .await;
 
@@ -518,8 +513,7 @@ mod tests {
             .generate_hover(
                 &parse_result,
                 position,
-                &cached_versions,
-                &resolved_versions,
+                VersionData::new(&cached_versions, &resolved_versions),
             )
             .await;
 
@@ -542,10 +536,9 @@ mod tests {
         };
 
         let position = Position::new(5, 5);
-        let cached_versions = HashMap::new();
 
         let actions = ecosystem
-            .generate_code_actions(&parse_result, position, &cached_versions, &uri)
+            .generate_code_actions(&parse_result, position, &uri)
             .await;
 
         // Returns actions (open documentation link)
@@ -576,8 +569,7 @@ mod tests {
             std::time::Duration::from_secs(5),
             ecosystem.generate_diagnostics(
                 &parse_result,
-                &cached_versions,
-                &resolved_versions,
+                VersionData::new(&cached_versions, &resolved_versions),
                 parse_result.uri(),
             ),
         )

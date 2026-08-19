@@ -131,7 +131,7 @@ impl Ecosystem for NpmEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::EcosystemConfig;
+    use deps_core::{EcosystemConfig, VersionData};
     use std::collections::HashMap;
 
     #[test]
@@ -356,8 +356,7 @@ mod tests {
         let hints = ecosystem
             .generate_inlay_hints(
                 parse_result.as_ref(),
-                &cached_versions,
-                &resolved_versions,
+                VersionData::new(&cached_versions, &resolved_versions),
                 deps_core::LoadingState::Loaded,
                 &config,
             )
@@ -430,8 +429,7 @@ mod tests {
             .generate_hover(
                 parse_result.as_ref(),
                 position,
-                &cached_versions,
-                &resolved_versions,
+                VersionData::new(&cached_versions, &resolved_versions),
             )
             .await;
 
@@ -451,10 +449,8 @@ mod tests {
             line: 0,
             character: 0,
         };
-        let cached_versions = HashMap::new();
-
         let actions = ecosystem
-            .generate_code_actions(parse_result.as_ref(), position, &cached_versions, &uri)
+            .generate_code_actions(parse_result.as_ref(), position, &uri)
             .await;
 
         assert!(actions.is_empty());
@@ -475,8 +471,7 @@ mod tests {
         let diagnostics = ecosystem
             .generate_diagnostics(
                 parse_result.as_ref(),
-                &cached_versions,
-                &resolved_versions,
+                VersionData::new(&cached_versions, &resolved_versions),
                 &uri,
             )
             .await;
