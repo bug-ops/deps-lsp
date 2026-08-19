@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 /// Detects if a Maven version string is a pre-release.
 ///
 /// A version is a pre-release when any of its segments is a qualifier that
-/// ranks below the release qualifier in [`qualifier_rank`] (`alpha`, `beta`,
+/// ranks below the release qualifier in `qualifier_rank` (`alpha`, `beta`,
 /// `milestone`/`M`, `rc`/`cr`, `snapshot`, ...) — the same table
 /// [`compare_versions`] uses for ordering, so this can never disagree with
 /// the comparator about whether a version is a base release or a
@@ -32,7 +32,7 @@ pub fn is_prerelease(version: &str) -> bool {
 /// below its base release (`6.1.0-RC1` < `6.1.0`). Two numeric segments
 /// compare by magnitude (leading zeros ignored, no size limit); two real
 /// non-numeric segments are ranked by Maven qualifier precedence (see
-/// [`compare_qualifiers`]).
+/// `compare_qualifiers`).
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
     let a_parts = split_version(a);
     let b_parts = split_version(b);
