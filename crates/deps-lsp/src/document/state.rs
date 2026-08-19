@@ -81,10 +81,11 @@ pub use deps_core::LoadingState;
 /// # Examples
 ///
 /// ```no_run
+/// use deps_core::EcosystemId;
 /// use deps_lsp::document::DocumentState;
 ///
 /// let state = DocumentState::new_without_parse_result(
-///     "cargo",
+///     EcosystemId::Cargo,
 ///     "[dependencies]\nserde = \"1.0\"".into(),
 /// );
 ///
@@ -236,16 +237,11 @@ impl DocumentState {
     ///
     /// This is the preferred constructor for Phase 3+ implementations.
     pub fn new_from_parse_result(
-        ecosystem_id: &'static str,
+        ecosystem: EcosystemId,
         content: String,
         parse_result: Box<dyn ParseResult>,
     ) -> Self {
-        // `ecosystem_id` always originates from a statically registered ecosystem
-        // (see `crate::register_ecosystems`), so parsing it back to `EcosystemId` can
-        // only fail on an internal registration bug, not on user input.
-        let ecosystem = ecosystem_id
-            .parse::<EcosystemId>()
-            .expect("ecosystem_id must be a registered EcosystemId");
+        let ecosystem_id = ecosystem.id();
 
         Self {
             ecosystem,
@@ -265,11 +261,8 @@ impl DocumentState {
     ///
     /// Used when parsing fails but the document should still be stored
     /// to enable fallback completion and other LSP features.
-    pub fn new_without_parse_result(ecosystem_id: &'static str, content: String) -> Self {
-        // See `new_from_parse_result`: `ecosystem_id` is always a registered ecosystem id.
-        let ecosystem = ecosystem_id
-            .parse::<EcosystemId>()
-            .expect("ecosystem_id must be a registered EcosystemId");
+    pub fn new_without_parse_result(ecosystem: EcosystemId, content: String) -> Self {
+        let ecosystem_id = ecosystem.id();
 
         Self {
             ecosystem,
@@ -310,9 +303,10 @@ impl DocumentState {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_lsp::document::DocumentState;
     ///
-    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// doc.set_loading();
     /// assert!(doc.loading_started_at.is_some());
     /// ```
@@ -332,9 +326,10 @@ impl DocumentState {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_lsp::document::{DocumentState, LoadingState};
     ///
-    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// doc.set_loading();
     /// doc.set_loaded();
     /// assert_eq!(doc.loading_state, LoadingState::Loaded);
@@ -350,9 +345,10 @@ impl DocumentState {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_lsp::document::{DocumentState, LoadingState};
     ///
-    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// doc.set_loading();
     /// doc.set_failed();
     /// assert_eq!(doc.loading_state, LoadingState::Failed);
@@ -371,9 +367,10 @@ impl DocumentState {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_lsp::document::DocumentState;
     ///
-    /// let mut doc = DocumentState::new_without_parse_result("cargo", "".into());
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// assert!(doc.loading_duration().is_none());
     ///
     /// doc.set_loading();
@@ -567,7 +564,7 @@ mod tests {
             use std::time::Duration;
 
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             // Initial state
             assert_eq!(doc.loading_state, LoadingState::Idle);
@@ -596,7 +593,7 @@ mod tests {
         #[test]
         fn test_loading_state_failed_transition() {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             doc.set_loading();
             assert_eq!(doc.loading_state, LoadingState::Loading);
@@ -609,7 +606,7 @@ mod tests {
         #[test]
         fn test_loading_state_clone() {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             doc.set_loading();
             let cloned = doc.clone();
@@ -621,7 +618,7 @@ mod tests {
         #[test]
         fn test_loading_state_debug() {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
             doc.set_loading();
 
             let debug_str = format!("{:?}", doc);
@@ -632,7 +629,7 @@ mod tests {
         #[test]
         fn test_loading_duration_none_when_idle() {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let doc = DocumentState::new_without_parse_result("cargo", content);
+            let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             assert_eq!(doc.loading_state, LoadingState::Idle);
             assert!(doc.loading_duration().is_none());
@@ -654,7 +651,7 @@ mod tests {
             use std::time::Duration;
 
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
-            let mut doc = DocumentState::new_without_parse_result("cargo", content);
+            let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             doc.set_loading();
 
@@ -674,7 +671,7 @@ mod tests {
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/concurrent-loading-test.toml");
 
-            let doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
             state.update_document(uri.clone(), doc);
 
             let barrier = Arc::new(Barrier::new(10));
@@ -715,7 +712,8 @@ mod tests {
 
         #[test]
         fn test_set_loaded_idempotent() {
-            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
             doc.set_loading();
             doc.set_loaded();
@@ -729,7 +727,8 @@ mod tests {
 
         #[test]
         fn test_set_loading_resets_timer() {
-            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
             doc.set_loading();
             let first_start = doc.loading_started_at.unwrap();
@@ -746,7 +745,8 @@ mod tests {
 
         #[test]
         fn test_retry_after_failure() {
-            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
             doc.set_loading();
             doc.set_failed();
@@ -764,7 +764,8 @@ mod tests {
 
         #[test]
         fn test_refresh_after_loaded() {
-            let mut doc = DocumentState::new_without_parse_result("cargo", String::new());
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
             doc.set_loading();
             doc.set_loaded();
@@ -950,9 +951,11 @@ mod tests {
 
     /// Regression test for issue #118: before the `EcosystemId` refactor, any
     /// `ecosystem_id` outside `{cargo, npm, pypi, go}` silently fell back to
-    /// `Ecosystem::Cargo` in `new_without_parse_result`/`new_from_parse_result`.
-    /// Exercises the constructors directly (not just `EcosystemId::from_str`) for
-    /// every previously-misclassified ecosystem.
+    /// `Ecosystem::Cargo`. The constructors are now infallible (`DocumentState`
+    /// takes `EcosystemId` directly, see the #144 follow-up), so the resolution
+    /// risk now lives entirely in `str::parse::<EcosystemId>()` — exercised here
+    /// for every registered ecosystem, alongside the constructor's derivation of
+    /// `ecosystem_id` back from `EcosystemId::id()`.
     #[test]
     fn test_document_state_new_without_parse_result_resolves_all_ecosystems() {
         for (id, expected) in [
@@ -968,15 +971,21 @@ mod tests {
             ("swift", EcosystemId::Swift),
             ("nuget", EcosystemId::NuGet),
         ] {
-            let doc = DocumentState::new_without_parse_result(id, String::new());
-            assert_eq!(doc.ecosystem, expected, "ecosystem_id {id:?} misresolved");
+            let parsed: EcosystemId = id
+                .parse()
+                .unwrap_or_else(|_| panic!("ecosystem_id {id:?} failed to parse"));
+            assert_eq!(parsed, expected, "ecosystem_id {id:?} misresolved");
+
+            let doc = DocumentState::new_without_parse_result(expected, String::new());
+            assert_eq!(doc.ecosystem, expected);
             assert_eq!(doc.ecosystem_id, id);
         }
     }
 
     /// Same regression as above, but through `new_from_parse_result` with a real
-    /// `ParseResult` for one of the previously-misclassified ecosystems (maven),
-    /// exercising the exact call path `document::lifecycle` uses in production.
+    /// `ParseResult` for one of the previously-misclassified ecosystems (maven).
+    /// Parses `"maven"` explicitly first, mirroring the parse-then-construct
+    /// sequence `document::lifecycle::resolve_ecosystem_id` performs in production.
     #[cfg(feature = "maven")]
     #[test]
     fn test_document_state_new_from_parse_result_maven_not_misclassified_as_cargo() {
@@ -1000,7 +1009,10 @@ mod tests {
             .block_on(ecosystem.parse_manifest(&content, &uri))
             .unwrap();
 
-        let doc_state = DocumentState::new_from_parse_result("maven", content, parse_result);
+        let ecosystem_id: EcosystemId = "maven"
+            .parse()
+            .expect("maven must resolve to an EcosystemId");
+        let doc_state = DocumentState::new_from_parse_result(ecosystem_id, content, parse_result);
 
         assert_eq!(doc_state.ecosystem_id, "maven");
         assert_eq!(doc_state.ecosystem, EcosystemId::Maven);
@@ -1016,7 +1028,8 @@ mod tests {
 
         #[test]
         fn test_document_state_creation() {
-            let state = DocumentState::new_without_parse_result("cargo", "test content".into());
+            let state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test content".into());
 
             assert_eq!(state.ecosystem, EcosystemId::Cargo);
             assert_eq!(state.content, "test content");
@@ -1025,7 +1038,8 @@ mod tests {
 
         #[test]
         fn test_document_state_update_versions() {
-            let mut state = DocumentState::new_without_parse_result("cargo", "test".into());
+            let mut state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             let mut versions = HashMap::new();
             versions.insert(
@@ -1046,7 +1060,8 @@ mod tests {
         fn test_server_state_document_operations() {
             let state = ServerState::new();
             let uri = deps_core::test_util::test_uri("/test.toml");
-            let doc_state = DocumentState::new_without_parse_result("cargo", "test".into());
+            let doc_state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             state.update_document(uri.clone(), doc_state);
             assert_eq!(state.document_count(), 1);
@@ -1083,8 +1098,11 @@ mod tests {
                 .block_on(ecosystem.parse_manifest(&content, &uri))
                 .unwrap();
 
-            let doc_state =
-                DocumentState::new_from_parse_result("cargo", content.clone(), parse_result);
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.clone(),
+                parse_result,
+            );
 
             assert_eq!(doc_state.ecosystem_id, "cargo");
             assert_eq!(doc_state.content, content);
@@ -1094,7 +1112,7 @@ mod tests {
         #[test]
         fn test_document_state_new_without_parse_result() {
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
-            let doc_state = DocumentState::new_without_parse_result("cargo", content);
+            let doc_state = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             assert_eq!(doc_state.ecosystem_id, "cargo");
             assert_eq!(doc_state.ecosystem, EcosystemId::Cargo);
@@ -1103,7 +1121,8 @@ mod tests {
 
         #[test]
         fn test_document_state_update_resolved_versions() {
-            let mut state = DocumentState::new_without_parse_result("cargo", "test".into());
+            let mut state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             let mut resolved = HashMap::new();
             resolved.insert("serde".into(), "1.0.195".into());
@@ -1118,7 +1137,8 @@ mod tests {
 
         #[test]
         fn test_document_state_update_cached_versions() {
-            let mut state = DocumentState::new_without_parse_result("cargo", "test".into());
+            let mut state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             let mut cached = HashMap::new();
             cached.insert("serde".into(), "1.0.210".into());
@@ -1129,13 +1149,14 @@ mod tests {
 
         #[test]
         fn test_document_state_parse_result_accessor() {
-            let state = DocumentState::new_without_parse_result("cargo", "test".into());
+            let state = DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
             assert!(state.parse_result().is_none());
         }
 
         #[test]
         fn test_document_state_clone() {
-            let state = DocumentState::new_without_parse_result("cargo", "test content".into());
+            let state =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test content".into());
             let cloned = state.clone();
 
             assert_eq!(cloned.ecosystem, state.ecosystem);
@@ -1145,7 +1166,7 @@ mod tests {
 
         #[test]
         fn test_document_state_debug() {
-            let state = DocumentState::new_without_parse_result("cargo", "test".into());
+            let state = DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
             let debug_str = format!("{state:?}");
             assert!(debug_str.contains("DocumentState"));
         }
@@ -1172,7 +1193,7 @@ mod tests {
         #[test]
         fn test_document_state_new_without_parse_result() {
             let content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
-            let doc_state = DocumentState::new_without_parse_result("npm", content);
+            let doc_state = DocumentState::new_without_parse_result(EcosystemId::Npm, content);
 
             assert_eq!(doc_state.ecosystem_id, "npm");
             assert_eq!(doc_state.ecosystem, EcosystemId::Npm);
@@ -1201,7 +1222,7 @@ mod tests {
         #[test]
         fn test_document_state_new_without_parse_result() {
             let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n".to_string();
-            let doc_state = DocumentState::new_without_parse_result("pypi", content);
+            let doc_state = DocumentState::new_without_parse_result(EcosystemId::Pypi, content);
 
             assert_eq!(doc_state.ecosystem_id, "pypi");
             assert_eq!(doc_state.ecosystem, EcosystemId::Pypi);
@@ -1262,7 +1283,7 @@ mod tests {
             let content =
                 "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n"
                     .to_string();
-            let doc_state = DocumentState::new_without_parse_result("go", content);
+            let doc_state = DocumentState::new_without_parse_result(EcosystemId::Go, content);
 
             assert_eq!(doc_state.ecosystem_id, "go");
             assert_eq!(doc_state.ecosystem, EcosystemId::Go);
@@ -1283,8 +1304,11 @@ mod tests {
                 .block_on(ecosystem.parse_manifest(&content, &uri))
                 .unwrap();
 
-            let doc_state =
-                DocumentState::new_from_parse_result("go", content.clone(), parse_result);
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Go,
+                content.clone(),
+                parse_result,
+            );
 
             assert_eq!(doc_state.ecosystem_id, "go");
             assert!(doc_state.parse_result.is_some());

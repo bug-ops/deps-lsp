@@ -9,6 +9,7 @@
 //! These benchmarks test user-facing performance - the most critical bottleneck.
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use deps_core::EcosystemId;
 use deps_lsp::config::DepsConfig;
 use deps_lsp::document::{DocumentState, ServerState};
 use deps_lsp::handlers::{completion, hover, inlay_hints};
@@ -71,7 +72,7 @@ async fn setup_document(state: &ServerState, uri: &Uri, content: &str) {
         .expect("Parse failed");
 
     let doc_state =
-        DocumentState::new_from_parse_result("cargo", content.to_string(), parse_result);
+        DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse_result);
     state.update_document(uri.clone(), doc_state);
 }
 
@@ -387,7 +388,7 @@ fn bench_cold_start_loading(c: &mut Criterion) {
                         .expect("Parse failed");
 
                     let _doc_state = DocumentState::new_from_parse_result(
-                        "cargo",
+                        EcosystemId::Cargo,
                         content.to_string(),
                         parse_result,
                     );

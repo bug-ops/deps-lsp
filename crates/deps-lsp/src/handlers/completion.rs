@@ -609,7 +609,7 @@ mod tests {
         let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
         let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
 
-        let doc = DocumentState::new_from_parse_result("cargo", content, parse_result);
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
@@ -1068,7 +1068,7 @@ ser"
         .to_string();
 
         // Create document without parse result (simulating parse failure)
-        let doc = DocumentState::new_without_parse_result("cargo", content.clone());
+        let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content.clone());
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
