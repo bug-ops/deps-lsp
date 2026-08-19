@@ -1,7 +1,7 @@
 use crate::error::{DepsError, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use reqwest::{Client, StatusCode, header};
+use reqwest::{Client, Response, StatusCode, header};
 use std::time::Instant;
 
 /// Maximum number of cached entries to prevent unbounded memory growth.
@@ -9,6 +9,15 @@ const MAX_CACHE_ENTRIES: usize = 1000;
 
 /// HTTP request timeout in seconds.
 const HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Maximum decompressed response body size accepted from a single request.
+///
+/// `reqwest`'s `gzip` feature strips `Content-Length`/`Content-Encoding` after
+/// decoding a response, so a header-based pre-check cannot bound body size
+/// (`response.content_length()` is `None` for every decoded response). This
+/// cap is instead enforced by counting bytes as the body streams in, aborting
+/// as soon as the running total would exceed the limit.
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Percentage of cache entries to evict when capacity is reached.
 const CACHE_EVICTION_PERCENTAGE: usize = 10;
@@ -28,6 +37,37 @@ fn ensure_https(url: &str) -> Result<()> {
     #[cfg(test)]
     let _ = url; // Silence unused warning in tests
     Ok(())
+}
+
+/// Reads a response body incrementally, aborting once it exceeds
+/// [`MAX_RESPONSE_BYTES`].
+///
+/// Chunked reading (via [`Response::chunk`]) is required because the
+/// decompressed body size is not known upfront: `gzip` decoding strips
+/// `Content-Length`, so the only reliable guard against an oversized or
+/// maliciously amplified (decompression-bomb) response is counting bytes
+/// as they arrive and bailing before the whole body is buffered.
+async fn read_body_capped(url: &str, mut response: Response) -> Result<Bytes> {
+    let mut body = BytesMut::new();
+
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| DepsError::RegistryError {
+            package: url.to_string(),
+            source: e,
+        })?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(DepsError::ResponseTooLarge {
+                url: url.to_string(),
+                limit: MAX_RESPONSE_BYTES,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body.freeze())
 }
 
 /// Cached HTTP response with validation headers.
@@ -130,8 +170,10 @@ impl HttpCache {
     ///
     /// # Errors
     ///
-    /// Returns `DepsError::RegistryError` if the initial fetch fails or
-    /// if no cached data exists and the network is unavailable.
+    /// Returns `DepsError::RegistryError` if the initial fetch fails and no
+    /// cached data exists, `DepsError::CacheError` if the server returns a
+    /// non-2xx status on that initial fetch, or `DepsError::ResponseTooLarge`
+    /// if the response body exceeds the configured size cap.
     ///
     /// # Examples
     ///
@@ -145,37 +187,20 @@ impl HttpCache {
     /// # }
     /// ```
     pub async fn get_cached(&self, url: &str) -> Result<Bytes> {
-        // Evict old entries if cache is at capacity
-        if self.entries.len() >= MAX_CACHE_ENTRIES {
-            self.evict_entries();
-        }
-
-        if let Some(cached) = self.entries.get(url).map(|r| r.clone()) {
-            // Clone and drop the DashMap Ref immediately to release the shard lock.
-            // Holding a Ref across .await causes deadlocks when concurrent tasks
-            // need write access to the same shard (e.g., conditional_request → insert).
-            match self.conditional_request(url, &cached).await {
-                Ok(Some(new_body)) => {
-                    return Ok(new_body);
-                }
-                Ok(None) => {
-                    return Ok(cached.body);
-                }
-                Err(e) => {
-                    tracing::warn!("conditional request failed, using cache: {e}");
-                    return Ok(cached.body);
-                }
-            }
-        }
-
-        // No cache entry - fetch fresh
-        self.fetch_and_store(url).await
+        self.get_cached_with_headers(url, &[]).await
     }
 
     /// Fetches a URL with additional request headers, using the cache.
     ///
     /// Works the same as `get_cached` but injects extra headers (e.g., Authorization)
     /// into every request. Useful for APIs that require authentication tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DepsError::RegistryError` if the initial fetch fails and no
+    /// cached data exists, `DepsError::CacheError` if the server returns a
+    /// non-2xx status on that initial fetch, or `DepsError::ResponseTooLarge`
+    /// if the response body exceeds the configured size cap.
     pub async fn get_cached_with_headers(
         &self,
         url: &str,
@@ -185,6 +210,9 @@ impl HttpCache {
             self.evict_entries();
         }
 
+        // Clone and drop the DashMap Ref immediately to release the shard lock.
+        // Holding a Ref across .await causes deadlocks when concurrent tasks
+        // need write access to the same shard (e.g., conditional_request_with_headers → insert).
         if let Some(cached) = self.entries.get(url).map(|r| r.clone()) {
             match self
                 .conditional_request_with_headers(url, &cached, extra_headers)
@@ -212,128 +240,6 @@ impl HttpCache {
     /// - `Ok(Some(Bytes))` - Server returned 200 OK with new content
     /// - `Ok(None)` - Server returned 304 Not Modified (cache is valid)
     /// - `Err(_)` - Network or HTTP error occurred
-    async fn conditional_request(
-        &self,
-        url: &str,
-        cached: &CachedResponse,
-    ) -> Result<Option<Bytes>> {
-        ensure_https(url)?;
-        let mut request = self.client.get(url);
-
-        if let Some(etag) = &cached.etag {
-            request = request.header(header::IF_NONE_MATCH, etag);
-        }
-        if let Some(last_modified) = &cached.last_modified {
-            request = request.header(header::IF_MODIFIED_SINCE, last_modified);
-        }
-
-        let response = request.send().await.map_err(|e| DepsError::RegistryError {
-            package: url.to_string(),
-            source: e,
-        })?;
-
-        if response.status() == StatusCode::NOT_MODIFIED {
-            // 304 Not Modified - content unchanged
-            return Ok(None);
-        }
-
-        // 200 OK - content changed
-        let etag = response
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let last_modified = response
-            .headers()
-            .get(header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| DepsError::RegistryError {
-                package: url.to_string(),
-                source: e,
-            })?;
-
-        // Update cache with new response
-        self.entries.insert(
-            url.to_string(),
-            CachedResponse {
-                body: body.clone(),
-                etag,
-                last_modified,
-                fetched_at: Instant::now(),
-            },
-        );
-
-        Ok(Some(body))
-    }
-
-    /// Fetches a fresh response from the network and stores it in the cache.
-    ///
-    /// This method bypasses the cache and always makes a network request.
-    /// The response is stored with its ETag and Last-Modified headers for
-    /// future conditional requests.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DepsError::CacheError` if the server returns a non-2xx status code,
-    /// or `DepsError::RegistryError` if the network request fails.
-    pub(crate) async fn fetch_and_store(&self, url: &str) -> Result<Bytes> {
-        ensure_https(url)?;
-        tracing::debug!("fetching fresh: {url}");
-
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| DepsError::RegistryError {
-                package: url.to_string(),
-                source: e,
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            return Err(DepsError::CacheError(format!("HTTP {status} for {url}")));
-        }
-
-        let etag = response
-            .headers()
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let last_modified = response
-            .headers()
-            .get(header::LAST_MODIFIED)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| DepsError::RegistryError {
-                package: url.to_string(),
-                source: e,
-            })?;
-
-        self.entries.insert(
-            url.to_string(),
-            CachedResponse {
-                body: body.clone(),
-                etag,
-                last_modified,
-                fetched_at: Instant::now(),
-            },
-        );
-
-        Ok(body)
-    }
-
     async fn conditional_request_with_headers(
         &self,
         url: &str,
@@ -377,13 +283,7 @@ impl HttpCache {
             .get(header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| DepsError::RegistryError {
-                package: url.to_string(),
-                source: e,
-            })?;
+        let body = read_body_capped(url, response).await?;
 
         self.entries.insert(
             url.to_string(),
@@ -398,13 +298,25 @@ impl HttpCache {
         Ok(Some(body))
     }
 
+    /// Fetches a fresh response from the network and stores it in the cache.
+    ///
+    /// This method bypasses the cache and always makes a network request.
+    /// The response is stored with its ETag and Last-Modified headers for
+    /// future conditional requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DepsError::CacheError` if the server returns a non-2xx status code,
+    /// `DepsError::RegistryError` if the network request fails, or
+    /// `DepsError::ResponseTooLarge` if the response body exceeds the
+    /// configured size cap.
     async fn fetch_and_store_with_headers(
         &self,
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
         ensure_https(url)?;
-        tracing::debug!("fetching fresh with headers: {url}");
+        tracing::debug!(extra_headers = extra_headers.len(), "fetching fresh: {url}");
 
         let mut request = self.client.get(url);
         for (name, value) in extra_headers {
@@ -431,13 +343,7 @@ impl HttpCache {
             .get(header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| DepsError::RegistryError {
-                package: url.to_string(),
-                source: e,
-            })?;
+        let body = read_body_capped(url, response).await?;
 
         self.entries.insert(
             url.to_string(),
@@ -762,7 +668,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/missing", server.url());
-        let result: Result<Bytes> = cache.fetch_and_store(&url).await;
+        let result: Result<Bytes> = cache.fetch_and_store_with_headers(&url, &[]).await;
 
         assert!(result.is_err());
         match result {
@@ -788,7 +694,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/data", server.url());
-        let _: Bytes = cache.fetch_and_store(&url).await.unwrap();
+        let _: Bytes = cache.fetch_and_store_with_headers(&url, &[]).await.unwrap();
 
         let cached = cache.entries.get(&url).unwrap();
         assert_eq!(cached.etag, Some("\"abc123\"".into()));
@@ -796,5 +702,110 @@ mod tests {
             cached.last_modified,
             Some("Wed, 21 Oct 2024 07:28:00 GMT".into())
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_with_headers_sends_extra_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+
+        let _m = server
+            .mock("GET", "/api/data")
+            .match_header("authorization", "Bearer token123")
+            .with_status(200)
+            .with_header("etag", "\"abc123\"")
+            .with_body("authed data")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let headers = [(header::AUTHORIZATION, "Bearer token123")];
+        let result: Bytes = cache.get_cached_with_headers(&url, &headers).await.unwrap();
+
+        assert_eq!(result.as_ref(), b"authed data");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_and_store_rejects_oversized_response() {
+        let mut server = mockito::Server::new_async().await;
+        let oversized_body = vec![0u8; MAX_RESPONSE_BYTES + 1];
+
+        let _m = server
+            .mock("GET", "/api/huge")
+            .with_status(200)
+            .with_body(oversized_body)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let url = format!("{}/api/huge", server.url());
+        let result: Result<Bytes> = cache.fetch_and_store_with_headers(&url, &[]).await;
+
+        match result {
+            Err(DepsError::ResponseTooLarge { limit, .. }) => {
+                assert_eq!(limit, MAX_RESPONSE_BYTES);
+            }
+            other => panic!("expected ResponseTooLarge, got {other:?}"),
+        }
+
+        // The oversized response must not have been cached.
+        assert!(cache.entries.get(&url).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_and_store_accepts_response_at_exact_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let exact_cap_body = vec![0u8; MAX_RESPONSE_BYTES];
+
+        let _m = server
+            .mock("GET", "/api/exact")
+            .with_status(200)
+            .with_body(exact_cap_body)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let url = format!("{}/api/exact", server.url());
+        let result: Bytes = cache.fetch_and_store_with_headers(&url, &[]).await.unwrap();
+
+        assert_eq!(result.len(), MAX_RESPONSE_BYTES);
+        assert!(cache.entries.get(&url).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_non_2xx_on_refresh_preserves_stale_cache() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+
+        let cache = HttpCache::new();
+        cache.entries.insert(
+            url.clone(),
+            CachedResponse {
+                body: Bytes::from_static(b"stale but good"),
+                etag: Some("\"stale-etag\"".into()),
+                last_modified: None,
+                fetched_at: Instant::now(),
+            },
+        );
+
+        // Registry is down for maintenance: the conditional request gets a
+        // non-2xx, non-304 response instead of either "unchanged" or "here's
+        // the new body".
+        let _m = server
+            .mock("GET", "/api/data")
+            .match_header("if-none-match", "\"stale-etag\"")
+            .with_status(503)
+            .with_body("<html>maintenance</html>")
+            .create_async()
+            .await;
+
+        let result: Bytes = cache.get_cached(&url).await.unwrap();
+
+        // The stale-while-revalidate fallback returns the last-known-good
+        // body, and the cache entry is left untouched rather than being
+        // overwritten with the error page.
+        assert_eq!(result.as_ref(), b"stale but good");
+        let cached = cache.entries.get(&url).unwrap();
+        assert_eq!(cached.etag, Some("\"stale-etag\"".into()));
     }
 }

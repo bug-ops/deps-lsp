@@ -43,6 +43,9 @@ pub enum DepsError {
     #[error("cache error: {0}")]
     CacheError(String),
 
+    #[error("response body for {url} exceeds {limit} byte limit")]
+    ResponseTooLarge { url: String, limit: usize },
+
     #[error("invalid version requirement: {0}")]
     InvalidVersionReq(String),
 
@@ -89,6 +92,18 @@ mod tests {
     fn test_error_display() {
         let error = DepsError::CacheError("test error".into());
         assert_eq!(error.to_string(), "cache error: test error");
+    }
+
+    #[test]
+    fn test_response_too_large() {
+        let error = DepsError::ResponseTooLarge {
+            url: "https://example.com/data".into(),
+            limit: 32 * 1024 * 1024,
+        };
+        assert_eq!(
+            error.to_string(),
+            "response body for https://example.com/data exceeds 33554432 byte limit"
+        );
     }
 
     #[test]
