@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Bump `yaml-rust2` 0.11 → 0.12 (routine dependency update, no functional changes) (resolves #115)
+- Bump `h2` (transitive, via `reqwest`/`hyper`) 0.4.15 → 0.4.17, patching RUSTSEC-2026-0258 (unbounded empty DATA frames) (resolves #116)
 
 ### Fixed
 - **CI**: the `test` job's matrix `include` entries for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` matched the same base `(ubuntu-latest, stable)` combination, so the second silently overwrote the first — `x86_64-unknown-linux-musl` was never actually checked in CI. Cross-compile checks (both musl targets plus `aarch64-pc-windows-msvc`) now run in a dedicated `cross-check` job with no shared base matrix axis, so `include` entries can no longer collide (resolves #109)
