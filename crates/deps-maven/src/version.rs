@@ -29,10 +29,18 @@ fn contains_milestone_qualifier(upper: &str) -> bool {
     false
 }
 
-/// Compares two Maven version strings.
+/// Compares two Maven version strings by dot/dash-separated segment.
 ///
-/// Splits on `.` and `-`, compares numeric segments numerically,
-/// string segments lexicographically.
+/// Each segment is classified as purely numeric (all ASCII digits) or a
+/// non-numeric qualifier. A numeric segment always outranks a non-numeric
+/// qualifier at the same position, which keeps legacy Maven identifiers such
+/// as Guava's bare `r03`..`r09` release tags below properly-formed numeric
+/// releases (e.g. `33.7.1-jre`). Two numeric segments compare by magnitude
+/// (leading zeros ignored, no size limit); two non-numeric segments compare
+/// lexicographically.
+// TODO(critic): qualifier segments still outrank the empty padding segment,
+// so `1.0.0-RC1` compares Greater than `1.0.0`; see #127 for
+// prerelease-vs-base-release ordering.
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
     let a_parts = split_version(a);
     let b_parts = split_version(b);
@@ -58,11 +66,40 @@ fn split_version(v: &str) -> Vec<String> {
         .collect()
 }
 
+/// Compares a single dot/dash-separated version segment.
+///
+/// A purely numeric segment always outranks a non-numeric one: legacy Maven
+/// qualifiers such as Guava's bare `r03`..`r09` identifiers must sort below
+/// properly-formed numeric releases (e.g. `33.7.1-jre`), not above them via a
+/// raw ASCII string comparison (`'r' > '3'`). When neither segment is
+/// numeric, they fall back to lexicographic order, which still ranks
+/// `r09 > r08 > ... > r03` correctly relative to each other.
 fn compare_segment(a: &str, b: &str) -> Ordering {
-    match (a.parse::<u64>(), b.parse::<u64>()) {
-        (Ok(an), Ok(bn)) => an.cmp(&bn),
-        _ => a.cmp(b),
+    match (is_numeric_segment(a), is_numeric_segment(b)) {
+        (true, true) => compare_numeric_segments(a, b),
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.cmp(b),
     }
+}
+
+/// A segment is numeric only if every byte is an ASCII digit; classifying by
+/// character class (rather than `str::parse::<u64>` success) means a segment
+/// with more than 20 digits is still treated as numeric instead of silently
+/// falling through to the non-numeric branch.
+fn is_numeric_segment(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Compares two all-digit segments by magnitude, ignoring leading zeros.
+///
+/// Digit strings of equal length compare identically whether by numeric
+/// value or by lexicographic byte order, so this avoids parsing into a
+/// fixed-width integer type and has no size limit.
+fn compare_numeric_segments(a: &str, b: &str) -> Ordering {
+    let a = a.trim_start_matches('0');
+    let b = b.trim_start_matches('0');
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
 #[cfg(test)]
@@ -101,5 +138,44 @@ mod tests {
     #[test]
     fn test_exact_match() {
         assert_eq!(compare_versions("3.14.0", "3.14.0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_numeric_release_outranks_bare_qualifier() {
+        // Guava scenario: r03-r09 are legacy bare qualifiers that must not
+        // outrank properly-formed numeric releases.
+        assert_eq!(compare_versions("33.7.1-jre", "r09"), Ordering::Greater);
+        assert_eq!(compare_versions("r09", "33.7.1-jre"), Ordering::Less);
+        assert_eq!(compare_versions("14.0", "r09"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_bare_qualifiers_ordered_relative_to_each_other() {
+        assert_eq!(compare_versions("r09", "r03"), Ordering::Greater);
+        assert_eq!(compare_versions("r03", "r09"), Ordering::Less);
+        assert_eq!(compare_versions("r05", "r05"), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_numeric_segment_outranks_qualifier_mid_version() {
+        // "1.0-final" has a non-numeric third segment; a numeric segment at
+        // the same position must still outrank it.
+        assert_eq!(compare_versions("1.0.1", "1.0-final"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_numeric_segment_beyond_u64_range() {
+        // A 20-digit segment overflows u64::MAX (20 digits) but must still be
+        // classified and compared as numeric, not fall through to the
+        // non-numeric lexicographic branch.
+        assert_eq!(
+            compare_versions("1.99999999999999999999", "1.2"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.100000000000000000000", "1.99999999999999999999"),
+            Ordering::Greater
+        );
+        assert_eq!(compare_versions("1.007", "1.07"), Ordering::Equal);
     }
 }

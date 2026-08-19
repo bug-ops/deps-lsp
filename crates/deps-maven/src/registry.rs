@@ -440,8 +440,8 @@ mod tests {
 
     #[test]
     fn test_parse_metadata_xml_legacy_versions_release_wins() {
-        // Guava scenario: legacy r03-r09 versions sort higher than semver versions
-        // lexicographically, but <release> must be used as authoritative latest stable.
+        // Guava scenario: legacy bare-qualifier r03-r09 releases must sort below
+        // properly-formed numeric releases, and <release> is authoritative for latest stable.
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <metadata>
   <groupId>com.google.guava</groupId>
@@ -463,9 +463,13 @@ mod tests {
         let (versions, release) = parse_metadata_xml(xml.as_bytes()).unwrap();
         assert_eq!(versions.len(), 6);
         assert_eq!(release.as_deref(), Some("33.5.0-jre"));
-        // versions are sorted descending by compare_versions; r09 may sort to top due to
-        // lexicographic fallback — the release field must override this
-        assert_ne!(versions[0].version, "33.5.0-jre", "sort puts r09 first");
+
+        let ordered: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(
+            ordered,
+            vec!["33.5.0-jre", "33.4.0-jre", "14.0", "r09", "r05", "r03"],
+            "numeric releases must sort above legacy bare qualifiers"
+        );
     }
 
     #[test]
