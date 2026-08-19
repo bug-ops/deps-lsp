@@ -13,6 +13,5 @@ mod state;
 pub use lifecycle::{ensure_document_loaded, handle_document_change, handle_document_open};
 pub use loader::load_document_from_disk;
 pub use state::{
-    ColdStartLimiter, DocumentState, Ecosystem, LoadingState, ServerState, UnifiedDependency,
-    UnifiedVersion,
+    ColdStartLimiter, DocumentState, LoadingState, ServerState, UnifiedDependency, UnifiedVersion,
 };

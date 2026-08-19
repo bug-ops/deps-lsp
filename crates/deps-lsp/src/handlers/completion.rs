@@ -4,6 +4,7 @@
 
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
+use deps_core::EcosystemId;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -133,8 +134,14 @@ async fn fallback_completion(
 
     tracing::info!("fallback_completion: line content = {:?}", line);
 
-    // Check if we're in a dependencies section
-    if !is_in_dependencies_section(content, position.line as usize, ecosystem_id) {
+    // Check if we're in a dependencies section. An ecosystem id that doesn't parse is
+    // not registered, so there is no fallback to offer (mirrors the `ecosystem_registry
+    // .get` lookup below, which fails the same way for the same reason).
+    let Ok(ecosystem_kind) = ecosystem_id.parse::<EcosystemId>() else {
+        tracing::warn!("fallback_completion: unknown ecosystem id {ecosystem_id:?}");
+        return vec![];
+    };
+    if !is_in_dependencies_section(content, position.line as usize, ecosystem_kind) {
         tracing::info!("fallback_completion: not in dependencies section");
         return vec![];
     }
@@ -161,15 +168,61 @@ async fn fallback_completion(
     let registry = ecosystem.registry();
 
     // Search for packages matching the prefix
-    search_packages(registry.as_ref(), ecosystem_id, prefix).await
+    search_packages(registry.as_ref(), ecosystem_kind, prefix).await
 }
 
 /// Checks if a line is inside a dependencies section.
-fn is_in_dependencies_section(content: &str, line_number: usize, ecosystem_id: &str) -> bool {
+///
+/// Dispatches to a per-ecosystem raw-text heuristic. Matching on [`EcosystemId`]
+/// rather than the raw ecosystem id string makes this exhaustive: adding a new
+/// ecosystem forces a decision here instead of silently disabling section-aware
+/// completion for it (see issue #118).
+fn is_in_dependencies_section(
+    content: &str,
+    line_number: usize,
+    ecosystem_id: EcosystemId,
+) -> bool {
     match ecosystem_id {
-        "cargo" | "pypi" => is_in_toml_dependencies(content, line_number),
-        "npm" => is_in_json_dependencies(content, line_number),
-        _ => false,
+        EcosystemId::Cargo | EcosystemId::Pypi => is_in_toml_dependencies(content, line_number),
+        EcosystemId::Npm => is_in_json_dependencies(
+            content,
+            line_number,
+            &[
+                "dependencies",
+                "devDependencies",
+                "peerDependencies",
+                "optionalDependencies",
+            ],
+        ),
+        EcosystemId::Composer => {
+            is_in_json_dependencies(content, line_number, &["require", "require-dev"])
+        }
+        EcosystemId::Maven => is_in_xml_tag_section(content, line_number, "dependencies"),
+        EcosystemId::Go => is_in_go_require(content, line_number),
+        EcosystemId::Dart => is_in_yaml_dependencies(content, line_number),
+        // TODO(#118 follow-up): Gemfile has no delimited dependencies section —
+        // `gem "name"` calls are valid anywhere at the top level or inside
+        // `group ... do ... end` blocks, so there is no raw-text boundary to detect.
+        // `false` matches the pre-fix behavior (fallback completion disabled) rather
+        // than `true`: `fallback_completion` fires on every keystroke where the
+        // ecosystem's own completion is empty, using the *whole trimmed line* as the
+        // search query (not a token), so a permissive `true` here would fire a live
+        // registry search on unrelated text and insert results with unrelated syntax.
+        EcosystemId::Bundler => false,
+        // TODO(#118 follow-up): Package.swift dependencies are `.package(...)` calls
+        // matched anywhere in the file by the real parser (not confined to the
+        // `dependencies: [...]` array), so there is no reliable raw-text section
+        // boundary here either. See the Bundler arm above for why this is `false`.
+        EcosystemId::Swift => false,
+        // TODO(#118 follow-up): Gradle spans five manifest formats (TOML version
+        // catalog, Groovy DSL, Kotlin DSL) with no raw-text section marker shared
+        // across all of them. See the Bundler arm above for why this is `false`.
+        EcosystemId::Gradle => false,
+        // TODO(#118 follow-up): NuGet spans three schemas: csproj/Directory.Packages
+        // .props nest PackageReference/PackageVersion in `<ItemGroup>`, while
+        // packages.config lists `<package>` elements directly under its root with no
+        // such wrapper. See the Bundler arm above for why this is `false`.
+        EcosystemId::NuGet => false,
     }
 }
 
@@ -204,14 +257,16 @@ fn is_in_toml_dependencies(content: &str, line_number: usize) -> bool {
     false
 }
 
-/// Checks if a line is inside a JSON dependencies section.
+/// Checks if a line is inside a JSON dependencies-like section.
 ///
-/// Looks for `"dependencies": {`, `"devDependencies": {`, etc. in package.json.
-fn is_in_json_dependencies(content: &str, line_number: usize) -> bool {
+/// Looks for `"{key}": {` for any of the given `keys`, e.g. `dependencies` /
+/// `devDependencies` in package.json, or `require` / `require-dev` in composer.json.
+fn is_in_json_dependencies(content: &str, line_number: usize, keys: &[&str]) -> bool {
     let mut in_dependencies = false;
     let mut brace_depth = 0;
+    // Build each `"{key}":` needle once per call rather than once per line.
+    let needles: Vec<String> = keys.iter().map(|key| format!("\"{key}\":")).collect();
 
-    // Use iterator directly without collecting to avoid allocation
     for (i, line) in content.lines().enumerate() {
         // Early exit: stop if we've passed the target line
         if i > line_number {
@@ -220,12 +275,11 @@ fn is_in_json_dependencies(content: &str, line_number: usize) -> bool {
 
         let trimmed = line.trim();
 
-        // Check if we're entering a dependencies section
+        // Check if we're entering a dependencies-like section
         if trimmed.starts_with('"')
-            && (trimmed.contains("\"dependencies\":")
-                || trimmed.contains("\"devDependencies\":")
-                || trimmed.contains("\"peerDependencies\":")
-                || trimmed.contains("\"optionalDependencies\":"))
+            && needles
+                .iter()
+                .any(|needle| trimmed.contains(needle.as_str()))
         {
             in_dependencies = true;
             brace_depth = 0;
@@ -257,10 +311,125 @@ fn is_in_json_dependencies(content: &str, line_number: usize) -> bool {
     false
 }
 
+/// Checks if a line is inside an XML `<tag>...</tag>` element.
+///
+/// Tracks nested open/close tag counts (ignoring attributes and self-closing tags) to
+/// find whether the target line falls within any occurrence of the element, e.g.
+/// `<dependencies>` in pom.xml (including nested inside `<dependencyManagement>`).
+fn is_in_xml_tag_section(content: &str, line_number: usize, tag: &str) -> bool {
+    let open_prefix = format!("<{tag}");
+    let close = format!("</{tag}>");
+    let mut depth: usize = 0;
+
+    for (i, line) in content.lines().enumerate() {
+        if i > line_number {
+            break;
+        }
+
+        let opens_here = count_open_tags(line, &open_prefix);
+        depth += opens_here;
+        // A line with an opening tag counts as "inside" even if the same line also
+        // closes it (`<dependencies></dependencies>`), consistent with the target
+        // line being the header itself in `is_in_toml_dependencies`.
+        if i == line_number && opens_here > 0 {
+            return true;
+        }
+
+        depth = depth.saturating_sub(line.matches(close.as_str()).count());
+        if i == line_number && depth > 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Counts real `<{open_prefix}...>` tag occurrences on `line`, i.e. `open_prefix`
+/// followed by `>` or whitespace (an attribute) rather than more tag-name characters
+/// (so `<dependencies` doesn't also match a longer, unrelated tag name).
+fn count_open_tags(line: &str, open_prefix: &str) -> usize {
+    let mut count = 0;
+    let mut search_from = 0;
+
+    while let Some(rel_idx) = line[search_from..].find(open_prefix) {
+        let idx = search_from + rel_idx;
+        let after = &line[idx + open_prefix.len()..];
+        if after.starts_with('>') || after.starts_with(char::is_whitespace) {
+            count += 1;
+        }
+        search_from = idx + open_prefix.len();
+    }
+
+    count
+}
+
+/// Checks if a line is inside a go.mod `require` directive.
+///
+/// Handles both the single-line form (`require module version`) and the
+/// parenthesized block form (`require (` ... `)`).
+fn is_in_go_require(content: &str, line_number: usize) -> bool {
+    let mut in_require_block = false;
+
+    for (i, line) in content.lines().enumerate() {
+        if i > line_number {
+            break;
+        }
+
+        let trimmed = line.trim();
+        let is_block_start = trimmed
+            .strip_prefix("require")
+            .is_some_and(|rest| rest.trim_start().starts_with('('));
+
+        if is_block_start {
+            in_require_block = true;
+        } else if in_require_block && trimmed.starts_with(')') {
+            in_require_block = false;
+        }
+
+        if i == line_number {
+            return in_require_block || is_block_start || trimmed.starts_with("require ");
+        }
+    }
+
+    false
+}
+
+/// Checks if a line is inside a pubspec.yaml dependency section.
+///
+/// Dart's `dependencies`, `dev_dependencies`, and `dependency_overrides` keys are
+/// top-level (unindented) YAML mappings; their entries stay part of the section until
+/// the next unindented key starts a new one.
+fn is_in_yaml_dependencies(content: &str, line_number: usize) -> bool {
+    const SECTION_KEYS: &[&str] = &[
+        "dependencies:",
+        "dev_dependencies:",
+        "dependency_overrides:",
+    ];
+    let mut in_dependencies = false;
+
+    for (i, line) in content.lines().enumerate() {
+        if i > line_number {
+            break;
+        }
+
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Top-level (unindented) key: starts a new section, or leaves the current one.
+        if trimmed.len() == line.len() {
+            in_dependencies = SECTION_KEYS.iter().any(|key| trimmed.starts_with(key));
+        }
+    }
+
+    in_dependencies
+}
+
 /// Searches for packages and returns completion items.
 async fn search_packages(
     registry: &dyn deps_core::Registry,
-    ecosystem_id: &str,
+    ecosystem_id: EcosystemId,
     query: &str,
 ) -> Vec<CompletionItem> {
     tracing::info!(
@@ -289,19 +458,30 @@ async fn search_packages(
 }
 
 /// Creates a completion item for a package.
+///
+/// The insert text mirrors each ecosystem's manifest syntax, exhaustively matched on
+/// [`EcosystemId`] so a new ecosystem must supply its own snippet instead of silently
+/// inheriting Cargo's `name = "version"` TOML syntax (see issue #118).
 fn create_package_completion_item(
     metadata: &dyn deps_core::Metadata,
-    ecosystem_id: &str,
+    ecosystem_id: EcosystemId,
 ) -> CompletionItem {
     let name = metadata.name();
     let latest = metadata.latest_version();
     let description = metadata.description();
 
-    // Create insert text based on ecosystem
     let insert_text = match ecosystem_id {
-        "cargo" | "pypi" => format!("{name} = \"{latest}\""),
-        "npm" => format!("\"{name}\": \"^{latest}\""),
-        _ => format!("{name} = \"{latest}\""),
+        EcosystemId::Cargo | EcosystemId::Pypi => format!("{name} = \"{latest}\""),
+        EcosystemId::Npm | EcosystemId::Composer => format!("\"{name}\": \"^{latest}\""),
+        EcosystemId::Go => format!("{name} {latest}"),
+        EcosystemId::Dart => format!("{name}: ^{latest}"),
+        EcosystemId::Maven => format!("<artifactId>{name}</artifactId><version>{latest}</version>"),
+        EcosystemId::Gradle => format!("implementation(\"{name}:{latest}\")"),
+        EcosystemId::Swift => format!(".package(url: \"{name}\", from: \"{latest}\")"),
+        EcosystemId::NuGet => {
+            format!("<PackageReference Include=\"{name}\" Version=\"{latest}\" />")
+        }
+        EcosystemId::Bundler => format!("gem \"{name}\", \"~> {latest}\""),
     };
 
     // Build detail text
@@ -465,6 +645,13 @@ tokio
         assert!(is_in_toml_dependencies(content, 5));
     }
 
+    const NPM_KEYS: &[&str] = &[
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ];
+
     #[test]
     fn test_is_in_json_dependencies_basic() {
         let content = r#"{
@@ -473,8 +660,8 @@ tokio
     "express"
   }
 }"#;
-        assert!(is_in_json_dependencies(content, 3));
-        assert!(!is_in_json_dependencies(content, 1));
+        assert!(is_in_json_dependencies(content, 3, NPM_KEYS));
+        assert!(!is_in_json_dependencies(content, 1, NPM_KEYS));
     }
 
     #[test]
@@ -484,7 +671,7 @@ tokio
     "jest": "^29.0.0"
   }
 }"#;
-        assert!(is_in_json_dependencies(content, 2));
+        assert!(is_in_json_dependencies(content, 2, NPM_KEYS));
     }
 
     #[test]
@@ -494,7 +681,7 @@ tokio
     "react"
   }
 }"#;
-        assert!(is_in_json_dependencies(content, 2));
+        assert!(is_in_json_dependencies(content, 2, NPM_KEYS));
     }
 
     #[test]
@@ -504,7 +691,7 @@ tokio
     "fsevents": "^2.0.0"
   }
 }"#;
-        assert!(is_in_json_dependencies(content, 2));
+        assert!(is_in_json_dependencies(content, 2, NPM_KEYS));
     }
 
     #[test]
@@ -518,8 +705,8 @@ tokio
     "start": "node index.js"
   }
 }"#;
-        assert!(is_in_json_dependencies(content, 3));
-        assert!(!is_in_json_dependencies(content, 6));
+        assert!(is_in_json_dependencies(content, 3, NPM_KEYS));
+        assert!(!is_in_json_dependencies(content, 6, NPM_KEYS));
     }
 
     #[test]
@@ -529,7 +716,29 @@ tokio
     "package": "1.0.0"
   }
 }"#;
-        assert!(is_in_json_dependencies(content, 2));
+        assert!(is_in_json_dependencies(content, 2, NPM_KEYS));
+    }
+
+    #[test]
+    fn test_is_in_json_dependencies_custom_keys() {
+        let content = r#"{
+  "require": {
+    "monolog/monolog": "^2.0"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^9.0"
+  }
+}"#;
+        assert!(is_in_json_dependencies(
+            content,
+            2,
+            &["require", "require-dev"]
+        ));
+        assert!(is_in_json_dependencies(
+            content,
+            5,
+            &["require", "require-dev"]
+        ));
     }
 
     #[test]
@@ -538,8 +747,8 @@ tokio
 [dependencies]
 serde
 ";
-        assert!(is_in_dependencies_section(content, 2, "cargo"));
-        assert!(!is_in_dependencies_section(content, 0, "cargo"));
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::Cargo));
+        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Cargo));
     }
 
     #[test]
@@ -548,7 +757,7 @@ serde
 [project.dependencies]
 requests
 ";
-        assert!(is_in_dependencies_section(content, 2, "pypi"));
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::Pypi));
     }
 
     #[test]
@@ -558,16 +767,127 @@ requests
     "express"
   }
 }"#;
-        assert!(is_in_dependencies_section(content, 2, "npm"));
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::Npm));
     }
 
     #[test]
-    fn test_is_in_dependencies_section_unknown_ecosystem() {
+    fn test_is_in_dependencies_section_composer() {
+        let content = r#"{
+  "require": {
+    "monolog/monolog": "^2.0"
+  },
+  "scripts": {
+    "test": "phpunit"
+  }
+}"#;
+        assert!(is_in_dependencies_section(
+            content,
+            2,
+            EcosystemId::Composer
+        ));
+        assert!(!is_in_dependencies_section(
+            content,
+            5,
+            EcosystemId::Composer
+        ));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_maven() {
         let content = r"
-[dependencies]
-something
+<project>
+  <dependencies>
+    <dependency></dependency>
+  </dependencies>
+</project>
 ";
-        assert!(!is_in_dependencies_section(content, 2, "unknown"));
+        assert!(is_in_dependencies_section(content, 3, EcosystemId::Maven));
+        assert!(!is_in_dependencies_section(content, 1, EcosystemId::Maven));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_maven_single_line() {
+        let content = "<project><dependencies></dependencies></project>\n";
+        assert!(is_in_dependencies_section(content, 0, EcosystemId::Maven));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_maven_attributed_tag() {
+        let content = r#"
+<project>
+  <dependencies xmlns="http://maven.apache.org/POM/4.0.0">
+    <dependency></dependency>
+  </dependencies>
+</project>
+"#;
+        assert!(is_in_dependencies_section(content, 3, EcosystemId::Maven));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_maven_no_false_positive_on_longer_tag_name() {
+        let content = r"
+<project>
+  <dependencyManagement>
+    <dependencies>
+      <dependency></dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+";
+        // Line 2 opens `<dependencyManagement>`, not `<dependencies>` — must not match.
+        assert!(!is_in_dependencies_section(content, 2, EcosystemId::Maven));
+        // Line 4 is genuinely inside the nested `<dependencies>` block.
+        assert!(is_in_dependencies_section(content, 4, EcosystemId::Maven));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_go_single_line() {
+        let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.1\n";
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::Go));
+        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Go));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_go_block() {
+        let content =
+            "module example.com/myapp\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n)\n";
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::Go));
+        assert!(is_in_dependencies_section(content, 3, EcosystemId::Go));
+        assert!(!is_in_dependencies_section(content, 4, EcosystemId::Go));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_dart() {
+        let content =
+            "name: myapp\ndependencies:\n  http: ^1.0.0\nenvironment:\n  sdk: '>=3.0.0'\n";
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::Dart));
+        assert!(!is_in_dependencies_section(content, 4, EcosystemId::Dart));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_dart_column_zero_comment() {
+        // A column-0 `#` comment inside a section must not read as a new top-level
+        // key and reset `in_dependencies` to false.
+        let content = "name: myapp\ndependencies:\n# a comment\n  http: ^1.0.0\n";
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::Dart));
+        assert!(is_in_dependencies_section(content, 3, EcosystemId::Dart));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_no_raw_text_boundary_ecosystems() {
+        // No existing raw-text section boundary: `false` preserves pre-fix behavior
+        // (fallback completion disabled) rather than risking spurious registry
+        // searches on arbitrary lines. See the TODO comments in
+        // `is_in_dependencies_section` for the per-ecosystem rationale.
+        let content = "anything at all\n";
+        assert!(!is_in_dependencies_section(
+            content,
+            0,
+            EcosystemId::Bundler
+        ));
+        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Swift));
+        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Gradle));
+        assert!(!is_in_dependencies_section(content, 0, EcosystemId::NuGet));
     }
 
     #[test]
@@ -595,7 +915,7 @@ something
         }
 
         let meta = MockMetadata;
-        let item = create_package_completion_item(&meta, "cargo");
+        let item = create_package_completion_item(&meta, EcosystemId::Cargo);
 
         assert_eq!(item.label, "serde");
         assert_eq!(item.kind, Some(CompletionItemKind::MODULE));
@@ -629,7 +949,7 @@ something
         }
 
         let meta = MockMetadata;
-        let item = create_package_completion_item(&meta, "npm");
+        let item = create_package_completion_item(&meta, EcosystemId::Npm);
 
         assert_eq!(item.label, "express");
         assert_eq!(
@@ -663,7 +983,7 @@ something
         }
 
         let meta = MockMetadata;
-        let item = create_package_completion_item(&meta, "pypi");
+        let item = create_package_completion_item(&meta, EcosystemId::Pypi);
 
         assert_eq!(item.label, "requests");
         assert_eq!(item.insert_text, Some("requests = \"2.31.0\"".to_string()));
@@ -671,7 +991,7 @@ something
 
     #[tokio::test]
     async fn test_fallback_triggered_when_parse_fails() {
-        use crate::document::Ecosystem;
+        use deps_core::EcosystemId;
 
         let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -682,7 +1002,7 @@ ser"
         .to_string();
 
         // Create document without parse result (simulating parse failure)
-        let doc = DocumentState::new(Ecosystem::Cargo, content.clone(), vec![]);
+        let doc = DocumentState::new(EcosystemId::Cargo, content.clone(), vec![]);
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
@@ -701,6 +1021,15 @@ ser"
         // Just verify it doesn't panic - actual results depend on registry availability
         // In a real scenario with mocked registry, we'd verify it returns search results
         drop(result);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_completion_unknown_ecosystem_id_returns_empty() {
+        let state = ServerState::new();
+        let content = "[dependencies]\nserde\n".to_string();
+
+        let items = fallback_completion(&state, "unknown", Position::new(1, 5), &content).await;
+        assert!(items.is_empty());
     }
 
     #[test]
