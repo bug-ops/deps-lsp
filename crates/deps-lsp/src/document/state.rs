@@ -3,69 +3,10 @@ use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
 use deps_core::{EcosystemId, EcosystemRegistry, ParseResult};
 use std::collections::HashMap;
-
-#[cfg(feature = "cargo")]
-use deps_cargo::CargoVersion;
-#[cfg(feature = "go")]
-use deps_go::GoVersion;
-#[cfg(feature = "npm")]
-use deps_npm::NpmVersion;
-#[cfg(feature = "pypi")]
-use deps_pypi::PypiVersion;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tower_lsp_server::ls_types::Uri;
-
-/// Unified version information enum for multi-ecosystem support.
-///
-/// Wraps ecosystem-specific version types.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum UnifiedVersion {
-    #[cfg(feature = "cargo")]
-    Cargo(CargoVersion),
-    #[cfg(feature = "npm")]
-    Npm(NpmVersion),
-    #[cfg(feature = "pypi")]
-    Pypi(PypiVersion),
-    #[cfg(feature = "go")]
-    Go(GoVersion),
-}
-
-impl UnifiedVersion {
-    /// Returns the version number as a string.
-    #[allow(unreachable_patterns)]
-    pub fn version_string(&self) -> &str {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(v) => &v.num,
-            #[cfg(feature = "npm")]
-            Self::Npm(v) => &v.version,
-            #[cfg(feature = "pypi")]
-            Self::Pypi(v) => &v.version,
-            #[cfg(feature = "go")]
-            Self::Go(v) => &v.version,
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-
-    /// Returns true if this version is yanked/deprecated.
-    #[allow(unreachable_patterns)]
-    pub fn is_yanked(&self) -> bool {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(v) => v.yanked,
-            #[cfg(feature = "npm")]
-            Self::Npm(v) => v.deprecated,
-            #[cfg(feature = "pypi")]
-            Self::Pypi(v) => v.yanked,
-            #[cfg(feature = "go")]
-            Self::Go(v) => v.retracted,
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-}
 
 // Re-export LoadingState from deps-core for convenience
 pub use deps_core::LoadingState;
@@ -89,7 +30,7 @@ pub use deps_core::LoadingState;
 ///     "[dependencies]\nserde = \"1.0\"".into(),
 /// );
 ///
-/// assert!(state.versions.is_empty());
+/// assert!(state.cached_versions.is_empty());
 /// ```
 pub struct DocumentState {
     /// Package ecosystem identifier, exhaustively typed.
@@ -104,8 +45,6 @@ pub struct DocumentState {
     /// Note: This is not cloned when DocumentState is cloned
     #[allow(dead_code)]
     parse_result: Option<Box<dyn ParseResult>>,
-    /// Cached latest version information from registry
-    pub versions: HashMap<String, UnifiedVersion>,
     /// Simplified cached versions (just strings) for new architecture
     pub cached_versions: HashMap<String, String>,
     /// Resolved versions from lock file
@@ -125,7 +64,6 @@ impl Clone for DocumentState {
             ecosystem_id: self.ecosystem_id,
             content: self.content.clone(),
             parse_result: None, // Don't clone trait object
-            versions: self.versions.clone(),
             cached_versions: self.cached_versions.clone(),
             resolved_versions: self.resolved_versions.clone(),
             parsed_at: self.parsed_at,
@@ -222,7 +160,6 @@ impl std::fmt::Debug for DocumentState {
             .field("ecosystem_id", &self.ecosystem_id)
             .field("content_len", &self.content.len())
             .field("has_parse_result", &self.parse_result.is_some())
-            .field("versions_count", &self.versions.len())
             .field("cached_versions_count", &self.cached_versions.len())
             .field("resolved_versions_count", &self.resolved_versions.len())
             .field("parsed_at", &self.parsed_at)
@@ -248,7 +185,6 @@ impl DocumentState {
             ecosystem_id,
             content,
             parse_result: Some(parse_result),
-            versions: HashMap::new(),
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             parsed_at: Instant::now(),
@@ -269,7 +205,6 @@ impl DocumentState {
             ecosystem_id,
             content,
             parse_result: None,
-            versions: HashMap::new(),
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             parsed_at: Instant::now(),
@@ -281,11 +216,6 @@ impl DocumentState {
     /// Gets a reference to the parse result if available.
     pub fn parse_result(&self) -> Option<&dyn ParseResult> {
         self.parse_result.as_ref().map(std::convert::AsRef::as_ref)
-    }
-
-    /// Updates the cached latest version information for dependencies.
-    pub fn update_versions(&mut self, versions: HashMap<String, UnifiedVersion>) {
-        self.versions = versions;
     }
 
     /// Updates the simplified cached versions (new architecture).
@@ -1033,27 +963,7 @@ mod tests {
 
             assert_eq!(state.ecosystem, EcosystemId::Cargo);
             assert_eq!(state.content, "test content");
-            assert!(state.versions.is_empty());
-        }
-
-        #[test]
-        fn test_document_state_update_versions() {
-            let mut state =
-                DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
-
-            let mut versions = HashMap::new();
-            versions.insert(
-                "serde".into(),
-                UnifiedVersion::Cargo(CargoVersion {
-                    num: "1.0.0".into(),
-                    yanked: false,
-                    features: HashMap::new(),
-                }),
-            );
-
-            state.update_versions(versions);
-            assert_eq!(state.versions.len(), 1);
-            assert!(state.versions.contains_key("serde"));
+            assert!(state.cached_versions.is_empty());
         }
 
         #[test]
@@ -1073,17 +983,6 @@ mod tests {
             let removed = state.remove_document(&uri);
             assert!(removed.is_some());
             assert_eq!(state.document_count(), 0);
-        }
-
-        #[test]
-        fn test_unified_version() {
-            let version = UnifiedVersion::Cargo(CargoVersion {
-                num: "1.0.0".into(),
-                yanked: false,
-                features: HashMap::new(),
-            });
-            assert_eq!(version.version_string(), "1.0.0");
-            assert!(!version.is_yanked());
         }
 
         #[test]
@@ -1181,16 +1080,6 @@ mod tests {
         use super::*;
 
         #[test]
-        fn test_unified_version() {
-            let version = UnifiedVersion::Npm(deps_npm::NpmVersion {
-                version: "4.18.2".into(),
-                deprecated: false,
-            });
-            assert_eq!(version.version_string(), "4.18.2");
-            assert!(!version.is_yanked());
-        }
-
-        #[test]
         fn test_document_state_new_without_parse_result() {
             let content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Npm, content);
@@ -1210,16 +1099,6 @@ mod tests {
         use super::*;
 
         #[test]
-        fn test_unified_version() {
-            let version = UnifiedVersion::Pypi(deps_pypi::PypiVersion {
-                version: "2.31.0".into(),
-                yanked: true,
-            });
-            assert_eq!(version.version_string(), "2.31.0");
-            assert!(version.is_yanked());
-        }
-
-        #[test]
         fn test_document_state_new_without_parse_result() {
             let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n".to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Pypi, content);
@@ -1237,46 +1116,6 @@ mod tests {
     #[cfg(feature = "go")]
     mod go_tests {
         use super::*;
-        use deps_go::GoVersion;
-
-        #[test]
-        fn test_unified_version() {
-            let version = UnifiedVersion::Go(GoVersion {
-                version: "v1.9.1".into(),
-                time: Some("2023-07-18T14:30:00Z".into()),
-                is_pseudo: false,
-                retracted: false,
-            });
-            assert_eq!(version.version_string(), "v1.9.1");
-            assert!(!version.is_yanked());
-        }
-
-        #[test]
-        fn test_unified_version_retracted() {
-            let version = UnifiedVersion::Go(GoVersion {
-                version: "v1.0.0".into(),
-                time: None,
-                is_pseudo: false,
-                retracted: true,
-            });
-            assert_eq!(version.version_string(), "v1.0.0");
-            assert!(version.is_yanked());
-        }
-
-        #[test]
-        fn test_unified_version_pseudo() {
-            let version = UnifiedVersion::Go(GoVersion {
-                version: "v0.0.0-20191109021931-daa7c04131f5".into(),
-                time: Some("2019-11-09T02:19:31Z".into()),
-                is_pseudo: true,
-                retracted: false,
-            });
-            assert_eq!(
-                version.version_string(),
-                "v0.0.0-20191109021931-daa7c04131f5"
-            );
-            assert!(!version.is_yanked());
-        }
 
         #[test]
         fn test_document_state_new_without_parse_result() {
