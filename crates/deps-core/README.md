@@ -13,6 +13,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 ## What this crate provides
 
 - **`Ecosystem` trait** — Unified interface for all package ecosystems (parse, registry, format)
+- **`EcosystemId` enum** — Exhaustive, typed identifier for every registered ecosystem, with `Display`/`FromStr` interop with `Ecosystem::id()`. Downstream code should match on this instead of the raw id string so a new ecosystem forces every relevant `match` to be updated at compile time
 - **`Registry` trait** — Abstraction over package registries with version lookup
 - **`LockFileProvider` trait** — Abstract lock file parsing for resolved versions
 - **Generic LSP handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics`

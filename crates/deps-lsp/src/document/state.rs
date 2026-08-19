@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
-use deps_core::{EcosystemRegistry, ParseResult};
+use deps_core::{EcosystemId, EcosystemRegistry, ParseResult};
 use std::collections::HashMap;
 
 #[cfg(feature = "cargo")]
@@ -170,67 +170,6 @@ impl UnifiedVersion {
 // Re-export LoadingState from deps-core for convenience
 pub use deps_core::LoadingState;
 
-/// Package ecosystem type.
-///
-/// Identifies which package manager and manifest file format
-/// a document belongs to. Used for routing LSP operations to
-/// the appropriate parser and registry.
-///
-/// # Examples
-///
-/// ```
-/// use deps_lsp::document::Ecosystem;
-///
-/// let cargo = Ecosystem::from_filename("Cargo.toml");
-/// assert_eq!(cargo, Some(Ecosystem::Cargo));
-///
-/// let npm = Ecosystem::from_filename("package.json");
-/// assert_eq!(npm, Some(Ecosystem::Npm));
-///
-/// let pypi = Ecosystem::from_filename("pyproject.toml");
-/// assert_eq!(pypi, Some(Ecosystem::Pypi));
-///
-/// let unknown = Ecosystem::from_filename("requirements.txt");
-/// assert_eq!(unknown, None);
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Ecosystem {
-    /// Rust Cargo ecosystem (Cargo.toml)
-    Cargo,
-    /// JavaScript/TypeScript npm ecosystem (package.json)
-    Npm,
-    /// Python PyPI ecosystem (pyproject.toml)
-    Pypi,
-    /// Go modules ecosystem (go.mod)
-    Go,
-}
-
-impl Ecosystem {
-    /// Detects ecosystem from filename.
-    ///
-    /// Returns `Some(Ecosystem)` if the filename matches a known manifest file,
-    /// or `None` if the file is not recognized.
-    pub fn from_filename(filename: &str) -> Option<Self> {
-        match filename {
-            "Cargo.toml" => Some(Self::Cargo),
-            "package.json" => Some(Self::Npm),
-            "pyproject.toml" => Some(Self::Pypi),
-            "go.mod" => Some(Self::Go),
-            _ => None,
-        }
-    }
-
-    /// Detects ecosystem from full URI path.
-    ///
-    /// Extracts the filename from the URI and checks if it matches a known manifest.
-    pub fn from_uri(uri: &Uri) -> Option<Self> {
-        let path = uri.path();
-        let filename = path.as_str().split('/').next_back()?;
-        Self::from_filename(filename)
-    }
-}
-
 /// State for a single open document.
 ///
 /// Stores the document content, parsed dependency information, and cached
@@ -243,8 +182,9 @@ impl Ecosystem {
 /// # Examples
 ///
 /// ```no_run
-/// use deps_lsp::document::{DocumentState, Ecosystem, UnifiedDependency};
+/// use deps_lsp::document::{DocumentState, UnifiedDependency};
 /// use deps_lsp::ParsedDependency;
+/// use deps_core::EcosystemId;
 /// use deps_cargo::{DependencySection, DependencySource};
 /// use tower_lsp_server::ls_types::{Position, Range};
 ///
@@ -260,7 +200,7 @@ impl Ecosystem {
 /// };
 ///
 /// let state = DocumentState::new(
-///     Ecosystem::Cargo,
+///     EcosystemId::Cargo,
 ///     "[dependencies]\nserde = \"1.0\"".into(),
 ///     vec![UnifiedDependency::Cargo(dep)],
 /// );
@@ -269,9 +209,11 @@ impl Ecosystem {
 /// assert_eq!(state.dependencies.len(), 1);
 /// ```
 pub struct DocumentState {
-    /// Package ecosystem type (deprecated, use ecosystem_id)
-    pub ecosystem: Ecosystem,
-    /// Ecosystem identifier ("cargo", "npm", "pypi")
+    /// Package ecosystem identifier, exhaustively typed.
+    pub ecosystem: EcosystemId,
+    /// Ecosystem identifier as a `&'static str` (matches `ecosystem.id()`), kept
+    /// alongside `ecosystem` since registry lookups (`EcosystemRegistry::get`) are
+    /// keyed by string.
     pub ecosystem_id: &'static str,
     /// Original document content
     pub content: String,
@@ -417,16 +359,11 @@ impl DocumentState {
     /// Initializes with the given ecosystem, content, and parsed dependencies.
     /// Version information starts empty and is populated asynchronously.
     pub fn new(
-        ecosystem: Ecosystem,
+        ecosystem: EcosystemId,
         content: String,
         dependencies: Vec<UnifiedDependency>,
     ) -> Self {
-        let ecosystem_id = match ecosystem {
-            Ecosystem::Cargo => "cargo",
-            Ecosystem::Npm => "npm",
-            Ecosystem::Pypi => "pypi",
-            Ecosystem::Go => "go",
-        };
+        let ecosystem_id = ecosystem.id();
 
         Self {
             ecosystem,
@@ -451,13 +388,12 @@ impl DocumentState {
         content: String,
         parse_result: Box<dyn ParseResult>,
     ) -> Self {
-        let ecosystem = match ecosystem_id {
-            "cargo" => Ecosystem::Cargo,
-            "npm" => Ecosystem::Npm,
-            "pypi" => Ecosystem::Pypi,
-            "go" => Ecosystem::Go,
-            _ => Ecosystem::Cargo, // Default fallback
-        };
+        // `ecosystem_id` always originates from a statically registered ecosystem
+        // (see `crate::register_ecosystems`), so parsing it back to `EcosystemId` can
+        // only fail on an internal registration bug, not on user input.
+        let ecosystem = ecosystem_id
+            .parse::<EcosystemId>()
+            .expect("ecosystem_id must be a registered EcosystemId");
 
         Self {
             ecosystem,
@@ -479,13 +415,10 @@ impl DocumentState {
     /// Used when parsing fails but the document should still be stored
     /// to enable fallback completion and other LSP features.
     pub fn new_without_parse_result(ecosystem_id: &'static str, content: String) -> Self {
-        let ecosystem = match ecosystem_id {
-            "cargo" => Ecosystem::Cargo,
-            "npm" => Ecosystem::Npm,
-            "pypi" => Ecosystem::Pypi,
-            "go" => Ecosystem::Go,
-            _ => Ecosystem::Cargo, // Default fallback
-        };
+        // See `new_from_parse_result`: `ecosystem_id` is always a registered ecosystem id.
+        let ecosystem = ecosystem_id
+            .parse::<EcosystemId>()
+            .expect("ecosystem_id must be a registered EcosystemId");
 
         Self {
             ecosystem,
@@ -998,62 +931,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ecosystem_from_filename() {
-        #[cfg(feature = "cargo")]
-        assert_eq!(
-            Ecosystem::from_filename("Cargo.toml"),
-            Some(Ecosystem::Cargo)
-        );
-        #[cfg(feature = "npm")]
-        assert_eq!(
-            Ecosystem::from_filename("package.json"),
-            Some(Ecosystem::Npm)
-        );
-        #[cfg(feature = "pypi")]
-        assert_eq!(
-            Ecosystem::from_filename("pyproject.toml"),
-            Some(Ecosystem::Pypi)
-        );
-        #[cfg(feature = "go")]
-        assert_eq!(Ecosystem::from_filename("go.mod"), Some(Ecosystem::Go));
-        assert_eq!(Ecosystem::from_filename("unknown.txt"), None);
-    }
-
-    #[test]
-    fn test_ecosystem_from_uri() {
-        #[cfg(feature = "cargo")]
-        {
-            let cargo_uri = deps_core::test_util::test_uri("/path/to/Cargo.toml");
-            assert_eq!(Ecosystem::from_uri(&cargo_uri), Some(Ecosystem::Cargo));
-        }
-        #[cfg(feature = "npm")]
-        {
-            let npm_uri = deps_core::test_util::test_uri("/path/to/package.json");
-            assert_eq!(Ecosystem::from_uri(&npm_uri), Some(Ecosystem::Npm));
-        }
-        #[cfg(feature = "pypi")]
-        {
-            let pypi_uri = deps_core::test_util::test_uri("/path/to/pyproject.toml");
-            assert_eq!(Ecosystem::from_uri(&pypi_uri), Some(Ecosystem::Pypi));
-        }
-        #[cfg(feature = "go")]
-        {
-            let go_uri = deps_core::test_util::test_uri("/path/to/go.mod");
-            assert_eq!(Ecosystem::from_uri(&go_uri), Some(Ecosystem::Go));
-        }
-        let unknown_uri = deps_core::test_util::test_uri("/path/to/README.md");
-        assert_eq!(Ecosystem::from_uri(&unknown_uri), None);
-    }
-
-    #[test]
-    fn test_ecosystem_from_filename_edge_cases() {
-        assert_eq!(Ecosystem::from_filename(""), None);
-        assert_eq!(Ecosystem::from_filename("cargo.toml"), None);
-        assert_eq!(Ecosystem::from_filename("CARGO.TOML"), None);
-        assert_eq!(Ecosystem::from_filename("requirements.txt"), None);
-    }
-
-    #[test]
     fn test_server_state_creation() {
         let state = ServerState::new();
         assert_eq!(state.document_count(), 0);
@@ -1218,6 +1095,68 @@ mod tests {
     }
 
     // =========================================================================
+    // Issue #118 regression tests: ecosystem_id resolution
+    // =========================================================================
+
+    /// Regression test for issue #118: before the `EcosystemId` refactor, any
+    /// `ecosystem_id` outside `{cargo, npm, pypi, go}` silently fell back to
+    /// `Ecosystem::Cargo` in `new_without_parse_result`/`new_from_parse_result`.
+    /// Exercises the constructors directly (not just `EcosystemId::from_str`) for
+    /// every previously-misclassified ecosystem.
+    #[test]
+    fn test_document_state_new_without_parse_result_resolves_all_ecosystems() {
+        for (id, expected) in [
+            ("cargo", EcosystemId::Cargo),
+            ("npm", EcosystemId::Npm),
+            ("pypi", EcosystemId::Pypi),
+            ("go", EcosystemId::Go),
+            ("bundler", EcosystemId::Bundler),
+            ("dart", EcosystemId::Dart),
+            ("maven", EcosystemId::Maven),
+            ("composer", EcosystemId::Composer),
+            ("gradle", EcosystemId::Gradle),
+            ("swift", EcosystemId::Swift),
+            ("nuget", EcosystemId::NuGet),
+        ] {
+            let doc = DocumentState::new_without_parse_result(id, String::new());
+            assert_eq!(doc.ecosystem, expected, "ecosystem_id {id:?} misresolved");
+            assert_eq!(doc.ecosystem_id, id);
+        }
+    }
+
+    /// Same regression as above, but through `new_from_parse_result` with a real
+    /// `ParseResult` for one of the previously-misclassified ecosystems (maven),
+    /// exercising the exact call path `document::lifecycle` uses in production.
+    #[cfg(feature = "maven")]
+    #[test]
+    fn test_document_state_new_from_parse_result_maven_not_misclassified_as_cargo() {
+        let state = ServerState::new();
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let ecosystem = state.ecosystem_registry.get("maven").unwrap();
+        let content = r"<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-lang3</artifactId>
+      <version>3.12.0</version>
+    </dependency>
+  </dependencies>
+</project>
+"
+        .to_string();
+
+        let parse_result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(ecosystem.parse_manifest(&content, &uri))
+            .unwrap();
+
+        let doc_state = DocumentState::new_from_parse_result("maven", content, parse_result);
+
+        assert_eq!(doc_state.ecosystem_id, "maven");
+        assert_eq!(doc_state.ecosystem, EcosystemId::Maven);
+    }
+
+    // =========================================================================
     // Cargo ecosystem tests
     // =========================================================================
 
@@ -1243,9 +1182,9 @@ mod tests {
         #[test]
         fn test_document_state_creation() {
             let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(Ecosystem::Cargo, "test content".into(), deps);
+            let state = DocumentState::new(EcosystemId::Cargo, "test content".into(), deps);
 
-            assert_eq!(state.ecosystem, Ecosystem::Cargo);
+            assert_eq!(state.ecosystem, EcosystemId::Cargo);
             assert_eq!(state.content, "test content");
             assert_eq!(state.dependencies.len(), 1);
             assert!(state.versions.is_empty());
@@ -1254,7 +1193,7 @@ mod tests {
         #[test]
         fn test_document_state_update_versions() {
             let deps = vec![create_test_dependency()];
-            let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+            let mut state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
 
             let mut versions = HashMap::new();
             versions.insert(
@@ -1276,7 +1215,7 @@ mod tests {
             let state = ServerState::new();
             let uri = deps_core::test_util::test_uri("/test.toml");
             let deps = vec![create_test_dependency()];
-            let doc_state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+            let doc_state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
 
             state.update_document(uri.clone(), doc_state);
             assert_eq!(state.document_count(), 1);
@@ -1368,7 +1307,7 @@ mod tests {
             let doc_state = DocumentState::new_without_parse_result("cargo", content);
 
             assert_eq!(doc_state.ecosystem_id, "cargo");
-            assert_eq!(doc_state.ecosystem, Ecosystem::Cargo);
+            assert_eq!(doc_state.ecosystem, EcosystemId::Cargo);
             assert!(doc_state.parse_result.is_none());
             assert!(doc_state.dependencies.is_empty());
         }
@@ -1376,7 +1315,7 @@ mod tests {
         #[test]
         fn test_document_state_update_resolved_versions() {
             let deps = vec![create_test_dependency()];
-            let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+            let mut state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
 
             let mut resolved = HashMap::new();
             resolved.insert("serde".into(), "1.0.195".into());
@@ -1392,7 +1331,7 @@ mod tests {
         #[test]
         fn test_document_state_update_cached_versions() {
             let deps = vec![create_test_dependency()];
-            let mut state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+            let mut state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
 
             let mut cached = HashMap::new();
             cached.insert("serde".into(), "1.0.210".into());
@@ -1404,14 +1343,14 @@ mod tests {
         #[test]
         fn test_document_state_parse_result_accessor() {
             let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+            let state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
             assert!(state.parse_result().is_none());
         }
 
         #[test]
         fn test_document_state_clone() {
             let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(Ecosystem::Cargo, "test content".into(), deps);
+            let state = DocumentState::new(EcosystemId::Cargo, "test content".into(), deps);
             let cloned = state.clone();
 
             assert_eq!(cloned.ecosystem, state.ecosystem);
@@ -1423,7 +1362,7 @@ mod tests {
         #[test]
         fn test_document_state_debug() {
             let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(Ecosystem::Cargo, "test".into(), deps);
+            let state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
             let debug_str = format!("{state:?}");
             assert!(debug_str.contains("DocumentState"));
         }
@@ -1470,7 +1409,7 @@ mod tests {
             let doc_state = DocumentState::new_without_parse_result("npm", content);
 
             assert_eq!(doc_state.ecosystem_id, "npm");
-            assert_eq!(doc_state.ecosystem, Ecosystem::Npm);
+            assert_eq!(doc_state.ecosystem, EcosystemId::Npm);
             assert!(doc_state.parse_result.is_none());
         }
     }
@@ -1521,7 +1460,7 @@ mod tests {
             let doc_state = DocumentState::new_without_parse_result("pypi", content);
 
             assert_eq!(doc_state.ecosystem_id, "pypi");
-            assert_eq!(doc_state.ecosystem, Ecosystem::Pypi);
+            assert_eq!(doc_state.ecosystem, EcosystemId::Pypi);
             assert!(doc_state.parse_result.is_none());
         }
     }
@@ -1639,9 +1578,9 @@ mod tests {
         #[test]
         fn test_document_state_new() {
             let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(Ecosystem::Go, "test content".into(), deps);
+            let state = DocumentState::new(EcosystemId::Go, "test content".into(), deps);
 
-            assert_eq!(state.ecosystem, Ecosystem::Go);
+            assert_eq!(state.ecosystem, EcosystemId::Go);
             assert_eq!(state.ecosystem_id, "go");
             assert_eq!(state.dependencies.len(), 1);
         }
@@ -1654,7 +1593,7 @@ mod tests {
             let doc_state = DocumentState::new_without_parse_result("go", content);
 
             assert_eq!(doc_state.ecosystem_id, "go");
-            assert_eq!(doc_state.ecosystem, Ecosystem::Go);
+            assert_eq!(doc_state.ecosystem, EcosystemId::Go);
             assert!(doc_state.parse_result.is_none());
         }
 

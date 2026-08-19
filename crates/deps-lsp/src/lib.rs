@@ -240,9 +240,61 @@ mod tests {
         assert!(registry.get("dart").is_some());
         #[cfg(feature = "maven")]
         assert!(registry.get("maven").is_some());
+        #[cfg(feature = "gradle")]
+        assert!(registry.get("gradle").is_some());
+        #[cfg(feature = "swift")]
+        assert!(registry.get("swift").is_some());
         #[cfg(feature = "composer")]
         assert!(registry.get("composer").is_some());
         #[cfg(feature = "nuget")]
         assert!(registry.get("nuget").is_some());
+    }
+
+    /// Regression guard for issue #118: `EcosystemId`'s string literals (`deps-core`)
+    /// are hand-duplicated from each ecosystem crate's own `Ecosystem::id()`, with
+    /// nothing linking them at compile time. This proves every id actually registered
+    /// by `register_ecosystems` round-trips through `EcosystemId::from_str`/`id()`,
+    /// and that every `EcosystemId` variant resolves back to a registered ecosystem —
+    /// so a future rename fails this test instead of panicking at document-open time
+    /// (see the `.expect()` in `DocumentState::new_from_parse_result`).
+    #[test]
+    fn test_ecosystem_id_matches_registered_ecosystems() {
+        let registry = Arc::new(EcosystemRegistry::new());
+        let cache = Arc::new(HttpCache::new());
+        register_ecosystems(&registry, Arc::clone(&cache));
+
+        for id in registry.ecosystem_ids() {
+            let parsed: deps_core::EcosystemId = id.parse().unwrap_or_else(|_| {
+                panic!("registered ecosystem id {id:?} has no matching EcosystemId variant")
+            });
+            assert_eq!(parsed.id(), id);
+        }
+
+        #[cfg(feature = "cargo")]
+        assert!(registry.get(deps_core::EcosystemId::Cargo.id()).is_some());
+        #[cfg(feature = "npm")]
+        assert!(registry.get(deps_core::EcosystemId::Npm.id()).is_some());
+        #[cfg(feature = "pypi")]
+        assert!(registry.get(deps_core::EcosystemId::Pypi.id()).is_some());
+        #[cfg(feature = "go")]
+        assert!(registry.get(deps_core::EcosystemId::Go.id()).is_some());
+        #[cfg(feature = "bundler")]
+        assert!(registry.get(deps_core::EcosystemId::Bundler.id()).is_some());
+        #[cfg(feature = "dart")]
+        assert!(registry.get(deps_core::EcosystemId::Dart.id()).is_some());
+        #[cfg(feature = "maven")]
+        assert!(registry.get(deps_core::EcosystemId::Maven.id()).is_some());
+        #[cfg(feature = "gradle")]
+        assert!(registry.get(deps_core::EcosystemId::Gradle.id()).is_some());
+        #[cfg(feature = "swift")]
+        assert!(registry.get(deps_core::EcosystemId::Swift.id()).is_some());
+        #[cfg(feature = "composer")]
+        assert!(
+            registry
+                .get(deps_core::EcosystemId::Composer.id())
+                .is_some()
+        );
+        #[cfg(feature = "nuget")]
+        assert!(registry.get(deps_core::EcosystemId::NuGet.id()).is_some());
     }
 }

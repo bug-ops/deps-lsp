@@ -151,7 +151,8 @@ mod tests {
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
-        use crate::document::{DocumentState, Ecosystem};
+        use crate::document::DocumentState;
+        use deps_core::EcosystemId;
 
         #[tokio::test]
         async fn test_handle_inlay_hints() {
@@ -201,7 +202,7 @@ serde = "1.0.0"
                 needs_update_text: "❌ {}".to_string(),
             };
 
-            let doc_state = DocumentState::new(Ecosystem::Cargo, String::new(), vec![]);
+            let doc_state = DocumentState::new(EcosystemId::Cargo, String::new(), vec![]);
             state.update_document(uri.clone(), doc_state);
 
             let params = InlayHintParams {

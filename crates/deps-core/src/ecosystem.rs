@@ -13,6 +13,104 @@ pub mod private {
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
+/// Canonical, exhaustive identifier for every package ecosystem the workspace supports.
+///
+/// [`Ecosystem::id`] returns a `&'static str` for registry lookups and document
+/// storage, but any code that needs to *branch* on ecosystem identity should match on
+/// this enum instead of re-deriving its own partial match over that string: an
+/// unhandled variant here is a compile error, while an unhandled string is a silent
+/// runtime bug (see the fix for issue #118, where two call sites silently mishandled
+/// ecosystems missing from an incomplete string match).
+///
+/// Deliberately **not** `#[non_exhaustive]`: adding a new ecosystem must force every
+/// exhaustive `match` on this type across the workspace to be updated at compile time.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::EcosystemId;
+///
+/// let id: EcosystemId = "npm".parse().unwrap();
+/// assert_eq!(id, EcosystemId::Npm);
+/// assert_eq!(id.id(), "npm");
+/// assert_eq!(id.to_string(), "npm");
+///
+/// assert!("unknown".parse::<EcosystemId>().is_err());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EcosystemId {
+    /// Rust Cargo ecosystem (`Cargo.toml`).
+    Cargo,
+    /// JavaScript/TypeScript npm ecosystem (`package.json`).
+    Npm,
+    /// Python PyPI ecosystem (`pyproject.toml`).
+    Pypi,
+    /// Go modules ecosystem (`go.mod`).
+    Go,
+    /// Ruby Bundler ecosystem (`Gemfile`).
+    Bundler,
+    /// Dart/Flutter pub ecosystem (`pubspec.yaml`).
+    Dart,
+    /// Java/Kotlin Maven ecosystem (`pom.xml`).
+    Maven,
+    /// PHP Composer ecosystem (`composer.json`).
+    Composer,
+    /// Java/Kotlin Gradle ecosystem (`build.gradle`, `build.gradle.kts`, version catalogs).
+    Gradle,
+    /// Swift Package Manager ecosystem (`Package.swift`).
+    Swift,
+    /// .NET NuGet ecosystem (`.csproj`/`.fsproj`/`.vbproj`, `Directory.Packages.props`, `packages.config`).
+    NuGet,
+}
+
+impl EcosystemId {
+    /// Returns the canonical string identifier, matching [`Ecosystem::id`] for the
+    /// corresponding ecosystem implementation.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::Npm => "npm",
+            Self::Pypi => "pypi",
+            Self::Go => "go",
+            Self::Bundler => "bundler",
+            Self::Dart => "dart",
+            Self::Maven => "maven",
+            Self::Composer => "composer",
+            Self::Gradle => "gradle",
+            Self::Swift => "swift",
+            Self::NuGet => "nuget",
+        }
+    }
+}
+
+impl std::fmt::Display for EcosystemId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
+impl std::str::FromStr for EcosystemId {
+    type Err = crate::error::DepsError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "cargo" => Ok(Self::Cargo),
+            "npm" => Ok(Self::Npm),
+            "pypi" => Ok(Self::Pypi),
+            "go" => Ok(Self::Go),
+            "bundler" => Ok(Self::Bundler),
+            "dart" => Ok(Self::Dart),
+            "maven" => Ok(Self::Maven),
+            "composer" => Ok(Self::Composer),
+            "gradle" => Ok(Self::Gradle),
+            "swift" => Ok(Self::Swift),
+            "nuget" => Ok(Self::NuGet),
+            _ => Err(crate::error::DepsError::UnsupportedEcosystem(s.to_string())),
+        }
+    }
+}
+
 /// Parse result trait containing dependencies and metadata.
 ///
 /// Implementations hold ecosystem-specific dependency types
@@ -342,6 +440,35 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ecosystem_id_roundtrip() {
+        const ALL: &[EcosystemId] = &[
+            EcosystemId::Cargo,
+            EcosystemId::Npm,
+            EcosystemId::Pypi,
+            EcosystemId::Go,
+            EcosystemId::Bundler,
+            EcosystemId::Dart,
+            EcosystemId::Maven,
+            EcosystemId::Composer,
+            EcosystemId::Gradle,
+            EcosystemId::Swift,
+            EcosystemId::NuGet,
+        ];
+
+        for id in ALL {
+            let parsed: EcosystemId = id.id().parse().unwrap();
+            assert_eq!(parsed, *id);
+            assert_eq!(id.to_string(), id.id());
+        }
+    }
+
+    #[test]
+    fn test_ecosystem_id_from_str_unknown() {
+        let err = "unknown".parse::<EcosystemId>().unwrap_err();
+        assert!(matches!(err, crate::error::DepsError::UnsupportedEcosystem(s) if s == "unknown"));
+    }
 
     #[test]
     fn test_ecosystem_config_default() {
