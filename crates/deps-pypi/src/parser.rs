@@ -14,6 +14,51 @@ use tower_lsp_server::ls_types::{Position, Range, Uri};
 /// raw, unnormalized form rather than being parsed.
 const MAX_MARKER_LEN: usize = 2048;
 
+/// Generous bound on PEP 508 marker parenthesis nesting depth.
+///
+/// `pep508_rs`'s recursive-descent marker parser recurses once per nesting
+/// level with no depth limit, so a marker can overflow the stack from
+/// nesting alone while staying well under [`MAX_MARKER_LEN`] — a marker can
+/// pack roughly one `(`/`)` pair per 2 bytes (verified: 1016 levels in 2047
+/// bytes aborts the process on a 256 KiB stack). Real-world markers rarely
+/// nest more than 2-3 levels, so this cap leaves ample headroom.
+const MAX_MARKER_DEPTH: u32 = 32;
+
+/// Returns `true` if `marker` nests parentheses deeper than [`MAX_MARKER_DEPTH`].
+///
+/// Tracks quoted-string state the same way `pep508_rs`'s tokenizer does
+/// (`marker/parse.rs`: a quote opens on an unquoted `'`/`"` and closes on the
+/// next occurrence of that same character, with no escape handling) so that
+/// `(`/`)` bytes inside a quoted marker value — e.g. `extra == ')'` — are not
+/// mistaken for real nesting. A scanner that counted paren bytes unconditionally
+/// could be tricked into undercounting depth by parentheses hidden in quoted
+/// values while the real recursive-descent parser, which treats quoted content
+/// as opaque, keeps recursing.
+fn marker_too_deep(marker: &str) -> bool {
+    let mut depth: u32 = 0;
+    let mut quote: Option<u8> = None;
+    for b in marker.bytes() {
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'(' => {
+                depth += 1;
+                if depth > MAX_MARKER_DEPTH {
+                    return true;
+                }
+            }
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Parse result containing all dependencies from pyproject.toml.
 ///
 /// Stores dependencies and optional workspace information for LSP operations.
@@ -432,13 +477,16 @@ impl PypiParser {
         // URLs containing `;` are a known, documented edge case - see #<follow-up>).
         let semicolon_idx = requirement_str.find(';');
 
-        // Pathologically long marker expressions can overflow the stack in
-        // `pep508_rs`'s unbounded recursive-descent parser. Parse only the
-        // name/version/extras portion and skip marker normalization instead of
-        // handing the oversized marker text to the parser.
-        let marker_too_long =
-            semicolon_idx.is_some_and(|idx| requirement_str.len() - idx > MAX_MARKER_LEN);
-        let parse_str = if marker_too_long {
+        // Pathologically long or deeply nested marker expressions can overflow
+        // the stack in `pep508_rs`'s unbounded recursive-descent parser. Parse
+        // only the name/version/extras portion and skip marker normalization
+        // instead of handing the oversized/deeply-nested marker text to the
+        // parser.
+        let marker_too_complex = semicolon_idx.is_some_and(|idx| {
+            let marker_text = &requirement_str[idx..];
+            marker_text.len() > MAX_MARKER_LEN || marker_too_deep(marker_text)
+        });
+        let parse_str = if marker_too_complex {
             &requirement_str[..semicolon_idx.unwrap()]
         } else {
             requirement_str
@@ -529,16 +577,17 @@ impl PypiParser {
             .map(|e| e.to_string())
             .collect();
 
-        let markers = if marker_too_long {
+        let markers = if marker_too_complex {
             let raw_marker = requirement_str[semicolon_idx.unwrap() + 1..].trim();
             if raw_marker.is_empty() {
                 None
             } else {
                 tracing::warn!(
-                    "Marker expression for '{}' is {} bytes (over the {}-byte cap), skipping normalization",
+                    "Marker expression for '{}' is too complex ({} bytes, over the {}-byte length cap or {}-level nesting cap), skipping normalization",
                     name,
                     raw_marker.len(),
-                    MAX_MARKER_LEN
+                    MAX_MARKER_LEN,
+                    MAX_MARKER_DEPTH
                 );
                 Some(raw_marker.to_string())
             }
@@ -755,17 +804,18 @@ fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::S
 /// `os_name == 'a' or os_name != 'a'`) — matching the PEP 621 path, which
 /// likewise yields `None` for an absent or always-true marker. Falls back to
 /// the raw string, unmodified, if the expression fails to parse or exceeds
-/// [`MAX_MARKER_LEN`].
+/// [`MAX_MARKER_LEN`] or [`MAX_MARKER_DEPTH`].
 fn normalize_marker_string(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed.len() > MAX_MARKER_LEN {
+    if trimmed.len() > MAX_MARKER_LEN || marker_too_deep(trimmed) {
         tracing::warn!(
-            "Marker expression is {} bytes (over the {}-byte cap), skipping normalization: '{}'",
+            "Marker expression is too complex ({} bytes, over the {}-byte length cap or {}-level nesting cap), skipping normalization: '{}'",
             trimmed.len(),
             MAX_MARKER_LEN,
+            MAX_MARKER_DEPTH,
             trimmed
         );
         return Some(trimmed.to_string());
@@ -1921,5 +1971,98 @@ requests = "^2.28.0"
         // but preserves the raw marker text rather than dropping it.
         assert_eq!(dep.markers, Some(long_marker));
         assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_pep621_deeply_nested_marker_under_length_cap_skips_normalization() {
+        // Regression test for #146: a marker packs ~1 paren pair per 2 bytes,
+        // so nesting depth can exceed MAX_MARKER_DEPTH while the marker text
+        // stays well under MAX_MARKER_LEN. Must not overflow the stack in
+        // pep508_rs's unbounded recursive-descent parser.
+        let depth = 1000;
+        let nested_marker = format!("{}os_name == 'a'{}", "(".repeat(depth), ")".repeat(depth));
+        assert!(nested_marker.len() < MAX_MARKER_LEN);
+        let toml =
+            format!("[project]\ndependencies = [\n    \"numpy>=1.24; {nested_marker}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "numpy");
+        assert_eq!(dep.version_req, Some(">=1.24".to_string()));
+        assert_eq!(dep.markers, Some(nested_marker));
+        assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_poetry_table_form_deeply_nested_marker_skips_normalization() {
+        // Same attack via the Poetry `markers` key, which goes through
+        // `normalize_marker_string` rather than `parse_pep508_requirement`.
+        let depth = 1000;
+        let nested_marker = format!("{}os_name == 'a'{}", "(".repeat(depth), ")".repeat(depth));
+        assert!(nested_marker.len() < MAX_MARKER_LEN);
+        let toml = format!(
+            "[tool.poetry.dependencies]\ndjango = {{ version = \"^4.0\", markers = \"{nested_marker}\" }}\n"
+        );
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.markers, Some(nested_marker));
+        assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_pep621_marker_depth_bypass_via_quoted_parens_falls_back() {
+        // Regression test for the quote-bypass gap: pep508_rs's own tokenizer
+        // treats `(`/`)` inside a quoted marker value as opaque (marker/parse.rs
+        // uses `take_while(|c| c != quotation_mark)`, no escape handling), so a
+        // scanner that counted parens unconditionally could be tricked into
+        // never observing real nesting depth. Each level here opens one real
+        // `(` but also embeds a `)` inside a quoted extra value; a quote-unaware
+        // scanner treats that `)` as closing the level's own `(`, capping the
+        // observed depth at 1 forever while the real recursive-descent parser
+        // keeps recursing one level per iteration.
+        let levels = 60;
+        let mut marker = String::new();
+        for _ in 0..levels {
+            marker.push_str("(extra==')'and ");
+        }
+        marker.push_str("extra=='a'");
+        for _ in 0..levels {
+            marker.push(')');
+        }
+        assert!(marker.len() < MAX_MARKER_LEN);
+        assert!(marker_too_deep(&marker));
+
+        let toml = format!("[project]\ndependencies = [\n    \"numpy>=1.24; {marker}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "numpy");
+        assert_eq!(dep.version_req, Some(">=1.24".to_string()));
+        // Routed through the raw fallback rather than handed to pep508_rs.
+        assert_eq!(dep.markers, Some(marker));
+        assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_pep621_reasonably_nested_marker_still_normalizes() {
+        // Legitimate markers nest a handful of levels at most; these must
+        // still be parsed and normalized, not routed to the raw fallback.
+        let toml = r#"[project]
+dependencies = [
+    "numpy>=1.24; (os_name == 'a' and sys_platform == 'b') or os_name == 'c'",
+]
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "numpy");
+        let markers = dep.markers.as_ref().expect("marker should normalize");
+        assert!(markers.contains("os_name"));
+        assert!(markers.contains("sys_platform"));
     }
 }

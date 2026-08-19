@@ -203,6 +203,56 @@ serde = ""
 }
 
 #[test]
+fn test_pep508_deeply_nested_marker_does_not_crash_server() {
+    // Regression test for #146: a PEP 508 marker packs ~1 paren pair per 2
+    // bytes, so a marker can nest ~1000 levels deep while staying under the
+    // parser's 2048-byte length cap. Without a depth guard, handing this to
+    // pep508_rs's unbounded recursive-descent parser aborts the whole
+    // process with a stack overflow (not a catchable panic).
+    let depth = 1000;
+    let nested_marker = format!("{}os_name == 'a'{}", "(".repeat(depth), ")".repeat(depth));
+    assert!(nested_marker.len() < 2048);
+
+    let mut client = LspClient::spawn();
+    client.initialize();
+
+    client.did_open(
+        "file:///test/pyproject.toml",
+        "toml",
+        &format!(
+            r#"[project]
+name = "test"
+version = "0.1.0"
+dependencies = [
+    "numpy>=1.24; {nested_marker}",
+]
+"#
+        ),
+    );
+
+    thread::sleep(Duration::from_millis(200));
+
+    // Hover on the dependency name - if the server had overflowed the stack
+    // while parsing the manifest, the process would already be dead and this
+    // request would fail to get a response.
+    let hover = client.hover(50, "file:///test/pyproject.toml", 4, 6);
+    assert!(
+        hover.get("error").is_none() || hover.get("result").is_some(),
+        "Server should still be alive and respond to hover: {hover:?}"
+    );
+
+    let hints = client.inlay_hints(51, "file:///test/pyproject.toml");
+    assert!(
+        hints.get("result").is_some(),
+        "Inlay hints request should not error: {hints:?}"
+    );
+
+    // Shutdown must round-trip - proves the server process is still running.
+    let shutdown = client.shutdown();
+    assert_eq!(shutdown["result"], json!(null));
+}
+
+#[test]
 fn test_unknown_document_type() {
     let mut client = LspClient::spawn();
     client.initialize();
