@@ -5,117 +5,17 @@ use deps_core::{EcosystemId, EcosystemRegistry, ParseResult};
 use std::collections::HashMap;
 
 #[cfg(feature = "cargo")]
-use deps_cargo::{CargoVersion, ParsedDependency};
+use deps_cargo::CargoVersion;
 #[cfg(feature = "go")]
-use deps_go::{GoDependency, GoVersion};
+use deps_go::GoVersion;
 #[cfg(feature = "npm")]
-use deps_npm::{NpmDependency, NpmVersion};
+use deps_npm::NpmVersion;
 #[cfg(feature = "pypi")]
-use deps_pypi::{PypiDependency, PypiVersion};
+use deps_pypi::PypiVersion;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tower_lsp_server::ls_types::Uri;
-
-/// Unified dependency enum for multi-ecosystem support.
-///
-/// Wraps ecosystem-specific dependency types to allow storing
-/// dependencies from different ecosystems in the same document state.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum UnifiedDependency {
-    #[cfg(feature = "cargo")]
-    Cargo(ParsedDependency),
-    #[cfg(feature = "npm")]
-    Npm(NpmDependency),
-    #[cfg(feature = "pypi")]
-    Pypi(PypiDependency),
-    #[cfg(feature = "go")]
-    Go(GoDependency),
-}
-
-impl UnifiedDependency {
-    /// Returns the dependency name.
-    #[allow(unreachable_patterns)]
-    pub fn name(&self) -> &str {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => &dep.name,
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => &dep.name,
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => &dep.name,
-            #[cfg(feature = "go")]
-            Self::Go(dep) => &dep.module_path,
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-
-    /// Returns the name range for LSP operations.
-    #[allow(unreachable_patterns)]
-    pub fn name_range(&self) -> tower_lsp_server::ls_types::Range {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => dep.name_range,
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => dep.name_range,
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => dep.name_range,
-            #[cfg(feature = "go")]
-            Self::Go(dep) => dep.module_path_range,
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-
-    /// Returns the version requirement string if present.
-    #[allow(unreachable_patterns)]
-    pub fn version_req(&self) -> Option<&str> {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => dep.version_req.as_deref(),
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => dep.version_req.as_deref(),
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => dep.version_req.as_deref(),
-            #[cfg(feature = "go")]
-            Self::Go(dep) => dep.version.as_deref(),
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-
-    /// Returns the version range for LSP operations if present.
-    #[allow(unreachable_patterns)]
-    pub fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => dep.version_range,
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => dep.version_range,
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => dep.version_range,
-            #[cfg(feature = "go")]
-            Self::Go(dep) => dep.version_range,
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-
-    /// Returns true if this is a registry dependency (not Git/Path/Workspace/etc).
-    #[allow(unreachable_patterns)]
-    pub fn is_registry(&self) -> bool {
-        use deps_core::Dependency;
-        match self {
-            #[cfg(feature = "cargo")]
-            Self::Cargo(dep) => dep.source().is_registry(),
-            #[cfg(feature = "npm")]
-            Self::Npm(dep) => dep.source().is_registry(),
-            #[cfg(feature = "pypi")]
-            Self::Pypi(dep) => dep.source().is_registry(),
-            #[cfg(feature = "go")]
-            Self::Go(dep) => dep.source().is_registry(),
-            _ => unreachable!("no ecosystem features enabled"),
-        }
-    }
-}
 
 /// Unified version information enum for multi-ecosystem support.
 ///
@@ -176,37 +76,19 @@ pub use deps_core::LoadingState;
 /// version data for a single file. The state is updated when the document
 /// changes or when version information is fetched from the registry.
 ///
-/// Supports multiple package ecosystems (Cargo, npm) with unified dependency
-/// and version storage.
+/// Supports multiple package ecosystems via the trait-based `ParseResult`.
 ///
 /// # Examples
 ///
 /// ```no_run
-/// use deps_lsp::document::{DocumentState, UnifiedDependency};
-/// use deps_lsp::ParsedDependency;
-/// use deps_core::EcosystemId;
-/// use deps_cargo::{DependencySection, DependencySource};
-/// use tower_lsp_server::ls_types::{Position, Range};
+/// use deps_lsp::document::DocumentState;
 ///
-/// let dep = ParsedDependency {
-///     name: "serde".into(),
-///     name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-///     version_req: Some("1.0".into()),
-///     version_range: Some(Range::new(Position::new(0, 8), Position::new(0, 12))),
-///     features: vec![],
-///     features_range: None,
-///     source: DependencySource::Registry,
-///     section: DependencySection::Dependencies,
-/// };
-///
-/// let state = DocumentState::new(
-///     EcosystemId::Cargo,
+/// let state = DocumentState::new_without_parse_result(
+///     "cargo",
 ///     "[dependencies]\nserde = \"1.0\"".into(),
-///     vec![UnifiedDependency::Cargo(dep)],
 /// );
 ///
 /// assert!(state.versions.is_empty());
-/// assert_eq!(state.dependencies.len(), 1);
 /// ```
 pub struct DocumentState {
     /// Package ecosystem identifier, exhaustively typed.
@@ -217,8 +99,6 @@ pub struct DocumentState {
     pub ecosystem_id: &'static str,
     /// Original document content
     pub content: String,
-    /// Parsed dependencies with positions (legacy)
-    pub dependencies: Vec<UnifiedDependency>,
     /// Parsed result as trait object (new architecture)
     /// Note: This is not cloned when DocumentState is cloned
     #[allow(dead_code)]
@@ -243,7 +123,6 @@ impl Clone for DocumentState {
             ecosystem: self.ecosystem,
             ecosystem_id: self.ecosystem_id,
             content: self.content.clone(),
-            dependencies: self.dependencies.clone(),
             parse_result: None, // Don't clone trait object
             versions: self.versions.clone(),
             cached_versions: self.cached_versions.clone(),
@@ -341,7 +220,6 @@ impl std::fmt::Debug for DocumentState {
             .field("ecosystem", &self.ecosystem)
             .field("ecosystem_id", &self.ecosystem_id)
             .field("content_len", &self.content.len())
-            .field("dependencies_count", &self.dependencies.len())
             .field("has_parse_result", &self.parse_result.is_some())
             .field("versions_count", &self.versions.len())
             .field("cached_versions_count", &self.cached_versions.len())
@@ -354,32 +232,6 @@ impl std::fmt::Debug for DocumentState {
 }
 
 impl DocumentState {
-    /// Creates a new document state (legacy constructor).
-    ///
-    /// Initializes with the given ecosystem, content, and parsed dependencies.
-    /// Version information starts empty and is populated asynchronously.
-    pub fn new(
-        ecosystem: EcosystemId,
-        content: String,
-        dependencies: Vec<UnifiedDependency>,
-    ) -> Self {
-        let ecosystem_id = ecosystem.id();
-
-        Self {
-            ecosystem,
-            ecosystem_id,
-            content,
-            dependencies,
-            parse_result: None,
-            versions: HashMap::new(),
-            cached_versions: HashMap::new(),
-            resolved_versions: HashMap::new(),
-            parsed_at: Instant::now(),
-            loading_state: LoadingState::Idle,
-            loading_started_at: None,
-        }
-    }
-
     /// Creates a new document state using trait objects (new architecture).
     ///
     /// This is the preferred constructor for Phase 3+ implementations.
@@ -399,7 +251,6 @@ impl DocumentState {
             ecosystem,
             ecosystem_id,
             content,
-            dependencies: vec![],
             parse_result: Some(parse_result),
             versions: HashMap::new(),
             cached_versions: HashMap::new(),
@@ -424,7 +275,6 @@ impl DocumentState {
             ecosystem,
             ecosystem_id,
             content,
-            dependencies: vec![],
             parse_result: None,
             versions: HashMap::new(),
             cached_versions: HashMap::new(),
@@ -1163,37 +1013,19 @@ mod tests {
     #[cfg(feature = "cargo")]
     mod cargo_tests {
         use super::*;
-        use deps_cargo::{DependencySection, DependencySource};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        fn create_test_dependency() -> UnifiedDependency {
-            UnifiedDependency::Cargo(ParsedDependency {
-                name: "serde".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-                version_req: Some("1.0".into()),
-                version_range: Some(Range::new(Position::new(0, 9), Position::new(0, 14))),
-                features: vec![],
-                features_range: None,
-                source: DependencySource::Registry,
-                section: DependencySection::Dependencies,
-            })
-        }
 
         #[test]
         fn test_document_state_creation() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Cargo, "test content".into(), deps);
+            let state = DocumentState::new_without_parse_result("cargo", "test content".into());
 
             assert_eq!(state.ecosystem, EcosystemId::Cargo);
             assert_eq!(state.content, "test content");
-            assert_eq!(state.dependencies.len(), 1);
             assert!(state.versions.is_empty());
         }
 
         #[test]
         fn test_document_state_update_versions() {
-            let deps = vec![create_test_dependency()];
-            let mut state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let mut state = DocumentState::new_without_parse_result("cargo", "test".into());
 
             let mut versions = HashMap::new();
             versions.insert(
@@ -1214,8 +1046,7 @@ mod tests {
         fn test_server_state_document_operations() {
             let state = ServerState::new();
             let uri = deps_core::test_util::test_uri("/test.toml");
-            let deps = vec![create_test_dependency()];
-            let doc_state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let doc_state = DocumentState::new_without_parse_result("cargo", "test".into());
 
             state.update_document(uri.clone(), doc_state);
             assert_eq!(state.document_count(), 1);
@@ -1227,47 +1058,6 @@ mod tests {
             let removed = state.remove_document(&uri);
             assert!(removed.is_some());
             assert_eq!(state.document_count(), 0);
-        }
-
-        #[test]
-        fn test_unified_dependency_name() {
-            let cargo_dep = create_test_dependency();
-            assert_eq!(cargo_dep.name(), "serde");
-            assert_eq!(cargo_dep.version_req(), Some("1.0"));
-            assert!(cargo_dep.is_registry());
-        }
-
-        #[test]
-        fn test_unified_dependency_git_source() {
-            let git_dep = UnifiedDependency::Cargo(ParsedDependency {
-                name: "custom".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 6)),
-                version_req: None,
-                version_range: None,
-                features: vec![],
-                features_range: None,
-                source: DependencySource::Git {
-                    url: "https://github.com/user/repo".into(),
-                    rev: None,
-                },
-                section: DependencySection::Dependencies,
-            });
-            assert!(!git_dep.is_registry());
-        }
-
-        #[test]
-        fn test_unified_dependency_workspace_source() {
-            let ws_dep = UnifiedDependency::Cargo(ParsedDependency {
-                name: "serde".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-                version_req: None,
-                version_range: None,
-                features: vec![],
-                features_range: None,
-                source: DependencySource::Workspace,
-                section: DependencySection::Dependencies,
-            });
-            assert!(!ws_dep.is_registry());
         }
 
         #[test]
@@ -1309,13 +1099,11 @@ mod tests {
             assert_eq!(doc_state.ecosystem_id, "cargo");
             assert_eq!(doc_state.ecosystem, EcosystemId::Cargo);
             assert!(doc_state.parse_result.is_none());
-            assert!(doc_state.dependencies.is_empty());
         }
 
         #[test]
         fn test_document_state_update_resolved_versions() {
-            let deps = vec![create_test_dependency()];
-            let mut state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let mut state = DocumentState::new_without_parse_result("cargo", "test".into());
 
             let mut resolved = HashMap::new();
             resolved.insert("serde".into(), "1.0.195".into());
@@ -1330,8 +1118,7 @@ mod tests {
 
         #[test]
         fn test_document_state_update_cached_versions() {
-            let deps = vec![create_test_dependency()];
-            let mut state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let mut state = DocumentState::new_without_parse_result("cargo", "test".into());
 
             let mut cached = HashMap::new();
             cached.insert("serde".into(), "1.0.210".into());
@@ -1342,27 +1129,23 @@ mod tests {
 
         #[test]
         fn test_document_state_parse_result_accessor() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let state = DocumentState::new_without_parse_result("cargo", "test".into());
             assert!(state.parse_result().is_none());
         }
 
         #[test]
         fn test_document_state_clone() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Cargo, "test content".into(), deps);
+            let state = DocumentState::new_without_parse_result("cargo", "test content".into());
             let cloned = state.clone();
 
             assert_eq!(cloned.ecosystem, state.ecosystem);
             assert_eq!(cloned.content, state.content);
-            assert_eq!(cloned.dependencies.len(), state.dependencies.len());
             assert!(cloned.parse_result.is_none());
         }
 
         #[test]
         fn test_document_state_debug() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Cargo, "test".into(), deps);
+            let state = DocumentState::new_without_parse_result("cargo", "test".into());
             let debug_str = format!("{state:?}");
             assert!(debug_str.contains("DocumentState"));
         }
@@ -1375,23 +1158,6 @@ mod tests {
     #[cfg(feature = "npm")]
     mod npm_tests {
         use super::*;
-        use deps_npm::{NpmDependency, NpmDependencySection};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        #[test]
-        fn test_unified_dependency() {
-            let npm_dep = UnifiedDependency::Npm(NpmDependency {
-                name: "express".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
-                version_req: Some("^4.0.0".into()),
-                version_range: Some(Range::new(Position::new(0, 11), Position::new(0, 18))),
-                section: NpmDependencySection::Dependencies,
-            });
-
-            assert_eq!(npm_dep.name(), "express");
-            assert_eq!(npm_dep.version_req(), Some("^4.0.0"));
-            assert!(npm_dep.is_registry());
-        }
 
         #[test]
         fn test_unified_version() {
@@ -1421,28 +1187,6 @@ mod tests {
     #[cfg(feature = "pypi")]
     mod pypi_tests {
         use super::*;
-        use deps_pypi::{PypiDependency, PypiDependencySection, PypiDependencySource};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        #[test]
-        fn test_unified_dependency() {
-            let pypi_dep = UnifiedDependency::Pypi(PypiDependency {
-                name: "requests".into(),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
-                version_req: Some(">=2.0.0".into()),
-                version_range: Some(Range::new(Position::new(0, 10), Position::new(0, 18))),
-                extras: vec![],
-                extras_range: None,
-                markers: None,
-                markers_range: None,
-                source: PypiDependencySource::Registry,
-                section: PypiDependencySection::Dependencies,
-            });
-
-            assert_eq!(pypi_dep.name(), "requests");
-            assert_eq!(pypi_dep.version_req(), Some(">=2.0.0"));
-            assert!(pypi_dep.is_registry());
-        }
 
         #[test]
         fn test_unified_version() {
@@ -1472,69 +1216,7 @@ mod tests {
     #[cfg(feature = "go")]
     mod go_tests {
         use super::*;
-        use deps_go::{GoDependency, GoDirective, GoVersion};
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        fn create_test_dependency() -> UnifiedDependency {
-            UnifiedDependency::Go(GoDependency {
-                module_path: "github.com/gin-gonic/gin".into(),
-                module_path_range: Range::new(Position::new(0, 0), Position::new(0, 25)),
-                version: Some("v1.9.1".into()),
-                version_range: Some(Range::new(Position::new(0, 26), Position::new(0, 32))),
-                directive: GoDirective::Require,
-                indirect: false,
-            })
-        }
-
-        #[test]
-        fn test_unified_dependency() {
-            let go_dep = create_test_dependency();
-            assert_eq!(go_dep.name(), "github.com/gin-gonic/gin");
-            assert_eq!(go_dep.version_req(), Some("v1.9.1"));
-            assert!(go_dep.is_registry());
-        }
-
-        #[test]
-        fn test_unified_dependency_name_range() {
-            let range = Range::new(Position::new(5, 10), Position::new(5, 35));
-            let go_dep = UnifiedDependency::Go(GoDependency {
-                module_path: "github.com/example/pkg".into(),
-                module_path_range: range,
-                version: Some("v1.0.0".into()),
-                version_range: Some(Range::new(Position::new(5, 36), Position::new(5, 42))),
-                directive: GoDirective::Require,
-                indirect: false,
-            });
-            assert_eq!(go_dep.name_range(), range);
-        }
-
-        #[test]
-        fn test_unified_dependency_version_range() {
-            let version_range = Range::new(Position::new(5, 36), Position::new(5, 42));
-            let go_dep = UnifiedDependency::Go(GoDependency {
-                module_path: "github.com/example/pkg".into(),
-                module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
-                version: Some("v1.0.0".into()),
-                version_range: Some(version_range),
-                directive: GoDirective::Require,
-                indirect: false,
-            });
-            assert_eq!(go_dep.version_range(), Some(version_range));
-        }
-
-        #[test]
-        fn test_unified_dependency_no_version() {
-            let go_dep = UnifiedDependency::Go(GoDependency {
-                module_path: "github.com/example/pkg".into(),
-                module_path_range: Range::new(Position::new(5, 10), Position::new(5, 35)),
-                version: None,
-                version_range: None,
-                directive: GoDirective::Require,
-                indirect: false,
-            });
-            assert_eq!(go_dep.version_req(), None);
-            assert_eq!(go_dep.version_range(), None);
-        }
+        use deps_go::GoVersion;
 
         #[test]
         fn test_unified_version() {
@@ -1573,16 +1255,6 @@ mod tests {
                 "v0.0.0-20191109021931-daa7c04131f5"
             );
             assert!(!version.is_yanked());
-        }
-
-        #[test]
-        fn test_document_state_new() {
-            let deps = vec![create_test_dependency()];
-            let state = DocumentState::new(EcosystemId::Go, "test content".into(), deps);
-
-            assert_eq!(state.ecosystem, EcosystemId::Go);
-            assert_eq!(state.ecosystem_id, "go");
-            assert_eq!(state.dependencies.len(), 1);
         }
 
         #[test]

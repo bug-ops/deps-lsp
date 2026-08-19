@@ -73,7 +73,6 @@ mod tests {
     mod cargo_tests {
         use super::*;
         use crate::document::DocumentState;
-        use deps_core::EcosystemId;
 
         #[tokio::test]
         async fn test_handle_hover() {
@@ -112,7 +111,7 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
-            let doc_state = DocumentState::new(EcosystemId::Cargo, String::new(), vec![]);
+            let doc_state = DocumentState::new_without_parse_result("cargo", String::new());
             state.update_document(uri.clone(), doc_state);
 
             let params = HoverParams {

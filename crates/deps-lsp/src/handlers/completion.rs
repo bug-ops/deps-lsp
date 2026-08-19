@@ -1059,8 +1059,6 @@ requests
 
     #[tokio::test]
     async fn test_fallback_triggered_when_parse_fails() {
-        use deps_core::EcosystemId;
-
         let state = Arc::new(ServerState::new());
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
 
@@ -1070,7 +1068,7 @@ ser"
         .to_string();
 
         // Create document without parse result (simulating parse failure)
-        let doc = DocumentState::new(EcosystemId::Cargo, content.clone(), vec![]);
+        let doc = DocumentState::new_without_parse_result("cargo", content.clone());
         state.update_document(uri.clone(), doc);
 
         let params = CompletionParams {
