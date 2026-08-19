@@ -342,6 +342,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         write!(&mut markdown, "**Requirement**: `{}`\n\n", version_req).unwrap();
     }
 
+    if let Some(marker_expr) = dep.markers() {
+        write!(&mut markdown, "**Active when**: `{}`\n\n", marker_expr).unwrap();
+    }
+
     let latest = versions
         .cached
         .get(&normalized_name)
@@ -787,6 +791,160 @@ mod tests {
             formatter.package_url("requests"),
             "https://pypi.org/project/requests"
         );
+    }
+
+    struct MockMarkedDep {
+        name: String,
+        name_range: Range,
+        markers: Option<String>,
+    }
+
+    impl Dependency for MockMarkedDep {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn name_range(&self) -> Range {
+            self.name_range
+        }
+        fn version_requirement(&self) -> Option<&str> {
+            None
+        }
+        fn version_range(&self) -> Option<Range> {
+            None
+        }
+        fn source(&self) -> crate::parser::DependencySource {
+            crate::parser::DependencySource::Registry
+        }
+        fn markers(&self) -> Option<&str> {
+            self.markers.as_deref()
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct MockMarkedParseResult {
+        dep: MockMarkedDep,
+        uri: Uri,
+    }
+
+    impl ParseResult for MockMarkedParseResult {
+        fn dependencies(&self) -> Vec<&dyn Dependency> {
+            vec![&self.dep]
+        }
+        fn workspace_root(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn uri(&self) -> &Uri {
+            &self.uri
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct MockRegistry;
+
+    impl crate::Registry for MockRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a str,
+            _req: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn package_url(&self, _name: &str) -> String {
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_surfaces_markers() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let parse_result = MockMarkedParseResult {
+            dep: MockMarkedDep {
+                name: "numpy".to_string(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                markers: Some("python_full_version >= '3.9'".to_string()),
+            },
+            uri: crate::test_util::test_uri("/test/pyproject.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            &HashMap::new(),
+            &HashMap::new(),
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("**Active when**: `python_full_version >= '3.9'`")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_omits_active_when_without_markers() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let parse_result = MockMarkedParseResult {
+            dep: MockMarkedDep {
+                name: "requests".to_string(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+                markers: None,
+            },
+            uri: crate::test_util::test_uri("/test/pyproject.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            &HashMap::new(),
+            &HashMap::new(),
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(!content.value.contains("Active when"));
     }
 
     #[test]

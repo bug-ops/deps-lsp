@@ -1,11 +1,18 @@
 use crate::error::{PypiError, Result};
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
-use pep508_rs::{Requirement, VersionOrUrl};
+use pep508_rs::{MarkerTree, Requirement, VersionOrUrl};
 use std::any::Any;
 use std::str::FromStr;
 use toml_span::value::{Table, Value};
 use tower_lsp_server::ls_types::{Position, Range, Uri};
+
+/// Marker expressions longer than this are not handed to `pep508_rs`'s
+/// recursive-descent parser, which has no depth limit and can overflow the
+/// stack on deeply nested expressions (verified: ~5000 nested parens, ~10 KiB,
+/// aborts the process; ~4000 survives). Text over the cap falls back to its
+/// raw, unnormalized form rather than being parsed.
+const MAX_MARKER_LEN: usize = 2048;
 
 /// Parse result containing all dependencies from pyproject.toml.
 ///
@@ -167,8 +174,8 @@ impl PypiParser {
 
         for value in requires_array {
             if let Some(dep_str) = value.as_str() {
-                let position = span_start(content, line_table, value.span);
-                match self.parse_pep508_requirement(dep_str, Some(position)) {
+                match self.parse_pep508_requirement(dep_str, Some(value.span), content, line_table)
+                {
                     Ok(mut dep) => {
                         dep.section = PypiDependencySection::BuildSystem;
                         dependencies.push(dep);
@@ -202,8 +209,8 @@ impl PypiParser {
 
         for value in deps_array {
             if let Some(dep_str) = value.as_str() {
-                let position = span_start(content, line_table, value.span);
-                match self.parse_pep508_requirement(dep_str, Some(position)) {
+                match self.parse_pep508_requirement(dep_str, Some(value.span), content, line_table)
+                {
                     Ok(mut dep) => {
                         dep.section = PypiDependencySection::Dependencies;
                         dependencies.push(dep);
@@ -239,8 +246,12 @@ impl PypiParser {
             if let Some(group_array) = group_val.as_array() {
                 for value in group_array {
                     if let Some(dep_str) = value.as_str() {
-                        let position = span_start(content, line_table, value.span);
-                        match self.parse_pep508_requirement(dep_str, Some(position)) {
+                        match self.parse_pep508_requirement(
+                            dep_str,
+                            Some(value.span),
+                            content,
+                            line_table,
+                        ) {
                             Ok(mut dep) => {
                                 dep.section = PypiDependencySection::OptionalDependencies {
                                     group: group_key.name.to_string(),
@@ -280,8 +291,12 @@ impl PypiParser {
             if let Some(group_array) = group_val.as_array() {
                 for value in group_array {
                     if let Some(dep_str) = value.as_str() {
-                        let position = span_start(content, line_table, value.span);
-                        match self.parse_pep508_requirement(dep_str, Some(position)) {
+                        match self.parse_pep508_requirement(
+                            dep_str,
+                            Some(value.span),
+                            content,
+                            line_table,
+                        ) {
                             Ok(mut dep) => {
                                 dep.section = PypiDependencySection::DependencyGroup {
                                     group: group_key.name.to_string(),
@@ -331,7 +346,7 @@ impl PypiParser {
 
             let position = span_start(content, line_table, name_key.span);
 
-            match self.parse_poetry_dependency(name, value, Some(position)) {
+            match self.parse_poetry_dependency(name, value, Some(position), content, line_table) {
                 Ok(mut dep) => {
                     dep.section = PypiDependencySection::PoetryDependencies;
                     dependencies.push(dep);
@@ -372,7 +387,13 @@ impl PypiParser {
                     let name = &name_key.name;
                     let position = span_start(content, line_table, name_key.span);
 
-                    match self.parse_poetry_dependency(name, value, Some(position)) {
+                    match self.parse_poetry_dependency(
+                        name,
+                        value,
+                        Some(position),
+                        content,
+                        line_table,
+                    ) {
                         Ok(mut dep) => {
                             dep.section = PypiDependencySection::PoetryGroup {
                                 group: group_name.to_string(),
@@ -393,12 +414,37 @@ impl PypiParser {
     /// Parse a PEP 508 requirement string.
     ///
     /// Example: `requests[security,socks]>=2.28.0,<3.0; python_version>='3.8'`
+    ///
+    /// `value_span` is the requirement string's source span (used for both
+    /// `Position` tracking and, via [`span_to_range`], UTF-16-correct
+    /// `markers_range` computation).
     fn parse_pep508_requirement(
         &self,
         requirement_str: &str,
-        base_position: Option<Position>,
+        value_span: Option<toml_span::Span>,
+        content: &str,
+        line_table: &LineOffsetTable,
     ) -> Result<PypiDependency> {
-        let requirement = Requirement::from_str(requirement_str)
+        let base_position = value_span.map(|span| span_start(content, line_table, span));
+
+        // `;` never appears inside a version/extras clause, so the first
+        // occurrence unambiguously anchors the marker section (direct-reference
+        // URLs containing `;` are a known, documented edge case - see #<follow-up>).
+        let semicolon_idx = requirement_str.find(';');
+
+        // Pathologically long marker expressions can overflow the stack in
+        // `pep508_rs`'s unbounded recursive-descent parser. Parse only the
+        // name/version/extras portion and skip marker normalization instead of
+        // handing the oversized marker text to the parser.
+        let marker_too_long =
+            semicolon_idx.is_some_and(|idx| requirement_str.len() - idx > MAX_MARKER_LEN);
+        let parse_str = if marker_too_long {
+            &requirement_str[..semicolon_idx.unwrap()]
+        } else {
+            requirement_str
+        };
+
+        let requirement = Requirement::from_str(parse_str)
             .map_err(|e| PypiError::InvalidDependencySpec { source: e })?;
 
         let name = requirement.name.to_string();
@@ -410,6 +456,9 @@ impl PypiParser {
                 )
             })
             .unwrap_or_default();
+
+        // Version/extras text never extends past the marker section.
+        let version_end = semicolon_idx.unwrap_or(requirement_str.len());
 
         let (version_req, version_range, source) = match requirement.version_or_url {
             Some(VersionOrUrl::VersionSpecifier(specs)) => {
@@ -431,10 +480,13 @@ impl PypiParser {
                 };
                 let start_offset = name.len() + extras_str_len;
 
-                // Calculate original version length from requirement_str
+                // Calculate original version length from requirement_str, bounded
+                // at the marker section so the range never overlaps markers_range
+                // (it is the sole TextEdit target for the "update version" code
+                // action, so overlap would delete the marker on accept).
                 // pep508 normalizes version specifiers (e.g., ">=1.7,<2.0" -> ">=1.7, <2.0")
                 // We need the original length for correct position tracking
-                let original_version_len = requirement_str.len() - start_offset;
+                let original_version_len = version_end.saturating_sub(start_offset);
 
                 let version_range = base_position.map(|pos| {
                     Range::new(
@@ -476,7 +528,36 @@ impl PypiParser {
             .into_iter()
             .map(|e| e.to_string())
             .collect();
-        let markers = requirement.marker.try_to_string();
+
+        let markers = if marker_too_long {
+            let raw_marker = requirement_str[semicolon_idx.unwrap() + 1..].trim();
+            if raw_marker.is_empty() {
+                None
+            } else {
+                tracing::warn!(
+                    "Marker expression for '{}' is {} bytes (over the {}-byte cap), skipping normalization",
+                    name,
+                    raw_marker.len(),
+                    MAX_MARKER_LEN
+                );
+                Some(raw_marker.to_string())
+            }
+        } else {
+            requirement.marker.try_to_string()
+        };
+
+        // The marker text starts right after the first `;` in the original
+        // requirement string; `pep508_rs` doesn't expose a source span for it.
+        let markers_range = markers.as_ref().and_then(|_| {
+            let idx = semicolon_idx?;
+            value_span.map(|span| {
+                span_to_range(
+                    content,
+                    line_table,
+                    toml_span::Span::new(span.start + idx + 1, span.end),
+                )
+            })
+        });
 
         Ok(PypiDependency {
             name,
@@ -486,7 +567,7 @@ impl PypiParser {
             extras,
             extras_range: None,
             markers,
-            markers_range: None,
+            markers_range,
             section: PypiDependencySection::Dependencies,
             source,
         })
@@ -496,12 +577,15 @@ impl PypiParser {
     ///
     /// Examples:
     /// - String: `requests = "^2.28.0"`
+    /// - String with marker: `requests = "^2.28.0; sys_platform == 'win32'"`
     /// - Table: `flask = { version = "^3.0", extras = ["async"] }`
     fn parse_poetry_dependency(
         &self,
         name: &str,
         value: &Value<'_>,
         base_position: Option<Position>,
+        content: &str,
+        line_table: &LineOffsetTable,
     ) -> Result<PypiDependency> {
         let name_range = base_position
             .map(|pos| {
@@ -512,27 +596,57 @@ impl PypiParser {
             })
             .unwrap_or_default();
 
-        // Simple string version
-        if let Some(version_str) = value.as_str() {
-            let version_range = base_position.map(|pos| {
-                Range::new(
-                    Position::new(pos.line, pos.character + name.len() as u32 + 3),
-                    Position::new(
-                        pos.line,
-                        pos.character + name.len() as u32 + 3 + version_str.len() as u32,
-                    ),
-                )
-            });
+        // Simple string version, optionally followed by a `; <marker>` suffix
+        // mirroring PEP 508 syntax (not standard Poetry, but handled defensively).
+        if let Some(raw_value) = value.as_str() {
+            let value_span = value.span;
+            let source_slice = &content[value_span.start..value_span.end];
+
+            let (version_str, raw_marker) = match raw_value.find(';') {
+                Some(idx) => (&raw_value[..idx], Some(&raw_value[idx + 1..])),
+                None => (raw_value, None),
+            };
+
+            // Locate the split independently in the *source* slice: `;` is
+            // never produced by TOML escape decoding, so this byte offset is
+            // safe for range math even when the decoded string's length
+            // diverges from the source (e.g. `\"` escapes in the marker).
+            // Deriving both ranges from `value_span` here (rather than
+            // `name.len()` arithmetic) also makes them correct regardless of
+            // spacing around `=` or whether the key itself is quoted.
+            let source_semicolon = source_slice.find(';');
+            let version_end_byte =
+                value_span.start + source_semicolon.unwrap_or(source_slice.len());
+            let version_range = Some(span_to_range(
+                content,
+                line_table,
+                toml_span::Span::new(value_span.start, version_end_byte),
+            ));
+
+            let (markers, markers_range) = match (raw_marker, source_semicolon) {
+                (Some(marker), Some(src_idx)) => match normalize_marker_string(marker) {
+                    Some(normalized) => {
+                        let marker_span =
+                            toml_span::Span::new(value_span.start + src_idx + 1, value_span.end);
+                        (
+                            Some(normalized),
+                            Some(span_to_range(content, line_table, marker_span)),
+                        )
+                    }
+                    None => (None, None),
+                },
+                _ => (None, None),
+            };
 
             return Ok(PypiDependency {
                 name: name.to_string(),
                 name_range,
-                version_req: Some(version_str.to_string()),
+                version_req: Some(version_str.trim().to_string()),
                 version_range,
                 extras: Vec::new(),
                 extras_range: None,
-                markers: None,
-                markers_range: None,
+                markers,
+                markers_range,
                 section: PypiDependencySection::PoetryDependencies,
                 source: PypiDependencySource::Registry,
             });
@@ -554,10 +668,13 @@ impl PypiParser {
                 })
                 .unwrap_or_default();
 
-            let markers = table
-                .get("markers")
+            let markers_value = table.get("markers").filter(|v| v.as_str().is_some());
+            let markers = markers_value
                 .and_then(|m| m.as_str())
-                .map(String::from);
+                .and_then(normalize_marker_string);
+            let markers_range = markers_value
+                .filter(|_| markers.is_some())
+                .map(|v| span_to_range(content, line_table, v.span));
 
             let source = if table.contains_key("git") {
                 PypiDependencySource::Git {
@@ -596,7 +713,7 @@ impl PypiParser {
                 extras,
                 extras_range: None,
                 markers,
-                markers_range: None,
+                markers_range,
                 section: PypiDependencySection::PoetryDependencies,
                 source,
             });
@@ -619,6 +736,47 @@ fn get_table<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Table<'a>> {
 /// points directly to the first character of the string content.
 fn span_start(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Position {
     line_table.byte_offset_to_position(content, span.start)
+}
+
+/// Converts a toml-span byte span to an LSP `Range` using the pre-computed line table.
+fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Range {
+    let start = line_table.byte_offset_to_position(content, span.start);
+    let end = line_table.byte_offset_to_position(content, span.end);
+    Range::new(start, end)
+}
+
+/// Parses a raw PEP 508 marker expression and serializes it back through
+/// `MarkerTree` for consistency with the PEP 621 requirement-string path,
+/// which canonicalizes markers on serialization (e.g. `python_version`
+/// comparisons become `python_full_version`).
+///
+/// Returns `None` for an empty/whitespace-only expression, or one that
+/// normalizes to the trivially-true marker (which has no string form, e.g.
+/// `os_name == 'a' or os_name != 'a'`) — matching the PEP 621 path, which
+/// likewise yields `None` for an absent or always-true marker. Falls back to
+/// the raw string, unmodified, if the expression fails to parse or exceeds
+/// [`MAX_MARKER_LEN`].
+fn normalize_marker_string(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() > MAX_MARKER_LEN {
+        tracing::warn!(
+            "Marker expression is {} bytes (over the {}-byte cap), skipping normalization: '{}'",
+            trimmed.len(),
+            MAX_MARKER_LEN,
+            trimmed
+        );
+        return Some(trimmed.to_string());
+    }
+    match MarkerTree::from_str(trimmed) {
+        Ok(tree) => tree.try_to_string(),
+        Err(e) => {
+            tracing::warn!("Failed to parse marker expression '{}': {}", trimmed, e);
+            Some(trimmed.to_string())
+        }
+    }
 }
 
 impl Default for PypiParser {
@@ -1387,5 +1545,381 @@ dev = ["pytest-cov >=4.0,<8.0"]
             version_range.start.character,
             version_range.end.character
         );
+    }
+
+    /// Converts an LSP UTF-16 code-unit offset within `line` to a byte offset.
+    fn utf16_offset_to_byte(line: &str, utf16_offset: u32) -> usize {
+        let mut utf16_count = 0u32;
+        for (byte_idx, ch) in line.char_indices() {
+            if utf16_count >= utf16_offset {
+                return byte_idx;
+            }
+            utf16_count += ch.len_utf16() as u32;
+        }
+        line.len()
+    }
+
+    /// Extracts the text a single-line `Range` covers, for asserting on
+    /// exact marker/version spans without hand-computing offsets. `Range`
+    /// characters are UTF-16 code units per the LSP spec, so this converts
+    /// through byte offsets rather than indexing `line` directly (which would
+    /// panic, or silently misbehave, on non-ASCII content).
+    fn slice_range(content: &str, range: Range) -> String {
+        assert_eq!(
+            range.start.line, range.end.line,
+            "helper only supports single-line ranges"
+        );
+        let line = content.lines().nth(range.start.line as usize).unwrap();
+        let start = utf16_offset_to_byte(line, range.start.character);
+        let end = utf16_offset_to_byte(line, range.end.character);
+        line[start..end].to_string()
+    }
+
+    #[test]
+    fn test_pep621_markers_range_covers_marker_text() {
+        let toml = r#"[project]
+dependencies = [
+    "numpy>=1.24; python_version>='3.9'",
+]
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+        assert_eq!(
+            dep.markers,
+            Some("python_full_version >= '3.9'".to_string())
+        );
+
+        // Range starts right after `;`, so it includes the following space.
+        let markers_range = dep.markers_range.expect("markers_range should be set");
+        assert_eq!(slice_range(toml, markers_range), " python_version>='3.9'");
+    }
+
+    #[test]
+    fn test_pep621_without_markers_has_no_markers_range() {
+        let toml = r#"[project]
+dependencies = ["requests>=2.28.0"]
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].markers, None);
+        assert_eq!(deps[0].markers_range, None);
+    }
+
+    #[test]
+    fn test_pep621_version_range_excludes_marker_text() {
+        // Regression test: version_range is the sole TextEdit range for the
+        // "update version" code action. If it overlapped markers_range,
+        // accepting that quick-fix would delete the marker from the file.
+        let toml = r#"[project]
+dependencies = [
+    "numpy>=1.24; python_version>='3.9'",
+]
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        let version_range = dep.version_range.expect("version_range should be set");
+        assert_eq!(slice_range(toml, version_range), ">=1.24");
+
+        let markers_range = dep.markers_range.expect("markers_range should be set");
+        assert!(version_range.end.character <= markers_range.start.character);
+    }
+
+    #[test]
+    fn test_poetry_table_form_markers_normalized() {
+        let toml = r#"[tool.poetry.dependencies]
+django = { version = "^4.0", markers = "python_version >= \"3.8\"" }
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+        assert_eq!(dep.name, "django");
+        // pep508_rs canonicalizes python_version comparisons to python_full_version.
+        assert_eq!(
+            dep.markers,
+            Some("python_full_version >= '3.8'".to_string())
+        );
+
+        let markers_range = dep.markers_range.expect("markers_range should be set");
+        assert_eq!(
+            slice_range(toml, markers_range),
+            "python_version >= \\\"3.8\\\""
+        );
+    }
+
+    #[test]
+    fn test_poetry_table_form_invalid_markers_falls_back_to_raw() {
+        let toml = r#"[tool.poetry.dependencies]
+django = { version = "^4.0", markers = "not a valid marker (((" }
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+        // Unparseable marker text is preserved verbatim rather than dropped.
+        assert_eq!(dep.markers, Some("not a valid marker (((".to_string()));
+        assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_poetry_table_form_trivially_true_marker_becomes_none() {
+        // Matches the PEP 621 path: a marker that normalizes to always-true
+        // has no string form and is indistinguishable from no marker at all.
+        let toml = r#"[tool.poetry.dependencies]
+django = { version = "^4.0", markers = "os_name == 'a' or os_name != 'a'" }
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_table_form_empty_markers_becomes_none() {
+        let toml = r#"[tool.poetry.dependencies]
+django = { version = "^4.0", markers = "   " }
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_table_form_oversized_marker_skips_normalization() {
+        let long_marker: String = "os_name == 'a' or ".repeat(200) + "os_name == 'a'";
+        assert!(long_marker.len() > MAX_MARKER_LEN);
+        let toml = format!(
+            "[tool.poetry.dependencies]\ndjango = {{ version = \"^4.0\", markers = \"{long_marker}\" }}\n"
+        );
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        // Falls back to raw text rather than being handed to pep508_rs's
+        // unbounded recursive-descent parser.
+        assert_eq!(dep.markers, Some(long_marker));
+        assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_poetry_table_form_without_markers_key_has_no_markers() {
+        let toml = r#"[tool.poetry.dependencies]
+django = { version = "^4.0" }
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].markers, None);
+        assert_eq!(deps[0].markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_string_form_without_marker_stays_none() {
+        let toml = r#"[tool.poetry.dependencies]
+requests = "^2.28.0"
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_string_form_with_marker_suffix_normalized() {
+        let toml = "[tool.poetry.dependencies]\nrequests = \"^2.28.0; python_version >= '3.8'\"\n";
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+        assert_eq!(dep.name, "requests");
+        // The marker suffix is split out of version_req and normalized.
+        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.markers,
+            Some("python_full_version >= '3.8'".to_string())
+        );
+
+        let version_range = dep.version_range.expect("version_range should be set");
+        assert_eq!(slice_range(toml, version_range), "^2.28.0");
+
+        // Range starts right after `;`, so it includes the following space.
+        let markers_range = dep.markers_range.expect("markers_range should be set");
+        assert_eq!(slice_range(toml, markers_range), " python_version >= '3.8'");
+    }
+
+    #[test]
+    fn test_poetry_string_form_with_invalid_marker_suffix_falls_back_to_raw() {
+        let toml = "[tool.poetry.dependencies]\nrequests = \"^2.28.0; not a valid marker (((\"\n";
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(deps.len(), 1);
+        let dep = &deps[0];
+        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(dep.markers, Some("not a valid marker (((".to_string()));
+        assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_poetry_string_form_version_range_without_marker() {
+        let toml = "[tool.poetry.dependencies]\nrequests = \"^2.28.0\"\n";
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        let version_range = dep.version_range.expect("version_range should be set");
+        assert_eq!(slice_range(toml, version_range), "^2.28.0");
+    }
+
+    #[test]
+    fn test_poetry_string_form_empty_marker_after_semicolon() {
+        let toml = "[tool.poetry.dependencies]\nrequests = \"^2.28.0;\"\n";
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_string_form_no_space_around_equals() {
+        // value.span-based range derivation must not depend on `name.len()`
+        // arithmetic assuming a fixed ` = "` layout.
+        let toml = "[tool.poetry.dependencies]\nrequests=\"^2.28.0; python_version >= '3.8'\"\n";
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "requests");
+        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.markers,
+            Some("python_full_version >= '3.8'".to_string())
+        );
+
+        let version_range = dep.version_range.expect("version_range should be set");
+        assert_eq!(slice_range(toml, version_range), "^2.28.0");
+        let markers_range = dep.markers_range.expect("markers_range should be set");
+        assert_eq!(slice_range(toml, markers_range), " python_version >= '3.8'");
+    }
+
+    #[test]
+    fn test_poetry_string_form_quoted_key() {
+        let toml =
+            "[tool.poetry.dependencies]\n\"requests\" = \"^2.28.0; python_version >= '3.8'\"\n";
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "requests");
+        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+
+        let version_range = dep.version_range.expect("version_range should be set");
+        assert_eq!(slice_range(toml, version_range), "^2.28.0");
+        let markers_range = dep.markers_range.expect("markers_range should be set");
+        assert_eq!(slice_range(toml, markers_range), " python_version >= '3.8'");
+    }
+
+    #[test]
+    fn test_poetry_string_form_marker_with_escaped_quotes() {
+        // TOML decodes `\"` to `"`, so the decoded string's byte length
+        // diverges from the source; range math must not desync from this.
+        let toml =
+            "[tool.poetry.dependencies]\nrequests = \"^2.28.0; python_version >= \\\"3.8\\\"\"\n";
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.markers,
+            Some("python_full_version >= '3.8'".to_string())
+        );
+
+        let version_range = dep.version_range.expect("version_range should be set");
+        assert_eq!(slice_range(toml, version_range), "^2.28.0");
+    }
+
+    #[test]
+    fn test_poetry_string_form_marker_with_non_ascii() {
+        // Byte offsets must be converted to UTF-16 code units (the LSP
+        // Position unit) via the line table, not added to Position::character
+        // directly.
+        let toml = "[tool.poetry.dependencies]\nrequests = \"^2.28.0; os_name == 'ПРИВЕТ🚀'\"\n";
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+
+        let version_range = dep.version_range.expect("version_range should be set");
+        assert_eq!(slice_range(toml, version_range), "^2.28.0");
+
+        let line = toml.lines().nth(1).unwrap();
+        let line_utf16_len = line.encode_utf16().count() as u32;
+        let markers_range = dep.markers_range.expect("markers_range should be set");
+        assert!(markers_range.end.character <= line_utf16_len);
+        assert_eq!(slice_range(toml, markers_range), " os_name == 'ПРИВЕТ🚀'");
+    }
+
+    #[test]
+    fn test_poetry_string_form_oversized_marker_skips_normalization() {
+        let long_marker: String = "os_name == 'a' or ".repeat(200) + "os_name == 'a'";
+        assert!(long_marker.len() > MAX_MARKER_LEN);
+        let toml = format!("[tool.poetry.dependencies]\nrequests = \"^2.28.0; {long_marker}\"\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(dep.markers, Some(long_marker));
+        assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_pep621_oversized_marker_skips_normalization() {
+        let long_marker: String = "os_name == 'a' or ".repeat(200) + "os_name == 'a'";
+        assert!(long_marker.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"numpy>=1.24; {long_marker}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "numpy");
+        assert_eq!(dep.version_req, Some(">=1.24".to_string()));
+        // Skips normalization (would blow the stack in pep508_rs's parser)
+        // but preserves the raw marker text rather than dropping it.
+        assert_eq!(dep.markers, Some(long_marker));
+        assert!(dep.markers_range.is_some());
     }
 }

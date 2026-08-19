@@ -161,6 +161,19 @@ pub trait Dependency: Send + Sync {
         None
     }
 
+    /// Environment marker expression gating this dependency (e.g. PEP 508's
+    /// `python_version >= '3.8'`). Ecosystem-specific, `None` if not supported
+    /// or not present on this dependency.
+    fn markers(&self) -> Option<&str> {
+        None
+    }
+
+    /// LSP range of the environment marker expression (ecosystem-specific,
+    /// `None` if not supported or not present).
+    fn markers_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+        None
+    }
+
     /// Downcast to concrete type
     fn as_any(&self) -> &dyn Any;
 }
