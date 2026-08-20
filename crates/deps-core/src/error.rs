@@ -1,5 +1,18 @@
 use thiserror::Error;
 
+/// Reconstructs the "{status} {reason}" text `reqwest::StatusCode`'s `Display`
+/// produces, since `HttpStatus` stores a bare `u16` for structural matching
+/// and loses the canonical reason phrase otherwise.
+fn http_status_message(status: u16, url: &str) -> String {
+    let reason = reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason());
+    reason.map_or_else(
+        || format!("HTTP {status} for {url}"),
+        |reason| format!("HTTP {status} {reason} for {url}"),
+    )
+}
+
 /// Core error types for deps-lsp.
 ///
 /// Extended from Phase 1 to support multiple ecosystems (Cargo, npm, PyPI).
@@ -42,6 +55,23 @@ pub enum DepsError {
 
     #[error("cache error: {0}")]
     CacheError(String),
+
+    #[error("{package} not found on {registry}")]
+    PackageNotFound {
+        package: String,
+        registry: &'static str,
+    },
+
+    #[error("{}", http_status_message(*status, url))]
+    HttpStatus { url: String, status: u16 },
+
+    #[error("failed to parse {registry} response for {package}: {source}")]
+    ApiResponse {
+        package: String,
+        registry: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
 
     #[error("response body for {url} exceeds {limit} byte limit")]
     ResponseTooLarge { url: String, limit: usize },
@@ -148,5 +178,50 @@ mod tests {
     fn test_invalid_uri() {
         let error = DepsError::InvalidUri("http://example.com".into());
         assert_eq!(error.to_string(), "invalid URI: http://example.com");
+    }
+
+    #[test]
+    fn test_package_not_found() {
+        let error = DepsError::PackageNotFound {
+            package: "flask".into(),
+            registry: "PyPI",
+        };
+        assert_eq!(error.to_string(), "flask not found on PyPI");
+    }
+
+    #[test]
+    fn test_http_status_with_known_reason() {
+        let error = DepsError::HttpStatus {
+            url: "https://example.com/data".into(),
+            status: 404,
+        };
+        assert_eq!(
+            error.to_string(),
+            "HTTP 404 Not Found for https://example.com/data"
+        );
+    }
+
+    #[test]
+    fn test_http_status_with_unknown_code() {
+        let error = DepsError::HttpStatus {
+            url: "https://example.com/data".into(),
+            status: 599,
+        };
+        assert_eq!(error.to_string(), "HTTP 599 for https://example.com/data");
+    }
+
+    #[test]
+    fn test_api_response_error() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err();
+        let error = DepsError::ApiResponse {
+            package: "flask".into(),
+            registry: "PyPI",
+            source: json_err,
+        };
+        assert!(
+            error
+                .to_string()
+                .starts_with("failed to parse PyPI response for flask:")
+        );
     }
 }

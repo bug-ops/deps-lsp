@@ -13,6 +13,10 @@ use std::any::Any;
 use std::sync::Arc;
 
 const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
+
+/// Display name for Maven Central used in not-found and API-response error
+/// messages. Reused by `deps-gradle`, which resolves through this registry.
+pub const REGISTRY: &str = "Maven Central";
 const GOOGLE_MAVEN_BASE: &str = "https://dl.google.com/dl/android/maven2";
 const GRADLE_PLUGIN_PORTAL_BASE: &str = "https://plugins.gradle.org/m2";
 const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";

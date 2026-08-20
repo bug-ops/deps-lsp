@@ -171,7 +171,7 @@ impl HttpCache {
     /// # Errors
     ///
     /// Returns `DepsError::RegistryError` if the initial fetch fails and no
-    /// cached data exists, `DepsError::CacheError` if the server returns a
+    /// cached data exists, `DepsError::HttpStatus` if the server returns a
     /// non-2xx status on that initial fetch, or `DepsError::ResponseTooLarge`
     /// if the response body exceeds the configured size cap.
     ///
@@ -198,7 +198,7 @@ impl HttpCache {
     /// # Errors
     ///
     /// Returns `DepsError::RegistryError` if the initial fetch fails and no
-    /// cached data exists, `DepsError::CacheError` if the server returns a
+    /// cached data exists, `DepsError::HttpStatus` if the server returns a
     /// non-2xx status on that initial fetch, or `DepsError::ResponseTooLarge`
     /// if the response body exceeds the configured size cap.
     pub async fn get_cached_with_headers(
@@ -269,8 +269,10 @@ impl HttpCache {
         }
 
         if !response.status().is_success() {
-            let status = response.status();
-            return Err(DepsError::CacheError(format!("HTTP {status} for {url}")));
+            return Err(DepsError::HttpStatus {
+                url: url.to_string(),
+                status: response.status().as_u16(),
+            });
         }
 
         let etag = response
@@ -306,7 +308,7 @@ impl HttpCache {
     ///
     /// # Errors
     ///
-    /// Returns `DepsError::CacheError` if the server returns a non-2xx status code,
+    /// Returns `DepsError::HttpStatus` if the server returns a non-2xx status code,
     /// `DepsError::RegistryError` if the network request fails, or
     /// `DepsError::ResponseTooLarge` if the response body exceeds the
     /// configured size cap.
@@ -329,8 +331,10 @@ impl HttpCache {
         })?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            return Err(DepsError::CacheError(format!("HTTP {status} for {url}")));
+            return Err(DepsError::HttpStatus {
+                url: url.to_string(),
+                status: response.status().as_u16(),
+            });
         }
 
         let etag = response
@@ -672,10 +676,10 @@ mod tests {
 
         assert!(result.is_err());
         match result {
-            Err(DepsError::CacheError(msg)) => {
-                assert!(msg.contains("404"));
+            Err(DepsError::HttpStatus { status, .. }) => {
+                assert_eq!(status, 404);
             }
-            _ => panic!("Expected CacheError"),
+            _ => panic!("Expected HttpStatus"),
         }
     }
 

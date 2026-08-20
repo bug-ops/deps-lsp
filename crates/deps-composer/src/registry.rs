@@ -35,6 +35,9 @@ pub fn package_url(name: &str) -> String {
     }
 }
 
+/// Display name for Packagist used in not-found and API-response error messages.
+pub const REGISTRY: &str = "Packagist";
+
 /// Client for interacting with the Packagist registry.
 ///
 /// Uses the Packagist v2 API for package metadata and search.

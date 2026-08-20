@@ -18,3 +18,10 @@ pub use error::{GradleError, Result};
 pub use formatter::GradleFormatter;
 pub use parser::{GradleParseResult, parse_gradle};
 pub use types::{GradleDependency, GradleVersion};
+
+/// Display name for the registry backing Gradle dependency resolution.
+///
+/// Gradle resolves through `deps_maven::MavenCentralRegistry`, so this
+/// reuses Maven's registry display name rather than introducing a
+/// separate, potentially divergent one.
+pub use deps_maven::registry::REGISTRY;

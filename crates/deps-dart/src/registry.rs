@@ -9,6 +9,9 @@ use std::sync::Arc;
 
 const PUB_DEV_API_BASE: &str = "https://pub.dev/api";
 
+/// Display name for pub.dev used in not-found and API-response error messages.
+pub const REGISTRY: &str = "pub.dev";
+
 pub fn package_url(name: &str) -> String {
     format!("https://pub.dev/packages/{}", urlencoding::encode(name))
 }

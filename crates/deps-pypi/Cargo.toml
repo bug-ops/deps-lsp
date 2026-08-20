@@ -17,6 +17,7 @@ deps-core = { workspace = true }
 async-trait = { workspace = true }
 pep440_rs = { workspace = true }
 pep508_rs = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

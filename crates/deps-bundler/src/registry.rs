@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 const RUBYGEMS_API_BASE: &str = "https://rubygems.org/api/v1";
 
+/// Display name for RubyGems used in not-found and API-response error messages.
+pub const REGISTRY: &str = "RubyGems";
+
 /// Base URL for gem pages on rubygems.org.
 pub const RUBYGEMS_URL: &str = "https://rubygems.org/gems";
 

@@ -22,7 +22,6 @@
 //! ```
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
@@ -32,7 +31,6 @@ pub mod version;
 
 // Re-export commonly used types
 pub use ecosystem::BundlerEcosystem;
-pub use error::{BundlerError, Result};
 pub use formatter::BundlerFormatter;
 pub use lockfile::GemfileLockParser;
 pub use parser::{BundlerParseResult, BundlerParser, parse_gemfile};

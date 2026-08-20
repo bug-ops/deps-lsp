@@ -4,8 +4,8 @@
 //! comments to avoid false positives. Byte offsets are preserved during
 //! comment stripping for accurate LSP position tracking.
 
-use crate::error::Result;
 use crate::types::{SwiftDependency, SwiftParseResult};
+use deps_core::Result;
 use deps_core::lsp_helpers::LineOffsetTable;
 use deps_core::parser::DependencySource;
 use regex::Regex;
