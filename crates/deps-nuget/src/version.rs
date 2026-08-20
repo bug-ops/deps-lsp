@@ -235,6 +235,28 @@ fn satisfies_max(v: &ParsedVersion, max: &ParsedVersion, inclusive: bool) -> boo
     }
 }
 
+/// Compares an "up to date" reference version against `range`'s floor, for range shapes
+/// that express a minimum with no upper bound — a bare floor (`1.0.0`) or an explicit
+/// open-ended minimum (`[1.0.0,)`, `(1.0.0,)`, `[1.0.0,]`). Both are the same
+/// `VersionRange::Minimum` shape once parsed, so this classifies on that shape rather than
+/// the range string's leading bracket character (a bare floor and `[1.0.0,)` must be
+/// treated identically — see `is_requirement_up_to_date` in `crate::formatter`).
+///
+/// Returns `None` for exact pins, maximums, bounded ranges, floating patterns (`1.1.*`,
+/// which `parse_range` cannot represent as `Minimum`), or unparseable input — those already
+/// express a genuine compatibility window rather than a simple pin, so the caller should
+/// fall back to `satisfies`.
+pub(crate) fn compare_minimum_floor(range: &str, other: &str) -> Option<Ordering> {
+    match parse_range(range)? {
+        VersionRange::Minimum { version, .. } => {
+            Some(compare_parsed(&version, &ParsedVersion::parse(other)))
+        }
+        VersionRange::Exact(_) | VersionRange::Maximum { .. } | VersionRange::Bounded { .. } => {
+            None
+        }
+    }
+}
+
 /// Checks whether `version` satisfies a NuGet interval-notation `range` (spec §2).
 ///
 /// Supports bare floors (`1.0`), exact pins (`[1.0]`), open/closed minimums and maximums

@@ -28,6 +28,25 @@ impl EcosystemFormatter for NuGetFormatter {
     fn normalize_package_name(&self, name: &str) -> String {
         name.to_lowercase()
     }
+
+    /// Overridden because a minimum-only range (a bare `Version="1.0.0"`, or its explicit
+    /// open-ended-minimum spellings `[1.0.0,)`/`(1.0.0,)`/`[1.0.0,]`) is a floor under
+    /// `PackageReference`/`PackageVersion` semantics, not an auto-following range:
+    /// `version_satisfies_requirement` accepts any version `>= 1.0.0`, so delegating to it
+    /// here would never flag a floor as outdated. `latest` behind the floor is not
+    /// "outdated" either (it would read as a downgrade suggestion), so up to date is
+    /// `latest <= floor` here, not `latest == floor`. Exact pins, maximums, bounded ranges,
+    /// and floating patterns (`1.1.*`) already express the intended forward-compatibility
+    /// window, so those keep the general satisfies check.
+    fn is_requirement_up_to_date(&self, requirement: &str, latest: &str) -> bool {
+        if requirement.contains('*') {
+            return self.version_satisfies_requirement(latest, requirement);
+        }
+        match crate::version::compare_minimum_floor(requirement, latest) {
+            Some(ordering) => ordering != std::cmp::Ordering::Less,
+            None => self.version_satisfies_requirement(latest, requirement),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -68,6 +87,52 @@ mod tests {
         let f = NuGetFormatter;
         assert!(f.version_satisfies_requirement("1.1.5", "1.1.*"));
         assert!(!f.version_satisfies_requirement("1.2.0", "1.1.*"));
+    }
+
+    #[test]
+    fn test_is_up_to_date_bare_floor_outdated() {
+        let f = NuGetFormatter;
+        // Bare floors are pins under PackageReference: a newer latest is outdated,
+        // even though it satisfies the floor (>= 13.0.3).
+        assert!(!f.is_requirement_up_to_date("13.0.3", "13.0.4"));
+        assert!(!f.is_requirement_up_to_date("13.0.3", "14.0.0"));
+    }
+
+    #[test]
+    fn test_is_up_to_date_bare_floor_matches_latest() {
+        let f = NuGetFormatter;
+        assert!(f.is_requirement_up_to_date("13.0.3", "13.0.3"));
+    }
+
+    #[test]
+    fn test_is_up_to_date_open_ended_minimum_bracket_forms_outdated() {
+        let f = NuGetFormatter;
+        // Same floor semantics as a bare version, spelled with explicit interval brackets.
+        assert!(!f.is_requirement_up_to_date("[13.0.3,)", "13.0.4"));
+        assert!(!f.is_requirement_up_to_date("(13.0.3,)", "13.0.4"));
+        assert!(!f.is_requirement_up_to_date("[13.0.3,]", "13.0.4"));
+        assert!(f.is_requirement_up_to_date("[13.0.3,)", "13.0.3"));
+    }
+
+    #[test]
+    fn test_is_up_to_date_floor_ahead_of_latest_is_not_outdated() {
+        let f = NuGetFormatter;
+        // A floor already ahead of the registry's latest (a preview/prerelease pin, or a
+        // latest that regressed) must not render a downgrade suggestion.
+        assert!(f.is_requirement_up_to_date("13.0.5", "13.0.4"));
+        assert!(f.is_requirement_up_to_date("9.0.0-preview.5", "8.0.11"));
+        // A prerelease pin genuinely behind a newer stable release is still outdated.
+        assert!(!f.is_requirement_up_to_date("9.0.0-preview.5", "9.0.0"));
+    }
+
+    #[test]
+    fn test_is_up_to_date_exact_pin_and_ranges_keep_satisfies_semantics() {
+        let f = NuGetFormatter;
+        assert!(f.is_requirement_up_to_date("[13.0.3]", "13.0.3"));
+        assert!(!f.is_requirement_up_to_date("[13.0.3]", "14.0.0"));
+        assert!(f.is_requirement_up_to_date("[1.0,2.0)", "1.5.0"));
+        assert!(f.is_requirement_up_to_date("1.1.*", "1.1.5"));
+        assert!(!f.is_requirement_up_to_date("1.1.*", "1.2.0"));
     }
 
     #[test]

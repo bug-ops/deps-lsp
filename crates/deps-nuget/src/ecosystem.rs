@@ -262,4 +262,144 @@ mod tests {
         let eco = NuGetEcosystem::new(cache);
         assert!(eco.complete_package_names("").await.is_empty());
     }
+
+    /// End-to-end regression for issue #163: a `.csproj`/`Directory.Packages.props`
+    /// bare-floor `Version` pinned behind the latest registry release must render `❌
+    /// {latest}`, not `✅` — see `NuGetFormatter::is_requirement_up_to_date`.
+    async fn inlay_hint_labels(
+        eco: &NuGetEcosystem,
+        content: &str,
+        uri: &tower_lsp_server::ls_types::Uri,
+        latest: &str,
+    ) -> Vec<String> {
+        use deps_core::lsp_helpers::VersionData;
+        use deps_core::{EcosystemConfig, LoadingState};
+        use tower_lsp_server::ls_types::InlayHintLabel;
+
+        let parse_result = eco.parse_manifest(content, uri).await.unwrap();
+        let mut cached = std::collections::HashMap::new();
+        cached.insert("newtonsoft.json".to_string(), latest.to_string());
+        let resolved = std::collections::HashMap::new();
+
+        let hints = eco
+            .generate_inlay_hints(
+                parse_result.as_ref(),
+                VersionData::new(&cached, &resolved),
+                LoadingState::Idle,
+                &EcosystemConfig::default(),
+            )
+            .await;
+
+        hints
+            .into_iter()
+            .map(|h| match h.label {
+                InlayHintLabel::String(s) => s,
+                InlayHintLabel::LabelParts(_) => unreachable!("NuGet never emits label parts"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_inlay_hint_flags_outdated_csproj_package_reference() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+        let labels = inlay_hint_labels(&eco, content, &uri, "13.0.4").await;
+        assert_eq!(labels, vec!["❌ 13.0.4"]);
+    }
+
+    #[tokio::test]
+    async fn test_inlay_hint_marks_up_to_date_csproj_package_reference() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+        let labels = inlay_hint_labels(&eco, content, &uri, "13.0.3").await;
+        assert_eq!(labels, vec!["✅"]);
+    }
+
+    #[tokio::test]
+    async fn test_inlay_hint_flags_outdated_directory_packages_props() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/Directory.Packages.props");
+        let content = r#"<Project><ItemGroup><PackageVersion Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+        let labels = inlay_hint_labels(&eco, content, &uri, "13.0.4").await;
+        assert_eq!(labels, vec!["❌ 13.0.4"]);
+    }
+
+    #[tokio::test]
+    async fn test_inlay_hint_packages_config_exact_pin_unaffected() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/packages.config");
+        let content = r#"<packages><package id="Newtonsoft.Json" version="13.0.3" targetFramework="net48" /></packages>"#;
+
+        assert_eq!(
+            inlay_hint_labels(&eco, content, &uri, "13.0.4").await,
+            vec!["❌ 13.0.4"]
+        );
+        assert_eq!(
+            inlay_hint_labels(&eco, content, &uri, "13.0.3").await,
+            vec!["✅"]
+        );
+    }
+
+    /// Diagnostics counterpart of the inlay-hint regressions above: `generate_diagnostics`
+    /// (default impl, delegates to `lsp_helpers::generate_diagnostics_from_cache`) shares
+    /// the same `EcosystemFormatter::is_requirement_up_to_date` call site, so it was
+    /// affected by the same bug and must be verified separately (no inlay-hint test
+    /// exercises this path).
+    async fn diagnostic_messages(
+        eco: &NuGetEcosystem,
+        content: &str,
+        uri: &tower_lsp_server::ls_types::Uri,
+        latest: &str,
+    ) -> Vec<String> {
+        use deps_core::lsp_helpers::VersionData;
+
+        let parse_result = eco.parse_manifest(content, uri).await.unwrap();
+        let mut cached = std::collections::HashMap::new();
+        cached.insert("newtonsoft.json".to_string(), latest.to_string());
+        let resolved = std::collections::HashMap::new();
+
+        eco.generate_diagnostics(
+            parse_result.as_ref(),
+            VersionData::new(&cached, &resolved),
+            uri,
+        )
+        .await
+        .into_iter()
+        .map(|d| d.message)
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_flag_outdated_csproj_package_reference() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+        let messages = diagnostic_messages(&eco, content, &uri, "13.0.4").await;
+        assert_eq!(messages, vec!["Newer version available: 13.0.4"]);
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_silent_when_up_to_date() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+        assert!(
+            diagnostic_messages(&eco, content, &uri, "13.0.3")
+                .await
+                .is_empty()
+        );
+    }
 }

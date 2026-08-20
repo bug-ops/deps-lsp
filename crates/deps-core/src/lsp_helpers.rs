@@ -140,6 +140,12 @@ pub trait EcosystemFormatter: Send + Sync {
     fn format_version_for_text_edit(&self, version: &str) -> String;
 
     /// Check if a version satisfies a requirement string.
+    ///
+    /// General constraint check (e.g. for completion/candidate filtering) — not the
+    /// "is this dependency up to date" hook. That is `is_requirement_up_to_date` below,
+    /// which has its own default and its own override points; an ecosystem whose bare
+    /// requirement is a floor rather than an auto-following range (see `deps-nuget`)
+    /// overrides that method, not this one.
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
         // Handle caret (^) - allows changes that don't modify left-most non-zero
         // ^2.0 allows 2.x.x, ^0.2 allows 0.2.x, ^0.0.3 allows only 0.0.3
@@ -178,6 +184,20 @@ pub trait EcosystemFormatter: Send + Sync {
         version == requirement
             || (is_partial_version && is_same_major_minor(requirement, version))
             || (is_partial_version && version.starts_with(requirement))
+    }
+
+    /// Whether an unresolved dependency (no lock-file version) should be reported as
+    /// up to date against `latest`, given its declared `requirement`.
+    ///
+    /// Default: `latest` satisfies `requirement` — correct for range-based ecosystems
+    /// (Cargo's `^1.2`, npm's `~1.2`, ...) where the declared requirement already
+    /// expresses forward compatibility, so a `latest` it accepts is not "newer" in any
+    /// actionable sense. Ecosystems where a bare requirement is a minimum floor rather
+    /// than an auto-following range (NuGet's bare `Version="1.0.0"`) must override this,
+    /// since "does the floor accept `latest`" and "is the pin already `latest`" are
+    /// different questions there.
+    fn is_requirement_up_to_date(&self, requirement: &str, latest: &str) -> bool {
+        self.version_satisfies_requirement(latest, requirement)
     }
 
     /// Get package URL for hover markdown.
@@ -273,7 +293,7 @@ pub fn generate_inlay_hints(
             resolved.as_str() == latest.as_str()
         } else {
             let version_req = dep.version_requirement().unwrap_or("");
-            formatter.version_satisfies_requirement(latest, version_req)
+            formatter.is_requirement_up_to_date(version_req, latest)
         };
 
         let label_text = if is_up_to_date {
@@ -485,10 +505,9 @@ pub fn generate_diagnostics_from_cache(
         };
 
         let version_req = dep.version_requirement().unwrap_or("");
-        let requirement_allows_latest =
-            formatter.version_satisfies_requirement(latest, version_req);
+        let is_up_to_date = formatter.is_requirement_up_to_date(version_req, latest);
 
-        if !requirement_allows_latest {
+        if !is_up_to_date {
             diagnostics.push(Diagnostic {
                 range: version_range,
                 severity: Some(DiagnosticSeverity::HINT),
@@ -505,8 +524,10 @@ pub fn generate_diagnostics_from_cache(
 /// Generates diagnostics by fetching from registry (makes network calls).
 ///
 /// **Warning**: This function makes network requests for each dependency.
-/// Prefer `generate_diagnostics_from_cache` when cached versions are available.
-#[allow(dead_code)]
+/// Prefer `generate_diagnostics_from_cache` when cached versions are available. Not called
+/// anywhere in this workspace (`deps-lsp` always has cached versions by the time
+/// diagnostics run) — kept as public API for external callers of `deps-core` as a library,
+/// re-exported as `deps_core::lsp_generate_diagnostics`.
 pub async fn generate_diagnostics<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     registry: &R,
@@ -556,7 +577,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
 
             let latest = crate::registry::find_latest_stable(&versions);
             if let Some(latest) = latest
-                && latest.version_string() != current.version_string()
+                && !formatter.is_requirement_up_to_date(version_req, latest.version_string())
             {
                 diagnostics.push(Diagnostic {
                     range: version_range,
