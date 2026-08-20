@@ -34,6 +34,9 @@ use std::sync::Arc;
 const SPARSE_INDEX_BASE: &str = "https://index.crates.io";
 const SEARCH_API_BASE: &str = "https://crates.io/api/v1";
 
+/// Display name for crates.io used in not-found and API-response error messages.
+pub const REGISTRY: &str = "crates.io";
+
 /// Base URL for crate pages on crates.io
 pub const CRATES_IO_URL: &str = "https://crates.io/crates";
 

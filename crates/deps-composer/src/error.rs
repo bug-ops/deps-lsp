@@ -1,4 +1,8 @@
 //! Errors specific to PHP/Composer dependency handling.
+//!
+//! These errors cover parsing composer.json files. Registry communication
+//! errors are reported as `deps_core::DepsError` directly (see
+//! `crate::registry`).
 
 use thiserror::Error;
 
@@ -11,22 +15,6 @@ pub enum ComposerError {
         #[source]
         source: serde_json::Error,
     },
-
-    /// Package not found on Packagist
-    #[error("Package '{package}' not found on Packagist")]
-    PackageNotFound { package: String },
-
-    /// Packagist registry request failed
-    #[error("Packagist registry request failed for '{package}': {source}")]
-    RegistryError {
-        package: String,
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    /// I/O error
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
 }
 
 /// Result type alias for Composer operations.
@@ -36,14 +24,6 @@ impl From<ComposerError> for deps_core::DepsError {
     fn from(err: ComposerError) -> Self {
         match err {
             ComposerError::JsonParseError { source } => Self::Json(source),
-            ComposerError::PackageNotFound { package } => {
-                Self::CacheError(format!("Package '{package}' not found"))
-            }
-            ComposerError::RegistryError { package, source } => Self::ParseError {
-                file_type: format!("Packagist registry for {package}"),
-                source,
-            },
-            ComposerError::Io(e) => Self::Io(e),
         }
     }
 }
@@ -54,21 +34,16 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = ComposerError::PackageNotFound {
-            package: "vendor/package".into(),
-        };
-        assert_eq!(
-            err.to_string(),
-            "Package 'vendor/package' not found on Packagist"
-        );
+        let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
+        let err = ComposerError::JsonParseError { source: json_err };
+        assert!(err.to_string().contains("Failed to parse composer.json"));
     }
 
     #[test]
     fn test_conversion_to_deps_error() {
-        let err = ComposerError::PackageNotFound {
-            package: "test/pkg".into(),
-        };
+        let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
+        let err = ComposerError::JsonParseError { source: json_err };
         let deps_err: deps_core::DepsError = err.into();
-        assert!(deps_err.to_string().contains("not found"));
+        assert!(matches!(deps_err, deps_core::DepsError::Json(_)));
     }
 }

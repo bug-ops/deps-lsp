@@ -3,14 +3,17 @@
 //! Fetches package versions from GitHub tags and searches repositories.
 //! Non-GitHub URLs get empty version lists with a tracing warning.
 
-use crate::error::SwiftError;
 use crate::types::{SwiftPackage, SwiftVersion};
-use deps_core::{HttpCache, Result};
+use deps_core::{DepsError, HttpCache, Result};
 use serde::Deserialize;
 use std::any::Any;
 use std::sync::Arc;
 
 const GITHUB_API: &str = "https://api.github.com";
+
+/// Display name for the registry backing Swift package version lookups,
+/// used in not-found and API-response error messages.
+pub const REGISTRY: &str = "GitHub";
 
 /// Validates that `name` is a valid `owner/repo` GitHub identifier.
 ///
@@ -23,20 +26,11 @@ fn validate_owner_repo(name: &str) -> Result<()> {
     if re.is_match(name) {
         Ok(())
     } else {
-        Err(SwiftError::registry_error(name, InvalidOwnerRepo(name.to_string())).into())
+        Err(DepsError::InvalidUri(format!(
+            "invalid owner/repo format: '{name}'"
+        )))
     }
 }
-
-#[derive(Debug)]
-struct InvalidOwnerRepo(String);
-
-impl std::fmt::Display for InvalidOwnerRepo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid owner/repo format: '{}'", self.0)
-    }
-}
-
-impl std::error::Error for InvalidOwnerRepo {}
 
 /// Client for fetching Swift package information from GitHub.
 #[derive(Clone)]
@@ -85,15 +79,17 @@ impl SwiftRegistry {
             .cache
             .get_cached_with_headers(&url, &self.headers())
             .await
-            .map_err(|e| {
-                if !self.has_token && e.to_string().contains("HTTP 403") {
-                    SwiftError::GitHubApiError {
-                        status: 403,
-                        message: "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)".into(),
-                    }.into()
-                } else {
-                    e
+            .map_err(|e| match &e {
+                DepsError::HttpStatus { status: 403, .. } if !self.has_token => {
+                    DepsError::CacheError(
+                        "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)".into(),
+                    )
                 }
+                DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
+                    package: name.to_string(),
+                    registry: REGISTRY,
+                },
+                _ => e,
             })?;
         parse_tags_response(&data)
     }
@@ -157,7 +153,10 @@ fn parse_tags_response(data: &[u8]) -> Result<Vec<SwiftVersion>> {
         Ok(t) => t,
         Err(_) => {
             if let Ok(err) = serde_json::from_slice::<GithubErrorResponse>(data) {
-                return Err(SwiftError::github_api_error(&err.message).into());
+                return Err(DepsError::CacheError(format!(
+                    "GitHub API error: {}",
+                    err.message
+                )));
             }
             return Ok(vec![]);
         }
@@ -380,6 +379,12 @@ mod tests {
         // Versions should have 'v' prefix stripped
         assert!(!versions[0].version.starts_with('v'));
         assert!(!versions[1].version.starts_with('v'));
+    }
+
+    #[test]
+    fn test_validate_owner_repo_invalid_format_message() {
+        let err = validate_owner_repo("no-slash").unwrap_err();
+        assert!(err.to_string().contains("invalid owner/repo format"));
     }
 
     #[test]

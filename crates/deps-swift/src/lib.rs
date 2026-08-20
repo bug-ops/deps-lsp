@@ -11,7 +11,6 @@
 //! for package discovery. Compatible with WASM (Zed extension) targets.
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
@@ -19,7 +18,6 @@ pub mod registry;
 pub mod types;
 
 pub use ecosystem::SwiftEcosystem;
-pub use error::SwiftError;
 pub use formatter::SwiftFormatter;
 pub use lockfile::SwiftLockParser;
 pub use parser::parse_package_swift;

@@ -25,15 +25,19 @@
 //! }
 //! ```
 
-use crate::error::{GoError, Result};
+use crate::error::GoError;
 use crate::types::GoVersion;
 use crate::version::{escape_module_path, is_pseudo_version};
-use deps_core::HttpCache;
+use deps_core::{DepsError, HttpCache, Result};
 use serde::Deserialize;
 use std::any::Any;
 use std::sync::Arc;
 
 const PROXY_BASE: &str = "https://proxy.golang.org";
+
+/// Display name for the Go module proxy used in not-found and API-response
+/// error messages.
+pub const REGISTRY: &str = "Go proxy";
 
 /// Base URL for Go package documentation
 pub const PKG_GO_DEV_URL: &str = "https://pkg.go.dev";
@@ -51,7 +55,7 @@ const MAX_VERSION_LENGTH: usize = 128;
 /// Returns error if:
 /// - Path is empty
 /// - Path exceeds MAX_MODULE_PATH_LENGTH
-fn validate_module_path(module_path: &str) -> Result<()> {
+fn validate_module_path(module_path: &str) -> crate::error::Result<()> {
     if module_path.is_empty() {
         return Err(GoError::InvalidModulePath("module path is empty".into()));
     }
@@ -73,7 +77,7 @@ fn validate_module_path(module_path: &str) -> Result<()> {
 /// - Version is empty
 /// - Version exceeds MAX_VERSION_LENGTH
 /// - Version contains path traversal sequences
-fn validate_version_string(version: &str) -> Result<()> {
+fn validate_version_string(version: &str) -> crate::error::Result<()> {
     if version.is_empty() {
         return Err(GoError::InvalidVersionSpecifier {
             specifier: version.to_string(),
@@ -115,6 +119,19 @@ pub fn package_url(module_path: &str) -> String {
         .collect::<Vec<_>>()
         .join("/");
     format!("{PKG_GO_DEV_URL}/{encoded}")
+}
+
+/// Converts a 404 response into `DepsError::PackageNotFound`, passing through
+/// any other error unchanged.
+fn not_found_or(err: DepsError, module_path: &str) -> DepsError {
+    if matches!(err, DepsError::HttpStatus { status: 404, .. }) {
+        DepsError::PackageNotFound {
+            package: module_path.to_string(),
+            registry: REGISTRY,
+        }
+    } else {
+        err
+    }
 }
 
 /// Client for interacting with proxy.golang.org.
@@ -169,10 +186,7 @@ impl GoRegistry {
             .cache
             .get_cached(&url)
             .await
-            .map_err(|e| GoError::RegistryError {
-                module: module_path.to_string(),
-                source: Box::new(e),
-            })?;
+            .map_err(|e| not_found_or(e, module_path))?;
 
         parse_version_list(&data)
     }
@@ -214,12 +228,9 @@ impl GoRegistry {
             .cache
             .get_cached(&url)
             .await
-            .map_err(|e| GoError::RegistryError {
-                module: module_path.to_string(),
-                source: Box::new(e),
-            })?;
+            .map_err(|e| not_found_or(e, module_path))?;
 
-        parse_version_info(&data)
+        parse_version_info(module_path, &data)
     }
 
     /// Fetches latest version using the `/@latest` endpoint.
@@ -258,12 +269,9 @@ impl GoRegistry {
             .cache
             .get_cached(&url)
             .await
-            .map_err(|e| GoError::RegistryError {
-                module: module_path.to_string(),
-                source: Box::new(e),
-            })?;
+            .map_err(|e| not_found_or(e, module_path))?;
 
-        parse_version_info(&data)
+        parse_version_info(module_path, &data)
     }
 
     /// Fetches the go.mod file for a specific version.
@@ -303,14 +311,11 @@ impl GoRegistry {
             .cache
             .get_cached(&url)
             .await
-            .map_err(|e| GoError::RegistryError {
-                module: module_path.to_string(),
-                source: Box::new(e),
-            })?;
+            .map_err(|e| not_found_or(e, module_path))?;
 
         std::str::from_utf8(&data)
             .map(std::string::ToString::to_string)
-            .map_err(|e| GoError::CacheError(format!("Invalid UTF-8 in go.mod: {e}")))
+            .map_err(|e| DepsError::CacheError(format!("Invalid UTF-8 in go.mod: {e}")))
     }
 }
 
@@ -328,9 +333,8 @@ struct VersionInfo {
 /// Versions are sorted in descending order (newest first) to ensure
 /// `find_latest_stable` returns the correct latest version.
 fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
-    let content = std::str::from_utf8(data).map_err(|e| GoError::InvalidVersionSpecifier {
-        specifier: String::new(),
-        message: format!("Invalid UTF-8 in version list response: {e}"),
+    let content = std::str::from_utf8(data).map_err(|e| {
+        DepsError::InvalidVersionReq(format!("Invalid UTF-8 in version list response: {e}"))
     })?;
 
     // Parse versions with precomputed sort keys (Schwartzian transform)
@@ -380,12 +384,12 @@ fn parse_sort_key(version: &str, is_pseudo: bool) -> Option<semver::Version> {
 }
 
 /// Parses JSON version info from `/@v/{version}.info` or `/@latest` endpoint.
-fn parse_version_info(data: &[u8]) -> Result<GoVersion> {
-    let info: VersionInfo =
-        serde_json::from_slice(data).map_err(|e| GoError::ApiResponseError {
-            module: String::new(),
-            source: e,
-        })?;
+fn parse_version_info(module_path: &str, data: &[u8]) -> Result<GoVersion> {
+    let info: VersionInfo = serde_json::from_slice(data).map_err(|e| DepsError::ApiResponse {
+        package: module_path.to_string(),
+        registry: REGISTRY,
+        source: e,
+    })?;
 
     let is_pseudo = is_pseudo_version(&info.version);
     Ok(GoVersion {
@@ -497,7 +501,7 @@ mod tests {
     #[test]
     fn test_parse_version_info() {
         let json = r#"{"Version":"v1.9.1","Time":"2023-07-18T14:30:00Z"}"#;
-        let version = parse_version_info(json.as_bytes()).unwrap();
+        let version = parse_version_info("github.com/gin-gonic/gin", json.as_bytes()).unwrap();
         assert_eq!(version.version, "v1.9.1");
         assert_eq!(version.time, Some("2023-07-18T14:30:00Z".into()));
         assert!(!version.is_pseudo);
@@ -507,7 +511,7 @@ mod tests {
     fn test_parse_version_info_pseudo() {
         let json =
             r#"{"Version":"v0.0.0-20191109021931-daa7c04131f5","Time":"2019-11-09T02:19:31Z"}"#;
-        let version = parse_version_info(json.as_bytes()).unwrap();
+        let version = parse_version_info("github.com/gin-gonic/gin", json.as_bytes()).unwrap();
         assert_eq!(version.version, "v0.0.0-20191109021931-daa7c04131f5");
         assert!(version.is_pseudo);
     }
@@ -515,8 +519,32 @@ mod tests {
     #[test]
     fn test_parse_version_info_invalid_json() {
         let json = b"not json";
-        let result = parse_version_info(json);
+        let result = parse_version_info("github.com/gin-gonic/gin", json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_not_found_or_maps_404_to_package_not_found() {
+        let err = DepsError::HttpStatus {
+            url: "https://proxy.golang.org/github.com/x/y/@v/list".into(),
+            status: 404,
+        };
+        let result = not_found_or(err, "github.com/x/y");
+        assert!(matches!(
+            result,
+            DepsError::PackageNotFound { package, registry }
+                if package == "github.com/x/y" && registry == REGISTRY
+        ));
+    }
+
+    #[test]
+    fn test_not_found_or_passes_through_non_404() {
+        let err = DepsError::HttpStatus {
+            url: "https://proxy.golang.org/github.com/x/y/@v/list".into(),
+            status: 500,
+        };
+        let result = not_found_or(err, "github.com/x/y");
+        assert!(matches!(result, DepsError::HttpStatus { status: 500, .. }));
     }
 
     #[test]
@@ -662,7 +690,7 @@ mod tests {
     #[test]
     fn test_parse_version_info_missing_fields() {
         let json = r#"{"Version":"v1.0.0"}"#; // Missing Time field
-        let result = parse_version_info(json.as_bytes());
+        let result = parse_version_info("github.com/gin-gonic/gin", json.as_bytes());
         assert!(result.is_err());
     }
 

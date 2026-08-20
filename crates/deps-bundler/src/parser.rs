@@ -3,8 +3,8 @@
 //! Parses Gemfile files using regex-based line parsing to extract dependencies
 //! with precise LSP positions.
 
-use crate::error::Result;
 use crate::types::{BundlerDependency, DependencyGroup, DependencySource};
+use deps_core::Result;
 use regex::Regex;
 use std::any::Any;
 use std::sync::LazyLock;
@@ -292,7 +292,7 @@ impl deps_core::ManifestParser for BundlerParser {
     type ParseResult = BundlerParseResult;
 
     fn parse(&self, content: &str, doc_uri: &Uri) -> deps_core::Result<Self::ParseResult> {
-        parse_gemfile(content, doc_uri).map_err(Into::into)
+        parse_gemfile(content, doc_uri)
     }
 }
 

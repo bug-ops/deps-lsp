@@ -15,6 +15,9 @@ use tokio::sync::OnceCell;
 
 const SERVICE_INDEX_URL: &str = "https://api.nuget.org/v3/index.json";
 
+/// Display name for NuGet used in not-found and API-response error messages.
+pub const REGISTRY: &str = "NuGet";
+
 #[derive(Debug, Deserialize)]
 struct ServiceIndexResponse {
     resources: Vec<ServiceResource>,
