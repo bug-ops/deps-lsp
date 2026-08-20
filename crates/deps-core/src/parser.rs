@@ -1,5 +1,9 @@
 use crate::error::Result;
+use std::collections::BTreeMap;
 use tower_lsp_server::ls_types::{Range, Uri};
+use yaml_rust2::Event;
+use yaml_rust2::parser::{MarkedEventReceiver, Parser};
+use yaml_rust2::scanner::Marker;
 
 /// Maximum allowed nesting depth for TOML table/array recursion before
 /// [`check_toml_nesting_depth`] rejects the input.
@@ -468,6 +472,236 @@ fn skip_yaml_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
         i += 1;
     }
     i
+}
+
+/// Fixed per-node byte floor [`check_yaml_expansion`] charges for every
+/// `Yaml` node, on top of any heap content (e.g. a scalar's string bytes) it
+/// owns.
+///
+/// Derived from `size_of::<yaml_rust2::Yaml>()` itself (64 bytes on a 64-bit
+/// target as of `yaml-rust2` 0.12, dominated by the `String`/`Array`/`Hash`
+/// variants' inline pointer+len+cap fields plus the enum discriminant)
+/// rather than hardcoded, so a `yaml-rust2` layout change or a non-64-bit
+/// target cannot silently drift this out of sync with reality — the size of
+/// the value every `Yaml` node occupies wherever it is stored (a
+/// `Vec<Yaml>` element, a `Hash` entry, or a clone inside `anchor_map`),
+/// independent of its variant. This floor does *not* separately model every
+/// real cost `YamlLoader` incurs beyond it: `Hash`'s `LinkedHashMap`
+/// prev/next link pointers and hash-table slots, and `Vec`'s
+/// capacity-doubling slack, both add further real allocation on top of what
+/// this constant (and thus [`MAX_YAML_EXPANDED_BYTES`]) charges for — see
+/// that constant's doc for the measured size of that gap.
+const YAML_NODE_OVERHEAD_BYTES: u64 = size_of::<yaml_rust2::Yaml>() as u64;
+
+/// Maximum total byte weight [`check_yaml_expansion`] allows a document to
+/// expand to (counting anchor/alias-driven duplication) before rejecting it.
+///
+/// `yaml-rust2` 0.12's `YamlLoader::on_event_impl` deep-clones the whole
+/// anchored subtree once per `Event::Alias` reference (`anchor_map.get(&id)
+/// => v.clone()`), and again into `anchor_map` itself for every anchored
+/// node. Nesting depth (bounded by [`MAX_YAML_NESTING_DEPTH`]) is irrelevant
+/// to this: a shallow document with a handful of anchors, each aliased a
+/// handful of times, expands exponentially in the memory actually
+/// allocated. Critically, this must be a **byte** budget, not a node-count
+/// budget: a single large scalar anchor (e.g. a 1 MB string) aliased many
+/// times allocates megabytes per alias while costing only one node each, so
+/// a node-count budget lets it through cheaply — a document under 3 MB can
+/// exhaust hundreds of gigabytes this way. `YamlLoader` exposes no
+/// budget/config hook, so callers must reject pathological input before
+/// handing it to the loader.
+///
+/// `32 MiB` (`32 * 1024 * 1024` = 33,554,432) is the *charged* byte budget —
+/// not an exact bound on `YamlLoader`'s real peak allocation. Charged bytes
+/// track `YAML_NODE_OVERHEAD_BYTES`'s per-node floor plus scalar content,
+/// which undercounts two real costs that floor doesn't model: `Hash`'s
+/// `LinkedHashMap` prev/next link pointers and hash-table slots (hash-heavy
+/// documents, e.g. a `pubspec.lock`), and `String`/`Vec` capacity-doubling
+/// slack — the scanner builds every scalar via `String::new()` + repeated
+/// `push`, so a single large scalar whose length lands just past a
+/// power-of-two capacity boundary (e.g. 1,048,577 bytes) wastes nearly its
+/// own length again in unused capacity, and the same growth pattern applies
+/// to a `Vec` backing a long sequence. Measured with a counting allocator:
+/// real peak allocation runs about 1.16x-1.74x the charged total depending
+/// on document shape (steadier ~1.56x for hash-heavy lockfiles, up to ~2x
+/// for a large scalar or long sequence whose length lands right past a
+/// capacity-doubling boundary), so an accepted document charged right at
+/// this limit really allocates roughly 50-65 MB, not 32 MB. Bytes
+/// charged do not compound with nesting, so ~2x is the ceiling on that
+/// ratio, not a growing multiplier — the budget stays a bounded, linear
+/// function of input size either way, which is what actually matters for
+/// this guard (an *unbounded* multiplier, as with the pre-fix node-count
+/// budget's `O(2^depth)` blowup, is the failure mode this guards against).
+///
+/// Measured against real payloads (exact charged totals, reproducible
+/// against the shape scaled up from
+/// `test_check_yaml_expansion_few_hundred_package_lockfile_accepted`): a
+/// 1.9 MB / 12,500-package synthetic `pubspec.lock` charges 12,416,870 bytes
+/// (2.70x headroom); a 757 KB / 5,000-package one charges 4,961,870 bytes
+/// (6.76x headroom); the doubling-chain attack payload (see
+/// [`check_yaml_expansion`]'s doctest) charges 16,907,046 bytes at N=14
+/// (accepted) and 33,815,273 at N=15 (rejected, in well under a
+/// millisecond); and a single 1 MB anchor aliased 31 times (33,002,370
+/// bytes charged, ~1 MB source) is accepted while 32 times (34,002,434
+/// bytes) is rejected rather than allocating unboundedly.
+pub const MAX_YAML_EXPANDED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Streams `content` through `yaml-rust2`'s own parser event stream and
+/// tallies the total bytes the `Yaml` nodes `YamlLoader::load_from_str`
+/// would allocate, rejecting once the tally exceeds `max_bytes`.
+///
+/// This is a pre-pass driven by the same `Parser`/event stream
+/// `YamlLoader::load_from_str` itself uses (`Parser::new(content.chars())`,
+/// `multi = true`), so anchor ids and event order are identical to the real
+/// load — unlike a raw-text `&anchor`/`*alias` scan, which was tried and
+/// rejected: ordinary prose such as `description: A widget *multiplier*
+/// helper` sits at exactly the position a text scanner treats as a token
+/// boundary, so it false-positives as an alias reference.
+///
+/// The accounting model mirrors `YamlLoader::on_event_impl` exactly, in
+/// bytes rather than node count: a `Scalar` charges
+/// `YAML_NODE_OVERHEAD_BYTES` plus its own string content length; a closed
+/// `Sequence`/`Mapping` charges `YAML_NODE_OVERHEAD_BYTES` for itself,
+/// plus the byte weight of its already-charged descendants. An anchored
+/// node (`SequenceStart`/`MappingStart`/`Scalar` anchor id `> 0`) charges
+/// its own subtree's byte weight a second time, mirroring
+/// `insert_new_node`'s `anchor_map.insert` clone; an `Alias` charges the
+/// referenced anchor's recorded byte weight (or
+/// `YAML_NODE_OVERHEAD_BYTES` for an unknown anchor id, matching the
+/// loader's own `Yaml::BadValue` fallback, which owns no heap content),
+/// mirroring the `v.clone()` in the `Event::Alias` arm. All counting uses
+/// `u64` with `saturating_add`, since the counter itself — not just the
+/// input — is the attack surface.
+///
+/// This pre-pass is not itself free relative to `max_bytes`: its own
+/// `anchors: BTreeMap<usize, u64>` grows by one entry per distinct anchor
+/// id seen, so a document built almost entirely of many tiny anchors (e.g.
+/// ~262,000 one-byte-scalar anchors, ~3.6 MB source) can transiently grow
+/// this map to roughly the same order of magnitude as `max_bytes` itself
+/// before the tally crosses it and rejection kicks in. This is bounded and
+/// transient, not unbounded like the vulnerability this guard closes, but
+/// callers should not assume the pre-pass's own peak memory is negligible
+/// next to the budget it enforces.
+///
+/// Any `ScanError` from this pre-pass is ignored: the real
+/// `YamlLoader::load_from_str` call that follows reports the authoritative
+/// syntax error. If the budget was already exceeded before the scan error,
+/// this still returns `Err`.
+///
+/// This pre-pass is, like the real load, driven by `Parser::load`'s mutually
+/// recursive `load_node`/`load_mapping`/`load_sequence` — callers must run
+/// [`check_yaml_nesting_depth`] first so this never recurses on input deep
+/// enough to overflow the stack itself.
+///
+/// # Errors
+///
+/// Returns `Err(bytes)` with the byte tally reached the instant it exceeds
+/// `max_bytes`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::parser::check_yaml_expansion;
+///
+/// assert!(check_yaml_expansion("a: 1\nb: [2, 3]\n", 1000).is_ok());
+///
+/// // A widget *multiplier* helper is a plain scalar, not an alias.
+/// assert!(check_yaml_expansion("description: A widget *multiplier* helper", 1000).is_ok());
+///
+/// // Each anchor doubles the next one's alias count, so N levels expand to
+/// // roughly 2^N nodes from a source only ~2N bytes long.
+/// let mut doubling_chain = String::from("a0: &a0 [x, x]\n");
+/// for i in 1..20 {
+///     doubling_chain.push_str(&format!("a{i}: &a{i} [*a{prev}, *a{prev}]\n", prev = i - 1));
+/// }
+/// assert!(check_yaml_expansion(&doubling_chain, 1000).is_err());
+/// ```
+pub fn check_yaml_expansion(content: &str, max_bytes: usize) -> std::result::Result<(), usize> {
+    struct Receiver {
+        max: u64,
+        consumed: u64,
+        exceeded: bool,
+        stack: Vec<(usize, u64)>,
+        anchors: BTreeMap<usize, u64>,
+    }
+
+    impl Receiver {
+        fn charge(&mut self, n: u64) {
+            if self.exceeded {
+                return;
+            }
+            self.consumed = self.consumed.saturating_add(n);
+            if self.consumed > self.max {
+                self.exceeded = true;
+            }
+        }
+
+        /// Records a just-finished node's total subtree byte weight (`size`,
+        /// including itself): charges the anchor-clone cost and remembers
+        /// it for future aliases when `aid > 0`, then adds it to the
+        /// enclosing container's running subtree weight, if any.
+        fn finish(&mut self, size: u64, aid: usize) {
+            if self.exceeded {
+                return;
+            }
+            if aid > 0 {
+                self.charge(size);
+                self.anchors.insert(aid, size);
+            }
+            if let Some((_, parent_size)) = self.stack.last_mut() {
+                *parent_size = parent_size.saturating_add(size);
+            }
+        }
+    }
+
+    impl MarkedEventReceiver for Receiver {
+        fn on_event(&mut self, ev: Event, _mark: Marker) {
+            if self.exceeded {
+                return;
+            }
+            match ev {
+                Event::SequenceStart(aid, _) | Event::MappingStart(aid, _) => {
+                    self.stack.push((aid, 0));
+                }
+                Event::SequenceEnd | Event::MappingEnd => {
+                    if let Some((aid, children_size)) = self.stack.pop() {
+                        self.charge(YAML_NODE_OVERHEAD_BYTES);
+                        self.finish(children_size.saturating_add(YAML_NODE_OVERHEAD_BYTES), aid);
+                    }
+                }
+                Event::Scalar(ref v, _, aid, _) => {
+                    let size = YAML_NODE_OVERHEAD_BYTES.saturating_add(v.len() as u64);
+                    self.charge(size);
+                    self.finish(size, aid);
+                }
+                Event::Alias(id) => {
+                    let size = self
+                        .anchors
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(YAML_NODE_OVERHEAD_BYTES);
+                    self.charge(size);
+                    self.finish(size, 0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut recv = Receiver {
+        max: max_bytes as u64,
+        consumed: 0,
+        exceeded: false,
+        stack: Vec::new(),
+        anchors: BTreeMap::new(),
+    };
+
+    let _ = Parser::new(content.chars()).load(&mut recv, true);
+
+    if recv.exceeded {
+        Err(usize::try_from(recv.consumed).unwrap_or(usize::MAX))
+    } else {
+        Ok(())
+    }
 }
 
 /// Generic manifest parser interface.
@@ -1135,6 +1369,213 @@ cpu_load = 3.14
         }
         content.push_str("]\n");
         assert_eq!(check_yaml_nesting_depth(&content, 3), Ok(()));
+    }
+
+    /// Billion-laughs-style doubling chain: depth stays 2, but expanded
+    /// `Yaml` node count is roughly `2^n` from a source only ~20 bytes/level
+    /// long — the exact attack shape from issue #175.
+    fn doubling_chain(n: usize) -> String {
+        let mut s = String::from("name: app\na0: &a0 [x, x]\n");
+        for i in 1..=n {
+            s.push_str(&format!("a{i}: &a{i} [*a{prev}, *a{prev}]\n", prev = i - 1));
+        }
+        s
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_empty_content() {
+        assert_eq!(check_yaml_expansion("", MAX_YAML_EXPANDED_BYTES), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_rejects_n30_doubling_chain_attack() {
+        // The exact #175 payload shape: N=30 expands to over 2^30 nodes,
+        // far past MAX_YAML_EXPANDED_BYTES, and must be rejected instead of
+        // handed to `YamlLoader::load_from_str` (which OOMs/SIGKILLs).
+        assert!(check_yaml_expansion(&doubling_chain(30), MAX_YAML_EXPANDED_BYTES).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_realistic_pubspec_yaml_accepted() {
+        let yaml = r"
+name: my_app
+description: A sample app
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.0.0
+  provider: ^6.0.0
+  my_pkg:
+    git:
+      url: https://github.com/user/repo.git
+      ref: main
+      path: packages/my_pkg
+dev_dependencies:
+  build_runner: ^2.4.0
+";
+        assert_eq!(check_yaml_expansion(yaml, MAX_YAML_EXPANDED_BYTES), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_few_hundred_package_lockfile_accepted() {
+        let mut lock = String::from("packages:\n");
+        for i in 0..300 {
+            lock.push_str(&format!(
+                "  pkg_{i}:\n    dependency: \"direct main\"\n    description:\n      name: pkg_{i}\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"1.{i}.0\"\n"
+            ));
+        }
+        assert_eq!(check_yaml_expansion(&lock, MAX_YAML_EXPANDED_BYTES), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_asterisk_in_plain_scalar_not_misread_as_alias() {
+        // The raw-text pre-scan approach this algorithm replaced
+        // false-positived on ordinary prose like this — a real `Event::Alias`
+        // is never produced for a `*`/`&` inside a plain scalar value.
+        let cases = [
+            "description: A widget *multiplier* helper\n",
+            "description: see *.dart files\n",
+            "e: text &y more\n",
+        ];
+        for content in cases {
+            assert_eq!(
+                check_yaml_expansion(content, MAX_YAML_EXPANDED_BYTES),
+                Ok(()),
+                "false positive on: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_alias_to_undefined_anchor_accepted() {
+        // `YamlLoader` itself falls back to `Yaml::BadValue` for an alias id
+        // it has no anchor recorded for; this guard mirrors that fallback
+        // (`unwrap_or(YAML_NODE_OVERHEAD_BYTES)`) rather than treating it as
+        // unbounded.
+        assert_eq!(
+            check_yaml_expansion("a: *undefined\n", MAX_YAML_EXPANDED_BYTES),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_self_referential_alias_accepted() {
+        // A sequence aliasing its own not-yet-closed anchor: the anchor
+        // isn't registered yet when the alias event fires, so this hits the
+        // same `unwrap_or(YAML_NODE_OVERHEAD_BYTES)` fallback as an
+        // undefined anchor (verified against real `yaml-rust2` 0.12
+        // behavior, not assumed) rather than recursing.
+        assert_eq!(
+            check_yaml_expansion("a: &x [1, *x]\n", MAX_YAML_EXPANDED_BYTES),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_at_production_boundary() {
+        // N=14 (16,907,046 bytes charged) stays under the byte budget,
+        // N=15 (33,815,273 bytes) crosses it — empirically verified against
+        // the real `MAX_YAML_EXPANDED_BYTES`, not assumed.
+        assert_eq!(
+            check_yaml_expansion(&doubling_chain(14), MAX_YAML_EXPANDED_BYTES),
+            Ok(())
+        );
+        assert!(check_yaml_expansion(&doubling_chain(15), MAX_YAML_EXPANDED_BYTES).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_large_scalar_anchor_aliased_many_times_rejected() {
+        // Regression test for the critic's CRITICAL 1 finding: a node-count
+        // budget accepted a large-scalar anchor aliased many times (linear
+        // node growth, but memory grows with anchor size x alias count).
+        // A 1 MB anchor aliased 32 times is ~33 MB of real `YamlLoader`
+        // allocation from a ~1 MB source — must be rejected under the byte
+        // budget even though it would cost only 34 nodes under a node
+        // budget.
+        let anchor_value = "A".repeat(1_000_000);
+        let mut content = format!("s: &s \"{anchor_value}\"\nl:\n");
+        for _ in 0..32 {
+            content.push_str("  - *s\n");
+        }
+        assert!(check_yaml_expansion(&content, MAX_YAML_EXPANDED_BYTES).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_exact_max_boundary() {
+        // `charge` compares with `>`, so a document whose total charge is
+        // exactly `max_bytes` must be accepted, and one byte more must be
+        // rejected — pins that this is intentional (an accidental `>=`
+        // would reject the exact-max case and go uncaught otherwise).
+        let scalar_len = 1000usize;
+        let max_bytes = YAML_NODE_OVERHEAD_BYTES as usize + scalar_len;
+        let content = "a".repeat(scalar_len);
+
+        assert_eq!(check_yaml_expansion(&content, max_bytes), Ok(()));
+        assert!(check_yaml_expansion(&content, max_bytes - 1).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_expansion_matches_recursive_byte_weight_oracle() {
+        // Pins the invariant the whole design rests on: `check_yaml_expansion`'s
+        // streaming tally equals an independent, recursive byte-weight
+        // computation over the real parsed `Yaml` tree, for anchor-free
+        // docs. Catches an accidental algorithm regression, or a
+        // `yaml-rust2` upgrade that changes what gets allocated, that unit
+        // tests on fixed payloads alone would not.
+        fn recursive_weight(y: &yaml_rust2::Yaml) -> u64 {
+            match y {
+                yaml_rust2::Yaml::String(s) => YAML_NODE_OVERHEAD_BYTES + s.len() as u64,
+                yaml_rust2::Yaml::Array(arr) => {
+                    YAML_NODE_OVERHEAD_BYTES + arr.iter().map(recursive_weight).sum::<u64>()
+                }
+                yaml_rust2::Yaml::Hash(h) => {
+                    YAML_NODE_OVERHEAD_BYTES
+                        + h.iter()
+                            .map(|(k, v)| recursive_weight(k) + recursive_weight(v))
+                            .sum::<u64>()
+                }
+                _ => YAML_NODE_OVERHEAD_BYTES,
+            }
+        }
+
+        // Binary search for the smallest `max_bytes` that `check_yaml_expansion`
+        // still accepts — since `charge` uses `>`, this is exactly the real
+        // total charged.
+        fn smallest_accepted(content: &str) -> u64 {
+            let (mut lo, mut hi) = (0u64, 1_000_000u64);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if check_yaml_expansion(content, usize::try_from(mid).unwrap_or(usize::MAX)).is_ok()
+                {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
+        }
+
+        // All scalars quoted, so every leaf is `Yaml::String` and its
+        // parsed length matches its source text exactly (an unquoted
+        // integer/bool/null scalar's `Yaml` variant does not retain its
+        // source text, which would make the oracle inexact).
+        let docs = [
+            r#"a: "hello""#,
+            r#"a: ["x", "yy", "zzz"]"#,
+            "a:\n  b: \"value\"\n  c:\n    - \"one\"\n    - \"two\"\n",
+        ];
+
+        for content in docs {
+            let parsed = yaml_rust2::YamlLoader::load_from_str(content).unwrap();
+            let expected = recursive_weight(&parsed[0]);
+            assert_eq!(
+                smallest_accepted(content),
+                expected,
+                "oracle mismatch for {content:?}"
+            );
+        }
     }
 
     #[test]

@@ -20,6 +20,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 - **`HttpCache`** — ETag/Last-Modified caching for registry HTTP requests, with a streaming 32 MiB response-size cap
 - **`check_toml_nesting_depth`** — single-pass structural guard rejecting pathologically nested TOML (bracket depth and dotted-key/header segment count) before it reaches the recursive-descent `toml_span` parser
 - **`check_yaml_nesting_depth`** — single-pass structural guard rejecting pathologically nested YAML (flow bracket depth and block-style indentation/dash-chain nesting) before it reaches the recursive-descent `yaml-rust2` parser
+- **`check_yaml_expansion`** — streaming pre-pass over `yaml-rust2`'s own parser event stream rejecting YAML whose anchor/alias references would expand to an excessive number of allocated bytes (billion-laughs-style), independent of nesting depth
 - **`lockfile::read_lockfile_content`** — shared read-and-error-wrap helper for lock file parsers
 - **Error types** — Unified error handling with `thiserror`
 

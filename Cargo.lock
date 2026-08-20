@@ -503,6 +503,7 @@ dependencies = [
  "tokio-test",
  "tower-lsp-server",
  "tracing",
+ "yaml-rust2",
 ]
 
 [[package]]

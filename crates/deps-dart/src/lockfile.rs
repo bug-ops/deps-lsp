@@ -48,6 +48,17 @@ pub fn parse_pubspec_lock(content: &str) -> Result<ResolvedPackages> {
         });
     }
 
+    if let Err(bytes) = deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES)
+    {
+        return Err(DepsError::ParseError {
+            file_type: "pubspec.lock".into(),
+            source: Box::new(std::io::Error::other(format!(
+                "YAML expansion {bytes} bytes exceeds maximum of {} bytes",
+                deps_core::MAX_YAML_EXPANDED_BYTES
+            ))),
+        });
+    }
+
     let mut packages = ResolvedPackages::new();
 
     let docs = YamlLoader::load_from_str(content).map_err(|e| DepsError::ParseError {
@@ -224,6 +235,45 @@ packages:
         );
         let result = parse_pubspec_lock(&lock);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_anchor_alias_expansion_bomb_rejected_not_oomed() {
+        // #175: a shallow (depth-2) doubling chain of anchor/alias
+        // references, which `check_yaml_nesting_depth` cannot catch since
+        // nesting depth stays constant — must be rejected by the expansion
+        // budget instead of handed to `YamlLoader::load_from_str`, which
+        // would OOM/SIGKILL the process on this shape.
+        let mut lock = String::from("packages:\n  a0: &a0 [x, x]\n");
+        for i in 1..=30 {
+            lock.push_str(&format!(
+                "  a{i}: &a{i} [*a{prev}, *a{prev}]\n",
+                prev = i - 1
+            ));
+        }
+        let result = parse_pubspec_lock(&lock);
+        // Asserting on the message (not just `is_err()`) pins that this is
+        // rejected by the expansion guard specifically, so a future reorder
+        // that lets a different guard fire first would be caught.
+        let err = result.expect_err("expected the expansion budget to reject this");
+        assert!(
+            err.to_string().contains("YAML expansion"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_asterisk_in_description_not_misread_as_alias() {
+        let lock = r#"
+packages:
+  http:
+    dependency: "direct main"
+    description: A package for *multiplier* http requests
+    source: hosted
+    version: "1.2.0"
+"#;
+        let result = parse_pubspec_lock(lock);
+        assert!(result.is_ok());
     }
 
     #[test]
