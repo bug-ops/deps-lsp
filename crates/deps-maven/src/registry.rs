@@ -45,12 +45,14 @@ pub fn package_url(name: &str) -> String {
         if is_google_group(group_id) {
             format!(
                 "https://maven.google.com/web/index.html#{}:{}",
-                group_id, artifact_id
+                urlencoding::encode(group_id),
+                urlencoding::encode(artifact_id)
             )
         } else {
             format!(
                 "https://central.sonatype.com/artifact/{}/{}",
-                group_id, artifact_id
+                urlencoding::encode(group_id),
+                urlencoding::encode(artifact_id)
             )
         }
     } else {
@@ -367,6 +369,34 @@ mod tests {
     fn test_package_url_no_colon() {
         let url = package_url("bad");
         assert!(url.contains("search.maven") || url.contains("sonatype.com"));
+    }
+
+    #[test]
+    fn test_package_url_encodes_malicious_group_and_artifact() {
+        let url = package_url("evil)[:pkg](x");
+        assert!(!url.contains('('));
+        assert!(!url.contains(')'));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_package_url_google_encodes_malicious_group_and_artifact() {
+        let url = package_url("androidx.evil)[:pkg](x");
+        assert!(url.contains("maven.google.com"));
+        assert!(!url.contains('('));
+        assert!(!url.contains(')'));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_package_url_encodes_newline_autolink_and_percent() {
+        let url = package_url("evil\n<%:pkg>");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(!url.contains('>'));
+        assert!(url.contains("%25"));
     }
 
     #[test]

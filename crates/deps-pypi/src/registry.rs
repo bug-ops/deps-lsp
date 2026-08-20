@@ -462,6 +462,31 @@ mod tests {
     }
 
     #[test]
+    fn test_package_url_encodes_malicious_name() {
+        let url = package_url("evil](https://evil.example)[pkg");
+        assert!(!url.contains('('));
+        assert!(!url.contains(')'));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_package_url_encodes_newline_autolink_and_percent() {
+        let url = package_url("evil\n<https://evil%zz.example>");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(!url.contains('>'));
+        // The literal '%' from the payload must itself be encoded (to %25), or a
+        // browser/renderer double-decode could smuggle a raw byte back in.
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_package_url_empty_name() {
+        assert_eq!(package_url(""), "https://pypi.org/project/");
+    }
+
+    #[test]
     fn test_parse_package_metadata() {
         let json = r#"{
             "info": {

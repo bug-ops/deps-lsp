@@ -19,8 +19,20 @@ pub const NPMJS_URL: &str = "https://www.npmjs.com/package";
 
 /// Returns the URL for a package's page on npmjs.com.
 ///
-/// Package names are URL-encoded to prevent path traversal attacks.
+/// Scoped packages (`@scope/name`) keep their `@` and `/` structure — each segment is
+/// percent-encoded individually so the URL still resolves, while everything else
+/// (including any attempt to smuggle extra path or Markdown syntax into a segment) is
+/// escaped.
 pub fn package_url(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('@')
+        && let Some((scope, pkg)) = rest.split_once('/')
+    {
+        return format!(
+            "{NPMJS_URL}/@{}/{}",
+            urlencoding::encode(scope),
+            urlencoding::encode(pkg)
+        );
+    }
     format!("{}/{}", NPMJS_URL, urlencoding::encode(name))
 }
 
@@ -297,6 +309,59 @@ impl deps_core::Registry for NpmRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_package_url_plain() {
+        assert_eq!(package_url("react"), "https://www.npmjs.com/package/react");
+    }
+
+    #[test]
+    fn test_package_url_scoped_preserves_structure() {
+        assert_eq!(
+            package_url("@types/node"),
+            "https://www.npmjs.com/package/@types/node"
+        );
+    }
+
+    #[test]
+    fn test_package_url_encodes_malicious_name() {
+        let url = package_url("evil)[pkg](https://evil.example");
+        assert!(!url.contains(')'));
+        assert!(!url.contains('('));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_package_url_scoped_encodes_malicious_segments() {
+        let url = package_url("@evil)[/pkg](x");
+        assert!(!url.contains(')'));
+        assert!(!url.contains('('));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_package_url_encodes_newline_autolink_and_percent() {
+        let url = package_url("evil\n<https://evil%zz.example>");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(!url.contains('>'));
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_package_url_scoped_encodes_newline_and_percent() {
+        let url = package_url("@evil\n<%/pkg");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_package_url_empty_name() {
+        assert_eq!(package_url(""), "https://www.npmjs.com/package/");
+    }
 
     #[test]
     fn test_parse_package_metadata() {

@@ -16,7 +16,7 @@ pub const RUBYGEMS_URL: &str = "https://rubygems.org/gems";
 
 /// Returns the URL for a gem's page on rubygems.org.
 pub fn gem_url(name: &str) -> String {
-    format!("{RUBYGEMS_URL}/{name}")
+    format!("{RUBYGEMS_URL}/{}", urlencoding::encode(name))
 }
 
 /// Client for interacting with rubygems.org registry.
@@ -274,6 +274,29 @@ mod tests {
             gem_url("activerecord-import"),
             "https://rubygems.org/gems/activerecord-import"
         );
+    }
+
+    #[test]
+    fn test_gem_url_encodes_malicious_name() {
+        let url = gem_url("evil](https://evil.example)[pkg");
+        assert!(!url.contains('('));
+        assert!(!url.contains(')'));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_gem_url_encodes_newline_autolink_and_percent() {
+        let url = gem_url("evil\n<https://evil%zz.example>");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(!url.contains('>'));
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_gem_url_empty_name() {
+        assert_eq!(gem_url(""), "https://rubygems.org/gems/");
     }
 
     #[test]

@@ -8,7 +8,7 @@ impl EcosystemFormatter for CargoFormatter {
     }
 
     fn package_url(&self, name: &str) -> String {
-        format!("https://crates.io/crates/{name}")
+        crate::registry::crate_url(name)
     }
 }
 

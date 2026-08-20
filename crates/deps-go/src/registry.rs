@@ -102,8 +102,19 @@ fn validate_version_string(version: &str) -> Result<()> {
 }
 
 /// Returns the URL for a module's documentation page on pkg.go.dev.
+///
+/// Each `/`-separated path segment is percent-encoded individually via
+/// `urlencoding::encode` (the same helper every other ecosystem uses), so `/` survives
+/// as the legitimate path separator in Go module paths (e.g.
+/// `github.com/gin-gonic/gin`) while every other character — including `%`, which a
+/// hand-rolled denylist would otherwise miss — is escaped.
 pub fn package_url(module_path: &str) -> String {
-    format!("{PKG_GO_DEV_URL}/{module_path}")
+    let encoded = module_path
+        .split('/')
+        .map(urlencoding::encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("{PKG_GO_DEV_URL}/{encoded}")
 }
 
 /// Client for interacting with proxy.golang.org.
@@ -518,6 +529,33 @@ mod tests {
             package_url("golang.org/x/crypto"),
             "https://pkg.go.dev/golang.org/x/crypto"
         );
+    }
+
+    #[test]
+    fn test_package_url_encodes_malicious_chars() {
+        let url = package_url("github.com/evil](https://evil.example)[pkg");
+        assert!(!url.contains('('));
+        assert!(!url.contains(')'));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+        assert!(
+            url.contains("github.com/evil"),
+            "legitimate path preserved: {url}"
+        );
+    }
+
+    #[test]
+    fn test_package_url_encodes_newline_autolink_and_percent() {
+        let url = package_url("github.com/evil\n<https://evil%zz.example>");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(!url.contains('>'));
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_package_url_empty_module_path() {
+        assert_eq!(package_url(""), "https://pkg.go.dev/");
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ impl EcosystemFormatter for ComposerFormatter {
     }
 
     fn package_url(&self, name: &str) -> String {
-        format!("https://packagist.org/packages/{name}")
+        crate::registry::package_url(name)
     }
 
     fn yanked_message(&self) -> &'static str {

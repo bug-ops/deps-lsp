@@ -10,7 +10,7 @@ use std::sync::Arc;
 const PUB_DEV_API_BASE: &str = "https://pub.dev/api";
 
 pub fn package_url(name: &str) -> String {
-    format!("https://pub.dev/packages/{name}")
+    format!("https://pub.dev/packages/{}", urlencoding::encode(name))
 }
 
 #[derive(Clone)]
@@ -243,6 +243,29 @@ mod tests {
     fn test_package_url() {
         assert_eq!(package_url("provider"), "https://pub.dev/packages/provider");
         assert_eq!(package_url("http"), "https://pub.dev/packages/http");
+    }
+
+    #[test]
+    fn test_package_url_encodes_malicious_name() {
+        let url = package_url("evil](https://evil.example)[pkg");
+        assert!(!url.contains('('));
+        assert!(!url.contains(')'));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_package_url_encodes_newline_autolink_and_percent() {
+        let url = package_url("evil\n<https://evil%zz.example>");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(!url.contains('>'));
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_package_url_empty_name() {
+        assert_eq!(package_url(""), "https://pub.dev/packages/");
     }
 
     #[test]

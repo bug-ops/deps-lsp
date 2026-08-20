@@ -110,6 +110,82 @@ impl LineOffsetTable {
     }
 }
 
+/// Escapes Markdown syntax characters so untrusted text cannot break out of the
+/// Markdown structure it is embedded in.
+///
+/// Applied to manifest-controlled text (dependency names) before it is written into
+/// hover markdown link labels. Every ASCII punctuation character is backslash-escaped
+/// (CommonMark's full escapable set — not just brackets/parens, which would still
+/// leave e.g. `<https://evil.example>` autolinks live), and control characters
+/// (including newlines) are replaced with a space so the text cannot terminate the
+/// single-line block (an ATX heading) it is embedded in and splice in new content.
+///
+/// Backslash-escaping does *not* work inside inline code spans (CommonMark §6.1) —
+/// use [`markdown_code_span`] for text embedded in `` `...` `` instead.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::escape_markdown;
+///
+/// assert_eq!(escape_markdown("pkg](evil)[pkg"), r"pkg\]\(evil\)\[pkg");
+/// assert_eq!(escape_markdown("a\nb"), "a b");
+/// ```
+pub fn escape_markdown(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            escaped.push(' ');
+            continue;
+        }
+        if c.is_ascii_punctuation() {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// Wraps `content` in a Markdown inline code span (backticks included) that safely
+/// contains arbitrary untrusted text, regardless of embedded backticks.
+///
+/// Backslash-escaping does not work inside code spans (CommonMark §6.1), so instead
+/// this fences with one more backtick than the longest run found in `content`, and
+/// pads with a single space on each side when `content` starts or ends with a
+/// backtick or space (required by CommonMark to keep the fence unambiguous). Control
+/// characters (including newlines) are replaced with a space first, since the raw
+/// hover string is otherwise free to merge into an adjacent Markdown block.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::markdown_code_span;
+///
+/// assert_eq!(markdown_code_span("1.0.0"), "`1.0.0`");
+/// assert_eq!(markdown_code_span("a`b"), "``a`b``");
+/// ```
+pub fn markdown_code_span(content: &str) -> String {
+    let sanitized: String = content
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+
+    let max_backtick_run = sanitized
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(max_backtick_run + 1);
+
+    if sanitized.is_empty() {
+        format!("{fence} {fence}")
+    } else if sanitized.starts_with(['`', ' ']) || sanitized.ends_with(['`', ' ']) {
+        format!("{fence} {sanitized} {fence}")
+    } else {
+        format!("{fence}{sanitized}{fence}")
+    }
+}
+
 /// Checks if two version strings have the same major and minor version.
 pub fn is_same_major_minor(v1: &str, v2: &str) -> bool {
     if v1.is_empty() || v2.is_empty() {
@@ -348,7 +424,13 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     // Pre-allocate with estimated capacity to reduce allocations
     let mut markdown = String::with_capacity(512);
-    write!(&mut markdown, "# [{}]({})\n\n", dep.name(), url).unwrap();
+    write!(
+        &mut markdown,
+        "# [{}]({})\n\n",
+        escape_markdown(dep.name()),
+        url
+    )
+    .unwrap();
 
     let normalized_name = formatter.normalize_package_name(dep.name());
 
@@ -357,13 +439,28 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .get(&normalized_name)
         .or_else(|| versions.resolved.get(dep.name()));
     if let Some(resolved_ver) = resolved {
-        write!(&mut markdown, "**Current**: `{}`\n\n", resolved_ver).unwrap();
+        write!(
+            &mut markdown,
+            "**Current**: {}\n\n",
+            markdown_code_span(resolved_ver)
+        )
+        .unwrap();
     } else if let Some(version_req) = dep.version_requirement() {
-        write!(&mut markdown, "**Requirement**: `{}`\n\n", version_req).unwrap();
+        write!(
+            &mut markdown,
+            "**Requirement**: {}\n\n",
+            markdown_code_span(version_req)
+        )
+        .unwrap();
     }
 
     if let Some(marker_expr) = dep.markers() {
-        write!(&mut markdown, "**Active when**: `{}`\n\n", marker_expr).unwrap();
+        write!(
+            &mut markdown,
+            "**Active when**: {}\n\n",
+            markdown_code_span(marker_expr)
+        )
+        .unwrap();
     }
 
     let latest = versions
@@ -371,23 +468,29 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .get(&normalized_name)
         .or_else(|| versions.cached.get(dep.name()));
     if let Some(latest_ver) = latest {
-        write!(&mut markdown, "**Latest**: `{}`\n\n", latest_ver).unwrap();
+        write!(
+            &mut markdown,
+            "**Latest**: {}\n\n",
+            markdown_code_span(latest_ver)
+        )
+        .unwrap();
     }
 
     markdown.push_str("**Recent versions**:\n");
     for (i, version) in available_versions.iter().take(8).enumerate() {
+        let version_span = markdown_code_span(version.version_string());
         if i == 0 {
-            writeln!(&mut markdown, "- {} *(latest)*", version.version_string()).unwrap();
+            writeln!(&mut markdown, "- {version_span} *(latest)*").unwrap();
         } else if version.is_yanked() {
             writeln!(
                 &mut markdown,
                 "- {} {}",
-                version.version_string(),
+                version_span,
                 formatter.yanked_label()
             )
             .unwrap();
         } else {
-            writeln!(&mut markdown, "- {}", version.version_string()).unwrap();
+            writeln!(&mut markdown, "- {version_span}").unwrap();
         }
     }
 
@@ -652,6 +755,101 @@ mod tests {
         let range = Range::new(Position::new(5, 10), Position::new(7, 5));
         let position = Position::new(6, 0);
         assert!(position_in_range(position, range));
+    }
+
+    #[test]
+    fn test_escape_markdown_link_breakout_payload() {
+        let payload = "real-pkg](https://legit-looking-typosquat.example/download)[real-pkg";
+        let escaped = escape_markdown(payload);
+        assert_eq!(
+            escaped,
+            r"real\-pkg\]\(https\:\/\/legit\-looking\-typosquat\.example\/download\)\[real\-pkg"
+        );
+        assert!(!escaped.contains("]("));
+    }
+
+    #[test]
+    fn test_escape_markdown_backslash_and_backtick() {
+        assert_eq!(escape_markdown(r"a\b`c"), r"a\\b\`c");
+    }
+
+    #[test]
+    fn test_escape_markdown_autolink_angle_brackets() {
+        // `<...>` around a bare URL is a CommonMark autolink; `<`/`>` must be escaped
+        // so it cannot render as a live link independent of the `[]`/`()` escaping.
+        let escaped = escape_markdown("pkg <https://evil.example>");
+        assert_eq!(escaped, r"pkg \<https\:\/\/evil\.example\>");
+        assert!(!escaped.contains('<') || escaped.contains(r"\<"));
+    }
+
+    #[test]
+    fn test_escape_markdown_control_chars_become_spaces() {
+        assert_eq!(escape_markdown("a\nb"), "a b");
+        assert_eq!(escape_markdown("a\r\nb"), "a  b");
+        assert_eq!(escape_markdown("a\tb"), "a b");
+        assert_eq!(escape_markdown("a\0b"), "a b");
+    }
+
+    #[test]
+    fn test_escape_markdown_newline_cannot_break_out_of_heading() {
+        // A raw newline used to terminate the ATX heading line early, letting the
+        // rest of the name (potentially another "# [...](...)" sequence) render as
+        // separate, unescaped Markdown blocks.
+        let escaped = escape_markdown("react\n# [fake](https://evil.example)");
+        assert!(!escaped.contains('\n'));
+    }
+
+    #[test]
+    fn test_escape_markdown_hyphenated_name_round_trips_visually() {
+        // Escaping a hyphen (ASCII punctuation) is visually inert on render — CommonMark
+        // renders `\-` as a literal `-` — so common package names are unaffected in
+        // practice even though the raw Markdown source now escapes them.
+        assert_eq!(escape_markdown("tokio-util"), r"tokio\-util");
+    }
+
+    #[test]
+    fn test_markdown_code_span_plain_content() {
+        assert_eq!(markdown_code_span("1.0.0"), "`1.0.0`");
+    }
+
+    #[test]
+    fn test_markdown_code_span_widens_fence_for_embedded_backticks() {
+        assert_eq!(markdown_code_span("a`b"), "``a`b``");
+        assert_eq!(markdown_code_span("``double``"), "``` ``double`` ```");
+    }
+
+    #[test]
+    fn test_markdown_code_span_pads_when_content_starts_or_ends_with_backtick() {
+        let span = markdown_code_span("`leading");
+        assert!(span.starts_with("`` `"));
+    }
+
+    #[test]
+    fn test_markdown_code_span_replaces_control_chars() {
+        let span = markdown_code_span("1.0\n[evil](https://evil.example)");
+        assert!(!span.contains('\n'));
+    }
+
+    #[test]
+    fn test_markdown_code_span_empty_content() {
+        assert_eq!(markdown_code_span(""), "` `");
+    }
+
+    #[test]
+    fn test_markdown_code_span_backtick_payload_cannot_break_span() {
+        // A payload attempting to close the code span early and splice in a live
+        // link must not succeed regardless of backtick count in the content.
+        let payload = "1.0` <https://evil.example>` more";
+        let span = markdown_code_span(payload);
+        // The fence must be strictly longer than any backtick run in the (sanitized)
+        // content, so no substring of `span` after the opening fence can act as a
+        // closing fence before the real one.
+        let opening_fence_len = span.chars().take_while(|&c| c == '`').count();
+        let inner = &span[opening_fence_len..span.len() - opening_fence_len];
+        assert!(
+            !inner.contains(&"`".repeat(opening_fence_len)),
+            "content contains a run of backticks as long as the fence: {span}"
+        );
     }
 
     #[test]
@@ -964,6 +1162,153 @@ mod tests {
             panic!("expected markup hover contents");
         };
         assert!(!content.value.contains("Active when"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_escapes_malicious_dependency_name() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let malicious_name = "real-pkg](https://legit-looking-typosquat.example/download)[real-pkg";
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: malicious_name.to_string(),
+                version_req: "1.0.0".to_string(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(
+                    Position::new(0, 0),
+                    Position::new(0, malicious_name.len() as u32),
+                ),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+
+        // The link label (between the H1's "# [" and the "](") must be the fully
+        // escaped name, with no raw "](" sequence that could close the label early
+        // and splice in an attacker-controlled markdown link.
+        let header_line = content
+            .value
+            .lines()
+            .next()
+            .expect("hover markdown has a header line");
+        let label = header_line
+            .strip_prefix("# [")
+            .expect("header starts with link label")
+            .split("](")
+            .next()
+            .expect("header contains label/url separator");
+        assert_eq!(
+            label,
+            r"real\-pkg\]\(https\:\/\/legit\-looking\-typosquat\.example\/download\)\[real\-pkg"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_newline_in_name_cannot_forge_new_heading() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // Combines S1 (newline breaks out of the ATX heading line) with an
+        // autolink payload that needs no brackets/parens at all.
+        let malicious_name = "react\n# [fake](https://evil.example) <https://evil.example>";
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: malicious_name.to_string(),
+                version_req: "1.0.0".to_string(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(
+                    Position::new(0, 0),
+                    Position::new(0, malicious_name.len() as u32),
+                ),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+
+        // The link label must be the exact single-line escaped name: no raw
+        // newline breaking the ATX heading, and the autolink's `<`/`>` escaped so
+        // it cannot render as a live link independent of the `[]`/`()` escaping.
+        let header_line = content
+            .value
+            .lines()
+            .next()
+            .expect("hover markdown has a header line");
+        let label = header_line
+            .strip_prefix("# [")
+            .expect("header starts with link label")
+            .split("](")
+            .next()
+            .expect("header contains label/url separator");
+        assert_eq!(label, escape_markdown(malicious_name));
+        assert!(!label.contains('\n'));
+        assert!(label.contains(r"\<https"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_marker_with_parens_renders_unescaped() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // Regression guard (M4): a legitimate PEP 508 marker with parentheses must
+        // render as-is inside its code span, not with visible `\(`/`\)` escapes —
+        // backslash-escaping does not apply inside code spans.
+        let marker = "python_version >= \"3.8\" and (sys_platform == \"linux\")";
+        let parse_result = MockMarkedParseResult {
+            dep: MockMarkedDep {
+                name: "numpy".to_string(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                markers: Some(marker.to_string()),
+            },
+            uri: crate::test_util::test_uri("/test/pyproject.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains(&format!("**Active when**: `{marker}`"))
+        );
     }
 
     #[test]

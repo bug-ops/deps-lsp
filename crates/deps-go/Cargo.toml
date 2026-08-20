@@ -22,6 +22,7 @@ tower-lsp-server.workspace = true
 tracing.workspace = true
 regex.workspace = true
 semver.workspace = true
+urlencoding.workspace = true
 
 [dev-dependencies]
 deps-core = { workspace = true, features = ["test-util"] }
