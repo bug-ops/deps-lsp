@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-20
+
 ### Removed
 - **Breaking (pre-1.0, internal API)**: deleted dead ecosystem-specific error variants, constructor helpers, and `DepsError`⇄ecosystem `From` conversions across all 11 registry-integrated crates. Evidence: none of these types were referenced by any consumer outside their own crate's `error.rs` (verified via workspace-wide `rg`), and registry code across the crates already returned `deps_core::DepsError` in 8 of 11 cases — the deleted variants existed only to be immediately round-tripped back into a `DepsError` with a lossier message, or were never constructed at all. Per-crate:
   - **deps-cargo**: `CargoError::{InvalidVersionSpecifier, PackageNotFound, RegistryError, ApiResponseError, InvalidStructure, MissingField, WorkspaceError, CacheError, Other}` and their constructor helpers; `impl From<DepsError> for CargoError`. Kept: `TomlParseError`, `InvalidUri`.
@@ -514,7 +516,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/bug-ops/deps-lsp/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/bug-ops/deps-lsp/compare/v0.9.5...v0.10.0
 [0.9.5]: https://github.com/bug-ops/deps-lsp/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/bug-ops/deps-lsp/compare/v0.9.3...v0.9.4

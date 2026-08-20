@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "deps-bundler"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "deps-cargo"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -470,7 +470,7 @@ dependencies = [
 
 [[package]]
 name = "deps-composer"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "deps-core",
  "serde",
@@ -485,7 +485,7 @@ dependencies = [
 
 [[package]]
 name = "deps-core"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "deps-dart"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "deps-go"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "deps-gradle"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "deps-core",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "deps-lsp"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "deps-maven"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "deps-core",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "deps-npm"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "deps-nuget"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "criterion",
  "deps-core",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "deps-pypi"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "criterion",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "deps-swift"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "deps-core",
  "insta",
