@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["CacheConfig","ColdStartConfig","DepsConfig","DiagnosticsConfig","InlayHintsConfig","LoadingIndicatorConfig"]};

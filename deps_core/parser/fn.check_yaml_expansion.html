@@ -1,0 +1,61 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Streams `content` through `yaml-rust2`’s own parser event stream and tallies the total bytes the `Yaml` nodes `YamlLoader::load_from_str` would allocate, rejecting once the tally exceeds `max_bytes`."><title>check_yaml_expansion in deps_core::parser - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">check_yaml_expansion</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.10.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">check_<wbr>yaml_<wbr>expansion</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#errors" title="Errors">Errors</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>parser</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">parser</a></div><h1>Function <span class="fn">check_<wbr>yaml_<wbr>expansion</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/parser.rs.html#618-705">Source</a> </span></div><pre class="rust item-decl"><code>pub fn check_yaml_expansion(
+    content: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    max_bytes: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Streams <code>content</code> through <code>yaml-rust2</code>’s own parser event stream and
+tallies the total bytes the <code>Yaml</code> nodes <code>YamlLoader::load_from_str</code>
+would allocate, rejecting once the tally exceeds <code>max_bytes</code>.</p>
+<p>This is a pre-pass driven by the same <code>Parser</code>/event stream
+<code>YamlLoader::load_from_str</code> itself uses (<code>Parser::new(content.chars())</code>,
+<code>multi = true</code>), so anchor ids and event order are identical to the real
+load — unlike a raw-text <code>&amp;anchor</code>/<code>*alias</code> scan, which was tried and
+rejected: ordinary prose such as <code>description: A widget *multiplier* helper</code> sits at exactly the position a text scanner treats as a token
+boundary, so it false-positives as an alias reference.</p>
+<p>The accounting model mirrors <code>YamlLoader::on_event_impl</code> exactly, in
+bytes rather than node count: a <code>Scalar</code> charges
+<code>YAML_NODE_OVERHEAD_BYTES</code> plus its own string content length; a closed
+<code>Sequence</code>/<code>Mapping</code> charges <code>YAML_NODE_OVERHEAD_BYTES</code> for itself,
+plus the byte weight of its already-charged descendants. An anchored
+node (<code>SequenceStart</code>/<code>MappingStart</code>/<code>Scalar</code> anchor id <code>&gt; 0</code>) charges
+its own subtree’s byte weight a second time, mirroring
+<code>insert_new_node</code>’s <code>anchor_map.insert</code> clone; an <code>Alias</code> charges the
+referenced anchor’s recorded byte weight (or
+<code>YAML_NODE_OVERHEAD_BYTES</code> for an unknown anchor id, matching the
+loader’s own <code>Yaml::BadValue</code> fallback, which owns no heap content),
+mirroring the <code>v.clone()</code> in the <code>Event::Alias</code> arm. All counting uses
+<code>u64</code> with <code>saturating_add</code>, since the counter itself — not just the
+input — is the attack surface.</p>
+<p>This pre-pass is not itself free relative to <code>max_bytes</code>: its own
+<code>anchors: BTreeMap&lt;usize, u64&gt;</code> grows by one entry per distinct anchor
+id seen, so a document built almost entirely of many tiny anchors (e.g.
+~262,000 one-byte-scalar anchors, ~3.6 MB source) can transiently grow
+this map to roughly the same order of magnitude as <code>max_bytes</code> itself
+before the tally crosses it and rejection kicks in. This is bounded and
+transient, not unbounded like the vulnerability this guard closes, but
+callers should not assume the pre-pass’s own peak memory is negligible
+next to the budget it enforces.</p>
+<p>Any <code>ScanError</code> from this pre-pass is ignored: the real
+<code>YamlLoader::load_from_str</code> call that follows reports the authoritative
+syntax error. If the budget was already exceeded before the scan error,
+this still returns <code>Err</code>.</p>
+<p>This pre-pass is, like the real load, driven by <code>Parser::load</code>’s mutually
+recursive <code>load_node</code>/<code>load_mapping</code>/<code>load_sequence</code> — callers must run
+<a href="fn.check_yaml_nesting_depth.html" title="fn deps_core::parser::check_yaml_nesting_depth"><code>check_yaml_nesting_depth</code></a> first so this never recurses on input deep
+enough to overflow the stack itself.</p>
+<h2 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h2>
+<p>Returns <code>Err(bytes)</code> with the byte tally reached the instant it exceeds
+<code>max_bytes</code>.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::parser::check_yaml_expansion;
+
+<span class="macro">assert!</span>(check_yaml_expansion(<span class="string">"a: 1\nb: [2, 3]\n"</span>, <span class="number">1000</span>).is_ok());
+
+<span class="comment">// A widget *multiplier* helper is a plain scalar, not an alias.
+</span><span class="macro">assert!</span>(check_yaml_expansion(<span class="string">"description: A widget *multiplier* helper"</span>, <span class="number">1000</span>).is_ok());
+
+<span class="comment">// Each anchor doubles the next one's alias count, so N levels expand to
+// roughly 2^N nodes from a source only ~2N bytes long.
+</span><span class="kw">let </span><span class="kw-2">mut </span>doubling_chain = String::from(<span class="string">"a0: &amp;a0 [x, x]\n"</span>);
+<span class="kw">for </span>i <span class="kw">in </span><span class="number">1</span>..<span class="number">20 </span>{
+    doubling_chain.push_str(<span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"a{i}: &amp;a{i} [*a{prev}, *a{prev}]\n"</span>, prev = i - <span class="number">1</span>));
+}
+<span class="macro">assert!</span>(check_yaml_expansion(<span class="kw-2">&amp;</span>doubling_chain, <span class="number">1000</span>).is_err());</code></pre></div></div></details></section></div></main></body></html>

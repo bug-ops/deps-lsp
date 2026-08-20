@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REGISTRY"],"fn":["flat_container_url","package_url","parse_flat_container","search_url"],"struct":["NuGetRegistry"]};

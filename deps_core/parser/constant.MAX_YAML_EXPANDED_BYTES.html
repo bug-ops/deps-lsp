@@ -1,0 +1,47 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Maximum total byte weight `check_yaml_expansion` allows a document to expand to (counting anchor/alias-driven duplication) before rejecting it."><title>MAX_YAML_EXPANDED_BYTES in deps_core::parser - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc constant"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">MAX_YAML_EXPANDED_BYTES</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.10.1</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>parser</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">parser</a></div><h1>Constant <span class="constant">MAX_<wbr>YAML_<wbr>EXPANDED_<wbr>BYTES</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/parser.rs.html#546">Source</a> </span></div><pre class="rust item-decl"><code>pub const MAX_YAML_EXPANDED_BYTES: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a> = _; // 33_554_432usize</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Maximum total byte weight <a href="fn.check_yaml_expansion.html" title="fn deps_core::parser::check_yaml_expansion"><code>check_yaml_expansion</code></a> allows a document to
+expand to (counting anchor/alias-driven duplication) before rejecting it.</p>
+<p><code>yaml-rust2</code> 0.12’s <code>YamlLoader::on_event_impl</code> deep-clones the whole
+anchored subtree once per <code>Event::Alias</code> reference (<code>anchor_map.get(&amp;id) =&gt; v.clone()</code>), and again into <code>anchor_map</code> itself for every anchored
+node. Nesting depth (bounded by <a href="constant.MAX_YAML_NESTING_DEPTH.html" title="constant deps_core::parser::MAX_YAML_NESTING_DEPTH"><code>MAX_YAML_NESTING_DEPTH</code></a>) is irrelevant
+to this: a shallow document with a handful of anchors, each aliased a
+handful of times, expands exponentially in the memory actually
+allocated. Critically, this must be a <strong>byte</strong> budget, not a node-count
+budget: a single large scalar anchor (e.g. a 1 MB string) aliased many
+times allocates megabytes per alias while costing only one node each, so
+a node-count budget lets it through cheaply — a document under 3 MB can
+exhaust hundreds of gigabytes this way. <code>YamlLoader</code> exposes no
+budget/config hook, so callers must reject pathological input before
+handing it to the loader.</p>
+<p><code>32 MiB</code> (<code>32 * 1024 * 1024</code> = 33,554,432) is the <em>charged</em> byte budget —
+not an exact bound on <code>YamlLoader</code>’s real peak allocation. Charged bytes
+track <code>YAML_NODE_OVERHEAD_BYTES</code>’s per-node floor plus scalar content,
+which undercounts two real costs that floor doesn’t model: <code>Hash</code>’s
+<code>LinkedHashMap</code> prev/next link pointers and hash-table slots (hash-heavy
+documents, e.g. a <code>pubspec.lock</code>), and <code>String</code>/<code>Vec</code> capacity-doubling
+slack — the scanner builds every scalar via <code>String::new()</code> + repeated
+<code>push</code>, so a single large scalar whose length lands just past a
+power-of-two capacity boundary (e.g. 1,048,577 bytes) wastes nearly its
+own length again in unused capacity, and the same growth pattern applies
+to a <code>Vec</code> backing a long sequence. Measured with a counting allocator:
+real peak allocation runs about 1.16x-1.74x the charged total depending
+on document shape (steadier ~1.56x for hash-heavy lockfiles, up to ~2x
+for a large scalar or long sequence whose length lands right past a
+capacity-doubling boundary), so an accepted document charged right at
+this limit really allocates roughly 50-65 MB, not 32 MB. Bytes
+charged do not compound with nesting, so ~2x is the ceiling on that
+ratio, not a growing multiplier — the budget stays a bounded, linear
+function of input size either way, which is what actually matters for
+this guard (an <em>unbounded</em> multiplier, as with the pre-fix node-count
+budget’s <code>O(2^depth)</code> blowup, is the failure mode this guards against).</p>
+<p>Measured against real payloads (exact charged totals, reproducible
+against the shape scaled up from
+<code>test_check_yaml_expansion_few_hundred_package_lockfile_accepted</code>): a
+1.9 MB / 12,500-package synthetic <code>pubspec.lock</code> charges 12,416,870 bytes
+(2.70x headroom); a 757 KB / 5,000-package one charges 4,961,870 bytes
+(6.76x headroom); the doubling-chain attack payload (see
+<a href="fn.check_yaml_expansion.html" title="fn deps_core::parser::check_yaml_expansion"><code>check_yaml_expansion</code></a>’s doctest) charges 16,907,046 bytes at N=14
+(accepted) and 33,815,273 at N=15 (rejected, in well under a
+millisecond); and a single 1 MB anchor aliased 31 times (33,002,370
+bytes charged, ~1 MB source) is accepted while 32 times (34,002,434
+bytes) is rejected rather than allocating unboundedly.</p>
+</div></details></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"macro":[["impl_dependency",1],["impl_metadata",1],["impl_parse_result",1],["impl_version",1]],"mod":["cache","completion","ecosystem","ecosystem_registry","error","lockfile","lsp_helpers","macros","parser","registry","test_util","version_matcher"]};

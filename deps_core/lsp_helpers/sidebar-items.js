@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["escape_markdown","generate_code_actions","generate_diagnostics","generate_diagnostics_from_cache","generate_hover","generate_inlay_hints","is_same_major_minor","markdown_code_span","position_in_range"],"struct":["LineOffsetTable","VersionData"],"trait":["EcosystemFormatter"]};

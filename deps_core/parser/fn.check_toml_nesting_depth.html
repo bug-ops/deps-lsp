@@ -1,0 +1,44 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Scans raw TOML text for table/array recursion deeper than `max_depth`."><title>check_toml_nesting_depth in deps_core::parser - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">check_toml_nesting_depth</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.10.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">check_<wbr>toml_<wbr>nesting_<wbr>depth</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#errors" title="Errors">Errors</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>parser</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">parser</a></div><h1>Function <span class="fn">check_<wbr>toml_<wbr>nesting_<wbr>depth</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/parser.rs.html#89-194">Source</a> </span></div><pre class="rust item-decl"><code>pub fn check_toml_nesting_depth(
+    content: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    max_depth: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Scans raw TOML text for table/array recursion deeper than <code>max_depth</code>.</p>
+<p><code>toml-span::parse</code> has no public option to cap recursion, so callers must
+reject pathological input before handing it to the parser. This performs a
+single-pass structural scan — no actual parsing, so it cannot itself
+recurse or overflow — that bounds the two independent ways TOML content
+drives <code>toml-span</code>’s table/array recursion:</p>
+<ul>
+<li><strong>Bracket nesting</strong>: <code>[</code>/<code>{</code> and <code>]</code>/<code>}</code> pairs, as in <code>[[[1]]]</code> or
+<code>{a={a=1}}</code>.</li>
+<li><strong>Dotted-key/header segments</strong>: each <code>.</code> in a dotted key (<code>a.b.c = 1</code>)
+or dotted table header (<code>[a.b.c]</code>) creates one level of table nesting
+with zero bracket characters, so bracket-only counting alone is not
+sufficient. Dots are only counted in <em>key</em> position (start of a
+top-level statement, inside a <code>[...]</code>/<code>[[...]]</code> header, or right after
+<code>{</code>/<code>,</code> while the innermost open bracket is <code>{</code>) — never in <em>value</em>
+position, so <code>a = 3.14</code> and multi-segment version/date values are not
+miscounted.</li>
+</ul>
+<p>Both counts accumulate into one shared depth budget bounded by
+<code>max_depth</code>, since both are ways <code>toml-span</code> recurses. Bracket characters
+and dots inside string literals or line comments are skipped, so this
+does not misfire on values like <code>"flask[async]&gt;=3.0"</code> or <code># example: [1, 2]</code>. Both single-line (<code>"..."</code>, <code>'...'</code>, honoring <code>\"</code> escapes) and
+multi-line (<code>"""..."""</code>, <code>'''...'''</code>, including a body that legally ends
+with 1-2 extra literal quote characters before the closing delimiter, per
+the TOML spec) string forms are recognized, so brackets and dots inside a
+multi-line string body are never miscounted.</p>
+<h2 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h2>
+<p>Returns <code>Err(depth)</code> with the depth reached the instant nesting exceeds
+<code>max_depth</code>.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::parser::check_toml_nesting_depth;
+
+<span class="macro">assert!</span>(check_toml_nesting_depth(<span class="string">r#"a = [1, 2, [3, 4]]"#</span>, <span class="number">4</span>).is_ok());
+<span class="macro">assert!</span>(check_toml_nesting_depth(<span class="string">"a = '''don't'''\nb = [1]"</span>, <span class="number">4</span>).is_ok());
+<span class="macro">assert!</span>(check_toml_nesting_depth(<span class="string">"a = 3.14\nb.c = 1"</span>, <span class="number">4</span>).is_ok());
+
+<span class="kw">let </span>deeply_nested = <span class="macro">format!</span>(<span class="string">"a = {}1{}"</span>, <span class="string">"["</span>.repeat(<span class="number">10</span>), <span class="string">"]"</span>.repeat(<span class="number">10</span>));
+<span class="macro">assert_eq!</span>(check_toml_nesting_depth(<span class="kw-2">&amp;</span>deeply_nested, <span class="number">4</span>), <span class="prelude-val">Err</span>(<span class="number">5</span>));
+
+<span class="kw">let </span>deep_dotted_key = <span class="macro">format!</span>(<span class="string">"a{} = 1"</span>, <span class="string">".a"</span>.repeat(<span class="number">10</span>));
+<span class="macro">assert_eq!</span>(check_toml_nesting_depth(<span class="kw-2">&amp;</span>deep_dotted_key, <span class="number">4</span>), <span class="prelude-val">Err</span>(<span class="number">5</span>));</code></pre></div></div></details></section></div></main></body></html>

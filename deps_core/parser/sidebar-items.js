@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_TOML_NESTING_DEPTH","MAX_YAML_EXPANDED_BYTES","MAX_YAML_NESTING_DEPTH"],"enum":["DependencySource","LoadingState"],"fn":["check_toml_nesting_depth","check_yaml_expansion","check_yaml_nesting_depth"],"trait":["DependencyInfo","ManifestParser","ParseResultInfo"]};

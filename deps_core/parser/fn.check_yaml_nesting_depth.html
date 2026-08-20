@@ -1,0 +1,59 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Scans raw YAML text for block/flow recursion deeper than `max_depth`."><title>check_yaml_nesting_depth in deps_core::parser - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="deps_core" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">check_yaml_nesting_depth</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../deps_core/index.html">deps_<wbr>core</a><span class="version">0.10.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">check_<wbr>yaml_<wbr>nesting_<wbr>depth</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#errors" title="Errors">Errors</a></li><li><a href="#examples" title="Examples">Examples</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="index.html">In deps_<wbr>core::<wbr>parser</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">deps_core</a>::<wbr><a href="index.html">parser</a></div><h1>Function <span class="fn">check_<wbr>yaml_<wbr>nesting_<wbr>depth</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/deps_core/parser.rs.html#334-431">Source</a> </span></div><pre class="rust item-decl"><code>pub fn check_yaml_nesting_depth(
+    content: &amp;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.str.html">str</a>,
+    max_depth: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.unit.html">()</a>, <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.usize.html">usize</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Scans raw YAML text for block/flow recursion deeper than <code>max_depth</code>.</p>
+<p><code>YamlLoader::load_from_str</code> has no public option to cap recursion, so
+callers must reject pathological input before handing it to the parser.
+This performs a single-pass structural scan — no actual parsing, so it
+cannot itself recurse or overflow — that bounds the two independent ways
+YAML content drives <code>yaml-rust2</code>’s recursion:</p>
+<ul>
+<li><strong>Flow-style bracket nesting</strong>: <code>[</code>/<code>{</code> and <code>]</code>/<code>}</code> pairs, as in
+<code>[[[1]]]</code> or <code>{a: {a: 1}}</code>.</li>
+<li><strong>Block-style indentation</strong>: each line whose leading indentation is
+deeper than the enclosing block context opens one nesting level (e.g. a
+mapping key or sequence item indented under its parent); each <code>-</code> in a
+compact chained sequence item (<code>- - - 1</code>) opens one level per dash,
+since it is equivalent to one nested single-item sequence per level.</li>
+</ul>
+<p>Both counts accumulate into one shared depth budget bounded by
+<code>max_depth</code>. Line-start block indentation is scanned unconditionally on
+every line, even one that looks like a continuation of a still-open flow
+bracket from a previous line — an unclosed <code>[</code>/<code>{</code> must never be able to
+suppress scanning for the rest of the file (impl-critic C2), so this
+guard accepts occasionally over-counting a multi-line flow collection’s
+continuation lines as extra block levels in exchange for never being able
+to go blind. A quote character is only treated as opening a quoted
+scalar when it sits at a token-start position (line start, or right
+after <code>: </code>, <code>- </code>, <code>[</code>, <code>{</code>, <code>,</code>) — never mid-token — so an apostrophe
+inside a plain scalar like <code>doesn't</code> is left alone rather than
+mistaken for the start of a string (impl-critic C1). Once a quoted
+scalar is opened, it is only ever trusted to close on the <em>same</em> line:
+hitting an unescaped <code>\n</code> before the matching quote resynchronizes the
+scanner at that newline unconditionally (including across a <code>\</code> right
+before it, which cannot extend the string past the line), rather than
+scanning forward indefinitely looking for a close — so neither a stray
+unquoted apostrophe nor a genuinely unterminated quoted scalar can ever
+blind the scanner to more than the remainder of one line. <code>#</code> outside a
+quoted scalar always starts a comment to end of line. Content indented
+under a literal/folded block scalar (<code>|</code>/<code>&gt;</code>) is not specially exempted
+and is scanned like any other indentation, which can only make this
+guard <em>more</em> conservative, never less. Only ASCII space counts as
+indentation — a tab-indented line reads as indent 0, an assumption that
+currently holds only because <code>yaml-rust2</code> itself rejects tabs used for
+block indentation before recursing deep enough to matter.</p>
+<h2 id="errors"><a class="doc-anchor" href="#errors">§</a>Errors</h2>
+<p>Returns <code>Err(depth)</code> with the depth reached the instant nesting exceeds
+<code>max_depth</code>.</p>
+<h2 id="examples"><a class="doc-anchor" href="#examples">§</a>Examples</h2>
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">use </span>deps_core::parser::check_yaml_nesting_depth;
+
+<span class="macro">assert!</span>(check_yaml_nesting_depth(<span class="string">"a:\n  b:\n    c: 1\n"</span>, <span class="number">4</span>).is_ok());
+
+<span class="kw">let </span>deeply_nested = <span class="macro">format!</span>(<span class="string">"{}1"</span>, <span class="string">"- "</span>.repeat(<span class="number">10</span>));
+<span class="macro">assert!</span>(check_yaml_nesting_depth(<span class="kw-2">&amp;</span>deeply_nested, <span class="number">4</span>).is_err());
+
+<span class="comment">// An apostrophe mid-scalar must not blind the scanner to nesting later
+// in the file (impl-critic C1).
+</span><span class="kw">let </span>content = <span class="macro">format!</span>(<span class="string">"a: it doesn't panic\n{}1"</span>, <span class="string">"- "</span>.repeat(<span class="number">10</span>));
+<span class="macro">assert!</span>(check_yaml_nesting_depth(<span class="kw-2">&amp;</span>content, <span class="number">4</span>).is_err());</code></pre></div></div></details></section></div></main></body></html>

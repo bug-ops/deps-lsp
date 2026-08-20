@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["REGISTRY"],"mod":["ecosystem","error","formatter","parser","types"],"struct":["GradleVersion"]};
