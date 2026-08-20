@@ -39,8 +39,9 @@ pub use lsp_helpers::{
     generate_inlay_hints as lsp_generate_inlay_hints, is_same_major_minor, position_in_range,
 };
 pub use parser::{
-    DependencyInfo, DependencySource, LoadingState, MAX_TOML_NESTING_DEPTH, MAX_YAML_NESTING_DEPTH,
-    ManifestParser, ParseResultInfo, check_toml_nesting_depth, check_yaml_nesting_depth,
+    DependencyInfo, DependencySource, LoadingState, MAX_TOML_NESTING_DEPTH,
+    MAX_YAML_EXPANDED_BYTES, MAX_YAML_NESTING_DEPTH, ManifestParser, ParseResultInfo,
+    check_toml_nesting_depth, check_yaml_expansion, check_yaml_nesting_depth,
 };
 pub use registry::{Metadata, Registry, Version, find_latest_stable};
 pub use version_matcher::{

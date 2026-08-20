@@ -56,6 +56,16 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
         });
     }
 
+    if let Err(bytes) = deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES)
+    {
+        return Err(crate::error::DartError::ParseError {
+            message: format!(
+                "YAML expansion {bytes} bytes exceeds maximum of {} bytes",
+                deps_core::MAX_YAML_EXPANDED_BYTES
+            ),
+        });
+    }
+
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
     let mut sdk_constraint = None;
@@ -483,6 +493,39 @@ dependencies:
         );
         let result = parse_pubspec_yaml(&yaml, &test_uri());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_anchor_alias_expansion_bomb_rejected_not_oomed() {
+        // #175: a shallow (depth-2) doubling chain of anchor/alias
+        // references, which `check_yaml_nesting_depth` cannot catch since
+        // nesting depth stays constant — must be rejected by the expansion
+        // budget instead of handed to `YamlLoader::load_from_str`, which
+        // would OOM/SIGKILL the process on this shape.
+        let mut yaml = String::from("name: app\na0: &a0 [x, x]\n");
+        for i in 1..=30 {
+            yaml.push_str(&format!("a{i}: &a{i} [*a{prev}, *a{prev}]\n", prev = i - 1));
+        }
+        let result = parse_pubspec_yaml(&yaml, &test_uri());
+        // Asserting on the message (not just `is_err()`) pins that this is
+        // rejected by the expansion guard specifically, so a future reorder
+        // that lets a different guard fire first would be caught.
+        match result {
+            Err(crate::error::DartError::ParseError { message }) => {
+                assert!(
+                    message.contains("YAML expansion"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected DartError::ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_asterisk_in_description_not_misread_as_alias() {
+        let yaml = "name: my_app\ndescription: A widget *multiplier* helper\ndependencies:\n  http: ^1.0.0\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri());
+        assert!(result.is_ok());
     }
 
     #[test]
