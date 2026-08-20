@@ -240,6 +240,236 @@ fn skip_multiline_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
     i
 }
 
+/// Maximum allowed nesting depth for YAML block/flow recursion before
+/// [`check_yaml_nesting_depth`] rejects the input.
+///
+/// `yaml-rust2` 0.12's block-style (indentation-driven) sequence/mapping
+/// parser recurses once per nesting level with no depth limit (its flow-style
+/// `[[[...]]]` array parser already caps recursion, but block style and flow
+/// objects do not). A deeply nested `pubspec.yaml`/`pubspec.lock` can overflow
+/// the native thread stack and abort the whole process (SIGABRT) before
+/// `YamlLoader::load_from_str` ever returns an error. As with
+/// [`MAX_TOML_NESTING_DEPTH`], this constant assumes the smallest stack any
+/// caller is likely to run on: a `tokio` worker thread's 2 MiB default, not
+/// `deps-lsp`'s own 8 MiB `WORKER_THREAD_STACK_SIZE` (defense-in-depth on top
+/// of this guard).
+///
+/// Bisected against the real `yaml-rust2` 0.12 recursion on a 2 MiB debug
+/// stack: the cheapest attack — compact block-sequence chaining
+/// (`- - - - 1`, 2 bytes per level) — survives depth 4535 and aborts at 4536;
+/// growing-indent block mappings (`k:\n k:\n  k:\n...`), the tightest case,
+/// survive depth 1993 and abort at 1994. 64 leaves a >30x margin under the
+/// tightest of these while still being far deeper than any real manifest
+/// needs — `pubspec.yaml`/`pubspec.lock` structures bottom out around 4-5
+/// levels (e.g. `packages.<name>.description.<field>`).
+pub const MAX_YAML_NESTING_DEPTH: usize = 64;
+
+/// Scans raw YAML text for block/flow recursion deeper than `max_depth`.
+///
+/// `YamlLoader::load_from_str` has no public option to cap recursion, so
+/// callers must reject pathological input before handing it to the parser.
+/// This performs a single-pass structural scan — no actual parsing, so it
+/// cannot itself recurse or overflow — that bounds the two independent ways
+/// YAML content drives `yaml-rust2`'s recursion:
+///
+/// - **Flow-style bracket nesting**: `[`/`{` and `]`/`}` pairs, as in
+///   `[[[1]]]` or `{a: {a: 1}}`.
+/// - **Block-style indentation**: each line whose leading indentation is
+///   deeper than the enclosing block context opens one nesting level (e.g. a
+///   mapping key or sequence item indented under its parent); each `-` in a
+///   compact chained sequence item (`- - - 1`) opens one level per dash,
+///   since it is equivalent to one nested single-item sequence per level.
+///
+/// Both counts accumulate into one shared depth budget bounded by
+/// `max_depth`. Line-start block indentation is scanned unconditionally on
+/// every line, even one that looks like a continuation of a still-open flow
+/// bracket from a previous line — an unclosed `[`/`{` must never be able to
+/// suppress scanning for the rest of the file (impl-critic C2), so this
+/// guard accepts occasionally over-counting a multi-line flow collection's
+/// continuation lines as extra block levels in exchange for never being able
+/// to go blind. A quote character is only treated as opening a quoted
+/// scalar when it sits at a token-start position (line start, or right
+/// after `: `, `- `, `[`, `{`, `,`) — never mid-token — so an apostrophe
+/// inside a plain scalar like `doesn't` is left alone rather than
+/// mistaken for the start of a string (impl-critic C1). Once a quoted
+/// scalar is opened, it is only ever trusted to close on the *same* line:
+/// hitting an unescaped `\n` before the matching quote resynchronizes the
+/// scanner at that newline unconditionally (including across a `\` right
+/// before it, which cannot extend the string past the line), rather than
+/// scanning forward indefinitely looking for a close — so neither a stray
+/// unquoted apostrophe nor a genuinely unterminated quoted scalar can ever
+/// blind the scanner to more than the remainder of one line. `#` outside a
+/// quoted scalar always starts a comment to end of line. Content indented
+/// under a literal/folded block scalar (`|`/`>`) is not specially exempted
+/// and is scanned like any other indentation, which can only make this
+/// guard *more* conservative, never less. Only ASCII space counts as
+/// indentation — a tab-indented line reads as indent 0, an assumption that
+/// currently holds only because `yaml-rust2` itself rejects tabs used for
+/// block indentation before recursing deep enough to matter.
+///
+/// # Errors
+///
+/// Returns `Err(depth)` with the depth reached the instant nesting exceeds
+/// `max_depth`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::parser::check_yaml_nesting_depth;
+///
+/// assert!(check_yaml_nesting_depth("a:\n  b:\n    c: 1\n", 4).is_ok());
+///
+/// let deeply_nested = format!("{}1", "- ".repeat(10));
+/// assert!(check_yaml_nesting_depth(&deeply_nested, 4).is_err());
+///
+/// // An apostrophe mid-scalar must not blind the scanner to nesting later
+/// // in the file (impl-critic C1).
+/// let content = format!("a: it doesn't panic\n{}1", "- ".repeat(10));
+/// assert!(check_yaml_nesting_depth(&content, 4).is_err());
+/// ```
+pub fn check_yaml_nesting_depth(content: &str, max_depth: usize) -> std::result::Result<(), usize> {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut depth: usize = 0;
+    let mut indent_stack: Vec<usize> = Vec::new();
+    let mut bracket_stack: Vec<u8> = Vec::new();
+
+    let mut i = 0;
+    while i < len {
+        let mut indent = 0;
+        while i < len && bytes[i] == b' ' {
+            indent += 1;
+            i += 1;
+        }
+        if i >= len || bytes[i] == b'\n' || bytes[i] == b'#' {
+            i = skip_to_eol(bytes, i);
+            if i < len && bytes[i] == b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        while indent_stack.last().is_some_and(|&top| top > indent) {
+            indent_stack.pop();
+            depth = depth.saturating_sub(1);
+        }
+
+        let mut col = indent;
+        while i < len && bytes[i] == b'-' && (i + 1 == len || matches!(bytes[i + 1], b' ' | b'\n'))
+        {
+            if indent_stack.last() != Some(&col) {
+                depth += 1;
+                if depth > max_depth {
+                    return Err(depth);
+                }
+                indent_stack.push(col);
+            }
+            i += 1;
+            col += 1;
+            while i < len && bytes[i] == b' ' {
+                i += 1;
+                col += 1;
+            }
+        }
+
+        if i < len && !matches!(bytes[i], b'\n' | b'#') && indent_stack.last() != Some(&col) {
+            depth += 1;
+            if depth > max_depth {
+                return Err(depth);
+            }
+            indent_stack.push(col);
+        }
+
+        // `prev` tracks whether the byte at `i` sits at a token-start
+        // position; starts `b' '` since we just consumed leading
+        // whitespace/dash-chain separators above.
+        let mut prev: u8 = b' ';
+        while i < len && bytes[i] != b'\n' {
+            match bytes[i] {
+                b'#' => {
+                    i = skip_to_eol(bytes, i);
+                    break;
+                }
+                quote @ (b'"' | b'\'')
+                    if matches!(prev, b' ' | b'\t' | b':' | b',' | b'[' | b'{' | b'-') =>
+                {
+                    i = skip_yaml_string(bytes, i + 1, quote);
+                    prev = quote;
+                }
+                b'[' | b'{' => {
+                    depth += 1;
+                    if depth > max_depth {
+                        return Err(depth);
+                    }
+                    bracket_stack.push(bytes[i]);
+                    prev = bytes[i];
+                    i += 1;
+                }
+                b']' | b'}' => {
+                    if bracket_stack.pop().is_some() {
+                        depth = depth.saturating_sub(1);
+                    }
+                    prev = bytes[i];
+                    i += 1;
+                }
+                b => {
+                    prev = b;
+                    i += 1;
+                }
+            }
+        }
+        if i < len && bytes[i] == b'\n' {
+            i += 1;
+        }
+    }
+
+    Ok(())
+}
+
+/// Advances past the rest of the current line (used for blank and comment
+/// lines), returning the index of the `\n` or `bytes.len()`.
+fn skip_to_eol(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    while i < len && bytes[i] != b'\n' {
+        i += 1;
+    }
+    i
+}
+
+/// Advances past a YAML quoted scalar opened at a token-start position
+/// (`"..."` or `'...'`), returning the index just past its closing quote.
+///
+/// Only ever trusts a close on the *same* line: hits an unescaped `\n`
+/// before finding the matching quote, this returns the index of that
+/// newline unconsumed rather than continuing to search — so neither a
+/// genuinely unterminated quoted scalar nor a `\` placed right before the
+/// newline (which would otherwise "escape" it and extend the scan) can
+/// blind the caller's line-oriented scan to more than the current line
+/// (impl-critic C1). `yaml-rust2` reports the real syntax error for content
+/// this treats as unterminated. Handles double-quote backslash escapes and
+/// single-quote `''` escapes.
+fn skip_yaml_string(bytes: &[u8], mut i: usize, quote: u8) -> usize {
+    let len = bytes.len();
+    while i < len && bytes[i] != b'\n' {
+        if bytes[i] == b'\\' && quote == b'"' {
+            if bytes.get(i + 1) == Some(&b'\n') {
+                break;
+            }
+            i += 2;
+            continue;
+        }
+        if bytes[i] == quote {
+            if quote == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    i
+}
+
 /// Generic manifest parser interface.
 ///
 /// Implementors parse ecosystem-specific manifest files (Cargo.toml, package.json, etc.)
@@ -709,6 +939,202 @@ cpu_load = 3.14
             "]".repeat(5)
         );
         assert_eq!(check_toml_nesting_depth(&content, 4), Err(5));
+    }
+
+    /// Builds `n` lines of block mapping, each one column deeper than the
+    /// last (`k:\n k:\n  k:\n...`) — the tightest real `yaml-rust2` crash
+    /// shape (impl-critic/tester finding), and exactly `n` scanner pushes.
+    fn nested_mapping(n: usize) -> String {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&" ".repeat(i));
+            s.push_str("k:\n");
+        }
+        s
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_empty_content() {
+        assert_eq!(check_yaml_nesting_depth("", 4), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_no_nesting() {
+        assert_eq!(
+            check_yaml_nesting_depth("name: foo\nversion: 1.0.0\n", 1),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_dash_chain_exactly_at_max() {
+        // N dashes push N levels, plus one more for the trailing scalar's
+        // own column (deeper than the last dash), so N=3 peaks at depth 4.
+        let content = format!("{}1", "- ".repeat(3));
+        assert_eq!(check_yaml_nesting_depth(&content, 4), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_dash_chain_one_over_max() {
+        let content = format!("{}1", "- ".repeat(4));
+        assert_eq!(check_yaml_nesting_depth(&content, 4), Err(5));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_block_mapping_exactly_at_max() {
+        assert_eq!(check_yaml_nesting_depth(&nested_mapping(4), 4), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_block_mapping_one_over_max() {
+        assert_eq!(check_yaml_nesting_depth(&nested_mapping(5), 4), Err(5));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_double_quoted_string_ignored() {
+        let content = r#"a: "[[[[[unbalanced brackets]]]]]""#;
+        assert_eq!(check_yaml_nesting_depth(content, 1), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_single_quoted_string_ignored() {
+        let content = "a: '[[[[[unbalanced brackets]]]]]'";
+        assert_eq!(check_yaml_nesting_depth(content, 1), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_escaped_quote_in_string() {
+        // The escaped quote must not terminate the string early, so the
+        // brackets that follow stay inside the string and are ignored.
+        let content = r#"a: "embedded \" quote [[[[[""#;
+        assert_eq!(check_yaml_nesting_depth(content, 1), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_comment_ignored() {
+        let content = "# [[[[[unbalanced comment brackets]]]]]\na: 1\n";
+        assert_eq!(check_yaml_nesting_depth(content, 1), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_mixed_flow_and_block_nesting() {
+        // a: -> depth 1, "  b:" -> depth 2, then [ [ [ inside the value ->
+        // peaks at depth 5 — flow and block share one budget.
+        let content = "a:\n  b: [c, [d, [e]]]\n";
+        assert_eq!(check_yaml_nesting_depth(content, 5), Ok(()));
+        assert_eq!(check_yaml_nesting_depth(content, 4), Err(5));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_dash_chain_at_production_boundary() {
+        // N dashes plus the trailing scalar's own column peak at depth
+        // N + 1, so N = depth - 1 is the boundary.
+        let depth = MAX_YAML_NESTING_DEPTH;
+        let at_max = format!("{}1", "- ".repeat(depth - 1));
+        assert_eq!(check_yaml_nesting_depth(&at_max, depth), Ok(()));
+
+        let over_max = format!("{}1", "- ".repeat(depth));
+        assert_eq!(check_yaml_nesting_depth(&over_max, depth), Err(depth + 1));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_block_mapping_at_production_boundary() {
+        let depth = MAX_YAML_NESTING_DEPTH;
+        assert_eq!(
+            check_yaml_nesting_depth(&nested_mapping(depth), depth),
+            Ok(())
+        );
+        assert_eq!(
+            check_yaml_nesting_depth(&nested_mapping(depth + 1), depth),
+            Err(depth + 1)
+        );
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_rejects_original_sigabrt_payloads() {
+        // Depths comfortably past the empirically bisected real `yaml-rust2`
+        // 0.12 crash thresholds on a 2 MiB debug stack (compact dash chain
+        // aborts at 4536, growing-indent block mapping aborts at 1994) —
+        // stays a real regression test even if `MAX_YAML_NESTING_DEPTH`
+        // changes later, mirroring the TOML sibling test's margin.
+        let dash_chain = format!("{}1", "- ".repeat(6000));
+        assert!(check_yaml_nesting_depth(&dash_chain, MAX_YAML_NESTING_DEPTH).is_err());
+
+        let block_mapping = nested_mapping(2500);
+        assert!(check_yaml_nesting_depth(&block_mapping, MAX_YAML_NESTING_DEPTH).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_apostrophe_does_not_blind_scanner() {
+        // impl-critic C1: an apostrophe mid-plain-scalar (e.g. `doesn't`)
+        // must not be mistaken for opening a quoted scalar and swallow the
+        // rest of the file, hiding the real nesting that follows.
+        let payload = format!(
+            "name: my_app\ndescription: A package that doesn't panic\n{}1",
+            "- ".repeat(MAX_YAML_NESTING_DEPTH + 1)
+        );
+        assert!(check_yaml_nesting_depth(&payload, MAX_YAML_NESTING_DEPTH).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_stray_double_quote_does_not_blind_scanner() {
+        // Same root cause as above, with a stray `"` (e.g. a dimension
+        // string like `6" long`) instead of an apostrophe.
+        let payload = format!(
+            "size: 6\" long\n{}1",
+            "- ".repeat(MAX_YAML_NESTING_DEPTH + 1)
+        );
+        assert!(check_yaml_nesting_depth(&payload, MAX_YAML_NESTING_DEPTH).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_unterminated_quote_only_blinds_one_line() {
+        // A quote that genuinely never closes must resynchronize at the
+        // next newline rather than scanning to EOF looking for a match.
+        let payload = format!(
+            "a: \"unterminated\n{}1",
+            "- ".repeat(MAX_YAML_NESTING_DEPTH + 1)
+        );
+        assert!(check_yaml_nesting_depth(&payload, MAX_YAML_NESTING_DEPTH).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_backslash_before_newline_does_not_extend_string() {
+        // A `\` placed right before the line break must not "escape" the
+        // newline and let an opened double-quoted scalar swallow further
+        // lines (impl-critic C1 follow-up).
+        let payload = format!(
+            "a: \"unterminated\\\n{}1",
+            "- ".repeat(MAX_YAML_NESTING_DEPTH + 1)
+        );
+        assert!(check_yaml_nesting_depth(&payload, MAX_YAML_NESTING_DEPTH).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_unclosed_bracket_does_not_blind_scanner() {
+        // impl-critic C2: an unclosed `[`/`{` must not permanently suppress
+        // block-indentation scanning for the remainder of the file.
+        let payload = format!("a: [\n{}1", "- ".repeat(MAX_YAML_NESTING_DEPTH + 1));
+        assert!(check_yaml_nesting_depth(&payload, MAX_YAML_NESTING_DEPTH).is_err());
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_many_sibling_keys_do_not_accumulate() {
+        let mut content = String::from("dependencies:\n");
+        for i in 0..2000 {
+            content.push_str(&format!("  pkg{i}: ^1.0.0\n"));
+        }
+        assert_eq!(check_yaml_nesting_depth(&content, 2), Ok(()));
+    }
+
+    #[test]
+    fn test_check_yaml_nesting_depth_multiline_flow_list_siblings_do_not_accumulate() {
+        let mut content = String::from("dependencies: [\n");
+        for _ in 0..2000 {
+            content.push_str("  a,\n");
+        }
+        content.push_str("]\n");
+        assert_eq!(check_yaml_nesting_depth(&content, 3), Ok(()));
     }
 
     #[test]
