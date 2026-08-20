@@ -76,6 +76,17 @@ pub struct ParseResult {
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
 pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
+    if let Err(depth) =
+        deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
+    {
+        return Err(CargoError::TomlParseError {
+            message: format!(
+                "array/table nesting depth {depth} exceeds maximum of {}",
+                deps_core::MAX_TOML_NESTING_DEPTH
+            ),
+        });
+    }
+
     let doc = toml_span::parse(content).map_err(|e| CargoError::TomlParseError {
         message: e.to_string(),
     })?;
@@ -258,13 +269,22 @@ fn find_workspace_root(doc_uri: &Uri) -> Result<Option<PathBuf>> {
 
         if workspace_toml.exists()
             && let Ok(content) = std::fs::read_to_string(&workspace_toml)
-            && let Ok(doc) = toml_span::parse(&content)
-            && doc
-                .as_table()
-                .and_then(|t| get_val(t, "workspace"))
-                .is_some()
         {
-            return Ok(Some(dir.to_path_buf()));
+            if deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
+                .is_err()
+            {
+                tracing::warn!(
+                    path = %workspace_toml.display(),
+                    "skipping ancestor Cargo.toml during workspace root discovery: nesting depth exceeds maximum"
+                );
+            } else if let Ok(doc) = toml_span::parse(&content)
+                && doc
+                    .as_table()
+                    .and_then(|t| get_val(t, "workspace"))
+                    .is_some()
+            {
+                return Ok(Some(dir.to_path_buf()));
+            }
         }
 
         current = dir.parent();
@@ -357,6 +377,16 @@ mod tests {
         #[cfg(not(windows))]
         let path = "/test/Cargo.toml";
         Uri::from_file_path(path).unwrap()
+    }
+
+    #[test]
+    fn test_parse_cargo_toml_rejects_excessive_nesting() {
+        // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
+        // that would actually overflow the stack, so the guard is what's
+        // being exercised here, not the crash itself.
+        let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
+        let result = parse_cargo_toml(&content, &test_url());
+        assert!(matches!(result, Err(CargoError::TomlParseError { .. })));
     }
 
     #[test]
@@ -591,5 +621,40 @@ tokio = "1.0"
             tokio.unwrap().section,
             DependencySection::Dependencies
         ));
+    }
+
+    #[test]
+    fn test_find_workspace_root_skips_over_depth_ancestor() {
+        // Directory layout:
+        //   <root>/workspace/Cargo.toml        - valid, has [workspace]
+        //   <root>/workspace/mid/Cargo.toml     - malicious: over MAX_TOML_NESTING_DEPTH
+        //   <root>/workspace/mid/pkg/Cargo.toml - the file actually opened
+        // find_workspace_root must skip the malicious ancestor (log + continue)
+        // rather than failing the whole parse, and still find the valid
+        // workspace root further up.
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        let mid_dir = workspace_dir.join("mid");
+        let pkg_dir = mid_dir.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+
+        std::fs::write(
+            workspace_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"mid/pkg\"]\n",
+        )
+        .unwrap();
+
+        let malicious = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
+        std::fs::write(mid_dir.join("Cargo.toml"), malicious).unwrap();
+
+        let opened_content = "[dependencies]\nserde = \"1.0\"\n";
+        let opened_path = pkg_dir.join("Cargo.toml");
+        std::fs::write(&opened_path, opened_content).unwrap();
+
+        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+        let result = parse_cargo_toml(opened_content, &doc_uri).unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.workspace_root, Some(workspace_dir));
     }
 }
