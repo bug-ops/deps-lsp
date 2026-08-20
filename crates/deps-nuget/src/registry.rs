@@ -98,7 +98,10 @@ struct SearchResultDoc {
 
 /// Returns the nuget.org package page URL for `name`.
 pub fn package_url(name: &str) -> String {
-    format!("https://www.nuget.org/packages/{name}")
+    format!(
+        "https://www.nuget.org/packages/{}",
+        urlencoding::encode(name)
+    )
 }
 
 #[derive(Clone)]
@@ -340,6 +343,29 @@ mod tests {
             package_url("Newtonsoft.Json"),
             "https://www.nuget.org/packages/Newtonsoft.Json"
         );
+    }
+
+    #[test]
+    fn test_package_url_encodes_malicious_name() {
+        let url = package_url("evil](https://evil.example)[pkg");
+        assert!(!url.contains('('));
+        assert!(!url.contains(')'));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_package_url_encodes_newline_autolink_and_percent() {
+        let url = package_url("evil\n<https://evil%zz.example>");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(!url.contains('>'));
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_package_url_empty_name() {
+        assert_eq!(package_url(""), "https://www.nuget.org/packages/");
     }
 
     #[test]

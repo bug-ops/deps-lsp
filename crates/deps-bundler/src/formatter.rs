@@ -12,7 +12,7 @@ impl EcosystemFormatter for BundlerFormatter {
     }
 
     fn package_url(&self, name: &str) -> String {
-        format!("https://rubygems.org/gems/{name}")
+        crate::registry::gem_url(name)
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {

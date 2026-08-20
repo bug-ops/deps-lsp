@@ -38,7 +38,7 @@ impl EcosystemFormatter for PypiFormatter {
     }
 
     fn package_url(&self, name: &str) -> String {
-        format!("https://pypi.org/project/{name}")
+        crate::registry::package_url(name)
     }
 
     fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {

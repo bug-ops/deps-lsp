@@ -39,7 +39,7 @@ pub const CRATES_IO_URL: &str = "https://crates.io/crates";
 
 /// Returns the URL for a crate's page on crates.io.
 pub fn crate_url(name: &str) -> String {
-    format!("{CRATES_IO_URL}/{name}")
+    format!("{CRATES_IO_URL}/{}", urlencoding::encode(name))
 }
 
 /// Client for interacting with crates.io registry.
@@ -563,6 +563,29 @@ mod tests {
             crate_url("serde-json"),
             "https://crates.io/crates/serde-json"
         );
+    }
+
+    #[test]
+    fn test_crate_url_encodes_malicious_name() {
+        let url = crate_url("evil](https://evil.example)[pkg");
+        assert!(!url.contains('('));
+        assert!(!url.contains(')'));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_crate_url_encodes_newline_autolink_and_percent() {
+        let url = crate_url("evil\n<https://evil%zz.example>");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(!url.contains('>'));
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_crate_url_empty_name() {
+        assert_eq!(crate_url(""), "https://crates.io/crates/");
     }
 
     #[tokio::test]

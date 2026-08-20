@@ -16,10 +16,7 @@ impl EcosystemFormatter for GoFormatter {
     }
 
     fn package_url(&self, name: &str) -> String {
-        // Use pkg.go.dev for package documentation
-        // URL encode special characters (@ and space)
-        let encoded = name.replace('@', "%40").replace(' ', "%20");
-        format!("https://pkg.go.dev/{encoded}")
+        crate::registry::package_url(name)
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {

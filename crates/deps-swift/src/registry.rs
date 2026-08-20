@@ -253,7 +253,11 @@ impl deps_core::Registry for SwiftRegistry {
     }
 
     fn package_url(&self, name: &str) -> String {
-        format!("https://github.com/{name}")
+        if validate_owner_repo(name).is_ok() {
+            format!("https://github.com/{name}")
+        } else {
+            String::new()
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -401,5 +405,26 @@ mod tests {
         let registry = SwiftRegistry::new(cache);
         let versions = registry.get_versions("apple/swift-nio").await.unwrap();
         assert!(!versions.is_empty());
+    }
+
+    #[test]
+    fn test_registry_package_url_valid() {
+        use deps_core::Registry;
+        let cache = Arc::new(HttpCache::new());
+        let registry = SwiftRegistry::new(cache);
+        assert_eq!(
+            registry.package_url("apple/swift-nio"),
+            "https://github.com/apple/swift-nio"
+        );
+    }
+
+    #[test]
+    fn test_registry_package_url_invalid_returns_empty() {
+        use deps_core::Registry;
+        let cache = Arc::new(HttpCache::new());
+        let registry = SwiftRegistry::new(cache);
+        assert_eq!(registry.package_url("../../etc/passwd"), "");
+        assert_eq!(registry.package_url("no-slash"), "");
+        assert_eq!(registry.package_url("owner/repo/extra"), "");
     }
 }

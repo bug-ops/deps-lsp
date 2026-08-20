@@ -16,6 +16,24 @@ use std::sync::Arc;
 
 const PACKAGIST_BASE: &str = "https://repo.packagist.org";
 const PACKAGIST_SEARCH: &str = "https://packagist.org/search.json";
+const PACKAGIST_WEB: &str = "https://packagist.org/packages";
+
+/// Returns the URL for a package's page on packagist.org.
+///
+/// Packagist names are `vendor/package`; each segment is percent-encoded
+/// individually so the `/` separator survives while any Markdown/URL-breaking
+/// characters in a segment are escaped.
+pub fn package_url(name: &str) -> String {
+    if let Some((vendor, package)) = name.split_once('/') {
+        format!(
+            "{PACKAGIST_WEB}/{}/{}",
+            urlencoding::encode(vendor),
+            urlencoding::encode(package)
+        )
+    } else {
+        format!("{PACKAGIST_WEB}/{}", urlencoding::encode(name))
+    }
+}
 
 /// Client for interacting with the Packagist registry.
 ///
@@ -249,7 +267,7 @@ impl deps_core::Registry for PackagistRegistry {
     }
 
     fn package_url(&self, name: &str) -> String {
-        format!("https://packagist.org/packages/{name}")
+        package_url(name)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -260,6 +278,37 @@ impl deps_core::Registry for PackagistRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_package_url_preserves_vendor_package() {
+        assert_eq!(
+            package_url("symfony/console"),
+            "https://packagist.org/packages/symfony/console"
+        );
+    }
+
+    #[test]
+    fn test_package_url_encodes_malicious_segments() {
+        let url = package_url("evil)[/pkg](x");
+        assert!(!url.contains('('));
+        assert!(!url.contains(')'));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_package_url_encodes_newline_autolink_and_percent() {
+        let url = package_url("evil\n<%>/pkg");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(!url.contains('>'));
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_package_url_empty_name() {
+        assert_eq!(package_url(""), "https://packagist.org/packages/");
+    }
 
     #[test]
     fn test_expand_minified_versions_basic() {
