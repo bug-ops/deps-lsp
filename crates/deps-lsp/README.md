@@ -6,13 +6,13 @@
 [![codecov](https://codecov.io/gh/bug-ops/deps-lsp/graph/badge.svg?token=S71PTINTGQ&flag=deps-lsp)](https://codecov.io/gh/bug-ops/deps-lsp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
-Language Server Protocol implementation for dependency management across ten package ecosystems.
+Language Server Protocol implementation for dependency management across eleven package ecosystems.
 
-This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It provides the LSP server binary and the ecosystem orchestration layer that wires together ecosystem-specific crates (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-go`, `deps-bundler`, `deps-dart`, `deps-maven`, `deps-gradle`, `deps-swift`, `deps-composer`) via the `Ecosystem` trait from `deps-core`.
+This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) workspace. It provides the LSP server binary and the ecosystem orchestration layer that wires together ecosystem-specific crates (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-go`, `deps-bundler`, `deps-dart`, `deps-maven`, `deps-gradle`, `deps-swift`, `deps-composer`, `deps-nuget`) via the `Ecosystem` trait from `deps-core`.
 
 ## Features
 
-- **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml, go.mod, Gemfile, pubspec.yaml, pom.xml, libs.versions.toml, Package.swift, composer.json
+- **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml, go.mod, Gemfile, pubspec.yaml, pom.xml, libs.versions.toml, Package.swift, composer.json, .csproj/.fsproj/.vbproj
 - **Inlay hints** — Show latest versions inline with loading indicators
 - **Hover info** — Package descriptions with resolved version from lock file
 - **Code actions** — Quick fixes to update dependencies
@@ -40,7 +40,7 @@ All ecosystems are enabled by default. Disable unused ones to reduce binary size
 
 ```toml
 [dependencies]
-deps-lsp = { version = "0.9", default-features = false, features = ["cargo", "npm"] }
+deps-lsp = { version = "0.10", default-features = false, features = ["cargo", "npm"] }
 ```
 
 | Feature | Ecosystem | Default |
@@ -55,6 +55,7 @@ deps-lsp = { version = "0.9", default-features = false, features = ["cargo", "np
 | `gradle` | Java / Version Catalog + DSL | Yes |
 | `swift` | Swift / Package.swift | Yes |
 | `composer` | PHP / composer.json | Yes |
+| `nuget` | C# / .csproj, Directory.Packages.props, packages.config | Yes |
 
 ## Supported editors
 

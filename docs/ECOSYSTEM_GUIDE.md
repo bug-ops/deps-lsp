@@ -2,6 +2,42 @@
 
 This guide explains how to add support for a new package ecosystem (e.g., Go modules, Maven, Gradle) to deps-lsp.
 
+## Supported Ecosystems
+
+deps-lsp provides comprehensive LSP support for 11 package ecosystems:
+
+| Ecosystem | Language | Manifest File(s) | Lock File(s) | Features |
+|-----------|----------|-----------------|--------------|----------|
+| **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, feature flag completion |
+| **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics |
+| **PyPI** | Python | `pyproject.toml`, `setup.py` | `poetry.lock`, `uv.lock`, `requirements.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics |
+| **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, pseudo-version support |
+| **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics |
+| **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover, inlay hints, completion, code actions, diagnostics |
+| **Maven** | Java | `pom.xml` | `maven-metadata.xml` (CDN) | Hover with corrected version ordering (numeric segments outrank qualifiers, prereleases sort below base release), inlay hints, completion, code actions, diagnostics |
+| **Gradle** | Kotlin/Groovy | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | — | Hover with corrected version ordering (same as Maven), inlay hints, completion, code actions, diagnostics, variable resolution (`gradle.properties`) |
+| **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics |
+| **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, GitHub API support |
+| **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, central package management support, SemVer2 prerelease handling |
+
+### PyPI Environment Markers (PEP 508)
+
+When a Python dependency is gated by an environment marker (e.g., `numpy>=1.24; python_version>='3.9'`), the hover popup displays:
+```
+Active when: python_version >= '3.9'
+```
+This helps you understand when conditional dependencies apply. Markers are shown for dependencies in `pyproject.toml` (PEP 621), Poetry `[tool.poetry.dependencies]` tables, and both PEP 621 requirement strings and Poetry string-form suffixes.
+
+### Maven/Gradle Version Comparison
+
+Versions are now ranked with correct Maven semantics:
+- **Numeric segments outrank non-numeric qualifiers**: `33` > `r09` (previously the reverse)
+- **Prerelease qualifiers sort below their base release**: `1.0-RC1` < `1.0` (previously the reverse)
+- **Qualifier precedence**: `alpha` < `beta` < `milestone` < `rc`/`cr` < `snapshot` < `release` < `sp` (case-insensitive)
+- **Numeric suffixes within qualifiers are compared numerically**: `M10` > `M2` (previously `M2` > `M10`)
+
+These fixes ensure hover's "Recent versions" list and completion sort order match Maven's actual version ordering.
+
 ## Architecture Overview
 
 Each ecosystem is implemented as a separate crate under `crates/deps-{ecosystem}/` with the following structure:
@@ -671,13 +707,15 @@ Before submitting a PR for a new ecosystem:
 See existing implementations for reference:
 - `crates/deps-cargo/` - Rust/Cargo.toml with crates.io sparse index
 - `crates/deps-npm/` - JavaScript/package.json with npm registry
-- `crates/deps-pypi/` - Python/pyproject.toml with PyPI API
+- `crates/deps-pypi/` - Python/pyproject.toml/poetry with PyPI API and PEP 508 marker support
 - `crates/deps-go/` - Go/go.mod with proxy.golang.org
-- `crates/deps-bundler/` - Ruby/Gemfile with RubyGems
-- `crates/deps-dart/` - Dart/pubspec.yaml with pub.dev
-- `crates/deps-maven/` - Java/pom.xml with Maven Central
-- `crates/deps-gradle/` - Kotlin/Gradle version catalogs
-- `crates/deps-nuget/` - C#/.csproj with NuGet V3
+- `crates/deps-bundler/` - Ruby/Gemfile with RubyGems API
+- `crates/deps-dart/` - Dart/pubspec.yaml with pub.dev API
+- `crates/deps-maven/` - Java/pom.xml with Maven Central (CDN metadata + Solr search)
+- `crates/deps-gradle/` - Kotlin/Groovy with version catalogs and property resolution
+- `crates/deps-composer/` - PHP/composer.json with Packagist V2 API
+- `crates/deps-swift/` - Swift/Package.swift with GitHub API support
+- `crates/deps-nuget/` - C#/.NET/.csproj/packages.config with NuGet V3 registry (SemVer2 prerelease, central package management)
 
 ## Key API Contracts
 

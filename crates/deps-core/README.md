@@ -16,15 +16,17 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 - **`EcosystemId` enum** — Exhaustive, typed identifier for every registered ecosystem, with `Display`/`FromStr` interop with `Ecosystem::id()`. Downstream code should match on this instead of the raw id string so a new ecosystem forces every relevant `match` to be updated at compile time
 - **`Registry` trait** — Abstraction over package registries with version lookup
 - **`LockFileProvider` trait** — Abstract lock file parsing for resolved versions
-- **Generic LSP handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics`
-- **`HttpCache`** — ETag/Last-Modified caching for registry HTTP requests
+- **Generic LSP handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics`, taking a bundled `VersionData` (cached + resolved version maps) to avoid swapping same-typed arguments at call sites
+- **`HttpCache`** — ETag/Last-Modified caching for registry HTTP requests, with a streaming 32 MiB response-size cap
+- **`check_toml_nesting_depth`** — single-pass structural guard rejecting pathologically nested TOML (bracket depth and dotted-key/header segment count) before it reaches the recursive-descent `toml_span` parser
+- **`lockfile::read_lockfile_content`** — shared read-and-error-wrap helper for lock file parsers
 - **Error types** — Unified error handling with `thiserror`
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-core = "0.9"
+deps-core = "0.10"
 ```
 
 > [!IMPORTANT]

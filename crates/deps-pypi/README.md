@@ -16,7 +16,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **PEP 735** — Parse `[dependency-groups]` (new standard)
 - **Poetry** — Parse `[tool.poetry.dependencies]` and dependency groups
 - **Lock file parsing** — Extract resolved versions from `poetry.lock` and `uv.lock`
-- **PEP 508 parsing** — Handle complex dependency specifications with extras and environment markers
+- **PEP 508 parsing** — Handle complex dependency specifications with extras and environment markers, normalized consistently across PEP 621, PEP 735, and Poetry table/string syntaxes and surfaced on `PypiDependency.markers`
 - **PEP 440 versions** — Validate and compare Python version specifiers
 - **PyPI API client** — Fetch package metadata from the PyPI JSON API
 
@@ -24,7 +24,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-pypi = "0.9"
+deps-pypi = "0.10"
 ```
 
 > [!IMPORTANT]
