@@ -114,11 +114,19 @@ impl LineOffsetTable {
 /// Markdown structure it is embedded in.
 ///
 /// Applied to manifest-controlled text (dependency names) before it is written into
-/// hover markdown link labels. Every ASCII punctuation character is backslash-escaped
-/// (CommonMark's full escapable set — not just brackets/parens, which would still
-/// leave e.g. `<https://evil.example>` autolinks live), and control characters
-/// (including newlines) are replaced with a space so the text cannot terminate the
-/// single-line block (an ATX heading) it is embedded in and splice in new content.
+/// hover markdown link labels, and to registry-controlled completion metadata
+/// (package name/version, description, repository/documentation URLs) before it is
+/// written into completion-item link labels and link destinations. Every ASCII
+/// punctuation character is backslash-escaped (CommonMark's full escapable set — not
+/// just brackets/parens, which would still leave e.g. `<https://evil.example>`
+/// autolinks live), and control characters (including newlines) are replaced with a
+/// space so the text cannot terminate the single-line block it is embedded in and
+/// splice in new content.
+///
+/// Backslash-escaping is valid in link destinations as well as regular text, so this
+/// also neutralizes `)`/`]` breakout attempts in a `[label](destination)` URL. It does
+/// *not* block dangerous URI schemes (e.g. `javascript:`) in a destination — that is a
+/// separate concern from breaking out of the surrounding Markdown structure.
 ///
 /// Backslash-escaping does *not* work inside inline code spans (CommonMark §6.1) —
 /// use [`markdown_code_span`] for text embedded in `` `...` `` instead.

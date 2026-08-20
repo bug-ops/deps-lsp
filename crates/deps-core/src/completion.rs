@@ -40,6 +40,7 @@
 //! }
 //! ```
 
+use crate::lsp_helpers::escape_markdown;
 use crate::{Metadata, ParseResult, Version};
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, MarkupContent,
@@ -379,15 +380,21 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
     let latest = metadata.latest_version();
 
     // Build markdown documentation
-    let mut doc_parts = vec![format!("**{}** v{}", name, latest)];
+    let mut doc_parts = vec![format!(
+        "**{}** v{}",
+        escape_markdown(name),
+        escape_markdown(latest)
+    )];
 
     if let Some(desc) = metadata.description() {
         doc_parts.push(String::new()); // Empty line
+        // Truncate the raw description first, then escape — escaping first could
+        // cut a `\`-escape sequence in half at the byte boundary.
         let truncated = if desc.len() > 200 {
             let end = desc.floor_char_boundary(200);
-            format!("{}...", &desc[..end])
+            format!("{}...", escape_markdown(&desc[..end]))
         } else {
-            desc.to_string()
+            escape_markdown(desc)
         };
         doc_parts.push(truncated);
     }
@@ -395,10 +402,10 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
     // Add links section if we have any links
     let mut links = Vec::new();
     if let Some(repo) = metadata.repository() {
-        links.push(format!("[Repository]({})", repo));
+        links.push(format!("[Repository]({})", escape_markdown(repo)));
     }
     if let Some(docs) = metadata.documentation() {
-        links.push(format!("[Documentation]({})", docs));
+        links.push(format!("[Documentation]({})", escape_markdown(docs)));
     }
 
     if !links.is_empty() {
@@ -1187,7 +1194,7 @@ mod tests {
         ));
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
-            assert!(content.value.contains("**serde** v1.0.214"));
+            assert!(content.value.contains("**serde** v1\\.0\\.214"));
             assert!(content.value.contains("Serialization framework"));
             assert!(content.value.contains("Repository"));
             assert!(content.value.contains("Documentation"));
@@ -1211,8 +1218,255 @@ mod tests {
         assert_eq!(item.detail, Some("v0.1.0".to_string()));
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
-            assert!(content.value.contains("**test-pkg** v0.1.0"));
+            assert!(content.value.contains("**test\\-pkg** v0\\.1\\.0"));
             assert!(!content.value.contains("Repository"));
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_escapes_description_markdown() {
+        let metadata = MockMetadata {
+            name: "test-pkg".to_string(),
+            description: Some("Fast *bold* _italic_ [link](evil) `code`".to_string()),
+            repository: None,
+            documentation: None,
+            latest_version: "1.0.0".to_string(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(!content.value.contains("*bold*"));
+            assert!(!content.value.contains("_italic_"));
+            assert!(!content.value.contains("[link](evil)"));
+            assert!(content.value.contains(r"\*bold\*"));
+            assert!(content.value.contains(r"\[link\]\(evil\)"));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_escapes_repository_link_breakout() {
+        // A malicious repository URL that attempts to close the `[Repository](...)`
+        // link early and splice in a new, attacker-controlled markdown link.
+        let malicious_repo = "https://legit.example)[Click here](https://evil.example";
+        let metadata = MockMetadata {
+            name: "test-pkg".to_string(),
+            description: None,
+            repository: Some(malicious_repo.to_string()),
+            documentation: None,
+            latest_version: "1.0.0".to_string(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(!content.value.contains(")[Click here]("));
+            assert!(content.value.contains(r"\)\[Click here\]\("));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_escapes_documentation_link_breakout() {
+        let malicious_docs = "https://legit.example)[Click here](https://evil.example";
+        let metadata = MockMetadata {
+            name: "test-pkg".to_string(),
+            description: None,
+            repository: None,
+            documentation: Some(malicious_docs.to_string()),
+            latest_version: "1.0.0".to_string(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(!content.value.contains(")[Click here]("));
+            assert!(content.value.contains(r"\)\[Click here\]\("));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_truncate_then_escape_no_dangling_backslash() {
+        // A special character sitting right at the 200-char truncation boundary:
+        // truncating BEFORE escaping (correct order) keeps the escape sequence
+        // whole; escaping before truncating would risk cutting between the
+        // backslash and the character it escapes, leaving a dangling `\`.
+        let mut desc = "a".repeat(199);
+        desc.push('*');
+        desc.push_str(&"b".repeat(50));
+
+        let metadata = MockMetadata {
+            name: "test-pkg".to_string(),
+            description: Some(desc),
+            repository: None,
+            documentation: None,
+            latest_version: "1.0.0".to_string(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            let lines: Vec<_> = content.value.lines().collect();
+            let desc_line = lines[2];
+            assert!(desc_line.ends_with(r"\*..."), "got: {desc_line}");
+            assert!(
+                !desc_line.ends_with(r"\..."),
+                "dangling backslash: {desc_line}"
+            );
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_escapes_malicious_name_and_version_link_breakout() {
+        // A crafted package name/version attempting to close the leading bold span
+        // and splice in a live, attacker-controlled markdown link — same injection
+        // class as description/repository/documentation, and reachable simply by
+        // typing a package-name prefix (no malicious manifest required).
+        let malicious_name = "a** [Official Download](https://evil.example) **b";
+        let malicious_latest = "1.0.0)[click](https://evil.example";
+        let metadata = MockMetadata {
+            name: malicious_name.to_string(),
+            description: None,
+            repository: None,
+            documentation: None,
+            latest_version: malicious_latest.to_string(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(
+                !content
+                    .value
+                    .contains("[Official Download](https://evil.example)")
+            );
+            assert!(!content.value.contains(")[click]("));
+            assert!(
+                content
+                    .value
+                    .contains(r"a\*\* \[Official Download\]\(https\:\/\/evil\.example\) \*\*b")
+            );
+            assert!(
+                content
+                    .value
+                    .contains(r"1\.0\.0\)\[click\]\(https\:\/\/evil\.example")
+            );
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_benign_repository_url_round_trips() {
+        // Backslash-escaping ASCII punctuation is visually inert on render (CommonMark
+        // strips the backslash for the literal character), so a normal URL must still
+        // render as the same, unmangled link once those escapes are stripped.
+        let metadata = MockMetadata {
+            name: "test-pkg".to_string(),
+            description: None,
+            repository: Some("https://github.com/owner/repo".to_string()),
+            documentation: None,
+            latest_version: "1.0.0".to_string(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            let unescaped: String = content.value.chars().filter(|&c| c != '\\').collect();
+            assert!(unescaped.contains("[Repository](https://github.com/owner/repo)"));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_escapes_html_in_description() {
+        let metadata = MockMetadata {
+            name: "test-pkg".to_string(),
+            description: Some("<img src=x onerror=alert(1)>".to_string()),
+            repository: None,
+            documentation: None,
+            latest_version: "1.0.0".to_string(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(!content.value.contains("<img src=x onerror=alert(1)>"));
+            assert!(
+                content
+                    .value
+                    .contains(r"\<img src\=x onerror\=alert\(1\)\>")
+            );
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_empty_description() {
+        let metadata = MockMetadata {
+            name: "test-pkg".to_string(),
+            description: Some(String::new()),
+            repository: None,
+            documentation: None,
+            latest_version: "1.0.0".to_string(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(content.value.starts_with(r"**test\-pkg** v1\.0\.0"));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_truncate_snaps_multibyte_boundary() {
+        // A 3-byte character straddling the 200-byte truncation boundary: truncation
+        // must snap back to a valid char boundary rather than panicking mid-codepoint,
+        // proving `floor_char_boundary` is exercised as a genuine non-identity op
+        // (unlike an all-ASCII description, where every byte offset is already a
+        // char boundary).
+        let mut desc = "a".repeat(199);
+        desc.push('日'); // 3 bytes, occupies byte offsets 199..202 — straddles byte 200
+        desc.push('*');
+        desc.push_str(&"b".repeat(50));
+
+        let metadata = MockMetadata {
+            name: "test-pkg".to_string(),
+            description: Some(desc),
+            repository: None,
+            documentation: None,
+            latest_version: "1.0.0".to_string(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            let lines: Vec<_> = content.value.lines().collect();
+            let desc_line = lines[2];
+            assert!(!desc_line.contains('日'));
+            assert!(desc_line.ends_with("..."));
+        } else {
+            panic!("Expected MarkupContent documentation");
         }
     }
 
