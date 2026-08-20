@@ -36,6 +36,18 @@ impl LockFileProvider for PubspecLockParser {
 }
 
 pub fn parse_pubspec_lock(content: &str) -> Result<ResolvedPackages> {
+    if let Err(depth) =
+        deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)
+    {
+        return Err(DepsError::ParseError {
+            file_type: "pubspec.lock".into(),
+            source: Box::new(std::io::Error::other(format!(
+                "YAML nesting depth {depth} exceeds maximum of {}",
+                deps_core::MAX_YAML_NESTING_DEPTH
+            ))),
+        });
+    }
+
     let mut packages = ResolvedPackages::new();
 
     let docs = YamlLoader::load_from_str(content).map_err(|e| DepsError::ParseError {
@@ -188,6 +200,46 @@ packages:
         let lock = "";
         let packages = parse_pubspec_lock(lock).unwrap();
         assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn test_deeply_nested_lock_rejected_not_crashed() {
+        // 6000 comfortably exceeds the empirically bisected real
+        // `yaml-rust2` 0.12 crash threshold for this exact payload shape
+        // (compact dash chain: aborts at depth 4536 on a 2 MiB debug
+        // stack), so this is a genuine regression test for the pre-fix
+        // SIGABRT, not just proof the 64 limit fires.
+        let lock = format!("{}1", "- ".repeat(6000));
+        let result = parse_pubspec_lock(&lock);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deeply_nested_lock_with_apostrophe_rejected_not_crashed() {
+        // impl-critic C1: a `'`/`"` inside a plain scalar earlier in the
+        // file must not blind the guard to real nesting later in the file.
+        let lock = format!(
+            "packages:\n  http:\n    description: it doesn't matter\n{}1",
+            "- ".repeat(6000)
+        );
+        let result = parse_pubspec_lock(&lock);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_realistic_pubspec_lock_still_parses() {
+        let lock = r#"
+packages:
+  http:
+    dependency: "direct main"
+    description:
+      name: http
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.2.0"
+"#;
+        let packages = parse_pubspec_lock(lock).unwrap();
+        assert_eq!(packages.get_version("http"), Some("1.2.0"));
     }
 
     #[test]

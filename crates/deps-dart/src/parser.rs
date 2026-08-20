@@ -45,6 +45,17 @@ impl LineOffsetTable {
 }
 
 pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResult> {
+    if let Err(depth) =
+        deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)
+    {
+        return Err(crate::error::DartError::ParseError {
+            message: format!(
+                "YAML nesting depth {depth} exceeds maximum of {}",
+                deps_core::MAX_YAML_NESTING_DEPTH
+            ),
+        });
+    }
+
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
     let mut sdk_constraint = None;
@@ -447,5 +458,51 @@ dependencies:
         let yaml = "{{invalid yaml";
         let result = parse_pubspec_yaml(yaml, &test_uri());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deeply_nested_yaml_rejected_not_crashed() {
+        // 6000 comfortably exceeds the empirically bisected real
+        // `yaml-rust2` 0.12 crash threshold for this exact payload shape
+        // (compact dash chain: aborts at depth 4536 on a 2 MiB debug
+        // stack), so this is a genuine regression test for the pre-fix
+        // SIGABRT, not just proof the 64 limit fires.
+        let yaml = format!("{}1", "- ".repeat(6000));
+        let result = parse_pubspec_yaml(&yaml, &test_uri());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deeply_nested_yaml_with_apostrophe_rejected_not_crashed() {
+        // impl-critic C1: a `'`/`"` inside a plain scalar earlier in the
+        // file (e.g. in a description) must not blind the guard to real
+        // nesting later in the same file.
+        let yaml = format!(
+            "name: my_app\ndescription: A package that doesn't panic\ndependencies:\n  foo:\n{}1",
+            "- ".repeat(6000)
+        );
+        let result = parse_pubspec_yaml(&yaml, &test_uri());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_realistic_deeply_nested_pubspec_still_parses() {
+        // A legitimately deep (but realistic) pubspec.yaml must still parse
+        // successfully — the guard's margin must not produce false
+        // positives on real-world manifests.
+        let yaml = r"
+name: my_app
+dependencies:
+  http: ^1.0.0
+flutter:
+  fonts:
+    - family: Schyler
+      fonts:
+        - asset: fonts/Schyler-Regular.ttf
+        - asset: fonts/Schyler-Italic.ttf
+          style: italic
+";
+        let result = parse_pubspec_yaml(yaml, &test_uri());
+        assert!(result.is_ok());
     }
 }

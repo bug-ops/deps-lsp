@@ -19,6 +19,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 - **Generic LSP handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics`, taking a bundled `VersionData` (cached + resolved version maps) to avoid swapping same-typed arguments at call sites
 - **`HttpCache`** — ETag/Last-Modified caching for registry HTTP requests, with a streaming 32 MiB response-size cap
 - **`check_toml_nesting_depth`** — single-pass structural guard rejecting pathologically nested TOML (bracket depth and dotted-key/header segment count) before it reaches the recursive-descent `toml_span` parser
+- **`check_yaml_nesting_depth`** — single-pass structural guard rejecting pathologically nested YAML (flow bracket depth and block-style indentation/dash-chain nesting) before it reaches the recursive-descent `yaml-rust2` parser
 - **`lockfile::read_lockfile_content`** — shared read-and-error-wrap helper for lock file parsers
 - **Error types** — Unified error handling with `thiserror`
 
