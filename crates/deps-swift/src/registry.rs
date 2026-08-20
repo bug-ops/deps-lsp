@@ -26,7 +26,7 @@ fn validate_owner_repo(name: &str) -> Result<()> {
     if re.is_match(name) {
         Ok(())
     } else {
-        Err(DepsError::CacheError(format!(
+        Err(DepsError::InvalidUri(format!(
             "invalid owner/repo format: '{name}'"
         )))
     }

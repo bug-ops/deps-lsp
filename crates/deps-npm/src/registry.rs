@@ -46,6 +46,25 @@ pub fn package_url(name: &str) -> String {
     format!("{}/{}", NPMJS_URL, urlencoding::encode(name))
 }
 
+/// Builds the npm registry request URL for a package's version metadata.
+///
+/// Mirrors `package_url`'s per-segment encoding for scoped packages (`@scope/name`
+/// keeps its `/` structure, with `scope` and `name` each percent-encoded
+/// individually) so a malicious or unusual name can't inject extra path
+/// segments or query syntax into the request.
+fn versions_url(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix('@')
+        && let Some((scope, pkg)) = rest.split_once('/')
+    {
+        return format!(
+            "{REGISTRY_BASE}/@{}/{}",
+            urlencoding::encode(scope),
+            urlencoding::encode(pkg)
+        );
+    }
+    format!("{}/{}", REGISTRY_BASE, urlencoding::encode(name))
+}
+
 /// Converts a 404 response into `DepsError::PackageNotFound`, passing through
 /// any other error unchanged.
 fn not_found_or(err: DepsError, name: &str) -> DepsError {
@@ -107,7 +126,7 @@ impl NpmRegistry {
     /// # }
     /// ```
     pub async fn get_versions(&self, name: &str) -> Result<Vec<NpmVersion>> {
-        let url = format!("{REGISTRY_BASE}/{name}");
+        let url = versions_url(name);
         let data = self
             .cache
             .get_cached_with_headers(&url, &[(reqwest::header::ACCEPT, ABBREVIATED_ACCEPT)])
@@ -393,6 +412,41 @@ mod tests {
     #[test]
     fn test_package_url_empty_name() {
         assert_eq!(package_url(""), "https://www.npmjs.com/package/");
+    }
+
+    #[test]
+    fn test_versions_url_plain() {
+        assert_eq!(
+            versions_url("express"),
+            "https://registry.npmjs.org/express"
+        );
+    }
+
+    #[test]
+    fn test_versions_url_scoped_preserves_structure() {
+        assert_eq!(
+            versions_url("@types/node"),
+            "https://registry.npmjs.org/@types/node"
+        );
+    }
+
+    #[test]
+    fn test_versions_url_encodes_malicious_name() {
+        // A raw `/`, `?`, or `#` in an unscoped name must not survive into
+        // the path/query, since `get_versions` doesn't normalize `name`
+        // before building the request URL.
+        let url = versions_url("evil/../secret?x=1#frag");
+        assert!(!url.contains("/../"));
+        assert!(!url.contains('?'));
+        assert!(!url.contains('#'));
+    }
+
+    #[test]
+    fn test_versions_url_scoped_encodes_malicious_segments() {
+        let url = versions_url("@evil/../secret?x=1#frag");
+        assert!(!url.contains("/../"));
+        assert!(!url.contains('?'));
+        assert!(!url.contains('#'));
     }
 
     #[test]

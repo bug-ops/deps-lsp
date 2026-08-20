@@ -129,6 +129,17 @@ pub struct CachedResponse {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Cache key
+///
+/// Entries are keyed by URL alone — `extra_headers` (see
+/// [`HttpCache::get_cached_with_headers`]) play no part in the cache key.
+/// This is safe only as long as "same URL" implies "same representation":
+/// a content-negotiating header (e.g. a per-request `Accept`) that can vary
+/// the response body for an otherwise-identical URL requires giving each
+/// distinct representation its own URL (e.g. a query parameter or distinct
+/// path), not just a distinct header value, or callers requesting different
+/// representations of the same URL will silently share one cache entry.
 pub struct HttpCache {
     entries: DashMap<String, CachedResponse>,
     client: Client,

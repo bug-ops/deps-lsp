@@ -65,6 +65,20 @@ pub fn package_url(name: &str) -> String {
     format!("{}/{}", PYPI_URL, urlencoding::encode(&normalized))
 }
 
+/// Builds the Simple API request URL for `normalized`'s version listing.
+///
+/// The name segment is URL-encoded (matching `package_url`) since
+/// `normalize_package_name` only collapses `-`/`_`/`.` separators and leaves
+/// characters like `/`, `?`, `#` untouched.
+fn simple_api_url(normalized: &str) -> String {
+    format!("{PYPI_SIMPLE_BASE}/{}/", urlencoding::encode(normalized))
+}
+
+/// Builds the JSON API request URL for `normalized`'s package metadata.
+fn metadata_url(normalized: &str) -> String {
+    format!("{PYPI_BASE}/{}/json", urlencoding::encode(normalized))
+}
+
 /// Converts a 404 response into `DepsError::PackageNotFound`, passing through
 /// any other error unchanged.
 fn not_found_or(err: DepsError, name: &str) -> DepsError {
@@ -143,7 +157,7 @@ impl PypiRegistry {
     /// ```
     pub async fn get_versions(&self, name: &str) -> Result<Vec<PypiVersion>> {
         let normalized = normalize_package_name(name);
-        let url = format!("{PYPI_SIMPLE_BASE}/{normalized}/");
+        let url = simple_api_url(&normalized);
         let data = self
             .cache
             .get_cached_with_headers(&url, &[(reqwest::header::ACCEPT, SIMPLE_API_ACCEPT)])
@@ -242,7 +256,7 @@ impl PypiRegistry {
     /// - JSON parsing fails
     pub async fn get_package_metadata(&self, name: &str) -> Result<PypiPackage> {
         let normalized = normalize_package_name(name);
-        let url = format!("{PYPI_BASE}/{normalized}/json");
+        let url = metadata_url(&normalized);
         let data = self
             .cache
             .get_cached(&url)
@@ -366,23 +380,58 @@ impl Yanked {
     }
 }
 
-/// Checks whether `filename` names a release file for `version`.
+/// Archive/wheel file extensions recognized on PyPI's Simple API index, used
+/// to strip the trailing extension off an sdist-style filename (one with no
+/// further `-`-delimited tags after the version) when deriving its version.
+const KNOWN_ARCHIVE_EXTENSIONS: &[&str] = &[
+    ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.lz", ".tar.Z", ".zip", ".whl", ".egg", ".tar",
+];
+
+/// Derives the release version directly from `filename`'s structure, given
+/// the package's PEP 503 normalized name, in O(filename length) with no
+/// dependency on the number of known versions.
 ///
-/// The Simple API's `files` entries carry no `version` field, so this
-/// matches `version` as a `-`-delimited token in the filename (e.g.
-/// `requests-2.28.2.tar.gz` or `requests-2.28.2-py3-none-any.whl` both match
-/// `"2.28.2"`). Caller is expected to try longer version strings first so
-/// e.g. `"1.0"` doesn't shadow `"1.0.0"`.
-fn filename_matches_version(filename: &str, version: &str) -> bool {
-    let Some(idx) = filename.find(version) else {
-        return false;
-    };
-    let preceded_by_hyphen = idx > 0 && filename.as_bytes()[idx - 1] == b'-';
-    let followed_by_boundary = matches!(
-        filename.as_bytes().get(idx + version.len()),
-        None | Some(b'-' | b'.')
-    );
-    preceded_by_hyphen && followed_by_boundary
+/// PyPI release filenames are `{name}-{version}[-...].{ext}`, but the
+/// `{name}` segment on disk may use the project's original casing and
+/// original `-`/`_`/`.` separators (e.g. `zope.interface-3.3.0b1.tar.gz` for
+/// normalized name `zope-interface`) rather than the normalized spelling.
+/// This walks `normalized_name` against `filename` byte-for-byte,
+/// case-insensitively, treating any run of `-`/`_`/`.` in `filename` as
+/// equivalent to a single `-` in `normalized_name`, then cuts the remainder
+/// at the first `-` (wheel tags) or a recognized archive extension (sdists).
+///
+/// Returns `None` if `filename` doesn't conform closely enough to derive a
+/// version unambiguously; callers skip attributing that file rather than
+/// guess (see [`build_yanked_map`]).
+fn parse_version_from_filename<'a>(filename: &'a str, normalized_name: &str) -> Option<&'a str> {
+    let bytes = filename.as_bytes();
+    let mut fi = 0usize;
+    for nb in normalized_name.bytes() {
+        if nb == b'-' {
+            let start = fi;
+            while matches!(bytes.get(fi), Some(b'-' | b'_' | b'.')) {
+                fi += 1;
+            }
+            if fi == start {
+                return None;
+            }
+        } else {
+            match bytes.get(fi) {
+                Some(&fb) if fb.to_ascii_lowercase() == nb => fi += 1,
+                _ => return None,
+            }
+        }
+    }
+    if bytes.get(fi) != Some(&b'-') {
+        return None;
+    }
+    let rest = &filename[fi + 1..];
+    match rest.find('-') {
+        Some(end) => Some(&rest[..end]),
+        None => KNOWN_ARCHIVE_EXTENSIONS
+            .iter()
+            .find_map(|ext| rest.strip_suffix(ext)),
+    }
 }
 
 /// Builds a per-version yanked map from a Simple API `files` list.
@@ -390,22 +439,56 @@ fn filename_matches_version(filename: &str, version: &str) -> bool {
 /// A version is yanked if any of its release files are yanked (PyPI itself
 /// treats a release as yanked once any file under it is, since new uploads
 /// to an already-yanked version are rejected).
+///
+/// Derives each file's version in O(1) via [`parse_version_from_filename`]
+/// and resolves it against `versions` in two tiers, the second tried only
+/// if the first misses:
+/// 1. Exact string match — the common case, and the only tier that can tell
+///    apart distinct-but-PEP-440-equal strings like `1.0` and `1.0.0`
+///    (legacy packages can list both as separate releases).
+/// 2. Match as a parsed [`Version`] — PyPI filenames sometimes spell a
+///    version differently than its canonical form (e.g. `4.21.0_rc_1` in a
+///    wheel filename for the canonical `4.21.0rc1`), which `Version`'s
+///    `Eq`/`Hash` normalize away.
+///
+/// A file whose filename doesn't structurally parse, or whose derived
+/// version matches neither tier, is skipped rather than guessed at via
+/// substring search — an earlier substring-based fallback could misattribute
+/// a file to an unrelated version whose digits happened to appear elsewhere
+/// in the filename (e.g. a platform tag), which is worse than the version's
+/// yanked status resting on its other, better-formed release files.
 fn build_yanked_map(
     files: &[SimpleFile],
     versions: &[String],
+    normalized_name: &str,
 ) -> std::collections::HashMap<String, bool> {
-    let mut by_length: Vec<&String> = versions.iter().collect();
-    by_length.sort_unstable_by_key(|v| std::cmp::Reverse(v.len()));
+    let version_set: std::collections::HashSet<&str> =
+        versions.iter().map(String::as_str).collect();
+
+    // Built lazily: most real-world responses resolve every file via the
+    // exact-string tier and never need this.
+    let mut parsed_versions: Option<std::collections::HashMap<Version, &str>> = None;
 
     let mut yanked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     for file in files {
-        let Some(version) = by_length
-            .iter()
-            .find(|v| filename_matches_version(&file.filename, v))
-        else {
+        let matched =
+            parse_version_from_filename(&file.filename, normalized_name).and_then(|candidate| {
+                version_set.get(candidate).copied().or_else(|| {
+                    let parsed = Version::from_str(candidate).ok()?;
+                    let map = parsed_versions.get_or_insert_with(|| {
+                        versions
+                            .iter()
+                            .filter_map(|v| Some((Version::from_str(v).ok()?, v.as_str())))
+                            .collect()
+                    });
+                    map.get(&parsed).copied()
+                })
+            });
+
+        let Some(version) = matched else {
             continue;
         };
-        let entry = yanked.entry((*version).clone()).or_insert(false);
+        let entry = yanked.entry(version.to_string()).or_insert(false);
         *entry |= file.yanked.is_yanked();
     }
     yanked
@@ -420,7 +503,8 @@ fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<Pypi
             source: e,
         })?;
 
-    let yanked_map = build_yanked_map(&response.files, &response.versions);
+    let normalized_name = normalize_package_name(package_name);
+    let yanked_map = build_yanked_map(&response.files, &response.versions, &normalized_name);
 
     let mut versions_with_parsed: Vec<(PypiVersion, Version)> = response
         .versions
@@ -632,18 +716,6 @@ mod tests {
     }
 
     #[test]
-    fn test_filename_matches_version_basic_boundaries() {
-        assert!(filename_matches_version("pkg-1.0.0.tar.gz", "1.0.0"));
-        assert!(filename_matches_version(
-            "pkg-1.0.0-py3-none-any.whl",
-            "1.0.0"
-        ));
-        assert!(!filename_matches_version("pkg-1.0.0.tar.gz", "2.0.0"));
-        // Not preceded by a hyphen.
-        assert!(!filename_matches_version("pkg1.0.0.tar.gz", "1.0.0"));
-    }
-
-    #[test]
     fn test_build_yanked_map_disambiguates_version_prefixes() {
         // "1.0" is a substring of the "1.0.0" filename; trying the longer
         // version first must ensure "1.0"'s own (absent) file isn't
@@ -653,7 +725,7 @@ mod tests {
             yanked: Yanked::Flag(true),
         }];
         let versions = vec!["1.0".to_string(), "1.0.0".to_string()];
-        let map = build_yanked_map(&files, &versions);
+        let map = build_yanked_map(&files, &versions, "pkg");
         assert_eq!(map.get("1.0.0"), Some(&true));
         assert_eq!(map.get("1.0"), None);
     }
@@ -671,7 +743,7 @@ mod tests {
             },
         ];
         let versions = vec!["1.0.0".to_string()];
-        let map = build_yanked_map(&files, &versions);
+        let map = build_yanked_map(&files, &versions, "pkg");
         assert_eq!(map.get("1.0.0"), Some(&true));
     }
 
@@ -691,7 +763,7 @@ mod tests {
             },
         ];
         let versions = vec!["1.0".to_string(), "1.0.0".to_string()];
-        let map = build_yanked_map(&files, &versions);
+        let map = build_yanked_map(&files, &versions, "pkg");
         assert_eq!(map.get("1.0"), Some(&true));
         assert_eq!(map.get("1.0.0"), Some(&false));
     }
@@ -724,7 +796,7 @@ mod tests {
             "1.0.0.post1".to_string(),
             "1.0.0.dev1".to_string(),
         ];
-        let map = build_yanked_map(&files, &versions);
+        let map = build_yanked_map(&files, &versions, "pkg");
         assert_eq!(map.get("1.0.0"), Some(&false));
         assert_eq!(map.get("1.0.0rc1"), Some(&true));
         assert_eq!(map.get("1.0.0.post1"), Some(&false));
@@ -732,10 +804,169 @@ mod tests {
     }
 
     #[test]
-    fn test_filename_matches_version_no_false_match_on_dotted_prefix() {
-        // "1.0.0" must not match inside "1.10.0" (digit run, not a version
-        // boundary).
-        assert!(!filename_matches_version("pkg-1.10.0.tar.gz", "1.0.0"));
+    fn test_parse_version_from_filename_wheel_and_sdist() {
+        assert_eq!(
+            parse_version_from_filename("requests-2.28.2.tar.gz", "requests"),
+            Some("2.28.2")
+        );
+        assert_eq!(
+            parse_version_from_filename("requests-2.28.2-py3-none-any.whl", "requests"),
+            Some("2.28.2")
+        );
+    }
+
+    #[test]
+    fn test_parse_version_from_filename_dotted_and_underscored_project_name() {
+        // Real PyPI filenames keep the project's original separator style
+        // even though `normalized_name` collapses it to hyphens.
+        assert_eq!(
+            parse_version_from_filename("zope.interface-3.3.0b1.tar.gz", "zope-interface"),
+            Some("3.3.0b1")
+        );
+        assert_eq!(
+            parse_version_from_filename(
+                "typing_extensions-3.6.2-py3-none-any.whl",
+                "typing-extensions"
+            ),
+            Some("3.6.2")
+        );
+    }
+
+    #[test]
+    fn test_parse_version_from_filename_rejects_non_conforming() {
+        // Doesn't start with the package name at all.
+        assert_eq!(
+            parse_version_from_filename("other-1.0.0.tar.gz", "pkg"),
+            None
+        );
+        // Name matches but there's no name/version separator afterwards.
+        assert_eq!(parse_version_from_filename("pkg1.0.0.tar.gz", "pkg"), None);
+    }
+
+    #[test]
+    fn test_parse_version_from_filename_no_digit_run_confusion() {
+        // Structural parsing reads the version as the literal token right
+        // after the name prefix, so "1.10.0" is never mistaken for "1.0.0"
+        // the way a substring search could be.
+        assert_eq!(
+            parse_version_from_filename("pkg-1.10.0.tar.gz", "pkg"),
+            Some("1.10.0")
+        );
+    }
+
+    #[test]
+    fn test_build_yanked_map_uses_fast_path_not_quadratic_fallback() {
+        // Regression guard for the O(files x versions) blowup: a well-formed
+        // filename must resolve via the O(1) structural fast path,
+        // regardless of how many other versions exist.
+        let mut versions: Vec<String> = (0..2000).map(|i| format!("0.0.{i}")).collect();
+        versions.push("9.9.9".to_string());
+        let files = vec![SimpleFile {
+            filename: "pkg-9.9.9.tar.gz".to_string(),
+            yanked: Yanked::Flag(true),
+        }];
+        assert_eq!(
+            parse_version_from_filename(&files[0].filename, "pkg"),
+            Some("9.9.9"),
+            "fast path must derive the version directly from filename structure"
+        );
+        let map = build_yanked_map(&files, &versions, "pkg");
+        assert_eq!(map.get("9.9.9"), Some(&true));
+    }
+
+    #[test]
+    fn test_build_yanked_map_ignores_platform_tag_false_match() {
+        // Regression for a live PyPI file (`pyobjc_core-2.2-py2.6-macosx-10.3-fat.egg`):
+        // the old whole-filename substring scan could misattribute this file
+        // to version "10.3" (a platform tag that happens to look like a
+        // version and sorts before "2.2" by length) instead of "2.2". The
+        // structural fast path only looks at the token right after the name
+        // prefix, so it can't be fooled by tags later in the filename.
+        let files = vec![SimpleFile {
+            filename: "pyobjc_core-2.2-py2.6-macosx-10.3-fat.egg".to_string(),
+            yanked: Yanked::Flag(true),
+        }];
+        let versions = vec!["2.2".to_string(), "10.3".to_string()];
+        let map = build_yanked_map(&files, &versions, "pyobjc-core");
+        assert_eq!(map.get("2.2"), Some(&true));
+        assert_eq!(map.get("10.3"), None);
+    }
+
+    #[test]
+    fn test_build_yanked_map_pep440_underscore_normalization() {
+        // Regression for a live PyPI file
+        // (`protobuf-4.21.0_rc_1-cp310-abi3-win_amd64.whl`): the wheel
+        // filename spells the pre-release as `4.21.0_rc_1` while the
+        // canonical version string PyPI lists is `4.21.0rc1`. An exact
+        // string comparison misses this; PEP 440-normalized comparison
+        // (`Version`'s `Eq`) does not.
+        let files = vec![SimpleFile {
+            filename: "protobuf-4.21.0_rc_1-cp310-abi3-win_amd64.whl".to_string(),
+            yanked: Yanked::Flag(false),
+        }];
+        let versions = vec!["4.21.0rc1".to_string()];
+        let map = build_yanked_map(&files, &versions, "protobuf");
+        assert_eq!(map.get("4.21.0rc1"), Some(&false));
+    }
+
+    #[test]
+    fn test_build_yanked_map_skips_non_conforming_filename_instead_of_guessing() {
+        // A filename whose leading segment doesn't match the package's
+        // normalized name at all can't resolve via the structural fast path.
+        // Rather than fall back to a substring guess (the mechanism behind
+        // the pyobjc-core misattribution above), that file is skipped —
+        // it contributes nothing to the yanked map, but doesn't corrupt it
+        // either. A well-formed file for the same version still resolves
+        // correctly, and an unrelated version stays untouched.
+        let files = vec![
+            SimpleFile {
+                filename: "unrelated-file-1.0.0.zip".to_string(),
+                yanked: Yanked::Flag(true),
+            },
+            SimpleFile {
+                filename: "pkg-1.0.0-py3-none-any.whl".to_string(),
+                yanked: Yanked::Flag(true),
+            },
+        ];
+        let versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
+        assert_eq!(
+            parse_version_from_filename(&files[0].filename, "pkg"),
+            None,
+            "filename doesn't start with the package name, must be skipped"
+        );
+        let map = build_yanked_map(&files, &versions, "pkg");
+        assert_eq!(map.get("1.0.0"), Some(&true));
+        assert_eq!(map.get("2.0.0"), None);
+    }
+
+    #[test]
+    fn test_simple_api_url_encodes_malicious_name() {
+        // `normalize_package_name` only collapses `-`/`_`/`.` separators and
+        // leaves characters like `/` untouched, so the URL builder itself
+        // must encode them to prevent smuggling extra path segments.
+        let url = simple_api_url("evil/../secret");
+        assert!(url.starts_with(PYPI_SIMPLE_BASE));
+        assert!(!url.contains("/../"));
+        assert_eq!(url, format!("{PYPI_SIMPLE_BASE}/evil%2F..%2Fsecret/"));
+    }
+
+    #[test]
+    fn test_metadata_url_encodes_malicious_name() {
+        let url = metadata_url("pkg?x=1#frag");
+        assert!(!url.contains('?'));
+        assert!(!url.contains('#'));
+    }
+
+    #[test]
+    fn test_simple_api_url_normal_names() {
+        assert_eq!(
+            simple_api_url("requests"),
+            "https://pypi.org/simple/requests/"
+        );
+        assert_eq!(
+            simple_api_url("zope-interface"),
+            "https://pypi.org/simple/zope-interface/"
+        );
     }
 
     #[test]
