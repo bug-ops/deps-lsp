@@ -10,6 +10,17 @@ use toml_span::value::{Table, Value};
 use tower_lsp_server::ls_types::{Range, Uri};
 
 pub fn parse_version_catalog(content: &str, uri: &Uri) -> Result<GradleParseResult> {
+    if let Err(depth) =
+        deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
+    {
+        return Err(GradleError::ParseError {
+            message: format!(
+                "array/table nesting depth {depth} exceeds maximum of {}",
+                deps_core::MAX_TOML_NESTING_DEPTH
+            ),
+        });
+    }
+
     let doc = toml_span::parse(content).map_err(|e| GradleError::ParseError {
         message: e.to_string(),
     })?;
@@ -146,6 +157,16 @@ mod tests {
 
     fn make_uri() -> Uri {
         deps_core::test_util::test_uri("/project/gradle/libs.versions.toml")
+    }
+
+    #[test]
+    fn test_parse_version_catalog_rejects_excessive_nesting() {
+        // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
+        // that would actually overflow the stack, so the guard is what's
+        // being exercised here, not the crash itself.
+        let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
+        let result = parse_version_catalog(&content, &make_uri());
+        assert!(matches!(result, Err(GradleError::ParseError { .. })));
     }
 
     #[test]

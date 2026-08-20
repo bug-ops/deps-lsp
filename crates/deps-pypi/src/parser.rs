@@ -143,6 +143,17 @@ impl PypiParser {
     /// let result = parser.parse_content(&content, &uri).unwrap();
     /// ```
     pub fn parse_content(&self, content: &str, uri: &Uri) -> Result<ParseResult> {
+        if let Err(depth) =
+            deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
+        {
+            return Err(PypiError::TomlParseError {
+                message: format!(
+                    "array/table nesting depth {depth} exceeds maximum of {}",
+                    deps_core::MAX_TOML_NESTING_DEPTH
+                ),
+            });
+        }
+
         let doc = toml_span::parse(content).map_err(|e| PypiError::TomlParseError {
             message: e.to_string(),
         })?;
@@ -894,6 +905,17 @@ mod tests {
 
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/pyproject.toml")
+    }
+
+    #[test]
+    fn test_parse_content_rejects_excessive_nesting() {
+        // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
+        // that would actually overflow the stack, so the guard is what's
+        // being exercised here, not the crash itself.
+        let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&content, &test_uri());
+        assert!(matches!(result, Err(PypiError::TomlParseError { .. })));
     }
 
     #[test]

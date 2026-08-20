@@ -100,6 +100,18 @@ impl LockFileProvider for PypiLockParser {
 
             let content = read_lockfile_content(lockfile_path, "lock file").await?;
 
+            if let Err(depth) =
+                deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
+            {
+                return Err(DepsError::ParseError {
+                    file_type: "Python lock file".into(),
+                    source: Box::new(std::io::Error::other(format!(
+                        "array/table nesting depth {depth} exceeds maximum of {}",
+                        deps_core::MAX_TOML_NESTING_DEPTH
+                    ))),
+                });
+            }
+
             let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
                 file_type: "Python lock file".into(),
                 source: Box::new(std::io::Error::other(e.to_string())),
@@ -310,6 +322,25 @@ fn parse_pypi_dependencies(table: &Table<'_>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_parse_lockfile_rejects_excessive_nesting() {
+        // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
+        // that would actually overflow the stack, so the guard is what's
+        // being exercised here, not the crash itself.
+        let lockfile_content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("poetry.lock");
+        std::fs::write(&lockfile_path, lockfile_content).unwrap();
+
+        let parser = PypiLockParser;
+        let result = parser.parse_lockfile(&lockfile_path).await;
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "Python lock file"
+        ));
+    }
 
     #[tokio::test]
     async fn test_parse_simple_poetry_lock() {

@@ -38,7 +38,10 @@ pub use lsp_helpers::{
     generate_diagnostics as lsp_generate_diagnostics, generate_hover as lsp_generate_hover,
     generate_inlay_hints as lsp_generate_inlay_hints, is_same_major_minor, position_in_range,
 };
-pub use parser::{DependencyInfo, DependencySource, LoadingState, ManifestParser, ParseResultInfo};
+pub use parser::{
+    DependencyInfo, DependencySource, LoadingState, MAX_TOML_NESTING_DEPTH, ManifestParser,
+    ParseResultInfo, check_toml_nesting_depth,
+};
 pub use registry::{Metadata, Registry, Version, find_latest_stable};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,

@@ -81,6 +81,18 @@ impl LockFileProvider for CargoLockParser {
 
             let content = read_lockfile_content(lockfile_path, "Cargo.lock").await?;
 
+            if let Err(depth) =
+                deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
+            {
+                return Err(DepsError::ParseError {
+                    file_type: "Cargo.lock".into(),
+                    source: Box::new(std::io::Error::other(format!(
+                        "array/table nesting depth {depth} exceeds maximum of {}",
+                        deps_core::MAX_TOML_NESTING_DEPTH
+                    ))),
+                });
+            }
+
             let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
                 file_type: "Cargo.lock".into(),
                 source: Box::new(std::io::Error::other(e.to_string())),
@@ -267,6 +279,79 @@ mod tests {
             }
             _ => panic!("Expected Path source"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_parse_cargo_lock_rejects_excessive_nesting() {
+        // Well past MAX_TOML_NESTING_DEPTH (64) but far below the depth
+        // that would actually overflow the stack, so the guard is what's
+        // being exercised here, not the crash itself.
+        let lockfile_content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(&lockfile_path, lockfile_content).unwrap();
+
+        let parser = CargoLockParser;
+        let result = parser.parse_lockfile(&lockfile_path).await;
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "Cargo.lock"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_parse_cargo_lock_rejects_excessive_inline_table_nesting() {
+        // Regression test for impl-critic C3: this is the exact shape
+        // (deeply nested inline tables inside a `[[package]]` field, on the
+        // lock file path that runs inside `tokio::spawn` on a 2 MiB worker
+        // stack) that still SIGABRT'd the real debug binary when
+        // `MAX_TOML_NESTING_DEPTH` was 256 — nested inline tables cost more
+        // stack per level than nested arrays, so an array-shaped test alone
+        // does not exercise the binding constraint.
+        let depth = deps_core::MAX_TOML_NESTING_DEPTH + 1;
+        let lockfile_content = format!(
+            "[[package]]\nname = \"evil\"\nversion = \"1.0.0\"\nx = {}1{}\n",
+            "{a=".repeat(depth),
+            "}".repeat(depth)
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(&lockfile_path, lockfile_content).unwrap();
+
+        let parser = CargoLockParser;
+        let result = parser.parse_lockfile(&lockfile_path).await;
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "Cargo.lock"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_parse_cargo_lock_rejects_dotted_header_nesting() {
+        // Regression test for impl-critic C4: this is the critic's exact
+        // ~875-byte minimal repro — a dotted table header (`[package.a.a...]`)
+        // nests one table level per `.` segment with zero bracket
+        // characters, so the bracket-only version of the guard scored this
+        // depth 0 and let it straight through to `toml_span::parse`, which
+        // still stack-overflowed the real `tokio-rt-worker` thread.
+        let depth = deps_core::MAX_TOML_NESTING_DEPTH + 1;
+        let dotted_lockfile_content = format!(
+            "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n\n[package{}]\ny = 1\n",
+            ".a".repeat(depth)
+        );
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(&lockfile_path, dotted_lockfile_content).unwrap();
+
+        let parser = CargoLockParser;
+        let result = parser.parse_lockfile(&lockfile_path).await;
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "Cargo.lock"
+        ));
     }
 
     #[tokio::test]
