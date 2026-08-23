@@ -869,7 +869,7 @@ dependencies = []
             // formatter-normalized manifest name land on "zope-interface".
             assert!(resolved_versions.contains_key("zope-interface"));
 
-            let cached_versions: HashMap<PackageName, String> = HashMap::new();
+            let cached_versions: HashMap<PackageName, deps_core::PackageVersions> = HashMap::new();
             let versions = VersionData::new(&cached_versions, &resolved_versions);
             let formatter = PypiFormatter;
 

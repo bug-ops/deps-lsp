@@ -63,6 +63,18 @@ pub fn satisfies(version: &str, requirement: &str) -> bool {
     matched
 }
 
+/// Whether `requirement` — assumed to already pass [`is_range`] — is a syntactically
+/// well-formed range/union, i.e. every top-level member parses.
+///
+/// Used by `MavenFormatter::compile_requirement` to distinguish "no published version
+/// satisfies this well-formed range" from "this range string doesn't parse", which
+/// [`satisfies`]'s fail-closed `false` return does not otherwise distinguish.
+pub fn is_valid_range(requirement: &str) -> bool {
+    split_top_level(requirement.trim())
+        .iter()
+        .all(|member| parse_interval(member, BracketStyle::Standard).is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

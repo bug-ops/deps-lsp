@@ -257,6 +257,21 @@ pub(crate) fn compare_minimum_floor(range: &str, other: &str) -> Option<Ordering
     }
 }
 
+/// Checks whether `requirement` is a syntactically well-formed NuGet range or floating
+/// pattern — i.e. whether [`satisfies`]/[`resolve_float`] can actually evaluate it rather
+/// than uniformly returning `false` because `requirement` itself failed to parse.
+///
+/// Used by `NuGetFormatter::compile_requirement` to distinguish "no published version
+/// satisfies this well-formed requirement" from "this requirement string doesn't parse",
+/// which `satisfies`'s blanket `false` return does not otherwise distinguish.
+pub(crate) fn is_valid_requirement(requirement: &str) -> bool {
+    if requirement.contains('*') {
+        parse_float(requirement).is_some()
+    } else {
+        parse_range(requirement).is_some()
+    }
+}
+
 /// Checks whether `version` satisfies a NuGet interval-notation `range` (spec §2).
 ///
 /// Supports bare floors (`1.0`), exact pins (`[1.0]`), open/closed minimums and maximums
@@ -414,6 +429,34 @@ pub fn resolve_float<'a>(versions: &'a [String], pattern: &str) -> Option<&'a st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_valid_requirement_accepts_well_formed_ranges() {
+        assert!(is_valid_requirement("[1.0.0]"));
+        assert!(is_valid_requirement("[1.0,2.0)"));
+        assert!(is_valid_requirement("(1.0,2.0]"));
+        assert!(is_valid_requirement("1.0.0"));
+    }
+
+    #[test]
+    fn test_is_valid_requirement_accepts_well_formed_floats() {
+        assert!(is_valid_requirement("*"));
+        assert!(is_valid_requirement("*-*"));
+        assert!(is_valid_requirement("1.1.*"));
+        assert!(is_valid_requirement("1.1.*-*"));
+    }
+
+    #[test]
+    fn test_is_valid_requirement_rejects_malformed_range() {
+        assert!(!is_valid_requirement("[1.0,2.0"));
+    }
+
+    #[test]
+    fn test_is_valid_requirement_rejects_malformed_float() {
+        // Contains '*' but not in a recognized float shape (not a trailing `.*`/`*-*`).
+        assert!(!is_valid_requirement("1.*.0"));
+        assert!(!is_valid_requirement("*.1"));
+    }
 
     #[test]
     fn test_compare_versions_basic() {

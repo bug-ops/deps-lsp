@@ -242,6 +242,17 @@ impl deps_core::Registry for PubDevRegistry {
         package_url(name.as_str())
     }
 
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        req: &deps_core::VersionReq,
+    ) -> Option<usize> {
+        versions.iter().position(|v| {
+            crate::version::version_matches_constraint(v.version_string(), req.as_str())
+                && !v.is_yanked()
+        })
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -470,5 +481,27 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = PubDevRegistry::new(cache);
         assert!(registry.as_any().is::<PubDevRegistry>());
+    }
+
+    #[test]
+    fn test_select_latest_matching_not_default_none() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PubDevRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(DartVersion {
+                version: "2.0.0".into(),
+                retracted: true,
+                published_at: None,
+            }),
+            Box::new(DartVersion {
+                version: "1.0.0".into(),
+                retracted: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
     }
 }

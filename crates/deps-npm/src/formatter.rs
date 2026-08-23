@@ -1,5 +1,17 @@
-use deps_core::lsp_helpers::EcosystemFormatter;
-use deps_core::{InvalidPackageName, PackageName};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::{InvalidPackageName, PackageName, VersionReq};
+
+/// Precise npm semver range matcher, compiled once per dependency by
+/// [`NpmFormatter::compile_requirement`].
+struct NodeSemverMatcher(node_semver::Range);
+
+impl RequirementMatcher for NodeSemverMatcher {
+    fn matches(&self, version: &str) -> Option<bool> {
+        node_semver::Version::parse(version)
+            .ok()
+            .map(|v| self.0.satisfies(&v))
+    }
+}
 
 /// Maximum name length npm's registry accepts.
 ///
@@ -121,6 +133,16 @@ impl EcosystemFormatter for NpmFormatter {
         }
 
         Ok(())
+    }
+
+    /// Compiles `requirement` via `node_semver::Range`, the same crate `deps-npm`'s
+    /// registry uses for matching — precise npm semver range semantics, unlike the
+    /// default `version_satisfies_requirement` heuristic this method deliberately does
+    /// not reuse (see that method's docs).
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        node_semver::Range::parse(requirement.as_str())
+            .ok()
+            .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
 }
 
@@ -278,5 +300,57 @@ mod tests {
         assert!(!formatter.version_satisfies_requirement("1.2.3", "2.0.0"));
         assert!(!formatter.version_satisfies_requirement("1.2.3", "1.3"));
         assert!(!formatter.version_satisfies_requirement("2.0.0", "^1.2.3")); // Different major
+    }
+
+    #[test]
+    fn test_compile_requirement_satisfiable() {
+        let formatter = NpmFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("^1.0.0"))
+            .expect("valid npm range must compile");
+        assert_eq!(matcher.matches("1.5.0"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_unparseable_requirement_returns_none() {
+        let formatter = NpmFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("not a range"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_unparseable_candidate_is_skipped() {
+        let formatter = NpmFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("^1.0.0"))
+            .unwrap();
+        assert_eq!(matcher.matches("not-a-version"), None);
+    }
+
+    /// §3.1 worked example counterpart for npm (this formatter also relies on the
+    /// default loose `version_satisfies_requirement`).
+    #[test]
+    fn test_compile_requirement_comparator_list_satisfiable() {
+        let formatter = NpmFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new(">=1.0.0 <2.0.0"))
+            .unwrap();
+        assert_eq!(matcher.matches("1.5.0"), Some(true));
+    }
+
+    /// §3.3 case for npm: `^0.2.999` and latest `0.2.14` share the leading zero-major
+    /// minor component, so the loose heuristic (and the removed `Outdated` gate) would
+    /// call this up to date. The precise matcher must reject it.
+    #[test]
+    fn test_compile_requirement_caret_zero_mistyped_patch_is_unsatisfiable() {
+        let formatter = NpmFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("^0.2.999"))
+            .unwrap();
+        assert_eq!(matcher.matches("0.2.14"), Some(false));
     }
 }

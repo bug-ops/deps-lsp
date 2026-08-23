@@ -96,7 +96,10 @@ impl LockFileProvider for SwiftLockParser {
                         let name =
                             url_to_identity(&pin.repository_url).unwrap_or(pin.package.clone());
                         if let Some(version) = pin.state.version {
-                            let version = version.strip_prefix('v').unwrap_or(&version).to_string();
+                            let version = version
+                                .strip_prefix(['v', 'V'])
+                                .unwrap_or(&version)
+                                .to_string();
                             packages.insert(ResolvedPackage {
                                 name,
                                 version,
@@ -122,7 +125,10 @@ impl LockFileProvider for SwiftLockParser {
                             url_to_identity(&pin.location).unwrap_or(pin.identity.clone())
                         };
                         if let Some(version) = pin.state.version {
-                            let version = version.strip_prefix('v').unwrap_or(&version).to_string();
+                            let version = version
+                                .strip_prefix(['v', 'V'])
+                                .unwrap_or(&version)
+                                .to_string();
                             let source = if pin.kind == "fileSystem" {
                                 ResolvedSource::Path {
                                     path: pin.location.clone(),

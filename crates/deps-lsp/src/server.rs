@@ -1053,7 +1053,10 @@ mod tests {
             // from `apply_edit`, not from the refusal predicate this pins as satisfied.
             assert!(doc_state.is_ready_for_batch_update());
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), "1.2.0".to_string());
+            cached.insert(
+                "serde".into(),
+                deps_core::PackageVersions::latest_only("1.2.0"),
+            );
             doc_state.update_cached_versions(cached);
             backend.state.update_document(uri.clone(), doc_state);
 
