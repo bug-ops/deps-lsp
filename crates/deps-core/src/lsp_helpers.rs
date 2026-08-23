@@ -8,8 +8,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::{
-    Dependency, EcosystemConfig, InvalidPackageName, PackageName, ParseResult, Registry,
-    VersionReq,
+    Dependency, EcosystemConfig, InvalidPackageName, PackageName, ParseResult, Registry, VersionReq,
 };
 
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
@@ -935,7 +934,7 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 /// };
 ///
 /// let mut cached = HashMap::new();
-/// cached.insert("serde".to_string(), "1.2.0".to_string());
+/// cached.insert("serde".into(), "1.2.0".to_string());
 /// let resolved = HashMap::new();
 ///
 /// let edits = collect_update_all_edits(
@@ -2642,7 +2641,7 @@ mod tests {
             let content = r#"serde = "1.0.0""#;
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".to_string(), "1.0.0".to_string());
+            cached.insert("serde".into(), "1.0.0".to_string());
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -2668,8 +2667,8 @@ mod tests {
                 dep("tokio", Some("1.0.0"), Some(range(1, 9, 1, 14))),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("serde".to_string(), "1.2.0".to_string());
-            cached.insert("tokio".to_string(), "1.3.0".to_string());
+            cached.insert("serde".into(), "1.2.0".to_string());
+            cached.insert("tokio".into(), "1.3.0".to_string());
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -2705,7 +2704,7 @@ mod tests {
             let content = r#"serde = "1.0.0""#;
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".to_string(), "1.2.0".to_string());
+            cached.insert("serde".into(), "1.2.0".to_string());
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -2729,7 +2728,7 @@ mod tests {
             let content = "serde = \"1.0.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), None)]);
             let mut cached = HashMap::new();
-            cached.insert("serde".to_string(), "1.2.0".to_string());
+            cached.insert("serde".into(), "1.2.0".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -2750,7 +2749,7 @@ mod tests {
             let content = "pkg = \"\"\n";
             let pr = parse_result(vec![dep("pkg", Some(""), Some(range(0, 6, 0, 6)))]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".to_string(), "1.0.0".to_string());
+            cached.insert("pkg".into(), "1.0.0".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -2792,7 +2791,7 @@ mod tests {
             let content = "serde = \"^1.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("^1.0"), Some(range(0, 9, 0, 13)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".to_string(), "1.2.0".to_string());
+            cached.insert("serde".into(), "1.2.0".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -2812,7 +2811,7 @@ mod tests {
             let content = r#"pkg = "1.0.0""#;
             let pr = parse_result(vec![dep("pkg", Some("1.0.0"), Some(range(0, 7, 0, 12)))]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".to_string(), "1.0.0".to_string());
+            cached.insert("pkg".into(), "1.0.0".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -2835,7 +2834,7 @@ mod tests {
                 Some(range(0, 9, 0, 25)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("slf4j-api".to_string(), "2.1.0".to_string());
+            cached.insert("slf4j-api".into(), "2.1.0".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -2861,7 +2860,7 @@ mod tests {
                 Some(range(0, 3, 0, 13)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".to_string(), "3.0.0".to_string());
+            cached.insert("pkg".into(), "3.0.0".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -2884,7 +2883,7 @@ mod tests {
                 Some(range(0, 53, 0, 58)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("Newtonsoft.Json".to_string(), "13.0.3".to_string());
+            cached.insert("Newtonsoft.Json".into(), "13.0.3".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -2915,7 +2914,7 @@ mod tests {
                 Some(range(0, 53, 0, 60)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("Newtonsoft.Json".to_string(), "13.0.3".to_string());
+            cached.insert("Newtonsoft.Json".into(), "13.0.3".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -2942,7 +2941,7 @@ mod tests {
                 Some(range(0, 53, 0, 61)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("Newtonsoft.Json".to_string(), "13.0.3".to_string());
+            cached.insert("Newtonsoft.Json".into(), "13.0.3".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -2969,7 +2968,7 @@ mod tests {
                 Some(range(0, 53, 0, 62)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("Newtonsoft.Json".to_string(), "13.0.3".to_string());
+            cached.insert("Newtonsoft.Json".into(), "13.0.3".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -3000,7 +2999,7 @@ mod tests {
                 Some(range(0, 9, 0, 18)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("interval-dep".to_string(), "3.0.0".to_string());
+            cached.insert("interval-dep".into(), "3.0.0".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -3026,8 +3025,8 @@ mod tests {
                 dep("unknown", Some("1.0.0"), Some(range(2, 11, 2, 16))),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("serde".to_string(), "2.0.0".to_string());
-            cached.insert("tokio".to_string(), "1.9.0".to_string());
+            cached.insert("serde".into(), "2.0.0".to_string());
+            cached.insert("tokio".into(), "1.9.0".to_string());
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -3052,8 +3051,8 @@ mod tests {
                 dep("aaaa-dup", Some("1.0.0"), Some(range(0, 8, 0, 13))),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("aaaa".to_string(), "2.0.0".to_string());
-            cached.insert("aaaa-dup".to_string(), "3.0.0".to_string());
+            cached.insert("aaaa".into(), "2.0.0".to_string());
+            cached.insert("aaaa-dup".into(), "3.0.0".to_string());
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(

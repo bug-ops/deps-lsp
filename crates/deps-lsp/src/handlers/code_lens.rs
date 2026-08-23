@@ -127,7 +127,7 @@ mod tests {
             state: &Arc<ServerState>,
             uri: &tower_lsp_server::ls_types::Uri,
             content: &str,
-            cached: std::collections::HashMap<String, String>,
+            cached: std::collections::HashMap<deps_core::PackageName, String>,
         ) {
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
             let parse_result = ecosystem
@@ -164,7 +164,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
-            cached.insert("serde".to_string(), "1.2.0".to_string());
+            cached.insert("serde".into(), "1.2.0".to_string());
             seed(&state, &uri, content, cached).await;
             state.documents.get_mut(&uri).unwrap().set_loading();
 
@@ -182,7 +182,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
-            cached.insert("serde".to_string(), "1.2.0".to_string());
+            cached.insert("serde".into(), "1.2.0".to_string());
             seed(&state, &uri, content, cached).await;
             state.documents.get_mut(&uri).unwrap().set_version(None);
 
@@ -197,7 +197,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
-            cached.insert("serde".to_string(), "1.0.0".to_string());
+            cached.insert("serde".into(), "1.0.0".to_string());
             seed(&state, &uri, content, cached).await;
 
             let (client, config) = create_test_client_and_config();
@@ -211,7 +211,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
-            cached.insert("serde".to_string(), "1.2.0".to_string());
+            cached.insert("serde".into(), "1.2.0".to_string());
             seed(&state, &uri, content, cached).await;
 
             let (client, config) = create_test_client_and_config();
@@ -260,7 +260,7 @@ mod tests {
             ecosystem: &dyn deps_core::Ecosystem,
             uri: &tower_lsp_server::ls_types::Uri,
             content: &str,
-            cached: HashMap<String, String>,
+            cached: HashMap<deps_core::PackageName, String>,
             expected_fragment: &str,
         ) {
             let parse_result = ecosystem
@@ -292,7 +292,7 @@ mod tests {
             ecosystem: &dyn deps_core::Ecosystem,
             uri: &tower_lsp_server::ls_types::Uri,
             content: &str,
-            cached: HashMap<String, String>,
+            cached: HashMap<deps_core::PackageName, String>,
         ) {
             let parse_result = ecosystem
                 .parse_manifest(content, uri)
@@ -319,7 +319,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = HashMap::new();
-            cached.insert("serde".to_string(), "1.2.0".to_string());
+            cached.insert("serde".into(), "1.2.0".to_string());
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -339,7 +339,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/package.json");
             let content = r#"{"dependencies": {"express": "^4.0.0"}}"#;
             let mut cached = HashMap::new();
-            cached.insert("express".to_string(), "5.0.0".to_string());
+            cached.insert("express".into(), "5.0.0".to_string());
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -361,7 +361,7 @@ mod tests {
             // ">=2.0.0" (which the "already accepts latest" rule would correctly skip).
             let content = "[project]\ndependencies = [\"requests==2.0.0\"]\n";
             let mut cached = HashMap::new();
-            cached.insert("requests".to_string(), "2.5.0".to_string());
+            cached.insert("requests".into(), "2.5.0".to_string());
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -382,10 +382,7 @@ mod tests {
             let content =
                 "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n";
             let mut cached = HashMap::new();
-            cached.insert(
-                "github.com/gin-gonic/gin".to_string(),
-                "v1.10.0".to_string(),
-            );
+            cached.insert("github.com/gin-gonic/gin".into(), "v1.10.0".to_string());
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -406,7 +403,7 @@ mod tests {
             // A major-version bump: "^1.0.0" does not accept "2.0.0".
             let content = "dependencies:\n  http: ^1.0.0\n";
             let mut cached = HashMap::new();
-            cached.insert("http".to_string(), "2.0.0".to_string());
+            cached.insert("http".into(), "2.0.0".to_string());
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -426,7 +423,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/project.csproj");
             let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="12.0.3" /></ItemGroup></Project>"#;
             let mut cached = HashMap::new();
-            cached.insert("Newtonsoft.Json".to_string(), "13.0.3".to_string());
+            cached.insert("Newtonsoft.Json".into(), "13.0.3".to_string());
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -446,7 +443,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/composer.json");
             let content = "{\n  \"require\": {\n    \"symfony/console\": \"^6.0\"\n  }\n}";
             let mut cached = HashMap::new();
-            cached.insert("symfony/console".to_string(), "7.0.0".to_string());
+            cached.insert("symfony/console".into(), "7.0.0".to_string());
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -466,7 +463,7 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
             let content = "source 'https://rubygems.org'\ngem 'rails', '~> 7.0'";
             let mut cached = HashMap::new();
-            cached.insert("rails".to_string(), "8.0.0".to_string());
+            cached.insert("rails".into(), "8.0.0".to_string());
 
             assert_single_edit_produces_valid_declaration(
                 ecosystem.as_ref(),
@@ -496,7 +493,7 @@ mod tests {
 ";
             let mut cached = HashMap::new();
             cached.insert(
-                "org.apache.commons:commons-lang3".to_string(),
+                "org.apache.commons:commons-lang3".into(),
                 "3.14.0".to_string(),
             );
 
@@ -530,7 +527,7 @@ mod tests {
 </project>
 ";
             let mut cached = HashMap::new();
-            cached.insert("org.slf4j:slf4j-api".to_string(), "2.1.0".to_string());
+            cached.insert("org.slf4j:slf4j-api".into(), "2.1.0".to_string());
 
             assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
         }
@@ -558,7 +555,7 @@ mod tests {
 
             let mut cached = HashMap::new();
             cached.insert(
-                "org.jetbrains.kotlin:kotlin-stdlib".to_string(),
+                "org.jetbrains.kotlin:kotlin-stdlib".into(),
                 "2.2.0".to_string(),
             );
 
@@ -574,7 +571,7 @@ mod tests {
             let content = "[versions]\nspring = \"3.2.0\"\n\n[libraries]\nspring-boot = { module = \"org.springframework.boot:spring-boot-starter\", version.ref = \"spring\" }\n";
             let mut cached = HashMap::new();
             cached.insert(
-                "org.springframework.boot:spring-boot-starter".to_string(),
+                "org.springframework.boot:spring-boot-starter".into(),
                 "3.3.0".to_string(),
             );
 
@@ -595,7 +592,7 @@ let package = Package(
 )
 "#;
             let mut cached = HashMap::new();
-            cached.insert("apple/swift-nio".to_string(), "3.0.0".to_string());
+            cached.insert("apple/swift-nio".into(), "3.0.0".to_string());
 
             assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
         }
