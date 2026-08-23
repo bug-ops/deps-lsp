@@ -45,10 +45,26 @@ use crate::{
     FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
     format_relative_age,
 };
+use std::time::Duration;
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
     Documentation, MarkupContent, MarkupKind, Position, Range, TextEdit,
 };
+
+/// Wall-clock budget `deps-lsp`'s completion handler gives an ecosystem's
+/// `generate_completions` before treating it as a timeout.
+///
+/// Past this, the handler skips the fallback search rather than treating a
+/// fast-but-empty result as "genuinely no results"
+/// (`crates/deps-lsp/src/handlers/completion.rs`).
+///
+/// A registry-backed completion path that retries internally on failure (e.g.
+/// `deps-maven`'s `search_typed`, #274) must size its own total retry budget to
+/// exceed this constant: finishing sooner with an empty/error result is
+/// indistinguishable, at the call site, from a query that legitimately has no
+/// matches, and triggers a wasted (and, for a struggling registry, likely to also
+/// fail) fallback search rather than the handler's existing skip-on-timeout path.
+pub const COMPLETION_SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Context for completion request based on cursor position.
 ///

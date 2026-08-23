@@ -5,6 +5,7 @@
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
+use deps_core::completion::COMPLETION_SEARCH_TIMEOUT;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -12,10 +13,14 @@ use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, InsertTextFormat,
 };
 
-/// Completion is keystroke-driven and must stay responsive, so registry-backed
-/// completion work gets its own short timeout instead of sharing the 30s HTTP client
-/// timeout used elsewhere.
-const COMPLETION_SEARCH_TIMEOUT_SECS: u64 = 2;
+// Completion is keystroke-driven and must stay responsive, so registry-backed
+// completion work gets its own short timeout instead of sharing the 30s HTTP client
+// timeout used elsewhere ([`COMPLETION_SEARCH_TIMEOUT`]).
+//
+// Shared with `deps_core::completion` (rather than kept local) because
+// registry-backed completion paths that retry internally on failure (e.g.
+// `deps-maven`'s `search_typed`, #274) must size their own retry budget against
+// this same value — see `deps_core::completion::COMPLETION_SEARCH_TIMEOUT`'s doc.
 
 /// Handles completion requests.
 ///
@@ -93,7 +98,7 @@ pub async fn handle_completion(
         let parse_result = doc.parse_result()?;
         let ecosystem = state.ecosystem_registry.get(ecosystem_id)?;
         let completion_result = tokio::time::timeout(
-            std::time::Duration::from_secs(COMPLETION_SEARCH_TIMEOUT_SECS),
+            COMPLETION_SEARCH_TIMEOUT,
             ecosystem.generate_completions(parse_result, position, &content, freshness),
         )
         .await;
@@ -113,7 +118,8 @@ pub async fn handle_completion(
             Err(_) => {
                 tracing::warn!(
                     "completion: generate_completions timed out after \
-                     {COMPLETION_SEARCH_TIMEOUT_SECS}s, skipping fallback search"
+                     {}s, skipping fallback search",
+                    COMPLETION_SEARCH_TIMEOUT.as_secs()
                 );
                 vec![]
             }
@@ -483,7 +489,7 @@ fn is_in_yaml_dependencies(content: &str, line_number: usize) -> bool {
 
 /// Searches for packages and returns completion items.
 ///
-/// Bounded by [`COMPLETION_SEARCH_TIMEOUT_SECS`] as a direct, in-place timeout (not a
+/// Bounded by [`deps_core::completion::COMPLETION_SEARCH_TIMEOUT`] as a direct, in-place timeout (not a
 /// detached `tokio::spawn`): this keeps the search cancellable by the LSP server's own
 /// `$/cancelRequest` handling, which wraps the whole request future and aborts it on
 /// cancellation — a detached task would sit outside that abort and keep the request's
@@ -499,25 +505,24 @@ async fn search_packages(
         ecosystem_id
     );
 
-    let results = match tokio::time::timeout(
-        std::time::Duration::from_secs(COMPLETION_SEARCH_TIMEOUT_SECS),
-        registry.search(query, 50),
-    )
-    .await
-    {
-        Ok(Ok(r)) => {
-            tracing::info!("search_packages: found {} results", r.len());
-            r
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("search_packages: search failed: {}", e);
-            return vec![];
-        }
-        Err(_) => {
-            tracing::warn!("search_packages: timed out after {COMPLETION_SEARCH_TIMEOUT_SECS}s");
-            return vec![];
-        }
-    };
+    let results =
+        match tokio::time::timeout(COMPLETION_SEARCH_TIMEOUT, registry.search(query, 50)).await {
+            Ok(Ok(r)) => {
+                tracing::info!("search_packages: found {} results", r.len());
+                r
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("search_packages: search failed: {}", e);
+                return vec![];
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "search_packages: timed out after {}s",
+                    COMPLETION_SEARCH_TIMEOUT.as_secs()
+                );
+                return vec![];
+            }
+        };
 
     // Convert search results to completion items
     results
@@ -1673,7 +1678,7 @@ serde
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move {
-                    // Well beyond COMPLETION_SEARCH_TIMEOUT_SECS; paused time makes this
+                    // Well beyond COMPLETION_SEARCH_TIMEOUT; paused time makes this
                     // resolve instantly instead of actually waiting.
                     tokio::time::sleep(Duration::from_mins(1)).await;
                     Ok(vec![])
@@ -1752,7 +1757,7 @@ serde
                 _freshness: deps_core::FreshnessSettings,
             ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
                 Box::pin(async move {
-                    // Well beyond COMPLETION_SEARCH_TIMEOUT_SECS; paused time resolves
+                    // Well beyond COMPLETION_SEARCH_TIMEOUT; paused time resolves
                     // this instantly instead of actually waiting.
                     tokio::time::sleep(Duration::from_mins(1)).await;
                     vec![]
