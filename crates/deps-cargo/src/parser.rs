@@ -172,7 +172,7 @@ fn parse_dependencies_section(
         let name_range = span_to_range(content, line_table, key.span);
 
         let mut dep = ParsedDependency {
-            name,
+            name: name.into(),
             name_range,
             version_req: None,
             version_range: None,
@@ -184,7 +184,7 @@ fn parse_dependencies_section(
 
         if let Some(s) = value.as_str() {
             // Simple string version: serde = "1.0"
-            dep.version_req = Some(s.to_string());
+            dep.version_req = Some(s.into());
             dep.version_range = Some(span_to_range(content, line_table, value.span));
         } else if let Some(t) = value.as_table() {
             // Inline table or full table: serde = { version = "1.0" }
@@ -210,7 +210,7 @@ fn parse_table_dependency(
         match key.name.as_ref() {
             "version" => {
                 if let Some(s) = value.as_str() {
-                    dep.version_req = Some(s.to_string());
+                    dep.version_req = Some(s.into());
                     dep.version_range = Some(span_to_range(content, line_table, value.span));
                 }
             }

@@ -121,7 +121,11 @@ fn test_fixture_packages_config_normalizes_exact_pin() {
     let result = parse_packages_config(&content, &fixture_uri("packages.config")).unwrap();
     assert_eq!(result.dependencies.len(), 3);
     for dep in &result.dependencies {
-        let req = dep.version_requirement.as_deref().unwrap();
+        let req = dep
+            .version_requirement
+            .as_ref()
+            .map(deps_core::VersionReq::as_str)
+            .unwrap();
         assert!(
             req.starts_with('[') && req.ends_with(']'),
             "expected bracketed exact pin for {}, got {req}",

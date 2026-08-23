@@ -177,12 +177,12 @@ mod tests {
         version_line: u32,
     ) -> ParsedDependency {
         ParsedDependency {
-            name: name.to_string(),
+            name: name.into(),
             name_range: Range::new(
                 Position::new(name_line, 0),
                 Position::new(name_line, name.len() as u32),
             ),
-            version_req: version.map(String::from),
+            version_req: version.map(Into::into),
             version_range: version.map(|_| {
                 Range::new(
                     Position::new(version_line, 0),

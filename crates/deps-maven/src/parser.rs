@@ -242,9 +242,9 @@ fn finalize_dep(
     Some(MavenDependency {
         group_id,
         artifact_id,
-        name,
+        name: name.into(),
         name_range,
-        version_req,
+        version_req: version_req.map(Into::into),
         version_range,
         scope,
     })

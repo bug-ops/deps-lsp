@@ -167,14 +167,18 @@ mod tests {
         }
 
         impl deps_core::Dependency for MockDep {
-            fn name(&self) -> &'static str {
-                "test-package"
+            fn name(&self) -> &deps_core::PackageName {
+                static NAME: std::sync::LazyLock<deps_core::PackageName> =
+                    std::sync::LazyLock::new(|| deps_core::PackageName::new("test-package"));
+                &NAME
             }
             fn name_range(&self) -> Range {
                 self.name_range
             }
-            fn version_requirement(&self) -> Option<&str> {
-                Some(">=1.0")
+            fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+                static VERSION_REQ: std::sync::LazyLock<deps_core::VersionReq> =
+                    std::sync::LazyLock::new(|| deps_core::VersionReq::new(">=1.0"));
+                Some(&VERSION_REQ)
             }
             fn version_range(&self) -> Option<Range> {
                 self.version_range

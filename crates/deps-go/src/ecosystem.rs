@@ -164,12 +164,12 @@ mod tests {
     /// Mock dependency for testing
     fn mock_dependency(name: &str, version: Option<&str>, line: u32) -> GoDependency {
         GoDependency {
-            module_path: name.to_string(),
+            module_path: name.into(),
             module_path_range: Range::new(
                 Position::new(line, 0),
                 Position::new(line, name.len() as u32),
             ),
-            version: version.map(String::from),
+            version: version.map(Into::into),
             version_range: version
                 .map(|_| Range::new(Position::new(line, 0), Position::new(line, 10))),
             directive: GoDirective::Require,

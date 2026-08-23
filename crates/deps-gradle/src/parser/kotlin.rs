@@ -95,9 +95,9 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             dependencies.push(GradleDependency {
                 group_id,
                 artifact_id,
-                name,
+                name: name.into(),
                 name_range,
-                version_req: Some(version),
+                version_req: Some(version.into()),
                 version_range: Some(version_range),
                 configuration: config.to_string(),
             });
@@ -134,7 +134,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             dependencies.push(GradleDependency {
                 group_id,
                 artifact_id,
-                name,
+                name: name.into(),
                 name_range,
                 version_req: None,
                 version_range: None,

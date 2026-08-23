@@ -10,16 +10,16 @@ pub struct GradleDependency {
     pub group_id: String,
     pub artifact_id: String,
     /// Canonical identifier: "{groupId}:{artifactId}"
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub name_range: Range,
-    pub version_req: Option<String>,
+    pub version_req: Option<deps_core::VersionReq>,
     pub version_range: Option<Range>,
     /// Gradle configuration (e.g. "implementation", "api", "testImplementation")
     pub configuration: String,
 }
 
 impl deps_core::Dependency for GradleDependency {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 
@@ -27,8 +27,8 @@ impl deps_core::Dependency for GradleDependency {
         self.name_range
     }
 
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
     }
 
     fn version_range(&self) -> Option<Range> {
@@ -71,7 +71,10 @@ mod tests {
 
         let dep = test_dep();
         assert_eq!(dep.name(), "org.springframework.boot:spring-boot-starter");
-        assert_eq!(dep.version_requirement(), Some("3.2.0"));
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("3.2.0")
+        );
         assert!(dep.features().is_empty());
         assert!(dep.as_any().is::<GradleDependency>());
         assert!(matches!(

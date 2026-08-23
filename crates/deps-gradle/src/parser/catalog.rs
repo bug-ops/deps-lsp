@@ -83,9 +83,9 @@ fn parse_library_entry(
     Some(GradleDependency {
         group_id,
         artifact_id,
-        name,
+        name: name.into(),
         name_range,
-        version_req,
+        version_req: version_req.map(Into::into),
         version_range,
         configuration: String::new(),
     })
@@ -249,8 +249,11 @@ guava = { module = "com.google.guava:guava", version.ref = "guava" }
         let result = parse_version_catalog(content, &make_uri()).unwrap();
         assert_eq!(result.dependencies[0].name, "junit:junit");
         assert_eq!(
-            result.dependencies[0].version_req,
-            Some("4.13.2".to_string())
+            result.dependencies[0]
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some("4.13.2")
         );
     }
 

@@ -162,9 +162,9 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
             let require = extract_require(rest_of_line);
 
             dependencies.push(BundlerDependency {
-                name,
+                name: name.into(),
                 name_range,
-                version_req,
+                version_req: version_req.map(Into::into),
                 version_range,
                 group,
                 source,

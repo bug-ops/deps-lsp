@@ -118,9 +118,9 @@ fn parse_package_element(
     };
 
     Some(NuGetDependency {
-        name,
+        name: name.into(),
         name_range,
-        version_requirement,
+        version_requirement: version_requirement.map(Into::into),
         version_range,
     })
 }
@@ -227,9 +227,9 @@ fn finalize_dep(
         resolve_version_field(content, line_table, accum.version, accum.version_span);
 
     Some(NuGetDependency {
-        name,
+        name: name.into(),
         name_range,
-        version_requirement,
+        version_requirement: version_requirement.map(Into::into),
         version_range,
     })
 }

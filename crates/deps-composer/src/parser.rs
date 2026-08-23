@@ -168,9 +168,9 @@ fn parse_section(
         search_start = new_offset;
 
         result.push(ComposerDependency {
-            name: name.clone(),
+            name: name.clone().into(),
             name_range,
-            version_req,
+            version_req: version_req.map(Into::into),
             version_range,
             section,
         });

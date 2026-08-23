@@ -6,12 +6,12 @@ use tower_lsp_server::ls_types::{Range, Uri};
 /// A single `PackageReference` / `PackageVersion` / `package` entry from a manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NuGetDependency {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub name_range: Range,
     /// Absent when the manifest omits an explicit version — central package management
     /// entries and unresolvable MSBuild property expressions (`$(...)`) both degrade to
     /// `None` rather than a bogus or unresolved-looking requirement.
-    pub version_requirement: Option<String>,
+    pub version_requirement: Option<deps_core::VersionReq>,
     pub version_range: Option<Range>,
 }
 
@@ -111,7 +111,10 @@ mod tests {
 
         let dep = test_dep();
         assert_eq!(dep.name(), "Newtonsoft.Json");
-        assert_eq!(dep.version_requirement(), Some("13.0.3"));
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("13.0.3")
+        );
         assert!(dep.features().is_empty());
         assert!(dep.as_any().is::<NuGetDependency>());
         assert!(matches!(

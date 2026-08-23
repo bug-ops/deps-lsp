@@ -58,7 +58,7 @@ fn test_catalog_name_ranges_set() {
 
     // All parsed dependencies must have a non-empty name
     for dep in &result.dependencies {
-        assert!(!dep.name.is_empty(), "Dependency has empty name");
+        assert!(!dep.name.as_str().is_empty(), "Dependency has empty name");
         assert!(
             !dep.group_id.is_empty() && !dep.artifact_id.is_empty(),
             "Dependency {} has empty group_id or artifact_id",

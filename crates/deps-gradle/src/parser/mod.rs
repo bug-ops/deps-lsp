@@ -29,9 +29,9 @@ pub struct GradleParseResult {
 pub fn resolve_variables(deps: &mut [GradleDependency], properties: &HashMap<String, String>) {
     for dep in deps.iter_mut() {
         if let Some(ref ver) = dep.version_req
-            && let Some(resolved) = resolve_variable_ref(ver, properties)
+            && let Some(resolved) = resolve_variable_ref(ver.as_str(), properties)
         {
-            dep.version_req = Some(resolved);
+            dep.version_req = Some(resolved.into());
         }
     }
 }
