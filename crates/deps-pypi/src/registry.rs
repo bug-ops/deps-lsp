@@ -34,42 +34,25 @@ pub const REGISTRY: &str = "PyPI";
 /// Base URL for package pages on pypi.org
 pub const PYPI_URL: &str = "https://pypi.org/project";
 
-/// Normalize package name according to PEP 503.
-///
-/// Converts package name to lowercase and replaces underscores/dots with hyphens,
-/// then filters out consecutive hyphens. This ensures consistent package lookups
-/// regardless of how the package name is written.
-///
-/// # Examples
-///
-/// ```
-/// # use deps_pypi::registry::normalize_package_name;
-/// assert_eq!(normalize_package_name("Flask"), "flask");
-/// assert_eq!(normalize_package_name("django_rest_framework"), "django-rest-framework");
-/// assert_eq!(normalize_package_name("Pillow.Image"), "pillow-image");
-/// assert_eq!(normalize_package_name("my__package"), "my-package");
-/// ```
-pub fn normalize_package_name(name: &str) -> String {
-    name.to_lowercase()
-        .replace(&['_', '.'][..], "-")
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
 /// Returns the URL for a package's page on pypi.org.
 ///
 /// Package names are normalized and URL-encoded to prevent path traversal attacks.
+/// Returns an empty string if `name` normalizes to nothing (e.g. `"---"`),
+/// rather than a dead link with an empty path segment — matching the
+/// `PackageNotFound` short-circuit `get_versions`/`get_package_metadata`
+/// apply for the same case.
 pub fn package_url(name: &str) -> String {
-    let normalized = normalize_package_name(name);
+    let normalized = crate::name::normalize(name);
+    if normalized.is_empty() {
+        return String::new();
+    }
     format!("{}/{}", PYPI_URL, urlencoding::encode(&normalized))
 }
 
 /// Builds the Simple API request URL for `normalized`'s version listing.
 ///
 /// The name segment is URL-encoded (matching `package_url`) since
-/// `normalize_package_name` only collapses `-`/`_`/`.` separators and leaves
+/// `name::normalize` only collapses `-`/`_`/`.` separators and leaves
 /// characters like `/`, `?`, `#` untouched.
 fn simple_api_url(normalized: &str) -> String {
     format!("{PYPI_SIMPLE_BASE}/{}/", urlencoding::encode(normalized))
@@ -157,7 +140,13 @@ impl PypiRegistry {
     /// # }
     /// ```
     pub async fn get_versions(&self, name: &str) -> Result<Vec<PypiVersion>> {
-        let normalized = normalize_package_name(name);
+        let normalized = crate::name::normalize(name);
+        if normalized.is_empty() {
+            return Err(DepsError::PackageNotFound {
+                package: name.to_string(),
+                registry: REGISTRY,
+            });
+        }
         let url = simple_api_url(&normalized);
         let data = self
             .cache
@@ -260,7 +249,13 @@ impl PypiRegistry {
     /// - Package does not exist
     /// - JSON parsing fails
     pub async fn get_package_metadata(&self, name: &str) -> Result<PypiPackage> {
-        let normalized = normalize_package_name(name);
+        let normalized = crate::name::normalize(name);
+        if normalized.is_empty() {
+            return Err(DepsError::PackageNotFound {
+                package: name.to_string(),
+                registry: REGISTRY,
+            });
+        }
         let url = metadata_url(&normalized);
         let data = self
             .cache
@@ -535,7 +530,7 @@ fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<Pypi
             source: e,
         })?;
 
-    let normalized_name = normalize_package_name(package_name);
+    let normalized_name = crate::name::normalize(package_name);
     let metadata_map =
         build_version_metadata(&response.files, &response.versions, &normalized_name);
 
@@ -593,67 +588,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalize_package_name_lowercase() {
-        assert_eq!(normalize_package_name("Flask"), "flask");
-        assert_eq!(normalize_package_name("DJANGO"), "django");
-        assert_eq!(normalize_package_name("Requests"), "requests");
-    }
-
-    #[test]
-    fn test_normalize_package_name_underscores() {
-        assert_eq!(
-            normalize_package_name("django_rest_framework"),
-            "django-rest-framework"
-        );
-        assert_eq!(normalize_package_name("my_package"), "my-package");
-    }
-
-    #[test]
-    fn test_normalize_package_name_dots() {
-        assert_eq!(normalize_package_name("Pillow.Image"), "pillow-image");
-        assert_eq!(normalize_package_name("zope.interface"), "zope-interface");
-    }
-
-    #[test]
-    fn test_normalize_package_name_consecutive_separators() {
-        assert_eq!(normalize_package_name("my__package"), "my-package");
-        assert_eq!(normalize_package_name("my..package"), "my-package");
-        assert_eq!(normalize_package_name("my_.package"), "my-package");
-    }
-
-    #[test]
-    fn test_normalize_package_name_mixed() {
-        assert_eq!(normalize_package_name("My_Package.Name"), "my-package-name");
-        assert_eq!(
-            normalize_package_name("SOME__Weird.._Package"),
-            "some-weird-package"
-        );
-    }
-
-    #[test]
-    fn test_normalize_package_name_already_normalized() {
-        assert_eq!(normalize_package_name("my-package"), "my-package");
-        assert_eq!(
-            normalize_package_name("django-rest-framework"),
-            "django-rest-framework"
-        );
-    }
-
-    #[test]
-    fn test_normalize_package_name_edge_cases() {
-        assert_eq!(normalize_package_name("a"), "a");
-        assert_eq!(normalize_package_name("A_B_C"), "a-b-c");
-        assert_eq!(normalize_package_name("---"), "");
-    }
-
-    #[test]
-    fn test_normalize_package_name_leading_trailing_separators() {
-        assert_eq!(normalize_package_name("_package_"), "package");
-        assert_eq!(normalize_package_name(".package."), "package");
-        assert_eq!(normalize_package_name("__package__"), "package");
-    }
-
-    #[test]
     fn test_package_url() {
         assert_eq!(package_url("requests"), "https://pypi.org/project/requests");
         assert_eq!(package_url("flask"), "https://pypi.org/project/flask");
@@ -697,7 +631,14 @@ mod tests {
 
     #[test]
     fn test_package_url_empty_name() {
-        assert_eq!(package_url(""), "https://pypi.org/project/");
+        assert_eq!(package_url(""), "");
+    }
+
+    #[test]
+    fn test_package_url_normalizes_to_empty() {
+        // "---" normalizes to "" (all separators) — must not build a dead
+        // link with an empty path segment.
+        assert_eq!(package_url("---"), "");
     }
 
     #[test]
@@ -1212,5 +1153,28 @@ mod tests {
 
         assert_eq!(stable.len(), 1);
         assert_eq!(prerelease.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_empty_normalized_name_short_circuits() {
+        // `name::normalize("---")` is "" — must fail as PackageNotFound
+        // before any HTTP request is attempted (an empty Simple API segment
+        // would otherwise build `https://pypi.org/simple//`).
+        let cache = std::sync::Arc::new(deps_core::HttpCache::new());
+        let registry = PypiRegistry::new(cache);
+        let err = registry.get_versions("---").await.unwrap_err();
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound { package, registry }
+                if package == "---" && registry == REGISTRY
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_package_metadata_empty_normalized_name_short_circuits() {
+        let cache = std::sync::Arc::new(deps_core::HttpCache::new());
+        let registry = PypiRegistry::new(cache);
+        let err = registry.get_package_metadata("...").await.unwrap_err();
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
     }
 }

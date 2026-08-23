@@ -151,8 +151,8 @@ impl LockFileProvider for PypiLockParser {
                 // Parse dependencies (format varies between poetry and uv)
                 let dependencies = parse_pypi_dependencies(table);
 
-                // Normalize name for consistent lookup (PyPI names are case-insensitive, - == _)
-                let normalized_name = name.to_lowercase().replace('-', "_");
+                // Normalize name for consistent lookup (PEP 503: case/`_`/`.`-insensitive)
+                let normalized_name = crate::name::normalize(name);
                 packages.insert(ResolvedPackage {
                     name: normalized_name,
                     version: version.to_string(),
@@ -458,9 +458,9 @@ resolved_reference = "abc123def456"
         let parser = PypiLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        // Names are normalized: - → _
+        // Names are normalized via PEP 503 (case/`_`/`.` collapsed to `-`)
         assert_eq!(resolved.len(), 1);
-        let pkg = resolved.get("my_git_dep").unwrap();
+        let pkg = resolved.get("my-git-dep").unwrap();
         assert_eq!(pkg.version, "0.1.0");
 
         match &pkg.source {
@@ -490,9 +490,9 @@ source = { git = "https://github.com/user/repo", rev = "abc123" }
         let parser = PypiLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        // Names are normalized: - → _
+        // Names are normalized via PEP 503 (case/`_`/`.` collapsed to `-`)
         assert_eq!(resolved.len(), 1);
-        let pkg = resolved.get("my_git_dep").unwrap();
+        let pkg = resolved.get("my-git-dep").unwrap();
 
         match &pkg.source {
             ResolvedSource::Git { url, rev } => {
@@ -522,9 +522,9 @@ url = "../local-package"
         let parser = PypiLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        // Names are normalized: - → _
+        // Names are normalized via PEP 503 (case/`_`/`.` collapsed to `-`)
         assert_eq!(resolved.len(), 1);
-        let pkg = resolved.get("my_local_dep").unwrap();
+        let pkg = resolved.get("my-local-dep").unwrap();
 
         match &pkg.source {
             ResolvedSource::Path { path } => {
@@ -552,9 +552,9 @@ source = { path = "../local-package" }
         let parser = PypiLockParser;
         let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
 
-        // Names are normalized: - → _
+        // Names are normalized via PEP 503 (case/`_`/`.` collapsed to `-`)
         assert_eq!(resolved.len(), 1);
-        let pkg = resolved.get("my_local_dep").unwrap();
+        let pkg = resolved.get("my-local-dep").unwrap();
 
         match &pkg.source {
             ResolvedSource::Path { path } => {
@@ -673,8 +673,8 @@ name = "missing-version"
 
         // Should only parse valid package (names are normalized: - → _)
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved.get_version("valid_package"), Some("1.0.0"));
-        assert!(resolved.get("missing_version").is_none());
+        assert_eq!(resolved.get_version("valid-package"), Some("1.0.0"));
+        assert!(resolved.get("missing-version").is_none());
     }
 
     #[test]

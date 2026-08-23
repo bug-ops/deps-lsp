@@ -359,6 +359,8 @@ mod tests {
             let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
             // An exact pin, not a lower bound: "==2.0.0" does not accept "2.5.0", unlike
             // ">=2.0.0" (which the "already accepts latest" rule would correctly skip).
+            // `format_version_replacing` preserves the `==` pin style rather than
+            // widening to a range (§6.1) — the edit is "requests==2.5.0", not a range.
             let content = "[project]\ndependencies = [\"requests==2.0.0\"]\n";
             let mut cached = HashMap::new();
             cached.insert("requests".into(), "2.5.0".to_string());
@@ -368,7 +370,7 @@ mod tests {
                 &uri,
                 content,
                 cached,
-                "requests>=2.5.0,<3",
+                "requests==2.5.0",
             )
             .await;
         }

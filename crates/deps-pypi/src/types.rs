@@ -31,7 +31,20 @@ use tower_lsp_server::ls_types::Range;
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct PypiDependency {
-    /// Package name (normalized to lowercase with underscores replaced by hyphens)
+    /// The package name **as produced by the parse path that created this
+    /// dependency** — normalization is non-uniform, not a property callers
+    /// can rely on directly:
+    ///
+    /// - PEP 508 string paths (PEP 621 `[project] dependencies`, PEP 735
+    ///   dependency groups, `requirements.txt`) — already PEP 503-normalized,
+    ///   because `pep508_rs::PackageName` normalizes at construction.
+    /// - Poetry table-key paths (`[tool.poetry.dependencies]`,
+    ///   `[tool.poetry.group.*.dependencies]`) — the **verbatim** TOML key,
+    ///   unnormalized.
+    ///
+    /// Callers must therefore never assume a normalized name. Apply
+    /// [`crate::name::normalize`] (via
+    /// `EcosystemFormatter::normalize_package_name`) at lookup time.
     pub name: deps_core::PackageName,
     /// LSP range of the package name
     pub name_range: Range,
@@ -85,6 +98,10 @@ pub enum PypiDependencySection {
     PoetryDependencies,
     /// Poetry dependency group (`[tool.poetry.group.{group}.dependencies]`)
     PoetryGroup { group: String },
+    /// A line in a `requirements.txt`- or `constraints.txt`-format file (pip's
+    /// requirements file format). Both file kinds map to this single variant —
+    /// nothing downstream distinguishes a constraint from a requirement.
+    Requirements,
 }
 
 pub use deps_core::parser::DependencySource as PypiDependencySource;

@@ -1,127 +1,14 @@
-use crate::error::{PypiError, Result};
+//! `pyproject.toml` parsing: PEP 621, PEP 735, Poetry, and PEP 517/518
+//! build-system requires.
+
+use super::{ParseResult, PypiParser, normalize_marker_string, span_start, span_to_range};
+use crate::error::Result;
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
-use pep508_rs::{MarkerTree, Requirement, VersionOrUrl};
-use std::any::Any;
-use std::str::FromStr;
 use toml_span::value::{Table, Value};
-use tower_lsp_server::ls_types::{Position, Range, Uri};
-
-/// Marker expressions longer than this are not handed to `pep508_rs`'s
-/// recursive-descent parser, which has no depth limit and can overflow the
-/// stack on deeply nested expressions (verified: ~5000 nested parens, ~10 KiB,
-/// aborts the process; ~4000 survives). Text over the cap falls back to its
-/// raw, unnormalized form rather than being parsed.
-const MAX_MARKER_LEN: usize = 2048;
-
-/// Generous bound on PEP 508 marker parenthesis nesting depth.
-///
-/// `pep508_rs`'s recursive-descent marker parser recurses once per nesting
-/// level with no depth limit, so a marker can overflow the stack from
-/// nesting alone while staying well under [`MAX_MARKER_LEN`] — a marker can
-/// pack roughly one `(`/`)` pair per 2 bytes (verified: 1016 levels in 2047
-/// bytes aborts the process on a 256 KiB stack). Real-world markers rarely
-/// nest more than 2-3 levels, so this cap leaves ample headroom.
-const MAX_MARKER_DEPTH: u32 = 32;
-
-/// Returns `true` if `marker` nests parentheses deeper than [`MAX_MARKER_DEPTH`].
-///
-/// Tracks quoted-string state the same way `pep508_rs`'s tokenizer does
-/// (`marker/parse.rs`: a quote opens on an unquoted `'`/`"` and closes on the
-/// next occurrence of that same character, with no escape handling) so that
-/// `(`/`)` bytes inside a quoted marker value — e.g. `extra == ')'` — are not
-/// mistaken for real nesting. A scanner that counted paren bytes unconditionally
-/// could be tricked into undercounting depth by parentheses hidden in quoted
-/// values while the real recursive-descent parser, which treats quoted content
-/// as opaque, keeps recursing.
-fn marker_too_deep(marker: &str) -> bool {
-    let mut depth: u32 = 0;
-    let mut quote: Option<u8> = None;
-    for b in marker.bytes() {
-        if let Some(q) = quote {
-            if b == q {
-                quote = None;
-            }
-            continue;
-        }
-        match b {
-            b'\'' | b'"' => quote = Some(b),
-            b'(' => {
-                depth += 1;
-                if depth > MAX_MARKER_DEPTH {
-                    return true;
-                }
-            }
-            b')' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Parse result containing all dependencies from pyproject.toml.
-///
-/// Stores dependencies and optional workspace information for LSP operations.
-#[derive(Debug, Clone)]
-pub struct ParseResult {
-    /// All dependencies found in the manifest
-    pub dependencies: Vec<PypiDependency>,
-    /// Workspace root path (None for Python - no workspace concept like Cargo)
-    pub workspace_root: Option<std::path::PathBuf>,
-    /// URI of the parsed file
-    pub uri: Uri,
-}
-
-impl deps_core::ParseResult for ParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
-    }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        self.workspace_root.as_deref()
-    }
-
-    fn uri(&self) -> &Uri {
-        &self.uri
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-/// Parser for Python pyproject.toml files.
-///
-/// Supports both PEP 621 standard format and Poetry format.
-/// Uses `toml-span` to preserve source positions for LSP operations.
-///
-/// # Examples
-///
-/// ```no_run
-/// use deps_pypi::parser::PypiParser;
-/// use tower_lsp_server::ls_types::Uri;
-///
-/// let content = r#"
-/// [project]
-/// dependencies = ["requests>=2.28.0", "flask[async]>=3.0"]
-/// "#;
-///
-/// let parser = PypiParser::new();
-/// let uri = Uri::from_file_path("/test/pyproject.toml").unwrap();
-/// let result = parser.parse_content(content, &uri).unwrap();
-/// assert_eq!(result.dependencies.len(), 2);
-/// ```
-pub struct PypiParser;
+use tower_lsp_server::ls_types::Uri;
 
 impl PypiParser {
-    /// Create a new PyPI parser.
-    pub const fn new() -> Self {
-        Self
-    }
-
     /// Parse pyproject.toml content and extract all dependencies.
     ///
     /// Parses both PEP 621 and Poetry formats in a single pass.
@@ -146,7 +33,7 @@ impl PypiParser {
         if let Err(depth) =
             deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
         {
-            return Err(PypiError::TomlParseError {
+            return Err(crate::error::PypiError::TomlParseError {
                 message: format!(
                     "array/table nesting depth {depth} exceeds maximum of {}",
                     deps_core::MAX_TOML_NESTING_DEPTH
@@ -154,9 +41,10 @@ impl PypiParser {
             });
         }
 
-        let doc = toml_span::parse(content).map_err(|e| PypiError::TomlParseError {
-            message: e.to_string(),
-        })?;
+        let doc =
+            toml_span::parse(content).map_err(|e| crate::error::PypiError::TomlParseError {
+                message: e.to_string(),
+            })?;
 
         let line_table = LineOffsetTable::new(content);
         let mut dependencies = Vec::new();
@@ -230,8 +118,12 @@ impl PypiParser {
 
         for value in requires_array {
             if let Some(dep_str) = value.as_str() {
-                match self.parse_pep508_requirement(dep_str, Some(value.span), content, line_table)
-                {
+                match self.parse_pep508_requirement(
+                    dep_str,
+                    Some(value.span.start..value.span.end),
+                    content,
+                    line_table,
+                ) {
                     Ok(mut dep) => {
                         dep.section = PypiDependencySection::BuildSystem;
                         dependencies.push(dep);
@@ -265,8 +157,12 @@ impl PypiParser {
 
         for value in deps_array {
             if let Some(dep_str) = value.as_str() {
-                match self.parse_pep508_requirement(dep_str, Some(value.span), content, line_table)
-                {
+                match self.parse_pep508_requirement(
+                    dep_str,
+                    Some(value.span.start..value.span.end),
+                    content,
+                    line_table,
+                ) {
                     Ok(mut dep) => {
                         dep.section = PypiDependencySection::Dependencies;
                         dependencies.push(dep);
@@ -304,7 +200,7 @@ impl PypiParser {
                     if let Some(dep_str) = value.as_str() {
                         match self.parse_pep508_requirement(
                             dep_str,
-                            Some(value.span),
+                            Some(value.span.start..value.span.end),
                             content,
                             line_table,
                         ) {
@@ -349,7 +245,7 @@ impl PypiParser {
                     if let Some(dep_str) = value.as_str() {
                         match self.parse_pep508_requirement(
                             dep_str,
-                            Some(value.span),
+                            Some(value.span.start..value.span.end),
                             content,
                             line_table,
                         ) {
@@ -467,172 +363,6 @@ impl PypiParser {
         Ok(dependencies)
     }
 
-    /// Parse a PEP 508 requirement string.
-    ///
-    /// Example: `requests[security,socks]>=2.28.0,<3.0; python_version>='3.8'`
-    ///
-    /// `value_span` is the requirement string's source span (used for both
-    /// `Position` tracking and, via [`span_to_range`], UTF-16-correct
-    /// `markers_range` computation).
-    fn parse_pep508_requirement(
-        &self,
-        requirement_str: &str,
-        value_span: Option<toml_span::Span>,
-        content: &str,
-        line_table: &LineOffsetTable,
-    ) -> Result<PypiDependency> {
-        let base_position = value_span.map(|span| span_start(content, line_table, span));
-
-        // `;` never appears inside a version/extras clause, so the first
-        // occurrence unambiguously anchors the marker section (direct-reference
-        // URLs containing `;` are a known, documented edge case - see #<follow-up>).
-        let semicolon_idx = requirement_str.find(';');
-
-        // Pathologically long or deeply nested marker expressions can overflow
-        // the stack in `pep508_rs`'s unbounded recursive-descent parser. Parse
-        // only the name/version/extras portion and skip marker normalization
-        // instead of handing the oversized/deeply-nested marker text to the
-        // parser.
-        let marker_too_complex = semicolon_idx.is_some_and(|idx| {
-            let marker_text = &requirement_str[idx..];
-            marker_text.len() > MAX_MARKER_LEN || marker_too_deep(marker_text)
-        });
-        let parse_str = if marker_too_complex {
-            &requirement_str[..semicolon_idx.unwrap()]
-        } else {
-            requirement_str
-        };
-
-        let requirement = Requirement::from_str(parse_str)
-            .map_err(|e| PypiError::InvalidDependencySpec { source: e })?;
-
-        let name = requirement.name.to_string();
-        let name_range = base_position
-            .map(|pos| {
-                Range::new(
-                    pos,
-                    Position::new(pos.line, pos.character + name.len() as u32),
-                )
-            })
-            .unwrap_or_default();
-
-        // Version/extras text never extends past the marker section.
-        let version_end = semicolon_idx.unwrap_or(requirement_str.len());
-
-        let (version_req, version_range, source) = match requirement.version_or_url {
-            Some(VersionOrUrl::VersionSpecifier(specs)) => {
-                let version_str = specs.to_string();
-                // Calculate offset from name start to version specifier
-                // For "package>=1.0": offset = len("package") = 7
-                // For "package[extra]>=1.0": offset = len("package[extra]") = 14
-                let extras_str_len = if requirement.extras.is_empty() {
-                    0
-                } else {
-                    // Format: "[extra1,extra2]"
-                    let extras_joined = requirement
-                        .extras
-                        .iter()
-                        .map(std::string::ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    extras_joined.len() + 2 // +2 for [ and ]
-                };
-                let start_offset = name.len() + extras_str_len;
-
-                // Calculate original version length from requirement_str, bounded
-                // at the marker section so the range never overlaps markers_range
-                // (it is the sole TextEdit target for the "update version" code
-                // action, so overlap would delete the marker on accept).
-                // pep508 normalizes version specifiers (e.g., ">=1.7,<2.0" -> ">=1.7, <2.0")
-                // We need the original length for correct position tracking
-                let original_version_len = version_end.saturating_sub(start_offset);
-
-                let version_range = base_position.map(|pos| {
-                    Range::new(
-                        Position::new(pos.line, pos.character + start_offset as u32),
-                        Position::new(
-                            pos.line,
-                            pos.character + start_offset as u32 + original_version_len as u32,
-                        ),
-                    )
-                });
-                (
-                    Some(version_str),
-                    version_range,
-                    PypiDependencySource::Registry,
-                )
-            }
-            Some(VersionOrUrl::Url(url)) => {
-                let url_str = url.to_string();
-                if url_str.starts_with("git+") {
-                    (
-                        None,
-                        None,
-                        PypiDependencySource::Git {
-                            url: url_str,
-                            rev: None,
-                        },
-                    )
-                } else if url_str.ends_with(".whl") || url_str.ends_with(".tar.gz") {
-                    (None, None, PypiDependencySource::Url { url: url_str })
-                } else {
-                    (None, None, PypiDependencySource::Registry)
-                }
-            }
-            None => (None, None, PypiDependencySource::Registry),
-        };
-
-        let extras: Vec<String> = requirement
-            .extras
-            .into_iter()
-            .map(|e| e.to_string())
-            .collect();
-
-        let markers = if marker_too_complex {
-            let raw_marker = requirement_str[semicolon_idx.unwrap() + 1..].trim();
-            if raw_marker.is_empty() {
-                None
-            } else {
-                tracing::warn!(
-                    "Marker expression for '{}' is too complex ({} bytes, over the {}-byte length cap or {}-level nesting cap), skipping normalization",
-                    name,
-                    raw_marker.len(),
-                    MAX_MARKER_LEN,
-                    MAX_MARKER_DEPTH
-                );
-                Some(raw_marker.to_string())
-            }
-        } else {
-            requirement.marker.try_to_string()
-        };
-
-        // The marker text starts right after the first `;` in the original
-        // requirement string; `pep508_rs` doesn't expose a source span for it.
-        let markers_range = markers.as_ref().and_then(|_| {
-            let idx = semicolon_idx?;
-            value_span.map(|span| {
-                span_to_range(
-                    content,
-                    line_table,
-                    toml_span::Span::new(span.start + idx + 1, span.end),
-                )
-            })
-        });
-
-        Ok(PypiDependency {
-            name: name.into(),
-            name_range,
-            version_req: version_req.map(Into::into),
-            version_range,
-            extras,
-            extras_range: None,
-            markers,
-            markers_range,
-            section: PypiDependencySection::Dependencies,
-            source,
-        })
-    }
-
     /// Parse a Poetry dependency (can be string or table).
     ///
     /// Examples:
@@ -643,10 +373,12 @@ impl PypiParser {
         &self,
         name: &str,
         value: &Value<'_>,
-        base_position: Option<Position>,
+        base_position: Option<tower_lsp_server::ls_types::Position>,
         content: &str,
         line_table: &LineOffsetTable,
     ) -> Result<PypiDependency> {
+        use tower_lsp_server::ls_types::{Position, Range};
+
         let name_range = base_position
             .map(|pos| {
                 Range::new(
@@ -779,7 +511,7 @@ impl PypiParser {
             });
         }
 
-        Err(PypiError::unsupported_format(format!(
+        Err(crate::error::PypiError::unsupported_format(format!(
             "Unsupported Poetry dependency format for '{name}'"
         )))
     }
@@ -790,65 +522,12 @@ fn get_table<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Table<'a>> {
     table.get(key)?.as_table()
 }
 
-/// Convert the start of a toml-span Span to an LSP Position.
-///
-/// toml-span string spans exclude surrounding quotes, so the span start
-/// points directly to the first character of the string content.
-fn span_start(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Position {
-    line_table.byte_offset_to_position(content, span.start)
-}
-
-/// Converts a toml-span byte span to an LSP `Range` using the pre-computed line table.
-fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::Span) -> Range {
-    let start = line_table.byte_offset_to_position(content, span.start);
-    let end = line_table.byte_offset_to_position(content, span.end);
-    Range::new(start, end)
-}
-
-/// Parses a raw PEP 508 marker expression and serializes it back through
-/// `MarkerTree` for consistency with the PEP 621 requirement-string path,
-/// which canonicalizes markers on serialization (e.g. `python_version`
-/// comparisons become `python_full_version`).
-///
-/// Returns `None` for an empty/whitespace-only expression, or one that
-/// normalizes to the trivially-true marker (which has no string form, e.g.
-/// `os_name == 'a' or os_name != 'a'`) — matching the PEP 621 path, which
-/// likewise yields `None` for an absent or always-true marker. Falls back to
-/// the raw string, unmodified, if the expression fails to parse or exceeds
-/// [`MAX_MARKER_LEN`] or [`MAX_MARKER_DEPTH`].
-fn normalize_marker_string(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.len() > MAX_MARKER_LEN || marker_too_deep(trimmed) {
-        tracing::warn!(
-            "Marker expression is too complex ({} bytes, over the {}-byte length cap or {}-level nesting cap), skipping normalization: '{}'",
-            trimmed.len(),
-            MAX_MARKER_LEN,
-            MAX_MARKER_DEPTH,
-            trimmed
-        );
-        return Some(trimmed.to_string());
-    }
-    match MarkerTree::from_str(trimmed) {
-        Ok(tree) => tree.try_to_string(),
-        Err(e) => {
-            tracing::warn!("Failed to parse marker expression '{}': {}", trimmed, e);
-            Some(trimmed.to_string())
-        }
-    }
-}
-
-impl Default for PypiParser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::{MAX_MARKER_LEN, marker_too_deep};
     use super::*;
+    use crate::error::PypiError;
+    use tower_lsp_server::ls_types::{Position, Range};
 
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/pyproject.toml")
@@ -1565,9 +1244,9 @@ dev = ["pytest-cov>=4.0,<8.0"]
 dev = ["pytest-cov >=4.0,<8.0"]
 "#;
         // Line 1: dev = ["pytest-cov >=4.0,<8.0"]
-        //               ^          ^          ^
-        //               8          18         29 (positions)
-        //               name_start space+ver  version_end
+        //               ^           ^         ^
+        //               8           19        29 (positions)
+        //               name_start  version   version_end
 
         let parser = PypiParser::new();
         let result = parser.parse_content(toml, &test_uri()).unwrap();
@@ -1576,15 +1255,17 @@ dev = ["pytest-cov >=4.0,<8.0"]
         assert_eq!(deps.len(), 1);
         let dep = &deps[0];
 
-        // Version range should cover " >=4.0,<8.0" (with leading space)
+        // Version range should cover exactly ">=4.0,<8.0", not the leading
+        // whitespace: `start_offset` is derived by scanning for the first
+        // specifier character, not from `name.len()` arithmetic (§6.2).
         let version_range = dep.version_range.expect("version_range should be set");
         assert_eq!(version_range.start.line, 1);
-        // pytest-cov is 10 chars, so version_range starts at 8 + 10 = 18 (the space)
-        assert_eq!(version_range.start.character, 18);
-        // " >=4.0,<8.0" is 11 chars, so version ends at 18 + 11 = 29
+        // pytest-cov is 10 chars plus 1 space, so version starts at 8 + 11 = 19
+        assert_eq!(version_range.start.character, 19);
+        // ">=4.0,<8.0" is 10 chars, so version ends at 19 + 10 = 29
         assert_eq!(version_range.end.character, 29);
 
-        // Verify that cursor at position 21 (on '>') is within version_range
+        // Verify that a cursor within the specifier text is within version_range
         let cursor_on_version = Position::new(1, 21);
         assert!(
             cursor_on_version.character >= version_range.start.character

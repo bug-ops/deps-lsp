@@ -329,6 +329,24 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &[]
     }
 
+    /// Basename glob patterns this ecosystem handles, each containing exactly
+    /// one `*` wildcard (e.g. `["requirements*.txt"]`).
+    ///
+    /// Consulted by [`crate::EcosystemRegistry::get_for_filename`] as a third
+    /// routing stage, tried after an exact
+    /// [`manifest_filenames`](Ecosystem::manifest_filenames) match fails and
+    /// before [`manifest_extensions`](Ecosystem::manifest_extensions) — for
+    /// basenames that are neither fixed nor identified by extension alone
+    /// (e.g. `requirements.txt`, `requirements-dev.txt`). Empty by default.
+    /// Matching is case-sensitive, unlike the extension stage: these patterns
+    /// target canonically-lowercase filenames (pip, Renovate and Dependabot
+    /// all treat `requirements.txt` as lowercase), whereas the extension
+    /// stage exists specifically for Windows/MSBuild project files whose
+    /// case genuinely varies.
+    fn manifest_patterns(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Lock file filenames this ecosystem uses (e.g., ["Cargo.lock"])
     ///
     /// Used for file watching - LSP will monitor changes to these files
@@ -427,12 +445,16 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Generate code actions for a position.
     ///
     /// Default implementation delegates to `lsp_helpers::generate_code_actions`
-    /// using `self.formatter()` and `self.registry()`.
+    /// using `self.formatter()` and `self.registry()`. `content` is the
+    /// manifest source, needed to guard against rewriting a `version_range`
+    /// that no longer slices to its declared requirement text (see
+    /// `lsp_helpers::literal_span_matches`).
     fn generate_code_actions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
         position: Position,
         uri: &'a Uri,
+        content: &'a str,
     ) -> BoxFuture<'a, Vec<CodeAction>> {
         Box::pin(async move {
             let registry = self.registry();
@@ -440,6 +462,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 parse_result,
                 position,
                 uri,
+                content,
                 registry.as_ref(),
                 self.formatter(),
             )
