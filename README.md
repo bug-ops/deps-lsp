@@ -18,6 +18,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Loading indicators** — Visual feedback during registry fetches with LSP progress support
 - **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved, composer.lock
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
+- **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
 - **Hover information** — Package descriptions with resolved version from lock file
 - **Code actions** — Quick fixes to update dependencies
 - **Code lens** — "Update N outdated dependencies" batch update on every open manifest
@@ -204,7 +205,8 @@ Configure via LSP initialization options:
   "diagnostics": {
     "outdated_severity": "hint",
     "unknown_severity": "warning",
-    "yanked_severity": "warning"
+    "yanked_severity": "warning",
+    "vulnerabilities_enabled": true
   },
   "cache": {
     "enabled": true,

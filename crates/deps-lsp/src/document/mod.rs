@@ -7,6 +7,8 @@
 
 mod lifecycle;
 mod loader;
+#[cfg(test)]
+mod osv_snapshot_tests;
 mod state;
 
 // Re-export all public items from submodules

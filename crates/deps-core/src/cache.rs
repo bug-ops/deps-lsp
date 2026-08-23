@@ -2,6 +2,7 @@ use crate::error::{DepsError, Result};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use reqwest::{Client, Response, StatusCode, header};
+use serde::Serialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -417,6 +418,81 @@ impl HttpCache {
         );
 
         Ok(body)
+    }
+
+    /// POSTs `body` as JSON and returns the response body.
+    ///
+    /// Deliberately does not cache: the OSV batch endpoint is a POST with a
+    /// request-body-dependent response and sends no `ETag`/`Last-Modified`
+    /// validators, so entry-map caching would be meaningless here — every
+    /// call reuses the client, HTTPS enforcement, size cap, and timeout
+    /// (via `read_body_capped`) without touching the entry map or
+    /// [`Self::total_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `DepsError::HttpStatus` if the server returns a non-2xx
+    /// status, `DepsError::RegistryError` if the request fails, or
+    /// `DepsError::ResponseTooLarge` if the response body exceeds the
+    /// configured size cap.
+    pub async fn post_json<T: Serialize + ?Sized>(&self, url: &str, body: &T) -> Result<Bytes> {
+        ensure_https(url)?;
+
+        let response = self.client.post(url).json(body).send().await.map_err(|e| {
+            DepsError::RegistryError {
+                package: url.to_string(),
+                source: e,
+            }
+        })?;
+
+        if !response.status().is_success() {
+            return Err(DepsError::HttpStatus {
+                url: url.to_string(),
+                status: response.status().as_u16(),
+            });
+        }
+
+        read_body_capped(url, response).await
+    }
+
+    /// GETs `url` and returns the response body, bypassing the entry-map
+    /// cache entirely — reuses the client, HTTPS enforcement, size cap, and
+    /// timeout, exactly like [`Self::post_json`], but for a plain GET.
+    ///
+    /// For a caller whose own values are already cached elsewhere (e.g.
+    /// `OsvClient`'s record cache, validated by a `modified` timestamp
+    /// rather than `ETag`/`Last-Modified`): reusing [`Self::get_cached`]
+    /// there would double-cache every fetched record in *this* cache's byte
+    /// budget too, competing with registry responses for it even though
+    /// nothing here ever reads that cached copy back.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DepsError::HttpStatus` if the server returns a non-2xx
+    /// status, `DepsError::RegistryError` if the request fails, or
+    /// `DepsError::ResponseTooLarge` if the response body exceeds the
+    /// configured size cap.
+    pub async fn get_transport_only(&self, url: &str) -> Result<Bytes> {
+        ensure_https(url)?;
+
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| DepsError::RegistryError {
+                package: url.to_string(),
+                source: e,
+            })?;
+
+        if !response.status().is_success() {
+            return Err(DepsError::HttpStatus {
+                url: url.to_string(),
+                status: response.status().as_u16(),
+            });
+        }
+
+        read_body_capped(url, response).await
     }
 
     /// Inserts (or replaces) a cache entry, keeping [`Self::total_bytes`] in sync.
@@ -940,6 +1016,93 @@ mod tests {
         assert_eq!(result.as_ref(), b"stale but good");
         let cached = cache.entries.get(&url).unwrap();
         assert_eq!(cached.etag, Some("\"stale-etag\"".into()));
+    }
+
+    #[tokio::test]
+    async fn test_post_json_success_returns_body_and_does_not_cache() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/v1/querybatch", server.url());
+
+        let _m = server
+            .mock("POST", "/v1/querybatch")
+            .match_header("content-type", "application/json")
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let body = serde_json::json!({ "queries": [] });
+        let result: Bytes = cache.post_json(&url, &body).await.unwrap();
+
+        assert_eq!(result.as_ref(), br#"{"results":[{}]}"#);
+        assert!(
+            cache.is_empty(),
+            "post_json must not populate the entry-map cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_json_non_2xx_returns_http_status_error() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/v1/querybatch", server.url());
+
+        let _m = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(400)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let body = serde_json::json!({ "queries": [] });
+        let result: Result<Bytes> = cache.post_json(&url, &body).await;
+
+        match result {
+            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 400),
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_transport_only_success_returns_body_and_does_not_cache() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/v1/vulns/RUSTSEC-2020-0071", server.url());
+
+        let _m = server
+            .mock("GET", "/v1/vulns/RUSTSEC-2020-0071")
+            .with_status(200)
+            .with_body(r#"{"id":"RUSTSEC-2020-0071"}"#)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let result: Bytes = cache.get_transport_only(&url).await.unwrap();
+
+        assert_eq!(result.as_ref(), br#"{"id":"RUSTSEC-2020-0071"}"#);
+        assert!(
+            cache.is_empty(),
+            "get_transport_only must not populate the entry-map cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_transport_only_non_2xx_returns_http_status_error() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/v1/vulns/missing", server.url());
+
+        let _m = server
+            .mock("GET", "/v1/vulns/missing")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let result: Result<Bytes> = cache.get_transport_only(&url).await;
+
+        match result {
+            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 404),
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
     }
 
     fn dummy_response(size: usize) -> CachedResponse {

@@ -13,8 +13,10 @@ use deps_core::EcosystemId;
 use deps_core::PackageName;
 use deps_core::Registry;
 use deps_core::Result;
+use deps_core::VersionReq;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
@@ -65,6 +67,7 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     tracing::trace!(
         cached = old_state.cached_versions.len(),
         resolved = old_state.resolved_versions.len(),
+        vulnerabilities = old_state.vulnerabilities.len(),
         "preserving version cache"
     );
     new_state
@@ -73,20 +76,391 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     new_state
         .resolved_versions
         .clone_from(&old_state.resolved_versions);
+    // DocumentState is rebuilt on every change, so without this the OSV scan
+    // result would be wiped on every keystroke — `run_osv_scan` overwrites it
+    // once the (cheap, cache-backed) rescan completes, see §4.
+    new_state
+        .vulnerabilities
+        .clone_from(&old_state.vulnerabilities);
+}
+
+/// Ceiling on the OSV scan timeout, independent of the configured
+/// `fetch_timeout_secs`: the shared `reqwest` client behind `HttpCache`
+/// already imposes its own client-wide 30s timeout (`cache.rs`), so a
+/// per-phase timeout longer than that would never actually bind.
+const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
+
+/// Ecosystems whose *bare* (no explicit pin marker) version requirement is a
+/// range under that ecosystem's own default semantics — Cargo's implicit
+/// caret, npm/Composer's implicit caret. For these, [`is_concrete_version`]
+/// requires an explicit `=`/`==` (or an exact-bracket wrap) before treating a
+/// requirement as concrete; a bare `"1.2.3"` alone is not enough evidence
+/// (critique C2).
+///
+/// Gradle is deliberately excluded: a bare Gradle coordinate version (e.g.
+/// `"2.14.1"`) is an exact match under `GradleFormatter`'s own
+/// `version_satisfies_requirement` unless it uses the `+` dynamic-version
+/// suffix, which [`looks_like_a_single_version`] already rejects via its
+/// reject-char set — Gradle has no implicit-caret default the way
+/// Cargo/npm/Composer do.
+const fn bare_version_is_a_range(ecosystem: EcosystemId) -> bool {
+    matches!(
+        ecosystem,
+        EcosystemId::Cargo | EcosystemId::Npm | EcosystemId::Composer
+    )
+}
+
+/// Returns `true` if `s` (already stripped of any pin marker) has the shape
+/// of a single concrete version: non-empty, no wildcard/range-operator
+/// character, and starting with a digit (after an optional `v`/`V` prefix,
+/// e.g. Go's `v1.9.1`).
+///
+/// Deliberately conservative — see [`is_concrete_version`]'s doc for why a
+/// false positive here is worse than a false negative.
+fn looks_like_a_single_version(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if s.contains([
+        '^', '~', '*', '<', '>', ',', '|', '(', ')', '[', ']', ' ', '\t', ':', '+', 'x', 'X',
+    ]) {
+        return false;
+    }
+    let core = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    core.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+/// Returns `true` if `requirement` denotes a single concrete version — the
+/// only shape safe to query OSV with directly (§3 step 2). A wrong answer
+/// here is invisible in testing (OSV silently returns `{}` for a fabricated
+/// version), so getting this right matters more than covering every
+/// ecosystem's full range grammar.
+///
+/// An explicit pin marker (`=`/`==`, or a single-value bracket wrap like
+/// NuGet's `[1.0.0]`) is always accepted. A *bare* requirement (no marker)
+/// is accepted only for ecosystems where a bare version is not itself a
+/// range by default (critique C2) — see [`bare_version_is_a_range`].
+fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
+    let trimmed = requirement.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("latest") {
+        return false;
+    }
+
+    let pinned = trimmed
+        .strip_prefix("==")
+        .or_else(|| trimmed.strip_prefix('='));
+    let bracket_pinned = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .filter(|inner| !inner.contains(','));
+
+    match pinned.or(bracket_pinned) {
+        Some(body) => looks_like_a_single_version(body),
+        None if bare_version_is_a_range(ecosystem) => false,
+        None => looks_like_a_single_version(trimmed),
+    }
+}
+
+/// Builds the OSV scan targets for one manifest's dependencies, applying the
+/// version-selection policy from `architecture.md` §3 in order:
+///
+/// 0. Skip unless `dep.source() == DependencySource::Registry` — a patched
+///    git/path fork must never be flagged with a CVE for a version it does
+///    not actually contain.
+/// 1. Use the lock-file-resolved version if present.
+/// 2. Otherwise use the declared requirement, if it is already concrete.
+/// 3. Otherwise skip — querying a fabricated version is a silent false
+///    negative, which is worse than not scanning at all.
+///
+/// Every dependency that does **not** become a [`deps_core::osv::ScanTarget`]
+/// gets an explicit [`deps_core::osv::ScanOutcome::Skipped`] entry in the
+/// returned map instead of silently vanishing (critique C1) — absence from
+/// [`deps_core::osv::VulnerabilityMap`] must never happen for an input this
+/// function considered.
+fn build_scan_targets(
+    parse_result: &dyn deps_core::ParseResult,
+    resolved_versions: &HashMap<PackageName, String>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    ecosystem: EcosystemId,
+) -> (
+    Vec<deps_core::osv::ScanTarget>,
+    deps_core::osv::VulnerabilityMap,
+) {
+    use deps_core::osv::{ScanOutcome, SkipReason};
+
+    let mut targets = Vec::new();
+    let mut skipped = deps_core::osv::VulnerabilityMap::new();
+
+    for dep in parse_result.dependencies() {
+        let key = formatter.normalize_package_name(dep.name());
+
+        if dep.source() != deps_core::parser::DependencySource::Registry {
+            skipped.insert(key, ScanOutcome::Skipped(SkipReason::NonRegistrySource));
+            continue;
+        }
+
+        let version = resolved_versions
+            .get(key.as_str())
+            .or_else(|| resolved_versions.get(dep.name()))
+            .cloned()
+            .or_else(|| {
+                dep.version_requirement()
+                    .filter(|req| is_concrete_version(req.as_str(), ecosystem))
+                    .map(|req| req.as_str().to_string())
+            });
+
+        let Some(version) = version else {
+            skipped.insert(key, ScanOutcome::Skipped(SkipReason::NoConcreteVersion));
+            continue;
+        };
+
+        let Some(osv_name) = formatter.osv_package_name(dep) else {
+            skipped.insert(key, ScanOutcome::Skipped(SkipReason::UnmappableName));
+            continue;
+        };
+
+        targets.push(deps_core::osv::ScanTarget {
+            key,
+            osv_name,
+            version,
+        });
+    }
+
+    (targets, skipped)
+}
+
+/// Logs the per-document scan summary unconditionally (critique C1) —
+/// including when every dependency was filtered out before ever reaching
+/// [`deps_core::osv::OsvClient::scan`], which previously produced no log line
+/// at all and defeated §8 invariant 0's purpose of making "not scanned"
+/// observable.
+fn log_osv_run_summary(vulnerabilities: &deps_core::osv::VulnerabilityMap) {
+    let mut clean = 0usize;
+    let mut vulnerable = 0usize;
+    let mut skipped = 0usize;
+    for outcome in vulnerabilities.values() {
+        match outcome {
+            deps_core::osv::ScanOutcome::Clean => clean += 1,
+            deps_core::osv::ScanOutcome::Vulnerable(_) => vulnerable += 1,
+            deps_core::osv::ScanOutcome::Skipped(_) => skipped += 1,
+        }
+    }
+    tracing::info!(
+        "OSV: document scan complete, {} dependencies considered, {clean} clean, {vulnerable} vulnerable, {skipped} skipped",
+        vulnerabilities.len(),
+    );
+}
+
+/// Phase A output, carried from the concurrently-spawned scan task into
+/// phase B (run later, after the registry fetch resolves — critique S1).
+struct OsvScanResult {
+    /// Document content at the moment the scan started, to guard the
+    /// eventual write against a cross-generation stale commit (critique M4).
+    content_snapshot: String,
+    vulnerabilities: deps_core::osv::VulnerabilityMap,
+    /// `key -> osv_name`, needed to build phase B candidates.
+    osv_name_by_key: HashMap<String, String>,
+    /// `key -> dep.name()` (raw, pre-normalization), the fallback
+    /// `cached_versions` lookup needs since that map is keyed by the raw
+    /// name while `key` is normalized (critique S2) — they differ for
+    /// Composer/Swift/NuGet-style ecosystems.
+    raw_name_by_key: HashMap<String, String>,
+}
+
+/// Phase A: builds scan targets, runs [`deps_core::osv::OsvClient::scan`], and
+/// merges in the pre-filter skips — all before the registry fetch is known
+/// to have completed, so this must be `tokio::spawn`ed by the caller and run
+/// concurrently with it, never awaited inline (critique S2/original design
+/// note: joining here would gate the inlay-hint refresh that must happen
+/// immediately after the registry fetch).
+///
+/// Returns `None` only when there is nothing to report at all (no
+/// dependencies reached any of steps 0-3, including the pre-filter skips —
+/// i.e. an empty manifest).
+async fn run_osv_scan_phase_a(
+    uri: Uri,
+    state: Arc<ServerState>,
+    ecosystem: Arc<dyn Ecosystem>,
+    fetch_timeout_secs: u64,
+) -> Option<OsvScanResult> {
+    let ecosystem_id = resolve_ecosystem_id(ecosystem.as_ref());
+
+    let (content_snapshot, targets, mut vulnerabilities, raw_name_by_key) = {
+        let doc = state.get_document(&uri)?;
+        let parse_result = doc.parse_result()?;
+        let (targets, skipped) = build_scan_targets(
+            parse_result,
+            &doc.resolved_versions,
+            ecosystem.formatter(),
+            ecosystem_id,
+        );
+        let raw_name_by_key: HashMap<String, String> = parse_result
+            .dependencies()
+            .into_iter()
+            .map(|d| {
+                (
+                    ecosystem.formatter().normalize_package_name(d.name()),
+                    d.name().to_string(),
+                )
+            })
+            .collect();
+        (doc.content.clone(), targets, skipped, raw_name_by_key)
+    };
+
+    if targets.is_empty() && vulnerabilities.is_empty() {
+        return None;
+    }
+
+    let osv_name_by_key: HashMap<String, String> = targets
+        .iter()
+        .map(|t| (t.key.clone(), t.osv_name.clone()))
+        .collect();
+
+    if !targets.is_empty() {
+        let timeout_duration =
+            Duration::from_secs(fetch_timeout_secs.min(OSV_SCAN_TIMEOUT_CEILING_SECS));
+        let scanned = state
+            .osv
+            .scan(ecosystem_id, &targets, timeout_duration)
+            .await;
+        vulnerabilities.extend(scanned);
+    }
+
+    log_osv_run_summary(&vulnerabilities);
+
+    Some(OsvScanResult {
+        content_snapshot,
+        vulnerabilities,
+        osv_name_by_key,
+        raw_name_by_key,
+    })
+}
+
+/// Phase B: for every dependency phase A flagged [`deps_core::osv::ScanOutcome::Vulnerable`],
+/// checks whether the version currently recommended (the registry's latest,
+/// now that the registry fetch has resolved — critique S1) is itself
+/// affected, then commits the result into `DocumentState.vulnerabilities`.
+///
+/// Must be called only *after* the registry fetch has updated
+/// `doc.cached_versions`: calling it concurrently with that fetch (as the
+/// original implementation did, by folding phase B into the same spawned
+/// task as phase A) reads `cached_versions` before it holds the registry's
+/// actual latest version, so hover could report the *already-installed*
+/// version as "also affected" instead of the true latest.
+///
+/// The write is guarded against a cross-generation stale commit (critique
+/// M4): `spawn_background_task` aborts the *previous* task only after the
+/// new `DocumentState` is already installed, so an in-flight scan from stale
+/// content could otherwise commit advisories computed against content the
+/// document no longer has.
+async fn run_osv_phase_b_and_commit(
+    uri: &Uri,
+    state: &Arc<ServerState>,
+    ecosystem_id: EcosystemId,
+    fetch_timeout_secs: u64,
+    mut result: OsvScanResult,
+) {
+    let vulnerable_keys: Vec<String> = result
+        .vulnerabilities
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, deps_core::osv::ScanOutcome::Vulnerable(_)))
+        .map(|(key, _)| key.clone())
+        .collect();
+
+    if !vulnerable_keys.is_empty() {
+        let candidates: Vec<deps_core::osv::ScanTarget> = {
+            let Some(doc) = state.get_document(uri) else {
+                return;
+            };
+            vulnerable_keys
+                .iter()
+                .filter_map(|key| {
+                    let osv_name = result.osv_name_by_key.get(key)?.clone();
+                    let latest = doc
+                        .cached_versions
+                        .get(key.as_str())
+                        .or_else(|| {
+                            let raw = result.raw_name_by_key.get(key)?;
+                            doc.cached_versions.get(raw.as_str())
+                        })?
+                        .clone();
+                    Some(deps_core::osv::ScanTarget {
+                        key: key.clone(),
+                        osv_name,
+                        version: latest,
+                    })
+                })
+                .collect()
+        };
+
+        if !candidates.is_empty() {
+            let timeout_duration =
+                Duration::from_secs(fetch_timeout_secs.min(OSV_SCAN_TIMEOUT_CEILING_SECS));
+            let statuses = state
+                .osv
+                .check_candidates(ecosystem_id, &candidates, timeout_duration)
+                .await;
+            for (key, status) in statuses {
+                if let Some(deps_core::osv::ScanOutcome::Vulnerable(dv)) =
+                    result.vulnerabilities.get_mut(&key)
+                {
+                    dv.upgrade_status = status;
+                }
+            }
+        }
+    }
+
+    if let Some(mut doc) = state.documents.get_mut(uri) {
+        if doc.content == result.content_snapshot {
+            doc.update_vulnerabilities(result.vulnerabilities);
+        } else {
+            tracing::debug!("dropping stale OSV scan result: document content changed mid-scan");
+        }
+    }
 }
 
 /// Diff between old and new dependency sets.
+///
+/// `version_changed` exists because [`Self::added`]/[`Self::removed`] alone
+/// are name-set diffs: editing a dependency's version requirement in place
+/// (e.g. `time = "0.1.43"` -> `"0.1.44"`) changes neither set, so gating the
+/// OSV rescan on `added` alone would silently skip re-scanning the one
+/// dependency whose version just changed (critique S1).
 #[derive(Debug, Clone, Default)]
 struct DependencyDiff {
     added: Vec<PackageName>,
     removed: Vec<PackageName>,
+    version_changed: Vec<PackageName>,
 }
 
 impl DependencyDiff {
-    fn compute(old_deps: &HashSet<PackageName>, new_deps: &HashSet<PackageName>) -> Self {
+    /// `old`/`new` map each dependency name to its declared version
+    /// requirement (`Dependency::version_requirement()`) at parse time.
+    fn compute(
+        old: &HashMap<PackageName, Option<VersionReq>>,
+        new: &HashMap<PackageName, Option<VersionReq>>,
+    ) -> Self {
+        let old_names: HashSet<&PackageName> = old.keys().collect();
+        let new_names: HashSet<&PackageName> = new.keys().collect();
+
+        let added = new_names
+            .difference(&old_names)
+            .map(|s| (*s).clone())
+            .collect();
+        let removed = old_names
+            .difference(&new_names)
+            .map(|s| (*s).clone())
+            .collect();
+        let version_changed = new_names
+            .intersection(&old_names)
+            .filter(|name| old.get(**name) != new.get(**name))
+            .map(|s| (*s).clone())
+            .collect();
+
         Self {
-            added: new_deps.difference(old_deps).cloned().collect(),
-            removed: old_deps.difference(new_deps).cloned().collect(),
+            added,
+            removed,
+            version_changed,
         }
     }
 
@@ -94,6 +468,25 @@ impl DependencyDiff {
     fn needs_fetch(&self) -> bool {
         !self.added.is_empty()
     }
+
+    /// Whether the OSV rescan (§4) has any reason to run: a new dependency,
+    /// or an existing one whose declared version changed. Kept separate from
+    /// [`Self::needs_fetch`] (registry-fetch gating) since a version-only
+    /// edit needs no registry request but does need a rescan.
+    fn needs_osv_rescan(&self) -> bool {
+        !self.added.is_empty() || !self.version_changed.is_empty()
+    }
+}
+
+/// Builds `name -> version_requirement` for every dependency in `pr`, the
+/// shape [`DependencyDiff::compute`] needs.
+fn dependency_version_map(
+    pr: &dyn deps_core::ParseResult,
+) -> HashMap<PackageName, Option<VersionReq>> {
+    pr.dependencies()
+        .into_iter()
+        .map(|d| (d.name().clone(), d.version_requirement().cloned()))
+        .collect()
 }
 
 /// Result of parallel version fetching.
@@ -254,8 +647,13 @@ pub async fn handle_document_open(
 
     state.update_document(uri.clone(), doc_state);
 
-    // Clone cache config before spawning background task
-    let cache_config = { config.read().await.cache.clone() };
+    // Clone cache and diagnostics config before spawning background task
+    // (both are read here, before any OSV request is built, so disabling
+    // the feature suppresses the network call itself — FR-011).
+    let (cache_config, vulnerabilities_enabled) = {
+        let cfg = config.read().await;
+        (cfg.cache.clone(), cfg.diagnostics.vulnerabilities_enabled)
+    };
 
     // Spawn background task to fetch versions
     let uri_clone = uri.clone();
@@ -278,6 +676,18 @@ pub async fn handle_document_open(
             // Use resolved versions as cached versions for instant display
             doc.update_cached_versions(resolved_versions.clone());
         }
+
+        // Phase A OSV scan, spawned so it runs concurrently with the
+        // registry fetch below rather than gating the inlay-hint refresh
+        // that must happen immediately after it (critique S2).
+        let osv_task = vulnerabilities_enabled.then(|| {
+            tokio::spawn(run_osv_scan_phase_a(
+                uri_clone.clone(),
+                Arc::clone(&state_clone),
+                Arc::clone(&ecosystem_clone),
+                cache_config.fetch_timeout_secs,
+            ))
+        });
 
         // Collect dependency names while holding reference (can't hold across await)
         let dep_names: Vec<PackageName> = {
@@ -378,6 +788,28 @@ pub async fn handle_document_open(
             tracing::debug!("code_lens_refresh not supported: {:?}", e);
         }
 
+        // Join phase A (already running concurrently since it was spawned
+        // above) and, only now that `cached_versions` holds the registry's
+        // actual latest (not the lockfile-seeded placeholder — critique S1),
+        // run phase B and commit before generating diagnostics.
+        if let Some(osv_task) = osv_task {
+            match osv_task.await {
+                Ok(Some(phase_a_result)) => {
+                    let ecosystem_id = resolve_ecosystem_id(ecosystem_clone.as_ref());
+                    run_osv_phase_b_and_commit(
+                        &uri_clone,
+                        &state_clone,
+                        ecosystem_id,
+                        cache_config.fetch_timeout_secs,
+                        phase_a_result,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("OSV scan task failed: {e}"),
+            }
+        }
+
         // Publish diagnostics (may be slower, runs after hints are already visible)
         let diags =
             diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone).await;
@@ -415,38 +847,30 @@ pub async fn handle_document_change(
 
     check_content_size(&content, &uri)?;
 
-    // Extract old dependency names before parsing (for diff computation)
-    let old_dep_names: HashSet<PackageName> =
-        state.get_document(&uri).map_or_else(HashSet::new, |doc| {
+    // Extract old dependency name -> version_requirement map before parsing
+    // (for diff computation)
+    let old_deps: HashMap<PackageName, Option<VersionReq>> =
+        state.get_document(&uri).map_or_else(HashMap::new, |doc| {
             doc.parse_result()
-                .map(|pr| {
-                    pr.dependencies()
-                        .into_iter()
-                        .map(|d| d.name().clone())
-                        .collect()
-                })
+                .map(dependency_version_map)
                 .unwrap_or_default()
         });
 
     // Try to parse manifest (may fail for incomplete syntax)
     let parse_result = ecosystem.parse_manifest(&content, &uri).await.ok();
 
-    // Extract new dependency names for diff
-    let new_dep_names: HashSet<PackageName> = parse_result
+    // Extract new dependency name -> version_requirement map for diff
+    let new_deps: HashMap<PackageName, Option<VersionReq>> = parse_result
         .as_ref()
-        .map(|pr| {
-            pr.dependencies()
-                .into_iter()
-                .map(|d| d.name().clone())
-                .collect()
-        })
+        .map(|pr| dependency_version_map(pr.as_ref()))
         .unwrap_or_default();
 
     // Compute dependency diff
-    let diff = DependencyDiff::compute(&old_dep_names, &new_dep_names);
+    let diff = DependencyDiff::compute(&old_deps, &new_deps);
     tracing::debug!(
         added = diff.added.len(),
         removed = diff.removed.len(),
+        version_changed = diff.version_changed.len(),
         "dependency diff"
     );
 
@@ -462,22 +886,35 @@ pub async fn handle_document_change(
         preserve_cache(&mut doc_state, &old_doc);
     }
 
-    // Prune stale cache entries for removed dependencies
+    // Prune stale cache entries for removed dependencies. `vulnerabilities`
+    // is keyed by the *normalized* name (unlike `cached_versions`/
+    // `resolved_versions`, which are raw-`dep.name()`-keyed), so pruning it
+    // with the raw name would silently no-op for Composer/Swift/NuGet-style
+    // ecosystems where normalization changes the string (critique M4).
+    let formatter = ecosystem.formatter();
     for removed_dep in &diff.removed {
         doc_state.cached_versions.remove(removed_dep);
         doc_state.resolved_versions.remove(removed_dep);
+        doc_state
+            .vulnerabilities
+            .remove(&formatter.normalize_package_name(removed_dep));
     }
 
     state.update_document(uri.clone(), doc_state);
 
-    // Clone cache config before spawning background task
-    let cache_config = { config.read().await.cache.clone() };
+    // Clone cache and diagnostics config before spawning background task
+    // (both are read here, before any OSV request is built — FR-011).
+    let (cache_config, vulnerabilities_enabled) = {
+        let cfg = config.read().await;
+        (cfg.cache.clone(), cfg.diagnostics.vulnerabilities_enabled)
+    };
 
     // Spawn background task to update diagnostics
     let uri_clone = uri.clone();
     let state_clone = Arc::clone(&state);
     let ecosystem_clone = Arc::clone(&ecosystem);
     let client_clone = client.clone();
+    let needs_osv_rescan = diff.needs_osv_rescan();
     let deps_to_fetch = diff.added;
 
     let task = tokio::spawn(async move {
@@ -496,6 +933,18 @@ pub async fn handle_document_change(
             doc.update_resolved_versions(resolved_versions.clone());
         }
 
+        // Phase A OSV scan (only when a dependency was added or an existing
+        // one's version changed — critique S1), spawned so it runs
+        // concurrently with the registry fetch below.
+        let osv_task = (vulnerabilities_enabled && needs_osv_rescan).then(|| {
+            tokio::spawn(run_osv_scan_phase_a(
+                uri_clone.clone(),
+                Arc::clone(&state_clone),
+                Arc::clone(&ecosystem_clone),
+                cache_config.fetch_timeout_secs,
+            ))
+        });
+
         // Skip registry fetch if no new dependencies
         if deps_to_fetch.is_empty() {
             tracing::debug!("no new dependencies, skipping registry fetch");
@@ -509,6 +958,24 @@ pub async fn handle_document_change(
             }
             if let Err(e) = client_clone.code_lens_refresh().await {
                 tracing::debug!("code_lens_refresh not supported: {:?}", e);
+            }
+
+            if let Some(osv_task) = osv_task {
+                match osv_task.await {
+                    Ok(Some(phase_a_result)) => {
+                        let ecosystem_id = resolve_ecosystem_id(ecosystem_clone.as_ref());
+                        run_osv_phase_b_and_commit(
+                            &uri_clone,
+                            &state_clone,
+                            ecosystem_id,
+                            cache_config.fetch_timeout_secs,
+                            phase_a_result,
+                        )
+                        .await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("OSV scan task failed: {e}"),
+                }
             }
 
             let diags =
@@ -593,6 +1060,24 @@ pub async fn handle_document_change(
         }
         if let Err(e) = client_clone.code_lens_refresh().await {
             tracing::debug!("code_lens_refresh not supported: {:?}", e);
+        }
+
+        if let Some(osv_task) = osv_task {
+            match osv_task.await {
+                Ok(Some(phase_a_result)) => {
+                    let ecosystem_id = resolve_ecosystem_id(ecosystem_clone.as_ref());
+                    run_osv_phase_b_and_commit(
+                        &uri_clone,
+                        &state_clone,
+                        ecosystem_id,
+                        cache_config.fetch_timeout_secs,
+                        phase_a_result,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("OSV scan task failed: {e}"),
+            }
         }
 
         let diags =
@@ -1854,6 +2339,58 @@ tokio = "1.0"
         }
 
         #[tokio::test]
+        async fn test_preserve_cache_carries_vulnerabilities_across_edit() {
+            use deps_core::osv::{ScanOutcome, VulnerabilityMap};
+
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+time = "0.1.43"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            let mut vulns = VulnerabilityMap::new();
+            vulns.insert("time".to_string(), ScanOutcome::Clean);
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_vulnerabilities(vulns);
+            }
+
+            // A whitespace-only edit: DocumentState is rebuilt from scratch,
+            // which would silently wipe `vulnerabilities` on every keystroke
+            // without preserve_cache carrying it through (§4).
+            let content2 = r#"[dependencies]
+time = "0.1.43"
+
+"#;
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+            state.update_document(uri.clone(), doc_state2);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(matches!(
+                doc.vulnerabilities.get("time"),
+                Some(ScanOutcome::Clean)
+            ));
+        }
+
+        #[tokio::test]
         async fn test_first_open_has_empty_cache() {
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -1939,14 +2476,21 @@ serde = "1.0"
             );
         }
 
+        fn versions(pairs: &[(&str, Option<&str>)]) -> HashMap<PackageName, Option<VersionReq>> {
+            pairs
+                .iter()
+                .map(|(name, req)| (PackageName::new(*name), req.map(VersionReq::new)))
+                .collect()
+        }
+
         #[test]
         fn test_dependency_diff_detects_additions() {
-            let old: HashSet<PackageName> =
-                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
-            let new: HashSet<PackageName> = ["serde", "tokio", "anyhow"]
-                .iter()
-                .map(|s| (*s).into())
-                .collect();
+            let old = versions(&[("serde", Some("1.0")), ("tokio", Some("1.0"))]);
+            let new = versions(&[
+                ("serde", Some("1.0")),
+                ("tokio", Some("1.0")),
+                ("anyhow", Some("1.0")),
+            ]);
 
             let diff = DependencyDiff::compute(&old, &new);
 
@@ -1954,16 +2498,17 @@ serde = "1.0"
             assert!(diff.added.contains(&PackageName::new("anyhow")));
             assert!(diff.removed.is_empty());
             assert!(diff.needs_fetch());
+            assert!(diff.needs_osv_rescan());
         }
 
         #[test]
         fn test_dependency_diff_detects_removals() {
-            let old: HashSet<PackageName> = ["serde", "tokio", "anyhow"]
-                .iter()
-                .map(|s| (*s).into())
-                .collect();
-            let new: HashSet<PackageName> =
-                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
+            let old = versions(&[
+                ("serde", Some("1.0")),
+                ("tokio", Some("1.0")),
+                ("anyhow", Some("1.0")),
+            ]);
+            let new = versions(&[("serde", Some("1.0")), ("tokio", Some("1.0"))]);
 
             let diff = DependencyDiff::compute(&old, &new);
 
@@ -1971,33 +2516,52 @@ serde = "1.0"
             assert_eq!(diff.removed.len(), 1);
             assert!(diff.removed.contains(&PackageName::new("anyhow")));
             assert!(!diff.needs_fetch());
+            assert!(!diff.needs_osv_rescan());
         }
 
         #[test]
         fn test_dependency_diff_no_changes() {
-            let old: HashSet<PackageName> =
-                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
-            let new: HashSet<PackageName> =
-                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
+            let old = versions(&[("serde", Some("1.0")), ("tokio", Some("1.0"))]);
+            let new = versions(&[("serde", Some("1.0")), ("tokio", Some("1.0"))]);
 
             let diff = DependencyDiff::compute(&old, &new);
 
             assert!(diff.added.is_empty());
             assert!(diff.removed.is_empty());
+            assert!(diff.version_changed.is_empty());
             assert!(!diff.needs_fetch());
+            assert!(!diff.needs_osv_rescan());
         }
 
         #[test]
         fn test_dependency_diff_empty_to_new() {
-            let old: HashSet<PackageName> = HashSet::new();
-            let new: HashSet<PackageName> =
-                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
+            let old: HashMap<PackageName, Option<VersionReq>> = HashMap::new();
+            let new = versions(&[("serde", Some("1.0")), ("tokio", Some("1.0"))]);
 
             let diff = DependencyDiff::compute(&old, &new);
 
             assert_eq!(diff.added.len(), 2);
             assert!(diff.removed.is_empty());
             assert!(diff.needs_fetch());
+        }
+
+        #[test]
+        fn test_dependency_diff_detects_version_change_without_name_set_change() {
+            // Regression guard for critique S1: editing only a dependency's
+            // version must be detected even though the name set is unchanged.
+            let old = versions(&[("time", Some("0.1.43"))]);
+            let new = versions(&[("time", Some("0.1.44"))]);
+
+            let diff = DependencyDiff::compute(&old, &new);
+
+            assert!(diff.added.is_empty());
+            assert!(diff.removed.is_empty());
+            assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
+            assert!(!diff.needs_fetch(), "registry fetch is name-set gated only");
+            assert!(
+                diff.needs_osv_rescan(),
+                "a version-only edit must still trigger an OSV rescan"
+            );
         }
 
         #[tokio::test]
@@ -2039,13 +2603,15 @@ tokio = "1.0"
 "#;
 
             // Compute diff and apply cache pruning
-            let old_dep_names: HashSet<PackageName> = ["serde", "tokio", "anyhow"]
+            let old_deps: HashMap<PackageName, Option<VersionReq>> = ["serde", "tokio", "anyhow"]
                 .iter()
-                .map(|s| (*s).into())
+                .map(|s| (PackageName::new(*s), None))
                 .collect();
-            let new_dep_names: HashSet<PackageName> =
-                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
-            let diff = DependencyDiff::compute(&old_dep_names, &new_dep_names);
+            let new_deps: HashMap<PackageName, Option<VersionReq>> = ["serde", "tokio"]
+                .iter()
+                .map(|s| (PackageName::new(*s), None))
+                .collect();
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
 
             let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
             let mut doc_state2 = DocumentState::new_from_parse_result(
@@ -2075,6 +2641,350 @@ tokio = "1.0"
             assert!(doc.cached_versions.contains_key("serde"));
             assert!(doc.cached_versions.contains_key("tokio"));
             assert!(!doc.cached_versions.contains_key("anyhow"));
+        }
+    }
+
+    mod osv_scan_target_tests {
+        use super::*;
+        use deps_core::Dependency;
+        use deps_core::lsp_helpers::EcosystemFormatter;
+        use deps_core::parser::DependencySource;
+        use std::any::Any;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct MockFormatter;
+        impl EcosystemFormatter for MockFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+
+        struct MockDep {
+            name: PackageName,
+            version_req: Option<VersionReq>,
+            source: DependencySource,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::new(Position::new(0, 0), Position::new(0, 1))
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                self.version_req.as_ref()
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> DependencySource {
+                self.source.clone()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult {
+            deps: Vec<MockDep>,
+        }
+
+        impl deps_core::ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                static URI: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
+                URI.get_or_init(|| deps_core::test_util::test_uri("/test/Cargo.toml"))
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        use deps_core::osv::{ScanOutcome, SkipReason};
+
+        #[test]
+        fn is_concrete_version_accepts_explicit_pins_in_any_ecosystem() {
+            for eco in [EcosystemId::Cargo, EcosystemId::Npm, EcosystemId::Go] {
+                assert!(is_concrete_version("=1.2.3", eco), "{eco:?}");
+            }
+            // Go's go.mod bare `v1.9.1` style: Go is not in the
+            // range-default set, so the bare form (with its `v` prefix) is
+            // accepted without needing an explicit `=`.
+            assert!(is_concrete_version("v1.9.1", EcosystemId::Go));
+        }
+
+        #[test]
+        fn is_concrete_version_pep440_double_equals_is_a_pin() {
+            // Critique C2: `strip_prefix('=')` alone turns PEP 440 `"==2.28.0"`
+            // into `"=2.28.0"`, whose first char then fails the digit check.
+            assert!(is_concrete_version("==2.28.0", EcosystemId::Pypi));
+        }
+
+        #[test]
+        fn is_concrete_version_bare_digit_accepted_for_non_range_default_ecosystems() {
+            // Maven/Go/Bundler/Dart/Gradle/NuGet: a bare version is already
+            // exact (or, for NuGet's PackageReference floor, resolves to
+            // exactly that version in practice). Gradle in particular has no
+            // implicit-caret default for a plain coordinate version like
+            // `"2.14.1"` — only the `+` dynamic-version suffix is a range,
+            // and that's rejected separately by `looks_like_a_single_version`.
+            for eco in [
+                EcosystemId::Maven,
+                EcosystemId::Go,
+                EcosystemId::Bundler,
+                EcosystemId::Dart,
+                EcosystemId::Gradle,
+                EcosystemId::NuGet,
+            ] {
+                assert!(is_concrete_version("2.14.1", eco), "{eco:?}");
+            }
+        }
+
+        #[test]
+        fn is_concrete_version_bare_digit_rejected_for_range_default_ecosystems() {
+            // Critique C2: Cargo's bare "1.2.3" is a caret range under
+            // Cargo's own default operator, not a pin — same for npm and
+            // Composer's implicit range notations.
+            for eco in [EcosystemId::Cargo, EcosystemId::Npm, EcosystemId::Composer] {
+                assert!(!is_concrete_version("1.2.3", eco), "{eco:?}");
+                // ...but an explicit pin is still accepted.
+                assert!(is_concrete_version("=1.2.3", eco), "{eco:?}");
+            }
+        }
+
+        #[test]
+        fn is_concrete_version_rejects_partials_and_wildcards() {
+            // Critique C2: npm/Composer "1.x"/"1.2.x" and bare partials like
+            // "1.2" are ranges, and Gradle's "1.+" is a dynamic version —
+            // none of these contained a previously-rejected character.
+            for eco in [EcosystemId::Npm, EcosystemId::Composer] {
+                assert!(!is_concrete_version("1.x", eco), "{eco:?}");
+                assert!(!is_concrete_version("1.2.x", eco), "{eco:?}");
+                assert!(!is_concrete_version("1.2", eco), "{eco:?}");
+            }
+            assert!(!is_concrete_version("1.+", EcosystemId::Gradle));
+        }
+
+        #[test]
+        fn is_concrete_version_rejects_ranges_and_wildcards() {
+            for eco in [EcosystemId::Maven, EcosystemId::Go] {
+                assert!(!is_concrete_version("^1.0", eco));
+                assert!(!is_concrete_version("~1.2", eco));
+                assert!(!is_concrete_version("*", eco));
+                assert!(!is_concrete_version(">=1.0", eco));
+                assert!(!is_concrete_version(">=1.0 <2.0", eco));
+                assert!(!is_concrete_version("1.0.*", eco));
+                assert!(!is_concrete_version("", eco));
+            }
+        }
+
+        #[test]
+        fn is_concrete_version_rejects_non_version_schemes() {
+            let eco = EcosystemId::Go;
+            assert!(!is_concrete_version("latest", eco));
+            assert!(!is_concrete_version("github:user/repo", eco));
+            assert!(!is_concrete_version("file:../x", eco));
+            assert!(!is_concrete_version("main", eco));
+        }
+
+        #[test]
+        fn build_scan_targets_step0_skips_non_registry_source_even_with_lockfile_version() {
+            // A git/path/patched fork must never be flagged with a CVE for a
+            // version it does not actually contain, even when its lockfile
+            // entry carries a plausible-looking version (critique C2).
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("time"),
+                    version_req: Some(VersionReq::new("0.1.43")),
+                    source: DependencySource::Git {
+                        url: "https://github.com/example/time".to_string(),
+                        rev: None,
+                    },
+                }],
+            };
+            let mut resolved = HashMap::new();
+            resolved.insert(PackageName::new("time"), "0.1.43".to_string());
+
+            let (targets, skipped) =
+                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            assert!(targets.is_empty());
+            assert!(matches!(
+                skipped.get("time"),
+                Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
+            ));
+        }
+
+        #[test]
+        fn build_scan_targets_step1_prefers_lockfile_resolved_version() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("serde"),
+                    version_req: Some(VersionReq::new("^1.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let mut resolved = HashMap::new();
+            resolved.insert(PackageName::new("serde"), "1.0.195".to_string());
+
+            let (targets, skipped) =
+                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].version, "1.0.195");
+            assert!(skipped.is_empty());
+        }
+
+        #[test]
+        fn build_scan_targets_step2_uses_concrete_requirement_verbatim() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("log4j-core"),
+                    version_req: Some(VersionReq::new("2.14.1")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let resolved = HashMap::new();
+
+            let (targets, skipped) =
+                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Maven);
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].version, "2.14.1");
+            assert!(skipped.is_empty());
+        }
+
+        #[test]
+        fn build_scan_targets_step3_skips_caret_range_with_no_lockfile_entry() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("serde"),
+                    version_req: Some(VersionReq::new("^1.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let resolved = HashMap::new();
+
+            let (targets, skipped) =
+                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            assert!(targets.is_empty());
+            assert!(matches!(
+                skipped.get("serde"),
+                Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
+            ));
+        }
+
+        #[test]
+        fn build_scan_targets_step3_skips_wildcard_with_no_lockfile_entry() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("serde"),
+                    version_req: Some(VersionReq::new("*")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let resolved = HashMap::new();
+
+            let (targets, skipped) =
+                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            assert!(targets.is_empty());
+            assert!(matches!(
+                skipped.get("serde"),
+                Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
+            ));
+        }
+
+        #[test]
+        fn build_scan_targets_all_non_registry_sources_are_skipped() {
+            let sources = vec![
+                DependencySource::Path {
+                    path: "../local".to_string(),
+                },
+                DependencySource::Url {
+                    url: "https://example.com/pkg.tgz".to_string(),
+                },
+                DependencySource::Sdk {
+                    sdk: "flutter".to_string(),
+                },
+                DependencySource::Workspace,
+                DependencySource::CustomRegistry {
+                    url: "https://private.example.com".to_string(),
+                },
+            ];
+
+            for source in sources {
+                let parse_result = MockParseResult {
+                    deps: vec![MockDep {
+                        name: PackageName::new("pkg"),
+                        version_req: Some(VersionReq::new("1.0.0")),
+                        source: source.clone(),
+                    }],
+                };
+                let mut resolved = HashMap::new();
+                resolved.insert(PackageName::new("pkg"), "1.0.0".to_string());
+
+                let (targets, skipped) = build_scan_targets(
+                    &parse_result,
+                    &resolved,
+                    &MockFormatter,
+                    EcosystemId::Cargo,
+                );
+                assert!(targets.is_empty(), "{source:?} must be skipped (step 0)");
+                assert!(matches!(
+                    skipped.get("pkg"),
+                    Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
+                ));
+            }
+        }
+
+        #[test]
+        fn build_scan_targets_never_drops_a_dependency_silently() {
+            // Critique C1: every dependency considered must end up in either
+            // `targets` or `skipped` — never absent from both.
+            let parse_result = MockParseResult {
+                deps: vec![
+                    MockDep {
+                        name: PackageName::new("concrete"),
+                        version_req: Some(VersionReq::new("2.14.1")),
+                        source: DependencySource::Registry,
+                    },
+                    MockDep {
+                        name: PackageName::new("range-only"),
+                        version_req: Some(VersionReq::new("^1.0")),
+                        source: DependencySource::Registry,
+                    },
+                    MockDep {
+                        name: PackageName::new("git-dep"),
+                        version_req: Some(VersionReq::new("1.0.0")),
+                        source: DependencySource::Git {
+                            url: "https://example.com/git-dep".to_string(),
+                            rev: None,
+                        },
+                    },
+                ],
+            };
+            let resolved = HashMap::new();
+
+            let (targets, skipped) =
+                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Maven);
+
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].key, "concrete");
+            assert_eq!(skipped.len(), 2);
+            assert!(matches!(
+                skipped.get("range-only"),
+                Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
+            ));
+            assert!(matches!(
+                skipped.get("git-dep"),
+                Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
+            ));
         }
     }
 }

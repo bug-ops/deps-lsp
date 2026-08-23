@@ -1,3 +1,4 @@
+use deps_core::Dependency;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 
@@ -117,6 +118,15 @@ impl EcosystemFormatter for ComposerFormatter {
         }
 
         false
+    }
+
+    /// Packagist's canonical form is lowercase, and `composer.json` files
+    /// legitimately carry mixed case (Composer resolves case-insensitively).
+    /// This is the mirror image of NuGet: there, lowercasing kills the
+    /// ecosystem; here, *not* lowercasing does (OSV is case-sensitive for
+    /// every ecosystem except PyPI).
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
+        Some(self.normalize_package_name(dep.name()))
     }
 }
 
@@ -324,6 +334,34 @@ mod tests {
         assert!(f.version_satisfies_requirement("1.2.3", "1"));
         assert!(f.version_satisfies_requirement("1.2.3", "1.2"));
         assert!(!f.version_satisfies_requirement("2.0.0", "1.2"));
+    }
+
+    #[test]
+    fn test_osv_package_name_lowercases_unlike_normalize_used_elsewhere() {
+        use crate::types::{ComposerDependency, ComposerSection};
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let f = ComposerFormatter;
+        let dep = ComposerDependency {
+            name: "Symfony/Http-Kernel".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_req: Some("^4.4".into()),
+            version_range: None,
+            section: ComposerSection::Require,
+        };
+
+        assert_eq!(
+            f.osv_package_name(&dep),
+            Some("symfony/http-kernel".to_string())
+        );
+        // Regression guard: a future "tidy-up" that routes osv_package_name
+        // through normalize_package_name directly instead of calling it
+        // explicitly would still be correct for Composer, but this pins the
+        // observable behavior so any drift is caught.
+        assert_eq!(
+            f.osv_package_name(&dep).as_deref(),
+            Some(f.normalize_package_name(&dep.name).as_str())
+        );
     }
 
     #[test]

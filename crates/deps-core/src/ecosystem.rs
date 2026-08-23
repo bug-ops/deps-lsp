@@ -85,6 +85,39 @@ impl EcosystemId {
             Self::NuGet => "nuget",
         }
     }
+
+    /// OSV.dev `package.ecosystem` value for this ecosystem, or `None` if
+    /// OSV has no equivalent.
+    ///
+    /// An exhaustive `match` rather than a lookup table: adding a 12th
+    /// ecosystem becomes a compile error here instead of a silent
+    /// zero-results ecosystem in OSV queries. Every arm below was verified
+    /// live against `https://api.osv.dev` (each returned real advisories for
+    /// a known-vulnerable version) — see `architecture.md` §2.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::EcosystemId;
+    ///
+    /// assert_eq!(EcosystemId::Cargo.osv_ecosystem(), Some("crates.io"));
+    /// assert_eq!(EcosystemId::Gradle.osv_ecosystem(), Some("Maven"));
+    /// ```
+    #[must_use]
+    pub const fn osv_ecosystem(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Cargo => "crates.io",
+            Self::Npm => "npm",
+            Self::Pypi => "PyPI",
+            Self::Go => "Go",
+            Self::Bundler => "RubyGems",
+            Self::Dart => "Pub",
+            Self::Maven | Self::Gradle => "Maven",
+            Self::Composer => "Packagist",
+            Self::Swift => "SwiftURL",
+            Self::NuGet => "NuGet",
+        })
+    }
 }
 
 impl std::fmt::Display for EcosystemId {
@@ -494,6 +527,31 @@ mod tests {
             let parsed: EcosystemId = id.id().parse().unwrap();
             assert_eq!(parsed, *id);
             assert_eq!(id.to_string(), id.id());
+        }
+    }
+
+    #[test]
+    fn test_osv_ecosystem_mapping_pinned() {
+        let expected: &[(EcosystemId, &str)] = &[
+            (EcosystemId::Cargo, "crates.io"),
+            (EcosystemId::Npm, "npm"),
+            (EcosystemId::Pypi, "PyPI"),
+            (EcosystemId::Go, "Go"),
+            (EcosystemId::Bundler, "RubyGems"),
+            (EcosystemId::Dart, "Pub"),
+            (EcosystemId::Maven, "Maven"),
+            (EcosystemId::Composer, "Packagist"),
+            (EcosystemId::Gradle, "Maven"),
+            (EcosystemId::Swift, "SwiftURL"),
+            (EcosystemId::NuGet, "NuGet"),
+        ];
+
+        for (id, expected_str) in expected {
+            assert_eq!(
+                id.osv_ecosystem(),
+                Some(*expected_str),
+                "unexpected OSV ecosystem string for {id:?}"
+            );
         }
     }
 

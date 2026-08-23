@@ -67,7 +67,8 @@ pub(crate) async fn generate_diagnostics_internal(
     ecosystem
         .generate_diagnostics(
             parse_result,
-            VersionData::new(&doc.cached_versions, &doc.resolved_versions),
+            VersionData::new(&doc.cached_versions, &doc.resolved_versions)
+                .with_vulnerabilities(&doc.vulnerabilities),
             uri,
         )
         .await

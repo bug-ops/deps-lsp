@@ -103,6 +103,7 @@ impl Default for InlayHintsConfig {
 ///     outdated_severity: DiagnosticSeverity::INFORMATION,
 ///     unknown_severity: DiagnosticSeverity::ERROR,
 ///     yanked_severity: DiagnosticSeverity::ERROR,
+///     vulnerabilities_enabled: true,
 /// };
 ///
 /// assert_eq!(config.unknown_severity, DiagnosticSeverity::ERROR);
@@ -115,6 +116,12 @@ pub struct DiagnosticsConfig {
     pub unknown_severity: DiagnosticSeverity,
     #[serde(default = "default_yanked_severity")]
     pub yanked_severity: DiagnosticSeverity,
+    /// Whether to run the OSV.dev vulnerability scan and render its
+    /// diagnostics/hover content. Default `true` (opt-out): `cargo audit`/
+    /// `npm audit` run by default, and an opt-in gate would undercut the
+    /// feature (approved Q5).
+    #[serde(default = "default_true")]
+    pub vulnerabilities_enabled: bool,
 }
 
 impl Default for DiagnosticsConfig {
@@ -123,6 +130,7 @@ impl Default for DiagnosticsConfig {
             outdated_severity: default_outdated_severity(),
             unknown_severity: default_unknown_severity(),
             yanked_severity: default_yanked_severity(),
+            vulnerabilities_enabled: true,
         }
     }
 }
@@ -453,6 +461,23 @@ mod tests {
         assert_eq!(config.outdated_severity, DiagnosticSeverity::ERROR);
         assert_eq!(config.unknown_severity, DiagnosticSeverity::WARNING);
         assert_eq!(config.yanked_severity, DiagnosticSeverity::WARNING);
+    }
+
+    #[test]
+    fn test_diagnostics_config_vulnerabilities_enabled_defaults_true() {
+        let config = DiagnosticsConfig::default();
+        assert!(config.vulnerabilities_enabled);
+
+        let json = r"{}";
+        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
+        assert!(config.vulnerabilities_enabled);
+    }
+
+    #[test]
+    fn test_diagnostics_config_vulnerabilities_enabled_can_be_disabled() {
+        let json = r#"{ "vulnerabilities_enabled": false }"#;
+        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.vulnerabilities_enabled);
     }
 
     #[test]

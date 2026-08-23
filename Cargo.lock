@@ -481,6 +481,7 @@ dependencies = [
  "mockito",
  "reqwest",
  "semver",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
