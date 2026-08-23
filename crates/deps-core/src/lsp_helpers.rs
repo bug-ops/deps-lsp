@@ -977,8 +977,7 @@ fn build_vulnerability_fix_action(
     // declared text and the freshly-formatted text don't agree on (e.g.
     // pep508's `>=1.7, <2.0` vs. a formatter's `>=1.7,<2.0`), which would
     // otherwise let a whitespace-only edit slip past this guard.
-    let strip_ws = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    if strip_ws(version_req) == strip_ws(&new_text) {
+    if strip_whitespace(version_req) == strip_whitespace(&new_text) {
         return None;
     }
 
@@ -1075,7 +1074,23 @@ fn build_vulnerability_fix_action(
 ///    action's edit text comes from [`EcosystemFormatter::format_version_replacing`],
 ///    which preserves the manifest's existing pin/operator style where an
 ///    ecosystem overrides it (e.g. PyPI's `==1.0.1` stays `==1.0.2` rather
-///    than expanding to a `>=,<` range).
+///    than expanding to a `>=,<` range). An entry whose formatted edit text
+///    already matches the declared requirement (whitespace-insensitive) is
+///    skipped as a no-op, mirroring the N1 guard in
+///    `build_vulnerability_fix_action`. This is the common case, not a rare
+///    edge case: [`crate::completion::prepare_version_display_items`] lists
+///    the top 5 non-yanked registry versions newest-first, so whenever the
+///    declared version is already within 5 releases of latest, it is itself
+///    one of the display items being offered as an "update". This guard is
+///    scoped to that one case — a display item textually matching the
+///    *declared requirement* — not to duplicates *among* display items,
+///    which is a separate, out-of-scope concern. Textual (not semantic)
+///    equality is deliberate: `formatter.is_requirement_up_to_date` answers
+///    "does `latest` already satisfy this requirement", which is true for
+///    e.g. `is_requirement_up_to_date("^1.0", "1.2.0")` and would wrongly
+///    suppress every explicit-bump action for a range-style requirement; it
+///    also can't detect a pinned no-op like `==1.0.0` -> `==1.0.0`, since it
+///    never compares the formatted edit text at all.
 ///
 /// Returns an empty `Vec` also when (no fix action applies and) the registry
 /// fetch fails.
@@ -1164,6 +1179,10 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     }
 
     let display_items = prepare_version_display_items(&registry_versions, dep.name());
+    // N1: skip a no-op edit below — mirrors the same guard in
+    // `build_vulnerability_fix_action`. Computed once since `version_req` doesn't change
+    // across display items.
+    let normalized_version_req = strip_whitespace(version_req.as_str());
 
     for item in display_items {
         // The fix action above already covers this exact edit with a more
@@ -1173,6 +1192,10 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         }
 
         let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());
+
+        if normalized_version_req == strip_whitespace(&new_text) {
+            continue;
+        }
 
         let mut edits = HashMap::new();
         edits.insert(
@@ -1323,6 +1346,17 @@ pub fn generate_diagnostics_from_cache(
     diagnostics
 }
 
+/// Strips every whitespace character from `s`, so two textually-equivalent strings that
+/// differ only in spacing compare equal.
+///
+/// Shared by every no-op/literal-match guard in this module (`build_vulnerability_fix_action`'s
+/// N1 guard, `generate_code_actions`'s REFACTOR-loop guard, and `literal_span_matches`), all of
+/// which compare a declared requirement string against a differently-normalized counterpart —
+/// e.g. pep508's `>=1.7, <2.0` vs. a formatter's `>=1.7,<2.0`.
+fn strip_whitespace(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
 /// Slices `content` over an LSP `Range` using a pre-built `LineOffsetTable`, returning
 /// `""` for an inverted or out-of-bounds range instead of panicking.
 ///
@@ -1356,8 +1390,8 @@ fn slice_for_range<'a>(content: &'a str, table: &LineOffsetTable, range: Range) 
 /// `1.0.0` and **falsely rejects** an editable dependency. Wrapping only the slice side
 /// handles both spellings without that false reject.
 fn literal_span_matches(slice: &str, requirement: &str) -> bool {
-    let norm_slice: String = slice.chars().filter(|c| !c.is_whitespace()).collect();
-    let norm_req: String = requirement.chars().filter(|c| !c.is_whitespace()).collect();
+    let norm_slice = strip_whitespace(slice);
+    let norm_req = strip_whitespace(requirement);
     norm_slice == norm_req || format!("[{norm_slice}]") == norm_req
 }
 
@@ -2971,6 +3005,29 @@ mod tests {
             .collect()
     }
 
+    fn refactor_titles(actions: &[CodeAction]) -> Vec<&str> {
+        actions
+            .iter()
+            .filter(|a| a.kind == Some(CodeActionKind::REFACTOR))
+            .map(|a| a.title.as_str())
+            .collect()
+    }
+
+    /// A formatter whose formatted edit text differs from the bare version only in
+    /// whitespace (a trailing space) — used to prove the REFACTOR-loop no-op guard
+    /// compares whitespace-insensitively rather than by raw string equality.
+    struct TrailingSpaceFormatter;
+
+    impl EcosystemFormatter for TrailingSpaceFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            format!("{version} ")
+        }
+
+        fn package_url(&self, name: &PackageName) -> String {
+            format!("https://example.com/{name}")
+        }
+    }
+
     #[tokio::test]
     async fn test_generate_code_actions_combines_advisories_sharing_the_highest_fix() {
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
@@ -3268,6 +3325,86 @@ mod tests {
         .await;
 
         assert!(quickfix_titles(&actions).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_refactor_loop_skips_no_op_entry_but_keeps_real_update() {
+        // Regression for #238: no OSV vulnerabilities are present, isolating the plain
+        // REFACTOR loop's own no-op guard from `build_vulnerability_fix_action`'s
+        // separate N1 guard (the two prior "no_op" tests above only exercise the latter,
+        // since `MockRegistry` returns no versions and the REFACTOR loop body never
+        // runs). The registry lists the already-declared version among the top-5
+        // display items — the common case per `prepare_version_display_items`, not an
+        // edge case — plus one genuinely newer version.
+        let (dep, version_range, content) = vulnerable_dep("1.2.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+        let registry = FixedVersionRegistry {
+            versions: vec![("1.2.0", false), ("1.1.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &IdentityFormatter,
+        )
+        .await;
+
+        let titles = refactor_titles(&actions);
+        assert!(
+            !titles.iter().any(|t| t.starts_with("1.2.0")),
+            "the already-declared version must not be offered as an update: {titles:?}"
+        );
+        assert!(
+            titles.contains(&"1.1.0"),
+            "a genuinely different version must still be offered: {titles:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_refactor_loop_no_op_guard_ignores_whitespace() {
+        // Whitespace-only divergence between the declared requirement and the
+        // formatter's edit text must still be treated as a no-op, mirroring
+        // `build_vulnerability_fix_action`'s N1 guard and `literal_span_matches`'s
+        // `test_guard_accepts_whitespace_only_difference`.
+        let (dep, version_range, content) = vulnerable_dep("1.2.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+        let registry = FixedVersionRegistry {
+            versions: vec![("1.2.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &TrailingSpaceFormatter,
+        )
+        .await;
+
+        assert!(
+            refactor_titles(&actions).is_empty(),
+            "a whitespace-only edit-text divergence must still be skipped as a no-op"
+        );
     }
 
     #[tokio::test]
