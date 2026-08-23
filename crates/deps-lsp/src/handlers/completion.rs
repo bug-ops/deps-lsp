@@ -167,8 +167,10 @@ async fn fallback_completion(
 
     tracing::info!("fallback_completion: prefix = {:?}", prefix);
 
-    // If it looks like a package name (letters, no = sign, at least 2 chars)
-    if prefix.is_empty() || prefix.contains('=') || prefix.len() < 2 {
+    // If it looks like a package name (letters, no = sign, at least 2 chars).
+    // Count Unicode scalar values, not bytes: a single multi-byte character
+    // (e.g. one CJK character) must not satisfy the "at least 2 chars" intent.
+    if prefix.is_empty() || prefix.contains('=') || prefix.chars().count() < 2 {
         tracing::info!("fallback_completion: prefix rejected (empty, contains =, or < 2 chars)");
         return vec![];
     }
@@ -592,6 +594,73 @@ mod tests {
     use tower_lsp_server::ls_types::{
         Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
+
+    /// Builds a `ServerState` whose `"cargo"` ecosystem entry is overridden to route
+    /// registry search through `registry`, so `fallback_completion` tests can observe
+    /// (or forbid) a search call without hitting the network.
+    fn mock_cargo_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
+        use deps_core::{Ecosystem, EcosystemFormatter, ParseResult};
+        use std::any::Any;
+        use tower_lsp_server::ls_types::Uri;
+
+        struct MockFormatter;
+        impl EcosystemFormatter for MockFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+
+        struct MockEcosystem {
+            registry: Arc<dyn deps_core::Registry>,
+        }
+        impl deps_core::ecosystem::private::Sealed for MockEcosystem {}
+        impl Ecosystem for MockEcosystem {
+            fn id(&self) -> &'static str {
+                "cargo"
+            }
+            fn display_name(&self) -> &'static str {
+                "Cargo (mock)"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &["Cargo.toml"]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a Uri,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
+            {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn registry(&self) -> Arc<dyn deps_core::Registry> {
+                Arc::clone(&self.registry)
+            }
+            fn formatter(&self) -> &dyn EcosystemFormatter {
+                &MockFormatter
+            }
+            fn generate_completions<'a>(
+                &'a self,
+                _parse_result: &'a dyn ParseResult,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = ServerState::new();
+        state
+            .ecosystem_registry
+            .register(Arc::new(MockEcosystem { registry }));
+        state
+    }
 
     #[tokio::test]
     async fn test_completion_returns_empty_for_missing_document() {
@@ -1242,7 +1311,149 @@ s
 
         // Should reject single char (< 2 chars requirement)
         assert_eq!(prefix.len(), 1);
-        assert!(prefix.len() < 2);
+        assert!(prefix.chars().count() < 2);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_completion_rejects_single_cjk_char_prefix() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        // A single CJK character is 3 bytes, so byte-length guard `prefix.len() < 2`
+        // wrongly let it reach the registry; `search` panics here so the test fails
+        // loudly if the guard regresses instead of silently returning empty either way.
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                panic!("guard must short-circuit before reaching registry search");
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry));
+        let content = "[dependencies]\n日\n";
+        let position = Position::new(1, 1); // after the single CJK char
+
+        let items = fallback_completion(&state, EcosystemId::Cargo, position, content).await;
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fallback_completion_passes_two_char_prefixes_to_search() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct MockMetadata {
+            name: deps_core::PackageName,
+        }
+        impl Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &'static str {
+                "1.0.0"
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct StubRegistry;
+        impl Registry for StubRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockMetadata {
+                        name: deps_core::PackageName::new("serde"),
+                    }) as Box<dyn Metadata>])
+                })
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        // Two CJK characters: byte count (6) and char count (2) agree, so this was
+        // never affected by the bug, but it must keep passing through to search.
+        let cjk_state = mock_cargo_state(Arc::new(StubRegistry));
+        let cjk_items = fallback_completion(
+            &cjk_state,
+            EcosystemId::Cargo,
+            Position::new(1, 2),
+            "[dependencies]\n日本\n",
+        )
+        .await;
+        assert_eq!(cjk_items.len(), 1);
+        assert_eq!(cjk_items[0].label, "serde");
+
+        // Two ASCII chars: regression check that the char-count guard didn't change
+        // behavior for the common case.
+        let ascii_state = mock_cargo_state(Arc::new(StubRegistry));
+        let ascii_items = fallback_completion(
+            &ascii_state,
+            EcosystemId::Cargo,
+            Position::new(1, 2),
+            "[dependencies]\nse\n",
+        )
+        .await;
+        assert_eq!(ascii_items.len(), 1);
+        assert_eq!(ascii_items[0].label, "serde");
     }
 
     #[test]
