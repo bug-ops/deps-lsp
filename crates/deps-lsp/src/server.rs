@@ -243,7 +243,10 @@ impl Backend {
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             inlay_hint_provider: Some(OneOf::Left(true)),
             code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
-                code_action_kinds: Some(vec![tower_lsp_server::ls_types::CodeActionKind::REFACTOR]),
+                code_action_kinds: Some(vec![
+                    tower_lsp_server::ls_types::CodeActionKind::REFACTOR,
+                    tower_lsp_server::ls_types::CodeActionKind::QUICKFIX,
+                ]),
                 ..Default::default()
             })),
             code_lens_provider: Some(CodeLensOptions {
@@ -803,6 +806,7 @@ mod tests {
                     .code_action_kinds
                     .expect("code action kinds should exist");
                 assert!(kinds.contains(&tower_lsp_server::ls_types::CodeActionKind::REFACTOR));
+                assert!(kinds.contains(&tower_lsp_server::ls_types::CodeActionKind::QUICKFIX));
             }
             _ => panic!("Expected code action provider options"),
         }

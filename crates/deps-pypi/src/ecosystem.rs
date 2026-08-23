@@ -638,8 +638,16 @@ name = "test"
             line: 0,
             character: 0,
         };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
         let actions = ecosystem
-            .generate_code_actions(parse_result.as_ref(), position, &uri, content)
+            .generate_code_actions(
+                parse_result.as_ref(),
+                position,
+                &uri,
+                VersionData::new(&cached_versions, &resolved_versions),
+                content,
+            )
             .await;
 
         assert!(actions.is_empty());

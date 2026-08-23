@@ -395,6 +395,8 @@ async fn run_osv_phase_b_and_commit(
         .collect();
 
     if !vulnerable_keys.is_empty() {
+        // TODO(critic): phase B checks registry-latest only; the fix target F is
+        // never scanned — see #216 critique D1
         let candidates: Vec<deps_core::osv::ScanTarget> = {
             let Some(doc) = state.get_document(uri) else {
                 return;

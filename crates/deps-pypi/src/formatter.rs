@@ -57,10 +57,22 @@ impl EcosystemFormatter for PypiFormatter {
 
         if let Some(term) = terms.iter().find(|t| t.starts_with("==")) {
             return match term.strip_prefix("==").and_then(|r| r.strip_suffix(".*")) {
-                Some(base) => match truncate_release_to_match(base, version) {
-                    Some(truncated) => format!("=={truncated}.*"),
-                    None => format!("=={version}"),
-                },
+                Some(base) => {
+                    let candidate = truncate_release_to_match(base, version)
+                        .map(|truncated| format!("=={truncated}.*"))
+                        .unwrap_or_else(|| format!("=={version}"));
+                    // Truncating `version` back down to the wildcard's own
+                    // precision can reproduce `current` byte-for-byte (e.g.
+                    // `==1.0.*` stays `==1.0.*` for a 1.0.2 fix) even though
+                    // the wildcard still admits the vulnerable range it
+                    // started from — fall back to the untruncated exact pin
+                    // rather than silently no-oping a live finding.
+                    if candidate == *term {
+                        format!("=={version}")
+                    } else {
+                        candidate
+                    }
+                }
                 None => format!("=={version}"),
             };
         }
@@ -71,9 +83,14 @@ impl EcosystemFormatter for PypiFormatter {
                 .map(|v| v.release().len())
                 .unwrap_or(0);
             return if release_len >= 2 {
-                match truncate_release_to_match(rest, version) {
-                    Some(truncated) => format!("~={truncated}"),
-                    None => format!("~={version}"),
+                let candidate = truncate_release_to_match(rest, version)
+                    .map(|truncated| format!("~={truncated}"))
+                    .unwrap_or_else(|| format!("~={version}"));
+                // Same no-op fallback as the `==` wildcard case above.
+                if candidate == *term {
+                    format!("~={version}")
+                } else {
+                    candidate
                 }
             } else {
                 // `~=3` has a single release segment, which is not valid PEP 440
@@ -238,6 +255,43 @@ mod tests {
     }
 
     #[test]
+    fn test_osv_version_to_native_round_trips_through_own_parser() {
+        // Critic S2 gate: `osv_version_to_native` is identity for PyPI (OSV
+        // records use PEP 440 verbatim), so the version it hands to
+        // `format_version_for_text_edit` — which expands it into a
+        // `>=v,<next-major` range, unlike the identity edit most other
+        // ecosystems use — must itself satisfy the requirement text that
+        // edit produces.
+        let formatter = PypiFormatter;
+        let osv_version = "2.28.0";
+        let native = formatter.osv_version_to_native(osv_version);
+        assert_eq!(native, osv_version);
+        let edit_text = formatter.format_version_for_text_edit(&native);
+        assert!(formatter.version_satisfies_requirement(&native, &edit_text));
+    }
+
+    #[test]
+    fn test_osv_version_to_native_round_trips_through_format_version_replacing() {
+        // Critic M2: the vulnerability-fix `TextEdit` is now built via
+        // `format_version_replacing`, not `format_version_for_text_edit` —
+        // the round-trip gate above no longer guards the code it was
+        // written for. Same property, retargeted at the method the fix
+        // path actually calls, across every `current` shape it recognizes.
+        let formatter = PypiFormatter;
+        let osv_version = "2.28.0";
+        let native = formatter.osv_version_to_native(osv_version);
+        assert_eq!(native, osv_version);
+
+        for current in ["==2.20.0", "==2.20.*", "~=2.20", "~=2.20.0", ">=2.20,<2.21"] {
+            let edit_text = formatter.format_version_replacing(&native, current);
+            assert!(
+                formatter.version_satisfies_requirement(&native, &edit_text),
+                "current={current:?} produced edit_text={edit_text:?}, which does not admit {native:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_normalize_fast_path() {
         let formatter = PypiFormatter;
         // Already lowercase, no hyphens - should hit fast path
@@ -327,6 +381,43 @@ mod tests {
         assert_eq!(
             formatter.format_version_replacing("2.0.0", ">=1.0"),
             ">=2.0.0,<3"
+        );
+    }
+
+    #[test]
+    fn test_format_version_replacing_wildcard_pin_no_op_falls_back_to_exact_fix() {
+        // Critic S1: truncating the fix version back down to the pin's own
+        // precision can reproduce `current` byte-for-byte even though the
+        // pin still admits the vulnerable range it started from (`~=1.0`
+        // and `==1.0.*` both still match 1.0.0/1.0.1). If that happens, the
+        // untruncated exact version must be emitted instead, or the N1
+        // no-op guard in `deps-core` silently drops the vulnerability
+        // quickfix entirely.
+        let formatter = PypiFormatter;
+
+        assert_eq!(
+            formatter.format_version_replacing("1.0.2", "~=1.0"),
+            "~=1.0.2"
+        );
+        assert_eq!(
+            formatter.format_version_replacing("1.0.2", "==1.0.*"),
+            "==1.0.2"
+        );
+
+        // `~=`'s floor equals the fix version's own precision: the
+        // untruncated fallback text is identical to the truncated one, so
+        // this is a genuine no-op either way (unaffected by the fallback).
+        assert_eq!(
+            formatter.format_version_replacing("1.0.2", "~=1.0.2"),
+            "~=1.0.2"
+        );
+        // `==V.*` has no floor semantics (it is a release-prefix match, not
+        // a lower bound), so there is no textually-identical "genuine
+        // no-op" fallback for it — the wildcard is narrowed to an exact pin
+        // instead, which is always at least as safe as leaving it alone.
+        assert_eq!(
+            formatter.format_version_replacing("1.0.2", "==1.0.2.*"),
+            "==1.0.2"
         );
     }
 

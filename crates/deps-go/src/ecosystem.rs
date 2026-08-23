@@ -569,6 +569,8 @@ mod tests {
         };
 
         let position = Position::new(5, 5);
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
 
         // `version_range` on line 5 spans columns 0..10; content must slice to
         // exactly the declared requirement text there for the `literal_span_matches`
@@ -576,7 +578,13 @@ mod tests {
         let content = "\n\n\n\n\nv1.9.0    \n";
 
         let actions = ecosystem
-            .generate_code_actions(&parse_result, position, &uri, content)
+            .generate_code_actions(
+                &parse_result,
+                position,
+                &uri,
+                VersionData::new(&cached_versions, &resolved_versions),
+                content,
+            )
             .await;
 
         // Returns actions (open documentation link)

@@ -44,6 +44,16 @@ impl EcosystemFormatter for GoFormatter {
         false
     }
 
+    fn osv_version_to_native(&self, version: &str) -> String {
+        // OSV's `fixed` events for Go are plain semver (`0.3.7`), never
+        // carrying the `v` prefix Go module versions require in go.mod.
+        if version.starts_with('v') {
+            version.to_string()
+        } else {
+            format!("v{version}")
+        }
+    }
+
     fn osv_version(&self, version: &str) -> String {
         // Go module versions always carry a mandatory "v" prefix
         // (golang.org/x/mod/module convention), but OSV.dev's SEMVER range
@@ -176,6 +186,16 @@ mod tests {
 
         // But v1.2.3.1 SHOULD match v1.2.3 (if it has dot boundary)
         assert!(formatter.version_satisfies_requirement("v1.2.3.1", "v1.2.3"));
+    }
+
+    #[test]
+    fn test_osv_version_to_native_prepends_v_prefix() {
+        let formatter = GoFormatter;
+
+        assert_eq!(formatter.osv_version_to_native("0.3.7"), "v0.3.7");
+        // Already-prefixed input (should not occur in practice, but must
+        // not be double-prefixed) round-trips unchanged.
+        assert_eq!(formatter.osv_version_to_native("v0.3.7"), "v0.3.7");
     }
 
     #[test]

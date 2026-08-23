@@ -97,6 +97,42 @@ in that case is regenerating the lock file, which only the package manager can d
 there is nothing for the lens to edit. Unifying the two definitions is tracked as a
 follow-up.
 
+### Code Action: Fix Vulnerability
+
+A dependency flagged by the OSV vulnerability scan (see the security-advisories hover
+section and diagnostics) gets an extra code action alongside the plain "update to
+version X" list: a quickfix titled `Update to <version> (fixes <ADVISORY-ID>[ +N more])`,
+naming only the worst-severity advisory id and summarizing the rest so the title stays
+readable in an editor's code-action menu (the full id list still travels with the action
+so editors can bind it to the matching diagnostics — see below). The target version is the
+*lowest* version that resolves every advisory the action claims to fix: an advisory OSV
+reports as still applying at the checked candidate (from the scan's second-phase check) is
+excluded from the claim, and — crucially — excluded *before* the target version is picked,
+so that advisory's own fix version (which may be much higher) can never inflate the
+recommendation past what the claimed advisories actually need.
+
+The action is independent of the registry fetch that produces the plain update list, so a
+registry outage never hides it. When the registry fetch does succeed, a fix version the
+registry reports as yanked is dropped instead of offered (no action, rather than silently
+retargeting to some other version), and a fix version whose *formatted* manifest text
+already matches the dependency's declared requirement is skipped as a no-op edit — the
+comparison uses the actual text the edit would write, not the bare version, since several
+ecosystems format it differently (Dart wraps it in a `^` constraint, PyPI expands it into a
+`>=,<` range). If the scanned version came from the lock file rather than the declared
+requirement, the title gets an `; update lockfile to apply` suffix, since editing the
+manifest alone will not clear the diagnostic until the lock file is regenerated.
+
+Editors that support diagnostic-bound quickfixes (surfacing the action from the advisory's
+own lightbulb rather than only the generic code-action menu) get this automatically: the
+action carries its resolved advisory ids internally, and `deps-lsp` binds it to any
+matching diagnostic the client already reported for the same range. Filtering code actions
+by kind (e.g. an editor's "quick fix only" view) is also honored.
+
+**Go note.** The formatter hook this action relies on to convert an OSV-reported version
+into `go.mod`'s `v`-prefixed form is in place, but Go's vulnerability scan currently sends
+the `v`-prefixed module version to OSV, which expects it unprefixed, and gets no matches
+back (tracked separately) — so no Go dependency can trigger this action yet.
+
 ### npm Package Name Validation
 
 When a dependency in `package.json` fails to resolve against the npm registry, the diagnostic distinguishes between two cases instead of always reporting "Unknown package":

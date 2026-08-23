@@ -570,6 +570,37 @@ pub trait EcosystemFormatter: Send + Sync {
         Some(dep.name().to_string())
     }
 
+    /// Converts a version string as it appears in an OSV advisory record
+    /// (e.g. [`crate::osv::Advisory::fixed_versions`]) into this ecosystem's
+    /// own version namespace, as used in manifests and by the registry.
+    ///
+    /// Default: identity — correct for ecosystems whose OSV records carry
+    /// the native version string verbatim. Override when OSV's namespace
+    /// diverges from the native one (Go module versions carry a `v` prefix
+    /// that OSV's SEMVER ranges never use).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::PackageName;
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(DefaultFormatter.osv_version_to_native("1.2.3"), "1.2.3");
+    /// ```
+    fn osv_version_to_native(&self, version: &str) -> String {
+        version.to_string()
+    }
+
     /// Rewrites a native-ecosystem version string into the spelling OSV.dev's
     /// SEMVER range matching expects.
     ///
@@ -856,14 +887,171 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     })
 }
 
-// TODO(critic): FR-006 (upgrade code actions for vulnerable dependencies) is
-// deferred to a follow-up PR — this is the one helper that does not take
-// `VersionData`, so wiring it up requires an `Ecosystem` trait signature
-// change that no crate currently overrides. See architecture.md §7/§10 Q3.
+/// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
+/// bundled with the native-namespace version it targets so callers can dedup
+/// display items and check the registry's yank flag against it without
+/// re-parsing the action's title.
+struct VulnerabilityFixAction {
+    /// `fix.version`, converted to this ecosystem's namespace via
+    /// [`EcosystemFormatter::osv_version_to_native`].
+    version_native: String,
+    action: CodeAction,
+}
+
+/// Builds the "fix vulnerability" quickfix for `dep`, if OSV data
+/// recommends one.
+///
+/// Registry-independent by construction (FR-007, mirroring the rule already
+/// enforced in [`generate_diagnostics_from_cache`]): computed entirely from
+/// `versions.vulnerabilities` and `version_req` (the caller's already-fetched
+/// `dep.version_requirement()`), never from a registry fetch. Callers must
+/// still reconcile the result against a successful registry fetch when one
+/// is available — see the yank check in [`generate_code_actions`].
+fn build_vulnerability_fix_action(
+    dep: &dyn Dependency,
+    uri: &Uri,
+    version_range: Range,
+    versions: VersionData<'_>,
+    version_req: &str,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<VulnerabilityFixAction> {
+    let normalized_name = formatter.normalize_package_name(dep.name());
+    let outcome = versions.vulnerabilities.and_then(|m| {
+        m.get(&normalized_name)
+            .or_else(|| m.get(dep.name().as_str()))
+    })?;
+    let ScanOutcome::Vulnerable(dv) = outcome else {
+        return None;
+    };
+    let fix = dv.recommended_fix()?;
+    let version_native = formatter.osv_version_to_native(&fix.version);
+    // Computed before the N1 guard below against the *same* formatting the
+    // plain "update version" action uses (`format_version_replacing`), not
+    // the bare version: several ecosystems wrap or expand it (`deps-dart`'s
+    // `^`-prefix, a range), and `deps-pypi` rewrites it in place to preserve
+    // the manifest's existing pin style (`==1.0.1` -> `==1.0.2`) — the guard
+    // must compare the text that would actually be written.
+    let new_text = formatter.format_version_replacing(&version_native, version_req);
+
+    // N1: skip a no-op edit — the manifest already declares exactly the text
+    // this action would write, so applying it would rewrite the text to
+    // itself. Whitespace-insensitive, mirroring `literal_span_matches`:
+    // `version_req` can be a normalized requirement string with spacing the
+    // declared text and the freshly-formatted text don't agree on (e.g.
+    // pep508's `>=1.7, <2.0` vs. a formatter's `>=1.7,<2.0`), which would
+    // otherwise let a whitespace-only edit slip past this guard.
+    let strip_ws = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    if strip_ws(version_req) == strip_ws(&new_text) {
+        return None;
+    }
+
+    // S3: the scan target may have been the lockfile-resolved version, not
+    // the declared requirement — rewriting the manifest alone would then not
+    // clear the diagnostic until the lockfile is regenerated. Say so in the
+    // title rather than silently overclaiming.
+    let lockfile_hit = versions
+        .resolved
+        .get(normalized_name.as_str())
+        .or_else(|| versions.resolved.get(dep.name()))
+        .is_some();
+
+    // Names only the first (worst-severity, per `recommended_fix`'s sort)
+    // advisory id and summarizes the rest — `recommended_fix` can return an
+    // unbounded number of ids (up to `ADVISORY_DISPLAY_CAP`), and a title
+    // listing every one of them would overflow an editor's code-action menu.
+    let (first_id, rest_ids) = fix.advisory_ids.split_first()?;
+    let fixes = if rest_ids.is_empty() {
+        first_id.clone()
+    } else {
+        format!("{first_id} +{} more", rest_ids.len())
+    };
+    let title = if lockfile_hit {
+        format!("Update to {version_native} (fixes {fixes}; update lockfile to apply)")
+    } else {
+        format!("Update to {version_native} (fixes {fixes})")
+    };
+
+    let mut edits = HashMap::new();
+    edits.insert(
+        uri.clone(),
+        vec![TextEdit {
+            range: version_range,
+            new_text,
+        }],
+    );
+
+    Some(VulnerabilityFixAction {
+        version_native,
+        action: CodeAction {
+            title,
+            kind: Some(CodeActionKind::QUICKFIX),
+            edit: Some(WorkspaceEdit {
+                changes: Some(edits),
+                ..Default::default()
+            }),
+            is_preferred: Some(true),
+            // Stashes the resolved advisory ids so the `deps-lsp` handler can
+            // bind this action to the matching client-supplied diagnostics
+            // (`CodeActionContext::diagnostics`) without deps-core needing to
+            // know about LSP request context — cleared by the handler once
+            // consumed.
+            data: Some(serde_json::json!({ "advisory_ids": fix.advisory_ids })),
+            ..Default::default()
+        },
+    })
+}
+
+/// Generates the code actions offered for the dependency at `position`.
+///
+/// Finds the dependency whose declared version `position` falls on
+/// (`formatter.is_position_on_dependency`). Returns an empty `Vec`
+/// immediately if no dependency is at `position`, it has no `version_range`
+/// to edit, it has no declared (or an empty) `version_requirement`, or the
+/// **literal-span guard** rejects it — `content` sliced over `version_range`
+/// no longer holds the literal requirement text (see `literal_span_matches`,
+/// e.g. a Maven `${property}` reference, a Gradle DSL variable/alias, or a
+/// synthesized comparator's lower bound). Writing a `TextEdit` at that range
+/// would corrupt the manifest instead of fixing it, so this mirrors the
+/// guard `collect_update_all_edits` already applies on the bulk-edit path,
+/// and gates *both* kinds of action below since either could write there.
+///
+/// Otherwise returns up to two kinds of action, in this order:
+///
+/// 1. At most one `QUICKFIX` "fix vulnerability" action, if `versions`
+///    carries an OSV scan result flagging this dependency and
+///    [`crate::osv::DependencyVulnerabilities::recommended_fix`] has a
+///    claimable target (see the private `build_vulnerability_fix_action` helper
+///    just above). This action
+///    is computed entirely from `versions` and the dependency's declared
+///    requirement, deliberately *before* the `registry.get_versions` call
+///    below — a registry outage must never hide a known-vulnerable
+///    dependency's fix (FR-007), so this action is still returned even when
+///    the registry fetch that produces the plain list below fails. When the
+///    fetch does succeed, a fix target the registry reports as yanked is
+///    dropped rather than offered.
+/// 2. Up to five plain `REFACTOR` "update to `<version>`" actions, one per
+///    non-yanked version [`crate::completion::prepare_version_display_items`]
+///    selects from the registry response — skipping whichever entry (if any)
+///    exactly duplicates the fix action's own target, and demoting
+///    `is_preferred` to `None` on all of them when a fix action is present,
+///    since only one preferred action is meaningful per response. Each
+///    action's edit text comes from [`EcosystemFormatter::format_version_replacing`],
+///    which preserves the manifest's existing pin/operator style where an
+///    ecosystem overrides it (e.g. PyPI's `==1.0.1` stays `==1.0.2` rather
+///    than expanding to a `>=,<` range).
+///
+/// Returns an empty `Vec` also when (no fix action applies and) the registry
+/// fetch fails.
+///
+/// No `# Examples` here: exercising this meaningfully needs a `Registry`
+/// impl plus `ParseResult`/`Dependency` mocks, which live as private test
+/// fixtures in this module's own `#[cfg(test)]` block rather than as public
+/// API — see the `generate_code_actions_*` tests there for realistic calls.
 pub async fn generate_code_actions<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
     uri: &Uri,
+    versions: VersionData<'_>,
     content: &str,
     registry: &R,
     formatter: &dyn EcosystemFormatter,
@@ -871,7 +1059,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     use crate::completion::prepare_version_display_items;
 
     let deps = parse_result.dependencies();
-    let mut actions = Vec::with_capacity(deps.len().min(5));
+    let mut actions = Vec::with_capacity(deps.len().min(5) + 1);
 
     let Some(dep) = deps
         .into_iter()
@@ -904,13 +1092,49 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         return actions;
     }
 
-    let Ok(versions) = registry.get_versions(dep.name()).await else {
+    // Built before the registry fetch below so a registry outage never
+    // suppresses an OSV-derived fix (FR-007).
+    let fix = build_vulnerability_fix_action(
+        dep,
+        uri,
+        version_range,
+        versions,
+        version_req.as_str(),
+        formatter,
+    );
+
+    let Ok(registry_versions) = registry.get_versions(dep.name()).await else {
+        if let Some(fix) = fix {
+            actions.push(fix.action);
+        }
         return actions;
     };
 
-    let display_items = prepare_version_display_items(&versions, dep.name());
+    // S4: a fix target that the registry reports as yanked is dropped
+    // entirely rather than offered — the surviving diagnostics carry the
+    // finding either way, and there is no comparator here to bound a search
+    // for an alternative target.
+    let fix = fix.filter(|f| {
+        !registry_versions
+            .iter()
+            .find(|v| v.version_string() == f.version_native)
+            .is_some_and(|v| v.is_yanked())
+    });
+
+    let fix_version_native = fix.as_ref().map(|f| f.version_native.clone());
+    if let Some(fix) = fix {
+        actions.push(fix.action);
+    }
+
+    let display_items = prepare_version_display_items(&registry_versions, dep.name());
 
     for item in display_items {
+        // The fix action above already covers this exact edit with a more
+        // informative title.
+        if fix_version_native.as_deref() == Some(item.version.as_str()) {
+            continue;
+        }
+
         let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());
 
         let mut edits = HashMap::new();
@@ -929,7 +1153,9 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                 changes: Some(edits),
                 ..Default::default()
             }),
-            is_preferred: Some(item.is_latest),
+            // Only one preferred action is meaningful; the fix action above
+            // takes that role when present.
+            is_preferred: (fix_version_native.is_none()).then_some(item.is_latest),
             ..Default::default()
         });
     }
@@ -2221,6 +2447,25 @@ mod tests {
         }
     }
 
+    struct TestVersion {
+        version: String,
+        yanked: bool,
+    }
+
+    impl crate::Version for TestVersion {
+        fn version_string(&self) -> &str {
+            &self.version
+        }
+
+        fn is_yanked(&self) -> bool {
+            self.yanked
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
     /// A registry whose `get_versions` returns a fixed, caller-supplied version list —
     /// used to exercise hover's "Recent versions" rendering, which `MockRegistry`
     /// above (always empty) cannot.
@@ -2267,6 +2512,59 @@ mod tests {
         }
 
         fn package_url(&self, _name: &crate::PackageName) -> String {
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A registry returning a fixed, caller-supplied version list — used to
+    /// exercise the yank check and display-item dedup in
+    /// [`generate_code_actions`].
+    struct FixedVersionRegistry {
+        versions: Vec<(&'static str, bool)>,
+    }
+
+    impl crate::Registry for FixedVersionRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a PackageName,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            let versions: Vec<Box<dyn crate::Version>> = self
+                .versions
+                .iter()
+                .map(|(version, yanked)| {
+                    Box::new(TestVersion {
+                        version: (*version).to_string(),
+                        yanked: *yanked,
+                    }) as Box<dyn crate::Version>
+                })
+                .collect();
+            Box::pin(async move { Ok(versions) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn package_url(&self, _name: &PackageName) -> String {
             String::new()
         }
 
@@ -2438,6 +2736,650 @@ mod tests {
         };
         assert!(content.value.contains("- `1.2.3` *(latest)*\n"));
         assert!(!content.value.contains("ago"));
+    }
+
+    /// A formatter whose `format_version_for_text_edit` is the identity —
+    /// unlike [`MockFormatter`], which wraps the version in quotes and would
+    /// otherwise confound the N1 no-op-edit guard's own test.
+    struct IdentityFormatter;
+
+    impl EcosystemFormatter for IdentityFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            version.to_string()
+        }
+
+        fn package_url(&self, name: &PackageName) -> String {
+            format!("https://example.com/{name}")
+        }
+    }
+
+    /// A formatter mimicking `deps-dart`'s non-identity
+    /// `format_version_for_text_edit` (wraps the version in a caret
+    /// constraint) — used to prove the N1 guard compares the *formatted*
+    /// text actually written, not the bare version (critic S3).
+    struct CaretWrappingFormatter;
+
+    impl EcosystemFormatter for CaretWrappingFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            format!("^{version}")
+        }
+
+        fn package_url(&self, name: &PackageName) -> String {
+            format!("https://example.com/{name}")
+        }
+    }
+
+    /// A formatter mimicking `deps-pypi`'s non-identity
+    /// `format_version_replacing` override (preserves an `==` pin instead of
+    /// falling back to `format_version_for_text_edit`) — used to prove the
+    /// vulnerability-fix action's `TextEdit` goes through the override, not
+    /// the default delegation (critic S3).
+    struct PinPreservingFormatter;
+
+    impl EcosystemFormatter for PinPreservingFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            format!(">={version}")
+        }
+
+        fn format_version_replacing(&self, version: &str, current: &str) -> String {
+            if current.starts_with("==") {
+                format!("=={version}")
+            } else {
+                self.format_version_for_text_edit(version)
+            }
+        }
+
+        fn package_url(&self, name: &PackageName) -> String {
+            format!("https://example.com/{name}")
+        }
+    }
+
+    /// Builds a `pkg = "<version_req>"`-shaped fixture: a dependency whose
+    /// `version_range` slices `content` to exactly `version_req` (so the
+    /// literal-span guard in `generate_code_actions` never rejects it).
+    fn vulnerable_dep(version_req: &str) -> (MockDep, tower_lsp_server::ls_types::Range, String) {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let content = format!("pkg = \"{version_req}\"");
+        let start = 7u32; // len(`pkg = "`)
+        let end = start + version_req.chars().count() as u32;
+        let version_range = Range::new(Position::new(0, start), Position::new(0, end));
+        (
+            MockDep {
+                name: pkg("pkg"),
+                version_req: VersionReq::new(version_req),
+                version_range,
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+            },
+            version_range,
+            content,
+        )
+    }
+
+    fn quickfix_titles(actions: &[CodeAction]) -> Vec<&str> {
+        actions
+            .iter()
+            .filter(|a| a.kind == Some(CodeActionKind::QUICKFIX))
+            .map(|a| a.title.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_combines_advisories_sharing_the_highest_fix() {
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![
+                    std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.1.0".to_string()],
+                        url: String::new(),
+                    }),
+                    std::sync::Arc::new(Advisory {
+                        id: "A2".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::Critical,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    }),
+                ],
+                total_known: 2,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await;
+
+        let titles = quickfix_titles(&actions);
+        assert_eq!(titles, vec!["Update to 1.2.0 (fixes A2 +1 more)"]);
+        assert_eq!(actions[0].kind, Some(CodeActionKind::QUICKFIX));
+        assert_eq!(actions[0].is_preferred, Some(true));
+        // The full id list still travels in `data` for the diagnostics
+        // binding, even though the title only names the first one.
+        assert_eq!(
+            actions[0].data,
+            Some(serde_json::json!({ "advisory_ids": ["A2", "A1"] }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_fix_target_is_not_inflated_by_a_subtracted_advisory() {
+        // Critic S1 counterexample: A1 is fixed at a high version (3.0.0) but
+        // phase B reports it still applies at the checked candidate, so it is
+        // excluded from the claim. A2 is fixed at a much lower version
+        // (1.2.0) and is claimed. The recommended target must be 1.2.0 — the
+        // version that clears what is actually claimed — not 3.0.0, which
+        // would push the user across an unnecessary major-version boundary
+        // for a fix A1 that version does not even resolve.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![
+                    std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["3.0.0".to_string()],
+                        url: String::new(),
+                    }),
+                    std::sync::Arc::new(Advisory {
+                        id: "A2".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::Medium,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    }),
+                ],
+                total_known: 2,
+                upgrade_status: UpgradeStatus::CandidateVulnerable {
+                    version: "3.0.0".to_string(),
+                    advisory_ids: vec!["A1".to_string()],
+                },
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await;
+
+        let titles = quickfix_titles(&actions);
+        assert_eq!(titles, vec!["Update to 1.2.0 (fixes A2)"]);
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_drops_yanked_fix_target() {
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["2.0.0".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+        let registry = FixedVersionRegistry {
+            versions: vec![("2.0.0", true), ("1.5.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MockFormatter,
+        )
+        .await;
+
+        assert!(quickfix_titles(&actions).is_empty());
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.kind == Some(CodeActionKind::REFACTOR))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_no_op_edit_is_skipped() {
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        // Manifest already declares exactly the fixed version.
+        let (dep, version_range, content) = vulnerable_dep("1.2.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.2.0".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &IdentityFormatter,
+        )
+        .await;
+
+        assert!(quickfix_titles(&actions).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_no_op_guard_compares_formatted_text_not_bare_version() {
+        // Critic S3: the manifest already declares "^1.2.0" — exactly what
+        // `CaretWrappingFormatter::format_version_for_text_edit` produces for
+        // the fixed version "1.2.0" (mirroring `deps-dart`'s real `^{v}`
+        // wrap). A guard comparing the bare version ("1.2.0" != "^1.2.0")
+        // would miss this and offer a no-op edit; the guard must compare
+        // against the formatted text instead.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("^1.2.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/pubspec.yaml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.2.0".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &CaretWrappingFormatter,
+        )
+        .await;
+
+        assert!(quickfix_titles(&actions).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_lockfile_hit_gets_title_suffix() {
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("^1.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.0.2".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let mut resolved = HashMap::new();
+        resolved.insert(pkg("pkg"), "1.0.1".to_string());
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await;
+
+        let titles = quickfix_titles(&actions);
+        assert_eq!(
+            titles,
+            vec!["Update to 1.0.2 (fixes A1; update lockfile to apply)"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_fix_action_survives_registry_error() {
+        // FR-007 / registry-independence: a registry outage must never
+        // suppress an OSV-derived fix. The fix action is computed before the
+        // `registry.get_versions` call, but this test exercises the early
+        // return on `Err` specifically, which no prior test reached.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.2.0".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &ErrorRegistry,
+            &MockFormatter,
+        )
+        .await;
+
+        let titles = quickfix_titles(&actions);
+        assert_eq!(titles, vec!["Update to 1.2.0 (fixes A1)"]);
+        // No plain "update to X" items either, since the registry fetch that
+        // would produce them failed.
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_coexistence_dedups_fix_version_and_demotes_preferred() {
+        // Exercises the branch where the registry fetch succeeds *and*
+        // returns the fix's own target version alongside other non-yanked
+        // versions: the display item for that exact version must not be
+        // duplicated, and no plain item may claim `is_preferred` once a fix
+        // action exists.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.2.0".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+        // Registry-native order is descending (index 0 = latest); the fix's
+        // own target (1.2.0) is present and not yanked, alongside others.
+        let registry = FixedVersionRegistry {
+            versions: vec![("1.2.0", false), ("1.1.0", false), ("1.0.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MockFormatter,
+        )
+        .await;
+
+        assert_eq!(quickfix_titles(&actions).len(), 1);
+
+        let refactor_titles: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.kind == Some(CodeActionKind::REFACTOR))
+            .map(|a| a.title.as_str())
+            .collect();
+        assert!(
+            !refactor_titles.iter().any(|t| t.starts_with("1.2.0")),
+            "the display item duplicating the fix's own target must be skipped: {refactor_titles:?}"
+        );
+        assert!(refactor_titles.iter().any(|t| t.starts_with("1.1.0")));
+
+        assert!(
+            actions
+                .iter()
+                .filter(|a| a.kind == Some(CodeActionKind::REFACTOR))
+                .all(|a| a.is_preferred.is_none()),
+            "only the fix action may be preferred once it exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_fix_uses_ecosystem_format_version_replacing_override() {
+        // Critic S3: `format_version_replacing` is overridden in exactly one
+        // place workspace-wide (`deps-pypi`); no test anywhere proved the
+        // vulnerability-fix action's `TextEdit` actually goes through such
+        // an override rather than the default delegation to
+        // `format_version_for_text_edit` — the same bug class the original
+        // #216 critique caught (a guard/edit comparing the wrong string,
+        // silently bypassed per-ecosystem).
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("==1.0.0");
+        let uri = crate::test_util::test_uri("/test/requirements.txt");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: uri.clone(),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.0.2".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &PinPreservingFormatter,
+        )
+        .await;
+
+        let quickfix = actions
+            .iter()
+            .find(|a| a.kind == Some(CodeActionKind::QUICKFIX))
+            .expect("a vulnerability-fix quickfix should be offered");
+        let new_text = quickfix
+            .edit
+            .as_ref()
+            .and_then(|e| e.changes.as_ref())
+            .and_then(|c| c.get(&uri))
+            .and_then(|edits| edits.first())
+            .map(|e| e.new_text.as_str())
+            .expect("quickfix should carry a TextEdit for the document uri");
+
+        assert_eq!(
+            new_text, "==1.0.2",
+            "the fix action's TextEdit must go through format_version_replacing's \
+             pin-preserving override, not the default format_version_for_text_edit delegation"
+        );
     }
 
     #[tokio::test]
@@ -4301,6 +5243,7 @@ mod tests {
     /// `collect_update_all_edits` already applies.
     mod code_actions_guard_tests {
         use super::*;
+        use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
         struct CaDep {
@@ -4429,17 +5372,84 @@ mod tests {
             // dependency at all — the point of this test is the guard past
             // that selection, not the selection itself.
             let position = Position::new(0, 7);
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
 
             let actions = generate_code_actions(
                 &pr,
                 position,
                 pr.uri(),
+                versions,
                 content,
                 &CaRegistry,
                 &MockFormatter,
             )
             .await;
 
+            assert!(actions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_guard_rejects_span_even_with_a_pending_vulnerability_fix() {
+            // Critic S2: the guard must gate the vulnerability-fix quickfix
+            // too, not just the plain "update version" action — a future
+            // refactor moving `build_vulnerability_fix_action` above the
+            // guard would reintroduce manifest corruption on a rejected
+            // span (e.g. a Maven `${property}` reference) at P0 severity.
+            // Every other test in this module uses an empty `VersionData`,
+            // which would pass even if the guard only gated the plain
+            // action; this one carries a real OSV hit so a regression that
+            // reorders the two checks fails here.
+            use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+
+            let content = "1.0.0 extra";
+            let dep = CaDep {
+                name: pkg("serde"),
+                version_req: Some(VersionReq::new("1.0.0")),
+                version_range: Some(range(0, 6, 0, 11)), // slices to "extra"
+            };
+            let pr = CaParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let position = Position::new(0, 7);
+
+            let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+            vulnerabilities.insert(
+                "serde".to_string(),
+                ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    advisories: vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["2.0.0".to_string()],
+                        url: String::new(),
+                    })],
+                    total_known: 1,
+                    upgrade_status: UpgradeStatus::NotChecked,
+                }),
+            );
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions =
+                VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                versions,
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(quickfix_titles(&actions).is_empty());
             assert!(actions.is_empty());
         }
 
@@ -4456,11 +5466,15 @@ mod tests {
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
             let position = Position::new(0, 0);
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
 
             let actions = generate_code_actions(
                 &pr,
                 position,
                 pr.uri(),
+                versions,
                 content,
                 &CaRegistry,
                 &MockFormatter,
@@ -4483,11 +5497,15 @@ mod tests {
                 uri: crate::test_util::test_uri("/test/Cargo.toml"),
             };
             let position = Position::new(0, 0);
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
 
             let actions = generate_code_actions(
                 &pr,
                 position,
                 pr.uri(),
+                versions,
                 content,
                 &CaRegistry,
                 &MockFormatter,

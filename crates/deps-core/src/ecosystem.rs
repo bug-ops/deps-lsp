@@ -445,7 +445,10 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Generate code actions for a position.
     ///
     /// Default implementation delegates to `lsp_helpers::generate_code_actions`
-    /// using `self.formatter()` and `self.registry()`. `content` is the
+    /// using `self.formatter()` and `self.registry()`. `versions` carries the
+    /// same OSV scan results `generate_hover` and `generate_diagnostics` use,
+    /// so a vulnerable dependency at `position` gets a "fix vulnerability"
+    /// quickfix alongside the plain version-update actions. `content` is the
     /// manifest source, needed to guard against rewriting a `version_range`
     /// that no longer slices to its declared requirement text (see
     /// `lsp_helpers::literal_span_matches`).
@@ -454,6 +457,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         parse_result: &'a dyn ParseResult,
         position: Position,
         uri: &'a Uri,
+        versions: VersionData<'a>,
         content: &'a str,
     ) -> BoxFuture<'a, Vec<CodeAction>> {
         Box::pin(async move {
@@ -462,6 +466,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 parse_result,
                 position,
                 uri,
+                versions,
                 content,
                 registry.as_ref(),
                 self.formatter(),

@@ -177,4 +177,17 @@ mod tests {
             f.normalize_package_name(&dep.name)
         );
     }
+
+    #[test]
+    fn test_osv_version_to_native_round_trips_through_own_parser() {
+        // Critic S2 gate: `osv_version_to_native` is identity for NuGet, so
+        // the version it hands to `format_version_for_text_edit` must
+        // itself satisfy the requirement text that edit produces.
+        let f = NuGetFormatter;
+        let osv_version = "12.0.1";
+        let native = f.osv_version_to_native(osv_version);
+        assert_eq!(native, osv_version);
+        let edit_text = f.format_version_for_text_edit(&native);
+        assert!(f.version_satisfies_requirement(&native, &edit_text));
+    }
 }
