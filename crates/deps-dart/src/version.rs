@@ -1,5 +1,6 @@
 //! Version comparison and constraint matching for Dart packages.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
@@ -30,20 +31,76 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 ///
 /// Supports: ^, >=, >, <=, <, exact, any, and space-separated AND constraints.
 pub fn version_matches_constraint(version: &str, constraint: &str) -> bool {
-    let constraint = constraint.trim();
+    let constraint = normalize_operator_spacing(constraint.trim());
+    version_matches_normalized_constraint(version, &constraint)
+}
 
+/// Same as [`version_matches_constraint`], but takes a constraint that has already been
+/// run through [`normalize_operator_spacing`]. Callers that check many candidate versions
+/// against the same constraint (e.g. a compiled [`RequirementMatcher`](deps_core::lsp_helpers::RequirementMatcher))
+/// should normalize once and reuse it here instead of re-normalizing per candidate.
+pub(crate) fn version_matches_normalized_constraint(version: &str, constraint: &str) -> bool {
     if constraint.is_empty() || constraint == "any" || constraint == "*" {
         return true;
     }
 
-    // Space-separated constraints are AND logic
-    if constraint.contains(' ') && !constraint.starts_with('^') {
+    // Space-separated constraints are AND logic (pub_semver intersects each comparator,
+    // including a leading caret comparator combined with further clauses).
+    if constraint.contains(' ') {
         return constraint
             .split_whitespace()
             .all(|c| match_single_constraint(version, c));
     }
 
     match_single_constraint(version, constraint)
+}
+
+/// Collapses whitespace between a range operator (`>=`, `<=`, `>`, `<`) and its version
+/// number, e.g. `">= 1.15.0 < 2.0.0"` becomes `">=1.15.0 <2.0.0"`. Both forms are valid
+/// pubspec constraint syntax, but leaving the space in place would make the later
+/// whitespace-based AND split treat the operator and its version as separate clauses.
+///
+/// Borrows `constraint` unchanged when there is no spaced operator to collapse (the
+/// common case) instead of always allocating — [`version_matches_constraint`] (the
+/// uncompiled/loose matching path) calls this once per candidate version.
+pub(crate) fn normalize_operator_spacing(constraint: &str) -> Cow<'_, str> {
+    if !has_spaced_operator(constraint) {
+        return Cow::Borrowed(constraint);
+    }
+
+    let mut result = String::with_capacity(constraint.len());
+    let mut chars = constraint.chars().peekable();
+    while let Some(c) = chars.next() {
+        result.push(c);
+        if c == '>' || c == '<' {
+            if chars.peek() == Some(&'=') {
+                result.push('=');
+                chars.next();
+            }
+            while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                chars.next();
+            }
+        }
+    }
+    Cow::Owned(result)
+}
+
+/// Reports whether `constraint` contains a `>`/`<`/`>=`/`<=` operator immediately
+/// followed by whitespace, i.e. whether [`normalize_operator_spacing`] would need to
+/// allocate. Pure scan, no allocation, so the common no-op case stays cheap.
+fn has_spaced_operator(constraint: &str) -> bool {
+    let mut chars = constraint.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '>' || c == '<' {
+            if chars.peek() == Some(&'=') {
+                chars.next();
+            }
+            if chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn match_single_constraint(version: &str, constraint: &str) -> bool {
@@ -149,6 +206,24 @@ mod tests {
         assert!(version_matches_constraint("1.0.0", ">=1.0.0 <2.0.0"));
         assert!(!version_matches_constraint("2.0.0", ">=1.0.0 <2.0.0"));
         assert!(!version_matches_constraint("0.9.0", ">=1.0.0 <2.0.0"));
+    }
+
+    #[test]
+    fn test_range_constraint_spaced_operators() {
+        assert!(version_matches_constraint("1.15.0", ">= 1.15.0 < 2.0.0"));
+        assert!(version_matches_constraint("1.99.0", ">= 1.15.0 < 2.0.0"));
+        assert!(!version_matches_constraint("1.14.0", ">= 1.15.0 < 2.0.0"));
+        assert!(!version_matches_constraint("2.0.0", ">= 1.15.0 < 2.0.0"));
+    }
+
+    #[test]
+    fn test_caret_combined_with_spaced_upper_bound() {
+        // pub_semver intersects space-separated comparators, so a caret comparator can be
+        // combined with a further clause instead of split into garbage input.
+        assert!(version_matches_constraint("1.5.0", "^1.0.0 < 2.0.0"));
+        assert!(version_matches_constraint("1.99.0", "^1.0.0 < 2.0.0"));
+        assert!(!version_matches_constraint("2.0.0", "^1.0.0 < 2.0.0"));
+        assert!(!version_matches_constraint("0.9.0", "^1.0.0 < 2.0.0"));
     }
 
     #[test]

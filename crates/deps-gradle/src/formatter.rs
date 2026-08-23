@@ -25,6 +25,10 @@ fn is_snapshot(requirement: &str) -> bool {
 /// since Gradle has no separate "loose" vs. "precise" comparator to distinguish (mirrors
 /// `deps-maven`'s formatter, which shares the same shape for the same reason).
 fn gradle_version_matches(version: &str, requirement: &str) -> bool {
+    // `!!` is Gradle's `strictly(...)` shorthand (e.g. `1.2.3!!`) — it constrains how
+    // Gradle's conflict resolution treats the version, not which version string it names,
+    // so matching drops the suffix and compares the version underneath unchanged.
+    let requirement = requirement.strip_suffix("!!").unwrap_or(requirement);
     // Unresolved Gradle variable reference (`$var`/`${var}`), or an empty version-catalog
     // entry (`[versions] foo = ""`) — skip comparison
     if is_unresolved(requirement) {
@@ -84,7 +88,14 @@ impl EcosystemFormatter for GradleFormatter {
     /// a false "unsatisfiable" verdict for a typo instead of correctly suppressing the check.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         let requirement = requirement.as_str();
-        if requirement.starts_with(['[', '(', ']']) && !crate::range::is_valid_range(requirement) {
+        // Strip the `!!` strict/force suffix before the range-validity check, matching
+        // `gradle_version_matches` — otherwise a strict range like `"[1.0,2.0)!!"` fails
+        // `is_valid_range` (the suffix isn't part of the range grammar) and this guard
+        // suppresses the diagnostic instead of compiling the matcher.
+        let range_check_target = requirement.strip_suffix("!!").unwrap_or(requirement);
+        if range_check_target.starts_with(['[', '(', ']'])
+            && !crate::range::is_valid_range(range_check_target)
+        {
             return None;
         }
         Some(Box::new(GradleMatcher(requirement.to_string())))
@@ -284,5 +295,34 @@ mod tests {
     fn test_version_satisfies_snapshot() {
         let f = GradleFormatter;
         assert!(f.version_satisfies_requirement("6.9.0", "7.0.0-SNAPSHOT"));
+    }
+
+    #[test]
+    fn test_version_satisfies_strict_shorthand() {
+        let f = GradleFormatter;
+        assert!(f.version_satisfies_requirement("1.2.3", "1.2.3!!"));
+        assert!(!f.version_satisfies_requirement("1.2.4", "1.2.3!!"));
+    }
+
+    #[test]
+    fn test_compile_requirement_strict_shorthand() {
+        let f = GradleFormatter;
+        let matcher = f.compile_requirement(&VersionReq::new("1.2.3!!")).unwrap();
+        assert_eq!(matcher.matches("1.2.3"), Some(true));
+        assert_eq!(matcher.matches("1.2.4"), Some(false));
+    }
+
+    /// M6: `compile_requirement`'s range-validity guard must strip `!!` the same way
+    /// `gradle_version_matches` does — otherwise a valid strict range like
+    /// `"[1.0,2.0)!!"` fails `is_valid_range` (the suffix isn't range grammar) and the
+    /// guard wrongly suppresses the diagnostic instead of compiling the matcher.
+    #[test]
+    fn test_compile_requirement_strict_range() {
+        let f = GradleFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("[1.0,2.0)!!"))
+            .expect("strict range must still compile a matcher");
+        assert_eq!(matcher.matches("1.5.0"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
     }
 }

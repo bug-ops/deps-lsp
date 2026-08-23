@@ -1,18 +1,22 @@
 //! Version formatting for Dart ecosystem.
 
-use crate::version::version_matches_constraint;
+use crate::version::{
+    normalize_operator_spacing, version_matches_constraint, version_matches_normalized_constraint,
+};
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
 
 /// pub.dev constraint matcher, compiled once per dependency by
-/// [`DartFormatter::compile_requirement`]. `version_matches_constraint` is a hand-rolled
-/// comparator with no external parser to fail on, so this always decides (`Some`).
+/// [`DartFormatter::compile_requirement`]. Holds the requirement already run through
+/// [`normalize_operator_spacing`] so per-candidate matching never re-normalizes or
+/// allocates. `version_matches_normalized_constraint` is a hand-rolled comparator with no
+/// external parser to fail on, so this always decides (`Some`).
 struct PubDevMatcher(String);
 
 impl RequirementMatcher for PubDevMatcher {
     fn matches(&self, version: &str) -> Option<bool> {
-        Some(version_matches_constraint(version, &self.0))
+        Some(version_matches_normalized_constraint(version, &self.0))
     }
 }
 
@@ -31,11 +35,13 @@ impl EcosystemFormatter for DartFormatter {
         version_matches_constraint(version, requirement)
     }
 
-    /// Compiles `requirement` into a `PubDevMatcher` using the same
-    /// `version_matches_constraint` comparator as `version_satisfies_requirement` — Dart
-    /// constraints have no separate "loose" vs. "precise" form to distinguish.
+    /// Compiles `requirement` into a `PubDevMatcher` using the same comparator as
+    /// `version_satisfies_requirement` — Dart constraints have no separate "loose" vs.
+    /// "precise" form to distinguish. Spaced-operator normalization runs once here, not
+    /// per candidate version.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        Some(Box::new(PubDevMatcher(requirement.as_str().to_string())))
+        let normalized = normalize_operator_spacing(requirement.as_str().trim()).into_owned();
+        Some(Box::new(PubDevMatcher(normalized)))
     }
 }
 
@@ -83,5 +89,17 @@ mod tests {
             .expect("Dart requirement always compiles");
         assert_eq!(matcher.matches("1.5.0"), Some(true));
         assert_eq!(matcher.matches("2.0.0"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_spaced_range() {
+        let f = DartFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new(">= 1.15.0 < 2.0.0"))
+            .expect("Dart requirement always compiles");
+        assert_eq!(matcher.matches("1.15.0"), Some(true));
+        assert_eq!(matcher.matches("1.99.0"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches("1.14.0"), Some(false));
     }
 }

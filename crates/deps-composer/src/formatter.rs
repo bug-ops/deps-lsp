@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use deps_core::Dependency;
 use deps_core::PackageName;
 use deps_core::VersionReq;
@@ -56,6 +58,18 @@ impl EcosystemFormatter for ComposerFormatter {
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
         let version = version.strip_prefix('v').unwrap_or(version);
         let requirement = requirement.trim();
+        // Composer's own version parser strips a leading `v` from every version string it
+        // normalizes, tags and constraints alike. Mirroring that only for `version` above
+        // and not here made an exact/wildcard/caret/tilde requirement pinned with a `v`
+        // prefix (e.g. `"v1.2.3"`, `"^v1.2.0"`) never match, since `version` had already
+        // lost its `v` while `requirement` had not. Only strip when it leaves something
+        // behind — a bare `"v"` requirement is not a valid version prefix and must fall
+        // through to the exact/partial match below (which correctly rejects it), rather
+        // than collapsing to `""` and being swallowed by the empty/wildcard guard next.
+        let requirement = match requirement.strip_prefix('v') {
+            Some(rest) if !rest.is_empty() => rest,
+            _ => requirement,
+        };
 
         if requirement.is_empty() || requirement == "*" {
             return true;
@@ -67,6 +81,15 @@ impl EcosystemFormatter for ComposerFormatter {
                 .split("||")
                 .any(|part| self.version_satisfies_requirement(version, part.trim()));
         }
+
+        // Collapse whitespace between a range operator and its version (">= 1.0" ->
+        // ">=1.0") so the AND split below treats the operator and its version as one
+        // token instead of two separate (and individually meaningless) clauses. Borrows
+        // `requirement` unchanged when there is nothing to collapse — this runs on every
+        // candidate version `ComposerMatcher::matches` checks, so the common case (no
+        // spaced operators) must not allocate.
+        let requirement = normalize_operator_spacing(requirement);
+        let requirement = &*requirement;
 
         // Range with AND (space-separated constraints like ">=1.0 <2.0")
         // Only treat as AND if there are multiple space-separated tokens that look like constraints
@@ -83,11 +106,13 @@ impl EcosystemFormatter for ComposerFormatter {
 
         // Caret operator
         if let Some(req) = requirement.strip_prefix('^') {
+            let req = req.strip_prefix('v').unwrap_or(req);
             return satisfies_caret(version, req);
         }
 
         // Tilde operator — Composer-specific semantics
         if let Some(req) = requirement.strip_prefix('~') {
+            let req = req.strip_prefix('v').unwrap_or(req);
             return satisfies_tilde_composer(version, req);
         }
 
@@ -207,6 +232,55 @@ fn satisfies_tilde_composer(version: &str, req: &str) -> bool {
         // ~X: >=X.0.0 <(X+1).0.0 — same as caret for single segment
         req_parts.first() == ver_parts.first()
     }
+}
+
+/// Collapses whitespace between a range operator (`>=`, `<=`, `>`, `<`) and its version
+/// number, e.g. `">= 1.0 < 2.0"` becomes `">=1.0 <2.0"`. Both forms are valid Composer
+/// constraint syntax, but leaving the space in place would make the whitespace-based AND
+/// split below treat the operator and its version as separate clauses.
+///
+/// Borrows `requirement` unchanged when there is no spaced operator to collapse (the
+/// common case) instead of always allocating — `ComposerMatcher::matches` calls this once
+/// per candidate version, and `version_satisfies_requirement` recurses through it again
+/// per `||`/AND clause, so an unconditional allocation here is O(candidates * clauses).
+fn normalize_operator_spacing(requirement: &str) -> Cow<'_, str> {
+    if !has_spaced_operator(requirement) {
+        return Cow::Borrowed(requirement);
+    }
+
+    let mut result = String::with_capacity(requirement.len());
+    let mut chars = requirement.chars().peekable();
+    while let Some(c) = chars.next() {
+        result.push(c);
+        if c == '>' || c == '<' {
+            if chars.peek() == Some(&'=') {
+                result.push('=');
+                chars.next();
+            }
+            while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                chars.next();
+            }
+        }
+    }
+    Cow::Owned(result)
+}
+
+/// Reports whether `requirement` contains a `>`/`<`/`>=`/`<=` operator immediately
+/// followed by whitespace, i.e. whether [`normalize_operator_spacing`] would need to
+/// allocate. Pure scan, no allocation, so the common no-op case stays cheap.
+fn has_spaced_operator(requirement: &str) -> bool {
+    let mut chars = requirement.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '>' || c == '<' {
+            if chars.peek() == Some(&'=') {
+                chars.next();
+            }
+            if chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Caret operator — same as default EcosystemFormatter but inlined for clarity.
@@ -347,6 +421,21 @@ mod tests {
     }
 
     #[test]
+    fn test_range_constraint_spaced_operators() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement("1.5.0", ">= 1.0 < 2.0"));
+        assert!(!f.version_satisfies_requirement("2.0.0", ">= 1.0 < 2.0"));
+        assert!(!f.version_satisfies_requirement("0.9.0", ">= 1.0 < 2.0"));
+    }
+
+    #[test]
+    fn test_bare_v_requirement_does_not_match_everything() {
+        let f = ComposerFormatter;
+        assert!(!f.version_satisfies_requirement("1.2.3", "v"));
+        assert!(!f.version_satisfies_requirement("0.0.0", "v"));
+    }
+
+    #[test]
     fn test_comparison_operators() {
         let f = ComposerFormatter;
         assert!(f.version_satisfies_requirement("2.0.0", ">=2.0.0"));
@@ -412,6 +501,28 @@ mod tests {
         assert!(f.version_satisfies_requirement("v1.0.5", "1.0.*"));
         assert!(f.version_satisfies_requirement("v1.2.3", "1.2.3"));
         assert!(!f.version_satisfies_requirement("v2.0.0", "^1.0"));
+    }
+
+    #[test]
+    fn test_v_prefix_symmetric_on_requirement_side() {
+        let f = ComposerFormatter;
+        // Exact pin with a `v`-prefixed requirement, matched against an un-prefixed
+        // candidate (the common case: registry candidates already had `v` stripped).
+        assert!(f.version_satisfies_requirement("1.2.3", "v1.2.3"));
+        // Both sides `v`-prefixed.
+        assert!(f.version_satisfies_requirement("v1.2.3", "v1.2.3"));
+        // Operator-prefixed requirement with a `v`-prefixed version literal.
+        assert!(f.version_satisfies_requirement("1.5.0", "^v1.2.0"));
+        assert!(f.version_satisfies_requirement("1.2.9", "~v1.2.3"));
+        assert!(!f.version_satisfies_requirement("2.0.0", "^v1.2.0"));
+        // Wildcard with a `v`-prefixed requirement.
+        assert!(f.version_satisfies_requirement("1.0.5", "v1.0.*"));
+    }
+
+    #[test]
+    fn test_compile_requirement_bare_at_dev_returns_none() {
+        let f = ComposerFormatter;
+        assert!(f.compile_requirement(&VersionReq::new("@dev")).is_none());
     }
 
     #[test]
