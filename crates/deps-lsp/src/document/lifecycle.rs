@@ -712,6 +712,14 @@ async fn fetch_latest_versions_parallel(
                             .iter()
                             .map(|v| v.version_string().to_string())
                             .collect();
+                        // Retained alongside `available` so `generate_diagnostics_from_cache`
+                        // can flag a requirement satisfiable only by a yanked version — see
+                        // `PackageVersions::yanked`.
+                        let yanked_list: Arc<[String]> = versions
+                            .iter()
+                            .filter(|v| v.is_yanked())
+                            .map(|v| v.version_string().to_string())
+                            .collect();
                         // `.get(idx)` rather than `versions[idx]`: `select_latest_matching`
                         // is a public `Registry` trait method, so an out-of-tree
                         // implementation returning a stale index must not panic this task.
@@ -788,7 +796,14 @@ async fn fetch_latest_versions_parallel(
                         }
 
                         resolved.map(|(latest, _)| {
-                            (name.clone(), PackageVersions { latest, available })
+                            (
+                                name.clone(),
+                                PackageVersions {
+                                    latest,
+                                    available,
+                                    yanked: yanked_list,
+                                },
+                            )
                         })
                     }
                     Ok(Err(e)) => {
@@ -2132,6 +2147,113 @@ mod tests {
         assert!(
             !result.versions.contains_key("package-error"),
             "Error package should not be in results"
+        );
+    }
+
+    /// Issue #247: the per-version yanked flag from `get_versions` must survive into
+    /// `PackageVersions.yanked`, not be discarded — this is what lets
+    /// `generate_diagnostics_from_cache` (via `requirement_matches_only_yanked`) detect a
+    /// requirement that is satisfiable only by a yanked version.
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_carries_yanked_flag_into_cache() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        #[derive(Debug)]
+        struct MockVersion {
+            version: String,
+            yanked: bool,
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &str {
+                &self.version
+            }
+            fn is_yanked(&self) -> bool {
+                self.yanked
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct YankedRegistry;
+
+        impl Registry for YankedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![
+                        Box::new(MockVersion {
+                            version: "1.0.214".to_string(),
+                            yanked: false,
+                        }) as Box<dyn Version>,
+                        Box::new(MockVersion {
+                            version: "1.0.213".to_string(),
+                            yanked: true,
+                        }) as Box<dyn Version>,
+                    ])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &deps_core::VersionReq,
+            ) -> Option<usize> {
+                versions.iter().position(|v| !v.is_yanked())
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(YankedRegistry);
+        let packages = vec![PackageName::new("serde")];
+
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 10, 10).await;
+
+        let serde = result
+            .versions
+            .get("serde")
+            .expect("serde should be fetched");
+        assert_eq!(serde.latest, "1.0.214", "latest must skip the yanked entry");
+        assert_eq!(
+            &*serde.available,
+            &["1.0.214".to_string(), "1.0.213".to_string()],
+            "available must remain unfiltered"
+        );
+        assert_eq!(
+            &*serde.yanked,
+            &["1.0.213".to_string()],
+            "yanked must carry only the entries reported as yanked"
         );
     }
 

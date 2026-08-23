@@ -167,6 +167,45 @@ impl EcosystemFormatter for ComposerFormatter {
         }
         Some(Box::new(ComposerMatcher(requirement.to_string())))
     }
+
+    /// Restricts the yanked-only-match diagnostic to an exact-pin requirement.
+    ///
+    /// Composer's `Version::is_yanked()` is sourced from `abandoned`
+    /// (`ComposerVersion::abandoned`), a package-level flag Packagist replicates onto every
+    /// version entry of an abandoned package — not a true per-version yank. Evaluating a
+    /// range requirement (`^1.0`, `~2.3`) against it would flag every dependency on such a
+    /// package with this diagnostic's "yanked" wording, conflating it with package-level
+    /// abandonment, which is a distinct, separately-planned diagnostic (issue #205).
+    fn yanked_diagnostic_applies_to(&self, requirement: &VersionReq) -> bool {
+        is_exact_pin(requirement.as_str())
+    }
+}
+
+/// Whether `requirement` is a bare exact version pin (e.g. `"1.2.3"`, `"v1.2.3"`,
+/// `"=1.2.3"`), as opposed to a range, wildcard, OR-combinator, or partial version.
+///
+/// Deliberately conservative: a partial version like `"1.2"` is Composer shorthand for
+/// `>=1.2.0 <1.3.0` (see `test_partial_version`), not an exact pin, so this requires at
+/// least three dot-separated, purely numeric segments before any `-`-prefixed suffix
+/// (pre-release/build metadata). Anything ambiguous is treated as *not* exact, which is the
+/// safe direction for [`ComposerFormatter::yanked_diagnostic_applies_to`]'s caller.
+fn is_exact_pin(requirement: &str) -> bool {
+    let r = requirement.trim();
+    if r.is_empty() || r.contains(char::is_whitespace) || r.contains("||") || r.contains('*') {
+        return false;
+    }
+    if matches!(r.chars().next(), Some('^' | '~' | '>' | '<')) || r.starts_with("!=") {
+        return false;
+    }
+    let r = r.strip_prefix('=').unwrap_or(r).trim();
+    let r = r.strip_prefix('v').unwrap_or(r);
+
+    let core = r.split('-').next().unwrap_or(r);
+    let segments: Vec<&str> = core.split('.').collect();
+    segments.len() >= 3
+        && segments
+            .iter()
+            .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Composer tilde semantics.
@@ -455,5 +494,55 @@ mod tests {
                 .is_none()
         );
         assert!(f.compile_requirement(&VersionReq::new("2.0@dev")).is_none());
+    }
+
+    #[test]
+    fn test_is_exact_pin_accepts_bare_and_prefixed_full_versions() {
+        for requirement in ["1.2.3", "v1.2.3", "=1.2.3", "1.2.3-beta1", "1.2.3.4"] {
+            assert!(
+                is_exact_pin(requirement),
+                "expected {requirement:?} to be recognized as an exact pin"
+            );
+        }
+    }
+
+    /// Composer treats a partial version ("1", "1.2") as shorthand for a range
+    /// (`test_partial_version` above), not an exact pin.
+    #[test]
+    fn test_is_exact_pin_rejects_partial_versions() {
+        for requirement in ["1", "1.2"] {
+            assert!(
+                !is_exact_pin(requirement),
+                "expected {requirement:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_exact_pin_rejects_ranges_and_wildcards() {
+        for requirement in [
+            "^1.2.3",
+            "~1.2.3",
+            ">=1.0.0 <2.0.0",
+            "1.0.*",
+            "1.0 || 2.0",
+            "*",
+        ] {
+            assert!(
+                !is_exact_pin(requirement),
+                "expected {requirement:?} to be rejected"
+            );
+        }
+    }
+
+    /// S1 regression: `yanked_diagnostic_applies_to` must reject a range requirement, since
+    /// Composer's `is_yanked()` is sourced from `abandoned`, a package-level flag replicated
+    /// onto every version — a range requirement would flag every dependency on an abandoned
+    /// package, conflating this diagnostic with package-level abandonment (issue #205).
+    #[test]
+    fn test_yanked_diagnostic_applies_to_matches_is_exact_pin() {
+        let f = ComposerFormatter;
+        assert!(f.yanked_diagnostic_applies_to(&VersionReq::new("1.2.3")));
+        assert!(!f.yanked_diagnostic_applies_to(&VersionReq::new("^1.2.3")));
     }
 }

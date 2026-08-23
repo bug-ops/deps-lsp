@@ -144,6 +144,21 @@ impl EcosystemFormatter for NpmFormatter {
             .ok()
             .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
+
+    /// Restricts the yanked-only-match diagnostic to an exact-pin requirement.
+    ///
+    /// npm's `Version::is_yanked()` is sourced from `deprecated` (`NpmVersion::deprecated`),
+    /// which `npm deprecate` sets per-version but is routinely applied to *every* published
+    /// version of a package at once (live-verified: the `request` package has all 126/126
+    /// versions marked deprecated) — a package-level signal, not a true per-version yank.
+    /// Evaluating a range requirement (`^1.0`, `~2.3.0`) against it would flag every
+    /// dependency on such a package with this diagnostic's "yanked" wording, conflating it
+    /// with package-level deprecation, which is a distinct, separately-planned diagnostic
+    /// (issue #205). `node_semver::Version::parse` succeeds only for a bare version string,
+    /// never a range/caret/tilde/wildcard, so it doubles as the exact-pin test.
+    fn yanked_diagnostic_applies_to(&self, requirement: &VersionReq) -> bool {
+        node_semver::Version::parse(requirement.as_str().trim()).is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -352,5 +367,27 @@ mod tests {
             .compile_requirement(&VersionReq::new("^0.2.999"))
             .unwrap();
         assert_eq!(matcher.matches("0.2.14"), Some(false));
+    }
+
+    #[test]
+    fn test_yanked_diagnostic_applies_to_exact_pin() {
+        let formatter = NpmFormatter;
+        assert!(formatter.yanked_diagnostic_applies_to(&VersionReq::new("1.2.3")));
+    }
+
+    /// S1 regression: a range/caret/tilde requirement must not trigger the yanked-only-match
+    /// diagnostic, since npm's `is_yanked()` is sourced from `deprecated`, which is commonly
+    /// applied to every published version of a package at once — a range requirement would
+    /// flag every dependency on such a package, conflating this diagnostic with package-level
+    /// deprecation (issue #205).
+    #[test]
+    fn test_yanked_diagnostic_applies_to_rejects_ranges() {
+        let formatter = NpmFormatter;
+        for requirement in ["^1.2.3", "~1.2.3", ">=1.0.0 <2.0.0", "*", "1.x"] {
+            assert!(
+                !formatter.yanked_diagnostic_applies_to(&VersionReq::new(requirement)),
+                "expected {requirement:?} to be rejected as not an exact pin"
+            );
+        }
     }
 }

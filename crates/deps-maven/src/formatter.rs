@@ -31,26 +31,34 @@ fn is_snapshot(requirement: &str) -> bool {
 }
 
 /// Precise Maven version/range matcher, compiled once per dependency by
-/// [`MavenFormatter::compile_requirement`]. Deliberately more precise than the loose
-/// `version_satisfies_requirement` in two ways `version_satisfies_requirement` does not
-/// need for its own "treat as up to date" question: it recognizes the `LATEST`/`RELEASE`
-/// keywords, and its exact-match branch uses qualifier-aware `compare_versions_for_range`
-/// instead of raw string equality, so `1.0` correctly matches a published `1.0.0` (equal
-/// under Maven's own `ComparableVersion`) rather than reporting a false WARNING.
-struct MavenMatcher(String);
+/// [`MavenFormatter::compile_requirement`] — the range union (if any) is parsed once into
+/// [`crate::interval::VersionRange`]s here rather than being re-parsed for every candidate
+/// version scanned. Deliberately more precise than the loose `version_satisfies_requirement`
+/// in two ways it does not need for its own "treat as up to date" question: it recognizes the
+/// `LATEST`/`RELEASE` keywords, and its exact-match branch uses qualifier-aware
+/// `compare_versions_for_range` instead of raw string equality, so `1.0` correctly matches a
+/// published `1.0.0` (equal under Maven's own `ComparableVersion`) rather than reporting a
+/// false WARNING.
+enum MavenMatcher {
+    /// Unresolved `${property}`, `LATEST`/`RELEASE`, or a `-SNAPSHOT` pin — see
+    /// [`is_unresolved`], [`is_latest_keyword`], [`is_snapshot`].
+    AlwaysSatisfied,
+    /// A range/union, pre-parsed by [`crate::range::parse_range`].
+    Ranges(Vec<crate::interval::VersionRange>),
+    /// A bare "soft" recommended version, compared with qualifier-aware equality.
+    Exact(String),
+}
 
 impl RequirementMatcher for MavenMatcher {
     fn matches(&self, version: &str) -> Option<bool> {
-        if is_unresolved(&self.0) || is_latest_keyword(&self.0) || is_snapshot(&self.0) {
-            return Some(true);
-        }
-        if crate::range::is_range(&self.0) {
-            return Some(crate::range::satisfies(version, &self.0));
-        }
-        Some(
-            crate::version::compare_versions_for_range(version, &self.0)
-                == std::cmp::Ordering::Equal,
-        )
+        Some(match self {
+            Self::AlwaysSatisfied => true,
+            Self::Ranges(ranges) => crate::range::satisfies_ranges(version, ranges),
+            Self::Exact(target) => {
+                crate::version::compare_versions_for_range(version, target)
+                    == std::cmp::Ordering::Equal
+            }
+        })
     }
 }
 
@@ -64,6 +72,11 @@ impl EcosystemFormatter for MavenFormatter {
         crate::registry::package_url(name.as_str())
     }
 
+    // #249 review (M4): this branch order (unresolved → range → exact) is a separate copy
+    // from `compile_requirement`'s below — kept apart deliberately (see `MavenMatcher`'s
+    // docs for the two precision differences), but any reordering here must be checked
+    // against `compile_requirement`'s malformed-range guard placement too, since S1/S2
+    // happened in `deps-gradle` from exactly this kind of drift between two copies.
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
         // Unresolved properties (missing from <properties>) — skip comparison
         if is_unresolved(requirement) {
@@ -79,16 +92,30 @@ impl EcosystemFormatter for MavenFormatter {
         is_unresolved(requirement.as_str())
     }
 
-    /// Returns `None` for a malformed range (`is_range` true but `is_valid_range` false):
-    /// without this guard, `crate::range::satisfies`'s fail-closed `false` would make every
-    /// candidate decide `Some(false)`, producing a false "unsatisfiable" verdict for a typo
-    /// instead of correctly suppressing the check.
+    /// Returns `None` for a malformed range (`is_range` true but `crate::range::parse_range`
+    /// fails) — checked unconditionally, first, before any other branch: without this guard
+    /// ahead of the `AlwaysSatisfied` short-circuits below, a range that happens to also end
+    /// in `-SNAPSHOT` or contain `${` would be misclassified as always-satisfied instead of
+    /// rejected, and a fail-closed `false` on every candidate would otherwise produce a false
+    /// "unsatisfiable" verdict for a typo instead of correctly suppressing the check.
+    ///
+    /// #249 review (M4): this is a separate branch-order copy from `version_satisfies_requirement`
+    /// above — see the note on that method before reordering either one.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         let requirement = requirement.as_str();
-        if crate::range::is_range(requirement) && !crate::range::is_valid_range(requirement) {
+        if crate::range::is_range(requirement) && crate::range::parse_range(requirement).is_none() {
             return None;
         }
-        Some(Box::new(MavenMatcher(requirement.to_string())))
+        if is_unresolved(requirement) || is_latest_keyword(requirement) || is_snapshot(requirement)
+        {
+            return Some(Box::new(MavenMatcher::AlwaysSatisfied));
+        }
+        if crate::range::is_range(requirement) {
+            return crate::range::parse_range(requirement).map(|ranges| {
+                Box::new(MavenMatcher::Ranges(ranges)) as Box<dyn RequirementMatcher>
+            });
+        }
+        Some(Box::new(MavenMatcher::Exact(requirement.to_string())))
     }
 }
 
@@ -260,5 +287,21 @@ mod tests {
             .unwrap();
         assert_eq!(matcher.matches("6.9.0"), Some(true));
         assert_eq!(matcher.matches("7.0.0"), Some(true));
+    }
+
+    /// #249 review regression: a malformed range that also happens to end in `-SNAPSHOT` or
+    /// contain `${` must still be rejected (`None`), not misclassified as always-satisfied by
+    /// checking the `AlwaysSatisfied` short-circuits before the malformed-range guard.
+    #[test]
+    fn test_compile_requirement_malformed_range_rejected_even_with_snapshot_or_property_suffix() {
+        let f = MavenFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("[1.0,2.0-SNAPSHOT"))
+                .is_none()
+        );
+        assert!(
+            f.compile_requirement(&VersionReq::new("[1.0,${max}"))
+                .is_none()
+        );
     }
 }

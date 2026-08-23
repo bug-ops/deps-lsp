@@ -146,8 +146,10 @@ pub fn is_prerelease(version: &str) -> bool {
     without_build.contains('-')
 }
 
-/// A parsed interval-notation version range (spec §2).
-enum VersionRange {
+/// A parsed interval-notation version range (spec §2), produced once per dependency by
+/// [`parse_range`] and reused by [`crate::formatter::NuGetMatcher`] against every candidate
+/// version, instead of being re-parsed per candidate.
+pub(crate) enum VersionRange {
     Exact(ParsedVersion),
     Minimum {
         version: ParsedVersion,
@@ -165,7 +167,7 @@ enum VersionRange {
     },
 }
 
-fn parse_range(range: &str) -> Option<VersionRange> {
+pub(crate) fn parse_range(range: &str) -> Option<VersionRange> {
     let range = range.trim();
     if range.is_empty() {
         return None;
@@ -257,18 +259,20 @@ pub(crate) fn compare_minimum_floor(range: &str, other: &str) -> Option<Ordering
     }
 }
 
-/// Checks whether `requirement` is a syntactically well-formed NuGet range or floating
-/// pattern — i.e. whether [`satisfies`]/[`resolve_float`] can actually evaluate it rather
-/// than uniformly returning `false` because `requirement` itself failed to parse.
-///
-/// Used by `NuGetFormatter::compile_requirement` to distinguish "no published version
-/// satisfies this well-formed requirement" from "this requirement string doesn't parse",
-/// which `satisfies`'s blanket `false` return does not otherwise distinguish.
-pub(crate) fn is_valid_requirement(requirement: &str) -> bool {
-    if requirement.contains('*') {
-        parse_float(requirement).is_some()
-    } else {
-        parse_range(requirement).is_some()
+/// Whether `version` falls inside an already-parsed NuGet interval `range`.
+pub(crate) fn range_contains(version: &str, range: &VersionRange) -> bool {
+    let v = ParsedVersion::parse(version);
+
+    match range {
+        VersionRange::Exact(target) => compare_parsed(&v, target) == Ordering::Equal,
+        VersionRange::Minimum { version, inclusive } => satisfies_min(&v, version, *inclusive),
+        VersionRange::Maximum { version, inclusive } => satisfies_max(&v, version, *inclusive),
+        VersionRange::Bounded {
+            min,
+            min_inclusive,
+            max,
+            max_inclusive,
+        } => satisfies_min(&v, min, *min_inclusive) && satisfies_max(&v, max, *max_inclusive),
     }
 }
 
@@ -276,28 +280,20 @@ pub(crate) fn is_valid_requirement(requirement: &str) -> bool {
 ///
 /// Supports bare floors (`1.0`), exact pins (`[1.0]`), open/closed minimums and maximums
 /// (`[1.0,)`, `(,1.0]`, ...), and bounded intervals (`[1.0,2.0)`, ...). Returns `false` for
-/// unparseable ranges rather than panicking.
+/// unparseable ranges rather than panicking. Convenience wrapper around `parse_range` +
+/// `range_contains` for callers that don't need to test more than one candidate against
+/// the same range.
 pub fn satisfies(version: &str, range: &str) -> bool {
-    let Some(parsed_range) = parse_range(range) else {
-        return false;
-    };
-    let v = ParsedVersion::parse(version);
-
-    match parsed_range {
-        VersionRange::Exact(target) => compare_parsed(&v, &target) == Ordering::Equal,
-        VersionRange::Minimum { version, inclusive } => satisfies_min(&v, &version, inclusive),
-        VersionRange::Maximum { version, inclusive } => satisfies_max(&v, &version, inclusive),
-        VersionRange::Bounded {
-            min,
-            min_inclusive,
-            max,
-            max_inclusive,
-        } => satisfies_min(&v, &min, min_inclusive) && satisfies_max(&v, &max, max_inclusive),
+    match parse_range(range) {
+        Some(parsed_range) => range_contains(version, &parsed_range),
+        None => false,
     }
 }
 
-/// A parsed floating-version pattern (spec §2).
-enum FloatPattern {
+/// A parsed floating-version pattern (spec §2), produced once per dependency by
+/// [`parse_float`] and reused by [`crate::formatter::NuGetMatcher`] against every candidate
+/// version, instead of being re-parsed per candidate.
+pub(crate) enum FloatPattern {
     /// `*` (stable only) or `*-*` (including prerelease).
     Any { include_prerelease: bool },
     /// `1.1.*` (stable only) or `1.1.*-*` (including prerelease); `prefix` is the
@@ -314,7 +310,7 @@ enum FloatPattern {
     },
 }
 
-fn parse_float(pattern: &str) -> Option<FloatPattern> {
+pub(crate) fn parse_float(pattern: &str) -> Option<FloatPattern> {
     let pattern = pattern.trim();
     if pattern == "*" {
         return Some(FloatPattern::Any {
@@ -381,6 +377,28 @@ fn prerelease_label_starts_with(version: &str, label_prefix: &str) -> bool {
     pre.to_lowercase().starts_with(&label_prefix.to_lowercase())
 }
 
+/// Whether `version` (already parsed as `parsed`) matches an already-parsed floating-version
+/// `pattern`.
+pub(crate) fn float_matches(version: &str, parsed: &ParsedVersion, pattern: &FloatPattern) -> bool {
+    match pattern {
+        FloatPattern::Any { include_prerelease } => *include_prerelease || parsed.pre.is_empty(),
+        FloatPattern::NumericPrefix {
+            prefix,
+            include_prerelease,
+        } => {
+            (*include_prerelease || parsed.pre.is_empty())
+                && numeric_prefix_matches(version, prefix)
+        }
+        FloatPattern::PrereleaseLabelPrefix {
+            stable_prefix,
+            label_prefix,
+        } => {
+            stable_core_matches(version, stable_prefix)
+                && (parsed.pre.is_empty() || prerelease_label_starts_with(version, label_prefix))
+        }
+    }
+}
+
 /// Resolves a floating-version pattern (`*`, `1.1.*`, `*-*`, `1.2.0-rc.*`, ...) against a
 /// list of available versions, returning the highest matching version.
 ///
@@ -393,25 +411,7 @@ pub fn resolve_float<'a>(versions: &'a [String], pattern: &str) -> Option<&'a st
 
     for v in versions {
         let parsed = ParsedVersion::parse(v);
-        let matches = match &float {
-            FloatPattern::Any { include_prerelease } => {
-                *include_prerelease || parsed.pre.is_empty()
-            }
-            FloatPattern::NumericPrefix {
-                prefix,
-                include_prerelease,
-            } => {
-                (*include_prerelease || parsed.pre.is_empty()) && numeric_prefix_matches(v, prefix)
-            }
-            FloatPattern::PrereleaseLabelPrefix {
-                stable_prefix,
-                label_prefix,
-            } => {
-                stable_core_matches(v, stable_prefix)
-                    && (parsed.pre.is_empty() || prerelease_label_starts_with(v, label_prefix))
-            }
-        };
-        if !matches {
+        if !float_matches(v, &parsed, &float) {
             continue;
         }
 
@@ -431,31 +431,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_valid_requirement_accepts_well_formed_ranges() {
-        assert!(is_valid_requirement("[1.0.0]"));
-        assert!(is_valid_requirement("[1.0,2.0)"));
-        assert!(is_valid_requirement("(1.0,2.0]"));
-        assert!(is_valid_requirement("1.0.0"));
+    fn test_parse_range_accepts_well_formed_ranges() {
+        assert!(parse_range("[1.0.0]").is_some());
+        assert!(parse_range("[1.0,2.0)").is_some());
+        assert!(parse_range("(1.0,2.0]").is_some());
+        assert!(parse_range("1.0.0").is_some());
     }
 
     #[test]
-    fn test_is_valid_requirement_accepts_well_formed_floats() {
-        assert!(is_valid_requirement("*"));
-        assert!(is_valid_requirement("*-*"));
-        assert!(is_valid_requirement("1.1.*"));
-        assert!(is_valid_requirement("1.1.*-*"));
+    fn test_parse_float_accepts_well_formed_floats() {
+        assert!(parse_float("*").is_some());
+        assert!(parse_float("*-*").is_some());
+        assert!(parse_float("1.1.*").is_some());
+        assert!(parse_float("1.1.*-*").is_some());
     }
 
     #[test]
-    fn test_is_valid_requirement_rejects_malformed_range() {
-        assert!(!is_valid_requirement("[1.0,2.0"));
+    fn test_parse_range_rejects_malformed_range() {
+        assert!(parse_range("[1.0,2.0").is_none());
     }
 
     #[test]
-    fn test_is_valid_requirement_rejects_malformed_float() {
+    fn test_parse_float_rejects_malformed_float() {
         // Contains '*' but not in a recognized float shape (not a trailing `.*`/`*-*`).
-        assert!(!is_valid_requirement("1.*.0"));
-        assert!(!is_valid_requirement("*.1"));
+        assert!(parse_float("1.*.0").is_none());
+        assert!(parse_float("*.1").is_none());
     }
 
     #[test]

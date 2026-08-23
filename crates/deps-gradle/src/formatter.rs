@@ -24,6 +24,13 @@ fn is_snapshot(requirement: &str) -> bool {
 /// `version_satisfies_requirement` and [`GradleFormatter::compile_requirement`]'s matcher,
 /// since Gradle has no separate "loose" vs. "precise" comparator to distinguish (mirrors
 /// `deps-maven`'s formatter, which shares the same shape for the same reason).
+///
+/// #249 review (M4, root cause of S1): this function's branch order is a separate copy from
+/// `compile_requirement`'s below — the malformed-range guard that function adds ahead of its
+/// own copy of this order has no equivalent here (this function has none; a malformed range
+/// simply falls through to `crate::range::satisfies`'s fail-closed `false`, which is correct
+/// for the "loose satisfies" question this function answers). Reordering the branches here
+/// must be checked against `compile_requirement`'s branch order and guard placement too.
 fn gradle_version_matches(version: &str, requirement: &str) -> bool {
     // Unresolved Gradle variable reference (`$var`/`${var}`), or an empty version-catalog
     // entry (`[versions] foo = ""`) — skip comparison
@@ -49,15 +56,33 @@ fn gradle_version_matches(version: &str, requirement: &str) -> bool {
 }
 
 /// Precise Gradle version/range matcher, compiled once per dependency by
-/// [`GradleFormatter::compile_requirement`]. `requirement_is_unsatisfiable` already gates
-/// on `requirement_is_unresolved` before calling `compile_requirement`, so the unresolved
-/// and `latest.*` short-circuits in [`gradle_version_matches`] are unreachable from that
-/// caller in practice; they stay so this matcher is correct if used standalone.
-struct GradleMatcher(String);
+/// [`GradleFormatter::compile_requirement`] — a bracket-interval range is parsed once into a
+/// [`deps_maven::interval::VersionRange`] here rather than being re-parsed for every
+/// candidate version scanned. `requirement_is_unsatisfiable` already gates on
+/// `requirement_is_unresolved` before calling `compile_requirement`, so the unresolved and
+/// `latest.*` short-circuits are unreachable from that caller in practice; they stay so this
+/// matcher is correct if used standalone.
+enum GradleMatcher {
+    /// Unresolved `$var`/`${var}`, `latest`/`latest.*`, or a `-SNAPSHOT` pin.
+    AlwaysSatisfied,
+    /// A dynamic `1.0.+` prefix — the text before the trailing `+`.
+    DynamicPrefix(String),
+    /// A bracket-interval range, pre-parsed by [`crate::range::parse_range`].
+    Range(deps_maven::interval::VersionRange),
+    /// A bare exact version.
+    Exact(String),
+}
 
 impl RequirementMatcher for GradleMatcher {
     fn matches(&self, version: &str) -> Option<bool> {
-        Some(gradle_version_matches(version, &self.0))
+        Some(match self {
+            Self::AlwaysSatisfied => true,
+            Self::DynamicPrefix(prefix) => {
+                version == prefix.trim_end_matches('.') || version.starts_with(prefix.as_str())
+            }
+            Self::Range(range) => deps_maven::interval::contains(version, range),
+            Self::Exact(target) => version == target,
+        })
     }
 }
 
@@ -78,16 +103,42 @@ impl EcosystemFormatter for GradleFormatter {
         is_unresolved(requirement.as_str())
     }
 
-    /// Returns `None` for a malformed range (leading `[`/`(`/`]` but not
-    /// `crate::range::is_valid_range`): without this guard, `crate::range::satisfies`'s
-    /// `false`-on-failure return would make every candidate decide `Some(false)`, producing
-    /// a false "unsatisfiable" verdict for a typo instead of correctly suppressing the check.
+    /// Returns `None` for a malformed range (leading `[`/`(`/`]` but
+    /// `crate::range::parse_range` fails) — checked unconditionally, first, before any
+    /// other branch: without this guard ahead of the `AlwaysSatisfied`/dynamic-prefix
+    /// short-circuits below, a malformed bracket range that also happens to end in `+`
+    /// (e.g. `"[1.0,2.0]+"`) would be misclassified as a dynamic prefix — which decides
+    /// `Some(false)` for every real candidate — instead of correctly suppressing the check.
+    ///
+    /// #249 review (M4): this is a separate branch-order copy from `gradle_version_matches`
+    /// above — see the note on that function before reordering either one.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         let requirement = requirement.as_str();
-        if requirement.starts_with(['[', '(', ']']) && !crate::range::is_valid_range(requirement) {
+        if requirement.starts_with(['[', '(', ']'])
+            && crate::range::parse_range(requirement).is_none()
+        {
             return None;
         }
-        Some(Box::new(GradleMatcher(requirement.to_string())))
+        if is_unresolved(requirement)
+            || requirement == "latest"
+            || requirement.starts_with("latest.")
+        {
+            return Some(Box::new(GradleMatcher::AlwaysSatisfied));
+        }
+        if is_snapshot(requirement) {
+            return Some(Box::new(GradleMatcher::AlwaysSatisfied));
+        }
+        if let Some(prefix) = requirement.strip_suffix('+') {
+            return Some(Box::new(GradleMatcher::DynamicPrefix(prefix.to_string())));
+        }
+        // `]` is included alongside `[`/`(` because Gradle's reversed-bracket exclusive
+        // notation (`]1.2,1.5]`) is a leading delimiter in its own right, not just a
+        // trailing one.
+        if requirement.starts_with(['[', '(', ']']) {
+            return crate::range::parse_range(requirement)
+                .map(|range| Box::new(GradleMatcher::Range(range)) as Box<dyn RequirementMatcher>);
+        }
+        Some(Box::new(GradleMatcher::Exact(requirement.to_string())))
     }
 }
 
@@ -284,5 +335,20 @@ mod tests {
     fn test_version_satisfies_snapshot() {
         let f = GradleFormatter;
         assert!(f.version_satisfies_requirement("6.9.0", "7.0.0-SNAPSHOT"));
+    }
+
+    /// #249 review regression: a malformed bracket range that also happens to end in `+`
+    /// must still be rejected (`None`), not misclassified as a dynamic prefix by checking
+    /// the `strip_suffix('+')` branch before the malformed-range guard — that would make
+    /// every real candidate decide `Some(false)`, a false "unsatisfiable" ERROR for a typo.
+    #[test]
+    fn test_compile_requirement_malformed_range_rejected_even_with_trailing_plus() {
+        let f = GradleFormatter;
+        for malformed in ["[1.0,2.0]+", "[1.0,2.+", "(1.0,2.0)+", "]1.0,2.0]+"] {
+            assert!(
+                f.compile_requirement(&VersionReq::new(malformed)).is_none(),
+                "expected None for {malformed:?}"
+            );
+        }
     }
 }

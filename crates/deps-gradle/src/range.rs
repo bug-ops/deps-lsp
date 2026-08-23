@@ -11,28 +11,31 @@
 //!
 //! [spec]: https://docs.gradle.org/current/userguide/rich_versions.html
 
-use deps_maven::interval::{BracketStyle, contains, parse_interval};
+use deps_maven::interval::{BracketStyle, VersionRange, contains, parse_interval};
+
+/// Parses a Gradle bracket-interval `requirement`, once.
+///
+/// Supports `[1.0,2.0)`, `[1.0]`, `[1.5,)`, `(,2.0]`, and Gradle's reversed-bracket exclusive
+/// notation (`]1.2,1.5]`, `[1.1,2.0[`). Returns `None` for an unparseable requirement
+/// (unbalanced/unrecognized delimiters, empty bounds, a nested bracket, an extra
+/// comma-separated component) rather than panicking.
+///
+/// Used by `GradleFormatter::compile_requirement` to parse the requirement once per
+/// dependency; the resulting `VersionRange` is then tested against each candidate version
+/// via `contains` with no re-parsing.
+pub(crate) fn parse_range(requirement: &str) -> Option<VersionRange> {
+    parse_interval(requirement.trim(), BracketStyle::AllowReversed)
+}
 
 /// Checks whether `version` satisfies a Gradle bracket-interval `requirement`.
 ///
-/// Supports `[1.0,2.0)`, `[1.0]`, `[1.5,)`, `(,2.0]`, and Gradle's reversed-bracket exclusive
-/// notation (`]1.2,1.5]`, `[1.1,2.0[`). Returns `false` for an unparseable requirement
-/// (unbalanced/unrecognized delimiters, empty bounds, a nested bracket, an extra
-/// comma-separated component) rather than panicking.
+/// Convenience wrapper around `parse_range` + [`contains`] for callers that don't need to
+/// test more than one candidate against the same requirement.
 pub fn satisfies(version: &str, requirement: &str) -> bool {
-    match parse_interval(requirement.trim(), BracketStyle::AllowReversed) {
+    match parse_range(requirement) {
         Some(range) => contains(version, &range),
         None => false,
     }
-}
-
-/// Whether `requirement` is a syntactically well-formed bracket-interval range.
-///
-/// Used by `GradleFormatter::compile_requirement` to distinguish "no published version
-/// satisfies this well-formed range" from "this range string doesn't parse", which
-/// [`satisfies`]'s `false`-on-failure return does not otherwise distinguish.
-pub fn is_valid_range(requirement: &str) -> bool {
-    parse_interval(requirement.trim(), BracketStyle::AllowReversed).is_some()
 }
 
 #[cfg(test)]

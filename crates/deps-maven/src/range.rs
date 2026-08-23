@@ -13,7 +13,7 @@
 //!
 //! [spec]: https://maven.apache.org/pom.html#dependency-version-requirement-specification
 
-use crate::interval::{BracketStyle, contains, parse_interval};
+use crate::interval::{BracketStyle, VersionRange, contains, parse_interval};
 
 /// Splits `s` on commas that are not nested inside a `[`/`(` ... `]`/`)` pair, so a
 /// union like `[1.0,2.0),[3.0,4.0)` yields two members while the inner min/max comma of
@@ -43,36 +43,39 @@ pub fn is_range(requirement: &str) -> bool {
     requirement.trim_start().starts_with(['[', '('])
 }
 
-/// Checks whether `version` satisfies a Maven range `requirement`.
+/// Parses a Maven range/union `requirement` into its union members, once.
 ///
 /// `requirement` may be a single interval (`[1.0,2.0)`, `[1.0]`, `[1.5,)`, `(,2.0]`) or a
-/// top-level comma union of intervals (`(,1.0),(1.2,)`), which matches if `version` falls
-/// inside any member. If any member fails to parse, the whole requirement is rejected and
-/// this returns `false` (fail-closed) rather than silently ignoring the bad member — a
-/// malformed union member indicates the whole `requirement` string is not the range its
-/// author intended, so treating it as satisfied by the well-formed members alone would be
-/// misleading, not just a missing feature.
-pub fn satisfies(version: &str, requirement: &str) -> bool {
-    let mut matched = false;
-    for member in split_top_level(requirement.trim()) {
-        match parse_interval(member, BracketStyle::Standard) {
-            Some(range) => matched |= contains(version, &range),
-            None => return false,
-        }
-    }
-    matched
-}
-
-/// Whether `requirement` — assumed to already pass [`is_range`] — is a syntactically
-/// well-formed range/union, i.e. every top-level member parses.
+/// top-level comma union of intervals (`(,1.0),(1.2,)`). Returns `None` if any member fails
+/// to parse — a malformed union member indicates the whole `requirement` string is not the
+/// range its author intended, so treating it as satisfied by the well-formed members alone
+/// would be misleading, not just a missing feature.
 ///
-/// Used by `MavenFormatter::compile_requirement` to distinguish "no published version
-/// satisfies this well-formed range" from "this range string doesn't parse", which
-/// [`satisfies`]'s fail-closed `false` return does not otherwise distinguish.
-pub fn is_valid_range(requirement: &str) -> bool {
+/// Used by `MavenFormatter::compile_requirement` to parse the requirement once per
+/// dependency; the resulting `Vec<VersionRange>` is then tested against each candidate
+/// version via `satisfies_ranges` with no re-parsing.
+pub(crate) fn parse_range(requirement: &str) -> Option<Vec<VersionRange>> {
     split_top_level(requirement.trim())
         .iter()
-        .all(|member| parse_interval(member, BracketStyle::Standard).is_some())
+        .map(|member| parse_interval(member, BracketStyle::Standard))
+        .collect()
+}
+
+/// Whether `version` falls inside any member of an already-parsed range union.
+pub(crate) fn satisfies_ranges(version: &str, ranges: &[VersionRange]) -> bool {
+    ranges.iter().any(|range| contains(version, range))
+}
+
+/// Checks whether `version` satisfies a Maven range `requirement`.
+///
+/// Convenience wrapper around `parse_range` + `satisfies_ranges` for callers that don't
+/// need to test more than one candidate against the same requirement (unlike
+/// `MavenFormatter::compile_requirement`, which parses once via `parse_range` and reuses it).
+pub fn satisfies(version: &str, requirement: &str) -> bool {
+    match parse_range(requirement) {
+        Some(ranges) => satisfies_ranges(version, &ranges),
+        None => false,
+    }
 }
 
 #[cfg(test)]
