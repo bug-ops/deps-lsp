@@ -17,12 +17,15 @@ pub async fn handle_diagnostics(
     full_config: Arc<RwLock<DepsConfig>>,
 ) -> Vec<Diagnostic> {
     // Ensure document is loaded (cold start support)
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, full_config).await {
+    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&full_config)).await {
         tracing::warn!("Could not load document for diagnostics: {:?}", uri);
         return vec![];
     }
 
-    generate_diagnostics_internal(state, uri).await
+    // Snapshot before generating diagnostics (Copy value, no lock held across the call)
+    let freshness = { full_config.read().await.freshness.to_settings() };
+
+    generate_diagnostics_internal(state, uri, freshness).await
 }
 
 /// Internal diagnostic generation without cold start support.
@@ -31,6 +34,7 @@ pub async fn handle_diagnostics(
 pub(crate) async fn generate_diagnostics_internal(
     state: Arc<ServerState>,
     uri: &Uri,
+    freshness: deps_core::FreshnessSettings,
 ) -> Vec<Diagnostic> {
     // Single document lookup: extract all needed data at once
     let doc = match state.get_document(uri) {
@@ -70,6 +74,7 @@ pub(crate) async fn generate_diagnostics_internal(
             VersionData::new(&doc.cached_versions, &doc.resolved_versions)
                 .with_vulnerabilities(&doc.vulnerabilities),
             uri,
+            freshness,
         )
         .await
 }

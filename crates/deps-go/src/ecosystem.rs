@@ -58,12 +58,14 @@ impl GoEcosystem {
         &self,
         package_name: &deps_core::PackageName,
         prefix: &str,
+        freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
             prefix,
             &[],
+            freshness,
         )
         .await
     }
@@ -129,6 +131,7 @@ impl Ecosystem for GoEcosystem {
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
         content: &'a str,
+        freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
@@ -142,7 +145,10 @@ impl Ecosystem for GoEcosystem {
                 CompletionContext::Version {
                     package_name,
                     prefix,
-                } => self.complete_versions(&package_name, &prefix).await,
+                } => {
+                    self.complete_versions(&package_name, &prefix, freshness)
+                        .await
+                }
                 CompletionContext::Feature {
                     package_name,
                     prefix,
@@ -426,7 +432,11 @@ mod tests {
         let ecosystem = GoEcosystem::new(cache);
 
         let results = ecosystem
-            .complete_versions(&pkg("github.com/gin-gonic/gin"), "v1.9")
+            .complete_versions(
+                &pkg("github.com/gin-gonic/gin"),
+                "v1.9",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("v1.9")));
@@ -439,7 +449,11 @@ mod tests {
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
-            .complete_versions(&pkg("github.com/nonexistent/package12345"), "v1.0")
+            .complete_versions(
+                &pkg("github.com/nonexistent/package12345"),
+                "v1.0",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.is_empty());
     }
@@ -464,7 +478,11 @@ mod tests {
 
         // Test that we respect the 20 result limit
         let results = ecosystem
-            .complete_versions(&pkg("github.com/gin-gonic/gin"), "v")
+            .complete_versions(
+                &pkg("github.com/gin-gonic/gin"),
+                "v",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.len() <= 20);
     }
@@ -493,6 +511,7 @@ mod tests {
                 &parse_result,
                 position,
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
             )
             .await;
 
@@ -527,6 +546,7 @@ mod tests {
                 &parse_result,
                 position,
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
             )
             .await;
 
@@ -584,6 +604,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
                 parse_result.uri(),
+                deps_core::FreshnessSettings::default(),
             ),
         )
         .await;
@@ -613,7 +634,12 @@ require github.com/
         let position = Position::new(4, 19);
 
         let completions = ecosystem
-            .generate_completions(&parse_result, position, content)
+            .generate_completions(
+                &parse_result,
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
 
         // Go doesn't support package search, should be empty
@@ -639,7 +665,12 @@ go 1.21
         let position = Position::new(0, 0);
 
         let completions = ecosystem
-            .generate_completions(&parse_result, position, content)
+            .generate_completions(
+                &parse_result,
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
 
         assert!(completions.is_empty());

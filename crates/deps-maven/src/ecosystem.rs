@@ -34,12 +34,14 @@ impl MavenEcosystem {
         &self,
         package_name: &deps_core::PackageName,
         prefix: &str,
+        freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
             prefix,
             &[],
+            freshness,
         )
         .await
     }
@@ -140,6 +142,7 @@ impl Ecosystem for MavenEcosystem {
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
         content: &'a str,
+        freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
         Box::pin(async move {
             let (ctx_type, value) = Self::detect_xml_context(content, position, parse_result);
@@ -152,7 +155,7 @@ impl Ecosystem for MavenEcosystem {
                             || d.name_range().start.line == position.line
                     });
                     if let Some(dep) = dep {
-                        self.complete_versions(dep.name(), value).await
+                        self.complete_versions(dep.name(), value, freshness).await
                     } else {
                         vec![]
                     }

@@ -19,23 +19,27 @@ pub async fn handle_hover(
     let position = params.text_document_position_params.position;
 
     // Ensure document is loaded (cold start support)
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, config).await {
+    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
         tracing::warn!("Could not load document for hover: {:?}", uri);
         return None;
     }
+
+    // Snapshot before the document lookup, matching diagnostics.rs's ordering — this
+    // acquires the config RwLock before the DashMap shard guard, never the reverse.
+    let freshness = { config.read().await.freshness.to_settings() };
 
     // Single document lookup: extract all needed data at once
     let doc = state.get_document(uri)?;
     let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
     let parse_result = doc.parse_result()?;
 
-    // Generate hover while holding the lock
     ecosystem
         .generate_hover(
             parse_result,
             position,
             VersionData::new(&doc.cached_versions, &doc.resolved_versions)
                 .with_vulnerabilities(&doc.vulnerabilities),
+            freshness,
         )
         .await
 }

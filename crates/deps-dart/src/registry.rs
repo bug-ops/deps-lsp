@@ -119,7 +119,10 @@ fn parse_versions_response(data: &[u8]) -> Result<Vec<DartVersion>> {
         .map(|e| DartVersion {
             version: e.version,
             retracted: e.retracted,
-            published: e.published,
+            published_at: e
+                .published
+                .as_deref()
+                .and_then(deps_core::PublishTime::parse_rfc3339),
         })
         .collect();
 
@@ -156,6 +159,10 @@ impl deps_core::Version for DartVersion {
 
     fn is_yanked(&self) -> bool {
         self.retracted
+    }
+
+    fn published_at(&self) -> Option<deps_core::PublishTime> {
+        self.published_at
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -295,6 +302,57 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_versions_response_with_published() {
+        let json = r#"{
+            "name": "http",
+            "latest": {"version": "1.2.0"},
+            "versions": [
+                {"version": "1.2.0", "retracted": false, "published": "2025-03-10T14:22:05.123Z"}
+            ]
+        }"#;
+
+        let versions = parse_versions_response(json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            versions[0].published_at,
+            deps_core::PublishTime::parse_rfc3339("2025-03-10T14:22:05.123Z")
+        );
+    }
+
+    #[test]
+    fn test_parse_versions_response_without_published() {
+        let json = r#"{
+            "name": "http",
+            "latest": {"version": "1.2.0"},
+            "versions": [
+                {"version": "1.2.0", "retracted": false}
+            ]
+        }"#;
+
+        let versions = parse_versions_response(json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].published_at.is_none());
+    }
+
+    #[test]
+    fn test_parse_versions_response_with_malformed_published() {
+        let json = r#"{
+            "name": "http",
+            "latest": {"version": "1.2.0"},
+            "versions": [
+                {"version": "1.2.0", "retracted": false, "published": "not-a-timestamp"}
+            ]
+        }"#;
+
+        let versions = parse_versions_response(json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(
+            versions[0].published_at.is_none(),
+            "malformed published degrades to None, not an error"
+        );
+    }
+
+    #[test]
     fn test_parse_versions_response_empty() {
         let json = r#"{
             "name": "test",
@@ -370,7 +428,7 @@ mod tests {
         let ver = DartVersion {
             version: "1.0.0".into(),
             retracted: true,
-            published: None,
+            published_at: None,
         };
         assert_eq!(ver.version_string(), "1.0.0");
         assert!(ver.is_yanked());

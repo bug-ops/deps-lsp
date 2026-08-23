@@ -98,7 +98,10 @@ fn parse_versions_response(data: &[u8], _gem_name: &str) -> Result<Vec<BundlerVe
             number: e.number,
             prerelease: e.prerelease,
             yanked: e.yanked,
-            created_at: e.created_at,
+            published_at: e
+                .created_at
+                .as_deref()
+                .and_then(deps_core::PublishTime::parse_rfc3339),
             platform: e.platform,
         })
         .collect();
@@ -175,6 +178,10 @@ impl deps_core::Version for BundlerVersion {
 
     fn is_yanked(&self) -> bool {
         self.yanked
+    }
+
+    fn published_at(&self) -> Option<deps_core::PublishTime> {
+        self.published_at
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -339,8 +346,33 @@ mod tests {
         let versions = parse_versions_response(json.as_bytes(), "test").unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(
-            versions[0].created_at,
-            Some("2024-01-15T10:30:00Z".to_string())
+            versions[0].published_at,
+            deps_core::PublishTime::parse_rfc3339("2024-01-15T10:30:00Z")
+        );
+    }
+
+    #[test]
+    fn test_parse_versions_response_without_created_at() {
+        let json = r#"[
+            {"number": "1.0.0", "prerelease": false, "yanked": false, "platform": "ruby"}
+        ]"#;
+
+        let versions = parse_versions_response(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].published_at.is_none());
+    }
+
+    #[test]
+    fn test_parse_versions_response_with_malformed_created_at() {
+        let json = r#"[
+            {"number": "1.0.0", "prerelease": false, "yanked": false, "created_at": "not-a-timestamp", "platform": "ruby"}
+        ]"#;
+
+        let versions = parse_versions_response(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(
+            versions[0].published_at.is_none(),
+            "malformed created_at degrades to None, not an error"
         );
     }
 
@@ -496,7 +528,7 @@ mod tests {
             number: "1.0.0".into(),
             prerelease: false,
             yanked: true,
-            created_at: None,
+            published_at: None,
             platform: "ruby".into(),
         };
 

@@ -90,6 +90,8 @@ macro_rules! impl_dependency {
 /// * `$type` - The struct type name
 /// * `version` - Field name for version string (`String`)
 /// * `yanked` - Field name for yanked/deprecated status (`bool`)
+/// * `published_at` - Optional: field name for publish timestamp
+///   (`Option<PublishTime>`), already parsed eagerly at construction
 ///
 /// # Examples
 ///
@@ -106,6 +108,24 @@ macro_rules! impl_dependency {
 ///     yanked: deprecated,
 /// });
 /// ```
+///
+/// With a publish timestamp:
+///
+/// ```ignore
+/// use deps_core::{impl_version, PublishTime};
+///
+/// pub struct MyVersion {
+///     pub version: String,
+///     pub deprecated: bool,
+///     pub published_at: Option<PublishTime>,
+/// }
+///
+/// impl_version!(MyVersion {
+///     version: version,
+///     yanked: deprecated,
+///     published_at: published_at,
+/// });
+/// ```
 #[macro_export]
 macro_rules! impl_version {
     ($type:ty {
@@ -119,6 +139,29 @@ macro_rules! impl_version {
 
             fn is_yanked(&self) -> bool {
                 self.$yanked
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
+    };
+    ($type:ty {
+        version: $version:ident,
+        yanked: $yanked:ident,
+        published_at: $published_at:ident $(,)?
+    }) => {
+        impl $crate::registry::Version for $type {
+            fn version_string(&self) -> &str {
+                &self.$version
+            }
+
+            fn is_yanked(&self) -> bool {
+                self.$yanked
+            }
+
+            fn published_at(&self) -> Option<$crate::freshness::PublishTime> {
+                self.$published_at
             }
 
             fn as_any(&self) -> &dyn ::std::any::Any {
@@ -304,6 +347,13 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
+    struct TestVersionWithPublishedAt {
+        version: String,
+        yanked: bool,
+        published_at: Option<crate::freshness::PublishTime>,
+    }
+
+    #[derive(Debug, Clone)]
     struct TestPackage {
         name: crate::PackageName,
         description: Option<String>,
@@ -329,6 +379,12 @@ mod tests {
     impl_version!(TestVersion {
         version: version,
         yanked: yanked,
+    });
+
+    impl_version!(TestVersionWithPublishedAt {
+        version: version,
+        yanked: yanked,
+        published_at: published_at,
     });
 
     impl_metadata!(TestPackage {
@@ -378,6 +434,27 @@ mod tests {
         assert_eq!(version.version_string(), "2.0.0");
         assert!(version.is_yanked());
         assert!(version.as_any().is::<TestVersion>());
+        assert!(version.published_at().is_none());
+    }
+
+    #[test]
+    fn test_impl_version_macro_with_published_at() {
+        use crate::freshness::PublishTime;
+        use crate::registry::Version;
+
+        let version = TestVersionWithPublishedAt {
+            version: "3.0.0".into(),
+            yanked: false,
+            published_at: Some(PublishTime::from_unix_secs(1_000)),
+        };
+
+        assert_eq!(version.version_string(), "3.0.0");
+        assert!(!version.is_yanked());
+        assert_eq!(
+            version.published_at(),
+            Some(PublishTime::from_unix_secs(1_000))
+        );
+        assert!(version.as_any().is::<TestVersionWithPublishedAt>());
     }
 
     #[test]

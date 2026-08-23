@@ -39,8 +39,14 @@ pub enum GoDirective {
 pub struct GoVersion {
     /// Version string (e.g., "v1.9.1")
     pub version: String,
-    /// Timestamp when version was published
-    pub time: Option<String>,
+    /// Publish timestamp, parsed eagerly from the `/@latest` and
+    /// `/@v/{version}.info` endpoints' `Time` field.
+    ///
+    /// Always `None` for versions from `/@v/list` (the `Ch2` path), which
+    /// carries no dates — a documented Go-specific limitation, not a bug.
+    /// `None` also when the value fails to parse as RFC 3339, degrading
+    /// gracefully per [US-003](https://github.com/bug-ops/deps-lsp/issues/145).
+    pub published_at: Option<deps_core::PublishTime>,
     /// Whether this is a pseudo-version
     pub is_pseudo: bool,
     /// Whether this version is retracted
@@ -106,6 +112,10 @@ impl deps_core::registry::Version for GoVersion {
         self.retracted
     }
 
+    fn published_at(&self) -> Option<deps_core::PublishTime> {
+        self.published_at
+    }
+
     fn is_prerelease(&self) -> bool {
         // Go considers pseudo-versions as pre-releases (they're commit-based).
         // Regular pre-releases contain '-' (e.g., v1.0.0-beta.1).
@@ -161,7 +171,7 @@ mod tests {
     fn test_go_version_trait() {
         let version = GoVersion {
             version: "v1.9.1".to_string(),
-            time: Some("2023-01-01T00:00:00Z".to_string()),
+            published_at: deps_core::PublishTime::parse_rfc3339("2023-01-01T00:00:00Z"),
             is_pseudo: false,
             retracted: false,
         };
@@ -170,13 +180,17 @@ mod tests {
         assert!(!version.is_yanked());
         assert!(!version.is_prerelease());
         assert!(version.is_stable());
+        assert_eq!(
+            version.published_at(),
+            deps_core::PublishTime::parse_rfc3339("2023-01-01T00:00:00Z")
+        );
     }
 
     #[test]
     fn test_pseudo_version_is_prerelease() {
         let version = GoVersion {
             version: "v0.0.0-20191109021931-daa7c04131f5".to_string(),
-            time: None,
+            published_at: None,
             is_pseudo: true,
             retracted: false,
         };
@@ -189,7 +203,7 @@ mod tests {
     fn test_retracted_version_is_yanked() {
         let version = GoVersion {
             version: "v1.0.0".to_string(),
-            time: None,
+            published_at: None,
             is_pseudo: false,
             retracted: true,
         };

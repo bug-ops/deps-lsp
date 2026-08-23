@@ -8,15 +8,16 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionParams, CodeActionProviderCapability, CodeLens, CodeLensOptions,
-    CodeLensParams, CompletionOptions, CompletionParams, CompletionResponse, DiagnosticOptions,
-    DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentChanges,
-    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
-    ExecuteCommandOptions, ExecuteCommandParams, FullDocumentDiagnosticReport, Hover, HoverParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, InlayHint,
-    InlayHintParams, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Range,
-    RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo, TextDocumentEdit,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
+    CodeLensParams, CompletionOptions, CompletionOptionsCompletionItem, CompletionParams,
+    CompletionResponse, DiagnosticOptions, DiagnosticServerCapabilities,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentChanges, DocumentDiagnosticParams, DocumentDiagnosticReport,
+    DocumentDiagnosticReportResult, ExecuteCommandOptions, ExecuteCommandParams,
+    FullDocumentDiagnosticReport, Hover, HoverParams, HoverProviderCapability, InitializeParams,
+    InitializeResult, InitializedParams, InlayHint, InlayHintParams, MessageType, OneOf,
+    OptionalVersionedTextDocumentIdentifier, Range, RelatedFullDocumentDiagnosticReport,
+    ServerCapabilities, ServerInfo, TextDocumentEdit, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
 
@@ -223,6 +224,9 @@ impl Backend {
             completion_provider: Some(CompletionOptions {
                 trigger_characters: Some(vec!["\"".into(), "=".into(), ".".into()]),
                 resolve_provider: Some(false),
+                completion_item: Some(CompletionOptionsCompletionItem {
+                    label_details_support: Some(true),
+                }),
                 ..Default::default()
             }),
             hover_provider: Some(HoverProviderCapability::Simple(true)),

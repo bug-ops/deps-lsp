@@ -236,6 +236,12 @@ struct IndexEntry {
     yanked: bool,
     #[serde(default)]
     features: HashMap<String, Vec<String>>,
+    /// Publish timestamp (RFC 3339, e.g. `"2026-07-18T23:05:13Z"`).
+    ///
+    /// Absent on index entries older than the sparse index's rollout of this
+    /// field; `#[serde(default)]` keeps such lines parseable.
+    #[serde(default)]
+    pubtime: Option<String>,
 }
 
 /// Parses newline-delimited JSON from sparse index.
@@ -250,11 +256,16 @@ fn parse_index_json(data: &[u8], _crate_name: &str) -> Result<Vec<CargoVersion>>
         .filter_map(|line| {
             let entry: IndexEntry = serde_json::from_str(line).ok()?;
             let parsed = entry.version.parse::<Version>().ok()?;
+            let published_at = entry
+                .pubtime
+                .as_deref()
+                .and_then(deps_core::PublishTime::parse_rfc3339);
             Some((
                 CargoVersion {
                     num: entry.version,
                     yanked: entry.yanked,
                     features: entry.features,
+                    published_at,
                 },
                 parsed,
             ))
@@ -481,6 +492,39 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].num, "2.0.0");
         assert_eq!(versions[1].num, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_index_json_with_pubtime() {
+        let json = r#"{"name":"test","vers":"1.0.0","yanked":false,"features":{},"deps":[],"pubtime":"2026-07-18T23:05:13Z"}"#;
+
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            versions[0].published_at,
+            Some(deps_core::PublishTime::parse_rfc3339("2026-07-18T23:05:13Z").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_parse_index_json_without_pubtime() {
+        let json = r#"{"name":"test","vers":"1.0.0","yanked":false,"features":{},"deps":[]}"#;
+
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].published_at.is_none());
+    }
+
+    #[test]
+    fn test_parse_index_json_with_malformed_pubtime() {
+        let json = r#"{"name":"test","vers":"1.0.0","yanked":false,"features":{},"deps":[],"pubtime":"not-a-timestamp"}"#;
+
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(
+            versions[0].published_at.is_none(),
+            "malformed pubtime degrades to None, not an error"
+        );
     }
 
     #[test]

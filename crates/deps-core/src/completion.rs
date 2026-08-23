@@ -41,10 +41,13 @@
 //! ```
 
 use crate::lsp_helpers::escape_markdown;
-use crate::{Metadata, PackageName, ParseResult, Version};
+use crate::{
+    FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
+    format_relative_age,
+};
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, MarkupContent,
-    MarkupKind, Position, Range, TextEdit,
+    CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
+    Documentation, MarkupContent, MarkupKind, Position, Range, TextEdit,
 };
 
 /// Context for completion request based on cursor position.
@@ -442,6 +445,9 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
 /// * `display_item` - Version display metadata with label, description, and flags
 /// * `insert_range` - Optional LSP range where the completion should replace text.
 ///   If `None`, the completion will insert at cursor position without replacing.
+/// * `now` - Current instant, injected explicitly rather than read internally, so every
+///   item in the same completion response has its age computed against one consistent
+///   instant instead of drifting mid-request.
 ///
 /// # Returns
 ///
@@ -451,6 +457,9 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
 ///
 /// - Label: `"version"` or `"version (latest)"` for the latest version
 /// - Detail: `"Update package_name to version"`
+/// - Label details: a greyed-out relative age (e.g. `"2 hours ago"`) when
+///   `display_item.published_at` is known and `freshness_enabled` is `true`; omitted
+///   entirely otherwise
 /// - Preselect: `true` for latest version, `false` otherwise
 /// - Sort: Index-based (00000, 00001, etc.)
 ///
@@ -462,22 +471,39 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
 /// use tower_lsp_server::ls_types::Range;
 ///
 /// # async fn example(version: &dyn deps_core::Version) {
+/// let now = deps_core::PublishTime::now();
+///
 /// // Without range - insert at cursor
 /// let display_item = VersionDisplayItem::new(version, &PackageName::new("serde"), 0, true);
-/// let item = build_version_completion(&display_item, None);
+/// let item = build_version_completion(&display_item, None, now, true);
 /// assert_eq!(item.label, display_item.label);
 ///
 /// // With range - replace existing text
 /// let range = Range::default();
-/// let item = build_version_completion(&display_item, Some(range));
+/// let item = build_version_completion(&display_item, Some(range), now, true);
 /// # }
 /// ```
 pub fn build_version_completion(
     display_item: &VersionDisplayItem,
     insert_range: Option<Range>,
+    now: PublishTime,
+    freshness_enabled: bool,
 ) -> CompletionItem {
     // Simple index-based sorting (00000, 00001, etc.)
     let sort_text = format!("{:05}", display_item.index);
+
+    // Greyed-out label suffix; unlike `label`, it never participates in filter matching,
+    // so adding it cannot change which items match a typed prefix (FR-006).
+    let label_details = freshness_enabled
+        .then_some(display_item.published_at)
+        .flatten()
+        .map(|published_at| CompletionItemLabelDetails {
+            detail: Some(format!(
+                "  {}",
+                format_relative_age(published_at.age_secs_from(now))
+            )),
+            description: None,
+        });
 
     CompletionItem {
         label: display_item.label.clone(),
@@ -493,6 +519,7 @@ pub fn build_version_completion(
         }),
         sort_text: Some(sort_text),
         preselect: Some(display_item.is_latest),
+        label_details,
         ..Default::default()
     }
 }
@@ -512,6 +539,12 @@ pub struct VersionDisplayItem {
     pub index: usize,
     /// True if this is the latest non-yanked version
     pub is_latest: bool,
+    /// When this version was published, if the registry exposes it.
+    ///
+    /// `None` for ecosystems without publish metadata (see
+    /// [`Version::published_at`]) — callers must degrade gracefully rather than
+    /// rendering a placeholder age.
+    pub published_at: Option<PublishTime>,
 }
 
 impl VersionDisplayItem {
@@ -536,6 +569,7 @@ impl VersionDisplayItem {
             description,
             index,
             is_latest,
+            published_at: version.published_at(),
         }
     }
 }
@@ -631,12 +665,15 @@ const MAX_COMPLETION_VERSIONS: usize = 5;
 /// use deps_core::PackageName;
 ///
 /// # async fn example(registry: &dyn deps_core::Registry) {
+/// let freshness = deps_core::FreshnessSettings::default();
+///
 /// // Cargo: strip ^, ~, =, <, > operators
 /// let items = complete_versions_generic(
 ///     registry,
 ///     &PackageName::new("serde"),
 ///     "^1.0",
 ///     &['^', '~', '=', '<', '>'],
+///     freshness,
 /// ).await;
 ///
 /// // Go: no operators to strip
@@ -645,6 +682,7 @@ const MAX_COMPLETION_VERSIONS: usize = 5;
 ///     &PackageName::new("github.com/gin-gonic/gin"),
 ///     "v1.9",
 ///     &[],
+///     freshness,
 /// ).await;
 /// # }
 /// ```
@@ -683,6 +721,7 @@ pub async fn complete_versions_generic(
     package_name: &PackageName,
     prefix: &str,
     operator_chars: &[char],
+    freshness: FreshnessSettings,
 ) -> Vec<CompletionItem> {
     let versions = match registry.get_versions(package_name).await {
         Ok(v) => v,
@@ -708,9 +747,10 @@ pub async fn complete_versions_generic(
     };
 
     // Don't provide text_edit range - let LSP client insert at cursor position
+    let now = PublishTime::now();
     display_items
         .iter()
-        .map(|item| build_version_completion(item, None))
+        .map(|item| build_version_completion(item, None, now, freshness.enabled))
         .collect()
 }
 
@@ -808,6 +848,32 @@ mod tests {
 
         fn is_prerelease(&self) -> bool {
             self.prerelease
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A [`MockVersion`] variant that reports a `published_at`, used only by the
+    /// freshness-specific tests below — kept separate so the many pre-existing
+    /// `MockVersion` literals do not need a new field added to every call site.
+    struct MockVersionWithAge {
+        version: String,
+        published_at: Option<PublishTime>,
+    }
+
+    impl crate::registry::Version for MockVersionWithAge {
+        fn version_string(&self) -> &str {
+            &self.version
+        }
+
+        fn is_yanked(&self) -> bool {
+            false
+        }
+
+        fn published_at(&self) -> Option<PublishTime> {
+            self.published_at
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -1491,8 +1557,9 @@ mod tests {
             prerelease: false,
         };
 
+        let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, false);
-        let item = build_version_completion(&display_item, None);
+        let item = build_version_completion(&display_item, None, now, true);
 
         assert_eq!(item.label, "1.0.0");
         assert_eq!(item.kind, Some(CompletionItemKind::VALUE));
@@ -1511,8 +1578,9 @@ mod tests {
             prerelease: false,
         };
 
+        let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
-        let item = build_version_completion(&display_item, None);
+        let item = build_version_completion(&display_item, None, now, true);
 
         assert_eq!(item.label, "1.0.0 (latest)");
         assert_eq!(item.kind, Some(CompletionItemKind::VALUE));
@@ -1531,8 +1599,9 @@ mod tests {
             prerelease: false,
         };
 
+        let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("tokio"), 1, false);
-        let item = build_version_completion(&display_item, None);
+        let item = build_version_completion(&display_item, None, now, true);
 
         assert_eq!(item.label, "0.9.0");
         assert_eq!(item.detail, Some("Update tokio to 0.9.0".to_string()));
@@ -1563,9 +1632,10 @@ mod tests {
         let display_item1 = VersionDisplayItem::new(&v1, &pkg("test"), 0, true);
         let display_item2 = VersionDisplayItem::new(&v2, &pkg("test"), 1, false);
         let display_item3 = VersionDisplayItem::new(&v3, &pkg("test"), 2, false);
-        let item1 = build_version_completion(&display_item1, None);
-        let item2 = build_version_completion(&display_item2, None);
-        let item3 = build_version_completion(&display_item3, None);
+        let now = PublishTime::now();
+        let item1 = build_version_completion(&display_item1, None, now, true);
+        let item2 = build_version_completion(&display_item2, None, now, true);
+        let item3 = build_version_completion(&display_item3, None, now, true);
 
         // Simple index-based sorting
         assert_eq!(item1.sort_text.as_ref().unwrap(), "00000");
@@ -1598,12 +1668,13 @@ mod tests {
             },
         ];
 
+        let now = PublishTime::now();
         let items: Vec<_> = versions
             .iter()
             .enumerate()
             .map(|(idx, v)| {
                 let display_item = VersionDisplayItem::new(v, &pkg("test"), idx, idx == 0);
-                build_version_completion(&display_item, None)
+                build_version_completion(&display_item, None, now, true)
             })
             .collect();
 
@@ -1628,6 +1699,7 @@ mod tests {
     fn test_version_completion_index_ordering() {
         let versions = ["1.20.0", "1.9.0", "1.2.0", "0.99.0", "0.50.0"];
 
+        let now = PublishTime::now();
         let items: Vec<_> = versions
             .iter()
             .enumerate()
@@ -1638,7 +1710,7 @@ mod tests {
                     prerelease: false,
                 };
                 let display_item = VersionDisplayItem::new(&v, &pkg("test"), idx, idx == 0);
-                build_version_completion(&display_item, None)
+                build_version_completion(&display_item, None, now, true)
             })
             .collect();
 
@@ -2145,6 +2217,7 @@ mod tests {
             &pkg("test-pkg"),
             "^1.0",
             &['^', '~', '=', '<', '>'],
+            FreshnessSettings::default(),
         )
         .await;
 
@@ -2159,6 +2232,7 @@ mod tests {
             &pkg("test-pkg"),
             "~1.1",
             &['^', '~', '=', '<', '>'],
+            FreshnessSettings::default(),
         )
         .await;
 
@@ -2171,6 +2245,7 @@ mod tests {
             &pkg("test-pkg"),
             "=2.0",
             &['^', '~', '=', '<', '>'],
+            FreshnessSettings::default(),
         )
         .await;
 
@@ -2183,6 +2258,7 @@ mod tests {
             &pkg("test-pkg"),
             "1.0",
             &['^', '~', '=', '<', '>'],
+            FreshnessSettings::default(),
         )
         .await;
 
@@ -2224,6 +2300,7 @@ mod tests {
             &pkg("test-pkg"),
             "3.0",
             &['^', '~', '=', '<', '>'],
+            FreshnessSettings::default(),
         )
         .await;
 
@@ -2237,7 +2314,14 @@ mod tests {
         assert!(!items.iter().any(|item| item.label == "2.1.0"));
 
         // Test with empty prefix (should show all non-yanked)
-        let items = complete_versions_generic(&registry, &pkg("test-pkg"), "", &[]).await;
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
 
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].label, "1.0.0 (latest)");
@@ -2268,7 +2352,14 @@ mod tests {
         };
 
         // Test that yanked versions are filtered out even when prefix matches
-        let items = complete_versions_generic(&registry, &pkg("test-pkg"), "1.0", &[]).await;
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "1.0",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
 
         // Should only include non-yanked versions
         assert_eq!(items.len(), 2);
@@ -2293,7 +2384,14 @@ mod tests {
         let registry = MockRegistry { versions };
 
         // Test that we only return 5 items
-        let items = complete_versions_generic(&registry, &pkg("test-pkg"), "1.0", &[]).await;
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "1.0",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
 
         assert_eq!(items.len(), 5);
         assert_eq!(items[0].label, "1.0.0 (latest)");
@@ -2323,9 +2421,14 @@ mod tests {
         };
 
         // Go has no operators, so empty array
-        let items =
-            complete_versions_generic(&registry, &pkg("github.com/gin-gonic/gin"), "v1.9", &[])
-                .await;
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("github.com/gin-gonic/gin"),
+            "v1.9",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "v1.9.0 (latest)");
@@ -2599,5 +2702,129 @@ mod tests {
         };
         let prefix = extract_feature_prefix(content, position);
         assert_eq!(prefix, "");
+    }
+
+    // --- Release-freshness signal (issue #145): VersionDisplayItem.published_at,
+    // build_version_completion's label_details ---
+
+    #[test]
+    fn test_version_display_item_captures_published_at() {
+        let version = MockVersionWithAge {
+            version: "1.0.0".to_string(),
+            published_at: Some(PublishTime::from_unix_secs(1_000)),
+        };
+
+        let item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
+
+        assert_eq!(item.published_at, Some(PublishTime::from_unix_secs(1_000)));
+    }
+
+    #[test]
+    fn test_version_display_item_published_at_none_when_unavailable() {
+        // Plain `MockVersion` doesn't override `published_at`, so it falls back to
+        // the `Version` trait's default `None` — the ecosystems-without-metadata case.
+        let version = MockVersion {
+            version: "1.0.0".to_string(),
+            yanked: false,
+            prerelease: false,
+        };
+
+        let item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
+
+        assert_eq!(item.published_at, None);
+    }
+
+    #[test]
+    fn test_build_version_completion_label_details_present_when_published_at_known() {
+        let now = PublishTime::from_unix_secs(10_000);
+        let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
+        let version = MockVersionWithAge {
+            version: "1.2.3".to_string(),
+            published_at: Some(published_two_hours_ago),
+        };
+        let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
+
+        let item = build_version_completion(&display_item, None, now, true);
+
+        let details = item
+            .label_details
+            .expect("label_details must be set when published_at is known");
+        assert_eq!(details.detail, Some("  2 hours ago".to_string()));
+        assert_eq!(details.description, None);
+    }
+
+    #[test]
+    fn test_build_version_completion_label_details_absent_when_freshness_disabled() {
+        // `freshness.enabled: false` must suppress label_details even when
+        // published_at is known — the escape hatch must be all-or-nothing.
+        let now = PublishTime::from_unix_secs(10_000);
+        let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
+        let version = MockVersionWithAge {
+            version: "1.2.3".to_string(),
+            published_at: Some(published_two_hours_ago),
+        };
+        let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
+
+        let item = build_version_completion(&display_item, None, now, false);
+
+        assert!(item.label_details.is_none());
+    }
+
+    #[test]
+    fn test_build_version_completion_label_details_absent_when_published_at_unknown() {
+        let version = MockVersion {
+            version: "1.2.3".to_string(),
+            yanked: false,
+            prerelease: false,
+        };
+        let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
+
+        let item = build_version_completion(&display_item, None, PublishTime::now(), true);
+
+        assert!(item.label_details.is_none());
+    }
+
+    /// FR-006 regression guard: when freshness data is absent (the pre-feature and
+    /// 5-deferred-ecosystem case), `label`, `sort_text`, `preselect`, and the item
+    /// count/order out of `prepare_version_display_items` must stay byte-identical to
+    /// what this suite asserted before `published_at`/`label_details` existed.
+    #[test]
+    fn test_build_version_completion_byte_identical_output_without_freshness_data() {
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
+            std::sync::Arc::new(MockVersion {
+                version: "1.0.0".to_string(),
+                yanked: false,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "0.9.0".to_string(),
+                yanked: true,
+                prerelease: false,
+            }),
+            std::sync::Arc::new(MockVersion {
+                version: "0.8.0".to_string(),
+                yanked: false,
+                prerelease: false,
+            }),
+        ];
+
+        let display_items = prepare_version_display_items(&versions, &pkg("test"));
+        assert_eq!(display_items.len(), 2, "yanked filtering must be unchanged");
+
+        let now = PublishTime::now();
+        let items: Vec<_> = display_items
+            .iter()
+            .map(|item| build_version_completion(item, None, now, true))
+            .collect();
+
+        assert_eq!(items[0].label, "1.0.0 (latest)");
+        assert_eq!(items[0].sort_text, Some("00000".to_string()));
+        assert_eq!(items[0].preselect, Some(true));
+        assert_eq!(items[0].label_details, None);
+
+        assert_eq!(items[1].label, "0.8.0");
+        assert_eq!(items[1].sort_text, Some("00001".to_string()));
+        assert_eq!(items[1].preselect, Some(false));
+        assert_eq!(items[1].label_details, None);
     }
 }

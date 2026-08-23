@@ -30,7 +30,12 @@ pub use deps_core::parser::DependencySource;
 pub struct DartVersion {
     pub version: String,
     pub retracted: bool,
-    pub published: Option<String>,
+    /// Publish timestamp, parsed eagerly from the API's `published` field.
+    ///
+    /// `None` when the response omits it or the value fails to parse as
+    /// RFC 3339 — degrades gracefully, per
+    /// [US-003](https://github.com/bug-ops/deps-lsp/issues/145).
+    pub published_at: Option<deps_core::PublishTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +197,7 @@ mod tests {
         let ver = DartVersion {
             version: "1.0.0".into(),
             retracted: false,
-            published: Some("2024-01-01".into()),
+            published_at: Some(deps_core::PublishTime::from_unix_secs(1_704_067_200)),
         };
         assert_eq!(ver.version_string(), "1.0.0");
         assert!(!ver.is_yanked());
@@ -206,7 +211,7 @@ mod tests {
         let ver = DartVersion {
             version: "0.9.0".into(),
             retracted: true,
-            published: None,
+            published_at: None,
         };
         assert!(ver.is_yanked());
     }

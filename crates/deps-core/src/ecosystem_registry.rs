@@ -379,6 +379,7 @@ mod tests {
             _parse_result: &'a dyn ParseResult,
             _position: Position,
             _content: &'a str,
+            _freshness: crate::FreshnessSettings,
         ) -> crate::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
             Box::pin(async move { vec![] })
         }
@@ -435,6 +436,7 @@ mod tests {
             _parse_result: &'a dyn ParseResult,
             _position: Position,
             _content: &'a str,
+            _freshness: crate::FreshnessSettings,
         ) -> crate::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
             Box::pin(async move { vec![] })
         }

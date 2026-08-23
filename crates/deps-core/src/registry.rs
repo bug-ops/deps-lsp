@@ -170,6 +170,15 @@ pub trait Version: Send + Sync {
     fn is_stable(&self) -> bool {
         !self.is_yanked() && !self.is_prerelease()
     }
+
+    /// When this version was published, if the registry exposes it.
+    ///
+    /// Default `None` — ecosystems without publish metadata (or where
+    /// fetching it would add a network round trip) degrade to pre-feature
+    /// behavior: no freshness signal shown, no error, no change in ranking.
+    fn published_at(&self) -> Option<crate::freshness::PublishTime> {
+        None
+    }
 }
 
 /// Finds the latest stable version from a list of versions.

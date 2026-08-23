@@ -293,6 +293,7 @@ impl Default for EcosystemConfig {
 ///         _parse_result: &'a dyn ParseResult,
 ///         _position: Position,
 ///         _content: &'a str,
+///         _freshness: deps_core::FreshnessSettings,
 ///     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
 ///         Box::pin(async move { vec![] })
 ///     }
@@ -407,6 +408,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         parse_result: &'a dyn ParseResult,
         position: Position,
         versions: VersionData<'a>,
+        freshness: crate::freshness::FreshnessSettings,
     ) -> BoxFuture<'a, Option<Hover>> {
         Box::pin(async move {
             let registry = self.registry();
@@ -416,6 +418,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 versions,
                 registry.as_ref(),
                 self.formatter(),
+                freshness,
             )
             .await
         })
@@ -453,12 +456,14 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         parse_result: &'a dyn ParseResult,
         versions: VersionData<'a>,
         _uri: &'a Uri,
+        freshness: crate::freshness::FreshnessSettings,
     ) -> BoxFuture<'a, Vec<Diagnostic>> {
         Box::pin(async move {
             crate::lsp_helpers::generate_diagnostics_from_cache(
                 parse_result,
                 versions,
                 self.formatter(),
+                freshness,
             )
         })
     }
@@ -490,11 +495,17 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Generate completions for a position.
     ///
     /// Provides autocomplete suggestions for package names and versions.
+    ///
+    /// `freshness.enabled` gates whether version completion items carry a
+    /// relative-age `label_details` suffix (issue #145); implementations that
+    /// delegate to [`crate::completion::complete_versions_generic`] get this for
+    /// free by threading `freshness` through.
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
         position: Position,
         content: &'a str,
+        freshness: crate::FreshnessSettings,
     ) -> BoxFuture<'a, Vec<CompletionItem>>;
 
     /// Support for downcasting to concrete ecosystem type

@@ -40,7 +40,12 @@ pub struct BundlerVersion {
     pub number: String,
     pub prerelease: bool,
     pub yanked: bool,
-    pub created_at: Option<String>,
+    /// Publish timestamp, parsed eagerly from the API's `created_at` field.
+    ///
+    /// `None` when the response omits it or the value fails to parse as
+    /// RFC 3339 — degrades gracefully, per
+    /// [US-003](https://github.com/bug-ops/deps-lsp/issues/145).
+    pub published_at: Option<deps_core::PublishTime>,
     pub platform: String,
 }
 
@@ -162,7 +167,7 @@ mod tests {
             number: "7.0.8".into(),
             prerelease: false,
             yanked: false,
-            created_at: Some("2023-09-09".into()),
+            published_at: Some(deps_core::PublishTime::from_unix_secs(1_694_208_000)),
             platform: "ruby".into(),
         };
 
@@ -177,7 +182,7 @@ mod tests {
             number: "7.1.0.beta1".into(),
             prerelease: true,
             yanked: false,
-            created_at: None,
+            published_at: None,
             platform: "ruby".into(),
         };
 
@@ -191,7 +196,7 @@ mod tests {
             number: "1.0.0".into(),
             prerelease: false,
             yanked: true,
-            created_at: None,
+            published_at: None,
             platform: "ruby".into(),
         };
 
@@ -344,7 +349,7 @@ mod tests {
             number: "1.2.3".into(),
             prerelease: false,
             yanked: false,
-            created_at: Some("2024-01-01".into()),
+            published_at: Some(deps_core::PublishTime::from_unix_secs(1_704_067_200)),
             platform: "ruby".into(),
         };
 
@@ -362,7 +367,7 @@ mod tests {
             number: "1.0.0".into(),
             prerelease: false,
             yanked: true,
-            created_at: None,
+            published_at: None,
             platform: "ruby".into(),
         };
 
