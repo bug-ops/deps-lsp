@@ -599,7 +599,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         on_name || on_version
     })?;
 
-    let available_versions = registry.get_versions(dep.name().as_str()).await.ok()?;
+    let available_versions = registry.get_versions(dep.name()).await.ok()?;
 
     let url = formatter.package_url(dep.name());
 
@@ -709,7 +709,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         return actions;
     };
 
-    let Ok(versions) = registry.get_versions(dep.name().as_str()).await else {
+    let Ok(versions) = registry.get_versions(dep.name()).await else {
         return actions;
     };
 
@@ -1117,7 +1117,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
     let mut diagnostics = Vec::with_capacity(deps.len());
 
     for dep in deps {
-        let versions = match registry.get_versions(dep.name().as_str()).await {
+        let versions = match registry.get_versions(dep.name()).await {
             Ok(v) => v,
             Err(_) => {
                 let message = match formatter.validate_package_name(dep.name().as_str()) {
@@ -1143,7 +1143,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
         };
 
         let matching = registry
-            .get_latest_matching(dep.name().as_str(), version_req.as_str())
+            .get_latest_matching(dep.name(), version_req)
             .await
             .ok()
             .flatten();
@@ -1597,7 +1597,7 @@ mod tests {
     impl crate::Registry for MockRegistry {
         fn get_versions<'a>(
             &'a self,
-            _name: &'a str,
+            _name: &'a PackageName,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(Vec::new()) })
@@ -1605,8 +1605,8 @@ mod tests {
 
         fn get_latest_matching<'a>(
             &'a self,
-            _name: &'a str,
-            _req: &'a str,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(None) })
@@ -1621,7 +1621,7 @@ mod tests {
             Box::pin(async move { Ok(Vec::new()) })
         }
 
-        fn package_url(&self, _name: &str) -> String {
+        fn package_url(&self, _name: &PackageName) -> String {
             String::new()
         }
 
@@ -1637,7 +1637,7 @@ mod tests {
     impl crate::Registry for ErrorRegistry {
         fn get_versions<'a>(
             &'a self,
-            _name: &'a str,
+            _name: &'a PackageName,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
         {
             Box::pin(async move {
@@ -1649,8 +1649,8 @@ mod tests {
 
         fn get_latest_matching<'a>(
             &'a self,
-            _name: &'a str,
-            _req: &'a str,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(None) })
@@ -1665,7 +1665,7 @@ mod tests {
             Box::pin(async move { Ok(Vec::new()) })
         }
 
-        fn package_url(&self, _name: &str) -> String {
+        fn package_url(&self, _name: &PackageName) -> String {
             String::new()
         }
 

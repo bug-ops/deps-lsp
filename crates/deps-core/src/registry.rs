@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::{PackageName, VersionReq};
 use std::any::Any;
 use std::pin::Pin;
 
@@ -48,13 +49,13 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// }
 ///
 /// impl Registry for MyRegistry {
-///     fn get_versions<'a>(&'a self, _name: &'a str)
+///     fn get_versions<'a>(&'a self, _name: &'a PackageName)
 ///         -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Version>>>> + Send + 'a>>
 ///     {
 ///         Box::pin(async move { Ok(vec![Box::new(MyVersion { version: "1.0.0".into() }) as Box<dyn Version>]) })
 ///     }
 ///
-///     fn get_latest_matching<'a>(&'a self, _name: &'a str, _req: &'a str)
+///     fn get_latest_matching<'a>(&'a self, _name: &'a PackageName, _req: &'a deps_core::VersionReq)
 ///         -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Option<Box<dyn Version>>>> + Send + 'a>>
 ///     {
 ///         Box::pin(async move { Ok(None) })
@@ -66,7 +67,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///         Box::pin(async move { Ok(vec![]) })
 ///     }
 ///
-///     fn package_url(&self, name: &str) -> String {
+///     fn package_url(&self, name: &PackageName) -> String {
 ///         format!("https://example.com/packages/{}", name)
 ///     }
 ///
@@ -84,7 +85,10 @@ pub trait Registry: Send + Sync {
     /// - Package does not exist
     /// - Network request fails
     /// - Response parsing fails
-    fn get_versions<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>>;
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a PackageName,
+    ) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>>;
 
     /// Finds the latest version matching a version requirement.
     ///
@@ -103,8 +107,8 @@ pub trait Registry: Send + Sync {
     /// - `Err(_)` - Network or parsing error
     fn get_latest_matching<'a>(
         &'a self,
-        name: &'a str,
-        req: &'a str,
+        name: &'a PackageName,
+        req: &'a VersionReq,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>>;
 
     /// Searches for packages by name or keywords.
@@ -123,7 +127,7 @@ pub trait Registry: Send + Sync {
     /// Package URL for ecosystem (e.g., <https://crates.io/crates/serde>)
     ///
     /// Returns a URL that links to the package page on the registry website.
-    fn package_url(&self, name: &str) -> String;
+    fn package_url(&self, name: &PackageName) -> String;
 
     /// Downcast to concrete registry type for ecosystem-specific operations
     fn as_any(&self) -> &dyn Any;

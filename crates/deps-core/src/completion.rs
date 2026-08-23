@@ -677,7 +677,10 @@ pub async fn complete_versions_generic(
     prefix: &str,
     operator_chars: &[char],
 ) -> Vec<CompletionItem> {
-    let versions = match registry.get_versions(package_name).await {
+    let versions = match registry
+        .get_versions(&crate::PackageName::new(package_name))
+        .await
+    {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
@@ -845,7 +848,7 @@ mod tests {
     impl crate::Registry for MockRegistry {
         fn get_versions<'a>(
             &'a self,
-            _package_name: &'a str,
+            _package_name: &'a crate::PackageName,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
         {
             let versions: Vec<Box<dyn crate::Version>> = self
@@ -864,8 +867,8 @@ mod tests {
 
         fn get_latest_matching<'a>(
             &'a self,
-            _name: &'a str,
-            _req: &'a str,
+            _name: &'a crate::PackageName,
+            _req: &'a crate::VersionReq,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(None) })
@@ -880,7 +883,7 @@ mod tests {
             Box::pin(async move { Ok(vec![]) })
         }
 
-        fn package_url(&self, _name: &str) -> String {
+        fn package_url(&self, _name: &crate::PackageName) -> String {
             String::new()
         }
 

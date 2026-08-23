@@ -148,6 +148,7 @@ async fn fetch_latest_versions_parallel(
     let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let first_error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let timeout = Duration::from_secs(timeout_secs);
+    let wildcard_req = deps_core::VersionReq::new("*");
 
     let results: Vec<_> = stream::iter(package_names)
         .map(|name| {
@@ -156,10 +157,13 @@ async fn fetch_latest_versions_parallel(
             let failed = Arc::clone(&failed);
             let first_error = Arc::clone(&first_error);
             let progress_sender = progress_sender.clone();
+            let wildcard_req = &wildcard_req;
             async move {
-                let result =
-                    tokio::time::timeout(timeout, registry.get_latest_matching(name.as_str(), "*"))
-                        .await;
+                let result = tokio::time::timeout(
+                    timeout,
+                    registry.get_latest_matching(&name, wildcard_req),
+                )
+                .await;
 
                 let version = match result {
                     Ok(Ok(Some(v))) => {
@@ -842,7 +846,7 @@ mod tests {
         impl Registry for TimeoutRegistry {
             fn get_versions<'a>(
                 &'a self,
-                _name: &'a str,
+                _name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -854,8 +858,8 @@ mod tests {
 
             fn get_latest_matching<'a>(
                 &'a self,
-                _name: &'a str,
-                _req: &'a str,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -874,7 +878,7 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{}", name)
             }
 
@@ -906,7 +910,7 @@ mod tests {
         impl Registry for MixedRegistry {
             fn get_versions<'a>(
                 &'a self,
-                name: &'a str,
+                name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -921,8 +925,8 @@ mod tests {
 
             fn get_latest_matching<'a>(
                 &'a self,
-                name: &'a str,
-                _req: &'a str,
+                name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -944,7 +948,7 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{}", name)
             }
 
@@ -997,7 +1001,7 @@ mod tests {
         impl Registry for ConcurrencyTrackingRegistry {
             fn get_versions<'a>(
                 &'a self,
-                _name: &'a str,
+                _name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -1019,8 +1023,8 @@ mod tests {
 
             fn get_latest_matching<'a>(
                 &'a self,
-                _name: &'a str,
-                _req: &'a str,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -1049,7 +1053,7 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{}", name)
             }
 
@@ -1121,11 +1125,11 @@ mod tests {
         impl Registry for MixedOutcomeRegistry {
             fn get_versions<'a>(
                 &'a self,
-                name: &'a str,
+                name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    match name {
+                    match name.as_str() {
                         "package-fast" => {
                             // Return immediately with a stable version
                             Ok(vec![Box::new(MockVersion {
@@ -1150,12 +1154,12 @@ mod tests {
 
             fn get_latest_matching<'a>(
                 &'a self,
-                name: &'a str,
-                _req: &'a str,
+                name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    match name {
+                    match name.as_str() {
                         "package-fast" => Ok(Some(Box::new(MockVersion {
                             version: "1.0.0".to_string(),
                         }) as Box<dyn Version>)),
@@ -1180,7 +1184,7 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{}", name)
             }
 
@@ -1231,7 +1235,7 @@ mod tests {
         impl Registry for ErrorRegistry {
             fn get_versions<'a>(
                 &'a self,
-                name: &'a str,
+                name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -1244,8 +1248,8 @@ mod tests {
 
             fn get_latest_matching<'a>(
                 &'a self,
-                name: &'a str,
-                _req: &'a str,
+                name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -1265,7 +1269,7 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{}", name)
             }
 

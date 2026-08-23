@@ -279,10 +279,10 @@ fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<PackageInfo>> 
 impl deps_core::Registry for NuGetRegistry {
     fn get_versions<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a deps_core::PackageName,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            let versions = self.get_versions_typed(name).await?;
+            let versions = self.get_versions_typed(name.as_str()).await?;
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -292,11 +292,13 @@ impl deps_core::Registry for NuGetRegistry {
 
     fn get_latest_matching<'a>(
         &'a self,
-        name: &'a str,
-        req: &'a str,
+        name: &'a deps_core::PackageName,
+        req: &'a deps_core::VersionReq,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            let version = self.get_latest_matching_typed(name, req).await?;
+            let version = self
+                .get_latest_matching_typed(name.as_str(), req.as_str())
+                .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
     }
@@ -315,8 +317,8 @@ impl deps_core::Registry for NuGetRegistry {
         })
     }
 
-    fn package_url(&self, name: &str) -> String {
-        package_url(name)
+    fn package_url(&self, name: &deps_core::PackageName) -> String {
+        package_url(name.as_str())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -577,7 +579,7 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = NuGetRegistry::new(cache);
         assert_eq!(
-            registry.package_url("Newtonsoft.Json"),
+            registry.package_url(&deps_core::PackageName::new("Newtonsoft.Json")),
             "https://www.nuget.org/packages/Newtonsoft.Json"
         );
         assert!(registry.as_any().is::<NuGetRegistry>());

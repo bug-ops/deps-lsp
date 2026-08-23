@@ -684,7 +684,7 @@ require github.com/gin-gonic/gin v1.9.1
 
         let registry = ecosystem.registry();
         assert_eq!(
-            registry.package_url("github.com/gin-gonic/gin"),
+            registry.package_url(&deps_core::PackageName::new("github.com/gin-gonic/gin")),
             "https://pkg.go.dev/github.com/gin-gonic/gin"
         );
     }

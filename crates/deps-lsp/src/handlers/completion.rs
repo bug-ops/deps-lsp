@@ -1225,7 +1225,7 @@ serde
         impl Registry for FastRegistry {
             fn get_versions<'a>(
                 &'a self,
-                _name: &'a str,
+                _name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
@@ -1233,8 +1233,8 @@ serde
 
             fn get_latest_matching<'a>(
                 &'a self,
-                _name: &'a str,
-                _req: &'a str,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1253,7 +1253,7 @@ serde
                 })
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{name}")
             }
 
@@ -1278,7 +1278,7 @@ serde
         impl Registry for SlowRegistry {
             fn get_versions<'a>(
                 &'a self,
-                _name: &'a str,
+                _name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
@@ -1286,8 +1286,8 @@ serde
 
             fn get_latest_matching<'a>(
                 &'a self,
-                _name: &'a str,
-                _req: &'a str,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1307,7 +1307,7 @@ serde
                 })
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{name}")
             }
 
