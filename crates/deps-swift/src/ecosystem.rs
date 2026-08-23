@@ -87,7 +87,7 @@ impl SwiftEcosystem {
         query: &str,
         replace_range: Option<LspRange>,
     ) -> Vec<CompletionItem> {
-        if query.len() < 2 || query.len() > 200 {
+        if !deps_core::completion::is_valid_completion_prefix_len(query) {
             return vec![];
         }
 

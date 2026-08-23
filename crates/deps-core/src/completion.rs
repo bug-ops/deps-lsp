@@ -697,6 +697,59 @@ pub fn build_feature_completion(
 /// Maximum number of version completions to show (matches Code Actions limit).
 const MAX_COMPLETION_VERSIONS: usize = 5;
 
+/// Checks whether `prefix` has an acceptable length (2 to 200 characters, inclusive) for
+/// triggering a package-name completion search.
+///
+/// Length is measured in Unicode scalar values (`chars().count()`), not bytes, so a
+/// multi-byte prefix (e.g. CJK) is bounded by how many characters the user typed rather
+/// than how many bytes those characters happen to occupy.
+///
+/// # Examples
+///
+/// ```
+/// # use deps_core::completion::is_valid_completion_prefix_len;
+/// assert!(!is_valid_completion_prefix_len("a")); // 1 char, too short
+/// assert!(is_valid_completion_prefix_len("ab")); // 2 chars, accepted
+///
+/// // "日" is 1 char / 3 bytes: rejected despite being >= 2 bytes.
+/// assert!(!is_valid_completion_prefix_len("日"));
+/// // "日本" is 2 chars / 6 bytes: accepted.
+/// assert!(is_valid_completion_prefix_len("日本"));
+/// ```
+#[must_use]
+pub fn is_valid_completion_prefix_len(prefix: &str) -> bool {
+    (2..=200).contains(&prefix.chars().count())
+}
+
+/// Generic package name completion using any `Registry` implementation.
+///
+/// Searches the registry for packages matching `prefix` and returns up to `limit`
+/// completion items, each with its `textEdit` set to replace `insert_range`. Returns
+/// empty vec if `prefix` is shorter than 2 characters or longer than 200 characters.
+pub async fn complete_package_names_generic(
+    registry: &dyn crate::Registry,
+    prefix: &str,
+    limit: usize,
+    insert_range: Range,
+) -> Vec<CompletionItem> {
+    if !is_valid_completion_prefix_len(prefix) {
+        return vec![];
+    }
+
+    let results = match registry.search(prefix, limit).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Registry search failed for '{}': {}", prefix, e);
+            return vec![];
+        }
+    };
+
+    results
+        .into_iter()
+        .map(|metadata| build_package_completion(metadata.as_ref(), insert_range))
+        .collect()
+}
+
 /// Generic version completion logic used by all ecosystems.
 ///
 /// Filters versions by prefix (stripping ecosystem-specific operators),
@@ -743,35 +796,6 @@ const MAX_COMPLETION_VERSIONS: usize = 5;
 /// ).await;
 /// # }
 /// ```
-/// Generic package name completion using any `Registry` implementation.
-///
-/// Searches the registry for packages matching `prefix` and returns up to `limit`
-/// completion items, each with its `textEdit` set to replace `insert_range`. Returns
-/// empty vec if `prefix` is shorter than 2 characters or longer than 200 characters.
-pub async fn complete_package_names_generic(
-    registry: &dyn crate::Registry,
-    prefix: &str,
-    limit: usize,
-    insert_range: Range,
-) -> Vec<CompletionItem> {
-    if prefix.len() < 2 || prefix.len() > 200 {
-        return vec![];
-    }
-
-    let results = match registry.search(prefix, limit).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("Registry search failed for '{}': {}", prefix, e);
-            return vec![];
-        }
-    };
-
-    results
-        .into_iter()
-        .map(|metadata| build_package_completion(metadata.as_ref(), insert_range))
-        .collect()
-}
-
 pub async fn complete_versions_generic(
     registry: &dyn crate::Registry,
     package_name: &PackageName,
@@ -1122,6 +1146,57 @@ mod tests {
 
         let items = complete_package_names_generic(&registry, "s", 5, Range::default()).await;
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_is_valid_completion_prefix_len_ascii_short_rejected() {
+        assert!(!is_valid_completion_prefix_len("a"));
+    }
+
+    #[test]
+    fn test_is_valid_completion_prefix_len_one_char_cjk_rejected() {
+        // "日" is 1 char but 3 bytes — a byte-length guard would wrongly accept it.
+        assert!(!is_valid_completion_prefix_len("日"));
+    }
+
+    #[test]
+    fn test_is_valid_completion_prefix_len_two_char_cjk_accepted() {
+        // "日本" is 2 chars but 6 bytes — must be accepted under char-count semantics.
+        assert!(is_valid_completion_prefix_len("日本"));
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_generic_one_char_cjk_prefix_empty() {
+        // "日" is 1 char but 3 bytes — a byte-length guard would wrongly accept it.
+        let registry = MockSearchRegistry {
+            results: vec![MockMetadata {
+                name: pkg("serde"),
+                description: None,
+                repository: None,
+                documentation: None,
+                latest_version: "1.0.0".to_string(),
+            }],
+        };
+
+        let items = complete_package_names_generic(&registry, "日", 5, Range::default()).await;
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_generic_two_char_cjk_prefix_accepted() {
+        // "日本" is 2 chars / 6 bytes — must pass the guard and reach the registry search.
+        let registry = MockSearchRegistry {
+            results: vec![MockMetadata {
+                name: pkg("serde"),
+                description: None,
+                repository: None,
+                documentation: None,
+                latest_version: "1.0.0".to_string(),
+            }],
+        };
+
+        let items = complete_package_names_generic(&registry, "日本", 5, Range::default()).await;
+        assert_eq!(items.len(), 1);
     }
 
     // Context detection tests
