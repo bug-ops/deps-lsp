@@ -1,5 +1,7 @@
-use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::{Dependency, PackageName};
+
+use crate::types::{GoDependency, GoDirective};
 
 /// Formatter for Go module version strings and package URLs.
 ///
@@ -60,11 +62,64 @@ impl EcosystemFormatter for GoFormatter {
         // matching forbids it — strip it before sending on the wire.
         version.strip_prefix('v').unwrap_or(version).to_string()
     }
+
+    fn manifest_requirement_is_resolved_version(&self, dep: &dyn Dependency) -> bool {
+        // go.mod's `require` line is already the module version selected by
+        // Go's MVS, never a range — unlike Cargo/npm. go.sum, by contrast,
+        // only ever gets appended to (`go get`/`go build`; only
+        // `go mod tidy` prunes it), so a stale higher version left over from
+        // a downgrade can still be recorded there and win naive
+        // last-occurrence-wins parsing (#235).
+        //
+        // Restricted to `GoDirective::Require`: `exclude`/`replace`
+        // directives are also surfaced as dependencies, but their
+        // `version_requirement()` is not an in-use version (the excluded
+        // version, or the replaced-from version) — treating those as
+        // resolved would fabricate a "current version" claim for a
+        // dependency that isn't actually pinned there (#235 review).
+        dep.as_any()
+            .downcast_ref::<GoDependency>()
+            .is_some_and(|go_dep| go_dep.directive == GoDirective::Require)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp_server::ls_types::{Position, Range};
+
+    fn go_dep(directive: GoDirective, version: &str) -> GoDependency {
+        GoDependency {
+            module_path: PackageName::new("github.com/gorilla/mux"),
+            module_path_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version: Some(deps_core::VersionReq::new(version)),
+            version_range: Some(Range::new(Position::new(0, 0), Position::new(0, 1))),
+            directive,
+            indirect: false,
+        }
+    }
+
+    /// Regression test for critique M1 (`.local/handoff/2026-08-23T20-55-32-critic.md`):
+    /// a `require` directive's version is the exact MVS-selected version (#235), but
+    /// `exclude`/`replace` directives are also surfaced as dependencies whose
+    /// `version_requirement()` is not an in-use version (the excluded version, or the
+    /// replaced-from version) — those must not be reported as resolved.
+    #[test]
+    fn test_manifest_requirement_is_resolved_version_only_for_require_directive() {
+        let formatter = GoFormatter;
+
+        let require_dep = go_dep(GoDirective::Require, "v1.8.0");
+        assert!(formatter.manifest_requirement_is_resolved_version(&require_dep));
+
+        let exclude_dep = go_dep(GoDirective::Exclude, "v0.1.0");
+        assert!(!formatter.manifest_requirement_is_resolved_version(&exclude_dep));
+
+        let replace_dep = go_dep(GoDirective::Replace, "v1.0.0");
+        assert!(!formatter.manifest_requirement_is_resolved_version(&replace_dep));
+
+        let retract_dep = go_dep(GoDirective::Retract, "v1.0.0");
+        assert!(!formatter.manifest_requirement_is_resolved_version(&retract_dep));
+    }
 
     #[test]
     fn test_format_version_for_text_edit() {

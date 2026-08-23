@@ -635,6 +635,32 @@ pub trait EcosystemFormatter: Send + Sync {
     fn osv_version(&self, version: &str) -> String {
         version.to_string()
     }
+
+    /// Whether `dep`'s manifest version-requirement line is itself the exact
+    /// version already selected — never a range.
+    ///
+    /// True only for a Go `require`-directive dependency: `go.mod`'s
+    /// `require` line already holds the module version selected by Go's
+    /// MVS, unlike Cargo/npm where the manifest holds a range and the lock
+    /// file holds the pin. When true, hover and inlay hints prefer
+    /// [`Dependency::version_requirement`] over the lock-file-derived entry
+    /// in [`VersionData::resolved`], because `go.sum` is a checksum ledger
+    /// that `go get`/`go build` only ever append to (only `go mod tidy`
+    /// prunes it) — a stale, no-longer-selected higher version can remain
+    /// recorded there after a downgrade and, since go.sum is written sorted
+    /// ascending by semver, always sorts last and wins naive
+    /// last-occurrence-wins parsing (overridden in `deps-go`; see `#235`).
+    ///
+    /// Takes `dep` (precedent: [`Self::osv_package_name`]) because Go's
+    /// `exclude`/`replace` directives are also surfaced as dependencies
+    /// whose `version_requirement()` is *not* an in-use version (the
+    /// excluded version, or the replaced-from version) — the `deps-go`
+    /// override inspects the directive kind and returns `true` only for
+    /// `require`.
+    fn manifest_requirement_is_resolved_version(&self, dep: &dyn Dependency) -> bool {
+        let _ = dep;
+        false
+    }
 }
 
 pub fn generate_inlay_hints(
@@ -657,10 +683,16 @@ pub fn generate_inlay_hints(
             .cached
             .get(normalized_name.as_str())
             .or_else(|| versions.cached.get(dep.name()));
-        let resolved_version = versions
-            .resolved
-            .get(normalized_name.as_str())
-            .or_else(|| versions.resolved.get(dep.name()));
+        let resolved_version: Option<&str> =
+            if formatter.manifest_requirement_is_resolved_version(dep) {
+                dep.version_requirement().map(VersionReq::as_str)
+            } else {
+                versions
+                    .resolved
+                    .get(normalized_name.as_str())
+                    .or_else(|| versions.resolved.get(dep.name()))
+                    .map(String::as_str)
+            };
 
         // Show loading hint if loading and no cached version
         if loading_state == crate::LoadingState::Loading
@@ -707,7 +739,7 @@ pub fn generate_inlay_hints(
         // 1. If lock file has the dep, check if resolved == latest
         // 2. If NOT in lock file, check the version requirement against latest
         let status = if let Some(resolved) = resolved_version {
-            if resolved.as_str() == latest.as_str() {
+            if resolved == latest.as_str() {
                 RequirementStatus::UpToDate
             } else {
                 RequirementStatus::Outdated
@@ -803,10 +835,15 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     let normalized_name = formatter.normalize_package_name(dep.name());
 
-    let resolved = versions
-        .resolved
-        .get(normalized_name.as_str())
-        .or_else(|| versions.resolved.get(dep.name()));
+    let resolved: Option<&str> = if formatter.manifest_requirement_is_resolved_version(dep) {
+        dep.version_requirement().map(VersionReq::as_str)
+    } else {
+        versions
+            .resolved
+            .get(normalized_name.as_str())
+            .or_else(|| versions.resolved.get(dep.name()))
+            .map(String::as_str)
+    };
     if let Some(resolved_ver) = resolved {
         write!(
             &mut markdown,
@@ -2060,6 +2097,25 @@ mod tests {
         }
     }
 
+    /// Formatter stub mirroring `GoFormatter`'s override: reports the manifest
+    /// version-requirement line (go.mod's `require`) as itself the resolved
+    /// version, since it is already the exact MVS-selected version (#235).
+    struct MockGoFormatter;
+
+    impl EcosystemFormatter for MockGoFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            version.to_string()
+        }
+
+        fn package_url(&self, name: &PackageName) -> String {
+            format!("https://pkg.go.dev/{}", name)
+        }
+
+        fn manifest_requirement_is_resolved_version(&self, _dep: &dyn Dependency) -> bool {
+            true
+        }
+    }
+
     /// A formatter whose `validate_package_name` always rejects, for exercising
     /// the "Invalid package name" diagnostic path independently of "Unknown package".
     struct RejectingFormatter;
@@ -2654,6 +2710,97 @@ mod tests {
         // Exactly the pre-feature line: no trailing age suffix.
         assert!(content.value.contains("- `1.2.3` *(latest)*\n"));
         assert!(!content.value.contains("ago"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_go_prefers_manifest_requirement_over_stale_resolved_version() {
+        use std::collections::HashMap;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "example.com/mod".into(),
+                version_req: "v0.8.1".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)),
+            }],
+            uri: crate::test_util::test_uri("/test/go.mod"),
+        };
+
+        // Stale go.sum entry left behind by a downgrade (#235): go.mod's `require`
+        // line was downgraded back to v0.8.1, but the ledger-only go.sum still
+        // records the higher v0.9.1 and sorts last, so it would win naive
+        // last-occurrence-wins parsing if hover trusted `versions.resolved` here.
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example.com/mod".into(), "v0.9.1".to_string());
+        let cached_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MockGoFormatter,
+            crate::freshness::FreshnessSettings::default(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Current**: `v0.8.1`"),
+            "expected hover to show go.mod's pinned version, got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("v0.9.1"),
+            "hover must not surface the stale go.sum version: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_non_go_formatter_uses_resolved_lockfile_version() {
+        use std::collections::HashMap;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), "1.2.0".to_string());
+        let cached_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        // Non-Go formatters must keep showing the lockfile-resolved version
+        // ("1.2.0"), not the raw manifest requirement ("1.0.0") — confirms the Go
+        // override does not leak into other ecosystems.
+        assert!(
+            content.value.contains("**Current**: `1.2.0`"),
+            "expected hover to show the resolved lockfile version, got: {}",
+            content.value
+        );
+        assert!(!content.value.contains("**Current**: `1.0.0`"));
     }
 
     #[tokio::test]
@@ -3690,6 +3837,116 @@ mod tests {
                     text.starts_with("✅"),
                     "Expected up-to-date hint, got: {}",
                     text
+                );
+            }
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    #[test]
+    fn test_inlay_hint_go_prefers_manifest_requirement_over_stale_resolved_version() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockGoFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "example.com/mod".into(),
+                version_req: "v0.8.1".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/go.mod"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("example.com/mod".into(), "v0.9.1".to_string());
+
+        // Stale go.sum entry left behind by a downgrade: go.sum is sorted ascending by
+        // semver, so it sorts last and would win naive last-occurrence-wins parsing
+        // even though go.mod's `require` line was downgraded back to v0.8.1 (#235).
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("example.com/mod".into(), "v0.9.1".to_string());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                // Bug: using the stale go.sum "v0.9.1" as resolved would equal latest
+                // ("v0.9.1") and wrongly report up-to-date. The fix takes go.mod's
+                // pinned "v0.8.1", which is genuinely outdated relative to latest.
+                assert!(
+                    text.starts_with("❌"),
+                    "expected outdated hint driven by go.mod pin, got: {text}"
+                );
+            }
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    #[test]
+    fn test_inlay_hint_non_go_formatter_uses_resolved_lockfile_version() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".into(), "1.2.0".to_string());
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), "1.2.0".to_string());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                // Non-Go formatters must keep using the lockfile-resolved version
+                // ("1.2.0", matching latest) rather than the raw manifest requirement
+                // ("1.0.0", which would wrongly report outdated) — confirms the Go
+                // override does not leak into other ecosystems.
+                assert!(
+                    text.starts_with("✅"),
+                    "expected up-to-date hint from resolved lockfile version, got: {text}"
                 );
             }
             _ => panic!("Expected string label"),
