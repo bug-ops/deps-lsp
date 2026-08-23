@@ -56,6 +56,12 @@ impl EcosystemFormatter for ComposerFormatter {
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
         let version = version.strip_prefix('v').unwrap_or(version);
         let requirement = requirement.trim();
+        // Composer's own version parser strips a leading `v` from every version string it
+        // normalizes, tags and constraints alike. Mirroring that only for `version` above
+        // and not here made an exact/wildcard/caret/tilde requirement pinned with a `v`
+        // prefix (e.g. `"v1.2.3"`, `"^v1.2.0"`) never match, since `version` had already
+        // lost its `v` while `requirement` had not.
+        let requirement = requirement.strip_prefix('v').unwrap_or(requirement);
 
         if requirement.is_empty() || requirement == "*" {
             return true;
@@ -83,11 +89,13 @@ impl EcosystemFormatter for ComposerFormatter {
 
         // Caret operator
         if let Some(req) = requirement.strip_prefix('^') {
+            let req = req.strip_prefix('v').unwrap_or(req);
             return satisfies_caret(version, req);
         }
 
         // Tilde operator — Composer-specific semantics
         if let Some(req) = requirement.strip_prefix('~') {
+            let req = req.strip_prefix('v').unwrap_or(req);
             return satisfies_tilde_composer(version, req);
         }
 
@@ -412,6 +420,28 @@ mod tests {
         assert!(f.version_satisfies_requirement("v1.0.5", "1.0.*"));
         assert!(f.version_satisfies_requirement("v1.2.3", "1.2.3"));
         assert!(!f.version_satisfies_requirement("v2.0.0", "^1.0"));
+    }
+
+    #[test]
+    fn test_v_prefix_symmetric_on_requirement_side() {
+        let f = ComposerFormatter;
+        // Exact pin with a `v`-prefixed requirement, matched against an un-prefixed
+        // candidate (the common case: registry candidates already had `v` stripped).
+        assert!(f.version_satisfies_requirement("1.2.3", "v1.2.3"));
+        // Both sides `v`-prefixed.
+        assert!(f.version_satisfies_requirement("v1.2.3", "v1.2.3"));
+        // Operator-prefixed requirement with a `v`-prefixed version literal.
+        assert!(f.version_satisfies_requirement("1.5.0", "^v1.2.0"));
+        assert!(f.version_satisfies_requirement("1.2.9", "~v1.2.3"));
+        assert!(!f.version_satisfies_requirement("2.0.0", "^v1.2.0"));
+        // Wildcard with a `v`-prefixed requirement.
+        assert!(f.version_satisfies_requirement("1.0.5", "v1.0.*"));
+    }
+
+    #[test]
+    fn test_compile_requirement_bare_at_dev_returns_none() {
+        let f = ComposerFormatter;
+        assert!(f.compile_requirement(&VersionReq::new("@dev")).is_none());
     }
 
     #[test]

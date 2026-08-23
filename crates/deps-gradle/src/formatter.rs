@@ -25,6 +25,10 @@ fn is_snapshot(requirement: &str) -> bool {
 /// since Gradle has no separate "loose" vs. "precise" comparator to distinguish (mirrors
 /// `deps-maven`'s formatter, which shares the same shape for the same reason).
 fn gradle_version_matches(version: &str, requirement: &str) -> bool {
+    // `!!` is Gradle's `strictly(...)` shorthand (e.g. `1.2.3!!`) — it constrains how
+    // Gradle's conflict resolution treats the version, not which version string it names,
+    // so matching drops the suffix and compares the version underneath unchanged.
+    let requirement = requirement.strip_suffix("!!").unwrap_or(requirement);
     // Unresolved Gradle variable reference (`$var`/`${var}`), or an empty version-catalog
     // entry (`[versions] foo = ""`) — skip comparison
     if is_unresolved(requirement) {
@@ -284,5 +288,20 @@ mod tests {
     fn test_version_satisfies_snapshot() {
         let f = GradleFormatter;
         assert!(f.version_satisfies_requirement("6.9.0", "7.0.0-SNAPSHOT"));
+    }
+
+    #[test]
+    fn test_version_satisfies_strict_shorthand() {
+        let f = GradleFormatter;
+        assert!(f.version_satisfies_requirement("1.2.3", "1.2.3!!"));
+        assert!(!f.version_satisfies_requirement("1.2.4", "1.2.3!!"));
+    }
+
+    #[test]
+    fn test_compile_requirement_strict_shorthand() {
+        let f = GradleFormatter;
+        let matcher = f.compile_requirement(&VersionReq::new("1.2.3!!")).unwrap();
+        assert_eq!(matcher.matches("1.2.3"), Some(true));
+        assert_eq!(matcher.matches("1.2.4"), Some(false));
     }
 }

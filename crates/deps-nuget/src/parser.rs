@@ -109,8 +109,13 @@ fn parse_package_element(
 
     let name = name?;
     let name_range = span_to_range(content, line_table, name_span);
+    // An empty `version=""` attribute must degrade to "no requirement" like a `$(...)`
+    // MSBuild property reference does — left unguarded, it gets wrapped into the
+    // syntactically valid but bogus exact pin `"[]"` (parses as version `0.0.0.0`), which
+    // silently disguises "no version" as a real, always-unsatisfiable requirement instead
+    // of being skipped by the empty-`VersionReq` guards downstream.
     let (version_requirement, version_range) = match version {
-        Some(v) if !v.contains("$(") => (
+        Some(v) if !v.is_empty() && !v.contains("$(") => (
             Some(format!("[{v}]")),
             Some(span_to_range(content, line_table, version_span)),
         ),
@@ -505,6 +510,19 @@ mod tests {
             result.dependencies[0].version_requirement,
             Some("[13.0.3]".into())
         );
+    }
+
+    #[test]
+    fn test_packages_config_empty_version_degrades_to_none() {
+        let xml = r#"<packages>
+  <package id="Foo" version="" targetFramework="net48" />
+</packages>"#;
+        let uri = deps_core::test_util::test_uri("/test/packages.config");
+        let result = parse_packages_config(xml, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "Foo");
+        assert_eq!(result.dependencies[0].version_requirement, None);
+        assert_eq!(result.dependencies[0].version_range, None);
     }
 
     #[test]

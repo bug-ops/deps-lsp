@@ -30,7 +30,8 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 ///
 /// Supports: ^, >=, >, <=, <, exact, any, and space-separated AND constraints.
 pub fn version_matches_constraint(version: &str, constraint: &str) -> bool {
-    let constraint = constraint.trim();
+    let constraint = normalize_operator_spacing(constraint.trim());
+    let constraint = constraint.as_str();
 
     if constraint.is_empty() || constraint == "any" || constraint == "*" {
         return true;
@@ -44,6 +45,28 @@ pub fn version_matches_constraint(version: &str, constraint: &str) -> bool {
     }
 
     match_single_constraint(version, constraint)
+}
+
+/// Collapses whitespace between a range operator (`>=`, `<=`, `>`, `<`) and its version
+/// number, e.g. `">= 1.15.0 < 2.0.0"` becomes `">=1.15.0 <2.0.0"`. Both forms are valid
+/// pubspec constraint syntax, but leaving the space in place would make the later
+/// whitespace-based AND split treat the operator and its version as separate clauses.
+fn normalize_operator_spacing(constraint: &str) -> String {
+    let mut result = String::with_capacity(constraint.len());
+    let mut chars = constraint.chars().peekable();
+    while let Some(c) = chars.next() {
+        result.push(c);
+        if c == '>' || c == '<' {
+            if chars.peek() == Some(&'=') {
+                result.push('=');
+                chars.next();
+            }
+            while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                chars.next();
+            }
+        }
+    }
+    result
 }
 
 fn match_single_constraint(version: &str, constraint: &str) -> bool {
@@ -149,6 +172,14 @@ mod tests {
         assert!(version_matches_constraint("1.0.0", ">=1.0.0 <2.0.0"));
         assert!(!version_matches_constraint("2.0.0", ">=1.0.0 <2.0.0"));
         assert!(!version_matches_constraint("0.9.0", ">=1.0.0 <2.0.0"));
+    }
+
+    #[test]
+    fn test_range_constraint_spaced_operators() {
+        assert!(version_matches_constraint("1.15.0", ">= 1.15.0 < 2.0.0"));
+        assert!(version_matches_constraint("1.99.0", ">= 1.15.0 < 2.0.0"));
+        assert!(!version_matches_constraint("1.14.0", ">= 1.15.0 < 2.0.0"));
+        assert!(!version_matches_constraint("2.0.0", ">= 1.15.0 < 2.0.0"));
     }
 
     #[test]

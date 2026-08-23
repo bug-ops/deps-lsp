@@ -84,4 +84,16 @@ mod tests {
         assert_eq!(matcher.matches("1.5.0"), Some(true));
         assert_eq!(matcher.matches("2.0.0"), Some(false));
     }
+
+    #[test]
+    fn test_compile_requirement_spaced_range() {
+        let f = DartFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new(">= 1.15.0 < 2.0.0"))
+            .expect("Dart requirement always compiles");
+        assert_eq!(matcher.matches("1.15.0"), Some(true));
+        assert_eq!(matcher.matches("1.99.0"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches("1.14.0"), Some(false));
+    }
 }
