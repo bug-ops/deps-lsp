@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **deps-maven**: `version_satisfies_requirement` now parses Maven's bracket-interval range syntax (`[1.0,2.0)`, `[1.0]`, `[1.5,)`, `(,2.0]`) and top-level comma unions (`(,1.0),(1.2,)`) instead of comparing the requirement string for plain equality, so dependencies pinned to a range no longer show a permanently "outdated" hover/diagnostic. Added `crates/deps-maven/src/range.rs`; bounds are compared with the existing qualifier-aware `compare_versions`, so `[1.0-beta,2.0-rc)`-style bounds order correctly. Malformed input (unbalanced/stray brackets, an extra comma-separated component, a mismatched no-comma pin like `[1.0)`, or any unparseable member of a union) fails closed — the whole requirement is rejected (`false`) instead of silently matching on the well-formed remainder (resolves #172).
+- **deps-gradle**: `version_satisfies_requirement` now handles dynamic versions (`1.0+`, `2.10.+`), `latest.release`/`latest.integration` selectors, and the same bracket-interval range syntax as Maven (plus Gradle's own reversed-bracket exclusive notation, `]1.2,1.5]`/`[1.1,2.0[`), instead of plain string equality. Added `crates/deps-gradle/src/range.rs`, reusing `deps_maven::version::compare_versions` for bound comparisons. Since Gradle has no comma-union syntax, a union-shaped string (e.g. `[1.0,2.0),[3.0,4.0)`) is rejected outright rather than parsed as one interval with a corrupted bound; the same malformed-input fail-closed rules as Maven apply otherwise (resolves #172).
+
 ### Removed
 - **deps-gradle**: deleted the dead `GradleError::InvalidDependency`, `GradleError::Maven`, and `GradleError::Io` variants (with their `#[from]` conversions and the reverse `impl From<DepsError> for GradleError`) — none was ever constructed outside `error.rs`'s own tests; the crate only ever produces `GradleError::ParseError`, and no call site in the crate propagates an `io::Error` or `MavenError` via `?` into a `GradleError`-returning function (resolves #171).
 
