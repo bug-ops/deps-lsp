@@ -541,9 +541,23 @@ fn create_package_completion_item(
         EcosystemId::Npm | EcosystemId::Composer => format!("\"{name}\": \"^{latest}\""),
         EcosystemId::Go => format!("{name} {latest}"),
         EcosystemId::Dart => format!("{name}: ^{latest}"),
-        EcosystemId::Maven => format!("<artifactId>{name}</artifactId><version>{latest}</version>"),
+        EcosystemId::Maven => match name.as_str().split_once(':') {
+            Some((group_id, artifact_id)) => format!(
+                "<groupId>{group_id}</groupId><artifactId>{artifact_id}</artifactId><version>{latest}</version>"
+            ),
+            None => format!("<artifactId>{name}</artifactId><version>{latest}</version>"),
+        },
         EcosystemId::Gradle => format!("implementation(\"{name}:{latest}\")"),
-        EcosystemId::Swift => format!(".package(url: \"{name}\", from: \"{latest}\")"),
+        EcosystemId::Swift => {
+            let url = metadata
+                .repository()
+                .map_or_else(|| format!("https://github.com/{name}"), str::to_string);
+            if latest.is_empty() {
+                format!(".package(url: \"{url}\")")
+            } else {
+                format!(".package(url: \"{url}\", from: \"{latest}\")")
+            }
+        }
         EcosystemId::NuGet => {
             format!("<PackageReference Include=\"{name}\" Version=\"{latest}\" />")
         }
@@ -1065,6 +1079,117 @@ requests
 
         assert_eq!(item.label, "requests");
         assert_eq!(item.insert_text, Some("requests = \"2.31.0\"".to_string()));
+    }
+
+    struct MockMetadata {
+        name: deps_core::PackageName,
+        repository: Option<&'static str>,
+        latest_version: &'static str,
+    }
+    impl deps_core::Metadata for MockMetadata {
+        fn name(&self) -> &deps_core::PackageName {
+            &self.name
+        }
+        fn description(&self) -> Option<&str> {
+            None
+        }
+        fn repository(&self) -> Option<&str> {
+            self.repository
+        }
+        fn documentation(&self) -> Option<&str> {
+            None
+        }
+        fn latest_version(&self) -> &'static str {
+            self.latest_version
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_create_package_completion_item_maven_group_artifact() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
+            repository: None,
+            latest_version: "3.14.0",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Maven);
+
+        assert_eq!(
+            item.insert_text,
+            Some(
+                "<groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId>\
+                 <version>3.14.0</version>"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_maven_no_colon() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("commons-lang3"),
+            repository: None,
+            latest_version: "3.14.0",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Maven);
+
+        assert_eq!(
+            item.insert_text,
+            Some("<artifactId>commons-lang3</artifactId><version>3.14.0</version>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_swift_with_repository() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio"),
+            repository: Some("https://github.com/apple/swift-nio"),
+            latest_version: "2.62.0",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Swift);
+
+        assert_eq!(
+            item.insert_text,
+            Some(
+                ".package(url: \"https://github.com/apple/swift-nio\", from: \"2.62.0\")"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_swift_empty_latest_omits_from_clause() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio"),
+            repository: Some("https://github.com/apple/swift-nio"),
+            latest_version: "",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Swift);
+
+        assert_eq!(
+            item.insert_text,
+            Some(".package(url: \"https://github.com/apple/swift-nio\")".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_swift_no_repository_falls_back_to_name() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio"),
+            repository: None,
+            latest_version: "2.62.0",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Swift);
+
+        assert_eq!(
+            item.insert_text,
+            Some(
+                ".package(url: \"https://github.com/apple/swift-nio\", from: \"2.62.0\")"
+                    .to_string()
+            )
+        );
     }
 
     #[tokio::test]
