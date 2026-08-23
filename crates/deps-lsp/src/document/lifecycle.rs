@@ -172,15 +172,21 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// 3. Otherwise skip — querying a fabricated version is a silent false
 ///    negative, which is worse than not scanning at all.
 ///
-/// **Go exception** (#228 follow-up): step 1 is skipped entirely for
-/// `EcosystemId::Go`, going straight to step 2. Go's `go.mod` `require` line
-/// is already an exact pinned version, never a range, unlike Cargo/npm where
-/// the manifest is a range and the lockfile holds the pin. go.sum-derived
-/// `resolved_versions` is unreliable here: go.sum is a checksum ledger that
-/// `go get`/`go build` only ever append to (only `go mod tidy` prunes it), so
-/// its last-occurrence-wins parse can surface a version still recorded in the
+/// **Go exception** (#228 follow-up, unified with #235's
+/// [`deps_core::lsp_helpers::EcosystemFormatter::manifest_requirement_is_resolved_version`]):
+/// step 1 is skipped entirely for a dependency whose manifest requirement is
+/// itself the resolved version (a Go `require`-directive dependency), going
+/// straight to step 2. Go's `go.mod` `require` line is already an exact
+/// pinned version, never a range, unlike Cargo/npm where the manifest is a
+/// range and the lockfile holds the pin. go.sum-derived `resolved_versions`
+/// is unreliable here: go.sum is a checksum ledger that `go get`/`go build`
+/// only ever append to (only `go mod tidy` prunes it), so its
+/// last-occurrence-wins parse can surface a version still recorded in the
 /// file but no longer selected by Go's MVS — silently querying OSV against
-/// the wrong version.
+/// the wrong version. Routing through the formatter hook (rather than a bare
+/// `ecosystem == EcosystemId::Go` check) also excludes Go's `exclude`/
+/// `replace` directive pseudo-dependencies, whose `version_requirement()` is
+/// not an in-use version.
 ///
 /// Every dependency that does **not** become a [`deps_core::osv::ScanTarget`]
 /// gets an explicit [`deps_core::osv::ScanOutcome::Skipped`] entry in the
@@ -211,14 +217,17 @@ fn build_scan_targets(
 
         // Go's go.mod `require` line is already an exact pinned version, never
         // a range (unlike Cargo/npm, where the manifest is a range and the
-        // lockfile holds the pin) — so for Go the manifest itself is the
-        // authoritative version, not go.sum. go.sum is a checksum ledger that
-        // `go get`/`go build` only ever append to (only `go mod tidy` prunes
-        // it), so its last-occurrence-wins parse can yield a stale version
-        // still recorded in the file but no longer selected by Go's MVS,
-        // silently mismatching whatever's actually in use. Skipping the
-        // lockfile lookup for Go avoids feeding that stale version to OSV.
-        let version = if ecosystem == EcosystemId::Go {
+        // lockfile holds the pin) — so for a Go `require` dependency the
+        // manifest itself is the authoritative version, not go.sum. go.sum is
+        // a checksum ledger that `go get`/`go build` only ever append to
+        // (only `go mod tidy` prunes it), so its last-occurrence-wins parse
+        // can yield a stale version still recorded in the file but no longer
+        // selected by Go's MVS, silently mismatching whatever's actually in
+        // use. Skipping the lockfile lookup avoids feeding that stale version
+        // to OSV (excludes/replaces fall through to the lockfile lookup below
+        // like any other ecosystem, since their `version_requirement()` is
+        // not an in-use version — see `manifest_requirement_is_resolved_version`).
+        let version = if formatter.manifest_requirement_is_resolved_version(dep) {
             dep.version_requirement()
                 .filter(|req| is_concrete_version(req.as_str(), ecosystem))
                 .map(|req| req.as_str().to_string())
@@ -708,8 +717,32 @@ pub async fn handle_document_open(
             && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
         {
             doc.update_resolved_versions(resolved_versions.clone());
-            // Use resolved versions as cached versions for instant display
-            doc.update_cached_versions(resolved_versions.clone());
+
+            // Use resolved versions as cached versions for instant display,
+            // except for a dependency whose manifest requirement is itself
+            // already the resolved version (Go's `require` lines) — for
+            // those, go.sum can hold a stale, no-longer-selected version
+            // (#235), so seeding it as the "latest" comparison operand would
+            // desync hover/inlay-hint status against the go.mod-accurate
+            // `resolved` value during the cold-open window before the
+            // registry fetch completes (critique S1).
+            let formatter = ecosystem_clone.formatter();
+            let instant_cached: HashMap<PackageName, String> = match doc.parse_result() {
+                Some(parse_result) => {
+                    let deps = parse_result.dependencies();
+                    resolved_versions
+                        .iter()
+                        .filter(|(name, _)| {
+                            deps.iter().find(|d| d.name() == *name).is_none_or(|d| {
+                                !formatter.manifest_requirement_is_resolved_version(*d)
+                            })
+                        })
+                        .map(|(name, version)| (name.clone(), version.clone()))
+                        .collect()
+                }
+                None => resolved_versions.clone(),
+            };
+            doc.update_cached_versions(instant_cached);
         }
 
         // Phase A OSV scan, spawned so it runs concurrently with the
@@ -2303,6 +2336,93 @@ require github.com/gorilla/mux v1.8.0
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(doc.ecosystem_id(), "go");
         }
+
+        /// Regression test for critique S1 (`.local/handoff/2026-08-23T20-55-32-critic.md`):
+        /// go.mod's `require` line is the exact MVS-selected version, but go.sum only ever
+        /// gets appended to, so a stale higher version left over from a downgrade can still
+        /// be recorded there and win last-occurrence-wins parsing (#235). The instant-cache
+        /// seed in `handle_document_open` must not copy that stale value into
+        /// `cached_versions` (the "latest" comparison operand) for such a dependency, or it
+        /// would desync against the go.mod-accurate `resolved_versions` value during the
+        /// cold-open window before the registry fetch completes.
+        #[tokio::test]
+        async fn test_handle_document_open_go_instant_cache_excludes_stale_require_version() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+            use std::fs;
+            use tempfile::TempDir;
+            use tokio::time::{Duration, sleep};
+
+            let temp_dir = TempDir::new().unwrap();
+            let go_mod_path = temp_dir.path().join("go.mod");
+            let go_sum_path = temp_dir.path().join("go.sum");
+
+            // go.mod was downgraded back to v1.8.0 after having briefly required v1.8.1.
+            let go_mod_content = r"module example.com/mymodule
+
+go 1.21
+
+require github.com/gorilla/mux v1.8.0
+";
+            fs::write(&go_mod_path, go_mod_content).unwrap();
+
+            // go.sum is a checksum ledger, not pruned on downgrade: it still carries the
+            // higher v1.8.1 entry appended before the downgrade, which sorts last and wins
+            // naive last-occurrence-wins parsing.
+            let go_sum_content = r"github.com/gorilla/mux v1.8.0 h1:hash1=
+github.com/gorilla/mux v1.8.1 h1:hash2=
+";
+            fs::write(&go_sum_path, go_sum_content).unwrap();
+
+            let uri = Uri::from_file_path(&go_mod_path).unwrap();
+            let state = Arc::new(ServerState::new());
+            let (client, config) = create_test_client_and_config();
+
+            handle_document_open(
+                uri.clone(),
+                go_mod_content.to_string(),
+                Some(1),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("go.mod should open successfully");
+
+            let dep_name = PackageName::new("github.com/gorilla/mux");
+
+            // The instant-cache seed is disk-only (go.sum read) and runs before any
+            // registry network call, but it happens in a spawned background task — poll
+            // briefly instead of assuming a fixed delay.
+            let mut resolved_seen = false;
+            for _ in 0..200 {
+                if state
+                    .get_document(&uri)
+                    .is_some_and(|doc| doc.resolved_versions.contains_key(&dep_name))
+                {
+                    resolved_seen = true;
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                resolved_seen,
+                "resolved_versions should be seeded from go.sum shortly after open"
+            );
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.resolved_versions.get(&dep_name),
+                Some(&"v1.8.1".to_string()),
+                "sanity check: go.sum's last-occurrence-wins parsing does surface the stale version"
+            );
+            assert!(
+                !doc.cached_versions.contains_key(&dep_name),
+                "S1: a Go `require` dependency's stale go.sum version must not be seeded into \
+                 cached_versions (the 'latest' comparison operand) during the cold-open window — \
+                 doing so would desync it against the go.mod-accurate resolved value and produce \
+                 a false 'outdated, update to the version you downgraded away from' signal"
+            );
+        }
     }
 
     // Phase 1: Cache Preservation Tests
@@ -2899,6 +3019,22 @@ tokio = "1.0"
             assert!(skipped.is_empty());
         }
 
+        /// Formatter stub mirroring `GoFormatter`'s override: every
+        /// dependency's manifest requirement is itself the resolved version
+        /// (#235's `manifest_requirement_is_resolved_version` unification).
+        struct MockGoFormatter;
+        impl EcosystemFormatter for MockGoFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://pkg.go.dev/{name}")
+            }
+            fn manifest_requirement_is_resolved_version(&self, _dep: &dyn Dependency) -> bool {
+                true
+            }
+        }
+
         struct MockVPrefixFormatter;
         impl EcosystemFormatter for MockVPrefixFormatter {
             fn format_version_for_text_edit(&self, version: &str) -> String {
@@ -2996,7 +3132,7 @@ tokio = "1.0"
             );
 
             let (targets, skipped) =
-                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Go);
+                build_scan_targets(&parse_result, &resolved, &MockGoFormatter, EcosystemId::Go);
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "v0.8.1");
             assert_eq!(targets[0].display_version, "v0.8.1");
