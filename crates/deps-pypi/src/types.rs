@@ -208,6 +208,10 @@ impl deps_core::Dependency for PypiDependency {
         self.source.clone()
     }
 
+    fn features(&self) -> &[String] {
+        &self.extras
+    }
+
     fn markers(&self) -> Option<&str> {
         self.markers.as_deref()
     }
@@ -285,6 +289,29 @@ mod tests {
         assert_eq!(dep.name, "flask");
         assert_eq!(dep.version_req, Some(">=3.0.0".into()));
         assert_eq!(dep.extras, vec!["async"]);
+    }
+
+    #[test]
+    fn test_pypi_dependency_features_maps_to_extras() {
+        use deps_core::Dependency;
+
+        let dep = PypiDependency {
+            name: "requests".into(),
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            extras: vec!["security".into(), "socks".into()],
+            extras_range: None,
+            markers: None,
+            markers_range: None,
+            section: PypiDependencySection::Dependencies,
+            source: PypiDependencySource::Registry,
+        };
+
+        assert_eq!(
+            dep.features(),
+            &["security".to_string(), "socks".to_string()]
+        );
     }
 
     #[test]

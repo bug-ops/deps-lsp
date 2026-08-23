@@ -32,7 +32,7 @@ pub struct NpmDependency {
     pub section: NpmDependencySection,
 }
 
-// Use macro to implement DependencyInfo and Dependency traits
+// Use macro to implement the Dependency trait
 deps_core::impl_dependency!(NpmDependency {
     name: name,
     name_range: name_range,

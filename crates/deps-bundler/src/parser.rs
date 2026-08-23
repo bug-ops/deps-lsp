@@ -287,27 +287,6 @@ fn extract_require(line: &str) -> Option<String> {
 /// Parser for Gemfile manifests.
 pub struct BundlerParser;
 
-impl deps_core::ManifestParser for BundlerParser {
-    type Dependency = BundlerDependency;
-    type ParseResult = BundlerParseResult;
-
-    fn parse(&self, content: &str, doc_uri: &Uri) -> deps_core::Result<Self::ParseResult> {
-        parse_gemfile(content, doc_uri)
-    }
-}
-
-impl deps_core::ParseResultInfo for BundlerParseResult {
-    type Dependency = BundlerDependency;
-
-    fn dependencies(&self) -> &[Self::Dependency] {
-        &self.dependencies
-    }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-}
-
 impl deps_core::ParseResult for BundlerParseResult {
     fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
         self.dependencies
@@ -694,29 +673,6 @@ gem 'rails', '~> 7.0'";
         assert_eq!(result.dependencies().len(), 1);
         assert!(result.workspace_root().is_none());
         assert!(result.as_any().is::<BundlerParseResult>());
-    }
-
-    #[test]
-    fn test_parse_result_info_trait() {
-        use deps_core::ParseResultInfo;
-
-        let gemfile = r"source 'https://rubygems.org'
-gem 'rails'";
-        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
-
-        assert_eq!(result.dependencies().len(), 1);
-        assert!(result.workspace_root().is_none());
-    }
-
-    #[test]
-    fn test_bundler_parser_trait() {
-        use deps_core::ManifestParser;
-
-        let parser = BundlerParser;
-        let gemfile = r"source 'https://rubygems.org'
-gem 'rails'";
-        let result = parser.parse(gemfile, &test_uri()).unwrap();
-        assert_eq!(result.dependencies.len(), 1);
     }
 
     #[test]

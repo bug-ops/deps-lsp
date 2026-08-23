@@ -18,32 +18,6 @@ pub struct GradleDependency {
     pub configuration: String,
 }
 
-impl deps_core::DependencyInfo for GradleDependency {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> deps_core::parser::DependencySource {
-        deps_core::parser::DependencySource::Registry
-    }
-
-    fn features(&self) -> &[String] {
-        &[]
-    }
-}
-
 impl deps_core::Dependency for GradleDependency {
     fn name(&self) -> &str {
         &self.name
@@ -108,7 +82,7 @@ mod tests {
 
     #[test]
     fn test_dependency_info_trait() {
-        use deps_core::DependencyInfo;
+        use deps_core::Dependency;
 
         let dep = test_dep();
         assert_eq!(dep.name(), "org.springframework.boot:spring-boot-starter");
