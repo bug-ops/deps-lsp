@@ -83,7 +83,11 @@ impl EcosystemFormatter for SwiftFormatter {
     }
 
     /// Compiles `requirement` via `semver::VersionReq`, the same crate
-    /// `version_satisfies_requirement` uses.
+    /// `version_satisfies_requirement` uses. `None` on parse failure is the fallible-parse
+    /// shape of `compile_requirement`'s "undecidable" contract (see
+    /// [`EcosystemFormatter::compile_requirement`]) — Swift's registry client follows GitHub
+    /// tags pagination to build `available`, so a `None` here is purely "this requirement
+    /// string doesn't parse as semver," not a gap in what pagination could return.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         requirement
             .as_str()

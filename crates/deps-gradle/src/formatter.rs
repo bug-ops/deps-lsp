@@ -1,6 +1,6 @@
 //! Version formatting for Gradle ecosystem.
 
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
 use deps_core::{PackageName, VersionReq};
 
 pub struct GradleFormatter;
@@ -107,7 +107,10 @@ impl EcosystemFormatter for GradleFormatter {
         is_unresolved(requirement.as_str())
     }
 
-    /// Returns `None` for a malformed range (leading `[`/`(`/`]` but
+    /// Uses [`compile_requirement_unless`] (see that function and
+    /// [`EcosystemFormatter::compile_requirement`] for the shared "undecidable" contract).
+    ///
+    /// The undecidable predicate rejects a malformed range (leading `[`/`(`/`]` but
     /// `crate::range::parse_range` fails) — checked unconditionally, first, before any
     /// other branch: without this guard ahead of the `AlwaysSatisfied`/dynamic-prefix
     /// short-circuits below, a malformed bracket range that also happens to end in `+`
@@ -126,31 +129,31 @@ impl EcosystemFormatter for GradleFormatter {
         // string would make e.g. `Exact` compare against a target that includes `"!!"`.
         let requirement = requirement.as_str();
         let requirement = requirement.strip_suffix("!!").unwrap_or(requirement);
-        if requirement.starts_with(['[', '(', ']'])
-            && crate::range::parse_range(requirement).is_none()
-        {
-            return None;
-        }
-        if is_unresolved(requirement)
-            || requirement == "latest"
-            || requirement.starts_with("latest.")
-        {
-            return Some(Box::new(GradleMatcher::AlwaysSatisfied));
-        }
-        if is_snapshot(requirement) {
-            return Some(Box::new(GradleMatcher::AlwaysSatisfied));
-        }
-        if let Some(prefix) = requirement.strip_suffix('+') {
-            return Some(Box::new(GradleMatcher::DynamicPrefix(prefix.to_string())));
-        }
-        // `]` is included alongside `[`/`(` because Gradle's reversed-bracket exclusive
-        // notation (`]1.2,1.5]`) is a leading delimiter in its own right, not just a
-        // trailing one.
-        if requirement.starts_with(['[', '(', ']']) {
-            return crate::range::parse_range(requirement)
-                .map(|range| Box::new(GradleMatcher::Range(range)) as Box<dyn RequirementMatcher>);
-        }
-        Some(Box::new(GradleMatcher::Exact(requirement.to_string())))
+        compile_requirement_unless(
+            requirement,
+            |r| r.starts_with(['[', '(', ']']) && crate::range::parse_range(r).is_none(),
+            |r| {
+                if is_unresolved(&r) || r == "latest" || r.starts_with("latest.") {
+                    return GradleMatcher::AlwaysSatisfied;
+                }
+                if is_snapshot(&r) {
+                    return GradleMatcher::AlwaysSatisfied;
+                }
+                if let Some(prefix) = r.strip_suffix('+') {
+                    return GradleMatcher::DynamicPrefix(prefix.to_string());
+                }
+                // `]` is included alongside `[`/`(` because Gradle's reversed-bracket
+                // exclusive notation (`]1.2,1.5]`) is a leading delimiter in its own
+                // right, not just a trailing one. The undecidable guard above already
+                // ensures `parse_range` succeeds here.
+                if r.starts_with(['[', '(', ']'])
+                    && let Some(range) = crate::range::parse_range(&r)
+                {
+                    return GradleMatcher::Range(range);
+                }
+                GradleMatcher::Exact(r)
+            },
+        )
     }
 }
 

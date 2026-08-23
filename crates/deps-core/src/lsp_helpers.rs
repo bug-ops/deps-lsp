@@ -143,6 +143,14 @@ pub struct VersionData<'a> {
     /// `None` when no yanked check has run yet — distinct from an empty map,
     /// which would mean "checked, nothing yanked".
     pub yanked: Option<&'a HashMap<String, String>>,
+    /// Packages whose registry fetch errored or timed out during the most
+    /// recent lifecycle fetch, keyed by normalized package name. Lets
+    /// [`generate_diagnostics_from_cache`] distinguish "the registry was
+    /// asked and said this package doesn't exist" from "the registry
+    /// couldn't be asked" (#267) — a `cached` miss alone conflates both into
+    /// a misleading "Unknown package" diagnostic. `None` when no fetch has
+    /// run yet, same convention as [`Self::yanked`].
+    pub fetch_failed: Option<&'a HashSet<String>>,
 }
 
 impl<'a> VersionData<'a> {
@@ -172,6 +180,7 @@ impl<'a> VersionData<'a> {
             resolved,
             vulnerabilities: None,
             yanked: None,
+            fetch_failed: None,
         }
     }
 
@@ -213,6 +222,27 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub fn with_yanked(mut self, yanked: &'a HashMap<String, String>) -> Self {
         self.yanked = Some(yanked);
+        self
+    }
+
+    /// Attaches the set of packages whose registry fetch failed (error or timeout)
+    /// during the most recent lifecycle fetch.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use std::collections::{HashMap, HashSet};
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let fetch_failed = HashSet::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_fetch_failed(&fetch_failed);
+    /// assert!(versions.fetch_failed.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_fetch_failed(mut self, fetch_failed: &'a HashSet<String>) -> Self {
+        self.fetch_failed = Some(fetch_failed);
         self
     }
 }
@@ -696,6 +726,21 @@ pub trait EcosystemFormatter: Send + Sync {
     /// requirement", so it must never guess: an ecosystem that has not opted in by
     /// overriding this method emits no such diagnostic at all, rather than one derived from
     /// a loose heuristic.
+    ///
+    /// `None` has two distinct causes, both correct to suppress the diagnostic for: the
+    /// requirement string fails to parse under this ecosystem's own comparator (`deps-cargo`,
+    /// `deps-npm`, `deps-pypi`, `deps-swift` — `.ok()` on a fallible parse), or the
+    /// requirement parses fine but names a version-space region the fetched `available` list
+    /// structurally cannot contain regardless — a Go pseudo-version, a Composer
+    /// dev-branch/`@dev` flag, a RubyGems exact pin indistinguishable from one that matches
+    /// only a yanked release, a malformed Maven/Gradle/NuGet range. Scanning either case would
+    /// always decide `Some(false)` for every candidate, producing a false "no published
+    /// version satisfies" verdict instead of correctly suppressing the check. Implementors of
+    /// the second (predicate-guard) shape should use
+    /// [`compile_requirement_unless`], which
+    /// centralizes this contract instead of re-deriving it per ecosystem. `deps-dart` is the
+    /// only ecosystem with neither cause: every requirement string is a valid Dart constraint
+    /// by construction, so its override is always `Some`.
     ///
     /// Default: `None` — an ecosystem that has not opted in emits no unsatisfiable-requirement
     /// diagnostics.
@@ -1541,6 +1586,66 @@ impl Default for DiagnosticSeverities {
     }
 }
 
+/// Shared shape for a [`EcosystemFormatter::compile_requirement`] guarded by one predicate.
+///
+/// This is the pattern several ecosystems' guards independently re-implemented
+/// (`deps-go`'s pseudo-version check, `deps-composer`'s dev-branch/`@dev` check,
+/// `deps-bundler`'s exact-pin check, `deps-maven`/`deps-gradle`'s malformed-range check,
+/// `deps-nuget`'s malformed-requirement check). See
+/// [`EcosystemFormatter::compile_requirement`]'s docs for why `None` is correct in exactly
+/// this case: `is_undecidable(requirement)` true means the fetched `available` list
+/// structurally cannot contain a version that would decide the match either way, so scanning
+/// it would always report `Some(false)` and produce a false "no published version satisfies
+/// this requirement" diagnostic.
+///
+/// Returns `None` when `is_undecidable(requirement)` is `true`. Otherwise builds `matcher`
+/// from `requirement`'s owned `String` and boxes it as the trait object
+/// [`EcosystemFormatter::compile_requirement`] returns.
+///
+/// Ecosystems whose guard is a fallible parse rather than a named predicate over the
+/// requirement string (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-swift`) don't fit this
+/// shape and implement `compile_requirement` directly via `.ok().map(...)` instead.
+/// `deps-dart` implements `compile_requirement` but has no guard at all — every requirement
+/// string is a valid Dart constraint by construction, so it is always `Some`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{compile_requirement_unless, RequirementMatcher};
+///
+/// struct ExactMatcher(String);
+/// impl RequirementMatcher for ExactMatcher {
+///     fn matches(&self, version: &str) -> Option<bool> {
+///         Some(version == self.0)
+///     }
+/// }
+///
+/// let is_pseudo_version = |r: &str| r.starts_with("v0.0.0-");
+///
+/// assert!(
+///     compile_requirement_unless(
+///         "v0.0.0-20191109021931-daa7c04131f5",
+///         is_pseudo_version,
+///         ExactMatcher,
+///     )
+///     .is_none()
+/// );
+/// assert!(compile_requirement_unless("v1.2.3", is_pseudo_version, ExactMatcher).is_some());
+/// ```
+pub fn compile_requirement_unless<M>(
+    requirement: &str,
+    is_undecidable: impl FnOnce(&str) -> bool,
+    matcher: impl FnOnce(String) -> M,
+) -> Option<Box<dyn RequirementMatcher>>
+where
+    M: RequirementMatcher + 'static,
+{
+    if is_undecidable(requirement) {
+        return None;
+    }
+    Some(Box::new(matcher(requirement.to_string())))
+}
+
 /// Requirement strings longer than this are rejected by [`requirement_is_unsatisfiable`]
 /// before compilation, rather than compiled and scanned. No real manifest requirement in any
 /// supported ecosystem approaches this length; it exists solely to bound the cost of an
@@ -1799,8 +1904,21 @@ pub fn generate_diagnostics_from_cache(
             let in_lockfile = versions.resolved.contains_key(normalized_name.as_str())
                 || versions.resolved.contains_key(dep.name());
             if !in_lockfile {
+                // A fetch error/timeout (#267) is not evidence the package doesn't
+                // exist — the registry was never successfully asked. Report it
+                // distinctly from a genuine "not found" so a transient registry
+                // outage or a malformed response (e.g. unparseable
+                // maven-metadata.xml) doesn't masquerade as "Unknown package".
+                let fetch_failed = dep.source().is_version_resolvable()
+                    && versions
+                        .fetch_failed
+                        .is_some_and(|f| f.contains(normalized_name.as_str()));
                 let message = match formatter.validate_package_name(dep.name().as_str()) {
                     Err(reason) => Some(format!("Invalid package name '{}': {reason}", dep.name())),
+                    Ok(()) if fetch_failed => Some(format!(
+                        "Registry lookup failed for '{}'; package status could not be determined",
+                        dep.name()
+                    )),
                     Ok(()) if dep.source().is_version_resolvable() => {
                         Some(format!("Unknown package '{}'", dep.name()))
                     }
@@ -2374,10 +2492,17 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
     for dep in deps {
         let versions = match registry.get_versions(dep.name()).await {
             Ok(v) => v,
-            Err(_) => {
+            Err(e) => {
+                // Same distinction as `generate_diagnostics_from_cache`/`FetchResult::fetch_failed`
+                // (#267): a genuine not-found means the registry answered "no such package",
+                // while any other error means the registry couldn't be asked at all.
                 let message = match formatter.validate_package_name(dep.name().as_str()) {
                     Err(reason) => format!("Invalid package name '{}': {reason}", dep.name()),
-                    Ok(()) => format!("Unknown package '{}'", dep.name()),
+                    Ok(()) if e.is_not_found() => format!("Unknown package '{}'", dep.name()),
+                    Ok(()) => format!(
+                        "Registry lookup failed for '{}'; package status could not be determined",
+                        dep.name()
+                    ),
                 };
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
@@ -2939,6 +3064,53 @@ mod tests {
                 Err(crate::error::DepsError::CacheError(
                     "mock registry error".to_string(),
                 ))
+            })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn package_url(&self, _name: &PackageName) -> String {
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A registry whose `get_versions` always errs with `PackageNotFound`, for
+    /// exercising `generate_diagnostics`'s "Unknown package" branch (#267 C1) —
+    /// distinct from [`ErrorRegistry`], whose `CacheError` must instead produce
+    /// the "Registry lookup failed" message.
+    struct NotFoundRegistry;
+
+    impl crate::Registry for NotFoundRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            name: &'a PackageName,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move {
+                Err(crate::error::DepsError::PackageNotFound {
+                    package: name.to_string(),
+                    registry: "mock",
+                })
             })
         }
 
@@ -4974,6 +5146,81 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_diagnostics_from_cache_fetch_failed_not_reported_as_unknown() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // A package missing from `cached` because its registry fetch errored
+        // or timed out (#267) must not be reported as "Unknown package" — the
+        // registry was never successfully asked, so absence is not evidence
+        // the package doesn't exist.
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "flaky-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let fetch_failed = HashSet::from(["flaky-pkg".to_string()]);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message.contains("Unknown package"));
+        assert!(diagnostics[0].message.contains("Registry lookup failed"));
+        assert!(diagnostics[0].message.contains("flaky-pkg"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_fetch_failed_does_not_mask_invalid_name() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // A syntactically invalid name is a local, name-only check independent
+        // of any registry round trip — it must win over a fetch-failure
+        // marker for the same (invalid) name, not be suppressed by it.
+        let formatter = RejectingFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "bad name".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let fetch_failed = HashSet::from(["bad name".to_string()]);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("Invalid package name"));
+    }
+
+    #[test]
     fn test_generate_diagnostics_from_cache_invalid_package_name() {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
@@ -5047,6 +5294,11 @@ mod tests {
     async fn test_generate_diagnostics_unknown_uses_configured_severity() {
         use tower_lsp_server::ls_types::{Position, Range};
 
+        // `NotFoundRegistry`, not `ErrorRegistry`: "Unknown package" is only
+        // correct when the registry was actually asked and said "no such
+        // package" (#267 C1) — an opaque `CacheError` must not reach this
+        // branch, or a transient outage would be mislabeled as a genuinely
+        // nonexistent dependency.
         let formatter = MockFormatter;
 
         let parse_result = MockParseResult {
@@ -5066,7 +5318,7 @@ mod tests {
 
         let diagnostics = generate_diagnostics(
             &parse_result,
-            &ErrorRegistry,
+            &NotFoundRegistry,
             &formatter,
             crate::FreshnessSettings::default(),
             severities,
@@ -5076,6 +5328,41 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.starts_with("Unknown package"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_registry_error_not_reported_as_unknown() {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // #267 C1: an opaque registry failure (`ErrorRegistry`'s `CacheError`,
+        // standing in for a network error, timeout, or malformed response)
+        // must not produce "Unknown package" — the registry was never
+        // successfully asked, so absence of a result is not evidence the
+        // package doesn't exist.
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let diagnostics = generate_diagnostics(
+            &parse_result,
+            &ErrorRegistry,
+            &formatter,
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        )
+        .await;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message.contains("Unknown package"));
+        assert!(diagnostics[0].message.contains("Registry lookup failed"));
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! Version formatting for the NuGet ecosystem.
 
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
 use deps_core::{PackageName, VersionReq};
 
 /// NuGet interval/floating-pattern matcher, compiled once per dependency by
@@ -84,18 +84,35 @@ impl EcosystemFormatter for NuGetFormatter {
         requirement.as_str().contains("$(")
     }
 
-    /// Compiles `requirement` into a `NuGetMatcher` only if it is a syntactically
-    /// well-formed range or floating pattern — without this guard, a malformed requirement
-    /// string would make every candidate decide `Some(false)`, producing a false
+    /// Uses [`compile_requirement_unless`] (see that function and
+    /// [`EcosystemFormatter::compile_requirement`] for the shared "undecidable" contract).
+    ///
+    /// The undecidable predicate rejects a syntactically malformed range or floating pattern
+    /// (parsing fails) — without this guard, a malformed requirement string would make
+    /// `satisfies`/`resolve_float` return `false` for every candidate, producing a false
     /// "unsatisfiable" verdict instead of correctly suppressing the check.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         let requirement = requirement.as_str();
         if requirement.contains('*') {
-            crate::version::parse_float(requirement)
-                .map(|float| Box::new(NuGetMatcher::Float(float)) as Box<dyn RequirementMatcher>)
+            compile_requirement_unless(
+                requirement,
+                |r| crate::version::parse_float(r).is_none(),
+                |r| {
+                    NuGetMatcher::Float(
+                        crate::version::parse_float(&r).expect("validated by undecidable guard"),
+                    )
+                },
+            )
         } else {
-            crate::version::parse_range(requirement)
-                .map(|range| Box::new(NuGetMatcher::Range(range)) as Box<dyn RequirementMatcher>)
+            compile_requirement_unless(
+                requirement,
+                |r| crate::version::parse_range(r).is_none(),
+                |r| {
+                    NuGetMatcher::Range(
+                        crate::version::parse_range(&r).expect("validated by undecidable guard"),
+                    )
+                },
+            )
         }
     }
 }

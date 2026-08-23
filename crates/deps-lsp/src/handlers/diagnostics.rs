@@ -75,7 +75,8 @@ pub(crate) async fn generate_diagnostics_internal(
             parse_result,
             VersionData::new(&doc.cached_versions, &doc.resolved_versions)
                 .with_vulnerabilities(&doc.vulnerabilities)
-                .with_yanked(&doc.yanked_versions),
+                .with_yanked(&doc.yanked_versions)
+                .with_fetch_failed(&doc.fetch_failed),
             uri,
             freshness,
             severities,

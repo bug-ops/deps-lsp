@@ -3,7 +3,7 @@
 use crate::version::version_matches_requirement;
 use deps_core::PackageName;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
 
 /// Rubygems requirement matcher, compiled once per dependency by
 /// [`BundlerFormatter::compile_requirement`]. `version_matches_requirement` is a hand-rolled
@@ -62,14 +62,14 @@ impl EcosystemFormatter for BundlerFormatter {
 
     /// Compiles `requirement` into a `RubygemsMatcher` using the same
     /// `version_matches_requirement` comparator as `version_satisfies_requirement` — Bundler
-    /// requirements have no separate "loose" vs. "precise" form to distinguish.
-    /// Returns `None` for an exact-pin requirement (see `is_exact_pin`): those can silently
-    /// match nothing but a yanked version, which `available` cannot reveal.
+    /// requirements have no separate "loose" vs. "precise" form to distinguish. Uses
+    /// [`compile_requirement_unless`] (see that function and
+    /// [`EcosystemFormatter::compile_requirement`] for the shared "undecidable" contract).
+    ///
+    /// The undecidable predicate is `is_exact_pin`: an exact pin can silently match nothing
+    /// but a yanked version, which `available` cannot reveal.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        if is_exact_pin(requirement.as_str()) {
-            return None;
-        }
-        Some(Box::new(RubygemsMatcher(requirement.as_str().to_string())))
+        compile_requirement_unless(requirement.as_str(), is_exact_pin, RubygemsMatcher)
     }
 }
 

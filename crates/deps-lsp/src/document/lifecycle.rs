@@ -71,6 +71,7 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
         resolved = old_state.resolved_versions.len(),
         vulnerabilities = old_state.vulnerabilities.len(),
         yanked = old_state.yanked_versions.len(),
+        fetch_failed = old_state.fetch_failed.len(),
         "preserving version cache"
     );
     new_state
@@ -90,6 +91,10 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     new_state
         .yanked_versions
         .clone_from(&old_state.yanked_versions);
+    // Same rationale — without this a registry-outage package would flip
+    // back to a misleading "Unknown package" diagnostic on every keystroke
+    // until the next fetch cycle re-populates it (#267).
+    new_state.fetch_failed.clone_from(&old_state.fetch_failed);
 }
 
 /// Ceiling on the OSV scan timeout, independent of the configured
@@ -624,6 +629,12 @@ struct FetchResult {
     /// `EcosystemFormatter::normalize_package_name` before merging into
     /// document state.
     yanked_versions: HashMap<PackageName, String>,
+    /// Packages whose registry fetch errored or timed out, keyed by **raw**
+    /// package name (same raw/normalized split as `yanked_versions` above).
+    /// Lets diagnostic generation (#267) distinguish "the registry said this
+    /// package doesn't exist" from "the registry couldn't be asked" instead
+    /// of conflating both into a misleading "Unknown package" diagnostic.
+    fetch_failed: HashSet<PackageName>,
     /// Number of packages that failed to fetch (timeout or error)
     failed_count: usize,
     /// First actionable error message (shown to user via `window/showMessage`)
@@ -706,6 +717,7 @@ async fn fetch_latest_versions_parallel(
                 let result = tokio::time::timeout(timeout, registry.get_versions(&name)).await;
 
                 let mut yanked: Option<(PackageName, String)> = None;
+                let mut failed_name: Option<PackageName> = None;
                 let version = match result {
                     Ok(Ok(versions)) => {
                         let available: Arc<[String]> = versions
@@ -757,8 +769,40 @@ async fn fetch_latest_versions_parallel(
                                     );
                                     Some((latest, v.is_yanked()))
                                 }
-                                _ => {
+                                Ok(Ok(None)) => {
                                     tracing::debug!(package = %name, "no version found");
+                                    None
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!(
+                                        package = %name,
+                                        error = %e,
+                                        "fetch fallback failed"
+                                    );
+                                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let mut fe =
+                                        first_error.lock().unwrap_or_else(|p| p.into_inner());
+                                    if fe.is_none() {
+                                        *fe = Some(e.to_string());
+                                    }
+                                    drop(fe);
+                                    // A genuine not-found (the registry was
+                                    // successfully asked and said "no such
+                                    // package") is not a fetch failure — only
+                                    // an unanswerable request is (#267 C1).
+                                    if !e.is_not_found() {
+                                        failed_name = Some(name.clone());
+                                    }
+                                    None
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        package = %name,
+                                        "fetch fallback timed out ({}s)",
+                                        timeout.as_secs()
+                                    );
+                                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    failed_name = Some(name.clone());
                                     None
                                 }
                             }
@@ -813,11 +857,24 @@ async fn fetch_latest_versions_parallel(
                         if fe.is_none() {
                             *fe = Some(e.to_string());
                         }
+                        drop(fe);
+                        // A genuine not-found (the registry was successfully
+                        // asked and said "no such package") is not a fetch
+                        // failure — only an unanswerable request is (#267
+                        // C1). Marking it `fetch_failed` here would make
+                        // `generate_diagnostics_from_cache` report "Registry
+                        // lookup failed" for the common typo'd-name case
+                        // instead of "Unknown package", inverting the bug
+                        // this field exists to fix.
+                        if !e.is_not_found() {
+                            failed_name = Some(name.clone());
+                        }
                         None
                     }
                     Err(_) => {
                         tracing::warn!(package = %name, "fetch timed out ({}s)", timeout.as_secs());
                         failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        failed_name = Some(name.clone());
                         None
                     }
                 };
@@ -827,7 +884,7 @@ async fn fetch_latest_versions_parallel(
                     sender.send(count);
                 }
 
-                (version, yanked)
+                (version, yanked, failed_name)
             }
         })
         .buffer_unordered(max_concurrent)
@@ -836,18 +893,23 @@ async fn fetch_latest_versions_parallel(
 
     let mut versions = HashMap::with_capacity(results.len());
     let mut yanked_versions = HashMap::new();
-    for (version, yanked) in results {
+    let mut fetch_failed = HashSet::new();
+    for (version, yanked, failed_name) in results {
         if let Some((name, v)) = version {
             versions.insert(name, v);
         }
         if let Some((name, v)) = yanked {
             yanked_versions.insert(name, v);
         }
+        if let Some(name) = failed_name {
+            fetch_failed.insert(name);
+        }
     }
 
     FetchResult {
         versions,
         yanked_versions,
+        fetch_failed,
         failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
         first_error: first_error.lock().unwrap_or_else(|p| p.into_inner()).take(),
     }
@@ -1052,6 +1114,13 @@ pub async fn handle_document_open(
                     .map(|(name, v)| (formatter.normalize_package_name(&name), v))
                     .collect(),
             );
+            doc.update_fetch_failed(
+                fetch_result
+                    .fetch_failed
+                    .into_iter()
+                    .map(|name| formatter.normalize_package_name(&name))
+                    .collect(),
+            );
             if success {
                 doc.set_loaded();
             } else {
@@ -1207,6 +1276,9 @@ pub async fn handle_document_change(
         doc_state
             .yanked_versions
             .remove(&formatter.normalize_package_name(removed_dep));
+        doc_state
+            .fetch_failed
+            .remove(&formatter.normalize_package_name(removed_dep));
     }
 
     // A version-only edit (name unchanged, requirement changed) invalidates
@@ -1215,10 +1287,15 @@ pub async fn handle_document_change(
     // diagnostic anchored on the new range (security F1 / impl-critic S1).
     // Drop rather than try to refresh in place; the registry re-fetch below
     // (`deps_to_fetch` includes `version_changed`) repopulates the entry if
-    // the *new* version also turns out to be yanked.
+    // the *new* version also turns out to be yanked. Same for `fetch_failed`
+    // (#267): a stale fetch-error marker must not survive an edit that gets
+    // re-fetched below.
     for changed_dep in &diff.version_changed {
         doc_state
             .yanked_versions
+            .remove(&formatter.normalize_package_name(changed_dep));
+        doc_state
+            .fetch_failed
             .remove(&formatter.normalize_package_name(changed_dep));
     }
 
@@ -1388,6 +1465,10 @@ pub async fn handle_document_change(
             for (name, version) in fetch_result.yanked_versions {
                 doc.yanked_versions
                     .insert(formatter.normalize_package_name(&name), version);
+            }
+            for name in fetch_result.fetch_failed {
+                doc.fetch_failed
+                    .insert(formatter.normalize_package_name(&name));
             }
             if success {
                 doc.set_loaded();
@@ -1805,6 +1886,13 @@ mod tests {
         // Should return empty (timeout, not success)
         assert!(result.versions.is_empty(), "Slow package should timeout");
         assert_eq!(result.failed_count, 1, "Should track 1 failed package");
+        // #267: a timeout is also a fetch failure, not a "not found" — must
+        // be recorded the same way as a hard registry error.
+        assert_eq!(
+            result.fetch_failed,
+            HashSet::from([PackageName::new("slow-package")]),
+            "timed-out package must be recorded in fetch_failed"
+        );
     }
 
     #[tokio::test]
@@ -2421,6 +2509,308 @@ mod tests {
             result.failed_count, 3,
             "All 3 packages should be marked as failed"
         );
+        // #267: a fetch error must be recorded per-package, not just counted,
+        // so diagnostic generation can tell "fetch failed" apart from
+        // "genuinely not found" instead of reporting "Unknown package".
+        assert_eq!(
+            result.fetch_failed,
+            HashSet::from([
+                PackageName::new("package-1"),
+                PackageName::new("package-2"),
+                PackageName::new("package-3"),
+            ]),
+            "every errored package must be recorded in fetch_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_not_found_is_not_recorded_as_fetch_failed() {
+        // #267 C1: a genuine not-found (`DepsError::PackageNotFound`, the
+        // variant npm/PyPI/Go/Swift map a 404 to) means the registry was
+        // successfully asked and answered "no such package" — recording it
+        // in `fetch_failed` would make `generate_diagnostics_from_cache`
+        // report "Registry lookup failed" instead of "Unknown package" for
+        // the common typo'd-dependency case, inverting the bug this field
+        // exists to fix.
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct NotFoundRegistry;
+
+        impl Registry for NotFoundRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Err(deps_core::error::DepsError::PackageNotFound {
+                        package: name.to_string(),
+                        registry: "mock",
+                    })
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Err(deps_core::error::DepsError::PackageNotFound {
+                        package: name.to_string(),
+                        registry: "mock",
+                    })
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(NotFoundRegistry);
+        let packages = vec![PackageName::new("typo-pkg")];
+
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
+
+        assert!(result.versions.is_empty());
+        assert!(
+            result.fetch_failed.is_empty(),
+            "a genuine not-found must not be recorded in fetch_failed, or \
+             generate_diagnostics_from_cache would report it as a registry \
+             error instead of Unknown package"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_http_404_is_not_recorded_as_fetch_failed() {
+        // Same as `test_fetch_not_found_is_not_recorded_as_fetch_failed`, for
+        // the ecosystems (Cargo, Maven, Gradle, Bundler, Dart, Composer,
+        // NuGet) that propagate a raw `DepsError::HttpStatus { status: 404 }`
+        // instead of mapping it to `PackageNotFound`.
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct Http404Registry;
+
+        impl Registry for Http404Registry {
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Err(deps_core::error::DepsError::HttpStatus {
+                        url: format!("https://example.com/{name}"),
+                        status: 404,
+                    })
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Err(deps_core::error::DepsError::HttpStatus {
+                        url: format!("https://example.com/{name}"),
+                        status: 404,
+                    })
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(Http404Registry);
+        let packages = vec![PackageName::new("typo-pkg")];
+
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
+
+        assert!(result.versions.is_empty());
+        assert!(
+            result.fetch_failed.is_empty(),
+            "a bare HTTP 404 must not be recorded in fetch_failed either"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_fallback_error_recorded_as_fetch_failed_unless_not_found() {
+        // Go-shaped path: `get_versions` returns an empty list (nothing for
+        // `select_latest_matching` to pick), so `fetch_latest_versions_parallel`
+        // falls back to `get_latest_matching`. Exercises the fallback's own
+        // error/timeout arms (previously zero test coverage — tester gap),
+        // and confirms the same not-found-vs-failure gating (#267 C1) applies
+        // there too, per-package via the `not_found` name.
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct FallbackErrorRegistry;
+
+        impl Registry for FallbackErrorRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                let name = name.clone();
+                Box::pin(async move {
+                    if name.as_str() == "not-found" {
+                        Err(deps_core::error::DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "mock",
+                        })
+                    } else {
+                        Err(deps_core::error::DepsError::CacheError(
+                            "mock fallback failure".to_string(),
+                        ))
+                    }
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(FallbackErrorRegistry);
+        let packages = vec![PackageName::new("flaky"), PackageName::new("not-found")];
+
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
+
+        assert!(result.versions.is_empty());
+        assert_eq!(
+            result.fetch_failed,
+            HashSet::from([PackageName::new("flaky")]),
+            "the fallback's own non-not-found error must be recorded in fetch_failed, \
+             but its not-found error must not"
+        );
+        assert_eq!(
+            result.failed_count, 2,
+            "both fallback failures count toward failed_count regardless of cause (S2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_fallback_timeout_recorded_as_fetch_failed() {
+        // Timeout coverage for the `get_latest_matching` fallback path — a
+        // timeout is never a "not found", so it must always land in
+        // `fetch_failed` (and count toward `failed_count`, S2).
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+        use std::time::Duration;
+
+        struct FallbackTimeoutRegistry;
+
+        impl Registry for FallbackTimeoutRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(None)
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(FallbackTimeoutRegistry);
+        let packages = vec![PackageName::new("slow-fallback")];
+
+        // 1s timeout for test speed.
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 1, 10).await;
+
+        assert!(result.versions.is_empty());
+        assert_eq!(
+            result.fetch_failed,
+            HashSet::from([PackageName::new("slow-fallback")])
+        );
+        assert_eq!(result.failed_count, 1);
     }
 
     // Cargo-specific tests
@@ -3531,6 +3921,80 @@ time = "=0.1.44"
             assert!(
                 !doc.yanked_versions.contains_key("time"),
                 "stale yanked entry against the OLD version must not survive an in-place edit"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_fetch_failed_pruned_on_dependency_removal_by_normalized_name() {
+            // Mirrors `test_yanked_versions_pruned_on_dependency_removal_by_normalized_name`
+            // for `fetch_failed` (#267): a stale fetch-error marker for a
+            // dependency the user has since deleted must not linger.
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+serde = "1.0"
+time = "0.1.43"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_fetch_failed(HashSet::from(["time".to_string()]));
+            }
+
+            let content2 = r#"[dependencies]
+serde = "1.0"
+"#;
+            let old_deps: HashMap<PackageName, Option<VersionReq>> =
+                [("serde", None), ("time", None)]
+                    .into_iter()
+                    .map(|(n, r)| (PackageName::new(n), r))
+                    .collect();
+            let new_deps: HashMap<PackageName, Option<VersionReq>> =
+                std::iter::once((PackageName::new("serde"), None)).collect();
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
+            assert_eq!(diff.removed, vec![PackageName::new("time")]);
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            // Preserved before pruning: proves `preserve_cache` itself
+            // carries `fetch_failed` across the edit, not just the final
+            // (already-pruned) state below.
+            assert!(
+                doc_state2.fetch_failed.contains("time"),
+                "preserve_cache must carry fetch_failed across an edit"
+            );
+
+            let formatter = ecosystem.formatter();
+            for removed_dep in &diff.removed {
+                doc_state2
+                    .fetch_failed
+                    .remove(&formatter.normalize_package_name(removed_dep));
+            }
+
+            state.update_document(uri.clone(), doc_state2);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                !doc.fetch_failed.contains("time"),
+                "removed dependency's fetch_failed entry must be pruned"
             );
         }
 

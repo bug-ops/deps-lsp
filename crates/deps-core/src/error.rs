@@ -95,6 +95,55 @@ pub enum DepsError {
     InvalidUri(String),
 }
 
+impl DepsError {
+    /// Returns `true` when this error means the registry was successfully asked and
+    /// answered "this package doesn't exist", as opposed to the registry not having
+    /// been answerable at all (network failure, timeout, malformed response, 5xx).
+    ///
+    /// Distinguishing the two matters for diagnostics (#267): a genuine not-found is
+    /// evidence the package name is wrong, while any other error is evidence only that
+    /// this particular request failed — reporting the latter as "Unknown package" would
+    /// mislabel a transient registry outage as a nonexistent dependency. Covers
+    /// [`DepsError::PackageNotFound`] (the ecosystems that map a 404 to it explicitly:
+    /// npm, PyPI, Go, Swift) and a bare [`DepsError::HttpStatus`] with `status == 404`
+    /// (the ecosystems that propagate the raw HTTP status instead: Cargo, Maven, Gradle,
+    /// Bundler, Dart, Composer, NuGet).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::DepsError;
+    ///
+    /// let not_found = DepsError::PackageNotFound {
+    ///     package: "left-pad".into(),
+    ///     registry: "npm",
+    /// };
+    /// assert!(not_found.is_not_found());
+    ///
+    /// let http_404 = DepsError::HttpStatus {
+    ///     url: "https://crates.io/api/v1/crates/left-pad".into(),
+    ///     status: 404,
+    /// };
+    /// assert!(http_404.is_not_found());
+    ///
+    /// let outage = DepsError::HttpStatus {
+    ///     url: "https://crates.io/api/v1/crates/serde".into(),
+    ///     status: 503,
+    /// };
+    /// assert!(!outage.is_not_found());
+    ///
+    /// let cache_err = DepsError::CacheError("connection reset".into());
+    /// assert!(!cache_err.is_not_found());
+    /// ```
+    #[must_use]
+    pub const fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::PackageNotFound { .. } | Self::HttpStatus { status: 404, .. }
+        )
+    }
+}
+
 /// Convenience type alias for `Result<T, DepsError>`.
 ///
 /// This is the standard `Result` type used throughout the deps-lsp codebase.

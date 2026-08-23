@@ -1,6 +1,6 @@
 //! Version formatting for Maven ecosystem.
 
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
 use deps_core::{PackageName, VersionReq};
 
 pub struct MavenFormatter;
@@ -120,33 +120,40 @@ impl EcosystemFormatter for MavenFormatter {
         is_unresolved(requirement.as_str())
     }
 
-    /// Returns `None` for a malformed range (`is_range` true but `crate::range::parse_range`
-    /// fails) — checked unconditionally, first, before any other branch: without this guard
-    /// ahead of the `AlwaysSatisfied` short-circuits below, a range that happens to also end
-    /// in `-SNAPSHOT` or contain `${` would be misclassified as always-satisfied instead of
-    /// rejected, and a fail-closed `false` on every candidate would otherwise produce a false
-    /// "unsatisfiable" verdict for a typo instead of correctly suppressing the check.
+    /// Uses [`compile_requirement_unless`] (see that function and
+    /// [`EcosystemFormatter::compile_requirement`] for the shared "undecidable" contract).
+    ///
+    /// The undecidable predicate rejects a malformed range (`is_range` true but
+    /// `crate::range::parse_range` fails) — checked unconditionally, first, before any other
+    /// branch: without this guard ahead of the `AlwaysSatisfied` short-circuits below, a
+    /// range that happens to also end in `-SNAPSHOT` or contain `${` would be misclassified
+    /// as always-satisfied instead of rejected, and a fail-closed `false` on every candidate
+    /// would otherwise produce a false "unsatisfiable" verdict for a typo instead of
+    /// correctly suppressing the check.
     ///
     /// #249 review (M4): this is a separate branch-order copy from `version_satisfies_requirement`
     /// above — see the note on that method before reordering either one.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.as_str();
-        if crate::range::is_range(requirement) && crate::range::parse_range(requirement).is_none() {
-            return None;
-        }
-        if is_unresolved(requirement)
-            || is_latest_keyword(requirement)
-            || is_snapshot(requirement)
-            || is_timestamped_snapshot(requirement)
-        {
-            return Some(Box::new(MavenMatcher::AlwaysSatisfied));
-        }
-        if crate::range::is_range(requirement) {
-            return crate::range::parse_range(requirement).map(|ranges| {
-                Box::new(MavenMatcher::Ranges(ranges)) as Box<dyn RequirementMatcher>
-            });
-        }
-        Some(Box::new(MavenMatcher::Exact(requirement.to_string())))
+        compile_requirement_unless(
+            requirement.as_str(),
+            |r| crate::range::is_range(r) && crate::range::parse_range(r).is_none(),
+            |r| {
+                if is_unresolved(&r)
+                    || is_latest_keyword(&r)
+                    || is_snapshot(&r)
+                    || is_timestamped_snapshot(&r)
+                {
+                    return MavenMatcher::AlwaysSatisfied;
+                }
+                // The undecidable guard above already ensures `parse_range` succeeds here.
+                if crate::range::is_range(&r)
+                    && let Some(ranges) = crate::range::parse_range(&r)
+                {
+                    return MavenMatcher::Ranges(ranges);
+                }
+                MavenMatcher::Exact(r)
+            },
+        )
     }
 }
 

@@ -3,7 +3,7 @@ use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{EcosystemId, EcosystemRegistry, PackageName, PackageVersions, ParseResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -60,6 +60,15 @@ pub struct DocumentState {
     /// until the first fetch completes; carried across document edits by
     /// `preserve_cache`.
     pub yanked_versions: HashMap<String, String>,
+    /// Packages whose registry fetch errored or timed out on the most recent
+    /// lifecycle fetch, keyed by **normalized** package name (same raw/normalized
+    /// split as `yanked_versions` above, for the same reason — see §3.1). Lets
+    /// diagnostic generation (#267) distinguish "the registry said this package
+    /// doesn't exist" from "the registry couldn't be asked", so a transient
+    /// outage isn't reported as "Unknown package". Cleared and repopulated by
+    /// each fetch cycle; carried across document edits by `preserve_cache` so
+    /// it doesn't flicker off on every keystroke, same as `yanked_versions`.
+    pub fetch_failed: HashSet<String>,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -85,6 +94,7 @@ impl Clone for DocumentState {
             resolved_versions: self.resolved_versions.clone(),
             vulnerabilities: self.vulnerabilities.clone(),
             yanked_versions: self.yanked_versions.clone(),
+            fetch_failed: self.fetch_failed.clone(),
             parsed_at: self.parsed_at,
             loading_state: self.loading_state,
             // Note: Instant is Copy. Clones share the same loading start time.
@@ -184,6 +194,7 @@ impl std::fmt::Debug for DocumentState {
             .field("resolved_versions_count", &self.resolved_versions.len())
             .field("vulnerabilities_count", &self.vulnerabilities.len())
             .field("yanked_versions_count", &self.yanked_versions.len())
+            .field("fetch_failed_count", &self.fetch_failed.len())
             .field("parsed_at", &self.parsed_at)
             .field("loading_state", &self.loading_state)
             .field("loading_started_at", &self.loading_started_at)
@@ -209,6 +220,7 @@ impl DocumentState {
             resolved_versions: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
             yanked_versions: HashMap::new(),
+            fetch_failed: HashSet::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -229,6 +241,7 @@ impl DocumentState {
             resolved_versions: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
             yanked_versions: HashMap::new(),
+            fetch_failed: HashSet::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -266,6 +279,12 @@ impl DocumentState {
     /// Updates the yanked-version findings, keyed by normalized package name.
     pub fn update_yanked_versions(&mut self, yanked_versions: HashMap<String, String>) {
         self.yanked_versions = yanked_versions;
+    }
+
+    /// Replaces the set of packages whose registry fetch errored or timed out
+    /// (normalized-keyed, see [`Self::fetch_failed`]).
+    pub fn update_fetch_failed(&mut self, fetch_failed: HashSet<String>) {
+        self.fetch_failed = fetch_failed;
     }
 
     /// Sets the LSP document version from the client's `didOpen`/`didChange`, or clears

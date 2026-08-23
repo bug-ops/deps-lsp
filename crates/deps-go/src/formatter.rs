@@ -1,5 +1,5 @@
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
 use deps_core::{Dependency, PackageName};
 
 use crate::types::{GoDependency, GoDirective};
@@ -66,22 +66,22 @@ impl EcosystemFormatter for GoFormatter {
 
     /// Compiles `requirement` into an `ExactMatcher` using the same exact/pseudo-version
     /// comparison `version_satisfies_requirement` uses — Go's requirement syntax has no
-    /// separate "loose" vs. "precise" distinction, so both share `go_version_matches`.
+    /// separate "loose" vs. "precise" distinction, so both share `go_version_matches`. Uses
+    /// [`compile_requirement_unless`] (see that function and
+    /// [`EcosystemFormatter::compile_requirement`] for the shared "undecidable" contract).
     ///
-    /// Returns `None` when `requirement` is itself a pseudo-version
-    /// (`crate::version::is_pseudo_version`): `proxy.golang.org/<mod>/@v/list` — the source
-    /// of `available` — never lists pseudo-versions (they're derived per-commit, not
-    /// enumerable), so a pseudo-version pin can never be found in `available` even when the
-    /// exact commit it names is real. Scanning would always decide `Some(false)` for every
-    /// candidate, producing a false "no published version satisfies" warning on an ordinary
-    /// `go.mod` commit pin. A `+incompatible`-suffixed *tag* (not a pseudo-version) is a real
-    /// entry `/@v/list` does return, so it needs no such guard.
+    /// The undecidable predicate is `crate::version::is_pseudo_version`:
+    /// `proxy.golang.org/<mod>/@v/list` — the source of `available` — never lists
+    /// pseudo-versions (they're derived per-commit, not enumerable), so a pseudo-version pin
+    /// can never be found in `available` even when the exact commit it names is real. A
+    /// `+incompatible`-suffixed *tag* (not a pseudo-version) is a real entry `/@v/list` does
+    /// return, so it needs no such guard.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.as_str();
-        if crate::version::is_pseudo_version(requirement) {
-            return None;
-        }
-        Some(Box::new(ExactMatcher(requirement.to_string())))
+        compile_requirement_unless(
+            requirement.as_str(),
+            crate::version::is_pseudo_version,
+            ExactMatcher,
+        )
     }
 
     fn osv_version_to_native(&self, version: &str) -> String {
