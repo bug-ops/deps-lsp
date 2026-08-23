@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **deps-gradle**: deleted the dead `GradleError::InvalidDependency`, `GradleError::Maven`, and `GradleError::Io` variants (with their `#[from]` conversions and the reverse `impl From<DepsError> for GradleError`) — none was ever constructed outside `error.rs`'s own tests; the crate only ever produces `GradleError::ParseError`, and no call site in the crate propagates an `io::Error` or `MavenError` via `?` into a `GradleError`-returning function (resolves #171).
+
 ## [0.10.1] - 2026-08-20
 
 ### Removed
