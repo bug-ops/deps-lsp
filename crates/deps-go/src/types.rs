@@ -65,32 +65,6 @@ pub struct GoMetadata {
 // NOTE: Cannot use deps_core::impl_dependency! macro because we need to provide custom
 // features() implementation (Go modules don't have features like Cargo).
 // The macro would provide features() but we need to override it anyway.
-impl deps_core::parser::DependencyInfo for GoDependency {
-    fn name(&self) -> &str {
-        &self.module_path
-    }
-
-    fn name_range(&self) -> Range {
-        self.module_path_range
-    }
-
-    fn version_requirement(&self) -> Option<&str> {
-        self.version.as_deref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> DependencySource {
-        DependencySource::Registry
-    }
-
-    fn features(&self) -> &[String] {
-        &[]
-    }
-}
-
 impl deps_core::ecosystem::Dependency for GoDependency {
     fn name(&self) -> &str {
         &self.module_path
@@ -159,7 +133,7 @@ deps_core::impl_metadata!(GoMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::parser::DependencyInfo;
+    use deps_core::ecosystem::Dependency;
     use deps_core::registry::{Metadata, Version};
     use tower_lsp_server::ls_types::Position;
 

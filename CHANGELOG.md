@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-core**: `HttpCache::evict_entries`'s pre-existing count-based eviction had an inverted `BinaryHeap<Reverse<_>>` comparison — `peek()` returns the oldest candidate, but the old code treated it as the newest-of-the-oldest-seen-so-far and only replaced it when a still-older one showed up, backwards from the intent. It evicted roughly the first ~100 entries in `DashMap` hash-iteration order with one churning slot, not the 100 oldest entries as the code and docs claimed. Fixed as part of extending eviction for the new byte budget above; eviction is now genuinely oldest-first for both the count- and byte-based paths.
+- **deps-pypi**: restored the `features()` mapping (`PypiDependency::extras`) on the `deps_core::Dependency` implementation, lost when the legacy `DependencyInfo` trait was deleted (see below) — the deleted trait's impl mapped `features() -> &self.extras`, but the surviving `Dependency` impl had no `features()` override and silently fell back to the default `&[]`. Not a runtime regression (nothing dispatched through the deleted trait in production), but it erased a mapping every other feature-bearing ecosystem (e.g. Cargo) still wires up correctly.
+
+### Removed
+- **Breaking (pre-1.0, internal API)**: deleted the legacy `deps_core::parser::{DependencyInfo, ManifestParser, ParseResultInfo}` traits, dead since the `ecosystem::{Dependency, ParseResult}` migration — no production code called them through the trait interface anywhere in the workspace (only test-only `use` statements and the `impl_dependency!` macro's now-removed `DependencyInfo` half exercised them). Every ecosystem dependency struct across all 11 crates already implemented `ecosystem::Dependency` in parallel with near-identical method bodies (see the PyPI `features()` fix above for the one exception), so callers migrate by depending on `ecosystem::Dependency`/`ecosystem::ParseResult` (already re-exported as `deps_core::Dependency`/`deps_core::ParseResult`) instead (resolves #139).
 
 ## [0.10.1] - 2026-08-20
 

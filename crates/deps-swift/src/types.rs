@@ -23,28 +23,6 @@ pub struct SwiftDependency {
     pub source: DependencySource,
 }
 
-impl deps_core::parser::DependencyInfo for SwiftDependency {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn name_range(&self) -> tower_lsp_server::ls_types::Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
-    }
-
-    fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> DependencySource {
-        self.source.clone()
-    }
-}
-
 impl deps_core::ecosystem::Dependency for SwiftDependency {
     fn name(&self) -> &str {
         &self.name
