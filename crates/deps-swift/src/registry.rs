@@ -129,6 +129,7 @@ impl SwiftRegistry {
             if !page_has_more(page_len) {
                 break;
             }
+            warn_if_pagination_truncated(name, page, page_len);
         }
         Ok(tags_to_versions(tags))
     }
@@ -188,6 +189,23 @@ struct GithubErrorResponse {
 /// A page with fewer entries is necessarily the last one.
 const fn page_has_more(page_len: usize) -> bool {
     page_len >= 100
+}
+
+/// Logs a warning when tag pagination for `name` stops at [`MAX_TAG_PAGES`]
+/// while GitHub still had more pages available (`page_has_more(page_len)`).
+///
+/// Without this, hitting the safety ceiling on a pathological repo is
+/// indistinguishable in logs from "the repo genuinely has no matching
+/// version" — this makes truncation diagnosable.
+fn warn_if_pagination_truncated(name: &str, page: u32, page_len: usize) {
+    if page == MAX_TAG_PAGES && page_has_more(page_len) {
+        tracing::warn!(
+            package = name,
+            pages_fetched = MAX_TAG_PAGES,
+            "Swift tags pagination for '{name}' stopped at the {MAX_TAG_PAGES}-page cap while \
+             GitHub reported more pages available; the fetched version list may be truncated"
+        );
+    }
 }
 
 /// Parses a single GitHub tags API page into raw tag entries.
@@ -516,6 +534,71 @@ mod tests {
     fn test_page_has_more_partial_page_stops() {
         assert!(!page_has_more(99));
         assert!(!page_has_more(0));
+    }
+
+    /// Captures `tracing` output emitted during `f` into a `String`, so
+    /// pagination-truncation warnings can be asserted on without a real
+    /// GitHub server (the tags endpoint's base URL isn't test-injectable).
+    fn capture_tracing_output(f: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct CapturingWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for CapturingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let writer = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_target(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+    }
+
+    #[test]
+    fn test_pagination_warns_when_truncated_at_cap() {
+        let output = capture_tracing_output(|| {
+            warn_if_pagination_truncated("owner/repo", MAX_TAG_PAGES, 100);
+        });
+        assert!(output.contains("owner/repo"), "output was: {output}");
+        assert!(output.contains("cap"), "output was: {output}");
+    }
+
+    #[test]
+    fn test_pagination_silent_when_under_cap() {
+        let output = capture_tracing_output(|| {
+            warn_if_pagination_truncated("owner/repo", MAX_TAG_PAGES - 1, 100);
+        });
+        assert!(output.is_empty(), "output was: {output}");
+    }
+
+    #[test]
+    fn test_pagination_silent_when_last_page_at_cap_is_partial() {
+        let output = capture_tracing_output(|| {
+            warn_if_pagination_truncated("owner/repo", MAX_TAG_PAGES, 42);
+        });
+        assert!(output.is_empty(), "output was: {output}");
     }
 
     #[test]
