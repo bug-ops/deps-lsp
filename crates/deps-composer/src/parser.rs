@@ -215,7 +215,12 @@ fn find_positions(
             let colon_offset =
                 name_start_idx + name_pattern.len() + (after_name.len() - trimmed.len());
             let after_colon = &content[colon_offset..];
-            let search_limit = after_colon.len().min(100 + version.len());
+
+            // Limit search to the next 100 chars to stay within this key-value pair.
+            // Round down to a char boundary since `version.len()` is a byte count that
+            // can land mid-character when the source contains multi-byte UTF-8.
+            let search_limit =
+                after_colon.floor_char_boundary(after_colon.len().min(100 + version.len()));
             let search_area = &after_colon[..search_limit];
 
             if let Some(ver_rel_idx) = search_area.find(&version_search) {
@@ -434,5 +439,76 @@ mod tests {
             .find(|d| d.name == "symfony/console")
             .unwrap();
         assert_eq!(symfony.name_range.start.line, 4);
+    }
+
+    #[test]
+    fn test_find_positions_no_panic_on_multibyte_utf8_boundary() {
+        // The search window is `100 + version.len()` bytes after the colon. Placing a
+        // 2-byte UTF-8 character ('é') to straddle that exact byte offset used to panic
+        // when the raw offset was used to slice the string directly (issue #245, same
+        // pattern as #230 in deps-npm).
+        let name = "vendor/pkg";
+        let version = "1.0.0".to_string();
+        let padding = "a".repeat(103);
+        let content = format!("\"{name}\":{padding}é more text \"{version}\" end");
+
+        let line_table = LineOffsetTable::new(&content);
+        let (name_range, version_range, _) =
+            find_positions(&content, name, Some(&version), &line_table, 0);
+
+        assert_eq!(name_range.start.line, 0);
+        // The multibyte character falls right at the truncated search boundary, so the
+        // version string (placed after it) is outside the search window and not found.
+        assert!(version_range.is_none());
+    }
+
+    #[test]
+    fn test_find_positions_finds_version_when_multibyte_char_is_further_out() {
+        // Same truncation boundary as above, but this time the version sits well inside
+        // the truncated window while the 2-byte UTF-8 character ('é') straddles the exact
+        // raw byte offset (107) that used to be sliced naively. Confirms the fix does not
+        // just avoid panicking but still returns the correct, real match.
+        let name = "vendor/pkg";
+        let version = "1.0.0-x".to_string(); // 7 bytes -> raw window limit = 100 + 7 = 107
+        let quoted_version = format!("\"{version}\"");
+        let padding = "a".repeat(95);
+        let content = format!("\"{name}\": {quoted_version}{padding}é end");
+
+        let line_table = LineOffsetTable::new(&content);
+        let (name_range, version_range, _) =
+            find_positions(&content, name, Some(&version), &line_table, 0);
+
+        assert_eq!(name_range.start.line, 0);
+        let version_range = version_range.expect("version should still be found after truncation");
+        assert_eq!(version_range.start.line, 0);
+
+        // Version content starts right after the opening quote; everything before it is
+        // ASCII, so byte offset and UTF-16 character offset coincide.
+        let expected_start = content.find(&quoted_version).unwrap() + 1;
+        assert_eq!(version_range.start.character, expected_start as u32);
+    }
+
+    #[test]
+    fn test_parse_composer_json_no_panic_with_multibyte_field_after_dependency() {
+        // Public-API-level regression test for issue #245: an ordinary manifest where a
+        // later top-level field (`description`) contains multi-byte UTF-8 can still land
+        // the search-window offset for an *earlier* dependency's version mid-character.
+        // This reaches the panic through `parse_composer_json`, the only entry point the
+        // LSP layer actually calls, rather than the private `find_positions` helper.
+        let json = r#"{
+  "require": {
+    "symfony/console": "^6.0"
+  },
+  "authors": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "description": "Gestão de projetos"
+}"#;
+
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let symfony = &result.dependencies[0];
+        assert_eq!(symfony.name, "symfony/console");
+        assert_eq!(symfony.version_req, Some("^6.0".into()));
+        assert!(symfony.version_range.is_some());
     }
 }
