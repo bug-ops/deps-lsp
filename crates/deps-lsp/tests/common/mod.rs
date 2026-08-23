@@ -247,6 +247,24 @@ impl LspClient {
         }));
     }
 
+    /// Sends a full-document change (matches the server's negotiated `FULL` sync kind).
+    #[allow(dead_code)] // Used in size-bound integration tests
+    pub(crate) fn did_change(&mut self, uri: &str, version: i64, text: &str) {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": {
+                    "uri": uri,
+                    "version": version
+                },
+                "contentChanges": [
+                    { "text": text }
+                ]
+            }
+        }));
+    }
+
     /// Request hover information.
     #[allow(dead_code)] // Not used in all tests
     pub(crate) fn hover(&mut self, id: i64, uri: &str, line: u32, character: u32) -> Value {

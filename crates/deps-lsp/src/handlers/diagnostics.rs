@@ -41,10 +41,13 @@ pub(crate) async fn generate_diagnostics_internal(
         }
     };
 
-    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id) {
+    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id()) {
         Some(e) => e,
         None => {
-            tracing::warn!("Ecosystem not found for diagnostics: {}", doc.ecosystem_id);
+            tracing::warn!(
+                "Ecosystem not found for diagnostics: {}",
+                doc.ecosystem_id()
+            );
             return vec![];
         }
     };
