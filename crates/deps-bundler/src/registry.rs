@@ -261,6 +261,16 @@ impl deps_core::Registry for RubyGemsRegistry {
         gem_url(name.as_str())
     }
 
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        req: &deps_core::VersionReq,
+    ) -> Option<usize> {
+        versions.iter().position(|v| {
+            version_matches_requirement(v.version_string(), req.as_str()) && !v.is_yanked()
+        })
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -609,6 +619,32 @@ mod tests {
     #[test]
     fn test_default_platform_function() {
         assert_eq!(default_platform(), "ruby");
+    }
+
+    #[test]
+    fn test_select_latest_matching_not_default_none() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = RubyGemsRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(BundlerVersion {
+                number: "2.0.0".into(),
+                prerelease: false,
+                yanked: true,
+                published_at: None,
+                platform: "ruby".into(),
+            }),
+            Box::new(BundlerVersion {
+                number: "1.0.0".into(),
+                prerelease: false,
+                yanked: false,
+                published_at: None,
+                platform: "ruby".into(),
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
     }
 
     #[tokio::test]

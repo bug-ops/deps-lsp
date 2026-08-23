@@ -94,6 +94,7 @@ impl Default for InlayHintsConfig {
 /// - `outdated_severity`: `HINT` - Dependencies with available updates
 /// - `unknown_severity`: `WARNING` - Dependencies not found in registry
 /// - `yanked_severity`: `WARNING` - Dependencies using yanked versions
+/// - `unsatisfiable_severity`: `WARNING` - Dependencies whose requirement matches zero published versions
 ///
 /// # Examples
 ///
@@ -105,6 +106,7 @@ impl Default for InlayHintsConfig {
 ///     outdated_severity: DiagnosticSeverity::INFORMATION,
 ///     unknown_severity: DiagnosticSeverity::ERROR,
 ///     yanked_severity: DiagnosticSeverity::ERROR,
+///     unsatisfiable_severity: DiagnosticSeverity::ERROR,
 ///     vulnerabilities_enabled: true,
 /// };
 ///
@@ -118,6 +120,8 @@ pub struct DiagnosticsConfig {
     pub unknown_severity: DiagnosticSeverity,
     #[serde(default = "default_yanked_severity")]
     pub yanked_severity: DiagnosticSeverity,
+    #[serde(default = "default_unsatisfiable_severity")]
+    pub unsatisfiable_severity: DiagnosticSeverity,
     /// Whether to run the OSV.dev vulnerability scan and render its
     /// diagnostics/hover content. Default `true` (opt-out): `cargo audit`/
     /// `npm audit` run by default, and an opt-in gate would undercut the
@@ -132,6 +136,7 @@ impl Default for DiagnosticsConfig {
             outdated_severity: default_outdated_severity(),
             unknown_severity: default_unknown_severity(),
             yanked_severity: default_yanked_severity(),
+            unsatisfiable_severity: default_unsatisfiable_severity(),
             vulnerabilities_enabled: true,
         }
     }
@@ -149,6 +154,9 @@ impl DiagnosticsConfig {
     /// let config = DiagnosticsConfig::default();
     /// let severities = config.to_severities();
     /// assert_eq!(severities.outdated, config.outdated_severity);
+    /// assert_eq!(severities.unknown, config.unknown_severity);
+    /// assert_eq!(severities.yanked, config.yanked_severity);
+    /// assert_eq!(severities.unsatisfiable, config.unsatisfiable_severity);
     /// ```
     #[must_use]
     pub const fn to_severities(&self) -> deps_core::DiagnosticSeverities {
@@ -156,6 +164,7 @@ impl DiagnosticsConfig {
             outdated: self.outdated_severity,
             unknown: self.unknown_severity,
             yanked: self.yanked_severity,
+            unsatisfiable: self.unsatisfiable_severity,
         }
     }
 }
@@ -308,6 +317,10 @@ const fn default_unknown_severity() -> DiagnosticSeverity {
 }
 
 const fn default_yanked_severity() -> DiagnosticSeverity {
+    DiagnosticSeverity::WARNING
+}
+
+const fn default_unsatisfiable_severity() -> DiagnosticSeverity {
     DiagnosticSeverity::WARNING
 }
 
@@ -575,13 +588,25 @@ mod tests {
         let json = r#"{
             "outdated_severity": 1,
             "unknown_severity": 2,
-            "yanked_severity": 2
+            "yanked_severity": 2,
+            "unsatisfiable_severity": 1
         }"#;
 
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.outdated_severity, DiagnosticSeverity::ERROR);
         assert_eq!(config.unknown_severity, DiagnosticSeverity::WARNING);
         assert_eq!(config.yanked_severity, DiagnosticSeverity::WARNING);
+        assert_eq!(config.unsatisfiable_severity, DiagnosticSeverity::ERROR);
+    }
+
+    #[test]
+    fn test_diagnostics_config_unsatisfiable_severity_defaults_warning() {
+        let config = DiagnosticsConfig::default();
+        assert_eq!(config.unsatisfiable_severity, DiagnosticSeverity::WARNING);
+
+        let json = r"{}";
+        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.unsatisfiable_severity, DiagnosticSeverity::WARNING);
     }
 
     #[test]

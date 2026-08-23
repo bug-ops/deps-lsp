@@ -323,12 +323,15 @@ mod tests {
         latest: &str,
     ) -> Vec<String> {
         use deps_core::lsp_helpers::VersionData;
-        use deps_core::{EcosystemConfig, LoadingState};
+        use deps_core::{EcosystemConfig, LoadingState, PackageVersions};
         use tower_lsp_server::ls_types::InlayHintLabel;
 
         let parse_result = eco.parse_manifest(content, uri).await.unwrap();
         let mut cached = std::collections::HashMap::new();
-        cached.insert("newtonsoft.json".into(), latest.to_string());
+        cached.insert(
+            "newtonsoft.json".into(),
+            PackageVersions::latest_only(latest),
+        );
         let resolved = std::collections::HashMap::new();
 
         let hints = eco
@@ -410,11 +413,15 @@ mod tests {
         uri: &tower_lsp_server::ls_types::Uri,
         latest: &str,
     ) -> Vec<String> {
+        use deps_core::PackageVersions;
         use deps_core::lsp_helpers::VersionData;
 
         let parse_result = eco.parse_manifest(content, uri).await.unwrap();
         let mut cached = std::collections::HashMap::new();
-        cached.insert("newtonsoft.json".into(), latest.to_string());
+        cached.insert(
+            "newtonsoft.json".into(),
+            PackageVersions::latest_only(latest),
+        );
         let resolved = std::collections::HashMap::new();
 
         eco.generate_diagnostics(

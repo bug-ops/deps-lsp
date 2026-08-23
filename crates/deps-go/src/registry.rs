@@ -449,6 +449,20 @@ impl deps_core::Registry for GoRegistry {
         package_url(name.as_str())
     }
 
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        _req: &deps_core::VersionReq,
+    ) -> Option<usize> {
+        // Mirrors the `/@v/list` fallback branch of the inherent `get_latest_matching`
+        // above (the `/@latest` fast path isn't reachable here: this method is a pure,
+        // no-I/O pick over an already-fetched list). `req` is ignored, matching that
+        // fallback — Go module requirements are exact pins/MVS, not ranges.
+        versions
+            .iter()
+            .position(|v| !v.is_prerelease() && !v.is_yanked())
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -777,5 +791,78 @@ mod tests {
 
         let result = validate_version_string("v0.0.0-20191109021931-daa7c04131f5");
         assert!(result.is_ok());
+    }
+
+    /// S8 regression guard: `select_latest_matching`'s pure pick must agree with
+    /// `get_latest_matching`'s `/@v/list` fallback branch (the `/@latest` fast path is
+    /// unreachable from `select_latest_matching`, which is pure and has no I/O) for an
+    /// ordinary, non-empty version list — the exact class of divergence Maven's S3/S7 hit.
+    #[test]
+    fn test_select_latest_matching_agrees_with_get_latest_matching_list_fallback() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = GoRegistry::new(cache);
+        let typed = vec![
+            GoVersion {
+                version: "v2.0.0-pseudo".to_string(),
+                published_at: None,
+                is_pseudo: true,
+                retracted: false,
+            },
+            GoVersion {
+                version: "v1.5.0".to_string(),
+                published_at: None,
+                is_pseudo: false,
+                retracted: true,
+            },
+            GoVersion {
+                version: "v1.0.0".to_string(),
+                published_at: None,
+                is_pseudo: false,
+                retracted: false,
+            },
+        ];
+
+        // Mirrors get_latest_matching's `/@v/list` fallback branch exactly.
+        let fallback_pick = typed
+            .iter()
+            .find(|v| !v.is_pseudo && !v.retracted)
+            .map(|v| v.version.clone());
+
+        let boxed: Vec<Box<dyn deps_core::Version>> = typed
+            .into_iter()
+            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+            .collect();
+        let idx = registry
+            .select_latest_matching(&boxed, &VersionReq::new("*"))
+            .expect("non-empty list must select an index");
+
+        assert_eq!(Some(boxed[idx].version_string().to_string()), fallback_pick);
+        assert_eq!(fallback_pick.as_deref(), Some("v1.0.0"));
+    }
+
+    #[test]
+    fn test_select_latest_matching_not_default_none() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = GoRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(GoVersion {
+                version: "v2.0.0".to_string(),
+                published_at: None,
+                is_pseudo: false,
+                retracted: true,
+            }),
+            Box::new(GoVersion {
+                version: "v1.0.0".to_string(),
+                published_at: None,
+                is_pseudo: false,
+                retracted: false,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
     }
 }

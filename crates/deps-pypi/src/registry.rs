@@ -320,6 +320,27 @@ impl deps_core::Registry for PypiRegistry {
         package_url(name.as_str())
     }
 
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        req: &deps_core::VersionReq,
+    ) -> Option<usize> {
+        // PEP 440 uses empty string for "any version"; mirrors the inherent
+        // `get_latest_matching` above.
+        let req_str = req.as_str();
+        let normalized_req = if req_str == "*" { "" } else { req_str };
+        let specs = VersionSpecifiers::from_str(normalized_req).ok()?;
+
+        versions.iter().position(|v| {
+            // Parsed directly via `pep440_rs` rather than the trait's default
+            // `is_prerelease` heuristic (substring match on "-alpha"/"-rc"/...), which
+            // does not recognize PyPI's unhyphenated prerelease spellings like
+            // "1.0.0rc1" and would silently treat them as stable.
+            Version::from_str(v.version_string())
+                .is_ok_and(|ver| specs.contains(&ver) && !v.is_yanked() && !ver.is_pre())
+        })
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1176,5 +1197,53 @@ mod tests {
         let registry = PypiRegistry::new(cache);
         let err = registry.get_package_metadata("...").await.unwrap_err();
         assert!(matches!(err, DepsError::PackageNotFound { .. }));
+    }
+
+    #[test]
+    fn test_select_latest_matching_not_default_none() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PypiRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(PypiVersion {
+                version: "2.0.0".into(),
+                yanked: true,
+                published_at: None,
+            }),
+            Box::new(PypiVersion {
+                version: "1.0.0".into(),
+                yanked: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    #[test]
+    fn test_select_latest_matching_excludes_unhyphenated_prerelease() {
+        // Regression guard: the trait default `is_prerelease` heuristic (substring match
+        // on "-rc"/"-alpha"/...) does not recognize PyPI's unhyphenated spelling
+        // ("1.0.0rc1") and would wrongly treat it as stable if used here instead of the
+        // pep440_rs-based check.
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PypiRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(PypiVersion {
+                version: "2.0.0rc1".into(),
+                yanked: false,
+                published_at: None,
+            }),
+            Box::new(PypiVersion {
+                version: "1.0.0".into(),
+                yanked: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
     }
 }

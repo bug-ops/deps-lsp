@@ -1,6 +1,6 @@
 //! Version formatting for Maven ecosystem.
 
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
 use deps_core::{PackageName, VersionReq};
 
 pub struct MavenFormatter;
@@ -8,6 +8,50 @@ pub struct MavenFormatter;
 /// Unexpanded property (missing from `<properties>`).
 fn is_unresolved(requirement: &str) -> bool {
     requirement.contains("${")
+}
+
+/// Maven's `LATEST`/`RELEASE` metadata keywords (case-sensitive per Maven's own grammar):
+/// "resolve to whatever `<latest>`/`<release>` in maven-metadata.xml currently designates".
+/// That designation is a side channel [`MavenMatcher`] has no access to (the same
+/// `<release>`-side-channel limitation `MavenCentralRegistry::select_latest_matching`
+/// documents), so — like an unresolved `${property}` — the requirement can't be checked
+/// literally against `available` and must be treated as always satisfied.
+fn is_latest_keyword(requirement: &str) -> bool {
+    matches!(requirement, "LATEST" | "RELEASE")
+}
+
+/// A `-SNAPSHOT` pin (e.g. `7.0.0-SNAPSHOT`) is a normal, common requirement in real dev
+/// manifests, but `MavenCentralRegistry` only ever fetches the release-repo
+/// `maven-metadata.xml` — which never lists snapshot versions, those live in a separate
+/// snapshot repository this registry client doesn't query. `available` can therefore never
+/// contain one, so — like `LATEST`/`RELEASE` and an unresolved `${property}` — it must be
+/// treated as always satisfied rather than scanned.
+fn is_snapshot(requirement: &str) -> bool {
+    requirement.ends_with("-SNAPSHOT")
+}
+
+/// Precise Maven version/range matcher, compiled once per dependency by
+/// [`MavenFormatter::compile_requirement`]. Deliberately more precise than the loose
+/// `version_satisfies_requirement` in two ways `version_satisfies_requirement` does not
+/// need for its own "treat as up to date" question: it recognizes the `LATEST`/`RELEASE`
+/// keywords, and its exact-match branch uses qualifier-aware `compare_versions_for_range`
+/// instead of raw string equality, so `1.0` correctly matches a published `1.0.0` (equal
+/// under Maven's own `ComparableVersion`) rather than reporting a false WARNING.
+struct MavenMatcher(String);
+
+impl RequirementMatcher for MavenMatcher {
+    fn matches(&self, version: &str) -> Option<bool> {
+        if is_unresolved(&self.0) || is_latest_keyword(&self.0) || is_snapshot(&self.0) {
+            return Some(true);
+        }
+        if crate::range::is_range(&self.0) {
+            return Some(crate::range::satisfies(version, &self.0));
+        }
+        Some(
+            crate::version::compare_versions_for_range(version, &self.0)
+                == std::cmp::Ordering::Equal,
+        )
+    }
 }
 
 impl EcosystemFormatter for MavenFormatter {
@@ -33,6 +77,18 @@ impl EcosystemFormatter for MavenFormatter {
 
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         is_unresolved(requirement.as_str())
+    }
+
+    /// Returns `None` for a malformed range (`is_range` true but `is_valid_range` false):
+    /// without this guard, `crate::range::satisfies`'s fail-closed `false` would make every
+    /// candidate decide `Some(false)`, producing a false "unsatisfiable" verdict for a typo
+    /// instead of correctly suppressing the check.
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.as_str();
+        if crate::range::is_range(requirement) && !crate::range::is_valid_range(requirement) {
+            return None;
+        }
+        Some(Box::new(MavenMatcher(requirement.to_string())))
     }
 }
 
@@ -138,5 +194,71 @@ mod tests {
         assert_eq!(native, osv_version);
         let edit_text = f.format_version_for_text_edit(&native);
         assert!(f.version_satisfies_requirement(&native, &edit_text));
+    }
+
+    #[test]
+    fn test_compile_requirement_exact() {
+        let f = MavenFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("3.14.0"))
+            .expect("Maven requirement always compiles");
+        assert_eq!(matcher.matches("3.14.0"), Some(true));
+        assert_eq!(matcher.matches("3.13.0"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_range() {
+        let f = MavenFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("[1.0,2.0)"))
+            .unwrap();
+        assert_eq!(matcher.matches("1.5.0"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_malformed_range_returns_none() {
+        let f = MavenFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("[1.0,2.0"))
+                .is_none()
+        );
+    }
+
+    /// M2: `<version>1.0</version>` and a published `1.0.0` are equal under Maven's own
+    /// `ComparableVersion` (trailing zero segments don't matter) — the exact-match branch
+    /// must not fall back to raw string equality and report a false WARNING.
+    #[test]
+    fn test_compile_requirement_trailing_zero_segments_are_equal() {
+        let f = MavenFormatter;
+        let matcher = f.compile_requirement(&VersionReq::new("1.0")).unwrap();
+        assert_eq!(matcher.matches("1.0.0"), Some(true));
+        assert_eq!(matcher.matches("1.1.0"), Some(false));
+    }
+
+    /// M2: `LATEST`/`RELEASE` resolve against maven-metadata.xml's `<latest>`/`<release>`
+    /// elements, a side channel this matcher has no access to — must be treated as always
+    /// satisfied, like an unresolved property, not compared literally against `available`.
+    #[test]
+    fn test_compile_requirement_latest_keyword_always_satisfied() {
+        let f = MavenFormatter;
+        let matcher = f.compile_requirement(&VersionReq::new("LATEST")).unwrap();
+        assert_eq!(matcher.matches("3.14.0"), Some(true));
+
+        let matcher = f.compile_requirement(&VersionReq::new("RELEASE")).unwrap();
+        assert_eq!(matcher.matches("3.14.0"), Some(true));
+    }
+
+    /// S6: a `-SNAPSHOT` pin resolves against the snapshot repository, which this registry
+    /// never queries — release-repo metadata never lists snapshot versions, so this must be
+    /// treated as always satisfied rather than reported unsatisfiable.
+    #[test]
+    fn test_compile_requirement_snapshot_always_satisfied() {
+        let f = MavenFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("7.0.0-SNAPSHOT"))
+            .unwrap();
+        assert_eq!(matcher.matches("6.9.0"), Some(true));
+        assert_eq!(matcher.matches("7.0.0"), Some(true));
     }
 }

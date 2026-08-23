@@ -321,6 +321,33 @@ impl deps_core::Registry for NuGetRegistry {
         package_url(name.as_str())
     }
 
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        req: &deps_core::VersionReq,
+    ) -> Option<usize> {
+        if versions.is_empty() {
+            return None;
+        }
+        let req_str = req.as_str();
+        let req_str = if req_str.is_empty() { "*" } else { req_str };
+
+        if req_str.contains('*') {
+            let strings: Vec<String> = versions
+                .iter()
+                .map(|v| v.version_string().to_string())
+                .collect();
+            let matched = crate::version::resolve_float(&strings, req_str)?;
+            return strings.iter().position(|s| s == matched);
+        }
+
+        let req_is_prerelease_bearing = req_str.contains('-');
+        versions.iter().position(|v| {
+            crate::version::satisfies(v.version_string(), req_str)
+                && (req_is_prerelease_bearing || !crate::version::is_prerelease(v.version_string()))
+        })
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -590,5 +617,17 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = NuGetRegistry::new(cache);
         assert_eq!(registry.service_index_url, SERVICE_INDEX_URL);
+    }
+
+    #[test]
+    fn test_select_latest_matching_not_default_none() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NuGetRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> =
+            vec![Box::new(v("1.1.0-rc.1")), Box::new(v("1.0.0"))];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
     }
 }

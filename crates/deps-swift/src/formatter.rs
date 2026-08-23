@@ -2,7 +2,21 @@
 
 use deps_core::Dependency;
 use deps_core::PackageName;
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::VersionReq;
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+
+/// Precise semver `VersionReq` matcher, compiled once per dependency by
+/// [`SwiftFormatter::compile_requirement`] — the same crate `version_satisfies_requirement`
+/// uses, but with the compile step (and its failure) split out from the per-candidate check.
+struct SemverMatcher(semver::VersionReq);
+
+impl RequirementMatcher for SemverMatcher {
+    fn matches(&self, version: &str) -> Option<bool> {
+        semver::Version::parse(version)
+            .ok()
+            .map(|v| self.0.matches(&v))
+    }
+}
 
 use crate::types::SwiftDependency;
 
@@ -66,6 +80,16 @@ impl EcosystemFormatter for SwiftFormatter {
         let host = reqwest::Url::parse(&swift_dep.url).ok()?;
         matches!(host.host_str(), Some("github.com" | "www.github.com"))
             .then(|| format!("github.com/{}", dep.name()))
+    }
+
+    /// Compiles `requirement` via `semver::VersionReq`, the same crate
+    /// `version_satisfies_requirement` uses.
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        requirement
+            .as_str()
+            .parse::<semver::VersionReq>()
+            .ok()
+            .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
 }
 
@@ -254,5 +278,33 @@ mod tests {
         assert_eq!(native, osv_version);
         let edit_text = fmt.format_version_for_text_edit(&native);
         assert!(fmt.version_satisfies_requirement(&native, &edit_text));
+    }
+
+    #[test]
+    fn test_compile_requirement_satisfiable() {
+        let fmt = SwiftFormatter;
+        let matcher = fmt
+            .compile_requirement(&VersionReq::new(">=1.5.0, <2.0.0"))
+            .expect("valid semver requirement must compile");
+        assert_eq!(matcher.matches("1.9.9"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_unparseable_requirement_returns_none() {
+        let fmt = SwiftFormatter;
+        assert!(
+            fmt.compile_requirement(&VersionReq::new("not-a-req"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_unparseable_candidate_is_skipped() {
+        let fmt = SwiftFormatter;
+        let matcher = fmt
+            .compile_requirement(&VersionReq::new(">=1.0.0"))
+            .unwrap();
+        assert_eq!(matcher.matches("not-a-version"), None);
     }
 }
