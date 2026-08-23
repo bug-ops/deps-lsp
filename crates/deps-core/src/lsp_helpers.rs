@@ -1,6 +1,6 @@
 //! Shared LSP response builders.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeDescription, CodeLens, Command, Diagnostic, DiagnosticSeverity,
@@ -1119,6 +1119,12 @@ struct VulnerabilityFixAction {
     /// `fix.version`, converted to this ecosystem's namespace via
     /// [`EcosystemFormatter::osv_version_to_native`].
     version_native: String,
+    /// The formatted edit text this action's own `TextEdit` writes — the exact
+    /// value `action.edit` carries, kept alongside it so callers (the REFACTOR-loop
+    /// dedup in [`generate_code_actions`]) can compare against it without
+    /// recomputing `format_version_replacing` and risking the copy silently
+    /// drifting from the actual edit if that computation ever changes.
+    new_text: String,
     action: CodeAction,
 }
 
@@ -1199,12 +1205,13 @@ fn build_vulnerability_fix_action(
         uri.clone(),
         vec![TextEdit {
             range: version_range,
-            new_text,
+            new_text: new_text.clone(),
         }],
     );
 
     Some(VulnerabilityFixAction {
         version_native,
+        new_text,
         action: CodeAction {
             title,
             kind: Some(CodeActionKind::QUICKFIX),
@@ -1254,30 +1261,33 @@ fn build_vulnerability_fix_action(
 ///    dropped rather than offered.
 /// 2. Up to five plain `REFACTOR` "update to `<version>`" actions, one per
 ///    non-yanked version [`crate::completion::prepare_version_display_items`]
-///    selects from the registry response — skipping whichever entry (if any)
-///    exactly duplicates the fix action's own target, and demoting
-///    `is_preferred` to `None` on all of them when a fix action is present,
-///    since only one preferred action is meaningful per response. Each
-///    action's edit text comes from [`EcosystemFormatter::format_version_replacing`],
-///    which preserves the manifest's existing pin/operator style where an
+///    selects from the registry response, and demoting `is_preferred` to
+///    `None` on all of them when a fix action is present, since only one
+///    preferred action is meaningful per response. Each action's edit text
+///    comes from [`EcosystemFormatter::format_version_replacing`], which
+///    preserves the manifest's existing pin/operator style where an
 ///    ecosystem overrides it (e.g. PyPI's `==1.0.1` stays `==1.0.2` rather
-///    than expanding to a `>=,<` range). An entry whose formatted edit text
-///    already matches the declared requirement (whitespace-insensitive) is
-///    skipped as a no-op, mirroring the N1 guard in
-///    `build_vulnerability_fix_action`. This is the common case, not a rare
-///    edge case: [`crate::completion::prepare_version_display_items`] lists
-///    the top 5 non-yanked registry versions newest-first, so whenever the
-///    declared version is already within 5 releases of latest, it is itself
-///    one of the display items being offered as an "update". This guard is
-///    scoped to that one case — a display item textually matching the
-///    *declared requirement* — not to duplicates *among* display items,
-///    which is a separate, out-of-scope concern. Textual (not semantic)
-///    equality is deliberate: `formatter.is_requirement_up_to_date` answers
-///    "does `latest` already satisfy this requirement", which is true for
-///    e.g. `is_requirement_up_to_date("^1.0", "1.2.0")` and would wrongly
-///    suppress every explicit-bump action for a range-style requirement; it
-///    also can't detect a pinned no-op like `==1.0.0` -> `==1.0.0`, since it
-///    never compares the formatted edit text at all.
+///    than expanding to a `>=,<` range). Every entry's formatted edit text is
+///    checked against a running set seeded with the declared requirement and
+///    the fix action's own formatted text (whitespace-insensitive); an entry
+///    is skipped, and never added to the set, when its text is already
+///    present. This is the common case, not a rare edge case:
+///    [`crate::completion::prepare_version_display_items`] lists the top 5
+///    non-yanked registry versions newest-first, so whenever the declared
+///    version is already within 5 releases of latest, it is itself one of
+///    the display items being offered as an "update". The same set also
+///    catches two display items whose formatted text coincides — e.g. an
+///    ecosystem formatter that truncates precision (PyPI's
+///    `truncate_release_to_match`) can map several distinct registry
+///    versions to the same rewritten text — and a display item matching the
+///    fix action's target even when their *raw* versions differ (formatting
+///    can normalize two distinct inputs to the same text). Textual (not
+///    semantic) equality is deliberate: `formatter.is_requirement_up_to_date`
+///    answers "does `latest` already satisfy this requirement", which is
+///    true for e.g. `is_requirement_up_to_date("^1.0", "1.2.0")` and would
+///    wrongly suppress every explicit-bump action for a range-style
+///    requirement; it also can't detect a pinned no-op like `==1.0.0` ->
+///    `==1.0.0`, since it never compares the formatted edit text at all.
 ///
 /// Returns an empty `Vec` also when (no fix action applies and) the registry
 /// fetch fails.
@@ -1363,26 +1373,34 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     });
 
     let fix_version_native = fix.as_ref().map(|f| f.version_native.clone());
+    // Captured before `fix.action` moves into `actions` below, so the dedup seeding
+    // reads back the exact text the fix action's own `TextEdit` already carries
+    // instead of recomputing it (see `VulnerabilityFixAction::new_text`'s doc comment).
+    let fix_new_text = fix.as_ref().map(|f| strip_whitespace(&f.new_text));
     if let Some(fix) = fix {
         actions.push(fix.action);
     }
 
     let display_items = prepare_version_display_items(&registry_versions, dep.name());
-    // N1: skip a no-op edit below — mirrors the same guard in
-    // `build_vulnerability_fix_action`. Computed once since `version_req` doesn't change
-    // across display items.
-    let normalized_version_req = strip_whitespace(version_req.as_str());
+    // De-duplicates every REFACTOR action's formatted edit text against the declared
+    // requirement, the fix action's edit (if any), and every REFACTOR action already
+    // emitted below, so no two actions in the response — nor a REFACTOR action and the
+    // fix action above — ever carry a byte-identical `WorkspaceEdit`. Seeding with the
+    // declared requirement subsumes the former N1 guard (an item whose formatted text
+    // equals the declared text is a no-op); checking formatted text rather than raw
+    // version also subsumes the former `item.version == fix_version_native` check, since
+    // `format_version_replacing` is deterministic in its inputs. Whitespace-insensitive,
+    // matching every other no-op guard in this module (see `strip_whitespace`).
+    let mut emitted_texts: HashSet<String> = HashSet::new();
+    emitted_texts.insert(strip_whitespace(version_req.as_str()));
+    if let Some(fix_text) = fix_new_text {
+        emitted_texts.insert(fix_text);
+    }
 
     for item in display_items {
-        // The fix action above already covers this exact edit with a more
-        // informative title.
-        if fix_version_native.as_deref() == Some(item.version.as_str()) {
-            continue;
-        }
-
         let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());
 
-        if normalized_version_req == strip_whitespace(&new_text) {
+        if !emitted_texts.insert(strip_whitespace(&new_text)) {
             continue;
         }
 
@@ -3698,6 +3716,159 @@ mod tests {
         assert!(
             refactor_titles(&actions).is_empty(),
             "a whitespace-only edit-text divergence must still be skipped as a no-op"
+        );
+    }
+
+    /// A formatter that truncates every version to `==<major>.<minor>`, mirroring
+    /// `deps-pypi`'s `truncate_release_to_match` collapsing several distinct
+    /// registry versions (or a registry version and an OSV fix version) to the
+    /// same rewritten text — used to prove issue #242's two dedup gaps: an item
+    /// matching the fix action's text under a different raw version, and two
+    /// items matching each other's text.
+    struct TruncatingFormatter;
+
+    impl EcosystemFormatter for TruncatingFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            version.to_string()
+        }
+
+        fn format_version_replacing(&self, version: &str, _current: &str) -> String {
+            let mut parts = version.split('.');
+            let major = parts.next().unwrap_or("0");
+            let minor = parts.next().unwrap_or("0");
+            format!("=={major}.{minor}")
+        }
+
+        fn package_url(&self, name: &PackageName) -> String {
+            format!("https://example.com/{name}")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_refactor_loop_dedups_item_matching_fix_text_by_different_raw_version()
+     {
+        // Regression for #242 (gap 1): the old guard compared `item.version` against
+        // `fix.version_native` verbatim, so a display item whose *formatted* text
+        // matched the fix action's edit but whose *raw* version differed slipped
+        // through undeduped. Here the fix targets "1.2.5" (formatted "==1.2") and the
+        // registry also offers "1.2.9" — a different raw version that formats to the
+        // same "==1.2" text — which must be skipped.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("==1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/requirements.txt"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.2.5".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+        let registry = FixedVersionRegistry {
+            versions: vec![("1.2.9", false), ("1.1.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &TruncatingFormatter,
+        )
+        .await;
+
+        assert_eq!(quickfix_titles(&actions).len(), 1);
+
+        let titles = refactor_titles(&actions);
+        assert!(
+            !titles.iter().any(|t| t.starts_with("1.2.9")),
+            "an item whose formatted text matches the fix action's text must be \
+             skipped even though its raw version differs from the fix's: {titles:?}"
+        );
+        assert!(titles.iter().any(|t| t.starts_with("1.1.0")));
+
+        for action in actions
+            .iter()
+            .filter(|a| a.kind == Some(CodeActionKind::REFACTOR))
+        {
+            let edit_text = &action.edit.as_ref().unwrap().changes.as_ref().unwrap()
+                [parse_result.uri()][0]
+                .new_text;
+            for other in actions.iter() {
+                if std::ptr::eq(action, other) {
+                    continue;
+                }
+                let other_text = &other.edit.as_ref().unwrap().changes.as_ref().unwrap()
+                    [parse_result.uri()][0]
+                    .new_text;
+                assert_ne!(
+                    edit_text, other_text,
+                    "no two actions may carry a byte-identical edit"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_refactor_loop_dedups_item_matching_another_items_text() {
+        // Regression for #242 (gap 2): two display items whose formatted text
+        // coincides (e.g. PyPI's release-segment truncation) must not both be
+        // offered as REFACTOR actions, even with no fix action in play at all.
+        // Registry-native order is newest-first, so "1.1.9" is `is_latest`; both
+        // "1.1.9" and "1.1.5" truncate to "==1.1" and must collapse into one action.
+        let (dep, version_range, content) = vulnerable_dep("==1.0.*");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/requirements.txt"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+        let registry = FixedVersionRegistry {
+            versions: vec![("1.1.9", false), ("1.1.5", false), ("1.1.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &TruncatingFormatter,
+        )
+        .await;
+
+        assert!(quickfix_titles(&actions).is_empty());
+
+        let titles = refactor_titles(&actions);
+        assert_eq!(
+            titles,
+            vec!["1.1.9 (latest)"],
+            "identical-text items after the first must be deduped: {titles:?}"
         );
     }
 
