@@ -1005,7 +1005,17 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         on_name || on_version
     })?;
 
-    let available_versions = registry.get_versions(dep.name()).await.ok()?;
+    // A non-resolvable source (e.g. `CustomRegistry`, Git, Path) doesn't resolve
+    // against `registry` at all — fetching by name here would silently check an
+    // unrelated or coincidentally-named public-registry package (#248), so hover
+    // must skip the registry lookup and every section built from it entirely.
+    let resolvable = dep.source().is_version_resolvable();
+
+    let available_versions = if resolvable {
+        Some(registry.get_versions(dep.name()).await.ok()?)
+    } else {
+        None
+    };
 
     let url = formatter.package_url(dep.name());
 
@@ -1055,11 +1065,15 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .unwrap();
     }
 
-    let latest = versions
-        .cached
-        .get(normalized_name.as_str())
-        .or_else(|| versions.cached.get(dep.name()))
-        .map(|v| v.latest.as_str());
+    let latest = resolvable
+        .then(|| {
+            versions
+                .cached
+                .get(normalized_name.as_str())
+                .or_else(|| versions.cached.get(dep.name()))
+                .map(|v| v.latest.as_str())
+        })
+        .flatten();
     if let Some(latest_ver) = latest {
         write!(
             &mut markdown,
@@ -1075,28 +1089,30 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     });
     push_vulnerability_hover_section(&mut markdown, vuln_outcome);
 
-    markdown.push_str("**Recent versions**:\n");
-    let now = PublishTime::now();
-    for (i, version) in available_versions.iter().take(8).enumerate() {
-        let version_span = markdown_code_span(version.version_string());
-        let age_suffix = if freshness.enabled {
-            version_age_suffix(version.as_ref(), now)
-        } else {
-            String::new()
-        };
-        if i == 0 {
-            writeln!(&mut markdown, "- {version_span} *(latest)*{age_suffix}").unwrap();
-        } else if version.is_yanked() {
-            writeln!(
-                &mut markdown,
-                "- {} {}{}",
-                version_span,
-                formatter.yanked_label(),
-                age_suffix
-            )
-            .unwrap();
-        } else {
-            writeln!(&mut markdown, "- {version_span}{age_suffix}").unwrap();
+    if let Some(available_versions) = &available_versions {
+        markdown.push_str("**Recent versions**:\n");
+        let now = PublishTime::now();
+        for (i, version) in available_versions.iter().take(8).enumerate() {
+            let version_span = markdown_code_span(version.version_string());
+            let age_suffix = if freshness.enabled {
+                version_age_suffix(version.as_ref(), now)
+            } else {
+                String::new()
+            };
+            if i == 0 {
+                writeln!(&mut markdown, "- {version_span} *(latest)*{age_suffix}").unwrap();
+            } else if version.is_yanked() {
+                writeln!(
+                    &mut markdown,
+                    "- {} {}{}",
+                    version_span,
+                    formatter.yanked_label(),
+                    age_suffix
+                )
+                .unwrap();
+            } else {
+                writeln!(&mut markdown, "- {version_span}{age_suffix}").unwrap();
+            }
         }
     }
 
@@ -1635,21 +1651,31 @@ pub fn generate_diagnostics_from_cache(
 
         let Some(package_versions) = package_versions else {
             // Skip "unknown" diagnostic if package exists in lock file
-            // (registry fetch may have failed due to rate limiting)
+            // (registry fetch may have failed due to rate limiting), or if
+            // the source isn't resolvable against the registry this LSP
+            // queries (e.g. `CustomRegistry` / Git / Path) — an absent cache
+            // entry there just means we never fetched it, not that the
+            // package doesn't exist (#248). Name-syntax validation is
+            // unaffected: it never depends on registry data.
             let in_lockfile = versions.resolved.contains_key(normalized_name.as_str())
                 || versions.resolved.contains_key(dep.name());
             if !in_lockfile {
                 let message = match formatter.validate_package_name(dep.name().as_str()) {
-                    Err(reason) => format!("Invalid package name '{}': {reason}", dep.name()),
-                    Ok(()) => format!("Unknown package '{}'", dep.name()),
+                    Err(reason) => Some(format!("Invalid package name '{}': {reason}", dep.name())),
+                    Ok(()) if dep.source().is_version_resolvable() => {
+                        Some(format!("Unknown package '{}'", dep.name()))
+                    }
+                    Ok(()) => None,
                 };
-                diagnostics.push(Diagnostic {
-                    range: dep.name_range(),
-                    severity: Some(severities.unknown),
-                    message,
-                    source: Some("deps-lsp".into()),
-                    ..Default::default()
-                });
+                if let Some(message) = message {
+                    diagnostics.push(Diagnostic {
+                        range: dep.name_range(),
+                        severity: Some(severities.unknown),
+                        message,
+                        source: Some("deps-lsp".into()),
+                        ..Default::default()
+                    });
+                }
             }
             continue;
         };
@@ -1687,11 +1713,15 @@ pub fn generate_diagnostics_from_cache(
             continue;
         }
 
+        // As with the unsatisfiable check above, a non-resolvable source's `latest`
+        // (when present at all) comes from an unrelated or coincidental cache entry,
+        // not a real lookup against the registry this dependency actually resolves
+        // against — so "Outdated" must not be evaluated for it either (#248).
         let status = match dep.version_requirement() {
-            Some(version_req) => formatter.requirement_status(version_req, latest),
-            // No declared requirement at all (e.g. a dangling alias/reference the parser
-            // couldn't resolve to any string) — nothing was verified.
-            None => RequirementStatus::Unresolved,
+            Some(version_req) if dep.source().is_version_resolvable() => {
+                formatter.requirement_status(version_req, latest)
+            }
+            _ => RequirementStatus::Unresolved,
         };
 
         if status == RequirementStatus::Outdated {
@@ -6162,6 +6192,9 @@ mod tests {
                 sdk: "flutter".into(),
             },
             DependencySource::Workspace,
+            DependencySource::CustomRegistry {
+                url: "my-corp".into(),
+            },
         ] {
             let parse_result = SingleDepParseResult {
                 dep: NonRegistryDep(dep_at("dep"), source.clone()),
@@ -6202,6 +6235,220 @@ mod tests {
                 .any(|d| d.message.contains("No published version satisfies")),
             "control case: a Registry-source dependency must still produce the WARNING"
         );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_unknown_package_skipped_for_non_registry_sources() {
+        use crate::parser::DependencySource;
+
+        // No cache entry at all for "dep" — simulates a `CustomRegistry`
+        // dependency, which this LSP never fetches from a real registry.
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/Cargo.toml");
+
+        let parse_result = SingleDepParseResult {
+            dep: NonRegistryDep(
+                dep_at("dep"),
+                DependencySource::CustomRegistry {
+                    url: "my-corp".into(),
+                },
+            ),
+            uri: uri.clone(),
+        };
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("Unknown package")),
+            "a CustomRegistry-sourced dependency must never produce the \"Unknown package\" WARNING"
+        );
+
+        // Control: the same missing cache entry on a Registry-source
+        // dependency DOES produce the WARNING.
+        let registry_parse_result = SingleDepParseResult {
+            dep: dep_at("dep"),
+            uri,
+        };
+        let diagnostics = generate_diagnostics_from_cache(
+            &registry_parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Unknown package")),
+            "control case: a Registry-source dependency must still produce the WARNING"
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_invalid_name_still_reported_for_non_registry_sources() {
+        use crate::parser::DependencySource;
+
+        // Invalid-name validation is pure syntax checking, independent of
+        // registry data — it must still fire even when the source is not
+        // resolvable (unlike "Unknown package", which requires a real lookup).
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/package.json");
+
+        let parse_result = SingleDepParseResult {
+            dep: NonRegistryDep(
+                dep_at("dep"),
+                DependencySource::CustomRegistry {
+                    url: "my-corp".into(),
+                },
+            ),
+            uri,
+        };
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &RejectingFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.starts_with("Invalid package name"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_outdated_skipped_for_non_registry_sources() {
+        use crate::parser::DependencySource;
+
+        // "dep" resolves to a coincidentally-matching cache entry with a newer
+        // "latest", as would happen for a Cargo path dependency that happens
+        // to share a name with an unrelated published crate.
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert("dep".into(), PackageVersions::latest_only("9.9.9"));
+            m
+        };
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/Cargo.toml");
+
+        let parse_result = SingleDepParseResult {
+            dep: NonRegistryDep(
+                dep_at("dep"),
+                DependencySource::CustomRegistry {
+                    url: "my-corp".into(),
+                },
+            ),
+            uri: uri.clone(),
+        };
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("Newer version available")),
+            "a CustomRegistry-sourced dependency must never produce the \"Outdated\" WARNING"
+        );
+
+        // Control: the same requirement/cache pair on a Registry-source
+        // dependency DOES produce the WARNING.
+        let registry_parse_result = SingleDepParseResult {
+            dep: dep_at("dep"),
+            uri,
+        };
+        let diagnostics = generate_diagnostics_from_cache(
+            &registry_parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Newer version available")),
+            "control case: a Registry-source dependency must still produce the WARNING"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_registry_sections_suppressed_for_non_registry_sources() {
+        use crate::parser::DependencySource;
+
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "9.9.9".to_string(),
+                yanked: false,
+                published_at: None,
+            }],
+        };
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert("dep".into(), PackageVersions::latest_only("9.9.9"));
+            m
+        };
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/Cargo.toml");
+
+        let parse_result = SingleDepParseResult {
+            dep: NonRegistryDep(
+                dep_at("dep"),
+                DependencySource::CustomRegistry {
+                    url: "my-corp".into(),
+                },
+            ),
+            uri: uri.clone(),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+        )
+        .await
+        .expect("hover should still be generated for a non-resolvable-source dependency");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(!content.value.contains("**Latest**"));
+        assert!(!content.value.contains("**Recent versions**"));
+        assert!(content.value.contains("**Requirement**"));
+
+        // Control: the same fixture on a Registry-source dependency DOES show
+        // both registry-derived sections, proving the fixture isn't vacuous.
+        let registry_parse_result = SingleDepParseResult {
+            dep: dep_at("dep"),
+            uri,
+        };
+        let hover = generate_hover(
+            &registry_parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+        )
+        .await
+        .expect("hover should be generated");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("**Latest**"));
+        assert!(content.value.contains("**Recent versions**"));
     }
 
     #[test]
