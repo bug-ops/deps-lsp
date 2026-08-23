@@ -320,12 +320,13 @@ serde = "1.0"
     // rather than replacing the previously stored document.
     let oversized_content = "a".repeat(10_000_001);
     client.did_change(uri, 2, &oversized_content);
-    client.flush_notifications();
 
+    // tower-lsp-server dispatches handlers via `buffer_unordered`, so the
+    // didChange handler's logMessage and the workspace/symbol response used to
+    // flush can arrive at the stdout sink in either order. Poll for the
+    // rejection notification instead of relying on exactly one flush.
     let rejection = client
-        .get_notifications()
-        .into_iter()
-        .find(|n| {
+        .wait_for_notification(10, |n| {
             n.method == "window/logMessage"
                 && n.params["message"]
                     .as_str()
