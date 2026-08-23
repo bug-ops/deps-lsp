@@ -122,6 +122,12 @@ pub struct VersionData<'a> {
     /// scan has run yet (e.g. the feature is disabled) — distinct from an
     /// empty map, which would mean "scanned, nothing found".
     pub vulnerabilities: Option<&'a VulnerabilityMap>,
+    /// Yanked-version findings, keyed by normalized package name -> the
+    /// version string found yanked (the in-use version, or `latest` when
+    /// only `latest` itself is yanked — see `deps-lsp`'s lifecycle probe).
+    /// `None` when no yanked check has run yet — distinct from an empty map,
+    /// which would mean "checked, nothing yanked".
+    pub yanked: Option<&'a HashMap<String, String>>,
 }
 
 impl<'a> VersionData<'a> {
@@ -150,6 +156,7 @@ impl<'a> VersionData<'a> {
             cached,
             resolved,
             vulnerabilities: None,
+            yanked: None,
         }
     }
 
@@ -171,6 +178,26 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub fn with_vulnerabilities(mut self, vulnerabilities: &'a VulnerabilityMap) -> Self {
         self.vulnerabilities = Some(vulnerabilities);
+        self
+    }
+
+    /// Attaches yanked-version findings to this `VersionData`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let yanked = HashMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_yanked(&yanked);
+    /// assert!(versions.yanked.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_yanked(mut self, yanked: &'a HashMap<String, String>) -> Self {
+        self.yanked = Some(yanked);
         self
     }
 }
@@ -1569,6 +1596,20 @@ pub fn generate_diagnostics_from_cache(
             push_vulnerability_diagnostics(&mut diagnostics, dep, dv);
         }
 
+        // Independent of the registry-outage/no-range early-`continue`s below,
+        // for the same reason as the vulnerability push above — a yanked
+        // finding from the lifecycle probe must never be suppressed by an
+        // unrelated "latest" lookup failure.
+        if let Some(yanked_version) = versions.yanked.and_then(|y| y.get(&normalized_name)) {
+            diagnostics.push(Diagnostic {
+                range: dep.version_range().unwrap_or_else(|| dep.name_range()),
+                severity: Some(severities.yanked),
+                message: format!("{} ({})", formatter.yanked_message(), yanked_version),
+                source: Some("deps-lsp".into()),
+                ..Default::default()
+            });
+        }
+
         let package_versions = versions
             .cached
             .get(normalized_name.as_str())
@@ -2099,7 +2140,10 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
 /// Prefer `generate_diagnostics_from_cache` when cached versions are available. Not called
 /// anywhere in this workspace (`deps-lsp` always has cached versions by the time
 /// diagnostics run) — kept as public API for external callers of `deps-core` as a library,
-/// re-exported as `deps_core::lsp_generate_diagnostics`.
+/// re-exported as `deps_core::lsp_generate_diagnostics`. Does not emit a yanked-version
+/// diagnostic: `get_latest_matching`'s trait contract filters yanked versions by default
+/// (see [`Registry::get_latest_matching`]), so the version it returns is never yanked
+/// under a normal requirement (#233).
 pub async fn generate_diagnostics<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     registry: &R,
@@ -2142,17 +2186,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
             .ok()
             .flatten();
 
-        if let Some(current) = matching {
-            if current.is_yanked() {
-                diagnostics.push(Diagnostic {
-                    range: version_range,
-                    severity: Some(severities.yanked),
-                    message: formatter.yanked_message().into(),
-                    source: Some("deps-lsp".into()),
-                    ..Default::default()
-                });
-            }
-
+        if matching.is_some() {
             let latest = crate::registry::find_latest_stable(&versions);
             if let Some(latest) = latest
                 && formatter.requirement_status(version_req, latest.version_string())
@@ -2698,52 +2732,6 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(None) })
-        }
-
-        fn search<'a>(
-            &'a self,
-            _query: &'a str,
-            _limit: usize,
-        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
-        {
-            Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn package_url(&self, _name: &PackageName) -> String {
-            String::new()
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    /// A registry whose `get_latest_matching` always returns a yanked version,
-    /// for exercising `generate_diagnostics`'s yanked-severity wiring.
-    struct YankedRegistry;
-
-    impl crate::Registry for YankedRegistry {
-        fn get_versions<'a>(
-            &'a self,
-            _name: &'a PackageName,
-        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
-        {
-            Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn get_latest_matching<'a>(
-            &'a self,
-            _name: &'a PackageName,
-            _req: &'a VersionReq,
-        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
-        {
-            Box::pin(async move {
-                Ok(Some(Box::new(MockVersionWithAge {
-                    version: "1.0.0".to_string(),
-                    yanked: true,
-                    published_at: None,
-                }) as Box<dyn crate::Version>))
-            })
         }
 
         fn search<'a>(
@@ -4685,83 +4673,6 @@ mod tests {
         assert!(!diagnostics[0].message.contains("Unknown package"));
     }
 
-    // The two tests below cover `generate_diagnostics` (the registry-calling public API,
-    // re-exported as `deps_core::lsp_generate_diagnostics`), not the live LSP path —
-    // `deps-lsp` always has cached versions by the time diagnostics run and calls
-    // `generate_diagnostics_from_cache` instead. `yanked_severity` is not yet honored
-    // on that live path (see #233): `Registry::get_latest_matching`, which populates
-    // the cache, filters out yanked versions by contract on every current registry
-    // implementation, so a yanked flag threaded through the cache would always read
-    // `false`.
-    #[tokio::test]
-    async fn test_generate_diagnostics_yanked_uses_configured_severity() {
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        let formatter = MockFormatter;
-
-        let parse_result = MockParseResult {
-            deps: vec![MockDep {
-                name: "serde".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-            }],
-            uri: crate::test_util::test_uri("/test/Cargo.toml"),
-        };
-
-        let severities = DiagnosticSeverities {
-            yanked: DiagnosticSeverity::ERROR,
-            ..DiagnosticSeverities::default()
-        };
-
-        let diagnostics = generate_diagnostics(
-            &parse_result,
-            &YankedRegistry,
-            &formatter,
-            crate::FreshnessSettings::default(),
-            severities,
-        )
-        .await;
-
-        let yanked_diag = diagnostics
-            .iter()
-            .find(|d| d.message == formatter.yanked_message())
-            .expect("expected a yanked diagnostic");
-        assert_eq!(yanked_diag.severity, Some(DiagnosticSeverity::ERROR));
-    }
-
-    #[tokio::test]
-    async fn test_generate_diagnostics_yanked_default_severity_unchanged() {
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        let formatter = MockFormatter;
-
-        let parse_result = MockParseResult {
-            deps: vec![MockDep {
-                name: "serde".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-            }],
-            uri: crate::test_util::test_uri("/test/Cargo.toml"),
-        };
-
-        let diagnostics = generate_diagnostics(
-            &parse_result,
-            &YankedRegistry,
-            &formatter,
-            crate::FreshnessSettings::default(),
-            DiagnosticSeverities::default(),
-        )
-        .await;
-
-        let yanked_diag = diagnostics
-            .iter()
-            .find(|d| d.message == formatter.yanked_message())
-            .expect("expected a yanked diagnostic");
-        assert_eq!(yanked_diag.severity, Some(DiagnosticSeverity::WARNING));
-    }
-
     #[tokio::test]
     async fn test_generate_diagnostics_unknown_uses_configured_severity() {
         use tower_lsp_server::ls_types::{Position, Range};
@@ -5103,6 +5014,268 @@ mod tests {
         assert!(
             diagnostics.is_empty(),
             "Expected no diagnostics for an unresolved requirement, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_yanked_uses_configured_severity() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.5".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        yanked.insert("serde".to_string(), "1.0.5".to_string());
+
+        let severities = DiagnosticSeverities {
+            yanked: DiagnosticSeverity::ERROR,
+            ..DiagnosticSeverities::default()
+        };
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            severities,
+        );
+
+        let yanked_diag = diagnostics
+            .iter()
+            .find(|d| d.message.starts_with(formatter.yanked_message()))
+            .expect("expected a yanked diagnostic");
+        assert_eq!(yanked_diag.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(yanked_diag.message.contains("1.0.5"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_yanked_default_severity_unchanged() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.5".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        yanked.insert("serde".to_string(), "1.0.5".to_string());
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+
+        let yanked_diag = diagnostics
+            .iter()
+            .find(|d| d.message.starts_with(formatter.yanked_message()))
+            .expect("expected a yanked diagnostic");
+        assert_eq!(yanked_diag.severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_no_yanked_map_emits_no_yanked_diagnostic() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // Regression guard for the four handlers (hover, completion, code_lens,
+        // inlay_hints) that keep calling `VersionData::new` without
+        // `.with_yanked(..)` — `yanked: None` must never produce a diagnostic.
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.5".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.5"));
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.starts_with(formatter.yanked_message())),
+            "Expected no yanked diagnostic when `yanked` is None, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_yanked_and_outdated_both_emitted() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // Proves the yanked push sits before the early-`continue`s, so a dep
+        // that is both yanked (in-use version) and outdated (vs. latest)
+        // gets both diagnostics.
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.5".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        yanked.insert("serde".to_string(), "1.0.5".to_string());
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "expected both diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.starts_with(formatter.yanked_message()))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("Newer version available"))
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_yanked_no_version_range_uses_name_range() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let name_range = Range::new(Position::new(0, 0), Position::new(0, 5));
+
+        let parse_result = MockMarkedParseResult {
+            dep: MockMarkedDep {
+                name: "serde".into(),
+                name_range,
+                markers: None,
+            },
+            uri: crate::test_util::test_uri("/test/pyproject.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        yanked.insert("serde".to_string(), "1.0.5".to_string());
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+
+        let yanked_diag = diagnostics
+            .iter()
+            .find(|d| d.message.starts_with(formatter.yanked_message()))
+            .expect("expected a yanked diagnostic even without a version_range");
+        assert_eq!(yanked_diag.range, name_range);
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_yanked_normalized_name_keying() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        /// Mirrors a Composer/NuGet/Swift-shaped formatter whose normalized
+        /// name differs from the manifest-declared raw name.
+        struct MockLowercaseFormatter;
+        impl EcosystemFormatter for MockLowercaseFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn normalize_package_name(&self, name: &PackageName) -> String {
+                name.to_string().to_lowercase()
+            }
+        }
+
+        let formatter = MockLowercaseFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "Newtonsoft.Json".into(),
+                version_req: "13.0.1".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/project.csproj"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        // Keyed by the *normalized* (lowercase) name, not the raw manifest name.
+        yanked.insert("newtonsoft.json".to_string(), "13.0.1".to_string());
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.starts_with(formatter.yanked_message())),
+            "expected normalized-name lookup to resolve the yanked entry, got: {diagnostics:?}"
         );
     }
 

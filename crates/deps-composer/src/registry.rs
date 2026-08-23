@@ -308,6 +308,14 @@ impl deps_core::Registry for PackagistRegistry {
         })
     }
 
+    // Packagist's `abandoned` is package-level, not per-version: `is_yanked`
+    // means "this package is abandoned", inherited by every version via the
+    // p2 minified-inheritance loop. Enabling the yanked check here would fire
+    // on nearly every dependency of an abandoned package (#233 R2).
+    fn reports_yanked(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

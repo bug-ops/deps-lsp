@@ -8,6 +8,7 @@ use super::state::{DocumentState, ServerState};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
 use crate::progress::{ProgressSender, RegistryProgress};
+use deps_core::Dependency;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
@@ -69,6 +70,7 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
         cached = old_state.cached_versions.len(),
         resolved = old_state.resolved_versions.len(),
         vulnerabilities = old_state.vulnerabilities.len(),
+        yanked = old_state.yanked_versions.len(),
         "preserving version cache"
     );
     new_state
@@ -83,6 +85,11 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     new_state
         .vulnerabilities
         .clone_from(&old_state.vulnerabilities);
+    // Same rationale as `vulnerabilities` above — without this the yanked
+    // diagnostic would flicker off on every keystroke until the next fetch.
+    new_state
+        .yanked_versions
+        .clone_from(&old_state.yanked_versions);
 }
 
 /// Ceiling on the OSV scan timeout, independent of the configured
@@ -131,20 +138,29 @@ fn looks_like_a_single_version(s: &str) -> bool {
     core.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
-/// Returns `true` if `requirement` denotes a single concrete version — the
-/// only shape safe to query OSV with directly (§3 step 2). A wrong answer
-/// here is invisible in testing (OSV silently returns `{}` for a fabricated
-/// version), so getting this right matters more than covering every
-/// ecosystem's full range grammar.
+/// Returns the concrete version text `requirement` denotes — with any pin
+/// marker (`=`/`==`, or a single-value bracket wrap like NuGet's `[1.0.0]`)
+/// stripped off — or `None` if `requirement` is not the shape of a single
+/// concrete version. The only shape safe to query OSV with directly (§3
+/// step 2), and, for #233, the only shape safe to compare against a real
+/// registry version string in the yanked-version probe. A wrong answer here
+/// is invisible in testing (OSV silently returns `{}` for a fabricated
+/// version; the yanked probe silently finds no match), so getting this
+/// right matters more than covering every ecosystem's full range grammar.
 ///
-/// An explicit pin marker (`=`/`==`, or a single-value bracket wrap like
-/// NuGet's `[1.0.0]`) is always accepted. A *bare* requirement (no marker)
-/// is accepted only for ecosystems where a bare version is not itself a
-/// range by default (critique C2) — see [`bare_version_is_a_range`].
-fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
+/// An explicit pin marker is always accepted, and its marker is stripped
+/// from the returned text — required because PyPI's parser retains the
+/// pep440 comparator in `Dependency::version_requirement()` (an exact pin
+/// parses to `"==4.9.0"`, not `"4.9.0"`; confirmed by
+/// `deps-pypi`'s `test_basic_pinned`), so comparing the *unstripped* text
+/// against a real registry version string (`"4.9.0"`) would never match. A
+/// *bare* requirement (no marker) is returned verbatim, and is accepted only
+/// for ecosystems where a bare version is not itself a range by default
+/// (critique C2) — see [`bare_version_is_a_range`].
+fn concrete_pin_version(requirement: &str, ecosystem: EcosystemId) -> Option<&str> {
     let trimmed = requirement.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("latest") {
-        return false;
+        return None;
     }
 
     let pinned = trimmed
@@ -156,10 +172,85 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
         .filter(|inner| !inner.contains(','));
 
     match pinned.or(bracket_pinned) {
-        Some(body) => looks_like_a_single_version(body),
-        None if bare_version_is_a_range(ecosystem) => false,
-        None => looks_like_a_single_version(trimmed),
+        Some(body) => looks_like_a_single_version(body).then_some(body),
+        None if bare_version_is_a_range(ecosystem) => None,
+        None => looks_like_a_single_version(trimmed).then_some(trimmed),
     }
+}
+
+/// Returns `true` if `requirement` denotes a single concrete version. See
+/// [`concrete_pin_version`], whose boolean projection this is, for the
+/// acceptance rules. Test-only: production code needs the stripped text
+/// from `concrete_pin_version` itself, not just the boolean.
+#[cfg(test)]
+fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
+    concrete_pin_version(requirement, ecosystem).is_some()
+}
+
+/// The version of `dep` this project treats as actually in use: the
+/// lock-file-resolved version, else the declared requirement when it is
+/// already concrete ([`concrete_pin_version`]). `None` when neither applies.
+///
+/// A dependency whose manifest requirement is itself the resolved version
+/// ([`deps_core::lsp_helpers::EcosystemFormatter::manifest_requirement_is_resolved_version`]
+/// — a Go `require`-directive dependency) skips the lockfile step entirely,
+/// going straight to the declared requirement — see [`build_scan_targets`]
+/// for why go.sum is unreliable here. Shared by `build_scan_targets` (OSV
+/// targets) and the yanked-version check (`fetch_latest_versions_parallel`),
+/// both of which need "what version does the user actually have" for the
+/// same reason: querying a fabricated version produces a silent false
+/// negative.
+fn in_use_version(
+    dep: &dyn Dependency,
+    normalized_name: &str,
+    resolved_versions: &HashMap<PackageName, String>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    ecosystem: EcosystemId,
+) -> Option<String> {
+    if formatter.manifest_requirement_is_resolved_version(dep) {
+        dep.version_requirement()
+            .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
+            .map(str::to_string)
+    } else {
+        resolved_versions
+            .get(normalized_name)
+            .or_else(|| resolved_versions.get(dep.name()))
+            .cloned()
+            .or_else(|| {
+                dep.version_requirement()
+                    .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
+                    .map(str::to_string)
+            })
+    }
+}
+
+/// Builds `dep_name -> in_use_version` (§4.5/§4.6) for every dependency with
+/// a known in-use version, for the yanked-check probe in
+/// `fetch_latest_versions_parallel`. Skips non-registry dependencies
+/// (git/path forks, step 0 of [`build_scan_targets`]'s ladder) so a patched
+/// fork is never flagged for a registry version it does not contain.
+fn collect_in_use_versions(
+    parse_result: &dyn deps_core::ParseResult,
+    resolved_versions: &HashMap<PackageName, String>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    ecosystem: EcosystemId,
+) -> HashMap<PackageName, String> {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .filter(|dep| dep.source() == deps_core::parser::DependencySource::Registry)
+        .filter_map(|dep| {
+            let normalized_name = formatter.normalize_package_name(dep.name());
+            in_use_version(
+                dep,
+                &normalized_name,
+                resolved_versions,
+                formatter,
+                ecosystem,
+            )
+            .map(|v| (dep.name().clone(), v))
+        })
+        .collect()
 }
 
 /// Builds the OSV scan targets for one manifest's dependencies, applying the
@@ -216,8 +307,6 @@ fn build_scan_targets(
             continue;
         }
 
-        // Go's go.mod `require` line is already an exact pinned version, never
-        // a range (unlike Cargo/npm, where the manifest is a range and the
         // lockfile holds the pin) — so for a Go `require` dependency the
         // manifest itself is the authoritative version, not go.sum. go.sum is
         // a checksum ledger that `go get`/`go build` only ever append to
@@ -228,21 +317,7 @@ fn build_scan_targets(
         // to OSV (excludes/replaces fall through to the lockfile lookup below
         // like any other ecosystem, since their `version_requirement()` is
         // not an in-use version — see `manifest_requirement_is_resolved_version`).
-        let version = if formatter.manifest_requirement_is_resolved_version(dep) {
-            dep.version_requirement()
-                .filter(|req| is_concrete_version(req.as_str(), ecosystem))
-                .map(|req| req.as_str().to_string())
-        } else {
-            resolved_versions
-                .get(key.as_str())
-                .or_else(|| resolved_versions.get(dep.name()))
-                .cloned()
-                .or_else(|| {
-                    dep.version_requirement()
-                        .filter(|req| is_concrete_version(req.as_str(), ecosystem))
-                        .map(|req| req.as_str().to_string())
-                })
-        };
+        let version = in_use_version(dep, &key, resolved_versions, formatter, ecosystem);
 
         let Some(version) = version else {
             skipped.insert(key, ScanOutcome::Skipped(SkipReason::NoConcreteVersion));
@@ -505,15 +580,24 @@ impl DependencyDiff {
         }
     }
 
+    /// Whether the registry fetch (and therefore the yanked-version probe,
+    /// #233) has any reason to run: a new dependency, or an existing one
+    /// whose declared version changed. A version-only edit still needs the
+    /// fetch — the "latest" value itself does not change, but a dependency
+    /// edited from a safe pin to a yanked one (or vice versa) must be
+    /// re-probed against its new in-use version, and any stale finding
+    /// against the *old* version must not linger (security F1 / impl-critic
+    /// S1).
     #[cfg(test)]
     fn needs_fetch(&self) -> bool {
-        !self.added.is_empty()
+        !self.added.is_empty() || !self.version_changed.is_empty()
     }
 
     /// Whether the OSV rescan (§4) has any reason to run: a new dependency,
-    /// or an existing one whose declared version changed. Kept separate from
-    /// [`Self::needs_fetch`] (registry-fetch gating) since a version-only
-    /// edit needs no registry request but does need a rescan.
+    /// or an existing one whose declared version changed. Identical to
+    /// [`Self::needs_fetch`] today (both gate on `added`/`version_changed`);
+    /// kept as separate methods since they answer different questions and
+    /// could diverge again if either gate changes independently.
     fn needs_osv_rescan(&self) -> bool {
         !self.added.is_empty() || !self.version_changed.is_empty()
     }
@@ -534,6 +618,12 @@ fn dependency_version_map(
 struct FetchResult {
     /// Successfully fetched versions (package -> latest + full version list)
     versions: HashMap<PackageName, PackageVersions>,
+    /// Yanked-version findings, keyed by **raw** package name (unlike
+    /// `DocumentState::yanked_versions`, which is normalized-keyed — see
+    /// §3.1 of the design). Callers must re-key through
+    /// `EcosystemFormatter::normalize_package_name` before merging into
+    /// document state.
+    yanked_versions: HashMap<PackageName, String>,
     /// Number of packages that failed to fetch (timeout or error)
     failed_count: usize,
     /// First actionable error message (shown to user via `window/showMessage`)
@@ -548,10 +638,23 @@ struct FetchResult {
 /// This function executes all registry requests concurrently with per-dependency
 /// timeout isolation, preventing slow packages from blocking others.
 ///
+/// Alongside the primary fetch, checks whether the in-use version of a
+/// dependency has been yanked (#233), for registries that [report yank
+/// data](Registry::reports_yanked). Unlike the original design, this is not
+/// a second registry round trip: `registry.get_versions` below already
+/// fetches the full, unfiltered version list once per package (see
+/// [`PackageVersions`]), so the in-use-version check is a zero-cost
+/// in-memory search over a list already in hand, run for every dependency
+/// with a known in-use version rather than only when it differs from
+/// `latest`.
+///
 /// # Arguments
 ///
 /// * `registry` - Package registry to fetch from
 /// * `package_names` - List of package names to fetch
+/// * `in_use` - Raw dependency name -> the version this project actually
+///   has (lockfile-resolved or a concrete pin), checked against the fetched
+///   version list for yank status
 /// * `progress` - Optional progress tracker (will be updated after each fetch)
 /// * `timeout_secs` - Timeout for each individual package fetch (default: 10s)
 /// * `max_concurrent` - Maximum concurrent fetches (default: 20)
@@ -571,6 +674,7 @@ struct FetchResult {
 async fn fetch_latest_versions_parallel(
     registry: Arc<dyn Registry>,
     package_names: Vec<PackageName>,
+    in_use: &HashMap<PackageName, String>,
     progress_sender: Option<ProgressSender>,
     timeout_secs: u64,
     max_concurrent: usize,
@@ -583,6 +687,7 @@ async fn fetch_latest_versions_parallel(
     let first_error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let timeout = Duration::from_secs(timeout_secs);
     let wildcard_req = deps_core::VersionReq::new("*");
+    let check_yanked = registry.reports_yanked();
 
     let results: Vec<_> = stream::iter(package_names)
         .map(|name| {
@@ -592,6 +697,7 @@ async fn fetch_latest_versions_parallel(
             let first_error = Arc::clone(&first_error);
             let progress_sender = progress_sender.clone();
             let wildcard_req = &wildcard_req;
+            let in_use_version = in_use.get(&name).cloned();
             async move {
                 // Single round trip: the full version list is fetched once, and "latest"
                 // is a pure in-memory pick over it (`Registry::select_latest_matching`) —
@@ -599,6 +705,7 @@ async fn fetch_latest_versions_parallel(
                 // over the network (see `PackageVersions`).
                 let result = tokio::time::timeout(timeout, registry.get_versions(&name)).await;
 
+                let mut yanked: Option<(PackageName, String)> = None;
                 let version = match result {
                     Ok(Ok(versions)) => {
                         let available: Arc<[String]> = versions
@@ -608,49 +715,81 @@ async fn fetch_latest_versions_parallel(
                         // `.get(idx)` rather than `versions[idx]`: `select_latest_matching`
                         // is a public `Registry` trait method, so an out-of-tree
                         // implementation returning a stale index must not panic this task.
-                        match registry
+                        let resolved = if let Some(v) = registry
                             .select_latest_matching(&versions, wildcard_req)
                             .and_then(|idx| versions.get(idx))
                         {
-                            Some(v) => {
-                                let latest = v.version_string().to_string();
-                                tracing::debug!(package = %name, version = %latest, "fetched");
-                                Some((name.clone(), PackageVersions { latest, available }))
-                            }
-                            None => {
-                                // The pure list-based pick found nothing — for most
-                                // ecosystems this genuinely means "no version found", but
-                                // for a registry whose list endpoint can be incomplete
-                                // (e.g. Go's `/@v/list`, which never enumerates
-                                // pseudo-versions and can be entirely empty for an
-                                // untagged module) it may just mean the list alone isn't
-                                // enough. Fall back to the registry's own
-                                // `get_latest_matching`, which some registries answer from
-                                // a different, more complete source (Go's `/@latest`). This
-                                // costs a second network call, but only in this already-rare
-                                // "list-based pick failed" case, not the common path.
-                                let fallback = tokio::time::timeout(
-                                    timeout,
-                                    registry.get_latest_matching(&name, wildcard_req),
-                                )
-                                .await;
-                                match fallback {
-                                    Ok(Ok(Some(v))) => {
-                                        let latest = v.version_string().to_string();
-                                        tracing::debug!(
-                                            package = %name,
-                                            version = %latest,
-                                            "fetched via get_latest_matching fallback"
-                                        );
-                                        Some((name.clone(), PackageVersions { latest, available }))
-                                    }
-                                    _ => {
-                                        tracing::debug!(package = %name, "no version found");
-                                        None
-                                    }
+                            let latest = v.version_string().to_string();
+                            tracing::debug!(package = %name, version = %latest, "fetched");
+                            Some((latest, v.is_yanked()))
+                        } else {
+                            // The pure list-based pick found nothing — for most
+                            // ecosystems this genuinely means "no version found", but
+                            // for a registry whose list endpoint can be incomplete
+                            // (e.g. Go's `/@v/list`, which never enumerates
+                            // pseudo-versions and can be entirely empty for an
+                            // untagged module) it may just mean the list alone isn't
+                            // enough. Fall back to the registry's own
+                            // `get_latest_matching`, which some registries answer from
+                            // a different, more complete source (Go's `/@latest`). This
+                            // costs a second network call, but only in this already-rare
+                            // "list-based pick failed" case, not the common path.
+                            let fallback = tokio::time::timeout(
+                                timeout,
+                                registry.get_latest_matching(&name, wildcard_req),
+                            )
+                            .await;
+                            match fallback {
+                                Ok(Ok(Some(v))) => {
+                                    let latest = v.version_string().to_string();
+                                    tracing::debug!(
+                                        package = %name,
+                                        version = %latest,
+                                        "fetched via get_latest_matching fallback"
+                                    );
+                                    Some((latest, v.is_yanked()))
+                                }
+                                _ => {
+                                    tracing::debug!(package = %name, "no version found");
+                                    None
                                 }
                             }
+                        };
+
+                        if check_yanked {
+                            // Row 1 (§4.7): the picked "latest" itself yanked —
+                            // zero extra cost, since it's already in hand.
+                            // Unreachable in production for an *enabled*
+                            // registry under today's hardcoded wildcard (one
+                            // never returns a yanked version for `*`), but
+                            // stays correct as a defense-in-depth check.
+                            if let Some((latest, true)) = &resolved {
+                                yanked = Some((name.clone(), latest.clone()));
+                            }
+
+                            // Row 2/3 (§4.7, revised under #206): `versions`
+                            // is the full, already-fetched, unfiltered list —
+                            // no second registry round trip is needed to
+                            // check whether the in-use version was yanked,
+                            // unlike the pre-#206 probe design. Checked for
+                            // every dependency with a known in-use version,
+                            // not just when it differs from `latest`, since
+                            // it's now a free in-memory lookup either way. A
+                            // yanked in-use version wins over an already
+                            // -recorded yanked `latest` — it's the version
+                            // the user actually has.
+                            if let Some(iv) = in_use_version.as_deref()
+                                && let Some(found) =
+                                    versions.iter().find(|v| v.version_string() == iv)
+                                && found.is_yanked()
+                            {
+                                yanked = Some((name.clone(), iv.to_string()));
+                            }
                         }
+
+                        resolved.map(|(latest, _)| {
+                            (name.clone(), PackageVersions { latest, available })
+                        })
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(package = %name, error = %e, "fetch failed");
@@ -673,15 +812,27 @@ async fn fetch_latest_versions_parallel(
                     sender.send(count);
                 }
 
-                version
+                (version, yanked)
             }
         })
         .buffer_unordered(max_concurrent)
         .collect()
         .await;
 
+    let mut versions = HashMap::with_capacity(results.len());
+    let mut yanked_versions = HashMap::new();
+    for (version, yanked) in results {
+        if let Some((name, v)) = version {
+            versions.insert(name, v);
+        }
+        if let Some((name, v)) = yanked {
+            yanked_versions.insert(name, v);
+        }
+    }
+
     FetchResult {
-        versions: results.into_iter().flatten().collect(),
+        versions,
+        yanked_versions,
         failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
         first_error: first_error.lock().unwrap_or_else(|p| p.into_inner()).take(),
     }
@@ -803,8 +954,9 @@ pub async fn handle_document_open(
             ))
         });
 
-        // Collect dependency names while holding reference (can't hold across await)
-        let dep_names: Vec<PackageName> = {
+        // Collect dependency names and the in-use-version map (§4.6) in one
+        // pass while holding the reference (can't hold across await).
+        let (dep_names, in_use): (Vec<PackageName>, HashMap<PackageName, String>) = {
             let doc = match state_clone.get_document(&uri_clone) {
                 Some(d) => d,
                 None => {
@@ -819,11 +971,18 @@ pub async fn handle_document_open(
                     return;
                 }
             };
-            parse_result
+            let dep_names = parse_result
                 .dependencies()
                 .into_iter()
                 .map(|d| d.name().clone())
-                .collect()
+                .collect();
+            let in_use = collect_in_use_versions(
+                parse_result,
+                &resolved_versions,
+                ecosystem_clone.formatter(),
+                resolve_ecosystem_id(ecosystem_clone.as_ref()),
+            );
+            (dep_names, in_use)
         };
 
         tracing::debug!(count = dep_names.len(), "starting registry fetch");
@@ -850,6 +1009,7 @@ pub async fn handle_document_open(
         let fetch_result = fetch_latest_versions_parallel(
             registry,
             dep_names,
+            &in_use,
             progress_sender,
             cache_config.fetch_timeout_secs,
             cache_config.max_concurrent_fetches,
@@ -860,12 +1020,23 @@ pub async fn handle_document_open(
         tracing::debug!(
             fetched = fetch_result.versions.len(),
             failed = fetch_result.failed_count,
+            yanked = fetch_result.yanked_versions.len(),
             "registry fetch complete"
         );
 
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.update_cached_versions(fetch_result.versions);
+            // Re-key raw -> normalized (§3.1): `FetchResult::yanked_versions`
+            // is raw-keyed, `DocumentState::yanked_versions` is normalized.
+            let formatter = ecosystem_clone.formatter();
+            doc.update_yanked_versions(
+                fetch_result
+                    .yanked_versions
+                    .into_iter()
+                    .map(|(name, v)| (formatter.normalize_package_name(&name), v))
+                    .collect(),
+            );
             if success {
                 doc.set_loaded();
             } else {
@@ -1018,6 +1189,22 @@ pub async fn handle_document_change(
         doc_state
             .vulnerabilities
             .remove(&formatter.normalize_package_name(removed_dep));
+        doc_state
+            .yanked_versions
+            .remove(&formatter.normalize_package_name(removed_dep));
+    }
+
+    // A version-only edit (name unchanged, requirement changed) invalidates
+    // any yanked finding recorded against the dependency's *old* version —
+    // e.g. editing a yanked pin to a safe one must not leave a stale
+    // diagnostic anchored on the new range (security F1 / impl-critic S1).
+    // Drop rather than try to refresh in place; the registry re-fetch below
+    // (`deps_to_fetch` includes `version_changed`) repopulates the entry if
+    // the *new* version also turns out to be yanked.
+    for changed_dep in &diff.version_changed {
+        doc_state
+            .yanked_versions
+            .remove(&formatter.normalize_package_name(changed_dep));
     }
 
     state.update_document(uri.clone(), doc_state);
@@ -1040,7 +1227,12 @@ pub async fn handle_document_change(
     let ecosystem_clone = Arc::clone(&ecosystem);
     let client_clone = client.clone();
     let needs_osv_rescan = diff.needs_osv_rescan();
-    let deps_to_fetch = diff.added;
+    // The yanked probe must also re-run for a version-only edit, not just a
+    // newly added dependency — otherwise editing a dependency's pin from a
+    // safe version to a yanked one would never be checked, since an empty
+    // `deps_to_fetch` skips the entire registry fetch below (security F1).
+    let mut deps_to_fetch = diff.added;
+    deps_to_fetch.extend(diff.version_changed);
 
     let task = tokio::spawn(async move {
         // Small debounce delay
@@ -1070,9 +1262,10 @@ pub async fn handle_document_change(
             ))
         });
 
-        // Skip registry fetch if no new dependencies
+        // Skip registry fetch if nothing new was added and no existing
+        // dependency's version changed.
         if deps_to_fetch.is_empty() {
-            tracing::debug!("no new dependencies, skipping registry fetch");
+            tracing::debug!("no added or version-changed dependencies, skipping registry fetch");
 
             if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
                 doc.set_loaded();
@@ -1119,7 +1312,7 @@ pub async fn handle_document_change(
 
         tracing::info!(
             count = deps_to_fetch.len(),
-            "fetching versions for new dependencies"
+            "fetching versions for added/version-changed dependencies"
         );
 
         // Mark as loading and start progress
@@ -1141,11 +1334,27 @@ pub async fn handle_document_change(
             _ => (None, None),
         };
 
+        // Build the in-use-version map (§4.6) from the freshly-committed parse
+        // result and the resolved versions just loaded above.
+        let in_use: HashMap<PackageName, String> = match state_clone.get_document(&uri_clone) {
+            Some(doc) => match doc.parse_result() {
+                Some(pr) => collect_in_use_versions(
+                    pr,
+                    &resolved_versions,
+                    ecosystem_clone.formatter(),
+                    resolve_ecosystem_id(ecosystem_clone.as_ref()),
+                ),
+                None => HashMap::new(),
+            },
+            None => HashMap::new(),
+        };
+
         // Fetch latest versions only for NEW dependencies
         let registry = ecosystem_clone.registry();
         let fetch_result = fetch_latest_versions_parallel(
             registry,
             deps_to_fetch,
+            &in_use,
             progress_sender,
             cache_config.fetch_timeout_secs,
             cache_config.max_concurrent_fetches,
@@ -1158,6 +1367,12 @@ pub async fn handle_document_change(
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             for (name, version) in fetch_result.versions {
                 doc.cached_versions.insert(name, version);
+            }
+            // Re-key raw -> normalized (§3.1), same as the didOpen path.
+            let formatter = ecosystem_clone.formatter();
+            for (name, version) in fetch_result.yanked_versions {
+                doc.yanked_versions
+                    .insert(formatter.normalize_package_name(&name), version);
             }
             if success {
                 doc.set_loaded();
@@ -1569,7 +1784,8 @@ mod tests {
         let packages = vec![PackageName::new("slow-package")];
 
         // Use 1 second timeout for test speed
-        let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 1, 10).await;
 
         // Should return empty (timeout, not success)
         assert!(result.versions.is_empty(), "Slow package should timeout");
@@ -1642,7 +1858,8 @@ mod tests {
         ];
 
         let start = std::time::Instant::now();
-        let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 1, 10).await;
         let elapsed = start.elapsed();
 
         // Should complete in ~1s (timeout), not 10s (slow package duration)
@@ -1753,7 +1970,7 @@ mod tests {
             .map(|i| PackageName::new(format!("package-{}", i)))
             .collect();
 
-        fetch_latest_versions_parallel(registry, packages, None, 5, 20).await;
+        fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 20).await;
 
         // Max concurrent should not exceed limit (allow small margin for timing)
         let max = max_seen.load(Ordering::SeqCst);
@@ -1891,7 +2108,8 @@ mod tests {
         ];
 
         // Use 1 second timeout for test speed
-        let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 1, 10).await;
 
         // Only the fast package should be in results
         assert_eq!(
@@ -1994,7 +2212,8 @@ mod tests {
         let registry: Arc<dyn Registry> = Arc::new(UntaggedModuleRegistry);
         let packages = vec![PackageName::new("golang.org/x/exp")];
 
-        let result = fetch_latest_versions_parallel(registry, packages, None, 5, 10).await;
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
 
         assert_eq!(
             result
@@ -2068,7 +2287,8 @@ mod tests {
         ];
 
         // Should not panic, just return empty result
-        let result = fetch_latest_versions_parallel(registry, packages, None, 5, 10).await;
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
 
         // All packages failed, result should be empty
         assert!(
@@ -2502,6 +2722,227 @@ dependencies = ["requests>=2.0.0"]
         }
     }
 
+    /// End-to-end PyPI key guard (critic S4): drives the *real* pypi parser
+    /// and formatter (not a hand-rolled mock) through the full
+    /// fetch -> re-key -> store -> diagnostic pipeline for an `==`-pinned
+    /// dependency with no lock file, declared as a Poetry
+    /// `[tool.poetry.dependencies]` table key. Poetry's table-key path keeps
+    /// `Dependency::name()` exactly as written in the manifest (unlike a PEP
+    /// 508 requirement *string* — `pyproject.toml`'s PEP 621 array or
+    /// `requirements.txt` — where `pep508_rs::PackageName` already
+    /// PEP 503-normalizes at construction, so raw and normalized already
+    /// coincide there and could not exercise this guard); the Poetry path is
+    /// therefore the one place a manifest-declared underscore/dotted name
+    /// genuinely reaches `FetchResult::yanked_versions` unnormalized (§3.1).
+    /// Asserts BOTH that `DocumentState::yanked_versions` ends up keyed by
+    /// the *normalized* name and that the diagnostic actually reaches
+    /// `generate_diagnostics_from_cache`'s output — either alone would miss
+    /// a regression the other half could hide (a normalized key with a
+    /// diagnostic-generation bug that never reads it, or a working
+    /// diagnostic built by accident on a raw key that happens to already be
+    /// normalized).
+    #[cfg(feature = "pypi")]
+    mod pypi_yanked_key_guard_tests {
+        use super::*;
+        use deps_core::{DiagnosticSeverities, Metadata, Version, VersionData};
+        use std::any::Any;
+
+        #[derive(Debug, Clone)]
+        struct MockYankVersion {
+            version: String,
+            yanked: bool,
+        }
+
+        impl Version for MockYankVersion {
+            fn version_string(&self) -> &str {
+                &self.version
+            }
+            fn is_yanked(&self) -> bool {
+                self.yanked
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// Reports `pinned_version` as yanked and a different, non-yanked
+        /// `"9.9.9"` as latest, for every package name it's asked about —
+        /// good enough for a single-dependency guard case.
+        struct MockYankedRegistry {
+            pinned_version: &'static str,
+        }
+
+        impl Registry for MockYankedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                let versions = vec![
+                    Box::new(MockYankVersion {
+                        version: "9.9.9".to_string(),
+                        yanked: false,
+                    }) as Box<dyn Version>,
+                    Box::new(MockYankVersion {
+                        version: self.pinned_version.to_string(),
+                        yanked: true,
+                    }) as Box<dyn Version>,
+                ];
+                Box::pin(async move { Ok(versions) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                let latest = Box::new(MockYankVersion {
+                    version: "9.9.9".to_string(),
+                    yanked: false,
+                }) as Box<dyn Version>;
+                Box::pin(async move { Ok(Some(latest)) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://pypi.org/project/{name}")
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// Runs the full pipeline for one Poetry `[tool.poetry.dependencies]`
+        /// table-key dependency, declared with an `==pinned_version` pin and
+        /// no lock file, and returns the generated diagnostics plus the
+        /// stored (normalized-keyed) yanked map.
+        async fn run_pipeline(
+            raw_name: &str,
+            pinned_version: &'static str,
+        ) -> (
+            Vec<tower_lsp_server::ls_types::Diagnostic>,
+            HashMap<String, String>,
+        ) {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+            // The TOML key is quoted so a dotted name (e.g. `zope.interface`)
+            // is a literal key rather than TOML's dotted-key table-nesting
+            // syntax.
+            let content =
+                format!("[tool.poetry.dependencies]\n\"{raw_name}\" = \"=={pinned_version}\"\n");
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get_for_uri(&uri)
+                .expect("pypi ecosystem not found");
+            let formatter = ecosystem.formatter();
+
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("a single Poetry table-key dependency must parse");
+            assert_eq!(
+                parse_result
+                    .dependencies()
+                    .iter()
+                    .map(|d| d.name().to_string())
+                    .collect::<Vec<_>>(),
+                vec![raw_name.to_string()],
+                "Poetry table-key parsing must keep the manifest-declared name as-is"
+            );
+
+            let resolved_versions = HashMap::new();
+            let dep_names: Vec<PackageName> = parse_result
+                .dependencies()
+                .into_iter()
+                .map(|d| d.name().clone())
+                .collect();
+            let in_use = collect_in_use_versions(
+                parse_result.as_ref(),
+                &resolved_versions,
+                formatter,
+                EcosystemId::Pypi,
+            );
+            // Sanity check on the fix this guard exists for: the pep440
+            // `==` comparator must already be stripped here.
+            assert_eq!(
+                in_use.get(&PackageName::new(raw_name)),
+                Some(&pinned_version.to_string())
+            );
+
+            let registry: Arc<dyn Registry> = Arc::new(MockYankedRegistry { pinned_version });
+            let fetch_result =
+                fetch_latest_versions_parallel(registry, dep_names, &in_use, None, 5, 10).await;
+
+            let yanked_versions: HashMap<String, String> = fetch_result
+                .yanked_versions
+                .into_iter()
+                .map(|(name, v)| (formatter.normalize_package_name(&name), v))
+                .collect();
+
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Pypi,
+                content.clone(),
+                parse_result,
+            );
+            doc_state.update_cached_versions(fetch_result.versions);
+            doc_state.update_yanked_versions(yanked_versions.clone());
+            state.update_document(uri.clone(), doc_state);
+
+            let doc = state.get_document(&uri).unwrap();
+            let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
+                doc.parse_result().unwrap(),
+                VersionData::new(&doc.cached_versions, &doc.resolved_versions)
+                    .with_yanked(&doc.yanked_versions),
+                formatter,
+                deps_core::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+            );
+
+            (diagnostics, yanked_versions)
+        }
+
+        #[tokio::test]
+        async fn typing_extensions_underscore_name_resolves_via_normalized_key() {
+            let (diagnostics, yanked_versions) = run_pipeline("typing_extensions", "4.9.0").await;
+
+            assert_eq!(
+                yanked_versions.get("typing-extensions"),
+                Some(&"4.9.0".to_string()),
+                "must be keyed by the normalized (dash) name, not the raw manifest name"
+            );
+            assert!(
+                diagnostics.iter().any(|d| d.message.contains("4.9.0")),
+                "yanked diagnostic must reach the generated output: {diagnostics:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn zope_interface_dotted_name_resolves_via_normalized_key() {
+            let (diagnostics, yanked_versions) = run_pipeline("zope.interface", "5.0.0").await;
+
+            assert_eq!(
+                yanked_versions.get("zope-interface"),
+                Some(&"5.0.0".to_string()),
+                "must be keyed by the normalized (dotted -> dash) name"
+            );
+            assert!(
+                diagnostics.iter().any(|d| d.message.contains("5.0.0")),
+                "yanked diagnostic must reach the generated output: {diagnostics:?}"
+            );
+        }
+    }
+
     // Go-specific tests
     #[cfg(feature = "go")]
     mod go_tests {
@@ -2775,6 +3216,289 @@ time = "0.1.43"
         }
 
         #[tokio::test]
+        async fn test_preserve_cache_carries_yanked_versions_across_edit() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+time = "0.1.43"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_yanked_versions(HashMap::from([(
+                    "time".to_string(),
+                    "0.1.43".to_string(),
+                )]));
+            }
+
+            // A whitespace-only edit: DocumentState is rebuilt from scratch,
+            // which would silently flicker the yanked diagnostic off on
+            // every keystroke without preserve_cache carrying it through.
+            let content2 = r#"[dependencies]
+time = "0.1.43"
+
+"#;
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+            state.update_document(uri.clone(), doc_state2);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.yanked_versions.get("time"), Some(&"0.1.43".to_string()));
+        }
+
+        #[tokio::test]
+        async fn test_yanked_versions_pruned_on_dependency_removal_by_normalized_name() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+serde = "1.0"
+time = "0.1.43"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_yanked_versions(HashMap::from([(
+                    "time".to_string(),
+                    "0.1.43".to_string(),
+                )]));
+            }
+
+            let content2 = r#"[dependencies]
+serde = "1.0"
+"#;
+            let old_deps: HashMap<PackageName, Option<VersionReq>> =
+                [("serde", None), ("time", None)]
+                    .into_iter()
+                    .map(|(n, r)| (PackageName::new(n), r))
+                    .collect();
+            let new_deps: HashMap<PackageName, Option<VersionReq>> =
+                std::iter::once((PackageName::new("serde"), None)).collect();
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
+            assert_eq!(diff.removed, vec![PackageName::new("time")]);
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            let formatter = ecosystem.formatter();
+            for removed_dep in &diff.removed {
+                doc_state2
+                    .yanked_versions
+                    .remove(&formatter.normalize_package_name(removed_dep));
+            }
+
+            state.update_document(uri.clone(), doc_state2);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                !doc.yanked_versions.contains_key("time"),
+                "removed dependency's yanked entry must be pruned"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_yanked_versions_pruned_on_version_change_by_normalized_name() {
+            // Security F1 / impl-critic S1 (false positive direction):
+            // editing a dependency from a yanked pin to a safe one, with no
+            // lock file, must not leave the stale yanked diagnostic
+            // anchored on the new version's range. Editing in place (not
+            // add+remove) means the pruning loop for `diff.removed` alone
+            // would miss this — the name never leaves `diff.removed`, it's
+            // in `diff.version_changed` instead.
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+time = "=0.1.43"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            // `time` was found yanked at its old pin, "=0.1.43".
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_yanked_versions(HashMap::from([(
+                    "time".to_string(),
+                    "0.1.43".to_string(),
+                )]));
+            }
+
+            // Edited to a different, safe pin — same dependency, in place.
+            let content2 = r#"[dependencies]
+time = "=0.1.44"
+"#;
+            let old_deps = dependency_version_map(
+                ecosystem
+                    .parse_manifest(content1, &uri)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+            );
+            let new_deps = dependency_version_map(
+                ecosystem
+                    .parse_manifest(content2, &uri)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+            );
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
+            assert!(diff.added.is_empty());
+            assert!(diff.removed.is_empty());
+            assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            let formatter = ecosystem.formatter();
+            for changed_dep in &diff.version_changed {
+                doc_state2
+                    .yanked_versions
+                    .remove(&formatter.normalize_package_name(changed_dep));
+            }
+
+            state.update_document(uri.clone(), doc_state2);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                !doc.yanked_versions.contains_key("time"),
+                "stale yanked entry against the OLD version must not survive an in-place edit"
+            );
+        }
+
+        #[test]
+        fn test_deps_to_fetch_includes_version_changed_dependencies() {
+            // Security F1 (false negative direction): editing a dependency
+            // from a safe pin to a yanked one, with no lock file, must
+            // still trigger the registry fetch (and therefore the probe) —
+            // otherwise the yanked pin is never checked at all, since
+            // `deps_to_fetch.is_empty()` would skip the fetch entirely if
+            // it only ever contained `diff.added`.
+            let old = versions(&[("time", Some("=0.1.44"))]);
+            let new = versions(&[("time", Some("=0.1.43"))]);
+
+            let diff = DependencyDiff::compute(&old, &new);
+            assert!(diff.added.is_empty());
+            assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
+            assert!(
+                diff.needs_fetch(),
+                "a version-only edit must trigger the registry fetch"
+            );
+
+            // Mirrors the production construction at the `deps_to_fetch`
+            // site in `handle_document_change`.
+            let mut deps_to_fetch = diff.added;
+            deps_to_fetch.extend(diff.version_changed);
+            assert_eq!(
+                deps_to_fetch,
+                vec![PackageName::new("time")],
+                "the version-changed dependency must be included in the fetch list"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_preserve_cache_yanked_versions_stale_after_lockfile_only_change() {
+            // R3 (accepted, not fixed): the yanked map is computed during the
+            // registry fetch. A didChange that adds no dependencies skips the
+            // fetch entirely, so `preserve_cache` carries the *old* yanked
+            // map forward verbatim even if a lockfile edited underneath (e.g.
+            // `cargo update` pulling in a newly-yanked release) would have
+            // changed the answer. This documents the existing behavior,
+            // identical to `cached_versions`' staleness.
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content = r#"[dependencies]
+time = "0.1.43"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            // Stale: `time` was yanked as of the last fetch.
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_yanked_versions(HashMap::from([(
+                    "time".to_string(),
+                    "0.1.43".to_string(),
+                )]));
+            }
+
+            // Identical manifest content re-parsed (as happens on a
+            // didChangeWatchedFiles-less lockfile edit that doesn't touch the
+            // manifest text) — no dependency added or removed, so the real
+            // handler would skip the registry fetch and never re-run the
+            // yanked probe.
+            let parse_result2 = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.to_string(),
+                parse_result2,
+            );
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+            state.update_document(uri.clone(), doc_state2);
+
+            // The stale entry survives verbatim — even if `time` were
+            // un-yanked (or a different version newly yanked) in the
+            // lockfile in the meantime, nothing here would know.
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.yanked_versions.get("time"), Some(&"0.1.43".to_string()));
+        }
+
+        #[tokio::test]
         async fn test_first_open_has_empty_cache() {
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
@@ -2941,7 +3665,11 @@ serde = "1.0"
             assert!(diff.added.is_empty());
             assert!(diff.removed.is_empty());
             assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
-            assert!(!diff.needs_fetch(), "registry fetch is name-set gated only");
+            assert!(
+                diff.needs_fetch(),
+                "a version-only edit must still trigger the registry fetch, \
+                 so the yanked probe re-runs against the new version"
+            );
             assert!(
                 diff.needs_osv_rescan(),
                 "a version-only edit must still trigger an OSV rescan"
@@ -3371,6 +4099,49 @@ tokio = "1.0"
         }
 
         #[test]
+        fn build_scan_targets_step2_strips_pin_marker_for_operator_prefixed_requirements() {
+            // impl-critic M2: the `concrete_pin_version` fix (originally
+            // scoped to the PyPI `==` case) also strips Cargo's `=` and
+            // NuGet's `[..]` exact-pin markers, since both callers share the
+            // same helper — a strict improvement over the old verbatim
+            // `"=1.2.3"`/`"[1.0.0]"` OSV scan targets, which would never
+            // have matched a real advisory's affected-version range anyway.
+            let cargo_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("time"),
+                    version_req: Some(VersionReq::new("=1.2.3")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let (targets, skipped) = build_scan_targets(
+                &cargo_result,
+                &HashMap::new(),
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].version, "1.2.3");
+            assert!(skipped.is_empty());
+
+            let nuget_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("Newtonsoft.Json"),
+                    version_req: Some(VersionReq::new("[1.0.0]")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let (targets, skipped) = build_scan_targets(
+                &nuget_result,
+                &HashMap::new(),
+                &MockFormatter,
+                EcosystemId::NuGet,
+            );
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].version, "1.0.0");
+            assert!(skipped.is_empty());
+        }
+
+        #[test]
         fn build_scan_targets_step3_skips_caret_range_with_no_lockfile_entry() {
             let parse_result = MockParseResult {
                 deps: vec![MockDep {
@@ -3495,6 +4266,647 @@ tokio = "1.0"
                 skipped.get("git-dep"),
                 Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
             ));
+        }
+
+        // `collect_in_use_versions` (§4.6) reuses the same `in_use_version`
+        // ladder as `build_scan_targets` above, plus its own step-0 filter —
+        // these tests exercise that reuse directly.
+
+        #[test]
+        fn collect_in_use_versions_prefers_lockfile_resolved_version() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("serde"),
+                    version_req: Some(VersionReq::new("^1.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let mut resolved = HashMap::new();
+            resolved.insert(PackageName::new("serde"), "1.0.195".to_string());
+
+            let in_use = collect_in_use_versions(
+                &parse_result,
+                &resolved,
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
+            assert_eq!(
+                in_use.get(&PackageName::new("serde")),
+                Some(&"1.0.195".to_string())
+            );
+        }
+
+        #[test]
+        fn collect_in_use_versions_concrete_pin_without_lockfile() {
+            // Closes the former R4 gap: an exact pin with no lock file must
+            // still produce an in-use version for the yanked probe.
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("log4j-core"),
+                    version_req: Some(VersionReq::new("2.14.1")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let resolved = HashMap::new();
+
+            let in_use = collect_in_use_versions(
+                &parse_result,
+                &resolved,
+                &MockFormatter,
+                EcosystemId::Maven,
+            );
+            assert_eq!(
+                in_use.get(&PackageName::new("log4j-core")),
+                Some(&"2.14.1".to_string())
+            );
+        }
+
+        #[test]
+        fn concrete_pin_version_strips_pep440_double_equals_comparator() {
+            // Regression guard: PyPI's parser retains the pep440 comparator
+            // in `version_requirement().as_str()` (`"==4.9.0"`, not
+            // `"4.9.0"` — confirmed by deps-pypi's `test_basic_pinned`). The
+            // verbatim string was silently unusable against real registry
+            // version strings in the yanked probe; `concrete_pin_version`
+            // must strip it.
+            assert_eq!(
+                concrete_pin_version("==4.9.0", EcosystemId::Pypi),
+                Some("4.9.0")
+            );
+        }
+
+        #[test]
+        fn concrete_pin_version_strips_single_equals_and_bracket_pins() {
+            assert_eq!(
+                concrete_pin_version("=1.2.3", EcosystemId::Cargo),
+                Some("1.2.3")
+            );
+            assert_eq!(
+                concrete_pin_version("[1.0.0]", EcosystemId::NuGet),
+                Some("1.0.0")
+            );
+        }
+
+        #[test]
+        fn concrete_pin_version_bare_version_returned_verbatim() {
+            // No operator to strip: Maven/Go/Bundler/Dart/Gradle/NuGet treat
+            // a bare version as already exact.
+            assert_eq!(
+                concrete_pin_version("2.14.1", EcosystemId::Maven),
+                Some("2.14.1")
+            );
+        }
+
+        #[test]
+        fn concrete_pin_version_rejects_ranges_and_partials() {
+            assert_eq!(concrete_pin_version("^1.0", EcosystemId::Cargo), None);
+            assert_eq!(concrete_pin_version("1.2.3", EcosystemId::Cargo), None);
+            assert_eq!(concrete_pin_version(">=1.0,<2.0", EcosystemId::Pypi), None);
+        }
+
+        #[test]
+        fn collect_in_use_versions_strips_pep440_double_equals_pin_for_pypi() {
+            // The scenario the plan's R4 closure claim actually targets:
+            // a PyPI `requirements.txt`-style `==` exact pin with no lock
+            // file. `in_use.get(..)` must be the bare `"4.9.0"` so it can
+            // ever match a real registry version string during the probe.
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("typing_extensions"),
+                    version_req: Some(VersionReq::new("==4.9.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let resolved = HashMap::new();
+
+            let in_use = collect_in_use_versions(
+                &parse_result,
+                &resolved,
+                &MockFormatter,
+                EcosystemId::Pypi,
+            );
+            assert_eq!(
+                in_use.get(&PackageName::new("typing_extensions")),
+                Some(&"4.9.0".to_string()),
+                "pep440 '==' comparator must be stripped, not carried into the in-use version"
+            );
+        }
+
+        #[test]
+        fn collect_in_use_versions_skips_non_concrete_requirement_with_no_lockfile() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("serde"),
+                    version_req: Some(VersionReq::new("^1.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let resolved = HashMap::new();
+
+            let in_use = collect_in_use_versions(
+                &parse_result,
+                &resolved,
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
+            assert!(in_use.is_empty());
+        }
+
+        #[test]
+        fn collect_in_use_versions_excludes_non_registry_source_even_with_lockfile_version() {
+            // Step 0 (§4.5): a patched git/path fork must never be flagged
+            // for a registry version it does not contain.
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("time"),
+                    version_req: Some(VersionReq::new("0.1.43")),
+                    source: DependencySource::Git {
+                        url: "https://github.com/example/time".to_string(),
+                        rev: None,
+                    },
+                }],
+            };
+            let mut resolved = HashMap::new();
+            resolved.insert(PackageName::new("time"), "0.1.43".to_string());
+
+            let in_use = collect_in_use_versions(
+                &parse_result,
+                &resolved,
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
+            assert!(in_use.is_empty());
+        }
+    }
+
+    mod yanked_check_tests {
+        use super::*;
+        use deps_core::{Metadata, Version};
+        use std::any::Any;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Clone)]
+        struct MockYankVersion {
+            version: String,
+            yanked: bool,
+        }
+
+        impl Version for MockYankVersion {
+            fn version_string(&self) -> &str {
+                &self.version
+            }
+            fn is_yanked(&self) -> bool {
+                self.yanked
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// Per-package outcome for the primary (and, under #206, only)
+        /// `get_versions` fetch.
+        enum FetchOutcome {
+            Versions(Vec<(&'static str, bool)>),
+            Error,
+            Timeout,
+        }
+
+        /// Configurable mock registry for exercising the yanked-check wiring
+        /// in `fetch_latest_versions_parallel`. Under #206's single-fetch
+        /// design, `get_versions` is both the source of "latest" (via
+        /// `select_latest_matching`, mirrored here by picking the first
+        /// non-yanked entry) and, in the same in-memory list, the source of
+        /// the yanked check — there is no second registry call to mock.
+        /// `latest_fallback` only feeds the `get_latest_matching` fallback
+        /// path, exercised when `select_latest_matching` finds nothing (all
+        /// yanked, or an empty list).
+        struct MockRegistry {
+            reports_yanked: bool,
+            versions: HashMap<&'static str, FetchOutcome>,
+            latest_fallback: HashMap<&'static str, (&'static str, bool)>,
+            fetch_calls: Arc<AtomicUsize>,
+        }
+
+        impl Registry for MockRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                self.fetch_calls.fetch_add(1, Ordering::Relaxed);
+                let outcome = self.versions.get(name.as_str());
+                Box::pin(async move {
+                    match outcome {
+                        Some(FetchOutcome::Versions(vs)) => Ok(vs
+                            .iter()
+                            .map(|(v, y)| {
+                                Box::new(MockYankVersion {
+                                    version: (*v).to_string(),
+                                    yanked: *y,
+                                }) as Box<dyn Version>
+                            })
+                            .collect()),
+                        Some(FetchOutcome::Error) => Err(deps_core::error::DepsError::CacheError(
+                            "mock fetch error".to_string(),
+                        )),
+                        Some(FetchOutcome::Timeout) => {
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            Ok(vec![])
+                        }
+                        None => Ok(vec![]),
+                    }
+                })
+            }
+
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &VersionReq,
+            ) -> Option<usize> {
+                versions.iter().position(|v| !v.is_yanked())
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                name: &'a PackageName,
+                _req: &'a VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                let outcome = self.latest_fallback.get(name.as_str()).copied();
+                Box::pin(async move {
+                    Ok(outcome.map(|(v, y)| {
+                        Box::new(MockYankVersion {
+                            version: v.to_string(),
+                            yanked: y,
+                        }) as Box<dyn Version>
+                    }))
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+
+            fn reports_yanked(&self) -> bool {
+                self.reports_yanked
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        #[tokio::test]
+        async fn reports_yanked_false_never_recorded() {
+            // The fetched list carries a yanked in-use entry, but
+            // `reports_yanked() == false` means `is_yanked()` must never be
+            // trusted, even though the data is already in hand for free.
+            let fetch_calls = Arc::new(AtomicUsize::new(0));
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: false,
+                versions: HashMap::from([(
+                    "pkg",
+                    FetchOutcome::Versions(vec![("2.0.0", false), ("1.0.0", true)]),
+                )]),
+                latest_fallback: HashMap::new(),
+                fetch_calls: Arc::clone(&fetch_calls),
+            });
+            let mut in_use = HashMap::new();
+            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &in_use,
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert_eq!(fetch_calls.load(Ordering::Relaxed), 1);
+            assert!(result.yanked_versions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn in_use_equal_to_latest_not_yanked() {
+            let fetch_calls = Arc::new(AtomicUsize::new(0));
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([("pkg", FetchOutcome::Versions(vec![("1.0.0", false)]))]),
+                latest_fallback: HashMap::new(),
+                fetch_calls: Arc::clone(&fetch_calls),
+            });
+            let mut in_use = HashMap::new();
+            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &in_use,
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert_eq!(fetch_calls.load(Ordering::Relaxed), 1);
+            assert!(result.yanked_versions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn no_known_in_use_version_skips_the_check() {
+            let fetch_calls = Arc::new(AtomicUsize::new(0));
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([("pkg", FetchOutcome::Versions(vec![("2.0.0", false)]))]),
+                latest_fallback: HashMap::new(),
+                fetch_calls: Arc::clone(&fetch_calls),
+            });
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &HashMap::new(),
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert_eq!(fetch_calls.load(Ordering::Relaxed), 1);
+            assert!(result.yanked_versions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn in_use_differs_and_yanked_is_recorded() {
+            // No second registry call under #206: the in-use check is a
+            // search over the same `versions` list already fetched for
+            // "latest" — `fetch_calls` stays at 1.
+            let fetch_calls = Arc::new(AtomicUsize::new(0));
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([(
+                    "pkg",
+                    FetchOutcome::Versions(vec![("2.0.0", false), ("1.0.0", true)]),
+                )]),
+                latest_fallback: HashMap::new(),
+                fetch_calls: Arc::clone(&fetch_calls),
+            });
+            let mut in_use = HashMap::new();
+            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &in_use,
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert_eq!(fetch_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                result.yanked_versions.get(&PackageName::new("pkg")),
+                Some(&"1.0.0".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn in_use_differs_and_not_yanked_is_not_recorded() {
+            let fetch_calls = Arc::new(AtomicUsize::new(0));
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([(
+                    "pkg",
+                    FetchOutcome::Versions(vec![("2.0.0", false), ("1.0.0", false)]),
+                )]),
+                latest_fallback: HashMap::new(),
+                fetch_calls: Arc::clone(&fetch_calls),
+            });
+            let mut in_use = HashMap::new();
+            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &in_use,
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert_eq!(fetch_calls.load(Ordering::Relaxed), 1);
+            assert!(result.yanked_versions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn every_version_yanked_still_checks_in_use() {
+            // Critique M2: every version filtered out by the wildcard
+            // requirement (here, all yanked) is the most severe case, not a
+            // silent skip. `select_latest_matching` finds nothing, the
+            // `get_latest_matching` fallback also finds nothing (no entry in
+            // `latest_fallback`), so `result.versions` stays empty — but the
+            // yanked check still runs against the originally fetched list.
+            let fetch_calls = Arc::new(AtomicUsize::new(0));
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([("pkg", FetchOutcome::Versions(vec![("1.0.0", true)]))]),
+                latest_fallback: HashMap::new(),
+                fetch_calls: Arc::clone(&fetch_calls),
+            });
+            let mut in_use = HashMap::new();
+            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &in_use,
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert_eq!(
+                result.yanked_versions.get(&PackageName::new("pkg")),
+                Some(&"1.0.0".to_string())
+            );
+            assert!(result.versions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn latest_pick_needs_fallback_in_use_yanked_still_found() {
+            // When the list-based pick fails (all yanked) and the
+            // `get_latest_matching` fallback succeeds with a *different*,
+            // non-yanked version, `result.versions` is populated from the
+            // fallback — but the in-use yanked check still searches the
+            // originally fetched list, not the fallback's single version.
+            let fetch_calls = Arc::new(AtomicUsize::new(0));
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([("pkg", FetchOutcome::Versions(vec![("1.0.0", true)]))]),
+                latest_fallback: HashMap::from([("pkg", ("2.0.0", false))]),
+                fetch_calls: Arc::clone(&fetch_calls),
+            });
+            let mut in_use = HashMap::new();
+            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &in_use,
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert_eq!(fetch_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                result
+                    .versions
+                    .get(&PackageName::new("pkg"))
+                    .map(|v| v.latest.as_str()),
+                Some("2.0.0")
+            );
+            assert_eq!(
+                result.yanked_versions.get(&PackageName::new("pkg")),
+                Some(&"1.0.0".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn latest_is_yanked_recorded_as_defense_in_depth() {
+            // §4.7 row 1: a contract-violating registry (its wildcard
+            // `get_latest_matching` fallback returns a yanked version) still
+            // gets recorded, at zero extra cost. `select_latest_matching`
+            // filters yanked entries by construction, so the list-based pick
+            // finds nothing here and the fallback is what "lies".
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([("pkg", FetchOutcome::Versions(vec![("1.0.0", true)]))]),
+                latest_fallback: HashMap::from([("pkg", ("1.0.0", true))]),
+                fetch_calls: Arc::new(AtomicUsize::new(0)),
+            });
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &HashMap::new(),
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert_eq!(
+                result.yanked_versions.get(&PackageName::new("pkg")),
+                Some(&"1.0.0".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn latest_is_yanked_not_recorded_when_reports_yanked_false() {
+            // impl-critic M1: row 1 must respect the same `reports_yanked()`
+            // gate as the in-memory in-use check. Harmless today only
+            // because every opt-out registry also hardcodes `is_yanked` to
+            // `false` — this guards against a follow-up (§8.2/§8.3) making
+            // an opt-out registry's `is_yanked()` real without also
+            // flipping `reports_yanked()`, which would otherwise silently
+            // reintroduce a #233-class bug through this exact row.
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: false,
+                versions: HashMap::from([("pkg", FetchOutcome::Versions(vec![("1.0.0", true)]))]),
+                latest_fallback: HashMap::from([("pkg", ("1.0.0", true))]),
+                fetch_calls: Arc::new(AtomicUsize::new(0)),
+            });
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &HashMap::new(),
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert!(
+                result.yanked_versions.is_empty(),
+                "a `reports_yanked() == false` registry's `is_yanked()` must never be trusted, \
+                 even on the zero-cost row-1 path"
+            );
+        }
+
+        #[tokio::test]
+        async fn primary_fetch_error_counts_as_failed_no_yanked_data() {
+            // Under #206's single-fetch design there is no separate "probe"
+            // that can fail independently of the primary fetch — a
+            // `get_versions` failure loses both the "latest" and the yanked
+            // data together, and is counted as a real fetch failure (unlike
+            // the pre-#206 best-effort probe).
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([("pkg", FetchOutcome::Error)]),
+                latest_fallback: HashMap::new(),
+                fetch_calls: Arc::new(AtomicUsize::new(0)),
+            });
+            let mut in_use = HashMap::new();
+            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &in_use,
+                None,
+                5,
+                10,
+            )
+            .await;
+
+            assert!(result.yanked_versions.is_empty());
+            assert_eq!(result.failed_count, 1);
+            assert!(result.versions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn primary_fetch_timeout_counts_as_failed_no_yanked_data() {
+            // Same reasoning as the error case above, for the timeout path.
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([("pkg", FetchOutcome::Timeout)]),
+                latest_fallback: HashMap::new(),
+                fetch_calls: Arc::new(AtomicUsize::new(0)),
+            });
+            let mut in_use = HashMap::new();
+            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+
+            // 1 second timeout for test speed.
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &in_use,
+                None,
+                1,
+                10,
+            )
+            .await;
+
+            assert!(result.yanked_versions.is_empty());
+            assert_eq!(result.failed_count, 1);
+            assert!(result.versions.is_empty());
         }
     }
 }

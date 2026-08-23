@@ -150,6 +150,24 @@ pub trait Registry: Send + Sync {
         None
     }
 
+    /// Whether [`get_versions`](Self::get_versions) results carry meaningful
+    /// per-version yank/deprecation data via [`Version::is_yanked`].
+    ///
+    /// Default `true`: a registry is opted into the yanked-version diagnostic
+    /// unless it explicitly says it cannot answer. This fails toward
+    /// correctness — a registry whose `is_yanked` later becomes real data
+    /// starts participating automatically, by deleting its opt-out rather
+    /// than by someone remembering to add an opt-in. Return `false` only
+    /// when `is_yanked()` is hardcoded (e.g. always `false`) or otherwise
+    /// cannot reflect real registry data; a `true` return authorizes callers
+    /// to trust `is_yanked()` on versions from this registry's normal
+    /// [`get_versions`](Self::get_versions)/
+    /// [`get_latest_matching`](Self::get_latest_matching) results — it does
+    /// not trigger any additional network request.
+    fn reports_yanked(&self) -> bool {
+        true
+    }
+
     /// Downcast to concrete registry type for ecosystem-specific operations
     fn as_any(&self) -> &dyn Any;
 }

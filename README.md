@@ -231,7 +231,7 @@ Configure via LSP initialization options:
 ```
 
 > [!NOTE]
-> `diagnostics.outdated_severity`, `diagnostics.unknown_severity`, and `diagnostics.unsatisfiable_severity` are honored end-to-end. `diagnostics.yanked_severity` is parsed and validated but not yet honored on the live diagnostics path — no yanked-version diagnostic is emitted yet regardless of this setting ([#233](https://github.com/bug-ops/deps-lsp/issues/233)).
+> `diagnostics.outdated_severity`, `diagnostics.unknown_severity`, `diagnostics.unsatisfiable_severity`, and `diagnostics.yanked_severity` are all honored end-to-end. `yanked_severity` flags a dependency pinned to a version the registry reports as yanked/deprecated/retracted — covering the lock-file-resolved version, or an exact pin (e.g. `requirements.txt`'s `==1.2.3`) when no lock file exists. Supported for **Cargo, npm, PyPI, Bundler, and Dart**; Go, Maven, Gradle, Swift, NuGet, and Composer report no reliable per-version yank data and are not covered (see `ECOSYSTEM_GUIDE.md` for details).
 
 ### Configuration reference
 
