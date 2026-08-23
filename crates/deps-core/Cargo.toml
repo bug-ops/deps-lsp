@@ -37,7 +37,7 @@ yaml-rust2 = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 tokio-test = { workspace = true }
 
 [[bench]]
