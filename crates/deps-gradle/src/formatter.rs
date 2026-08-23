@@ -14,8 +14,9 @@ impl EcosystemFormatter for GradleFormatter {
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
-        // Unresolved Gradle variable reference (`$var` or `${var}`) — skip comparison
-        if requirement.contains('$') {
+        // Unresolved Gradle variable reference (`$var`/`${var}`), or an empty version-catalog
+        // entry (`[versions] foo = ""`) — skip comparison
+        if self.requirement_is_unresolved(requirement) {
             return true;
         }
         if requirement == "latest" || requirement.starts_with("latest.") {
@@ -32,11 +33,18 @@ impl EcosystemFormatter for GradleFormatter {
         }
         version == requirement
     }
+
+    fn requirement_is_unresolved(&self, requirement: &str) -> bool {
+        // Unresolved Gradle variable reference (`$var`, `${var}`), or an explicit empty
+        // version-catalog entry (`[versions] foo = ""`) that a `version.ref` could point at.
+        requirement.is_empty() || requirement.contains('$')
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::RequirementStatus;
 
     #[test]
     fn test_format_version() {
@@ -130,6 +138,53 @@ mod tests {
         assert_eq!(
             f.normalize_package_name("com.google.guava:guava"),
             "com.google.guava:guava"
+        );
+    }
+
+    #[test]
+    fn test_requirement_status_unresolved_bare_variable() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.requirement_status("$someVersion", "3.14.0"),
+            RequirementStatus::Unresolved
+        );
+    }
+
+    #[test]
+    fn test_requirement_status_unresolved_braced_variable() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.requirement_status("${someVersion}", "3.14.0"),
+            RequirementStatus::Unresolved
+        );
+    }
+
+    #[test]
+    fn test_requirement_status_unresolved_dangling_catalog_ref() {
+        // Synthetic `$alias` produced by `catalog::extract_version` for a `version.ref`
+        // missing from `[versions]` — must be treated the same as an unresolved variable.
+        let f = GradleFormatter;
+        assert_eq!(
+            f.requirement_status("$missing", "3.14.0"),
+            RequirementStatus::Unresolved
+        );
+    }
+
+    #[test]
+    fn test_requirement_status_up_to_date() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.requirement_status("3.2.0", "3.2.0"),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn test_requirement_status_outdated() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.requirement_status("3.1.0", "3.2.0"),
+            RequirementStatus::Outdated
         );
     }
 }
