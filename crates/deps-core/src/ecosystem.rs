@@ -485,6 +485,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         versions: VersionData<'a>,
         _uri: &'a Uri,
         freshness: crate::freshness::FreshnessSettings,
+        severities: crate::lsp_helpers::DiagnosticSeverities,
     ) -> BoxFuture<'a, Vec<Diagnostic>> {
         Box::pin(async move {
             crate::lsp_helpers::generate_diagnostics_from_cache(
@@ -492,6 +493,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 versions,
                 self.formatter(),
                 freshness,
+                severities,
             )
         })
     }

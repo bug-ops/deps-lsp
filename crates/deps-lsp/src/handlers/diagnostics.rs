@@ -12,7 +12,7 @@ use tower_lsp_server::ls_types::{Diagnostic, Uri};
 pub async fn handle_diagnostics(
     state: Arc<ServerState>,
     uri: &Uri,
-    _config: &DiagnosticsConfig,
+    config: &DiagnosticsConfig,
     client: Client,
     full_config: Arc<RwLock<DepsConfig>>,
 ) -> Vec<Diagnostic> {
@@ -24,8 +24,9 @@ pub async fn handle_diagnostics(
 
     // Snapshot before generating diagnostics (Copy value, no lock held across the call)
     let freshness = { full_config.read().await.freshness.to_settings() };
+    let severities = config.to_severities();
 
-    generate_diagnostics_internal(state, uri, freshness).await
+    generate_diagnostics_internal(state, uri, freshness, severities).await
 }
 
 /// Internal diagnostic generation without cold start support.
@@ -35,6 +36,7 @@ pub(crate) async fn generate_diagnostics_internal(
     state: Arc<ServerState>,
     uri: &Uri,
     freshness: deps_core::FreshnessSettings,
+    severities: deps_core::DiagnosticSeverities,
 ) -> Vec<Diagnostic> {
     // Single document lookup: extract all needed data at once
     let doc = match state.get_document(uri) {
@@ -75,6 +77,7 @@ pub(crate) async fn generate_diagnostics_internal(
                 .with_vulnerabilities(&doc.vulnerabilities),
             uri,
             freshness,
+            severities,
         )
         .await
 }
@@ -98,6 +101,138 @@ mod tests {
         let (client, full_config) = create_test_client_and_config();
         let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
         assert!(result.is_empty());
+    }
+
+    // Severity wiring tests (issue #224): confirm `DiagnosticsConfig`'s
+    // outdated/unknown severity fields actually reach the emitted diagnostics,
+    // and that default config preserves the pre-existing hardcoded severities.
+    #[cfg(feature = "cargo")]
+    mod severity_wiring_tests {
+        use super::*;
+        use crate::document::DocumentState;
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
+
+        #[tokio::test]
+        async fn test_unknown_package_uses_configured_severity() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let config = DiagnosticsConfig {
+                unknown_severity: DiagnosticSeverity::ERROR,
+                ..DiagnosticsConfig::default()
+            };
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = r#"[dependencies]
+serde = "1.0.0"
+"#
+            .to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].severity, Some(DiagnosticSeverity::ERROR));
+        }
+
+        #[tokio::test]
+        async fn test_unknown_package_default_severity_unchanged() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = r#"[dependencies]
+serde = "1.0.0"
+"#
+            .to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].severity, Some(DiagnosticSeverity::WARNING));
+        }
+
+        #[tokio::test]
+        async fn test_outdated_dependency_uses_configured_severity() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let config = DiagnosticsConfig {
+                outdated_severity: DiagnosticSeverity::ERROR,
+                ..DiagnosticsConfig::default()
+            };
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = r#"[dependencies]
+serde = "1.0.0"
+"#
+            .to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let mut cached = HashMap::new();
+            cached.insert("serde".into(), "2.0.0".to_string());
+            doc_state.update_cached_versions(cached);
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert!(result[0].message.contains("Newer version available"));
+        }
+
+        #[tokio::test]
+        async fn test_outdated_dependency_default_severity_unchanged() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = r#"[dependencies]
+serde = "1.0.0"
+"#
+            .to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let mut cached = HashMap::new();
+            cached.insert("serde".into(), "2.0.0".to_string());
+            doc_state.update_cached_versions(cached);
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].severity, Some(DiagnosticSeverity::HINT));
+        }
     }
 
     // Cargo-specific tests

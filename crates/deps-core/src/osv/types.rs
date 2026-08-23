@@ -13,13 +13,21 @@ use serde::{Deserialize, Serialize};
 
 /// One dependency to query against OSV.
 ///
-/// Three distinct strings, deliberately: `key` is this project's internal
+/// Four distinct strings, deliberately: `key` is this project's internal
 /// lookup key (`EcosystemFormatter::normalize_package_name`), `osv_name` is
 /// OSV's canonical spelling (`EcosystemFormatter::osv_package_name`). The
 /// transform from `key` to `osv_name` is not round-trippable (Swift
 /// `owner/repo` -> `github.com/owner/repo`; NuGet raw vs Composer lowercased),
 /// so the client cannot reconstruct the map key from what it sends on the
 /// wire — both must be carried alongside each other.
+///
+/// `version` and `display_version` are the same split, one level down: `version`
+/// is what gets sent on the wire (`EcosystemFormatter::osv_version`), while
+/// `display_version` is the ecosystem-native spelling a caller should surface
+/// back to the user (e.g. in [`crate::osv::UpgradeStatus`]). They coincide for
+/// every ecosystem except Go, where `osv_version` strips the mandatory `v`
+/// prefix — a caller that echoed `version` in an upgrade suggestion would show
+/// `1.2.3` instead of the `go.mod`-native `v1.2.3`.
 ///
 /// # Examples
 ///
@@ -30,6 +38,7 @@ use serde::{Deserialize, Serialize};
 ///     key: "time".to_string(),
 ///     osv_name: "time".to_string(),
 ///     version: "0.1.43".to_string(),
+///     display_version: "0.1.43".to_string(),
 /// };
 /// assert_eq!(target.key, target.osv_name);
 /// ```
@@ -39,8 +48,15 @@ pub struct ScanTarget {
     pub key: String,
     /// OSV's canonical package name for this ecosystem — sent on the wire.
     pub osv_name: String,
-    /// Concrete version to query, resolved per the version-selection policy.
+    /// Concrete version to query, resolved per the version-selection policy
+    /// and rewritten to OSV's wire spelling via
+    /// `EcosystemFormatter::osv_version`. Never surface this to the user —
+    /// use [`Self::display_version`] instead.
     pub version: String,
+    /// The same version in the ecosystem's native spelling (pre-`osv_version`
+    /// rewrite), for callers that need to display it back to the user rather
+    /// than send it to OSV.
+    pub display_version: String,
 }
 
 /// Severity bucket derived from an OSV advisory record.

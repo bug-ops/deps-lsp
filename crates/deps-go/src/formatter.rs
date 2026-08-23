@@ -53,6 +53,13 @@ impl EcosystemFormatter for GoFormatter {
             format!("v{version}")
         }
     }
+
+    fn osv_version(&self, version: &str) -> String {
+        // Go module versions always carry a mandatory "v" prefix
+        // (golang.org/x/mod/module convention), but OSV.dev's SEMVER range
+        // matching forbids it — strip it before sending on the wire.
+        version.strip_prefix('v').unwrap_or(version).to_string()
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +196,29 @@ mod tests {
         // Already-prefixed input (should not occur in practice, but must
         // not be double-prefixed) round-trips unchanged.
         assert_eq!(formatter.osv_version_to_native("v0.3.7"), "v0.3.7");
+    }
+
+    #[test]
+    fn test_osv_version_strips_v_prefix() {
+        let formatter = GoFormatter;
+
+        assert_eq!(formatter.osv_version("v1.2.3"), "1.2.3");
+        assert_eq!(
+            formatter.osv_version("v0.0.0-20191109021931-daa7c04131f5"),
+            "0.0.0-20191109021931-daa7c04131f5"
+        );
+        assert_eq!(
+            formatter.osv_version("v2.0.0+incompatible"),
+            "2.0.0+incompatible"
+        );
+    }
+
+    #[test]
+    fn test_osv_version_unprefixed_is_unaffected() {
+        let formatter = GoFormatter;
+
+        // A version without the "v" prefix (should not normally occur for
+        // Go, but the transform must be a no-op rather than corrupt it).
+        assert_eq!(formatter.osv_version("1.2.3"), "1.2.3");
     }
 }
