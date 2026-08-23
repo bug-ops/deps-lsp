@@ -136,6 +136,11 @@ fn extract_version(
         && let Some(ref_val) = get_table_val(version_table, "ref")
         && let Some(ref_key) = ref_val.as_str()
     {
+        // A dangling alias (missing from `[versions]`, or a rich version like
+        // `{ require = "1.0" }` that isn't a plain string) resolves to `None` here — the
+        // generic deps-core diagnostics/inlay-hint/hover paths already treat a `None`
+        // requirement as "not verified" rather than comparing an empty-string fallback
+        // against the latest version.
         let resolved = version_refs.get(ref_key).cloned();
         let range = span_to_range(content, line_table, ref_val.span);
         return (resolved, Some(range));
@@ -307,5 +312,9 @@ hilt-compiler = { group = "com.google.dagger", name = "hilt-compiler", version.r
         let result = parse_version_catalog(content, &make_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert!(result.dependencies[0].version_req.is_none());
+        // The version range must still be populated so hints/diagnostics have somewhere to
+        // anchor a status — deps-core treats a `None` requirement paired with `Some` range as
+        // `RequirementStatus::Unresolved` rather than an always-outdated empty string.
+        assert!(result.dependencies[0].version_range.is_some());
     }
 }

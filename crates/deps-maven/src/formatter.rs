@@ -16,7 +16,7 @@ impl EcosystemFormatter for MavenFormatter {
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
         // Unresolved properties (missing from <properties>) — skip comparison
-        if requirement.contains("${") {
+        if self.requirement_is_unresolved(requirement) {
             return true;
         }
         if crate::range::is_range(requirement) {
@@ -24,11 +24,17 @@ impl EcosystemFormatter for MavenFormatter {
         }
         version == requirement
     }
+
+    fn requirement_is_unresolved(&self, requirement: &str) -> bool {
+        // Unexpanded property (missing from <properties>)
+        requirement.contains("${")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::RequirementStatus;
 
     #[test]
     fn test_format_version() {
@@ -80,6 +86,37 @@ mod tests {
         assert_eq!(
             f.normalize_package_name("org.apache.commons:commons-lang3"),
             "org.apache.commons:commons-lang3"
+        );
+    }
+
+    #[test]
+    fn test_requirement_status_unresolved_property() {
+        let f = MavenFormatter;
+        assert_eq!(
+            f.requirement_status("${woodstoxVersion}", "7.1.1"),
+            RequirementStatus::Unresolved
+        );
+        assert_eq!(
+            f.requirement_status("${project.version}", "1.0.0"),
+            RequirementStatus::Unresolved
+        );
+    }
+
+    #[test]
+    fn test_requirement_status_up_to_date() {
+        let f = MavenFormatter;
+        assert_eq!(
+            f.requirement_status("3.14.0", "3.14.0"),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn test_requirement_status_outdated() {
+        let f = MavenFormatter;
+        assert_eq!(
+            f.requirement_status("3.13.0", "3.14.0"),
+            RequirementStatus::Outdated
         );
     }
 }

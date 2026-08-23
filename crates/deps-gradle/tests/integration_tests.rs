@@ -1,6 +1,10 @@
 //! Integration tests for deps-gradle parsers using fixture files.
 
+use deps_core::lsp_helpers::{generate_diagnostics_from_cache, generate_inlay_hints};
+use deps_core::{EcosystemConfig, LoadingState, VersionData};
+use deps_gradle::GradleFormatter;
 use deps_gradle::parser::{GradleParseResult, parse_gradle};
+use std::collections::HashMap;
 use tower_lsp_server::ls_types::Uri;
 
 fn make_uri(path: &str) -> Uri {
@@ -186,6 +190,68 @@ fn test_groovy_position_tracking() {
             );
         }
     }
+}
+
+// --- #190 regression: dangling `version.ref` alias ---
+
+#[test]
+fn test_dangling_version_ref_emits_no_diagnostic_or_up_to_date_hint() {
+    use deps_core::ParseResult;
+
+    // "missing" has no entry in [versions], so `spring-boot`'s requirement resolves to
+    // `None` (see `catalog::extract_version`) rather than an empty string that would
+    // always compare as outdated; `version_range` stays populated so diagnostics/hints
+    // still have somewhere to anchor a status.
+    let content = r#"[versions]
+guava = "33.0.0-jre"
+
+[libraries]
+spring-boot = { module = "org.springframework.boot:spring-boot-starter", version.ref = "missing" }
+"#;
+    let uri = make_uri("/project/gradle/libs.versions.toml");
+    let parse_result = parse_gradle(content, &uri).unwrap();
+    assert_eq!(parse_result.dependencies().len(), 1);
+    assert_eq!(parse_result.dependencies()[0].version_requirement(), None);
+    assert!(parse_result.dependencies()[0].version_range().is_some());
+
+    let formatter = GradleFormatter;
+
+    let mut cached_versions = HashMap::new();
+    cached_versions.insert(
+        "org.springframework.boot:spring-boot-starter".to_string(),
+        "3.2.0".to_string(),
+    );
+    let resolved_versions = HashMap::new();
+
+    let diagnostics = generate_diagnostics_from_cache(
+        &parse_result,
+        VersionData::new(&cached_versions, &resolved_versions),
+        &formatter,
+    );
+    assert!(
+        diagnostics.is_empty(),
+        "dangling version.ref must not produce a 'Newer version available' diagnostic, got: {diagnostics:?}"
+    );
+
+    let config = EcosystemConfig {
+        show_up_to_date_hints: true,
+        up_to_date_text: "✅".to_string(),
+        needs_update_text: "❌ {}".to_string(),
+        loading_text: "⏳".to_string(),
+        show_loading_hints: true,
+    };
+
+    let hints = generate_inlay_hints(
+        &parse_result,
+        VersionData::new(&cached_versions, &resolved_versions),
+        LoadingState::Loaded,
+        &config,
+        &formatter,
+    );
+    assert!(
+        hints.is_empty(),
+        "dangling version.ref must not produce a misleading 'up to date' inlay hint, got: {hints:?}"
+    );
 }
 
 // --- ParseResult trait ---

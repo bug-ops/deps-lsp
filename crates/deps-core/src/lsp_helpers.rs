@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::{
     TextEdit, Uri, WorkspaceEdit,
 };
 
-use crate::{Dependency, EcosystemConfig, ParseResult, Registry, VersionReq};
+use crate::{Dependency, EcosystemConfig, ParseResult, Registry};
 
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
 /// together everywhere.
@@ -213,6 +213,27 @@ pub fn is_same_major_minor(v1: &str, v2: &str) -> bool {
     }
 }
 
+/// Result of checking whether a dependency's declared requirement is already satisfied by
+/// the latest known version.
+///
+/// Diagnostics and inlay hints read this result differently: diagnostics only need to know
+/// whether it is safe to skip the "Newer version available" warning, so both `UpToDate` and
+/// `Unresolved` suppress it. Inlay hints additionally need to distinguish `Unresolved` from
+/// `UpToDate`, since an unresolved requirement (e.g. a dangling Gradle version-catalog
+/// `version.ref` alias, or an unexpanded Maven `${property}`) must not render an "up to
+/// date" badge that was never actually verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequirementStatus {
+    /// The latest version satisfies the declared requirement.
+    UpToDate,
+    /// The latest version does not satisfy the declared requirement — a newer version is
+    /// available.
+    Outdated,
+    /// The requirement could not be resolved to a concrete constraint, so no comparison
+    /// could be made.
+    Unresolved,
+}
+
 /// Ecosystem-specific formatting and comparison logic.
 pub trait EcosystemFormatter: Send + Sync {
     /// Normalize package name for lookup (default: identity).
@@ -282,6 +303,80 @@ pub trait EcosystemFormatter: Send + Sync {
     /// different questions there.
     fn is_requirement_up_to_date(&self, requirement: &str, latest: &str) -> bool {
         self.version_satisfies_requirement(latest, requirement)
+    }
+
+    /// Whether `requirement` could not be resolved to a concrete version constraint (e.g. an
+    /// unexpanded property/variable placeholder rather than a real version or range).
+    ///
+    /// Default: always resolvable. Ecosystems whose requirement syntax can contain
+    /// unresolved placeholders (Maven's `${property}`, Gradle's `$var`/`${var}`) override
+    /// this single predicate; both `version_satisfies_requirement`'s "treat as satisfied"
+    /// short-circuit and `requirement_status`'s `Unresolved` variant are derived from it, so
+    /// the two can't drift out of sync with each other.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &str) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert!(!DefaultFormatter.requirement_is_unresolved("^1.2"));
+    /// ```
+    fn requirement_is_unresolved(&self, _requirement: &str) -> bool {
+        false
+    }
+
+    /// Tri-state variant of `is_requirement_up_to_date` that distinguishes "confirmed up to
+    /// date" from "could not be resolved, so we don't know."
+    ///
+    /// Default: `Unresolved` when `requirement_is_unresolved` says so, otherwise maps the
+    /// boolean result of `is_requirement_up_to_date` to `UpToDate`/`Outdated`. Callers
+    /// needing the distinction — inlay hints, in particular — use this instead of
+    /// `is_requirement_up_to_date` so they can tell "verified up to date" apart from
+    /// "resolution failed."
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{EcosystemFormatter, RequirementStatus};
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &str) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(
+    ///     DefaultFormatter.requirement_status("^1.2", "1.5.0"),
+    ///     RequirementStatus::UpToDate
+    /// );
+    /// assert_eq!(
+    ///     DefaultFormatter.requirement_status("^1.2", "2.0.0"),
+    ///     RequirementStatus::Outdated
+    /// );
+    /// ```
+    fn requirement_status(&self, requirement: &str, latest: &str) -> RequirementStatus {
+        if self.requirement_is_unresolved(requirement) {
+            return RequirementStatus::Unresolved;
+        }
+        if self.is_requirement_up_to_date(requirement, latest) {
+            RequirementStatus::UpToDate
+        } else {
+            RequirementStatus::Outdated
+        }
     }
 
     /// Get package URL for hover markdown.
@@ -372,26 +467,38 @@ pub fn generate_inlay_hints(
 
         // Two-tier check for up-to-date status:
         // 1. If lock file has the dep, check if resolved == latest
-        // 2. If NOT in lock file, check if version requirement is satisfied by latest
-        let is_up_to_date = if let Some(resolved) = resolved_version {
-            resolved.as_str() == latest.as_str()
-        } else {
-            let version_req = dep.version_requirement().map_or("", VersionReq::as_str);
-            formatter.is_requirement_up_to_date(version_req, latest)
-        };
-
-        let label_text = if is_up_to_date {
-            if config.show_up_to_date_hints {
-                if let Some(resolved) = resolved_version {
-                    format!("{} {}", config.up_to_date_text, resolved)
-                } else {
-                    config.up_to_date_text.clone()
-                }
+        // 2. If NOT in lock file, check the version requirement against latest
+        let status = if let Some(resolved) = resolved_version {
+            if resolved.as_str() == latest.as_str() {
+                RequirementStatus::UpToDate
             } else {
-                continue;
+                RequirementStatus::Outdated
             }
         } else {
-            config.needs_update_text.replace("{}", latest)
+            match dep.version_requirement() {
+                Some(version_req) => formatter.requirement_status(version_req.as_str(), latest),
+                // No declared requirement at all (e.g. a dangling alias/reference the
+                // parser couldn't resolve to any string) — nothing was verified.
+                None => RequirementStatus::Unresolved,
+            }
+        };
+
+        let label_text = match status {
+            RequirementStatus::UpToDate => {
+                if config.show_up_to_date_hints {
+                    if let Some(resolved) = resolved_version {
+                        format!("{} {}", config.up_to_date_text, resolved)
+                    } else {
+                        config.up_to_date_text.clone()
+                    }
+                } else {
+                    continue;
+                }
+            }
+            RequirementStatus::Outdated => config.needs_update_text.replace("{}", latest),
+            // Resolution failed (e.g. dangling alias/unexpanded variable) — neither
+            // "up to date" nor "outdated" was actually verified, so show nothing.
+            RequirementStatus::Unresolved => continue,
         };
 
         hints.push(InlayHint {
@@ -615,10 +722,14 @@ pub fn generate_diagnostics_from_cache(
             continue;
         };
 
-        let version_req = dep.version_requirement().map_or("", VersionReq::as_str);
-        let is_up_to_date = formatter.is_requirement_up_to_date(version_req, latest);
+        let status = match dep.version_requirement() {
+            Some(version_req) => formatter.requirement_status(version_req.as_str(), latest),
+            // No declared requirement at all (e.g. a dangling alias/reference the parser
+            // couldn't resolve to any string) — nothing was verified.
+            None => RequirementStatus::Unresolved,
+        };
 
-        if !is_up_to_date {
+        if status == RequirementStatus::Outdated {
             diagnostics.push(Diagnostic {
                 range: version_range,
                 severity: Some(DiagnosticSeverity::HINT),
@@ -688,8 +799,8 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
 
             let latest = crate::registry::find_latest_stable(&versions);
             if let Some(latest) = latest
-                && !formatter
-                    .is_requirement_up_to_date(version_req.as_str(), latest.version_string())
+                && formatter.requirement_status(version_req.as_str(), latest.version_string())
+                    == RequirementStatus::Outdated
             {
                 diagnostics.push(Diagnostic {
                     range: version_range,
@@ -708,7 +819,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PackageName;
+    use crate::{PackageName, VersionReq};
     use std::any::Any;
 
     #[test]
@@ -910,6 +1021,24 @@ mod tests {
 
         fn package_url(&self, name: &str) -> String {
             format!("https://example.com/{}", name)
+        }
+    }
+
+    /// Formatter stub that always reports `Unresolved`, mirroring `MavenFormatter` /
+    /// `GradleFormatter`'s override for `${property}` / `$var` requirements.
+    struct MockUnresolvedFormatter;
+
+    impl EcosystemFormatter for MockUnresolvedFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            version.to_string()
+        }
+
+        fn package_url(&self, name: &str) -> String {
+            format!("https://example.com/{}", name)
+        }
+
+        fn requirement_status(&self, _requirement: &str, _latest: &str) -> RequirementStatus {
+            RequirementStatus::Unresolved
         }
     }
 
@@ -1858,5 +1987,84 @@ mod tests {
             }
             _ => panic!("Expected string label"),
         }
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_unresolved_emits_no_diagnostic() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockUnresolvedFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "spring-boot-starter".into(),
+                version_req: "$missing".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/libs.versions.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("spring-boot-starter".to_string(), "3.2.0".to_string());
+
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+        );
+
+        assert!(
+            diagnostics.is_empty(),
+            "Expected no diagnostics for an unresolved requirement, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_inlay_hint_unresolved_requirement_emits_no_hint() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "spring-boot-starter".into(),
+                version_req: "$missing".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/libs.versions.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("spring-boot-starter".to_string(), "3.2.0".to_string());
+
+        // Not in lock file, so status is derived from `requirement_status` on the
+        // formatter (which the caller sets to `Unresolved`) rather than a resolved-vs-latest
+        // comparison.
+        let resolved_versions = HashMap::new();
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &MockUnresolvedFormatter,
+        );
+
+        assert!(
+            hints.is_empty(),
+            "Expected no inlay hint at all for an unresolved requirement (not even 'up to date'), got: {hints:?}"
+        );
     }
 }
