@@ -19,6 +19,9 @@ impl EcosystemFormatter for MavenFormatter {
         if requirement.contains("${") {
             return true;
         }
+        if crate::range::is_range(requirement) {
+            return crate::range::satisfies(version, requirement);
+        }
         version == requirement
     }
 }
@@ -52,6 +55,15 @@ mod tests {
         assert!(f.version_satisfies_requirement("3.14.0", "3.14.0"));
         assert!(!f.version_satisfies_requirement("3.14.0", "3.13.0"));
         assert!(!f.version_satisfies_requirement("3.14.0", "3.14.1"));
+    }
+
+    #[test]
+    fn test_version_satisfies_range() {
+        let f = MavenFormatter;
+        assert!(f.version_satisfies_requirement("1.5.0", "[1.0,2.0)"));
+        assert!(!f.version_satisfies_requirement("2.0.0", "[1.0,2.0)"));
+        assert!(f.version_satisfies_requirement("1.0.0", "[1.0.0]"));
+        assert!(!f.version_satisfies_requirement("1.0.1", "[1.0.0]"));
     }
 
     #[test]
