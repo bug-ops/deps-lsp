@@ -4,14 +4,25 @@ use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
 use deps_core::{PackageName, VersionReq};
 
 /// NuGet interval/floating-pattern matcher, compiled once per dependency by
-/// [`NuGetFormatter::compile_requirement`]. Always decidable (`Some`) — `satisfies` and
-/// `resolve_float` have no separate "candidate failed to parse" signal, only "range/pattern
-/// failed to parse" (already ruled out by `compile_requirement` before this is constructed).
-struct NuGetMatcher(String);
+/// [`NuGetFormatter::compile_requirement`] — the range or floating pattern is parsed once
+/// here rather than being re-parsed for every candidate version scanned. Always decidable
+/// (`Some`) — matching a candidate against an already-parsed range/pattern has no separate
+/// "candidate failed to parse" signal, only "range/pattern failed to parse" (already ruled
+/// out by `compile_requirement` before this is constructed).
+enum NuGetMatcher {
+    Range(crate::version::VersionRange),
+    Float(crate::version::FloatPattern),
+}
 
 impl RequirementMatcher for NuGetMatcher {
     fn matches(&self, version: &str) -> Option<bool> {
-        Some(NuGetFormatter.version_satisfies_requirement(version, &self.0))
+        Some(match self {
+            Self::Range(range) => crate::version::range_contains(version, range),
+            Self::Float(pattern) => {
+                let parsed = crate::version::ParsedVersion::parse(version);
+                crate::version::float_matches(version, &parsed, pattern)
+            }
+        })
     }
 }
 
@@ -74,16 +85,18 @@ impl EcosystemFormatter for NuGetFormatter {
     }
 
     /// Compiles `requirement` into a `NuGetMatcher` only if it is a syntactically
-    /// well-formed range or floating pattern (`is_valid_requirement`) — without this guard,
-    /// a malformed requirement string would make `satisfies`/`resolve_float` return `false`
-    /// for every candidate, producing a false "unsatisfiable" verdict instead of correctly
-    /// suppressing the check.
+    /// well-formed range or floating pattern — without this guard, a malformed requirement
+    /// string would make every candidate decide `Some(false)`, producing a false
+    /// "unsatisfiable" verdict instead of correctly suppressing the check.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         let requirement = requirement.as_str();
-        if !crate::version::is_valid_requirement(requirement) {
-            return None;
+        if requirement.contains('*') {
+            crate::version::parse_float(requirement)
+                .map(|float| Box::new(NuGetMatcher::Float(float)) as Box<dyn RequirementMatcher>)
+        } else {
+            crate::version::parse_range(requirement)
+                .map(|range| Box::new(NuGetMatcher::Range(range)) as Box<dyn RequirementMatcher>)
         }
-        Some(Box::new(NuGetMatcher(requirement.to_string())))
     }
 }
 

@@ -231,7 +231,7 @@ Configure via LSP initialization options:
 ```
 
 > [!NOTE]
-> `diagnostics.outdated_severity`, `diagnostics.unknown_severity`, `diagnostics.unsatisfiable_severity`, and `diagnostics.yanked_severity` are all honored end-to-end. `yanked_severity` flags a dependency pinned to a version the registry reports as yanked/deprecated/retracted — covering the lock-file-resolved version, or an exact pin (e.g. `requirements.txt`'s `==1.2.3`) when no lock file exists. Supported for **Cargo, npm, PyPI, Bundler, and Dart**; Go, Maven, Gradle, Swift, NuGet, and Composer report no reliable per-version yank data and are not covered (see `ECOSYSTEM_GUIDE.md` for details).
+> `diagnostics.outdated_severity`, `diagnostics.unknown_severity`, `diagnostics.unsatisfiable_severity`, and `diagnostics.yanked_severity` are all honored end-to-end. The yanked diagnostic fires in two independent cases (never both at once for the same dependency): (1) the dependency's in-use version — lock-file-resolved, or an exact pin such as `requirements.txt`'s `==1.2.3` — is itself reported as yanked/deprecated/retracted, supported for **Cargo, npm, PyPI, Bundler, and Dart**; or (2) the dependency's declared version *requirement* (a range) is currently satisfiable only by yanked versions, even with no lock file at all. See [Yanked Version Diagnostic](docs/ECOSYSTEM_GUIDE.md#yanked-version-diagnostic) for exact semantics and per-ecosystem coverage of each case (RubyGems cannot be detected by either mechanism, since its registry omits yanked versions from the list entirely rather than flagging them).
 
 ### Configuration reference
 

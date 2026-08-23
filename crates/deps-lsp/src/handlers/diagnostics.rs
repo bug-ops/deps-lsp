@@ -202,6 +202,7 @@ serde = "1.0.0"
                 deps_core::PackageVersions {
                     latest: "2.0.0".to_string(),
                     available: std::sync::Arc::from(vec!["2.0.0".to_string(), "1.0.0".to_string()]),
+                    yanked: std::sync::Arc::from(Vec::new()),
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -241,6 +242,7 @@ serde = "1.0.0"
                 deps_core::PackageVersions {
                     latest: "2.0.0".to_string(),
                     available: std::sync::Arc::from(vec!["2.0.0".to_string(), "1.0.0".to_string()]),
+                    yanked: std::sync::Arc::from(Vec::new()),
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -280,6 +282,7 @@ serde = "1.0.0"
                         "1.0.214".to_string(),
                         "1.0.213".to_string(),
                     ]),
+                    yanked: std::sync::Arc::from(Vec::new()),
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -369,6 +372,7 @@ serde = "1.0.0"
                         "1.0.214".to_string(),
                         "1.0.213".to_string(),
                     ]),
+                    yanked: std::sync::Arc::from(Vec::new()),
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -451,6 +455,7 @@ serde = "1.0.0"
                 deps_core::PackageVersions {
                     latest: "1.0.214".to_string(),
                     available: std::sync::Arc::from(vec!["1.0.214".to_string()]),
+                    yanked: std::sync::Arc::from(Vec::new()),
                 },
             );
             cached.insert(
@@ -462,6 +467,7 @@ serde = "1.0.0"
                     // available list containing only `latest` would make every requirement
                     // that latest doesn't itself satisfy look unsatisfiable.
                     available: std::sync::Arc::from(vec!["2.0.0".to_string(), "1.5.0".to_string()]),
+                    yanked: std::sync::Arc::from(Vec::new()),
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -480,6 +486,56 @@ serde = "1.0.0"
                 result
                     .iter()
                     .any(|d| d.message.contains("Newer version available"))
+            );
+        }
+
+        /// End-to-end coverage for issue #247: a dependency pinned to an exact version that
+        /// the registry reports as yanked must produce the yanked diagnostic through the real
+        /// `DocumentState` -> `Ecosystem::generate_diagnostics` ->
+        /// `generate_diagnostics_from_cache` -> `CargoFormatter::compile_requirement` path —
+        /// the same live path the LSP server actually calls, not just the pure
+        /// `requirement_matches_only_yanked` function.
+        #[tokio::test]
+        async fn test_handle_diagnostics_yanked_only_match_yields_one_warning() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"=1.0.213\"\n".to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                "serde".into(),
+                deps_core::PackageVersions {
+                    latest: "1.0.214".to_string(),
+                    available: std::sync::Arc::from(vec![
+                        "1.0.214".to_string(),
+                        "1.0.213".to_string(),
+                    ]),
+                    yanked: std::sync::Arc::from(vec!["1.0.213".to_string()]),
+                },
+            );
+            doc_state.update_cached_versions(cached);
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(result.len(), 1, "expected exactly one diagnostic");
+            assert_eq!(
+                result[0].severity,
+                Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)
+            );
+            assert_eq!(
+                result[0].message,
+                "This version has been yanked; latest is 1.0.214"
             );
         }
     }

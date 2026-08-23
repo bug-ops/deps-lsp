@@ -28,12 +28,22 @@ use crate::{
 /// scans `available` and deliberately does not filter it: a requirement that only matches a
 /// yanked or prerelease version is still satisfied, so filtering `available` the same way
 /// `latest` is filtered would produce false "no published version satisfies" warnings.
+///
+/// `yanked` is the subset of `available` (same version-string encoding) that the registry
+/// reported as yanked/deprecated. It exists because `Registry::get_latest_matching` — the
+/// call that used to populate this cache — filters yanked entries out by contract on every
+/// current registry implementation, so a per-version yanked flag threaded through *that*
+/// call would always read `false` (see #233). `available` now comes from the unfiltered
+/// `get_versions` instead, which does observe yanked entries, so `yanked` is derived from
+/// that same fetch rather than discarded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageVersions {
     /// Latest usable version for this package.
     pub latest: String,
     /// Every published version, newest-first, unfiltered.
     pub available: Arc<[String]>,
+    /// Subset of `available` reported as yanked/deprecated by the registry.
+    pub yanked: Arc<[String]>,
 }
 
 impl PackageVersions {
@@ -63,7 +73,11 @@ impl PackageVersions {
     pub fn latest_only(latest: impl Into<String>) -> Self {
         let latest = latest.into();
         let available = Arc::from(vec![latest.clone()]);
-        Self { latest, available }
+        Self {
+            latest,
+            available,
+            yanked: Arc::from(Vec::new()),
+        }
     }
 
     /// Builds a `PackageVersions` with no version list — used where only the "latest" value
@@ -85,6 +99,7 @@ impl PackageVersions {
         Self {
             latest: latest.into(),
             available: Arc::from(Vec::new()),
+            yanked: Arc::from(Vec::new()),
         }
     }
 }
@@ -725,6 +740,45 @@ pub trait EcosystemFormatter: Send + Sync {
     /// Label for yanked versions in hover.
     fn yanked_label(&self) -> &'static str {
         "*(yanked)*"
+    }
+
+    /// Whether the "requirement satisfiable only by a yanked version" diagnostic
+    /// (`crate::lsp_helpers::requirement_matches_only_yanked`) should evaluate `requirement`
+    /// at all for this ecosystem.
+    ///
+    /// Default `true` — no restriction, every requirement shape is checked. Override to
+    /// `false` for a requirement shape where this ecosystem's `Version::is_yanked()` is not
+    /// a genuine per-version signal. `NpmFormatter` and `ComposerFormatter` restrict this to
+    /// exact-pin requirements: npm's yanked flag is sourced from `deprecated`
+    /// (`NpmVersion::deprecated`), and Composer's from `abandoned`
+    /// (`ComposerVersion::abandoned`) — both are commonly package-wide (a live-verified
+    /// npm package had 126/126 versions marked deprecated), so evaluating a range
+    /// requirement against them would flag every dependency on a deprecated/abandoned
+    /// package under this diagnostic's wording, conflating it with package-level
+    /// deprecation — a distinct, separately-planned diagnostic (issue #205). Restricting to
+    /// an exact pin keeps this diagnostic scoped to #247's actual scenario: "you are pinned
+    /// to this one specific version, and it has been yanked."
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    /// use deps_core::{PackageName, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert!(DefaultFormatter.yanked_diagnostic_applies_to(&VersionReq::new("^1.2")));
+    /// ```
+    fn yanked_diagnostic_applies_to(&self, _requirement: &VersionReq) -> bool {
+        true
     }
 
     /// Detect if cursor position is on a dependency for code actions.
@@ -1490,13 +1544,14 @@ impl Default for DiagnosticSeverities {
 /// Requirement strings longer than this are rejected by [`requirement_is_unsatisfiable`]
 /// before compilation, rather than compiled and scanned. No real manifest requirement in any
 /// supported ecosystem approaches this length; it exists solely to bound the cost of an
-/// adversarial or corrupted requirement string. Three of the eleven ecosystems'
-/// `RequirementMatcher::matches` implementations (Maven/Gradle's `crate::range::satisfies`,
-/// NuGet's `crate::version::satisfies`/`resolve_float`) re-parse the requirement on every
-/// candidate rather than once per dependency (a tracked follow-up, not fixed here), so
-/// without this cap a long-but-syntactically-valid requirement scanning a large `available`
-/// list is O(`requirement.len()` × `available.len()`) — measured at seconds for a
-/// several-KB requirement against a few thousand versions.
+/// adversarial or corrupted requirement string. All eleven ecosystems' `compile_requirement`
+/// implementations now parse `requirement` exactly once per dependency and reuse the parsed
+/// form across every candidate in `matches` — Maven/Gradle/NuGet's `RequirementMatcher`s were
+/// the last holdouts re-parsing per candidate, fixed alongside this comment — so the scan
+/// itself is O(`available.len()`) in the size of the candidate list, not the requirement.
+/// This cap stays as defense-in-depth against the one-time parse cost: Maven's range union
+/// can still degrade non-linearly on a pathological multi-KB comma union, and a stray
+/// oversized string is never a real requirement, only a corrupted or adversarial one.
 const MAX_REQUIREMENT_LEN: usize = 256;
 
 /// Returns `true` when no published version satisfies `requirement`.
@@ -1595,6 +1650,64 @@ pub fn requirement_is_unsatisfiable(
     saw_decided_false
 }
 
+/// Returns `true` when `requirement` is satisfied by at least one entry in `available`, but
+/// every matching entry is yanked — i.e. the dependency is currently satisfiable only by a
+/// yanked/deprecated version.
+///
+/// Mutually exclusive with [`requirement_is_unsatisfiable`]: both scan `available` through the
+/// same `formatter.compile_requirement` matcher, but this one additionally cross-references
+/// `yanked` (see [`PackageVersions::yanked`]) to distinguish "satisfied, but only by a yanked
+/// version" from "satisfied by an ordinary version" or "not satisfied at all". Callers should
+/// only invoke this once `requirement_is_unsatisfiable` has returned `false` for the same
+/// `requirement`/`available` pair, so a match is already known to exist.
+///
+/// Shares `requirement_is_unsatisfiable`'s guard cascade (empty `available`/`requirement`,
+/// oversized `requirement`, unresolved placeholder `requirement`, uncompilable `requirement`)
+/// — each returns `false` here for the identical reason it does there.
+///
+/// Unlike `requirement_is_unsatisfiable`, an undecided candidate (`matcher.matches` returns
+/// `None` — an unparseable candidate string) does not just get skipped: it disqualifies a
+/// `true` verdict entirely. That candidate might have been a genuine non-yanked match this
+/// scan simply could not evaluate, so claiming "every match is yanked" without accounting for
+/// it would be a false positive — the same #206 conservatism (nothing decided means no
+/// diagnostic, not a guess) applied to a different question than `requirement_is_unsatisfiable`
+/// asks.
+fn requirement_matches_only_yanked(
+    formatter: &dyn EcosystemFormatter,
+    requirement: &VersionReq,
+    available: &[String],
+    yanked: &[String],
+) -> bool {
+    if available.is_empty() || yanked.is_empty() || requirement.as_str().trim().is_empty() {
+        return false;
+    }
+    if requirement.as_str().len() > MAX_REQUIREMENT_LEN {
+        return false;
+    }
+    if formatter.requirement_is_unresolved(requirement) {
+        return false;
+    }
+    let Some(matcher) = formatter.compile_requirement(requirement) else {
+        return false;
+    };
+
+    let mut saw_match = false;
+    let mut saw_undecided = false;
+    for candidate in available {
+        match matcher.matches(candidate) {
+            Some(true) => {
+                saw_match = true;
+                if !yanked.iter().any(|y| y == candidate) {
+                    return false;
+                }
+            }
+            Some(false) => {}
+            None => saw_undecided = true,
+        }
+    }
+    saw_match && !saw_undecided
+}
+
 /// Generates diagnostics using cached versions (no network calls).
 ///
 /// Uses pre-fetched version information from the lifecycle's parallel fetch.
@@ -1634,15 +1747,41 @@ pub fn generate_diagnostics_from_cache(
         // for the same reason as the vulnerability push above — a yanked
         // finding from the lifecycle probe must never be suppressed by an
         // unrelated "latest" lookup failure.
-        if let Some(yanked_version) = versions.yanked.and_then(|y| y.get(&normalized_name)) {
-            diagnostics.push(Diagnostic {
-                range: dep.version_range().unwrap_or_else(|| dep.name_range()),
-                severity: Some(severities.yanked),
-                message: format!("{} ({})", formatter.yanked_message(), yanked_version),
-                source: Some("deps-lsp".into()),
-                ..Default::default()
-            });
-        }
+        //
+        // Two independent yanked-version checks exist and both run in this loop:
+        // this one (#263) flags the specific in-use version (lockfile-resolved,
+        // or an exact manifest pin) when it is yanked, while `yanked_only` below
+        // (#247) flags a declared *range* requirement that can currently only be
+        // satisfied by a yanked version, even with no lockfile at all. They answer
+        // different questions and neither subsumes the other, but for a dependency
+        // pinned to the one version that also happens to be the only version
+        // satisfying its own requirement, both would fire on the same dependency.
+        // `yanked_diagnostic_pushed` suppresses the second (#247) check once the
+        // first (#263) already emitted a diagnostic for this dependency, so a
+        // single dependency never gets two yanked diagnostics.
+        //
+        // The two checks deliberately keep different outdated-interaction policies —
+        // this is not an oversight left over from the merge. This (#263) check has no
+        // `continue`, so it co-emits alongside an "outdated" diagnostic for the same
+        // dependency (see `test_generate_diagnostics_from_cache_yanked_and_outdated_both_emitted`,
+        // asserting exactly that on the upstream #263 design). `yanked_only` below
+        // (#247) does `continue`, suppressing "outdated" for the same dependency (see
+        // `test_yanked_only_match_suppresses_outdated_diagnostic`). Each policy was
+        // independently reviewed and tested before this merge; harmonizing them is out
+        // of scope here.
+        let yanked_diagnostic_pushed =
+            if let Some(yanked_version) = versions.yanked.and_then(|y| y.get(&normalized_name)) {
+                diagnostics.push(Diagnostic {
+                    range: dep.version_range().unwrap_or_else(|| dep.name_range()),
+                    severity: Some(severities.yanked),
+                    message: format!("{} ({})", formatter.yanked_message(), yanked_version),
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                });
+                true
+            } else {
+                false
+            };
 
         let package_versions = versions
             .cached
@@ -1707,6 +1846,36 @@ pub fn generate_diagnostics_from_cache(
                 message: format!(
                     "No published version satisfies requirement '{req_str}'; latest is {latest}"
                 ),
+                source: Some("deps-lsp".into()),
+                ..Default::default()
+            });
+            continue;
+        }
+
+        // Same source-resolvability guard as `unsatisfiable` above — only meaningful once a
+        // requirement is known to match *something* in `available` (see `requirement_is_unsatisfiable`).
+        // `yanked_diagnostic_applies_to` additionally opts an ecosystem out for a requirement
+        // shape where `is_yanked()` is not a genuine per-version signal (npm/Composer restrict
+        // to exact pins — see that method's docs). Skipped entirely when the in-use-version
+        // check above already pushed a yanked diagnostic for this dependency (see
+        // `yanked_diagnostic_pushed`), so the two checks never double-report.
+        let yanked_only = !yanked_diagnostic_pushed
+            && dep.source().is_version_resolvable()
+            && dep.version_requirement().is_some_and(|version_req| {
+                formatter.yanked_diagnostic_applies_to(version_req)
+                    && requirement_matches_only_yanked(
+                        formatter,
+                        version_req,
+                        &package_versions.available,
+                        &package_versions.yanked,
+                    )
+            });
+
+        if yanked_only {
+            diagnostics.push(Diagnostic {
+                range: version_range,
+                severity: Some(severities.yanked),
+                message: format!("{}; latest is {latest}", formatter.yanked_message()),
                 source: Some("deps-lsp".into()),
                 ..Default::default()
             });
@@ -7175,6 +7344,519 @@ mod tests {
                 calls.load(std::sync::atomic::Ordering::SeqCst),
                 1,
                 "must stop scanning at the first Some(true)"
+            );
+        }
+    }
+
+    /// Coverage for `requirement_matches_only_yanked` and its wiring into
+    /// `generate_diagnostics_from_cache` (issue #247): the cache-only diagnostics path's
+    /// substitute for the network path's `current.is_yanked()` check in `generate_diagnostics`,
+    /// which never fires against a real registry because `Registry::get_latest_matching`
+    /// filters yanked entries out by contract on every current implementation (#233). This
+    /// scans `available`/`yanked` directly instead, so it observes yanked entries that
+    /// `get_latest_matching` never returns.
+    mod requirement_matches_only_yanked_tests {
+        use super::*;
+
+        type Decide = Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
+
+        struct ClosureMatcher(Decide);
+
+        impl RequirementMatcher for ClosureMatcher {
+            fn matches(&self, version: &str) -> Option<bool> {
+                (self.0)(version)
+            }
+        }
+
+        /// Same shape as `requirement_is_unsatisfiable_tests::TableFormatter`:
+        /// `compile_requirement` only opts in for the literal requirement string `"modelled"`.
+        struct TableFormatter {
+            decide: Decide,
+        }
+
+        impl TableFormatter {
+            fn new(decide: impl Fn(&str) -> Option<bool> + Send + Sync + 'static) -> Self {
+                Self {
+                    decide: Arc::new(decide),
+                }
+            }
+        }
+
+        impl EcosystemFormatter for TableFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.to_string()
+            }
+            fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+                requirement.as_str() == "unresolved"
+            }
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                if requirement.as_str() != "modelled" {
+                    return None;
+                }
+                Some(Box::new(ClosureMatcher(Arc::clone(&self.decide)))
+                    as Box<dyn RequirementMatcher>)
+            }
+        }
+
+        fn versions(strs: &[&str]) -> Vec<String> {
+            strs.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        #[test]
+        fn test_yanked_only_match_is_true() {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+            assert!(requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.2.1"]),
+                &versions(&["1.2.1"]),
+            ));
+        }
+
+        #[test]
+        fn test_no_match_is_false() {
+            let formatter = TableFormatter::new(|_v| Some(false));
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.2.1"]),
+                &versions(&["1.2.1"]),
+            ));
+        }
+
+        #[test]
+        fn test_match_on_non_yanked_alongside_yanked_is_false() {
+            // "^1.0" matches both a yanked 1.0.0 and a non-yanked 1.0.1 — a non-yanked
+            // alternative exists, so this must not be reported as "yanked-only".
+            let formatter = TableFormatter::new(|v| Some(v == "1.0.0" || v == "1.0.1"));
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.0.1", "1.0.0"]),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        #[test]
+        fn test_scan_continues_past_a_yanked_match_to_find_a_non_yanked_alternative() {
+            // Same as above but with the yanked candidate ordered first, so a scan that
+            // stopped at the first `Some(true)` (as `requirement_is_unsatisfiable` does) would
+            // wrongly report "yanked-only" here.
+            let formatter = TableFormatter::new(|v| Some(v == "1.0.0" || v == "1.0.1"));
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.0.0", "1.0.1"]),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        #[test]
+        fn test_empty_yanked_list_is_false_without_compiling() {
+            let formatter =
+                TableFormatter::new(|_v| panic!("must not compile/scan when yanked is empty"));
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.0.0"]),
+                &[],
+            ));
+        }
+
+        #[test]
+        fn test_empty_available_list_is_false() {
+            let formatter = TableFormatter::new(|_v| Some(true));
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &[],
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        #[test]
+        fn test_unresolved_requirement_is_false() {
+            let formatter = TableFormatter::new(|_v| Some(true));
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("unresolved"),
+                &versions(&["1.0.0"]),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        #[test]
+        fn test_compile_requirement_none_is_false() {
+            let formatter = TableFormatter::new(|_v| Some(true));
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("not-modelled"),
+                &versions(&["1.0.0"]),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        /// End-to-end: `generate_diagnostics_from_cache` emits the yanked diagnostic (default
+        /// severity, `formatter.yanked_message()` plus a "; latest is X" suffix mirroring the
+        /// sibling unsatisfiable diagnostic's actionability) and nothing else for a dependency
+        /// whose requirement matches only a yanked version.
+        #[test]
+        fn test_generate_diagnostics_from_cache_yanked_only_match_fires_yanked_diagnostic() {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "modelled".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "serde".into(),
+                PackageVersions {
+                    latest: "2.0.0".to_string(),
+                    available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
+                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                },
+            );
+            let resolved_versions = HashMap::new();
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+            );
+
+            assert_eq!(diagnostics.len(), 1, "expected exactly one diagnostic");
+            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(
+                diagnostics[0].message,
+                format!("{}; latest is 2.0.0", formatter.yanked_message())
+            );
+        }
+
+        /// #247 vs. #263 dedup: a dependency whose in-use version (lock-file-resolved, or an
+        /// exact pin) is yanked *and* is the only version satisfying its own requirement
+        /// triggers both the in-use-version check (`versions.yanked`, #263) and the
+        /// requirement-only-satisfiable-by-yanked check (`requirement_matches_only_yanked`,
+        /// #247). Exactly one diagnostic must be emitted, not two.
+        #[test]
+        fn test_generate_diagnostics_from_cache_yanked_dedup_in_use_and_requirement_only_match() {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "modelled".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "serde".into(),
+                PackageVersions {
+                    latest: "2.0.0".to_string(),
+                    available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
+                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                },
+            );
+            let resolved_versions = HashMap::new();
+            let mut in_use_yanked = HashMap::new();
+            in_use_yanked.insert("serde".to_string(), "1.2.1".to_string());
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions).with_yanked(&in_use_yanked),
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+            );
+
+            // Two diagnostics are expected, not one: the in-use-version check (#263) has
+            // no `continue`, so it co-emits alongside the ordinary "outdated" diagnostic
+            // for the same dependency (the fixture's declared requirement "modelled"
+            // does not itself equal `latest` "2.0.0", so `requirement_status` reports
+            // `Outdated`) — this is #263's deliberate, separately-tested policy, see
+            // `test_generate_diagnostics_from_cache_yanked_and_outdated_both_emitted`.
+            // What this test actually proves is narrower: exactly one *yanked*
+            // diagnostic, not two — #247's `yanked_only` check must not also fire.
+            let yanked_diags: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.message.starts_with(formatter.yanked_message()))
+                .collect();
+            assert_eq!(
+                yanked_diags.len(),
+                1,
+                "expected exactly one yanked diagnostic, got: {diagnostics:?}"
+            );
+            // The in-use-version check (#263) runs first and wins.
+            assert_eq!(
+                yanked_diags[0].message,
+                format!("{} (1.2.1)", formatter.yanked_message())
+            );
+            assert_eq!(
+                diagnostics.len(),
+                2,
+                "expected exactly the yanked diagnostic plus the co-emitted outdated \
+                 diagnostic (#263's policy), got: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message == "Newer version available: 2.0.0"),
+                "expected the co-emitted outdated diagnostic, got: {diagnostics:?}"
+            );
+        }
+
+        /// `severities.yanked` reaches the emitted diagnostic on the cache-only path, the same
+        /// way `outdated_severity`/`unknown_severity`/`unsatisfiable_severity` already do.
+        #[test]
+        fn test_generate_diagnostics_from_cache_yanked_only_match_uses_configured_severity() {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "modelled".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "serde".into(),
+                PackageVersions {
+                    latest: "1.2.1".to_string(),
+                    available: Arc::from(vec!["1.2.1".to_string()]),
+                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                },
+            );
+            let resolved_versions = HashMap::new();
+
+            let severities = DiagnosticSeverities {
+                yanked: DiagnosticSeverity::ERROR,
+                ..DiagnosticSeverities::default()
+            };
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                severities,
+            );
+
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        }
+
+        /// When a non-yanked version also satisfies the requirement, no yanked diagnostic
+        /// fires — the dependency falls through to the ordinary outdated/up-to-date check.
+        #[test]
+        fn test_generate_diagnostics_from_cache_match_with_non_yanked_alternative_skips_yanked_diagnostic()
+         {
+            let formatter = TableFormatter::new(|v| Some(v == "1.0.0" || v == "1.0.1"));
+
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "modelled".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "serde".into(),
+                PackageVersions {
+                    latest: "2.0.0".to_string(),
+                    available: Arc::from(vec![
+                        "2.0.0".to_string(),
+                        "1.0.1".to_string(),
+                        "1.0.0".to_string(),
+                    ]),
+                    yanked: Arc::from(vec!["1.0.0".to_string()]),
+                },
+            );
+            let resolved_versions = HashMap::new();
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+            );
+
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.message.starts_with(formatter.yanked_message())),
+                "a non-yanked match exists, so no yanked diagnostic should fire, got: {diagnostics:?}"
+            );
+        }
+
+        /// M1 regression: an undecided candidate (`matcher.matches` returns `None`) must not
+        /// be silently skipped — it might have been a genuine non-yanked match this scan
+        /// could not evaluate, so it disqualifies a `true` verdict entirely.
+        #[test]
+        fn test_undecided_candidate_prevents_true_verdict() {
+            let formatter = TableFormatter::new(|v| match v {
+                "1.2.1" => Some(true),
+                "unparseable" => None,
+                _ => Some(false),
+            });
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.2.1", "unparseable"]),
+                &versions(&["1.2.1"]),
+            ));
+        }
+
+        /// Same scenario, but the undecided candidate is scanned before the yanked match —
+        /// proves the early `return false` on a non-yanked match doesn't accidentally mask
+        /// this case, and that the `saw_undecided` flag survives regardless of scan order.
+        #[test]
+        fn test_undecided_candidate_before_match_still_prevents_true_verdict() {
+            let formatter = TableFormatter::new(|v| match v {
+                "1.2.1" => Some(true),
+                "unparseable" => None,
+                _ => Some(false),
+            });
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["unparseable", "1.2.1"]),
+                &versions(&["1.2.1"]),
+            ));
+        }
+
+        #[test]
+        fn test_oversized_requirement_is_false_without_compiling() {
+            let formatter =
+                TableFormatter::new(|_v| panic!("must not compile/scan an oversized requirement"));
+            let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
+            assert!(!requirement_matches_only_yanked(
+                &formatter,
+                &VersionReq::new(oversized),
+                &versions(&["1.0.0"]),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        /// The yanked-only-match diagnostic must never fire for a non-registry-resolvable
+        /// dependency source (path/git/URL/SDK/workspace) — the same guard
+        /// `requirement_is_unsatisfiable` already has (see
+        /// `test_generate_diagnostics_unsatisfiable_skipped_for_non_registry_sources`).
+        #[test]
+        fn test_yanked_only_match_skipped_for_non_registry_sources() {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+            let uri = crate::test_util::test_uri("/test/Cargo.toml");
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "dep".into(),
+                PackageVersions {
+                    latest: "2.0.0".to_string(),
+                    available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
+                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                },
+            );
+            let resolved_versions = HashMap::new();
+
+            let dep = MockDep {
+                name: "dep".into(),
+                version_req: "modelled".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 3)),
+            };
+            let parse_result = SingleDepParseResult {
+                dep: NonRegistryDep(
+                    dep,
+                    crate::parser::DependencySource::Path {
+                        path: "../local".into(),
+                    },
+                ),
+                uri,
+            };
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+            );
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|d| !d.message.starts_with(formatter.yanked_message())),
+                "a path dependency must never produce the yanked diagnostic, got: {diagnostics:?}"
+            );
+        }
+
+        /// The `continue` after emitting the yanked diagnostic must suppress the sibling
+        /// outdated check for the same dependency — proven directly rather than just
+        /// inferred from `diagnostics.len() == 1` elsewhere in this module.
+        #[test]
+        fn test_yanked_only_match_suppresses_outdated_diagnostic() {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "modelled".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "serde".into(),
+                PackageVersions {
+                    latest: "2.0.0".to_string(),
+                    available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
+                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                },
+            );
+            let resolved_versions = HashMap::new();
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+            );
+
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("Newer version available")),
+                "the yanked diagnostic must suppress the outdated hint, not add to it, got: {diagnostics:?}"
             );
         }
     }

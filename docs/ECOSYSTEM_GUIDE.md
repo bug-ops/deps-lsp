@@ -25,10 +25,16 @@ deps-lsp provides comprehensive LSP support for 11 package ecosystems:
 `diagnostics.yanked_severity` flags a dependency pinned to a version the registry
 reports as yanked/deprecated/retracted, covering either the lock-file-resolved
 version or an exact manifest pin (e.g. `requirements.txt`'s `==1.2.3`) when no lock
-file exists. The check is conditional: it only runs for a dependency whose in-use
-version differs from the registry's reported latest, and only against a registry
-that exposes real per-version yank data — an up-to-date dependency costs nothing
-extra.
+file exists. Checked for every dependency with a known in-use version — not only
+one that differs from the registry's reported latest — since it is a free
+in-memory lookup against the version list `deps-lsp` already fetched to compute
+"latest", and only against a registry that exposes real per-version yank data.
+
+This is one of two independent yanked-related diagnostics; see
+[Yanked Version Diagnostic](#yanked-version-diagnostic) below for the other, which
+flags a *requirement* (a range, not necessarily an in-use version) satisfiable only
+by yanked versions. `deps-lsp` never emits both for the same dependency — see that
+section for how the two are deduplicated.
 
 | Ecosystem | Yanked diagnostic | Registry signal |
 |-----------|--------------------|------------------|
@@ -184,10 +190,12 @@ deliberately conservative:
 - **Suppressed for an unresolved requirement** — a dangling Gradle version-catalog
   `version.ref` alias or an unexpanded Maven `${property}` was never actually checked
   against anything.
-- **A prerelease-only or yanked-only match still counts as satisfied.** `foo = "2.0.0-beta.1"`
-  is a deliberate opt-in, and a yanked version is still installable when pinned (Cargo
-  resolves yanked versions present in the lock file); flagging either as unsatisfiable would
-  be a false positive.
+- **A prerelease-only or yanked-only match still counts as satisfied** — neither triggers
+  this WARNING. `foo = "2.0.0-beta.1"` is a deliberate opt-in, and a yanked version is still
+  installable when pinned (Cargo resolves yanked versions present in the lock file); flagging
+  either as unsatisfiable would be a false positive. A yanked-only match is not silent,
+  though — it surfaces instead as the separate [Yanked Version](#yanked-version-diagnostic)
+  diagnostic below.
 - **Suppressed for requirement forms naming a version outside the fetched candidate list by
   construction**, not just failing to match one present in it — Go pseudo-versions and
   `dev-*`/`*-dev`/`@dev` Composer branches (never enumerable from the registry list at all),
@@ -206,6 +214,63 @@ deliberately conservative:
 **Not yet implemented:** a quick-fix code action that rewrites the requirement to the
 latest version (tracked as a follow-up), and a separate informational diagnostic for a
 requirement that only matches prerelease versions.
+
+### Yanked Version Diagnostic
+
+The other of the two independent yanked-related diagnostics — see
+[Yanked-Version Diagnostics](#yanked-version-diagnostics) above for the in-use-version
+check. When a dependency's declared version requirement is satisfiable, but **every**
+version that satisfies it has been yanked/deprecated by the registry, deps-lsp shows a
+WARNING diagnostic (configurable via `diagnostics.yanked_severity`):
+
+```
+This version has been yanked
+```
+
+This only fires when at least one matching version exists and all matching versions are
+yanked — the same scan `Unsatisfiable Version Requirement` above uses (via
+`EcosystemFormatter::compile_requirement`), cross-referenced against the registry's yanked
+flags. It is mutually exclusive with both the unsatisfiable WARNING (a yanked-only match is
+a satisfied match, not zero matches) and the outdated/up-to-date check. If a non-yanked
+version also satisfies the requirement (e.g. `^1.0` matching both a yanked `1.0.0` and a
+non-yanked `1.0.1`), this diagnostic does not fire — the dependency is not actually stuck on
+a yanked version, and the ordinary outdated/up-to-date check applies instead.
+
+It is also mutually exclusive with the in-use-version [Yanked-Version
+Diagnostics](#yanked-version-diagnostics) check above: for a dependency pinned to the one
+version that also happens to be the only version satisfying its own requirement, both checks
+would independently find a yanked verdict, but `generate_diagnostics_from_cache` skips this
+check once the in-use-version check has already emitted a diagnostic for the same
+dependency, so only one yanked diagnostic is ever shown per dependency.
+
+- **npm and Composer are restricted to exact-pin requirements.** Both source their yanked
+  flag from a package-wide signal — npm's from `deprecated` (live-verified: the `request`
+  package has 126/126 versions marked deprecated), Composer's from `abandoned` — not a true
+  per-version yank. Evaluating a range requirement against either would flag every dependency
+  on a deprecated/abandoned package under this diagnostic's wording, which is a distinct,
+  separately-planned diagnostic (package-level deprecation, issue #205). A bare exact pin
+  (`"1.2.3"`, not `"^1.2.3"`) is unaffected by that ambiguity, so the check still applies
+  there.
+
+**Ecosystem coverage, live-verified per registry rather than assumed from code:**
+
+| Ecosystem | Works today? | Source |
+| --------- | ------------- | ------ |
+| Cargo | Yes | sparse index `yanked` field |
+| npm | Yes, exact pins only | `deprecated` (see restriction above) |
+| PyPI | Yes | PEP 592 `yanked` |
+| Composer | Yes, exact pins only | `abandoned` (see restriction above) |
+| Dart | Yes | pub.dev `retracted` |
+| Bundler | No | RubyGems' `versions.json` never includes a `yanked` field on any entry (live-verified against the API directly) — indistinguishable from a version that never existed, same limitation the `Unsatisfiable Version Requirement` check documents above |
+| Go | No | `GoVersion.retracted` is hardcoded `false` at both construction sites in `deps-go`'s registry client — the field exists but is never populated from real data (tracked separately) |
+| Maven | No | `MavenVersion::is_yanked` is a hardcoded `false` constant — Maven Central does not support version retraction |
+| Gradle | No | reuses Maven Central's registry client, same hardcoded `false` |
+| NuGet | No | `NuGetVersion::is_yanked` is a hardcoded `false` constant |
+| Swift | No | `SwiftVersion.yanked` is a field that is always `false` for GitHub tags (no such concept in the source) |
+
+5 of 11 ecosystems can produce this diagnostic today; the other 6 have no real yanked signal
+to source it from (three are architecturally impossible — no such registry concept exists —
+and Go's is a fixable but separate gap).
 
 ### npm Package Name Validation
 
