@@ -184,7 +184,7 @@ impl Ecosystem for CargoEcosystem {
 mod tests {
     use super::*;
     use crate::types::{DependencySection, DependencySource, ParsedDependency};
-    use deps_core::{EcosystemConfig, VersionData};
+    use deps_core::{EcosystemConfig, PackageVersions, VersionData};
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
@@ -285,7 +285,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -322,7 +322,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -359,7 +359,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -394,7 +394,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -430,7 +430,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -464,7 +464,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),

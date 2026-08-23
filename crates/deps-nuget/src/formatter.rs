@@ -1,7 +1,19 @@
 //! Version formatting for the NuGet ecosystem.
 
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
 use deps_core::{PackageName, VersionReq};
+
+/// NuGet interval/floating-pattern matcher, compiled once per dependency by
+/// [`NuGetFormatter::compile_requirement`]. Always decidable (`Some`) — `satisfies` and
+/// `resolve_float` have no separate "candidate failed to parse" signal, only "range/pattern
+/// failed to parse" (already ruled out by `compile_requirement` before this is constructed).
+struct NuGetMatcher(String);
+
+impl RequirementMatcher for NuGetMatcher {
+    fn matches(&self, version: &str) -> Option<bool> {
+        Some(NuGetFormatter.version_satisfies_requirement(version, &self.0))
+    }
+}
 
 pub struct NuGetFormatter;
 
@@ -48,6 +60,30 @@ impl EcosystemFormatter for NuGetFormatter {
             Some(ordering) => ordering != std::cmp::Ordering::Less,
             None => self.version_satisfies_requirement(latest, requirement),
         }
+    }
+
+    /// M3: an unexpanded MSBuild property reference (`$(PropertyName)`) inside a version
+    /// string — most commonly `[$(MinVersion),$(MaxVersion))`, which parses to a `Bounded`
+    /// interval whose min/max both fall back to `0.0.0` (a fail-safe floor, not an error),
+    /// but then rejects every real candidate as out of range. A bare `$(X)` (unbracketed) is
+    /// already fail-safe via that same floor fallback and needs no guard; the bracketed form
+    /// does not. Mirrors Maven's `${property}` / Gradle's `$var`/`${var}` unresolved-variable
+    /// guards.
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        requirement.as_str().contains("$(")
+    }
+
+    /// Compiles `requirement` into a `NuGetMatcher` only if it is a syntactically
+    /// well-formed range or floating pattern (`is_valid_requirement`) — without this guard,
+    /// a malformed requirement string would make `satisfies`/`resolve_float` return `false`
+    /// for every candidate, producing a false "unsatisfiable" verdict instead of correctly
+    /// suppressing the check.
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.as_str();
+        if !crate::version::is_valid_requirement(requirement) {
+            return None;
+        }
+        Some(Box::new(NuGetMatcher(requirement.to_string())))
     }
 }
 
@@ -189,5 +225,83 @@ mod tests {
         assert_eq!(native, osv_version);
         let edit_text = f.format_version_for_text_edit(&native);
         assert!(f.version_satisfies_requirement(&native, &edit_text));
+    }
+
+    #[test]
+    fn test_compile_requirement_exact_pin_satisfiable() {
+        let f = NuGetFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("[13.0.3]"))
+            .expect("well-formed exact pin must compile");
+        assert_eq!(matcher.matches("13.0.3"), Some(true));
+        assert_eq!(matcher.matches("13.0.4"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_range_satisfiable() {
+        let f = NuGetFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("[1.0,2.0)"))
+            .expect("well-formed range must compile");
+        assert_eq!(matcher.matches("1.5.0"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_floating_pattern_satisfiable() {
+        let f = NuGetFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("1.1.*"))
+            .expect("well-formed floating pattern must compile");
+        assert_eq!(matcher.matches("1.1.5"), Some(true));
+        assert_eq!(matcher.matches("1.2.0"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_bare_floor_satisfiable() {
+        // A bare version is a minimum-floor requirement under `satisfies` (unlike
+        // `is_requirement_up_to_date`'s floor-pin override) — any version `>= floor` counts
+        // as a match for the unsatisfiable check.
+        let f = NuGetFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("1.0.0"))
+            .expect("a bare version is a well-formed minimum floor");
+        assert_eq!(matcher.matches("2.0.0"), Some(true));
+        assert_eq!(matcher.matches("0.9.0"), Some(false));
+    }
+
+    /// The malformed-requirement guard this formatter's `compile_requirement` adds — the
+    /// same class of fix Maven/Gradle carry, but previously untested for NuGet.
+    #[test]
+    fn test_compile_requirement_malformed_range_returns_none() {
+        let f = NuGetFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("[1.0,2.0"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_malformed_floating_pattern_returns_none() {
+        let f = NuGetFormatter;
+        // Not a valid interval (contains '*') and not a valid float pattern either
+        // (`resolve_float`'s grammar requires a trailing `.*`/`*` segment).
+        assert!(f.compile_requirement(&VersionReq::new("1.*.0")).is_none());
+    }
+
+    /// M3: a bracketed MSBuild property reference parses as a `Bounded` 0.0.0-0.0.0
+    /// interval that rejects every real candidate — must be treated as unresolved, not
+    /// checked against `available`.
+    #[test]
+    fn test_requirement_is_unresolved_bracketed_msbuild_property() {
+        let f = NuGetFormatter;
+        assert!(f.requirement_is_unresolved(&VersionReq::new("[$(MinVersion),$(MaxVersion))")));
+    }
+
+    #[test]
+    fn test_requirement_is_unresolved_false_for_ordinary_requirements() {
+        let f = NuGetFormatter;
+        assert!(!f.requirement_is_unresolved(&VersionReq::new("13.0.3")));
+        assert!(!f.requirement_is_unresolved(&VersionReq::new("[1.0,2.0)")));
     }
 }

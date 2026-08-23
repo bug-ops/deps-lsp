@@ -129,6 +129,27 @@ pub trait Registry: Send + Sync {
     /// Returns a URL that links to the package page on the registry website.
     fn package_url(&self, name: &PackageName) -> String;
 
+    /// Index of the latest version in `versions` satisfying `req`, with no I/O.
+    ///
+    /// `versions` must be a newest-first list as returned by this registry's
+    /// [`get_versions`](Self::get_versions). Returns an index rather than a reference so
+    /// callers holding an owned `Vec` can move the chosen element out
+    /// (`versions.into_iter().nth(i)`) — a borrow into the list would keep it frozen while
+    /// [`get_latest_matching`](Self::get_latest_matching) needs to return an owned
+    /// `Box<dyn Version>`, and `Version` has no `clone_box`.
+    ///
+    /// Default: `None`. Every registry reachable from the LSP fetch path overrides this so
+    /// the fetch loop can obtain both "latest" and the full version list from one round
+    /// trip; the default exists so test doubles that never resolve a "latest" compile
+    /// unchanged.
+    fn select_latest_matching(
+        &self,
+        _versions: &[Box<dyn Version>],
+        _req: &VersionReq,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Downcast to concrete registry type for ecosystem-specific operations
     fn as_any(&self) -> &dyn Any;
 }

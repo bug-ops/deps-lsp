@@ -342,6 +342,19 @@ impl deps_core::Registry for CratesIoRegistry {
         })
     }
 
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        req: &deps_core::VersionReq,
+    ) -> Option<usize> {
+        let parsed_req: VersionReq = req.as_str().parse().ok()?;
+        versions.iter().position(|v| {
+            v.version_string()
+                .parse::<Version>()
+                .is_ok_and(|ver| parsed_req.matches(&ver) && !v.is_yanked())
+        })
+    }
+
     fn search<'a>(
         &'a self,
         query: &'a str,
@@ -648,5 +661,29 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = CratesIoRegistry::new(cache);
         let _cloned = registry;
+    }
+
+    #[test]
+    fn test_select_latest_matching_not_default_none() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = CratesIoRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(CargoVersion {
+                num: "2.0.0".into(),
+                yanked: true,
+                features: HashMap::new(),
+                published_at: None,
+            }),
+            Box::new(CargoVersion {
+                num: "1.0.0".into(),
+                yanked: false,
+                features: HashMap::new(),
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
     }
 }

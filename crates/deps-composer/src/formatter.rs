@@ -1,6 +1,19 @@
 use deps_core::Dependency;
 use deps_core::PackageName;
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::VersionReq;
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+
+/// Composer requirement matcher, compiled once per dependency by
+/// [`ComposerFormatter::compile_requirement`]. Shares `version_satisfies_requirement`'s
+/// hand-rolled comparator, which has no external parser to fail on, so this always
+/// decides (`Some`).
+struct ComposerMatcher(String);
+
+impl RequirementMatcher for ComposerMatcher {
+    fn matches(&self, version: &str) -> Option<bool> {
+        Some(ComposerFormatter.version_satisfies_requirement(version, &self.0))
+    }
+}
 
 /// Composer-specific LSP formatting.
 ///
@@ -127,6 +140,32 @@ impl EcosystemFormatter for ComposerFormatter {
     /// every ecosystem except PyPI).
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
         Some(self.normalize_package_name(dep.name()))
+    }
+
+    /// Compiles `requirement` into a `ComposerMatcher` using the same
+    /// `version_satisfies_requirement` comparator — Composer requirements have no separate
+    /// "loose" vs. "precise" form to distinguish.
+    /// Returns `None` for a `dev-*`/`*-dev` branch requirement (e.g. `"dev-master"`,
+    /// `"1.0.x-dev"`): `PackagistRegistry::get_versions` (`expand_minified_versions`)
+    /// filters exactly those version strings out of every result, so `available` — unlike
+    /// every other ecosystem's, which is the plan's "unfiltered `get_versions` output"
+    /// invariant — can never contain one, even when the branch itself is real and
+    /// installable. Scanning would always decide `Some(false)` for every candidate,
+    /// producing a false "no published version satisfies" warning.
+    ///
+    /// Also returns `None` for a bare `@dev` minimum-stability flag (e.g. `"1.0.*@dev"`,
+    /// `"2.0@dev"`): Composer resolves that flag against dev-stability packages, which
+    /// normalize to the same `x-dev` version shape `expand_minified_versions` filters out —
+    /// the same undecidable-from-`available` case as a `dev-*`/`*-dev` branch itself.
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.as_str().trim();
+        if requirement.starts_with("dev-") || requirement.ends_with("-dev") {
+            return None;
+        }
+        if requirement.contains("@dev") {
+            return None;
+        }
+        Some(Box::new(ComposerMatcher(requirement.to_string())))
     }
 }
 
@@ -373,5 +412,48 @@ mod tests {
         assert!(f.version_satisfies_requirement("v1.0.5", "1.0.*"));
         assert!(f.version_satisfies_requirement("v1.2.3", "1.2.3"));
         assert!(!f.version_satisfies_requirement("v2.0.0", "^1.0"));
+    }
+
+    #[test]
+    fn test_compile_requirement_satisfiable() {
+        let f = ComposerFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("^1.2"))
+            .expect("Composer requirement always compiles");
+        assert_eq!(matcher.matches("1.5.0"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
+    }
+
+    /// S2 regression: `get_versions` filters `dev-*`/`*-dev` entries out of `available`, so
+    /// a branch requirement must suppress the whole scan rather than being checked against
+    /// a list that structurally can never contain it.
+    #[test]
+    fn test_compile_requirement_dev_branch_prefix_returns_none() {
+        let f = ComposerFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("dev-master"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_dev_branch_suffix_returns_none() {
+        let f = ComposerFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("1.0.x-dev"))
+                .is_none()
+        );
+    }
+
+    /// Minor item: a bare `@dev` minimum-stability flag resolves against dev-stability
+    /// packages, which normalize to the same filtered-out `x-dev` shape as a dev branch.
+    #[test]
+    fn test_compile_requirement_at_dev_stability_flag_returns_none() {
+        let f = ComposerFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("1.0.*@dev"))
+                .is_none()
+        );
+        assert!(f.compile_requirement(&VersionReq::new("2.0@dev")).is_none());
     }
 }

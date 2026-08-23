@@ -1,10 +1,21 @@
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::VersionReq;
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
 use pep440_rs::{Version, VersionSpecifiers};
 use std::str::FromStr;
 use tower_lsp_server::ls_types::Position;
+
+/// Precise PEP 440 specifier-set matcher, compiled once per dependency by
+/// [`PypiFormatter::compile_requirement`].
+struct Pep440Matcher(VersionSpecifiers);
+
+impl RequirementMatcher for Pep440Matcher {
+    fn matches(&self, version: &str) -> Option<bool> {
+        Version::from_str(version).ok().map(|v| self.0.contains(&v))
+    }
+}
 
 pub struct PypiFormatter;
 
@@ -134,6 +145,16 @@ impl EcosystemFormatter for PypiFormatter {
 
         position.character >= start_char && position.character <= end_char
     }
+
+    /// Compiles `requirement` via `pep440_rs::VersionSpecifiers` — the same crate and the
+    /// same precise contains-check `version_satisfies_requirement` above already uses, so
+    /// this is not a new comparator, just its result cached across candidates instead of
+    /// reparsed per call.
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        VersionSpecifiers::from_str(requirement.as_str())
+            .ok()
+            .map(|specs| Box::new(Pep440Matcher(specs)) as Box<dyn RequirementMatcher>)
+    }
 }
 
 /// Truncates `latest`'s PEP 440 release segments to the same segment count
@@ -245,6 +266,35 @@ mod tests {
     fn test_version_satisfies_invalid_specifier() {
         let formatter = PypiFormatter;
         assert!(!formatter.version_satisfies_requirement("1.0.0", "not-a-specifier"));
+    }
+
+    #[test]
+    fn test_compile_requirement_satisfiable() {
+        let formatter = PypiFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new(">=1.0,<2.0"))
+            .expect("valid PEP 440 specifier must compile");
+        assert_eq!(matcher.matches("1.5.0"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_unparseable_requirement_returns_none() {
+        let formatter = PypiFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("not-a-specifier"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_unparseable_candidate_is_skipped() {
+        let formatter = PypiFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new(">=1.0"))
+            .unwrap();
+        assert_eq!(matcher.matches("2011k"), None);
     }
 
     #[test]

@@ -26,6 +26,15 @@ pub fn satisfies(version: &str, requirement: &str) -> bool {
     }
 }
 
+/// Whether `requirement` is a syntactically well-formed bracket-interval range.
+///
+/// Used by `GradleFormatter::compile_requirement` to distinguish "no published version
+/// satisfies this well-formed range" from "this range string doesn't parse", which
+/// [`satisfies`]'s `false`-on-failure return does not otherwise distinguish.
+pub fn is_valid_range(requirement: &str) -> bool {
+    parse_interval(requirement.trim(), BracketStyle::AllowReversed).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

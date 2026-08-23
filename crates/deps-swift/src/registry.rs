@@ -15,6 +15,33 @@ const GITHUB_API: &str = "https://api.github.com";
 /// used in not-found and API-response error messages.
 pub const REGISTRY: &str = "GitHub";
 
+/// Maximum number of `tags` pages fetched per package (100 tags/page).
+///
+/// This is a **safety ceiling, not the correctness mechanism** — the loop
+/// already stops as soon as a page comes back with fewer than 100 entries
+/// (`page_has_more`), which is GitHub's documented signal that no further
+/// page exists. Every real repository terminates via that signal well
+/// before this bound is reached.
+///
+/// The bound exists only to protect against a pathological repo with an
+/// unbounded number of tags. It must stay high enough that it never
+/// truncates a real repository's tag list, because GitHub returns tags in
+/// **lexicographic, not semver, order** — verified live on
+/// `firebase/firebase-ios-sdk` (1131 tags): page 1 is headed by `v8.15.0`
+/// (a `v`-prefixed tag lexicographically outranks unprefixed ones), pages
+/// 2-9 are entirely unrelated `DataTransport-*`/`Core-*` subproject tags
+/// with zero semver-parseable entries, and the real `11.x`/`12.x` releases
+/// only appear around pages 10-11. A low page cap (previously 5, i.e. 500
+/// tags) silently dropped those newer tags out of `available` entirely —
+/// no amount of sorting the *fetched* subset fixes that, since the highest
+/// real versions were never fetched at all. This produced two distinct
+/// bugs: an ordinary pin like `from: "11.0.0"` read as "unsatisfiable",
+/// and hover/completion/update-all reported the stale `8.15.0` as
+/// `latest`. 3000 tags (30 pages) comfortably covers this repository and
+/// any other known real-world package with room to spare, while still
+/// bounding worst-case request count for an adversarial input.
+const MAX_TAG_PAGES: u32 = 30;
+
 /// Validates that `name` is a valid `owner/repo` GitHub identifier.
 ///
 /// Accepts characters `[a-zA-Z0-9._-]` in both owner and repo segments.
@@ -72,26 +99,38 @@ impl SwiftRegistry {
     /// Fetches all semver-tagged versions for a package.
     ///
     /// Returns versions sorted newest-first. Non-semver tags are skipped.
+    /// Follows GitHub tags pagination up to `MAX_TAG_PAGES` pages, stopping
+    /// as soon as a page comes back with fewer than 100 entries (no further
+    /// pages exist).
     pub async fn get_versions(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         validate_owner_repo(name)?;
-        let url = format!("{GITHUB_API}/repos/{name}/tags?per_page=100");
-        let data = self
-            .cache
-            .get_cached_with_headers(&url, &self.headers())
-            .await
-            .map_err(|e| match &e {
-                DepsError::HttpStatus { status: 403, .. } if !self.has_token => {
-                    DepsError::CacheError(
-                        "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)".into(),
-                    )
-                }
-                DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
-                    package: name.to_string(),
-                    registry: REGISTRY,
-                },
-                _ => e,
-            })?;
-        parse_tags_response(&data)
+        let mut tags = Vec::new();
+        for page in 1..=MAX_TAG_PAGES {
+            let url = format!("{GITHUB_API}/repos/{name}/tags?per_page=100&page={page}");
+            let data = self
+                .cache
+                .get_cached_with_headers(&url, &self.headers())
+                .await
+                .map_err(|e| match &e {
+                    DepsError::HttpStatus { status: 403, .. } if !self.has_token => {
+                        DepsError::CacheError(
+                            "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)".into(),
+                        )
+                    }
+                    DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
+                        package: name.to_string(),
+                        registry: REGISTRY,
+                    },
+                    _ => e,
+                })?;
+            let page_tags = parse_tags_page(&data)?;
+            let page_len = page_tags.len();
+            tags.extend(page_tags);
+            if !page_has_more(page_len) {
+                break;
+            }
+        }
+        Ok(tags_to_versions(tags))
     }
 
     /// Finds the latest version satisfying the given semver requirement.
@@ -144,28 +183,48 @@ struct GithubErrorResponse {
     message: String,
 }
 
-/// Parses GitHub tags API response into SwiftVersion list.
+/// Returns `true` when a fetched page came back full (`per_page=100`
+/// entries), meaning a subsequent page may exist and should be fetched too.
+/// A page with fewer entries is necessarily the last one.
+const fn page_has_more(page_len: usize) -> bool {
+    page_len >= 100
+}
+
+/// Parses a single GitHub tags API page into raw tag entries.
 ///
 /// GitHub returns an error object instead of array when rate-limited or on
 /// other errors. Detect this and return a descriptive error.
-fn parse_tags_response(data: &[u8]) -> Result<Vec<SwiftVersion>> {
-    let tags: Vec<GithubTag> = match serde_json::from_slice(data) {
-        Ok(t) => t,
+fn parse_tags_page(data: &[u8]) -> Result<Vec<GithubTag>> {
+    match serde_json::from_slice(data) {
+        Ok(tags) => Ok(tags),
         Err(_) => {
             if let Ok(err) = serde_json::from_slice::<GithubErrorResponse>(data) {
-                return Err(DepsError::CacheError(format!(
+                Err(DepsError::CacheError(format!(
                     "GitHub API error: {}",
                     err.message
-                )));
+                )))
+            } else {
+                Ok(vec![])
             }
-            return Ok(vec![]);
         }
-    };
+    }
+}
 
+/// Converts raw tags (possibly accumulated across pages) into a
+/// newest-first `SwiftVersion` list. Non-semver tags are skipped.
+fn tags_to_versions(tags: Vec<GithubTag>) -> Vec<SwiftVersion> {
     let mut versions_with_parsed: Vec<(SwiftVersion, semver::Version)> = tags
         .into_iter()
         .filter_map(|tag| {
-            let name = tag.name.strip_prefix('v').unwrap_or(&tag.name).to_string();
+            // Both cases are real GitHub tag conventions ("v2.62.0", "V2.62.0"); stripping
+            // only lowercase 'v' would leave "V2.62.0" unparseable as semver, silently
+            // dropping a real, installable tag out of `available` — the same false-positive
+            // class this PR's diagnostic guards against elsewhere.
+            let name = tag
+                .name
+                .strip_prefix(['v', 'V'])
+                .unwrap_or(&tag.name)
+                .to_string();
             let parsed = semver::Version::parse(&name).ok()?;
             Some((
                 SwiftVersion {
@@ -178,7 +237,15 @@ fn parse_tags_response(data: &[u8]) -> Result<Vec<SwiftVersion>> {
         .collect();
 
     versions_with_parsed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    Ok(versions_with_parsed.into_iter().map(|(v, _)| v).collect())
+    versions_with_parsed.into_iter().map(|(v, _)| v).collect()
+}
+
+/// Parses a single GitHub tags API response page into a `SwiftVersion`
+/// list. Test-only convenience wrapper composing [`parse_tags_page`] and
+/// [`tags_to_versions`] for single-page fixtures.
+#[cfg(test)]
+fn parse_tags_response(data: &[u8]) -> Result<Vec<SwiftVersion>> {
+    Ok(tags_to_versions(parse_tags_page(data)?))
 }
 
 /// GitHub search API response.
@@ -260,6 +327,17 @@ impl deps_core::Registry for SwiftRegistry {
         } else {
             String::new()
         }
+    }
+
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        req: &deps_core::VersionReq,
+    ) -> Option<usize> {
+        let parsed_req = semver::VersionReq::parse(req.as_str()).ok()?;
+        versions.iter().position(|v| {
+            semver::Version::parse(v.version_string()).is_ok_and(|ver| parsed_req.matches(&ver))
+        })
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -385,6 +463,14 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_tags_uppercase_v_prefix_stripped() {
+        let json = r#"[{"name": "V1.2.3"}]"#;
+        let versions = parse_tags_response(json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "1.2.3");
+    }
+
+    #[test]
     fn test_validate_owner_repo_invalid_format_message() {
         let err = validate_owner_repo("no-slash").unwrap_err();
         assert!(err.to_string().contains("invalid owner/repo format"));
@@ -416,6 +502,57 @@ mod tests {
     }
 
     #[test]
+    fn test_page_has_more_full_page_continues() {
+        assert!(page_has_more(100));
+    }
+
+    #[test]
+    fn test_page_has_more_partial_page_stops() {
+        assert!(!page_has_more(99));
+        assert!(!page_has_more(0));
+    }
+
+    #[test]
+    fn test_parse_tags_page_returns_raw_tags() {
+        let json = r#"[{"name": "v1.0.0"}, {"name": "not-semver"}]"#;
+        let tags = parse_tags_page(json.as_bytes()).unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].name, "v1.0.0");
+    }
+
+    #[test]
+    fn test_tags_to_versions_accumulated_across_pages_sorts_and_dedupes_none() {
+        // Simulates two accumulated pages being merged before sorting, the
+        // shape `get_versions` produces when pagination fetches page 2.
+        let page1 = parse_tags_page(br#"[{"name": "3.0.0"}, {"name": "2.0.0"}]"#).unwrap();
+        let page2 = parse_tags_page(br#"[{"name": "1.0.0"}]"#).unwrap();
+        let mut all = page1;
+        all.extend(page2);
+        let versions = tags_to_versions(all);
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].version, "3.0.0");
+        assert_eq!(versions[2].version, "1.0.0");
+    }
+
+    #[test]
+    fn test_tags_to_versions_later_page_can_hold_the_highest_semver() {
+        // Regression guard for N1: GitHub returns tags in lexicographic order,
+        // not semver order, so a page fetched *later* in pagination can still
+        // contain the highest real version (e.g. `v`-prefixed tags sort
+        // lexicographically ahead of unrelated subproject tags that fill
+        // earlier pages on large monorepos). The final list must be sorted by
+        // parsed semver regardless of fetch/page order.
+        let page1 =
+            parse_tags_page(br#"[{"name": "DataTransport-1.0.0"}, {"name": "1.0.0"}]"#).unwrap();
+        let page2 = parse_tags_page(br#"[{"name": "v12.0.0"}]"#).unwrap();
+        let mut all = page1;
+        all.extend(page2);
+        let versions = tags_to_versions(all);
+        assert_eq!(versions[0].version, "12.0.0");
+        assert_eq!(versions[1].version, "1.0.0");
+    }
+
+    #[test]
     fn test_registry_package_url_valid() {
         use deps_core::{PackageName, Registry};
         let cache = Arc::new(HttpCache::new());
@@ -424,6 +561,26 @@ mod tests {
             registry.package_url(&PackageName::new("apple/swift-nio")),
             "https://github.com/apple/swift-nio"
         );
+    }
+
+    #[test]
+    fn test_select_latest_matching_not_default_none() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = SwiftRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(SwiftVersion {
+                version: "2.0.0".into(),
+                yanked: false,
+            }),
+            Box::new(SwiftVersion {
+                version: "1.0.0".into(),
+                yanked: false,
+            }),
+        ];
+        let req = VersionReq::new("^1.0.0");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
     }
 
     #[test]

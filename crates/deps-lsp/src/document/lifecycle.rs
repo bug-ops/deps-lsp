@@ -11,6 +11,7 @@ use crate::progress::{ProgressSender, RegistryProgress};
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
+use deps_core::PackageVersions;
 use deps_core::Registry;
 use deps_core::Result;
 use deps_core::VersionReq;
@@ -421,6 +422,7 @@ async fn run_osv_phase_b_and_commit(
                             let raw = result.raw_name_by_key.get(key)?;
                             doc.cached_versions.get(raw.as_str())
                         })?
+                        .latest
                         .clone();
                     Some(deps_core::osv::ScanTarget {
                         key: key.clone(),
@@ -530,8 +532,8 @@ fn dependency_version_map(
 
 /// Result of parallel version fetching.
 struct FetchResult {
-    /// Successfully fetched versions (package -> latest version)
-    versions: HashMap<PackageName, String>,
+    /// Successfully fetched versions (package -> latest + full version list)
+    versions: HashMap<PackageName, PackageVersions>,
     /// Number of packages that failed to fetch (timeout or error)
     failed_count: usize,
     /// First actionable error message (shown to user via `window/showMessage`)
@@ -591,20 +593,64 @@ async fn fetch_latest_versions_parallel(
             let progress_sender = progress_sender.clone();
             let wildcard_req = &wildcard_req;
             async move {
-                let result = tokio::time::timeout(
-                    timeout,
-                    registry.get_latest_matching(&name, wildcard_req),
-                )
-                .await;
+                // Single round trip: the full version list is fetched once, and "latest"
+                // is a pure in-memory pick over it (`Registry::select_latest_matching`) —
+                // no second registry call, so the retained full list costs nothing extra
+                // over the network (see `PackageVersions`).
+                let result = tokio::time::timeout(timeout, registry.get_versions(&name)).await;
 
                 let version = match result {
-                    Ok(Ok(Some(v))) => {
-                        tracing::debug!(package = %name, version = %v.version_string(), "fetched");
-                        Some((name.clone(), v.version_string().to_string()))
-                    }
-                    Ok(Ok(None)) => {
-                        tracing::debug!(package = %name, "no version found");
-                        None
+                    Ok(Ok(versions)) => {
+                        let available: Arc<[String]> = versions
+                            .iter()
+                            .map(|v| v.version_string().to_string())
+                            .collect();
+                        // `.get(idx)` rather than `versions[idx]`: `select_latest_matching`
+                        // is a public `Registry` trait method, so an out-of-tree
+                        // implementation returning a stale index must not panic this task.
+                        match registry
+                            .select_latest_matching(&versions, wildcard_req)
+                            .and_then(|idx| versions.get(idx))
+                        {
+                            Some(v) => {
+                                let latest = v.version_string().to_string();
+                                tracing::debug!(package = %name, version = %latest, "fetched");
+                                Some((name.clone(), PackageVersions { latest, available }))
+                            }
+                            None => {
+                                // The pure list-based pick found nothing — for most
+                                // ecosystems this genuinely means "no version found", but
+                                // for a registry whose list endpoint can be incomplete
+                                // (e.g. Go's `/@v/list`, which never enumerates
+                                // pseudo-versions and can be entirely empty for an
+                                // untagged module) it may just mean the list alone isn't
+                                // enough. Fall back to the registry's own
+                                // `get_latest_matching`, which some registries answer from
+                                // a different, more complete source (Go's `/@latest`). This
+                                // costs a second network call, but only in this already-rare
+                                // "list-based pick failed" case, not the common path.
+                                let fallback = tokio::time::timeout(
+                                    timeout,
+                                    registry.get_latest_matching(&name, wildcard_req),
+                                )
+                                .await;
+                                match fallback {
+                                    Ok(Ok(Some(v))) => {
+                                        let latest = v.version_string().to_string();
+                                        tracing::debug!(
+                                            package = %name,
+                                            version = %latest,
+                                            "fetched via get_latest_matching fallback"
+                                        );
+                                        Some((name.clone(), PackageVersions { latest, available }))
+                                    }
+                                    _ => {
+                                        tracing::debug!(package = %name, "no version found");
+                                        None
+                                    }
+                                }
+                            }
+                        }
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(package = %name, error = %e, "fetch failed");
@@ -727,7 +773,7 @@ pub async fn handle_document_open(
             // `resolved` value during the cold-open window before the
             // registry fetch completes (critique S1).
             let formatter = ecosystem_clone.formatter();
-            let instant_cached: HashMap<PackageName, String> = match doc.parse_result() {
+            let instant_resolved: HashMap<PackageName, String> = match doc.parse_result() {
                 Some(parse_result) => {
                     let deps = parse_result.dependencies();
                     resolved_versions
@@ -742,7 +788,7 @@ pub async fn handle_document_open(
                 }
                 None => resolved_versions.clone(),
             };
-            doc.update_cached_versions(instant_cached);
+            doc.update_cached_versions(cached_versions_from_lockfile(&instant_resolved));
         }
 
         // Phase A OSV scan, spawned so it runs concurrently with the
@@ -1181,6 +1227,29 @@ pub async fn handle_document_change(
     Ok(task)
 }
 
+/// Builds a `cached_versions` map from lock-file-resolved versions, ahead of any registry
+/// fetch.
+///
+/// `available` is deliberately left empty (`PackageVersions::latest_without_list`, not a
+/// plausible-looking one-element list) — this runs before any registry fetch, and
+/// `requirement_is_unsatisfiable` treats an empty `available` as "still loading, skip"
+/// (FR-004). Using `latest_only` here instead would populate a bogus single-entry list and
+/// let the unsatisfiable-requirement check compute a false verdict on every document open,
+/// before the fetch that's supposed to suppress it has a chance to run.
+fn cached_versions_from_lockfile(
+    resolved: &HashMap<PackageName, String>,
+) -> HashMap<PackageName, PackageVersions> {
+    resolved
+        .iter()
+        .map(|(name, version)| {
+            (
+                name.clone(),
+                PackageVersions::latest_without_list(version.clone()),
+            )
+        })
+        .collect()
+}
+
 /// Loads resolved versions from lock file for a given manifest URI.
 ///
 /// Uses the ecosystem's lockfile provider to parse the lock file.
@@ -1378,6 +1447,40 @@ mod tests {
             }
             other => panic!("Expected CacheError, got {other:?}"),
         }
+    }
+
+    /// N5 regression guard: the lock-file-population path must build every
+    /// `PackageVersions` with an **empty** `available` list, never a populated one — an
+    /// empty `available` is what makes `requirement_is_unsatisfiable`'s FR-004 guard
+    /// suppress the check before any registry fetch has run. This is the exact function
+    /// `handle_document_open`'s background task calls, so a regression here (e.g.
+    /// swapping `latest_without_list` for `latest_only`) is caught directly, without
+    /// racing the background task.
+    #[test]
+    fn test_cached_versions_from_lockfile_has_empty_available() {
+        let mut resolved = HashMap::new();
+        resolved.insert(PackageName::new("serde"), "1.0.195".to_string());
+        resolved.insert(PackageName::new("tokio"), "1.35.0".to_string());
+
+        let cached = cached_versions_from_lockfile(&resolved);
+
+        assert_eq!(cached.len(), 2);
+        let serde = cached.get(&PackageName::new("serde")).unwrap();
+        assert_eq!(serde.latest, "1.0.195");
+        assert!(
+            serde.available.is_empty(),
+            "lock-file-populated entries must have an empty available list, got: {:?}",
+            serde.available
+        );
+        let tokio = cached.get(&PackageName::new("tokio")).unwrap();
+        assert_eq!(tokio.latest, "1.35.0");
+        assert!(tokio.available.is_empty());
+    }
+
+    #[test]
+    fn test_cached_versions_from_lockfile_empty_input_is_empty_output() {
+        let resolved = HashMap::new();
+        assert!(cached_versions_from_lockfile(&resolved).is_empty());
     }
 
     #[tokio::test]
@@ -1763,6 +1866,18 @@ mod tests {
                 format!("https://example.com/{}", name)
             }
 
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &deps_core::VersionReq,
+            ) -> Option<usize> {
+                // The fetch loop no longer calls `get_latest_matching` — it derives
+                // "latest" from `get_versions` via this method instead, so this mock
+                // must implement it too (rather than relying on the `None` default) to
+                // keep exercising "package-fast" as a successful fetch.
+                if versions.is_empty() { None } else { Some(0) }
+            }
+
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -1785,8 +1900,11 @@ mod tests {
             "Should have exactly 1 successful package"
         );
         assert_eq!(
-            result.versions.get("package-fast"),
-            Some(&"1.0.0".to_string()),
+            result
+                .versions
+                .get("package-fast")
+                .map(|v| v.latest.as_str()),
+            Some("1.0.0"),
             "Fast package should have correct version"
         );
         assert!(
@@ -1796,6 +1914,95 @@ mod tests {
         assert!(
             !result.versions.contains_key("package-error"),
             "Error package should not be in results"
+        );
+    }
+
+    /// S3 regression: a registry whose `get_versions` list is incomplete (e.g. Go's
+    /// `/@v/list`, which never enumerates pseudo-versions and can be entirely empty for an
+    /// untagged module) must not render the package as "no version found" just because
+    /// `select_latest_matching`'s pure list-based pick came up empty — the fetch loop must
+    /// fall back to the registry's own `get_latest_matching`.
+    #[tokio::test]
+    async fn test_fetch_falls_back_to_get_latest_matching_when_list_based_pick_finds_nothing() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        #[derive(Debug)]
+        struct MockVersion {
+            version: String,
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &str {
+                &self.version
+            }
+            fn is_yanked(&self) -> bool {
+                false
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// Mimics an untagged Go module: `get_versions` (the list endpoint) is empty, but
+        /// `get_latest_matching` (a different, more complete endpoint) still resolves a
+        /// pseudo-version. `select_latest_matching` deliberately relies on the trait
+        /// default (`None`), matching a real registry whose list-based pick has nothing to
+        /// work with.
+        struct UntaggedModuleRegistry;
+
+        impl Registry for UntaggedModuleRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(Some(Box::new(MockVersion {
+                        version: "v0.0.0-20191109021931-daa7c04131f5".to_string(),
+                    }) as Box<dyn Version>))
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(UntaggedModuleRegistry);
+        let packages = vec![PackageName::new("golang.org/x/exp")];
+
+        let result = fetch_latest_versions_parallel(registry, packages, None, 5, 10).await;
+
+        assert_eq!(
+            result
+                .versions
+                .get("golang.org/x/exp")
+                .map(|v| v.latest.as_str()),
+            Some("v0.0.0-20191109021931-daa7c04131f5"),
+            "must fall back to get_latest_matching instead of reporting no version found"
         );
     }
 
@@ -2454,9 +2661,9 @@ tokio = "1.0"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.cached_versions
-                    .insert("serde".into(), "1.0.210".to_string());
+                    .insert("serde".into(), PackageVersions::latest_only("1.0.210"));
                 doc.cached_versions
-                    .insert("tokio".into(), "1.40.0".to_string());
+                    .insert("tokio".into(), PackageVersions::latest_only("1.40.0"));
                 doc.resolved_versions
                     .insert("serde".into(), "1.0.195".to_string());
                 doc.resolved_versions
@@ -2498,13 +2705,13 @@ tokio = "1.0"
                     "Cached versions should be preserved"
                 );
                 assert_eq!(
-                    doc.cached_versions.get("serde"),
-                    Some(&"1.0.210".to_string()),
+                    doc.cached_versions.get("serde").map(|v| v.latest.as_str()),
+                    Some("1.0.210"),
                     "serde cache preserved"
                 );
                 assert_eq!(
-                    doc.cached_versions.get("tokio"),
-                    Some(&"1.40.0".to_string()),
+                    doc.cached_versions.get("tokio").map(|v| v.latest.as_str()),
+                    Some("1.40.0"),
                     "tokio cache preserved"
                 );
                 assert_eq!(
@@ -2617,7 +2824,7 @@ serde = "1.0"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.cached_versions
-                    .insert("serde".into(), "1.0.210".to_string());
+                    .insert("serde".into(), PackageVersions::latest_only("1.0.210"));
             }
 
             // Invalid TOML (parse will fail)
@@ -2648,8 +2855,8 @@ serde = "1.0"
                 "Cache should be preserved on parse failure"
             );
             assert_eq!(
-                doc.cached_versions.get("serde"),
-                Some(&"1.0.210".to_string())
+                doc.cached_versions.get("serde").map(|v| v.latest.as_str()),
+                Some("1.0.210")
             );
         }
 
@@ -2765,12 +2972,18 @@ anyhow = "1.0"
             // Populate cache for all 3 deps
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.cached_versions
-                    .insert(PackageName::new("serde"), "1.0.210".to_string());
-                doc.cached_versions
-                    .insert(PackageName::new("tokio"), "1.40.0".to_string());
-                doc.cached_versions
-                    .insert(PackageName::new("anyhow"), "1.0.89".to_string());
+                doc.cached_versions.insert(
+                    PackageName::new("serde"),
+                    PackageVersions::latest_only("1.0.210"),
+                );
+                doc.cached_versions.insert(
+                    PackageName::new("tokio"),
+                    PackageVersions::latest_only("1.40.0"),
+                );
+                doc.cached_versions.insert(
+                    PackageName::new("anyhow"),
+                    PackageVersions::latest_only("1.0.89"),
+                );
             }
 
             // Remove anyhow from manifest

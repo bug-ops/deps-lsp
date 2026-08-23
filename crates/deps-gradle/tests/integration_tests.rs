@@ -1,7 +1,7 @@
 //! Integration tests for deps-gradle parsers using fixture files.
 
 use deps_core::lsp_helpers::{generate_diagnostics_from_cache, generate_inlay_hints};
-use deps_core::{EcosystemConfig, LoadingState, VersionData};
+use deps_core::{EcosystemConfig, LoadingState, PackageVersions, VersionData};
 use deps_gradle::GradleFormatter;
 use deps_gradle::parser::{GradleParseResult, parse_gradle};
 use std::collections::HashMap;
@@ -219,7 +219,7 @@ spring-boot = { module = "org.springframework.boot:spring-boot-starter", version
     let mut cached_versions = HashMap::new();
     cached_versions.insert(
         "org.springframework.boot:spring-boot-starter".into(),
-        "3.2.0".to_string(),
+        PackageVersions::latest_only("3.2.0"),
     );
     let resolved_versions = HashMap::new();
 

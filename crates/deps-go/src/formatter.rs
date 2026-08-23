@@ -1,7 +1,45 @@
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::VersionReq;
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
 use deps_core::{Dependency, PackageName};
 
 use crate::types::{GoDependency, GoDirective};
+
+/// Exact/pseudo-version comparison shared by `version_satisfies_requirement` and
+/// [`GoFormatter::compile_requirement`]'s matcher — Go module requirements are exact pins
+/// or MVS-selected versions, not ranges, so both call sites need identical semantics:
+///
+/// 1. Exact match: v1.2.3 == v1.2.3
+/// 2. Prefix match for pseudo-versions: v0.0.0-20191109021931-daa7c04131f5 starts with v0.0.0
+/// 3. Prefix match for +incompatible: v2.0.0+incompatible starts with v2.0.0
+fn go_version_matches(version: &str, requirement: &str) -> bool {
+    if version == requirement {
+        return true;
+    }
+
+    // Handle pseudo-versions and +incompatible suffix
+    // Check if version starts with requirement followed by a dot, hyphen, plus, or end
+    // This prevents false positives like v1.2.30 matching v1.2.3
+    if let Some(suffix) = version.strip_prefix(requirement) {
+        return suffix.is_empty()
+            || suffix.starts_with('.')
+            || suffix.starts_with('-')
+            || suffix.starts_with('+');
+    }
+
+    false
+}
+
+/// Exact/pseudo-version matcher, compiled once per dependency by
+/// [`GoFormatter::compile_requirement`]. Always decidable (`Some`) — Go module version
+/// strings need no external parser, just [`go_version_matches`]'s string comparison — so
+/// this never skips a candidate the way ecosystems with a real version parser can.
+struct ExactMatcher(String);
+
+impl RequirementMatcher for ExactMatcher {
+    fn matches(&self, version: &str) -> Option<bool> {
+        Some(go_version_matches(version, &self.0))
+    }
+}
 
 /// Formatter for Go module version strings and package URLs.
 ///
@@ -23,27 +61,27 @@ impl EcosystemFormatter for GoFormatter {
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
-        // For Go modules, version matching is typically exact
-        // However, we need to handle:
-        // 1. Exact match: v1.2.3 == v1.2.3
-        // 2. Prefix match for pseudo-versions: v0.0.0-20191109021931-daa7c04131f5 starts with v0.0.0
-        // 3. Prefix match for +incompatible: v2.0.0+incompatible starts with v2.0.0
+        go_version_matches(version, requirement)
+    }
 
-        if version == requirement {
-            return true;
+    /// Compiles `requirement` into an `ExactMatcher` using the same exact/pseudo-version
+    /// comparison `version_satisfies_requirement` uses — Go's requirement syntax has no
+    /// separate "loose" vs. "precise" distinction, so both share `go_version_matches`.
+    ///
+    /// Returns `None` when `requirement` is itself a pseudo-version
+    /// (`crate::version::is_pseudo_version`): `proxy.golang.org/<mod>/@v/list` — the source
+    /// of `available` — never lists pseudo-versions (they're derived per-commit, not
+    /// enumerable), so a pseudo-version pin can never be found in `available` even when the
+    /// exact commit it names is real. Scanning would always decide `Some(false)` for every
+    /// candidate, producing a false "no published version satisfies" warning on an ordinary
+    /// `go.mod` commit pin. A `+incompatible`-suffixed *tag* (not a pseudo-version) is a real
+    /// entry `/@v/list` does return, so it needs no such guard.
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.as_str();
+        if crate::version::is_pseudo_version(requirement) {
+            return None;
         }
-
-        // Handle pseudo-versions and +incompatible suffix
-        // Check if version starts with requirement followed by a dot, hyphen, plus, or end
-        // This prevents false positives like v1.2.30 matching v1.2.3
-        if let Some(suffix) = version.strip_prefix(requirement) {
-            return suffix.is_empty()
-                || suffix.starts_with('.')
-                || suffix.starts_with('-')
-                || suffix.starts_with('+');
-        }
-
-        false
+        Some(Box::new(ExactMatcher(requirement.to_string())))
     }
 
     fn osv_version_to_native(&self, version: &str) -> String {
@@ -275,5 +313,50 @@ mod tests {
         // A version without the "v" prefix (should not normally occur for
         // Go, but the transform must be a no-op rather than corrupt it).
         assert_eq!(formatter.osv_version("1.2.3"), "1.2.3");
+    }
+
+    #[test]
+    fn test_compile_requirement_satisfiable() {
+        let formatter = GoFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("v1.9.1"))
+            .expect("an ordinary tagged requirement compiles");
+        assert_eq!(matcher.matches("v1.9.1"), Some(true));
+        assert_eq!(matcher.matches("v1.9.2"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_never_skips_a_candidate() {
+        // Go's matcher has no external parser to fail on, so unlike other ecosystems it
+        // never returns `None` for a candidate.
+        let formatter = GoFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("v1.9.1"))
+            .unwrap();
+        assert_eq!(matcher.matches("not-a-version-at-all"), Some(false));
+    }
+
+    /// S1 regression: `/@v/list` never enumerates pseudo-versions, so a pseudo-version
+    /// requirement (an ordinary `go.mod` commit pin) can never be found in `available` —
+    /// the whole scan must be suppressed (`None`), not scanned to a false "unsatisfiable".
+    #[test]
+    fn test_compile_requirement_pseudo_version_requirement_returns_none() {
+        let formatter = GoFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("v0.0.0-20191109021931-daa7c04131f5"))
+                .is_none()
+        );
+    }
+
+    /// A `+incompatible`-suffixed *tag* is a real, enumerable `/@v/list` entry (not a
+    /// pseudo-version), so it must not be caught by the pseudo-version guard above.
+    #[test]
+    fn test_compile_requirement_incompatible_tag_still_compiles() {
+        let formatter = GoFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("v2.0.0+incompatible"))
+            .expect("a +incompatible tag is not a pseudo-version");
+        assert_eq!(matcher.matches("v2.0.0+incompatible"), Some(true));
     }
 }

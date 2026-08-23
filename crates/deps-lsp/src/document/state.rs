@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
-use deps_core::{EcosystemId, EcosystemRegistry, PackageName, ParseResult};
+use deps_core::{EcosystemId, EcosystemRegistry, PackageName, PackageVersions, ParseResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,8 +42,9 @@ pub struct DocumentState {
     /// Note: This is not cloned when DocumentState is cloned
     #[allow(dead_code)]
     parse_result: Option<Box<dyn ParseResult>>,
-    /// Simplified cached versions (just strings) for new architecture
-    pub cached_versions: HashMap<PackageName, String>,
+    /// Latest known version and full version list per package, fetched together in a
+    /// single registry round trip (see [`PackageVersions`]).
+    pub cached_versions: HashMap<PackageName, PackageVersions>,
     /// Resolved versions from lock file
     pub resolved_versions: HashMap<PackageName, String>,
     /// OSV.dev scan results, keyed by normalized package name. Empty until
@@ -234,8 +235,8 @@ impl DocumentState {
         self.parse_result.as_ref().map(std::convert::AsRef::as_ref)
     }
 
-    /// Updates the simplified cached versions (new architecture).
-    pub fn update_cached_versions(&mut self, versions: HashMap<PackageName, String>) {
+    /// Updates the cached registry version data (new architecture).
+    pub fn update_cached_versions(&mut self, versions: HashMap<PackageName, PackageVersions>) {
         self.cached_versions = versions;
     }
 
@@ -1167,7 +1168,7 @@ mod tests {
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, "test".into());
 
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), "1.0.210".into());
+            cached.insert("serde".into(), PackageVersions::latest_only("1.0.210"));
 
             state.update_cached_versions(cached);
             assert_eq!(state.cached_versions.len(), 1);

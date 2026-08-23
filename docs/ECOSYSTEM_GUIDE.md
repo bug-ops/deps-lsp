@@ -133,6 +133,56 @@ into `go.mod`'s `v`-prefixed form is in place, but Go's vulnerability scan curre
 the `v`-prefixed module version to OSV, which expects it unprefixed, and gets no matches
 back (tracked separately) — so no Go dependency can trigger this action yet.
 
+### Unsatisfiable Version Requirement
+
+When a dependency's declared version requirement matches **zero published versions** — of
+any kind, stable, prerelease, or yanked — deps-lsp shows a WARNING diagnostic:
+
+```
+No published version satisfies requirement '99'; latest is 1.0.214
+```
+
+This is distinct from `Unknown package` (the package itself was not found) and from the
+"Newer version available" HINT (a satisfiable requirement that simply isn't pinned to the
+latest release). The two are mutually exclusive on the same dependency — a requirement is
+either up to date, outdated-but-satisfiable, or unsatisfiable, never more than one at once.
+
+The check is always on (no configuration flag) across all 11 ecosystems, and is
+deliberately conservative:
+
+- **Suppressed while versions are still loading**, or if the registry fetch failed — an
+  empty/unknown version list means "don't know yet", not "nothing published".
+- **Suppressed for path/git/URL/SDK/workspace dependencies** — their `version` field, if
+  present, does not refer to something resolvable against the ecosystem's package registry
+  at all (e.g. this project's own `deps-core = { path = ..., version = "0.10.1" }`, or
+  Dart's `{ sdk: flutter, version: "^3.24.0" }`, which resolves against pub.dev's unrelated
+  package literally named `flutter`).
+- **Suppressed for an unresolved requirement** — a dangling Gradle version-catalog
+  `version.ref` alias or an unexpanded Maven `${property}` was never actually checked
+  against anything.
+- **A prerelease-only or yanked-only match still counts as satisfied.** `foo = "2.0.0-beta.1"`
+  is a deliberate opt-in, and a yanked version is still installable when pinned (Cargo
+  resolves yanked versions present in the lock file); flagging either as unsatisfiable would
+  be a false positive.
+- **Suppressed for requirement forms naming a version outside the fetched candidate list by
+  construction**, not just failing to match one present in it — Go pseudo-versions and
+  `dev-*`/`*-dev`/`@dev` Composer branches (never enumerable from the registry list at all),
+  RubyGems exact pins (yanked versions are omitted from the list with no flag to detect
+  them by), and Maven/Gradle `-SNAPSHOT`/`LATEST`/`RELEASE` (resolved via a different
+  repository/side channel this registry never queries).
+- Each ecosystem opts in by implementing a precise per-version-format comparator (the same
+  crate its registry client already depends on: `semver` for Cargo/Swift, `node-semver` for
+  npm, `pep440_rs` for PyPI, bracket-interval range parsers for Maven/Gradle/NuGet, and
+  exact/pattern comparators for Go/Bundler/Dart/Composer) — not the same loose heuristic
+  used for the "up to date" hint, which is intentionally permissive and would produce false
+  positives if reused here (e.g. Cargo's `~1.0.999` reads as "up to date" against a latest
+  of `1.0.214` under the loose same-major-minor heuristic, despite patch `999` never having
+  been published).
+
+**Not yet implemented:** a quick-fix code action that rewrites the requirement to the
+latest version (tracked as a follow-up), and a separate informational diagnostic for a
+requirement that only matches prerelease versions.
+
 ### npm Package Name Validation
 
 When a dependency in `package.json` fails to resolve against the npm registry, the diagnostic distinguishes between two cases instead of always reporting "Unknown package":

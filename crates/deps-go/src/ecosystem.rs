@@ -167,7 +167,7 @@ impl Ecosystem for GoEcosystem {
 mod tests {
     use super::*;
     use crate::types::{GoDependency, GoDirective};
-    use deps_core::{Dependency, EcosystemConfig, VersionData};
+    use deps_core::{Dependency, EcosystemConfig, PackageVersions, VersionData};
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
@@ -262,7 +262,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
+        cached_versions.insert(
+            "github.com/gin-gonic/gin".into(),
+            PackageVersions::latest_only("v1.9.1"),
+        );
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -305,7 +308,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
+        cached_versions.insert(
+            "github.com/gin-gonic/gin".into(),
+            PackageVersions::latest_only("v1.9.1"),
+        );
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -346,7 +352,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
+        cached_versions.insert(
+            "github.com/gin-gonic/gin".into(),
+            PackageVersions::latest_only("v1.9.1"),
+        );
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -384,7 +393,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
+        cached_versions.insert(
+            "github.com/gin-gonic/gin".into(),
+            PackageVersions::latest_only("v1.9.1"),
+        );
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),

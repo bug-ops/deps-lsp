@@ -1,5 +1,18 @@
-use deps_core::PackageName;
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::{PackageName, VersionReq};
+
+/// Precise semver `VersionReq` matcher, compiled once per dependency by
+/// [`CargoFormatter::compile_requirement`].
+struct SemverMatcher(semver::VersionReq);
+
+impl RequirementMatcher for SemverMatcher {
+    fn matches(&self, version: &str) -> Option<bool> {
+        version
+            .parse::<semver::Version>()
+            .ok()
+            .map(|v| self.0.matches(&v))
+    }
+}
 
 pub struct CargoFormatter;
 
@@ -10,6 +23,18 @@ impl EcosystemFormatter for CargoFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::crate_url(name.as_str())
+    }
+
+    /// Compiles `requirement` via `semver::VersionReq`, the same crate `deps-cargo`'s
+    /// registry uses for matching — precise range semantics (`^`, `~`, comparator lists),
+    /// unlike the default `version_satisfies_requirement` heuristic this method
+    /// deliberately does not reuse (see that method's docs).
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        requirement
+            .as_str()
+            .parse::<semver::VersionReq>()
+            .ok()
+            .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
 }
 
@@ -69,5 +94,60 @@ mod tests {
 
         assert!(!formatter.version_satisfies_requirement("1.2.3", "2.0.0"));
         assert!(!formatter.version_satisfies_requirement("1.2.3", "1.3"));
+    }
+
+    #[test]
+    fn test_compile_requirement_satisfiable() {
+        let formatter = CargoFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("^1.0"))
+            .expect("valid semver requirement must compile");
+        assert_eq!(matcher.matches("1.5.0"), Some(true));
+        assert_eq!(matcher.matches("2.0.0"), Some(false));
+    }
+
+    #[test]
+    fn test_compile_requirement_unparseable_requirement_returns_none() {
+        let formatter = CargoFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("not a semver req"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_unparseable_candidate_is_skipped() {
+        let formatter = CargoFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("^1.0"))
+            .unwrap();
+        assert_eq!(matcher.matches("not-a-version"), None);
+    }
+
+    /// §3.1 worked example: an ordinary comparator-list requirement, which
+    /// `version_satisfies_requirement`'s loose heuristic (no `^`/`~` prefix, three dot
+    /// segments so `is_partial_version` is false) incorrectly rejects. The precise
+    /// `compile_requirement` matcher must accept it.
+    #[test]
+    fn test_compile_requirement_comparator_list_satisfiable() {
+        let formatter = CargoFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new(">=1.0, <2.0"))
+            .unwrap();
+        assert_eq!(matcher.matches("1.5.0"), Some(true));
+    }
+
+    /// §3.3 case: `~1.0.999` and latest `1.0.214` share major/minor, so the loose
+    /// `is_same_major_minor`-based heuristic (and the removed `status == Outdated` gate)
+    /// would treat this as up to date. The precise matcher must reject it — patch `999`
+    /// is not published.
+    #[test]
+    fn test_compile_requirement_tilde_mistyped_patch_is_unsatisfiable() {
+        let formatter = CargoFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("~1.0.999"))
+            .unwrap();
+        assert_eq!(matcher.matches("1.0.214"), Some(false));
     }
 }

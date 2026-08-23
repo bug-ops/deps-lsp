@@ -1,6 +1,7 @@
 //! Shared LSP response builders.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeDescription, CodeLens, Command, Diagnostic, DiagnosticSeverity,
     Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip,
@@ -13,33 +14,108 @@ use crate::{
     Registry, Version, VersionReq, format_relative_age,
 };
 
+/// Registry version data for one package, fetched together in a single round trip.
+///
+/// `latest` and `available` are deliberately asymmetric — this is load-bearing, not an
+/// oversight:
+/// - `latest` comes from this ecosystem's own `Registry::select_latest_matching(.., "*")`
+///   pick, which excludes yanked (and, for semver/node-semver `*`, prerelease) versions —
+///   the same value `get_latest_matching` returned before this type existed.
+/// - `available` is the **unfiltered** `get_versions` output: every published version,
+///   newest-first, yanked and prerelease entries included.
+///
+/// The unsatisfiable-requirement check (see `crate::lsp_helpers::requirement_is_unsatisfiable`)
+/// scans `available` and deliberately does not filter it: a requirement that only matches a
+/// yanked or prerelease version is still satisfied, so filtering `available` the same way
+/// `latest` is filtered would produce false "no published version satisfies" warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageVersions {
+    /// Latest usable version for this package.
+    pub latest: String,
+    /// Every published version, newest-first, unfiltered.
+    pub available: Arc<[String]>,
+}
+
+impl PackageVersions {
+    /// Builds a `PackageVersions` from only the "latest" version string, with `available`
+    /// populated as the single-element list `[latest]`.
+    ///
+    /// **Test-only in intent.** The one-element `available` this produces is a real, if
+    /// small, version list — it is not "empty/unknown", so `requirement_is_unsatisfiable`
+    /// will evaluate a requirement against it. Do **not** use this for a lock-file-only
+    /// population path that has no real version list to offer (use
+    /// [`latest_without_list`](Self::latest_without_list) there instead, which leaves
+    /// `available` genuinely empty) — that exact substitution is the false-positive N5 was
+    /// written to prevent: it would let the unsatisfiable-requirement check produce a
+    /// verdict against a fabricated one-entry list before any registry fetch has run. Real
+    /// registry fetches always populate `available` from the full `get_versions` result
+    /// instead of using either constructor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::PackageVersions;
+    ///
+    /// let versions = PackageVersions::latest_only("1.0.214");
+    /// assert_eq!(versions.latest, "1.0.214");
+    /// assert_eq!(&*versions.available, &["1.0.214".to_string()]);
+    /// ```
+    pub fn latest_only(latest: impl Into<String>) -> Self {
+        let latest = latest.into();
+        let available = Arc::from(vec![latest.clone()]);
+        Self { latest, available }
+    }
+
+    /// Builds a `PackageVersions` with no version list — used where only the "latest" value
+    /// is known and probing further would be misleading, notably the lock-file population
+    /// path (`crates/deps-lsp/src/document/lifecycle.rs`), which must not populate a
+    /// plausible-looking one-element `available` list before any registry fetch has run: the
+    /// unsatisfiable-requirement check treats an empty `available` as "still loading, skip".
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::PackageVersions;
+    ///
+    /// let versions = PackageVersions::latest_without_list("1.0.195");
+    /// assert_eq!(versions.latest, "1.0.195");
+    /// assert!(versions.available.is_empty());
+    /// ```
+    pub fn latest_without_list(latest: impl Into<String>) -> Self {
+        Self {
+            latest: latest.into(),
+            available: Arc::from(Vec::new()),
+        }
+    }
+}
+
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
 /// together everywhere.
 ///
-/// Grouping them prevents accidentally swapping the two `&HashMap<PackageName, String>`
-/// arguments at a call site, since the compiler can no longer typecheck them positionally.
+/// Grouping them prevents accidentally swapping the two map arguments at a call site, since
+/// the compiler can no longer typecheck them positionally.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::{PackageName, VersionData};
+/// use deps_core::{PackageName, PackageVersions, VersionData};
 /// use std::collections::HashMap;
 ///
 /// let mut cached = HashMap::new();
-/// cached.insert(PackageName::new("serde"), "1.0.214".to_string());
+/// cached.insert(PackageName::new("serde"), PackageVersions::latest_only("1.0.214"));
 ///
 /// let mut resolved = HashMap::new();
 /// resolved.insert(PackageName::new("serde"), "1.0.200".to_string());
 ///
 /// let versions = VersionData::new(&cached, &resolved);
 ///
-/// assert_eq!(versions.cached.get("serde"), Some(&"1.0.214".to_string()));
+/// assert_eq!(versions.cached.get("serde").map(|v| v.latest.as_str()), Some("1.0.214"));
 /// assert_eq!(versions.resolved.get("serde"), Some(&"1.0.200".to_string()));
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct VersionData<'a> {
-    /// Latest versions known from the registry, keyed by package name.
-    pub cached: &'a HashMap<PackageName, String>,
+    /// Latest known versions and full version lists from the registry, keyed by package name.
+    pub cached: &'a HashMap<PackageName, PackageVersions>,
     /// Versions actually resolved in the lock file, keyed by package name.
     pub resolved: &'a HashMap<PackageName, String>,
     /// OSV scan results, keyed by normalized package name. `None` when no
@@ -67,7 +143,7 @@ impl<'a> VersionData<'a> {
     /// assert!(versions.vulnerabilities.is_none());
     /// ```
     pub fn new(
-        cached: &'a HashMap<PackageName, String>,
+        cached: &'a HashMap<PackageName, PackageVersions>,
         resolved: &'a HashMap<PackageName, String>,
     ) -> Self {
         Self {
@@ -328,6 +404,44 @@ pub enum RequirementStatus {
     Unresolved,
 }
 
+/// A `requirement` compiled by one ecosystem, ready to test candidate versions against.
+///
+/// Produced by [`EcosystemFormatter::compile_requirement`]. Kept as a separate object
+/// (rather than a single "does any version match" function) so the requirement is parsed
+/// once per dependency, and so the scanning loop — including the empty-list guard, the
+/// early-exit on first match, and the "skip an unparseable candidate" rule — lives once in
+/// [`requirement_is_unsatisfiable`] instead of being reimplemented by all eleven ecosystems.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::RequirementMatcher;
+///
+/// struct ExactMatch(String);
+///
+/// impl RequirementMatcher for ExactMatch {
+///     fn matches(&self, version: &str) -> Option<bool> {
+///         Some(version == self.0)
+///     }
+/// }
+///
+/// let matcher = ExactMatch("1.0.0".to_string());
+/// assert_eq!(matcher.matches("1.0.0"), Some(true));
+/// assert_eq!(matcher.matches("2.0.0"), Some(false));
+/// ```
+pub trait RequirementMatcher: Send + Sync {
+    /// Tests one candidate version string against the compiled requirement.
+    ///
+    /// `Some(true)` / `Some(false)`: this candidate provably does / does not satisfy the
+    /// requirement. `None`: this candidate *string* could not be parsed by this ecosystem's
+    /// version format (e.g. a PyPI legacy release identifier, a Maven timestamped snapshot
+    /// qualifier) — the caller skips it and keeps scanning the rest of the list. Never
+    /// return `None` to mean "the requirement itself is unusable"; that is
+    /// [`EcosystemFormatter::compile_requirement`]'s job, via returning `None` from that
+    /// method instead of constructing a matcher at all.
+    fn matches(&self, version: &str) -> Option<bool>;
+}
+
 /// Ecosystem-specific formatting and comparison logic.
 pub trait EcosystemFormatter: Send + Sync {
     /// Normalize package name for lookup (default: identity).
@@ -529,6 +643,50 @@ pub trait EcosystemFormatter: Send + Sync {
         }
     }
 
+    /// Compiles `requirement` into a matcher for precise membership testing against a list
+    /// of candidate version strings, or `None` when this ecosystem cannot parse or cannot
+    /// model this requirement form — in which case no unsatisfiable-requirement diagnostic
+    /// is produced for it.
+    ///
+    /// Distinct from `version_satisfies_requirement`, which answers the looser "treat as up
+    /// to date" question and is deliberately permissive (see that method's docs). This one
+    /// gates a WARNING diagnostic claiming "no published version satisfies this
+    /// requirement", so it must never guess: an ecosystem that has not opted in by
+    /// overriding this method emits no such diagnostic at all, rather than one derived from
+    /// a loose heuristic.
+    ///
+    /// Default: `None` — an ecosystem that has not opted in emits no unsatisfiable-requirement
+    /// diagnostics.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    /// use deps_core::{PackageName, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert!(
+    ///     DefaultFormatter
+    ///         .compile_requirement(&VersionReq::new("^1.2"))
+    ///         .is_none()
+    /// );
+    /// ```
+    fn compile_requirement(
+        &self,
+        _requirement: &VersionReq,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        None
+    }
+
     /// Get package URL for hover markdown.
     fn package_url(&self, name: &PackageName) -> String;
 
@@ -682,7 +840,8 @@ pub fn generate_inlay_hints(
         let latest_version = versions
             .cached
             .get(normalized_name.as_str())
-            .or_else(|| versions.cached.get(dep.name()));
+            .or_else(|| versions.cached.get(dep.name()))
+            .map(|v| v.latest.as_str());
         let resolved_version: Option<&str> =
             if formatter.manifest_requirement_is_resolved_version(dep) {
                 dep.version_requirement().map(VersionReq::as_str)
@@ -739,7 +898,7 @@ pub fn generate_inlay_hints(
         // 1. If lock file has the dep, check if resolved == latest
         // 2. If NOT in lock file, check the version requirement against latest
         let status = if let Some(resolved) = resolved_version {
-            if resolved == latest.as_str() {
+            if resolved == latest {
                 RequirementStatus::UpToDate
             } else {
                 RequirementStatus::Outdated
@@ -872,7 +1031,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let latest = versions
         .cached
         .get(normalized_name.as_str())
-        .or_else(|| versions.cached.get(dep.name()));
+        .or_else(|| versions.cached.get(dep.name()))
+        .map(|v| v.latest.as_str());
     if let Some(latest_ver) = latest {
         write!(
             &mut markdown,
@@ -1099,6 +1259,8 @@ fn build_vulnerability_fix_action(
 /// impl plus `ParseResult`/`Dependency` mocks, which live as private test
 /// fixtures in this module's own `#[cfg(test)]` block rather than as public
 /// API — see the `generate_code_actions_*` tests there for realistic calls.
+// TODO(#206-followup): unsatisfiable quick-fix needs context.diagnostics + latest
+// threaded into generate_code_actions.
 pub async fn generate_code_actions<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
@@ -1223,7 +1385,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     actions
 }
 
-/// Diagnostic severity levels for the three per-dependency issue categories.
+/// Diagnostic severity levels for the four per-dependency issue categories.
 ///
 /// Threaded from `DiagnosticsConfig` (`deps-lsp`) through
 /// [`crate::Ecosystem::generate_diagnostics`] into [`generate_diagnostics_from_cache`]
@@ -1239,6 +1401,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 /// assert_eq!(severities.outdated, DiagnosticSeverity::HINT);
 /// assert_eq!(severities.unknown, DiagnosticSeverity::WARNING);
 /// assert_eq!(severities.yanked, DiagnosticSeverity::WARNING);
+/// assert_eq!(severities.unsatisfiable, DiagnosticSeverity::WARNING);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiagnosticSeverities {
@@ -1248,6 +1411,8 @@ pub struct DiagnosticSeverities {
     pub unknown: DiagnosticSeverity,
     /// Severity for a dependency pinned to a yanked/deprecated version.
     pub yanked: DiagnosticSeverity,
+    /// Severity for a dependency whose requirement matches zero published versions.
+    pub unsatisfiable: DiagnosticSeverity,
 }
 
 impl Default for DiagnosticSeverities {
@@ -1256,8 +1421,117 @@ impl Default for DiagnosticSeverities {
             outdated: DiagnosticSeverity::HINT,
             unknown: DiagnosticSeverity::WARNING,
             yanked: DiagnosticSeverity::WARNING,
+            unsatisfiable: DiagnosticSeverity::WARNING,
         }
     }
+}
+
+/// Requirement strings longer than this are rejected by [`requirement_is_unsatisfiable`]
+/// before compilation, rather than compiled and scanned. No real manifest requirement in any
+/// supported ecosystem approaches this length; it exists solely to bound the cost of an
+/// adversarial or corrupted requirement string. Three of the eleven ecosystems'
+/// `RequirementMatcher::matches` implementations (Maven/Gradle's `crate::range::satisfies`,
+/// NuGet's `crate::version::satisfies`/`resolve_float`) re-parse the requirement on every
+/// candidate rather than once per dependency (a tracked follow-up, not fixed here), so
+/// without this cap a long-but-syntactically-valid requirement scanning a large `available`
+/// list is O(`requirement.len()` × `available.len()`) — measured at seconds for a
+/// several-KB requirement against a few thousand versions.
+const MAX_REQUIREMENT_LEN: usize = 256;
+
+/// Returns `true` when no published version satisfies `requirement`.
+///
+/// `available` must be non-empty, `requirement` must be a concrete (non-empty, resolved,
+/// not implausibly long) constraint, and no entry in `available` — of any kind: stable,
+/// prerelease, or yanked — may satisfy it. All of the following must hold for `true`:
+///
+/// 1. `!available.is_empty()` — an empty or not-yet-loaded list means "unknown", not
+///    "unsatisfiable" (FR-004: no diagnostic while loading or offline).
+/// 2. `!requirement.as_str().trim().is_empty()`.
+/// 3. `requirement.as_str().len() <= MAX_REQUIREMENT_LEN` — see that constant's docs; an
+///    oversized requirement is treated the same as "unmodellable" (suppressed, not warned).
+/// 4. `!formatter.requirement_is_unresolved(requirement)` (FR-005) — an unresolved
+///    placeholder requirement was never actually checked against anything.
+/// 5. `formatter.compile_requirement(requirement)` returns `Some(matcher)` — this
+///    ecosystem opted in and the requirement string itself parses.
+/// 6. Scanning `available` with `matcher.matches`: **at least one** candidate returned
+///    `Some(false)`, and **none** returned `Some(true)`. Candidates returning `None`
+///    (unparseable candidate strings) are skipped and count toward neither side —
+///    condition 6's "at least one `Some(false)`" is load-bearing: if every candidate is
+///    unparseable, nothing was decided, so the verdict is `false` (no diagnostic) rather
+///    than a vacuous `true`.
+///
+/// The scan short-circuits on the first `Some(true)` — O(N) worst case, and the newest-first
+/// ordering of `available` means a satisfiable requirement typically exits within the first
+/// few entries.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{requirement_is_unsatisfiable, EcosystemFormatter, RequirementMatcher};
+/// use deps_core::{PackageName, VersionReq};
+///
+/// struct ExactMatcher(String);
+/// impl RequirementMatcher for ExactMatcher {
+///     fn matches(&self, version: &str) -> Option<bool> {
+///         Some(version == self.0)
+///     }
+/// }
+///
+/// struct ExactFormatter;
+/// impl EcosystemFormatter for ExactFormatter {
+///     fn format_version_for_text_edit(&self, version: &str) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.to_string()
+///     }
+///     fn compile_requirement(
+///         &self,
+///         requirement: &VersionReq,
+///     ) -> Option<Box<dyn RequirementMatcher>> {
+///         Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
+///     }
+/// }
+///
+/// let available = vec!["1.0.0".to_string(), "0.9.0".to_string()];
+/// assert!(requirement_is_unsatisfiable(
+///     &ExactFormatter,
+///     &VersionReq::new("2.0.0"),
+///     &available,
+/// ));
+/// assert!(!requirement_is_unsatisfiable(
+///     &ExactFormatter,
+///     &VersionReq::new("1.0.0"),
+///     &available,
+/// ));
+/// ```
+pub fn requirement_is_unsatisfiable(
+    formatter: &dyn EcosystemFormatter,
+    requirement: &VersionReq,
+    available: &[String],
+) -> bool {
+    if available.is_empty() || requirement.as_str().trim().is_empty() {
+        return false;
+    }
+    if requirement.as_str().len() > MAX_REQUIREMENT_LEN {
+        return false;
+    }
+    if formatter.requirement_is_unresolved(requirement) {
+        return false;
+    }
+    let Some(matcher) = formatter.compile_requirement(requirement) else {
+        return false;
+    };
+
+    let mut saw_decided_false = false;
+    for candidate in available {
+        match matcher.matches(candidate) {
+            Some(true) => return false,
+            Some(false) => saw_decided_false = true,
+            None => {}
+        }
+    }
+    saw_decided_false
 }
 
 /// Generates diagnostics using cached versions (no network calls).
@@ -1295,12 +1569,12 @@ pub fn generate_diagnostics_from_cache(
             push_vulnerability_diagnostics(&mut diagnostics, dep, dv);
         }
 
-        let latest_version = versions
+        let package_versions = versions
             .cached
             .get(normalized_name.as_str())
             .or_else(|| versions.cached.get(dep.name()));
 
-        let Some(latest) = latest_version else {
+        let Some(package_versions) = package_versions else {
             // Skip "unknown" diagnostic if package exists in lock file
             // (registry fetch may have failed due to rate limiting)
             let in_lockfile = versions.resolved.contains_key(normalized_name.as_str())
@@ -1320,10 +1594,39 @@ pub fn generate_diagnostics_from_cache(
             }
             continue;
         };
+        let latest = package_versions.latest.as_str();
 
         let Some(version_range) = dep.version_range() else {
             continue;
         };
+
+        // Path/git/URL/SDK/workspace dependencies never resolve against a
+        // registry version list at all — `package_versions` (when present)
+        // either came from a coincidentally-matching registry entry of the
+        // same name (e.g. this workspace's own `deps-core = { path = ...
+        // version = "0.10.1" }`, which only avoids a false WARNING today
+        // because 0.10.1 also happens to be published) or an entirely
+        // unrelated package (Dart's `{ sdk: flutter, version = "^3.24.0" }`
+        // resolves against pub.dev's unrelated `flutter` package). Neither
+        // is a meaningful "no published version satisfies this" check.
+        let unsatisfiable = dep.source().is_version_resolvable()
+            && dep.version_requirement().is_some_and(|version_req| {
+                requirement_is_unsatisfiable(formatter, version_req, &package_versions.available)
+            });
+
+        if unsatisfiable {
+            let req_str = dep.version_requirement().map_or("", |r| r.as_str());
+            diagnostics.push(Diagnostic {
+                range: version_range,
+                severity: Some(severities.unsatisfiable),
+                message: format!(
+                    "No published version satisfies requirement '{req_str}'; latest is {latest}"
+                ),
+                source: Some("deps-lsp".into()),
+                ..Default::default()
+            });
+            continue;
+        }
 
         let status = match dep.version_requirement() {
             Some(version_req) => formatter.requirement_status(version_req, latest),
@@ -1426,7 +1729,9 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{collect_update_all_edits, EcosystemFormatter, VersionData};
+/// use deps_core::lsp_helpers::{
+///     collect_update_all_edits, EcosystemFormatter, PackageVersions, VersionData,
+/// };
 /// use deps_core::{Dependency, ParseResult, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
@@ -1481,7 +1786,7 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 /// };
 ///
 /// let mut cached = HashMap::new();
-/// cached.insert("serde".into(), "1.2.0".to_string());
+/// cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
 /// let resolved = HashMap::new();
 ///
 /// let edits = collect_update_all_edits(
@@ -1516,6 +1821,7 @@ pub fn collect_update_all_edits(
             .cached
             .get(normalized_name.as_str())
             .or_else(|| versions.cached.get(dep.name()))
+            .map(|v| v.latest.as_str())
         else {
             continue;
         };
@@ -3907,7 +4213,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "2.1.1".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.1.1"));
 
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert("serde".into(), "2.0.12".to_string());
@@ -3954,7 +4260,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "2.1.1".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.1.1"));
 
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert("serde".into(), "2.1.1".to_string());
@@ -4005,7 +4311,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("example.com/mod".into(), "v0.9.1".to_string());
+        cached_versions.insert(
+            "example.com/mod".into(),
+            PackageVersions::latest_only("v0.9.1"),
+        );
 
         // Stale go.sum entry left behind by a downgrade: go.sum is sorted ascending by
         // semver, so it sorts last and would win naive last-occurrence-wins parsing
@@ -4061,7 +4370,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.2.0".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
 
         let mut resolved_versions = HashMap::new();
         resolved_versions.insert("serde".into(), "1.2.0".to_string());
@@ -4245,7 +4554,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
@@ -4543,7 +4852,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "2.0.0".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
 
         let resolved_versions = HashMap::new();
 
@@ -4579,7 +4888,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
 
         let resolved_versions = HashMap::new();
 
@@ -4629,8 +4938,8 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), "1.0.214".to_string());
-        cached_versions.insert("tokio".into(), "2.0.0".to_string());
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+        cached_versions.insert("tokio".into(), PackageVersions::latest_only("2.0.0"));
 
         let resolved_versions = HashMap::new();
 
@@ -4680,7 +4989,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("criterion".into(), "0.5.1".to_string());
+        cached_versions.insert("criterion".into(), PackageVersions::latest_only("0.5.1"));
 
         // Not in lock file (empty resolved_versions)
         let resolved_versions = HashMap::new();
@@ -4731,7 +5040,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("criterion".into(), "0.5.1".to_string());
+        cached_versions.insert("criterion".into(), PackageVersions::latest_only("0.5.1"));
 
         // Not in lock file (empty resolved_versions)
         let resolved_versions = HashMap::new();
@@ -4776,7 +5085,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("spring-boot-starter".into(), "3.2.0".to_string());
+        cached_versions.insert(
+            "spring-boot-starter".into(),
+            PackageVersions::latest_only("3.2.0"),
+        );
 
         let resolved_versions = HashMap::new();
 
@@ -4818,7 +5130,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("spring-boot-starter".into(), "3.2.0".to_string());
+        cached_versions.insert(
+            "spring-boot-starter".into(),
+            PackageVersions::latest_only("3.2.0"),
+        );
 
         // Not in lock file, so status is derived from `requirement_status` on the
         // formatter (which the caller sets to `Unresolved`) rather than a resolved-vs-latest
@@ -4932,7 +5247,7 @@ mod tests {
             let content = r#"serde = "1.0.0""#;
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), "1.0.0".to_string());
+            cached.insert("serde".into(), PackageVersions::latest_only("1.0.0"));
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -4958,8 +5273,8 @@ mod tests {
                 dep("tokio", Some("1.0.0"), Some(range(1, 9, 1, 14))),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), "1.2.0".to_string());
-            cached.insert("tokio".into(), "1.3.0".to_string());
+            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
+            cached.insert("tokio".into(), PackageVersions::latest_only("1.3.0"));
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -4995,7 +5310,7 @@ mod tests {
             let content = r#"serde = "1.0.0""#;
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), "1.2.0".to_string());
+            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -5019,7 +5334,7 @@ mod tests {
             let content = "serde = \"1.0.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("1.0.0"), None)]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), "1.2.0".to_string());
+            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5040,7 +5355,7 @@ mod tests {
             let content = "pkg = \"\"\n";
             let pr = parse_result(vec![dep("pkg", Some(""), Some(range(0, 6, 0, 6)))]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".into(), "1.0.0".to_string());
+            cached.insert("pkg".into(), PackageVersions::latest_only("1.0.0"));
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5082,7 +5397,7 @@ mod tests {
             let content = "serde = \"^1.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("^1.0"), Some(range(0, 9, 0, 13)))]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), "1.2.0".to_string());
+            cached.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5102,7 +5417,7 @@ mod tests {
             let content = r#"pkg = "1.0.0""#;
             let pr = parse_result(vec![dep("pkg", Some("1.0.0"), Some(range(0, 7, 0, 12)))]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".into(), "1.0.0".to_string());
+            cached.insert("pkg".into(), PackageVersions::latest_only("1.0.0"));
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5125,7 +5440,7 @@ mod tests {
                 Some(range(0, 9, 0, 25)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("slf4j-api".into(), "2.1.0".to_string());
+            cached.insert("slf4j-api".into(), PackageVersions::latest_only("2.1.0"));
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5151,7 +5466,7 @@ mod tests {
                 Some(range(0, 3, 0, 13)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("pkg".into(), "3.0.0".to_string());
+            cached.insert("pkg".into(), PackageVersions::latest_only("3.0.0"));
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5174,7 +5489,10 @@ mod tests {
                 Some(range(0, 53, 0, 58)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("Newtonsoft.Json".into(), "13.0.3".to_string());
+            cached.insert(
+                "Newtonsoft.Json".into(),
+                PackageVersions::latest_only("13.0.3"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5205,7 +5523,10 @@ mod tests {
                 Some(range(0, 53, 0, 60)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("Newtonsoft.Json".into(), "13.0.3".to_string());
+            cached.insert(
+                "Newtonsoft.Json".into(),
+                PackageVersions::latest_only("13.0.3"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5232,7 +5553,10 @@ mod tests {
                 Some(range(0, 53, 0, 61)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("Newtonsoft.Json".into(), "13.0.3".to_string());
+            cached.insert(
+                "Newtonsoft.Json".into(),
+                PackageVersions::latest_only("13.0.3"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5259,7 +5583,10 @@ mod tests {
                 Some(range(0, 53, 0, 62)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("Newtonsoft.Json".into(), "13.0.3".to_string());
+            cached.insert(
+                "Newtonsoft.Json".into(),
+                PackageVersions::latest_only("13.0.3"),
+            );
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5290,7 +5617,7 @@ mod tests {
                 Some(range(0, 9, 0, 18)),
             )]);
             let mut cached = HashMap::new();
-            cached.insert("interval-dep".into(), "3.0.0".to_string());
+            cached.insert("interval-dep".into(), PackageVersions::latest_only("3.0.0"));
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5316,8 +5643,8 @@ mod tests {
                 dep("unknown", Some("1.0.0"), Some(range(2, 11, 2, 16))),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("serde".into(), "2.0.0".to_string());
-            cached.insert("tokio".into(), "1.9.0".to_string());
+            cached.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
+            cached.insert("tokio".into(), PackageVersions::latest_only("1.9.0"));
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
@@ -5348,8 +5675,8 @@ mod tests {
                 dep("aaaa-dup", Some("1.0.0"), Some(range(0, 8, 0, 13))),
             ]);
             let mut cached = HashMap::new();
-            cached.insert("aaaa".into(), "2.0.0".to_string());
-            cached.insert("aaaa-dup".into(), "3.0.0".to_string());
+            cached.insert("aaaa".into(), PackageVersions::latest_only("2.0.0"));
+            cached.insert("aaaa-dup".into(), PackageVersions::latest_only("3.0.0"));
             let resolved = HashMap::new();
 
             let edits = collect_update_all_edits(
@@ -5385,6 +5712,152 @@ mod tests {
             version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
             name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)),
         }
+    }
+
+    /// Wraps a [`MockDep`] to report a non-`Registry` [`crate::parser::DependencySource`],
+    /// without touching every other `MockDep` literal in this test module.
+    struct NonRegistryDep(MockDep, crate::parser::DependencySource);
+
+    impl Dependency for NonRegistryDep {
+        fn name(&self) -> &PackageName {
+            self.0.name()
+        }
+        fn name_range(&self) -> Range {
+            self.0.name_range()
+        }
+        fn version_requirement(&self) -> Option<&VersionReq> {
+            self.0.version_requirement()
+        }
+        fn version_range(&self) -> Option<Range> {
+            self.0.version_range()
+        }
+        fn source(&self) -> crate::parser::DependencySource {
+            self.1.clone()
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// `ParseResult` holding exactly one dependency of any concrete `Dependency`
+    /// type, so single-dependency tests aren't forced to use `MockDep`/`MockParseResult`.
+    struct SingleDepParseResult<D> {
+        dep: D,
+        uri: Uri,
+    }
+
+    impl<D: Dependency + 'static> ParseResult for SingleDepParseResult<D> {
+        fn dependencies(&self) -> Vec<&dyn Dependency> {
+            vec![&self.dep]
+        }
+        fn workspace_root(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn uri(&self) -> &Uri {
+            &self.uri
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Formatter whose `compile_requirement` does exact-string matching, so
+    /// `requirement_is_unsatisfiable` can actually return `true` in a test
+    /// (unlike the default `MockFormatter`, whose `compile_requirement`
+    /// default always returns `None`).
+    struct ExactMatchFormatter;
+
+    struct ExactMatcher(String);
+    impl RequirementMatcher for ExactMatcher {
+        fn matches(&self, version: &str) -> Option<bool> {
+            Some(version == self.0)
+        }
+    }
+
+    impl EcosystemFormatter for ExactMatchFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            format!("https://example.com/{}", name)
+        }
+        fn compile_requirement(
+            &self,
+            requirement: &VersionReq,
+        ) -> Option<Box<dyn RequirementMatcher>> {
+            Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
+        }
+    }
+
+    #[test]
+    fn test_generate_diagnostics_unsatisfiable_skipped_for_non_registry_sources() {
+        use crate::parser::DependencySource;
+
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert("dep".into(), PackageVersions::latest_only("9.9.9"));
+            m
+        };
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/Cargo.toml");
+
+        // Requirement "1.0.0" against available ["9.9.9"] is unsatisfiable
+        // under ExactMatchFormatter — proven by the Registry-source case below.
+        for source in [
+            DependencySource::Path {
+                path: "../local".into(),
+            },
+            DependencySource::Git {
+                url: "https://example.com/repo.git".into(),
+                rev: None,
+            },
+            DependencySource::Url {
+                url: "https://example.com/pkg.tar.gz".into(),
+            },
+            DependencySource::Sdk {
+                sdk: "flutter".into(),
+            },
+            DependencySource::Workspace,
+        ] {
+            let parse_result = SingleDepParseResult {
+                dep: NonRegistryDep(dep_at("dep"), source.clone()),
+                uri: uri.clone(),
+            };
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                &ExactMatchFormatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|d| !d.message.contains("No published version satisfies")),
+                "source {source:?} must never produce the unsatisfiable-requirement WARNING"
+            );
+        }
+
+        // Control: the same requirement/available pair on a Registry-source
+        // dependency DOES produce the WARNING, proving the loop above isn't
+        // vacuously passing because the fixture never triggers it at all.
+        let registry_parse_result = SingleDepParseResult {
+            dep: dep_at("dep"),
+            uri,
+        };
+        let diagnostics = generate_diagnostics_from_cache(
+            &registry_parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &ExactMatchFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("No published version satisfies")),
+            "control case: a Registry-source dependency must still produce the WARNING"
+        );
     }
 
     #[test]
@@ -5491,7 +5964,7 @@ mod tests {
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
         };
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("git-pkg".into(), "1.0.0".to_string());
+        cached_versions.insert("git-pkg".into(), PackageVersions::latest_only("1.0.0"));
         let resolved_versions = HashMap::new();
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
@@ -5907,6 +6380,211 @@ mod tests {
             .await;
 
             assert!(actions.is_empty());
+        }
+    }
+
+    /// Table-driven coverage for `requirement_is_unsatisfiable` (plan §4), using a
+    /// formatter whose `compile_requirement` is configured per test via a closure-backed
+    /// matcher, rather than one of the fixed ecosystem formatters.
+    mod requirement_is_unsatisfiable_tests {
+        use super::*;
+
+        type Decide = Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
+
+        /// A matcher backed by a type-erased closure, so each test can express its own
+        /// per-candidate decision table without a new named type per test.
+        struct ClosureMatcher(Decide);
+
+        impl RequirementMatcher for ClosureMatcher {
+            fn matches(&self, version: &str) -> Option<bool> {
+                (self.0)(version)
+            }
+        }
+
+        /// A formatter whose `compile_requirement` is `None` (requirement is treated as
+        /// unmodellable) unless `requirement.as_str() == "modelled"`, in which case it
+        /// returns a `ClosureMatcher` wrapping `decide`. `requirement_is_unresolved` fires
+        /// on the literal string `"unresolved"`.
+        struct TableFormatter {
+            decide: Decide,
+        }
+
+        impl TableFormatter {
+            fn new(decide: impl Fn(&str) -> Option<bool> + Send + Sync + 'static) -> Self {
+                Self {
+                    decide: Arc::new(decide),
+                }
+            }
+        }
+
+        impl EcosystemFormatter for TableFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.to_string()
+            }
+            fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+                requirement.as_str() == "unresolved"
+            }
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                if requirement.as_str() != "modelled" {
+                    return None;
+                }
+                Some(Box::new(ClosureMatcher(Arc::clone(&self.decide)))
+                    as Box<dyn RequirementMatcher>)
+            }
+        }
+
+        fn versions(strs: &[&str]) -> Vec<String> {
+            strs.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        #[test]
+        fn test_empty_available_list_is_false() {
+            let formatter = TableFormatter::new(|_v| Some(true));
+            assert!(!requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &[],
+            ));
+        }
+
+        #[test]
+        fn test_empty_requirement_string_is_false() {
+            let formatter = TableFormatter::new(|_v| Some(false));
+            assert!(!requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new(""),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        /// S-1 (security): an oversized requirement is rejected before `compile_requirement`
+        /// is even called, bounding the cost of an adversarial/corrupted requirement string
+        /// regardless of how expensive that ecosystem's matcher is per candidate.
+        #[test]
+        fn test_oversized_requirement_is_false_without_compiling() {
+            let formatter =
+                TableFormatter::new(|_v| panic!("must not compile/scan an oversized requirement"));
+            let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
+            assert!(!requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new(oversized),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        #[test]
+        fn test_unresolved_requirement_is_false() {
+            let formatter = TableFormatter::new(|_v| Some(false));
+            assert!(!requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("unresolved"),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        #[test]
+        fn test_compile_requirement_none_is_false() {
+            let formatter = TableFormatter::new(|_v| Some(false));
+            assert!(!requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("not-modelled"),
+                &versions(&["1.0.0"]),
+            ));
+        }
+
+        #[test]
+        fn test_all_candidates_decided_false_is_true() {
+            let formatter = TableFormatter::new(|_v| Some(false));
+            assert!(requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.0.0", "2.0.0", "3.0.0"]),
+            ));
+        }
+
+        #[test]
+        fn test_one_match_among_many_non_matches_is_false() {
+            let formatter = TableFormatter::new(|v| Some(v == "2.0.0"));
+            assert!(!requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.0.0", "2.0.0", "3.0.0"]),
+            ));
+        }
+
+        /// S2 regression: every candidate unparseable means nothing was decided, so the
+        /// verdict must be `false` (no diagnostic), not a vacuous `true`.
+        #[test]
+        fn test_all_candidates_unparseable_is_false() {
+            let formatter = TableFormatter::new(|_v| None);
+            assert!(!requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.0.0", "2.0.0"]),
+            ));
+        }
+
+        /// S2 regression, other half: a single junk entry among otherwise-all-`Some(false)`
+        /// candidates is skipped, not fatal to the whole scan.
+        #[test]
+        fn test_one_unparseable_candidate_among_false_is_still_true() {
+            let formatter = TableFormatter::new(|v| if v == "junk" { None } else { Some(false) });
+            assert!(requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.0.0", "junk", "2.0.0"]),
+            ));
+        }
+
+        /// §1.3: a match on a candidate that happens to be yanked still counts as
+        /// satisfied — `available` carries no yanked flag, so this is exercised the same
+        /// way any other match is: the matcher deciding `Some(true)` for that entry.
+        #[test]
+        fn test_match_on_yanked_only_candidate_is_false() {
+            let formatter = TableFormatter::new(|v| Some(v == "1.0.0-yanked"));
+            assert!(!requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.0.0-yanked"]),
+            ));
+        }
+
+        /// §1.2: same, for a prerelease-only match.
+        #[test]
+        fn test_match_on_prerelease_only_candidate_is_false() {
+            let formatter = TableFormatter::new(|v| Some(v == "2.0.0-beta.1"));
+            assert!(!requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["2.0.0-beta.1"]),
+            ));
+        }
+
+        #[test]
+        fn test_scan_short_circuits_on_first_match() {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_clone = Arc::clone(&calls);
+            let formatter = TableFormatter::new(move |v| {
+                calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(v == "1.0.0")
+            });
+            let result = requirement_is_unsatisfiable(
+                &formatter,
+                &VersionReq::new("modelled"),
+                &versions(&["1.0.0", "0.9.0", "0.8.0"]),
+            );
+            assert!(!result);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "must stop scanning at the first Some(true)"
+            );
         }
     }
 }

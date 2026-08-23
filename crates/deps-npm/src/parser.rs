@@ -232,8 +232,11 @@ fn find_dependency_positions(
                 name_start_idx + name_pattern.len() + (after_name.len() - trimmed.len());
             let after_colon = &content[colon_offset..];
 
-            // Limit search to the next 100 chars to stay within this key-value pair
-            let search_limit = after_colon.len().min(100 + version.len());
+            // Limit search to the next 100 chars to stay within this key-value pair.
+            // Round down to a char boundary since `version.len()` is a byte count that
+            // can land mid-character when the source contains multi-byte UTF-8.
+            let search_limit =
+                after_colon.floor_char_boundary(after_colon.len().min(100 + version.len()));
             let search_area = &after_colon[..search_limit];
 
             if let Some(ver_rel_idx) = search_area.find(&version_search) {
@@ -592,5 +595,51 @@ mod tests {
             coverage_pos.start.line, vitest_pos.start.line,
             "version positions should be on different lines"
         );
+    }
+
+    #[test]
+    fn test_find_dependency_positions_no_panic_on_multibyte_utf8_boundary() {
+        // The search window is `100 + version.len()` bytes after the colon. Placing a
+        // 2-byte UTF-8 character ('é') to straddle that exact byte offset used to panic
+        // when the raw offset was used to slice the string directly (issue #230).
+        let name = "pkg";
+        let version = "1.0.0".to_string();
+        let padding = "a".repeat(103);
+        let content = format!("\"{name}\":{padding}é more text \"{version}\" end");
+
+        let line_table = LineOffsetTable::new(&content);
+        let (name_range, version_range) =
+            find_dependency_positions(&content, name, Some(&version), &line_table);
+
+        assert_eq!(name_range.start.line, 0);
+        // The multibyte character falls right at the truncated search boundary, so the
+        // version string (placed after it) is outside the search window and not found.
+        assert!(version_range.is_none());
+    }
+
+    #[test]
+    fn test_find_dependency_positions_finds_version_when_multibyte_char_is_further_out() {
+        // Same truncation boundary as above, but this time the version sits well inside
+        // the truncated window while the 2-byte UTF-8 character ('é') straddles the exact
+        // raw byte offset (107) that used to be sliced naively. Confirms the fix does not
+        // just avoid panicking but still returns the correct, real match.
+        let name = "pkg";
+        let version = "1.0.0-x".to_string(); // 7 bytes -> raw window limit = 100 + 7 = 107
+        let quoted_version = format!("\"{version}\"");
+        let padding = "a".repeat(95);
+        let content = format!("\"{name}\": {quoted_version}{padding}é end");
+
+        let line_table = LineOffsetTable::new(&content);
+        let (name_range, version_range) =
+            find_dependency_positions(&content, name, Some(&version), &line_table);
+
+        assert_eq!(name_range.start.line, 0);
+        let version_range = version_range.expect("version should still be found after truncation");
+        assert_eq!(version_range.start.line, 0);
+
+        // Version content starts right after the opening quote; everything before it is
+        // ASCII, so byte offset and UTF-16 character offset coincide.
+        let expected_start = content.find(&quoted_version).unwrap() + 1;
+        assert_eq!(version_range.start.character, expected_start as u32);
     }
 }
