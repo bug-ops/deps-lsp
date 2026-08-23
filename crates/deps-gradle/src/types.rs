@@ -112,4 +112,22 @@ mod tests {
         assert!(dep.version_requirement().is_none());
         assert!(dep.version_range().is_none());
     }
+
+    /// `GradleVersion` is a re-export of `deps_maven::MavenVersion` (see the `pub use` at
+    /// the top of this module), not a type this crate defines — so `published_at` is wired
+    /// by construction rather than by anything `deps-gradle` implements itself. This test
+    /// exists so a future change that breaks the re-export (e.g. swapping it for a
+    /// gradle-specific newtype) fails loudly here instead of silently losing freshness data.
+    #[test]
+    fn test_gradle_version_published_at_is_wired_through_the_maven_reexport() {
+        use deps_core::Version;
+
+        let published = deps_core::PublishTime::parse_rfc3339("2026-07-18T23:05:13Z").unwrap();
+        let version = GradleVersion {
+            version: "3.2.0".into(),
+            published_at: Some(published),
+        };
+
+        assert_eq!(version.published_at(), Some(published));
+    }
 }

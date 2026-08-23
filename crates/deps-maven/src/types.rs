@@ -44,7 +44,12 @@ impl std::str::FromStr for MavenScope {
 #[derive(Debug, Clone)]
 pub struct MavenVersion {
     pub version: String,
-    pub timestamp: Option<u64>,
+    /// When this version was published, from the `repo1.maven.org` directory listing.
+    ///
+    /// `None` whenever the listing could not be fetched or parsed (Google Maven and the
+    /// Gradle Plugin Portal never carry a date, and the fetch is disabled by
+    /// `freshness.enabled: false`) — this is graceful degradation, not an error.
+    pub published_at: Option<deps_core::PublishTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +115,10 @@ impl deps_core::Version for MavenVersion {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn published_at(&self) -> Option<deps_core::PublishTime> {
+        self.published_at
     }
 }
 
@@ -249,13 +258,17 @@ mod tests {
 
         let ver = MavenVersion {
             version: "3.14.0".into(),
-            timestamp: Some(1_699_000_000),
+            published_at: Some(deps_core::PublishTime::from_unix_secs(1_699_000_000)),
         };
         assert_eq!(ver.version_string(), "3.14.0");
         assert!(!ver.is_yanked());
         assert!(!ver.is_prerelease());
         assert!(ver.features().is_empty());
         assert!(ver.as_any().is::<MavenVersion>());
+        assert_eq!(
+            ver.published_at(),
+            Some(deps_core::PublishTime::from_unix_secs(1_699_000_000))
+        );
     }
 
     #[test]
@@ -264,13 +277,13 @@ mod tests {
 
         let ver = MavenVersion {
             version: "1.0.0-SNAPSHOT".into(),
-            timestamp: None,
+            published_at: None,
         };
         assert!(ver.is_prerelease());
 
         let ver = MavenVersion {
             version: "2.0.0-M1".into(),
-            timestamp: None,
+            published_at: None,
         };
         assert!(ver.is_prerelease());
     }

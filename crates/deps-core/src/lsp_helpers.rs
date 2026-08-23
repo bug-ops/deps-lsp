@@ -1111,7 +1111,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let resolvable = dep.source().is_version_resolvable();
 
     let available_versions = if resolvable {
-        Some(registry.get_versions(dep.name()).await.ok()?)
+        Some(
+            registry
+                .get_versions_with(dep.name(), freshness)
+                .await
+                .ok()?,
+        )
     } else {
         None
     };
@@ -2490,6 +2495,10 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
     let mut diagnostics = Vec::with_capacity(deps.len());
 
     for dep in deps {
+        // Deliberately `get_versions`, not `get_versions_with`: diagnostics render no
+        // publish ages, so paying for a registry's extra freshness fetch here would be
+        // pure waste. This function is not called anywhere in this workspace (see the
+        // doc comment above), so `_freshness` stays unused by design, not oversight.
         let versions = match registry.get_versions(dep.name()).await {
             Ok(v) => v,
             Err(e) => {

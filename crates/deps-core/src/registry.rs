@@ -90,6 +90,33 @@ pub trait Registry: Send + Sync {
         name: &'a PackageName,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>>;
 
+    /// Like [`get_versions`](Self::get_versions), but lets a registry that can obtain
+    /// [`Version::published_at`] only through an *extra* request gate that request behind
+    /// `freshness.enabled` instead of always paying for it.
+    ///
+    /// Implementors overriding this method MUST keep every other aspect of
+    /// [`get_versions`](Self::get_versions)'s behavior — set, order, and content of the
+    /// returned versions — identical; the only difference the override may introduce is
+    /// populating [`Version::published_at`]. Callers that render publish ages MUST call this
+    /// method rather than [`get_versions`](Self::get_versions): the default implementation
+    /// below simply forwards to `get_versions` and ignores `freshness`, so a caller that
+    /// keeps calling `get_versions` silently gets no freshness signal even from a registry
+    /// that implements this override.
+    ///
+    /// Default: forwards to [`get_versions`](Self::get_versions), ignoring `freshness`. This
+    /// keeps the ten registries with no extra publish-time source unchanged, and keeps
+    /// [`FreshnessSettings`](crate::freshness::FreshnessSettings) — a `Copy + 'static` DTO —
+    /// out of every `Registry::new` signature and the `register!` ecosystem-registration
+    /// macro.
+    fn get_versions_with<'a>(
+        &'a self,
+        name: &'a PackageName,
+        freshness: crate::freshness::FreshnessSettings,
+    ) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
+        let _ = freshness;
+        self.get_versions(name)
+    }
+
     /// Finds the latest version matching a version requirement.
     ///
     /// Only returns stable (non-yanked, non-deprecated) versions unless

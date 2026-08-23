@@ -57,21 +57,50 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 /// Percentage of cache entries to evict when capacity is reached.
 const CACHE_EVICTION_PERCENTAGE: usize = 10;
 
+/// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`), with any scheme
+/// and an optional port — the shape every `mockito::Server` binds to.
+///
+/// Only compiled into test builds (see [`ensure_https`]): a non-loopback host must never
+/// be allowed to bypass the HTTPS requirement, even under `cfg(test)`/`test-util`.
+#[cfg(any(test, feature = "test-util"))]
+fn is_loopback_host(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let host_and_port = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else {
+        host_and_port.split(':').next().unwrap_or("")
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 /// Validates that a URL uses HTTPS protocol.
 ///
 /// Returns an error if the URL doesn't start with "https://".
 /// This ensures all network requests are encrypted.
 ///
-/// In test mode, HTTP URLs are allowed for mockito compatibility.
+/// A loopback HTTP URL (`127.0.0.1`/`localhost`/`::1`, the shape every `mockito::Server`
+/// binds to) is allowed in `deps-core`'s own test builds (`cfg(test)`) and in other
+/// workspace crates' test builds via the `test-util` feature — `cfg(test)` alone does not
+/// apply there, since those crates depend on `deps-core` as a normal, non-dev dependency.
+/// Any other HTTP host is still rejected even under those cfgs: `test-util` is a public,
+/// independently-enablable crates.io feature, so this must not become "any host, any
+/// environment" just because the feature is on.
 #[inline]
 fn ensure_https(url: &str) -> Result<()> {
-    #[cfg(not(test))]
-    if !url.starts_with("https://") {
-        return Err(DepsError::CacheError(format!("URL must use HTTPS: {url}")));
+    if url.starts_with("https://") {
+        return Ok(());
     }
-    #[cfg(test)]
-    let _ = url; // Silence unused warning in tests
-    Ok(())
+    #[cfg(any(test, feature = "test-util"))]
+    if is_loopback_host(url) {
+        return Ok(());
+    }
+    Err(DepsError::CacheError(format!("URL must use HTTPS: {url}")))
 }
 
 /// Reads a response body incrementally, aborting once it exceeds
