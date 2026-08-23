@@ -2,15 +2,68 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
+use tower_lsp_server::ls_types::{
+    CompletionItem, CompletionTextEdit, Position, Range as LspRange, TextEdit, Uri,
+};
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
+    position_in_range,
 };
 
 use crate::formatter::SwiftFormatter;
 use crate::lockfile::SwiftLockParser;
 use crate::registry::SwiftRegistry;
+use crate::types::SwiftPackage;
+
+/// Builds a completion item that inserts the full GitHub URL for `.package(url: "...")`.
+///
+/// The completion fires with the cursor inside the `url:` string literal (see
+/// [`SwiftEcosystem::generate_completions`]), so the insertable text must always be a
+/// full URL — never the bare `owner/repo` identity — regardless of how much of the
+/// scheme the user has typed so far. `replace_range` should be the dependency's
+/// `name_range()` (the byte span of the whole URL literal) whenever the caller can resolve
+/// it — the base builder's own range is a placeholder `(0,0)-(0,0)` that does not contain
+/// the real cursor position and would corrupt the document if used as-is. When `None` (the
+/// dependency containing the cursor could not be found), falls back to `insert_text`-only
+/// — the same safe pattern used by `create_package_completion_item` in `deps-lsp` — rather
+/// than guessing a range.
+fn build_url_completion(package: &SwiftPackage, replace_range: Option<LspRange>) -> CompletionItem {
+    let mut item = deps_core::completion::build_package_completion(package, LspRange::default());
+
+    let url = package
+        .repository
+        .clone()
+        .unwrap_or_else(|| format!("https://github.com/{}", package.name));
+
+    item.insert_text = Some(url.clone());
+    item.filter_text = Some(url.clone());
+    item.sort_text = Some(url.clone());
+    item.text_edit = replace_range.map(|range| {
+        CompletionTextEdit::Edit(TextEdit {
+            range,
+            new_text: url,
+        })
+    });
+
+    // Swift search() deliberately leaves latest_version empty to avoid an N+1 GitHub API
+    // call per result (see SwiftRegistry::search docs); the base builder's `detail` is
+    // `format!("v{latest}")`, which would otherwise render as the misleading bare "v".
+    if package.latest_version.is_empty() {
+        item.detail = None;
+    }
+
+    item
+}
+
+/// Strips a leading `https://github.com/` (or `https://github.com`) scheme from a
+/// completion prefix, leaving the search query GitHub's repository search expects.
+fn strip_github_prefix(prefix: &str) -> &str {
+    prefix
+        .strip_prefix("https://github.com/")
+        .or_else(|| prefix.strip_prefix("https://github.com"))
+        .unwrap_or(prefix)
+}
 
 /// Swift/SPM ecosystem implementation.
 ///
@@ -37,9 +90,27 @@ impl SwiftEcosystem {
         }
     }
 
-    async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
-        deps_core::completion::complete_package_names_generic(self.registry.as_ref(), prefix, 20)
-            .await
+    async fn complete_package_urls(
+        &self,
+        query: &str,
+        replace_range: Option<LspRange>,
+    ) -> Vec<CompletionItem> {
+        if query.len() < 2 || query.len() > 200 {
+            return vec![];
+        }
+
+        let results = match self.registry.search(query, 20).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Swift registry search failed for '{}': {}", query, e);
+                return vec![];
+            }
+        };
+
+        results
+            .iter()
+            .map(|package| build_url_completion(package, replace_range))
+            .collect()
     }
 
     async fn complete_versions(
@@ -115,15 +186,16 @@ impl Ecosystem for SwiftEcosystem {
 
             match context {
                 CompletionContext::PackageName { prefix } => {
-                    // Strip "https://github.com/" prefix for search query
-                    let query = prefix
-                        .strip_prefix("https://github.com/")
-                        .or_else(|| prefix.strip_prefix("https://github.com"))
-                        .unwrap_or(&prefix);
-                    if query.len() < 2 {
-                        return vec![];
-                    }
-                    self.complete_package_names(query).await
+                    // The completion context only fires with the cursor inside an existing
+                    // dependency's url: "..." literal (see module docs), so its name_range()
+                    // is the exact span the completion must replace.
+                    let replace_range = parse_result
+                        .dependencies()
+                        .into_iter()
+                        .find(|d| position_in_range(position, d.name_range()))
+                        .map(deps_core::Dependency::name_range);
+                    self.complete_package_urls(strip_github_prefix(&prefix), replace_range)
+                        .await
                 }
                 CompletionContext::Version {
                     package_name,
@@ -146,6 +218,108 @@ impl Ecosystem for SwiftEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_package(repository: Option<&str>) -> SwiftPackage {
+        SwiftPackage {
+            name: "apple/swift-nio".to_string().into(),
+            description: Some("Networking framework".to_string()),
+            repository: repository.map(str::to_string),
+            homepage: None,
+            latest_version: String::new(),
+        }
+    }
+
+    fn test_range() -> LspRange {
+        LspRange {
+            start: Position::new(3, 20),
+            end: Position::new(3, 45),
+        }
+    }
+
+    #[test]
+    fn test_build_url_completion_uses_repository_url() {
+        let package = test_package(Some("https://github.com/apple/swift-nio"));
+        let item = build_url_completion(&package, None);
+
+        assert_eq!(
+            item.insert_text,
+            Some("https://github.com/apple/swift-nio".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_url_completion_falls_back_to_constructed_url() {
+        let package = test_package(None);
+        let item = build_url_completion(&package, None);
+
+        assert_eq!(
+            item.insert_text,
+            Some("https://github.com/apple/swift-nio".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_url_completion_with_range_sets_text_edit() {
+        let package = test_package(Some("https://github.com/apple/swift-nio"));
+        let range = test_range();
+        let item = build_url_completion(&package, Some(range));
+
+        assert_eq!(
+            item.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: "https://github.com/apple/swift-nio".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn test_build_url_completion_without_range_has_no_text_edit() {
+        // Defensive fallback: when the containing dependency's range can't be resolved,
+        // insert_text-only is safer than guessing a range that might not contain the cursor.
+        let package = test_package(Some("https://github.com/apple/swift-nio"));
+        let item = build_url_completion(&package, None);
+
+        assert_eq!(item.text_edit, None);
+    }
+
+    #[test]
+    fn test_build_url_completion_clears_detail_when_latest_version_empty() {
+        let package = test_package(Some("https://github.com/apple/swift-nio"));
+        assert!(package.latest_version.is_empty());
+        let item = build_url_completion(&package, None);
+
+        assert_eq!(item.detail, None);
+    }
+
+    #[test]
+    fn test_build_url_completion_keeps_detail_when_latest_version_present() {
+        let mut package = test_package(Some("https://github.com/apple/swift-nio"));
+        package.latest_version = "2.40.0".to_string();
+        let item = build_url_completion(&package, None);
+
+        assert_eq!(item.detail, Some("v2.40.0".to_string()));
+    }
+
+    #[test]
+    fn test_strip_github_prefix_with_trailing_slash() {
+        assert_eq!(
+            strip_github_prefix("https://github.com/apple/swift-n"),
+            "apple/swift-n"
+        );
+    }
+
+    #[test]
+    fn test_strip_github_prefix_without_trailing_slash() {
+        assert_eq!(strip_github_prefix("https://github.com"), "");
+    }
+
+    #[test]
+    fn test_strip_github_prefix_no_scheme_typed_yet() {
+        // Cursor is still within the scheme itself (e.g. "htt|"), so nothing to strip —
+        // the raw partial text becomes the (short-lived, low-value) search query.
+        assert_eq!(strip_github_prefix("htt"), "htt");
+    }
 
     #[test]
     fn test_ecosystem_id() {
