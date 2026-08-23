@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::{
     MarkupKind, Position, Range, TextEdit, Uri, WorkspaceEdit,
 };
 
-use crate::{Dependency, EcosystemConfig, ParseResult, Registry};
+use crate::{Dependency, EcosystemConfig, ParseResult, Registry, VersionReq};
 
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
 /// together everywhere.
@@ -832,7 +832,7 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 ///
 /// ```
 /// use deps_core::lsp_helpers::{collect_update_all_edits, EcosystemFormatter, VersionData};
-/// use deps_core::{Dependency, ParseResult};
+/// use deps_core::{Dependency, ParseResult, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use tower_lsp_server::ls_types::{Position, Range, Uri};
@@ -848,15 +848,15 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 /// }
 ///
 /// struct MockDep {
-///     name: String,
-///     version_req: String,
+///     name: PackageName,
+///     version_req: VersionReq,
 ///     version_range: Range,
 ///     name_range: Range,
 /// }
 /// impl Dependency for MockDep {
-///     fn name(&self) -> &str { &self.name }
+///     fn name(&self) -> &PackageName { &self.name }
 ///     fn name_range(&self) -> Range { self.name_range }
-///     fn version_requirement(&self) -> Option<&str> { Some(&self.version_req) }
+///     fn version_requirement(&self) -> Option<&VersionReq> { Some(&self.version_req) }
 ///     fn version_range(&self) -> Option<Range> { Some(self.version_range) }
 ///     fn source(&self) -> deps_core::parser::DependencySource {
 ///         deps_core::parser::DependencySource::Registry
@@ -877,8 +877,8 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 /// let content = r#"serde = "1.0.0""#;
 /// let parse_result = MockParseResult {
 ///     deps: vec![MockDep {
-///         name: "serde".to_string(),
-///         version_req: "1.0.0".to_string(),
+///         name: PackageName::new("serde"),
+///         version_req: VersionReq::new("1.0.0"),
 ///         version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
 ///         name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
 ///     }],
@@ -916,16 +916,16 @@ pub fn collect_update_all_edits(
             continue;
         };
 
-        let normalized_name = formatter.normalize_package_name(dep.name());
+        let normalized_name = formatter.normalize_package_name(dep.name().as_str());
         let Some(latest) = versions
             .cached
             .get(&normalized_name)
-            .or_else(|| versions.cached.get(dep.name()))
+            .or_else(|| versions.cached.get(dep.name().as_str()))
         else {
             continue;
         };
 
-        let version_req = dep.version_requirement().unwrap_or("");
+        let version_req = dep.version_requirement().map_or("", VersionReq::as_str);
         if version_req.is_empty() {
             // Defense-in-depth: an empty requirement would trivially satisfy the guard
             // below (both sides normalize to ""), so without this, a future formatter
@@ -2378,20 +2378,20 @@ mod tests {
         use tower_lsp_server::ls_types::{Position, Range};
 
         struct UaeDep {
-            name: String,
-            version_req: Option<String>,
+            name: PackageName,
+            version_req: Option<VersionReq>,
             version_range: Option<Range>,
         }
 
         impl Dependency for UaeDep {
-            fn name(&self) -> &str {
+            fn name(&self) -> &PackageName {
                 &self.name
             }
             fn name_range(&self) -> Range {
                 Range::default()
             }
-            fn version_requirement(&self) -> Option<&str> {
-                self.version_req.as_deref()
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                self.version_req.as_ref()
             }
             fn version_range(&self) -> Option<Range> {
                 self.version_range
@@ -2430,8 +2430,8 @@ mod tests {
 
         fn dep(name: &str, req: Option<&str>, vr: Option<Range>) -> UaeDep {
             UaeDep {
-                name: name.to_string(),
-                version_req: req.map(str::to_string),
+                name: PackageName::new(name),
+                version_req: req.map(VersionReq::new),
                 version_range: vr,
             }
         }
