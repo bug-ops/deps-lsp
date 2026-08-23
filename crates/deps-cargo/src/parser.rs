@@ -242,9 +242,50 @@ fn parse_table_dependency(
                     };
                 }
             }
+            // `registry = "my-corp"` names an alternative registry defined in
+            // `.cargo/config.toml`, not crates.io. deps-cargo has no client
+            // for it, so it must not stay classified as the plain `Registry`
+            // source: `CustomRegistry` opts it out of version-resolution
+            // diagnostics that would otherwise silently check it against
+            // crates.io's unrelated package of the same name (#248, known
+            // limitation until private-registry client support exists).
+            // `"crates-io"` is Cargo's reserved alias for the *public*
+            // registry (not a custom one) and must stay classified as
+            // `Registry`.
+            "registry" => {
+                if let Some(name) = value.as_str()
+                    && name != "crates-io"
+                {
+                    dep.source = DependencySource::CustomRegistry {
+                        url: name.to_string(),
+                    };
+                }
+            }
+            // `registry-index = "<url>"` is the direct-URL spelling of the
+            // same concept as `registry` above. Cargo's built-in public
+            // index URLs must stay classified as `Registry`; any other URL
+            // names a private index this LSP has no client for.
+            "registry-index" => {
+                if let Some(url) = value.as_str()
+                    && !is_public_crates_io_index(url)
+                {
+                    dep.source = DependencySource::CustomRegistry {
+                        url: url.to_string(),
+                    };
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// Returns true if `url` is one of Cargo's built-in public crates.io index URLs
+/// (the git index or the sparse index), as opposed to a private registry index.
+fn is_public_crates_io_index(url: &str) -> bool {
+    matches!(
+        url,
+        "https://github.com/rust-lang/crates.io-index" | "sparse+https://index.crates.io/"
+    )
 }
 
 /// Converts toml-span byte offsets to LSP Range using pre-computed line table.
@@ -398,6 +439,56 @@ local = { path = "../local" }"#;
             result.dependencies[0].source,
             DependencySource::Path { .. }
         ));
+    }
+
+    #[test]
+    fn test_parse_custom_registry_dependency() {
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry = "my-corp" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "my-corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+        assert!(!result.dependencies[0].source.is_version_resolvable());
+    }
+
+    #[test]
+    fn test_parse_registry_crates_io_alias_stays_registry() {
+        let toml = r#"[dependencies]
+serde = { version = "1.0", registry = "crates-io" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+        assert!(result.dependencies[0].source.is_version_resolvable());
+    }
+
+    #[test]
+    fn test_parse_registry_index_custom_url() {
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry-index = "https://gitlab.mycorp.com/registry-index" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gitlab.mycorp.com/registry-index");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+        assert!(!result.dependencies[0].source.is_version_resolvable());
+    }
+
+    #[test]
+    fn test_parse_registry_index_public_crates_io_stays_registry() {
+        let toml = r#"[dependencies]
+serde = { version = "1.0", registry-index = "https://github.com/rust-lang/crates.io-index" }
+serde_json = { version = "1.0", registry-index = "sparse+https://index.crates.io/" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        for dep in &result.dependencies {
+            assert_eq!(dep.source, DependencySource::Registry);
+        }
     }
 
     #[test]

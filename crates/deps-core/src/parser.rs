@@ -744,12 +744,21 @@ impl DependencySource {
         matches!(self, Self::Registry | Self::CustomRegistry { .. })
     }
 
-    /// Returns true if version resolution is possible for this source.
+    /// Returns true if this LSP can resolve version data for this source
+    /// against the registry client it actually queries.
     ///
-    /// Currently equivalent to `is_registry()`, but semantically distinct
-    /// for future extensibility (e.g., Git tags could support version listing).
+    /// `Registry` resolves to the ecosystem's default public registry
+    /// (crates.io, npm, PyPI, ...), which every `deps-*` crate implements a
+    /// client for. `CustomRegistry` names a private/alternative registry
+    /// (e.g. Bundler `source "https://gems.mycorp.com"`, Cargo
+    /// `registry = "my-corp"`) that this LSP has no client for — known
+    /// limitation, tracked until private-registry client support exists.
+    /// Diagnostics and hover must not silently fall back to checking a
+    /// `CustomRegistry` dependency's name against the *public* registry, so
+    /// this deliberately diverges from `is_registry()` and returns `false`
+    /// for it, alongside Git/Path/Url/Sdk/Workspace sources.
     pub fn is_version_resolvable(&self) -> bool {
-        self.is_registry()
+        matches!(self, Self::Registry)
     }
 }
 
@@ -1592,8 +1601,11 @@ dev_dependencies:
         let source = DependencySource::CustomRegistry {
             url: "https://gems.example.com".into(),
         };
+        // `is_registry()` stays true (it does name a registry), but this LSP
+        // has no client for a private/custom registry, so it must not be
+        // treated as version-resolvable against the public registry (#248).
         assert!(source.is_registry());
-        assert!(source.is_version_resolvable());
+        assert!(!source.is_version_resolvable());
     }
 
     #[test]

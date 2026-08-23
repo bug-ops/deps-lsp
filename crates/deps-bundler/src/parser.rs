@@ -154,7 +154,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
                 .unwrap_or_else(|| current_group.clone().unwrap_or(DependencyGroup::Default));
 
             // Extract source
-            let source = extract_source(rest_of_line);
+            let source = extract_source(rest_of_line, source_url.as_deref());
 
             // Extract platforms
             let platforms = extract_platforms(rest_of_line);
@@ -228,7 +228,19 @@ fn parse_group_symbols(text: &str) -> DependencyGroup {
     }
 }
 
-fn extract_source(line: &str) -> DependencySource {
+/// Bundler's implicit default gem source when a Gemfile declares no `source` line.
+const DEFAULT_RUBYGEMS_SOURCE: &str = "https://rubygems.org";
+
+/// Classifies a gem's dependency source.
+///
+/// `gemfile_source_url` is the Gemfile-level `source "..."` declaration (if any),
+/// captured once per file in [`parse_gemfile`] and threaded through here so a gem
+/// with no per-line `git:`/`github:`/`path:` option is classified against the
+/// source that actually resolves it, rather than defaulting to the public
+/// registry. A non-default URL (anything but rubygems.org) has no client this LSP
+/// can query, so it becomes `CustomRegistry` — mirroring Cargo's `registry = "..."`
+/// handling (#248).
+fn extract_source(line: &str, gemfile_source_url: Option<&str>) -> DependencySource {
     if let Some(caps) = GIT_OPTION.captures(line) {
         return DependencySource::Git {
             url: caps[1].to_string(),
@@ -249,7 +261,12 @@ fn extract_source(line: &str) -> DependencySource {
         };
     }
 
-    DependencySource::Registry
+    match gemfile_source_url {
+        Some(url) if url != DEFAULT_RUBYGEMS_SOURCE => DependencySource::CustomRegistry {
+            url: url.to_string(),
+        },
+        _ => DependencySource::Registry,
+    }
 }
 
 fn extract_platforms(line: &str) -> Vec<String> {
@@ -433,6 +450,40 @@ gem 'rails'";
 gem 'rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.source_url, Some("https://rubygems.org".into()));
+    }
+
+    #[test]
+    fn test_default_rubygems_source_classified_as_registry() {
+        let gemfile = r"source 'https://rubygems.org'
+gem 'rails'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
+        assert!(result.dependencies[0].source.is_version_resolvable());
+    }
+
+    #[test]
+    fn test_custom_gemfile_source_classified_as_custom_registry() {
+        let gemfile = r"source 'https://gems.mycorp.com'
+gem 'internal-gem'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => {
+                assert_eq!(url, "https://gems.mycorp.com");
+            }
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+        assert!(!result.dependencies[0].source.is_version_resolvable());
+    }
+
+    #[test]
+    fn test_custom_gemfile_source_does_not_override_explicit_git_source() {
+        let gemfile = r"source 'https://gems.mycorp.com'
+gem 'rails', git: 'https://github.com/rails/rails.git'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert!(matches!(
+            result.dependencies[0].source,
+            DependencySource::Git { .. }
+        ));
     }
 
     #[test]
