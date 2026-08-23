@@ -62,7 +62,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
 deps-core = { workspace = true, features = ["test-util"] }
-async-trait = { workspace = true }
 criterion = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }

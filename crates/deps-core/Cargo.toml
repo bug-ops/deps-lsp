@@ -19,7 +19,6 @@ workspace = true
 test-util = []
 
 [dependencies]
-async-trait = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }

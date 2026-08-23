@@ -14,6 +14,7 @@ use deps_core::{DepsError, HttpCache, Result};
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
 use std::any::Any;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 

@@ -288,7 +288,7 @@ impl LanguageServer for Backend {
         });
     }
 
-    fn shutdown(&self) -> impl Future<Output = Result<()>> {
+    fn shutdown(&self) -> impl std::future::Future<Output = Result<()>> + Send {
         tracing::info!("shutting down deps-lsp server");
         std::future::ready(Ok(()))
     }

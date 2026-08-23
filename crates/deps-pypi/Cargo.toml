@@ -14,7 +14,6 @@ workspace = true
 
 [dependencies]
 deps-core = { workspace = true }
-async-trait = { workspace = true }
 pep440_rs = { workspace = true }
 pep508_rs = { workspace = true }
 reqwest = { workspace = true }

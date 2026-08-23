@@ -4,6 +4,7 @@
 //! providing LSP functionality for `go.mod` files.
 
 use std::any::Any;
+use std::future::Future;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
 

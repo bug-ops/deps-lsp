@@ -12,7 +12,6 @@ license = "MIT"
 repository = "https://github.com/bug-ops/deps-lsp"
 
 [workspace.dependencies]
-async-trait = "0.1"
 criterion = "0.8"
 dashmap = "6.2"
 deps-core = { version = "0.10.1", path ="crates/deps-core" }
