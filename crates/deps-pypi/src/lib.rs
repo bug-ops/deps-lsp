@@ -1,15 +1,20 @@
 //! PyPI/Python support for deps-lsp.
 //!
 //! This crate provides parsing, validation, and registry client functionality
-//! for Python dependency management in `pyproject.toml` files, supporting both
-//! PEP 621 and Poetry formats.
+//! for Python dependency management in `pyproject.toml` files (PEP 621 and
+//! Poetry formats) and in `requirements.txt`/`constraints.txt` files (pip's
+//! requirements file format).
 //!
 //! # Features
 //!
 //! - **PEP 621 Support**: Parse `[project.dependencies]` and `[project.optional-dependencies]`
 //! - **Poetry Support**: Parse `[tool.poetry.dependencies]` and `[tool.poetry.group.*.dependencies]`
+//! - **requirements.txt / constraints.txt Support**: Parse pip's line-oriented requirements
+//!   file format, including comments, continuations, per-requirement options, and includes
 //! - **PEP 508 Parsing**: Handle complex dependency specifications with extras and markers
 //! - **PEP 440 Versions**: Validate and compare Python version specifiers
+//! - **PEP 503 Name Normalization**: One canonical normalizer ([`name::normalize`]) shared by
+//!   registry lookups, the formatter, and lock file parsing
 //! - **PyPI API Client**: Fetch package metadata from PyPI JSON API with HTTP caching
 //!
 //! # Architecture
@@ -101,6 +106,7 @@ pub mod ecosystem;
 pub mod error;
 pub mod formatter;
 pub mod lockfile;
+pub mod name;
 pub mod parser;
 pub mod registry;
 pub mod types;

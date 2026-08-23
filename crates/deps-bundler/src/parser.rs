@@ -19,6 +19,7 @@ pub struct BundlerParseResult {
     pub uri: Uri,
 }
 
+// TODO(critic): use deps_core LineOffsetTable::line_start
 /// Pre-computed line start byte offsets for O(1) position lookups.
 struct LineOffsetTable {
     line_starts: Vec<usize>,

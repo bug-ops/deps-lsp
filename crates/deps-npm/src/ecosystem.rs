@@ -497,7 +497,7 @@ mod tests {
             character: 0,
         };
         let actions = ecosystem
-            .generate_code_actions(parse_result.as_ref(), position, &uri)
+            .generate_code_actions(parse_result.as_ref(), position, &uri, content)
             .await;
 
         assert!(actions.is_empty());

@@ -1,4 +1,5 @@
 use deps_core::Dependency;
+use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 use pep440_rs::{Version, VersionSpecifiers};
@@ -9,11 +10,31 @@ pub struct PypiFormatter;
 
 impl EcosystemFormatter for PypiFormatter {
     fn normalize_package_name(&self, name: &PackageName) -> String {
-        let name = name.as_str();
-        if !name.chars().any(|c| c.is_uppercase() || c == '-') {
-            return name.to_string();
+        crate::name::normalize(name.as_str())
+    }
+
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        // PEP 508: ^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$
+        let valid = !name.is_empty()
+            && name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            && name
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+
+        if valid {
+            Ok(())
+        } else {
+            Err(InvalidPackageName::new(
+                "must match PEP 508 name pattern ^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$",
+            ))
         }
-        name.to_lowercase().replace('-', "_")
     }
 
     fn format_version_for_text_edit(&self, version: &str) -> String {
@@ -25,6 +46,43 @@ impl EcosystemFormatter for PypiFormatter {
             .unwrap_or(1);
 
         format!(">={version},<{next_major}")
+    }
+
+    fn format_version_replacing(&self, version: &str, current: &str) -> String {
+        let terms: Vec<&str> = current.trim().split(',').map(str::trim).collect();
+
+        if terms.iter().any(|t| t.starts_with("===")) {
+            return format!("==={version}");
+        }
+
+        if let Some(term) = terms.iter().find(|t| t.starts_with("==")) {
+            return match term.strip_prefix("==").and_then(|r| r.strip_suffix(".*")) {
+                Some(base) => match truncate_release_to_match(base, version) {
+                    Some(truncated) => format!("=={truncated}.*"),
+                    None => format!("=={version}"),
+                },
+                None => format!("=={version}"),
+            };
+        }
+
+        if let Some(term) = terms.iter().find(|t| t.starts_with("~=")) {
+            let rest = term.strip_prefix("~=").unwrap_or_default().trim();
+            let release_len = Version::from_str(rest)
+                .map(|v| v.release().len())
+                .unwrap_or(0);
+            return if release_len >= 2 {
+                match truncate_release_to_match(rest, version) {
+                    Some(truncated) => format!("~={truncated}"),
+                    None => format!("~={version}"),
+                }
+            } else {
+                // `~=3` has a single release segment, which is not valid PEP 440
+                // on its own — don't emit another invalid pin.
+                self.format_version_for_text_edit(version)
+            };
+        }
+
+        self.format_version_for_text_edit(version)
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -61,6 +119,27 @@ impl EcosystemFormatter for PypiFormatter {
     }
 }
 
+/// Truncates `latest`'s PEP 440 release segments to the same segment count
+/// as `source_version`'s release, joined with `.`. Returns `None` if either
+/// fails to parse, or `latest` has fewer release segments than
+/// `source_version` (in which case the caller falls back to the untruncated
+/// version rather than losing precision).
+fn truncate_release_to_match(source_version: &str, latest: &str) -> Option<String> {
+    let source_release_len = Version::from_str(source_version).ok()?.release().len();
+    let latest_release = Version::from_str(latest).ok()?;
+    let latest_release = latest_release.release();
+    if latest_release.len() < source_release_len {
+        return None;
+    }
+    Some(
+        latest_release[..source_release_len]
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,11 +153,15 @@ mod tests {
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("Django-REST-Framework")),
-            "django_rest_framework"
+            "django-rest-framework"
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("My-Package")),
-            "my_package"
+            "my-package"
+        );
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("zope.interface")),
+            "zope-interface"
         );
     }
 
@@ -169,6 +252,81 @@ mod tests {
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("numpy")),
             "numpy"
+        );
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_valid_names() {
+        let formatter = PypiFormatter;
+        assert!(formatter.validate_package_name("zope.interface").is_ok());
+        assert!(formatter.validate_package_name("Django").is_ok());
+        assert!(formatter.validate_package_name("a").is_ok());
+        assert!(formatter.validate_package_name("my-package_1.0").is_ok());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_invalid_names() {
+        let formatter = PypiFormatter;
+        assert!(formatter.validate_package_name("---").is_err());
+        assert!(formatter.validate_package_name("-x").is_err());
+        assert!(formatter.validate_package_name("x-").is_err());
+        assert!(formatter.validate_package_name("a b").is_err());
+        assert!(formatter.validate_package_name("").is_err());
+    }
+
+    #[test]
+    fn test_format_version_replacing_table() {
+        let formatter = PypiFormatter;
+
+        // starts `===`
+        assert_eq!(
+            formatter.format_version_replacing("1.2", "===1.0"),
+            "===1.2"
+        );
+
+        // starts `==`, no wildcard
+        assert_eq!(formatter.format_version_replacing("1.2", "==1.0"), "==1.2");
+
+        // starts `==`, wildcard, latest has enough segments
+        assert_eq!(
+            formatter.format_version_replacing("1.6.2", "==1.4.*"),
+            "==1.6.*"
+        );
+
+        // `~=` with >=2 release segments truncates, never over-specifies
+        assert_eq!(
+            formatter.format_version_replacing("1.26.4", "~=1.24"),
+            "~=1.26"
+        );
+
+        // `~=` with a single release segment is invalid PEP 440 on its own; default
+        assert_eq!(
+            formatter.format_version_replacing("4.0.0", "~=3"),
+            ">=4.0.0,<5"
+        );
+
+        // multi-specifier collapse: any comma-separated term starting with `==` wins,
+        // regardless of position (N1 fix — pep440_rs sorts specifiers by version, so
+        // `!=0.9,==1.0` in source may render sorted either way)
+        assert_eq!(
+            formatter.format_version_replacing("1.2", "==1.0, !=1.0.1"),
+            "==1.2"
+        );
+        assert_eq!(
+            formatter.format_version_replacing("1.2", "!=0.9, ==1.0"),
+            "==1.2"
+        );
+
+        // comma-separated, no `==`/`===`/`~=` term -> default range
+        assert_eq!(
+            formatter.format_version_replacing("2.0.0", ">=1.0, !=1.5, <2.0"),
+            ">=2.0.0,<3"
+        );
+
+        // anything else -> default
+        assert_eq!(
+            formatter.format_version_replacing("2.0.0", ">=1.0"),
+            ">=2.0.0,<3"
         );
     }
 

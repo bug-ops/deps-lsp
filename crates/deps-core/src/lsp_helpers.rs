@@ -134,9 +134,44 @@ impl LineOffsetTable {
         Self { line_starts }
     }
 
+    /// Absolute byte offset where `line` (0-indexed) starts, or `None` if
+    /// `line` is out of range.
+    ///
+    /// Prefer this over re-deriving a line's start via cursor arithmetic
+    /// (`cursor += line.len() + 1`): `str::lines()` strips a trailing `\r`,
+    /// so that approach under-counts by one byte per CRLF line and corrupts
+    /// every subsequent offset in the file. This table is built by scanning
+    /// `char_indices()` for `\n` (see [`new`](Self::new)), which counts the
+    /// `\r`, so it stays correct for LF, CRLF and mixed line endings alike.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::LineOffsetTable;
+    ///
+    /// let table = LineOffsetTable::new("a\r\nb\r\nc");
+    /// assert_eq!(table.line_start(0), Some(0));
+    /// assert_eq!(table.line_start(1), Some(3));
+    /// assert_eq!(table.line_start(2), Some(6));
+    /// assert_eq!(table.line_start(3), None);
+    /// ```
+    pub fn line_start(&self, line: usize) -> Option<usize> {
+        self.line_starts.get(line).copied()
+    }
+
     /// Converts a byte offset into an LSP `Position`.
     pub fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
         let offset = offset.min(content.len());
+        // `offset` is not always a toml-span offset (boundary-safe by
+        // construction) — the requirements.txt line parser derives offsets
+        // via hand-rolled byte arithmetic, which can land inside a
+        // multi-byte character (e.g. a non-ASCII comment or marker string
+        // combined with an off-by-a-byte cut). Clamp down to the nearest
+        // char boundary rather than panicking on the slice below.
+        let mut offset = offset;
+        while offset > 0 && !content.is_char_boundary(offset) {
+            offset -= 1;
+        }
         let line = self
             .line_starts
             .partition_point(|&start| start <= offset)
@@ -342,6 +377,20 @@ pub trait EcosystemFormatter: Send + Sync {
 
     /// Format version string for code action text edit.
     fn format_version_for_text_edit(&self, version: &str) -> String;
+
+    /// Format `version` as a replacement for the existing requirement text
+    /// `current`, preserving `current`'s operator/pin style where the
+    /// ecosystem supports more than one.
+    ///
+    /// Default: ignores `current`, delegating to
+    /// [`format_version_for_text_edit`](Self::format_version_for_text_edit).
+    /// Override when a bare `format_version_for_text_edit` replacement would
+    /// silently change the requirement's semantics — e.g. PyPI's `==1.0.1`
+    /// pin becoming `>=1.0.1,<2` on "update version" would defeat the point
+    /// of pinning.
+    fn format_version_replacing(&self, version: &str, _current: &str) -> String {
+        self.format_version_for_text_edit(version)
+    }
 
     /// Check if a version satisfies a requirement string.
     ///
@@ -780,6 +829,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
     uri: &Uri,
+    content: &str,
     registry: &R,
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<CodeAction> {
@@ -799,6 +849,26 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         return actions;
     };
 
+    let Some(version_req) = dep.version_requirement() else {
+        return actions;
+    };
+    if version_req.as_str().is_empty() {
+        // Defense-in-depth, mirroring `collect_update_all_edits`: an empty
+        // requirement would trivially satisfy the guard below.
+        return actions;
+    }
+
+    let line_offsets = LineOffsetTable::new(content);
+    let slice = slice_for_range(content, &line_offsets, version_range);
+    if !literal_span_matches(slice, version_req.as_str()) {
+        // `version_range` no longer slices to the declared requirement text
+        // (e.g. a Maven `${property}`, a Gradle DSL variable/alias, or a
+        // synthesized comparator's lower bound) — writing a TextEdit there
+        // would corrupt the manifest instead of fixing it. Mirrors the guard
+        // `collect_update_all_edits` already applies on the bulk-edit path.
+        return actions;
+    }
+
     let Ok(versions) = registry.get_versions(dep.name()).await else {
         return actions;
     };
@@ -806,7 +876,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     let display_items = prepare_version_display_items(&versions, dep.name());
 
     for item in display_items {
-        let new_text = formatter.format_version_for_text_edit(&item.version);
+        let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());
 
         let mut edits = HashMap::new();
         edits.insert(
@@ -1100,7 +1170,7 @@ pub fn collect_update_all_edits(
 
         edits.push(TextEdit {
             range: version_range,
-            new_text: formatter.format_version_for_text_edit(latest),
+            new_text: formatter.format_version_replacing(latest, version_req.as_str()),
         });
     }
 
@@ -1432,6 +1502,37 @@ mod tests {
 
     fn pkg(s: &str) -> PackageName {
         PackageName::new(s)
+    }
+
+    #[test]
+    fn test_line_offset_table_line_start_crlf() {
+        let table = LineOffsetTable::new("a\r\nbb\r\nc");
+        assert_eq!(table.line_start(0), Some(0));
+        assert_eq!(table.line_start(1), Some(3));
+        assert_eq!(table.line_start(2), Some(7));
+        assert_eq!(table.line_start(3), None);
+    }
+
+    #[test]
+    fn test_byte_offset_to_position_clamps_to_char_boundary_instead_of_panicking() {
+        // "é" is a 2-byte UTF-8 sequence; offset 1 lands inside it.
+        let content = "é";
+        let table = LineOffsetTable::new(content);
+        // Must not panic; clamps down to the nearest boundary (offset 0).
+        let pos = table.byte_offset_to_position(content, 1);
+        assert_eq!(pos, Position::new(0, 0));
+    }
+
+    #[test]
+    fn test_byte_offset_to_position_multi_byte_boundary_in_longer_line() {
+        let content = "ab é cd";
+        let table = LineOffsetTable::new(content);
+        // Byte 3 is 'é's leading byte (boundary); byte 4 is its continuation
+        // byte (not a boundary) and must clamp back to 3 rather than panic.
+        assert!(content.is_char_boundary(3));
+        assert!(!content.is_char_boundary(4));
+        let pos = table.byte_offset_to_position(content, 4);
+        assert_eq!(pos, table.byte_offset_to_position(content, 3));
     }
 
     #[test]
@@ -3858,5 +3959,208 @@ mod tests {
         );
         assert!(content.value.contains("+2 more advisories"));
         assert!(content.value.contains("also affected"));
+    }
+
+    /// Tests for the `literal_span_matches` guard on `generate_code_actions`
+    /// (§6.3): a dependency whose `version_range` no longer slices to its
+    /// declared requirement must yield no code action, mirroring the guard
+    /// `collect_update_all_edits` already applies.
+    mod code_actions_guard_tests {
+        use super::*;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct CaDep {
+            name: PackageName,
+            version_req: Option<VersionReq>,
+            version_range: Option<Range>,
+        }
+
+        impl Dependency for CaDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::default()
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                self.version_req.as_ref()
+            }
+            fn version_range(&self) -> Option<Range> {
+                self.version_range
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct CaParseResult {
+            deps: Vec<CaDep>,
+            uri: Uri,
+        }
+
+        impl ParseResult for CaParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct CaVersion {
+            version: String,
+            yanked: bool,
+        }
+
+        crate::impl_version!(CaVersion {
+            version: version,
+            yanked: yanked,
+        });
+
+        struct CaRegistry;
+
+        impl crate::Registry for CaRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(CaVersion {
+                        version: "2.0.0".to_string(),
+                        yanked: false,
+                    }) as Box<dyn crate::Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+            ) -> crate::ecosystem::BoxFuture<
+                'a,
+                crate::error::Result<Option<Box<dyn crate::Version>>>,
+            > {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+            {
+                Box::pin(async move { Ok(Vec::new()) })
+            }
+
+            fn package_url(&self, _name: &PackageName) -> String {
+                String::new()
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        fn range(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
+            Range::new(Position::new(sl, sc), Position::new(el, ec))
+        }
+
+        #[tokio::test]
+        async fn test_guard_rejects_span_that_does_not_match_requirement() {
+            // content has "1.0.0" at 0..5, but the dependency claims its
+            // version_range covers 6..11 (out of bounds / wrong slice) —
+            // simulate via a version_range that slices to different text.
+            let content = "1.0.0 extra";
+            let dep = CaDep {
+                name: pkg("serde"),
+                version_req: Some(VersionReq::new("1.0.0")),
+                version_range: Some(range(0, 6, 0, 11)), // slices to "extra"
+            };
+            let pr = CaParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            // Must fall inside `version_range` (6..11) for
+            // `is_position_on_dependency`'s default impl to select this
+            // dependency at all — the point of this test is the guard past
+            // that selection, not the selection itself.
+            let position = Position::new(0, 7);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(actions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_guard_accepts_matching_span() {
+            let content = "1.0.0";
+            let dep = CaDep {
+                name: pkg("serde"),
+                version_req: Some(VersionReq::new("1.0.0")),
+                version_range: Some(range(0, 0, 0, 5)),
+            };
+            let pr = CaParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let position = Position::new(0, 0);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(!actions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_guard_rejects_empty_requirement() {
+            let content = "1.0.0";
+            let dep = CaDep {
+                name: pkg("serde"),
+                version_req: Some(VersionReq::new("")),
+                version_range: Some(range(0, 0, 0, 5)),
+            };
+            let pr = CaParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let position = Position::new(0, 0);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(actions.is_empty());
+        }
     }
 }

@@ -29,6 +29,7 @@ pub struct GoParseResult {
     pub uri: Uri,
 }
 
+// TODO(critic): use deps_core LineOffsetTable::line_start
 /// Pre-computed line start byte offsets for O(log n) position lookups.
 struct LineOffsetTable {
     line_starts: Vec<usize>,
