@@ -194,7 +194,8 @@ async fn fallback_completion(
 /// editor auto-closed it, or the user retyped it). Either would otherwise reach the
 /// registry as part of the search query and suppress exact matches.
 fn extract_prefix(line: &str, character: u32, ecosystem_kind: EcosystemId) -> &str {
-    let prefix_end = std::cmp::min(character as usize, line.len());
+    let prefix_end =
+        deps_core::completion::utf16_to_byte_offset(line, character).unwrap_or(line.len());
     let prefix = line[..prefix_end].trim();
     if uses_json_quoted_keys(ecosystem_kind) {
         prefix.trim_matches('"')
@@ -1237,9 +1238,7 @@ s
 
         // Extract prefix at position (1 char)
         let line = content.lines().nth(2).unwrap();
-        let prefix_end = std::cmp::min(1, line.len());
-        let prefix = &line[..prefix_end];
-        let prefix = prefix.trim();
+        let prefix = extract_prefix(line, 1, EcosystemId::Cargo);
 
         // Should reject single char (< 2 chars requirement)
         assert_eq!(prefix.len(), 1);
@@ -1255,9 +1254,7 @@ serde = "1.0"
 
         // Extract prefix at position (contains '=')
         let line = content.lines().nth(2).unwrap();
-        let prefix_end = std::cmp::min(12, line.len()); // "serde = "
-        let prefix = &line[..prefix_end];
-        let prefix = prefix.trim();
+        let prefix = extract_prefix(line, 12, EcosystemId::Cargo); // "serde = \"1.0"
 
         // Should reject prefix containing '='
         assert!(prefix.contains('='));
@@ -1275,12 +1272,21 @@ serde
         assert_eq!(line, "serde");
 
         // Cursor at position 100 (beyond line)
-        let prefix_end = std::cmp::min(100, line.len());
-        let prefix = &line[..prefix_end];
+        let prefix = extract_prefix(line, 100, EcosystemId::Cargo);
 
         // Should clamp to line length
         assert_eq!(prefix, "serde");
         assert_eq!(prefix.len(), 5); // Not 100
+    }
+
+    #[test]
+    fn test_extract_prefix_fallback_when_character_exceeds_line() {
+        // `character` beyond the line's UTF-16 length hits `utf16_to_byte_offset`'s
+        // `None` branch; `unwrap_or(line.len())` must clamp to the full line rather
+        // than panic, even when the line contains multi-byte characters.
+        let line = "café";
+        let character = line.chars().map(|c| c.len_utf16() as u32).sum::<u32>() + 10;
+        assert_eq!(extract_prefix(line, character, EcosystemId::Cargo), "café");
     }
 
     #[test]
@@ -1323,6 +1329,29 @@ serde
             extract_prefix(line, line.len() as u32, EcosystemId::Cargo),
             "\"expr"
         );
+    }
+
+    #[test]
+    fn test_extract_prefix_does_not_panic_on_multibyte_char_boundary() {
+        // `character` is a UTF-16 code unit count; using it as a raw byte index (the
+        // pre-fix bug) split "é" mid-encoding here and panicked on the slice.
+        let line = "    \"é";
+        let character: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
+        assert_eq!(extract_prefix(line, character, EcosystemId::Cargo), "\"é");
+    }
+
+    #[test]
+    fn test_extract_prefix_multibyte_word_not_truncated() {
+        let line = "café";
+        let character: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
+        assert_eq!(extract_prefix(line, character, EcosystemId::Cargo), "café");
+    }
+
+    #[test]
+    fn test_extract_prefix_cjk_word_not_truncated() {
+        let line = "日本";
+        let character: u32 = line.chars().map(|c| c.len_utf16() as u32).sum();
+        assert_eq!(extract_prefix(line, character, EcosystemId::Cargo), "日本");
     }
 
     #[tokio::test]
