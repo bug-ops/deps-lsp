@@ -11,7 +11,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
@@ -41,9 +41,14 @@ impl NuGetEcosystem {
         }
     }
 
-    async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
-        deps_core::completion::complete_package_names_generic(self.registry.as_ref(), prefix, 20)
-            .await
+    async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
+        deps_core::completion::complete_package_names_generic(
+            self.registry.as_ref(),
+            prefix,
+            20,
+            range,
+        )
+        .await
     }
 
     async fn complete_versions(
@@ -138,8 +143,8 @@ impl Ecosystem for NuGetEcosystem {
             use deps_core::completion::{CompletionContext, detect_completion_context};
 
             match detect_completion_context(parse_result, position, content) {
-                CompletionContext::PackageName { prefix } => {
-                    self.complete_package_names(&prefix).await
+                CompletionContext::PackageName { prefix, range } => {
+                    self.complete_package_names(&prefix, range).await
                 }
                 CompletionContext::Version {
                     package_name,
@@ -212,6 +217,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_package_name_completion_context_has_real_range() {
+        // Regression test for #232: the textEdit range for a package-name completion
+        // must be the real name token span, not the (0,0)-(0,0) placeholder.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Foo\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>";
+        let uri = deps_core::test_util::test_uri("/test/App.csproj");
+
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let position = Position::new(2, 33); // cursor after "Fo" in "Foo"
+
+        let context = deps_core::completion::detect_completion_context(
+            parse_result.as_ref(),
+            position,
+            content,
+        );
+
+        match context {
+            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                assert_eq!(prefix, "Fo");
+                assert_ne!(range, Range::default());
+                assert_eq!(
+                    range,
+                    Range::new(Position::new(2, 31), Position::new(2, 34))
+                );
+            }
+            other => panic!("Expected PackageName context, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_parse_manifest_csproj() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
@@ -270,7 +306,11 @@ mod tests {
     async fn test_complete_package_names_min_prefix() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
-        assert!(eco.complete_package_names("").await.is_empty());
+        assert!(
+            eco.complete_package_names("", Range::default())
+                .await
+                .is_empty()
+        );
     }
 
     /// End-to-end regression for issue #163: a `.csproj`/`Directory.Packages.props`

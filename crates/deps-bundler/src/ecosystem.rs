@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
@@ -34,9 +34,14 @@ impl BundlerEcosystem {
         }
     }
 
-    async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
-        deps_core::completion::complete_package_names_generic(self.registry.as_ref(), prefix, 20)
-            .await
+    async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
+        deps_core::completion::complete_package_names_generic(
+            self.registry.as_ref(),
+            prefix,
+            20,
+            range,
+        )
+        .await
     }
 
     async fn complete_versions(
@@ -111,8 +116,8 @@ impl Ecosystem for BundlerEcosystem {
             let context = detect_completion_context(parse_result, position, content);
 
             match context {
-                CompletionContext::PackageName { prefix } => {
-                    self.complete_package_names(&prefix).await
+                CompletionContext::PackageName { prefix, range } => {
+                    self.complete_package_names(&prefix, range).await
                 }
                 CompletionContext::Version {
                     package_name,
@@ -172,16 +177,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_package_name_completion_context_has_real_range() {
+        // Regression test for #232: the textEdit range for a package-name completion
+        // must be the real name token span, not the (0,0)-(0,0) placeholder.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = BundlerEcosystem::new(cache);
+        let content = "source 'https://rubygems.org'\ngem 'rails', '~> 7.0'";
+        let uri = deps_core::test_util::test_uri("/test/Gemfile");
+
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let position = Position::new(1, 7); // cursor after "ra" in "rails"
+
+        let context = deps_core::completion::detect_completion_context(
+            parse_result.as_ref(),
+            position,
+            content,
+        );
+
+        match context {
+            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                assert_eq!(prefix, "ra");
+                assert_ne!(range, Range::default());
+                assert_eq!(range, Range::new(Position::new(1, 5), Position::new(1, 10)));
+            }
+            other => panic!("Expected PackageName context, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_complete_package_names_minimum_prefix() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = BundlerEcosystem::new(cache);
 
         // Less than 2 characters should return empty
-        let results = ecosystem.complete_package_names("r").await;
+        let results = ecosystem
+            .complete_package_names("r", Range::default())
+            .await;
         assert!(results.is_empty());
 
         // Empty prefix should return empty
-        let results = ecosystem.complete_package_names("").await;
+        let results = ecosystem.complete_package_names("", Range::default()).await;
         assert!(results.is_empty());
     }
 
@@ -192,7 +227,9 @@ mod tests {
 
         // Prefix longer than 200 chars should return empty
         let long_prefix = "a".repeat(201);
-        let results = ecosystem.complete_package_names(&long_prefix).await;
+        let results = ecosystem
+            .complete_package_names(&long_prefix, Range::default())
+            .await;
         assert!(results.is_empty());
     }
 
