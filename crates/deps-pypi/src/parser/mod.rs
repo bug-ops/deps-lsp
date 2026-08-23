@@ -31,6 +31,16 @@ pub mod requirements;
 /// raw, unnormalized form rather than being parsed.
 const MAX_MARKER_LEN: usize = 2048;
 
+/// Requirement strings (name + extras + version specifier, excluding the
+/// marker section) longer than this are rejected outright rather than handed
+/// to `pep508_rs`'s extras-list parser, which runs in O(n²) on the extras
+/// list (verified: `pkg[a,a,a,...]` with ~256 KiB of repeated single-char
+/// extras takes ~400ms to parse; the cost grows quadratically with input
+/// length). Real-world requirement lines are well under 200 bytes, so this
+/// cap leaves ample headroom while bounding worst-case parse time for a
+/// single requirement to well under a millisecond.
+const MAX_REQUIREMENT_LEN: usize = 4096;
+
 /// Generous bound on PEP 508 marker parenthesis nesting depth.
 ///
 /// `pep508_rs`'s recursive-descent marker parser recurses once per nesting
@@ -74,6 +84,23 @@ fn marker_too_deep(marker: &str) -> bool {
         }
     }
     false
+}
+
+/// Longest prefix of an attacker-controlled requirement/dependency string
+/// logged verbatim by [`truncate_for_log`].
+const MAX_LOGGED_LEN: usize = 200;
+
+/// Truncates `s` to a safe-to-log prefix, so a warn!/debug! call site can
+/// never turn into a multi-megabyte synchronous write to the (by default,
+/// unbuffered, stderr-backed) log sink — exactly the size range
+/// [`MAX_REQUIREMENT_LEN`] exists to reject, up to the ~10 MB overall file
+/// cap. Falls back to `s` unchanged when it's already short enough.
+fn truncate_for_log(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.len() <= MAX_LOGGED_LEN {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let boundary = s.floor_char_boundary(MAX_LOGGED_LEN);
+    std::borrow::Cow::Owned(format!("{}... ({} bytes total)", &s[..boundary], s.len()))
 }
 
 /// Parse result containing all dependencies from a Python dependency manifest.
@@ -165,6 +192,30 @@ impl PypiParser {
         // occurrence unambiguously anchors the marker section (direct-reference
         // URLs containing `;` are a known, documented edge case - see #<follow-up>).
         let semicolon_idx = requirement_str.find(';');
+
+        // The name/extras/version portion — excluding the marker section —
+        // over the cap is rejected outright rather than handed to
+        // `pep508_rs`, whose extras-list parser runs in O(n²) on the extras
+        // list — an attacker-controlled `pkg[a,a,a,...]` list can otherwise
+        // block a tokio worker for minutes. Measured against this portion
+        // only (not the whole `requirement_str`) so an oversized *marker*
+        // still takes the `MAX_MARKER_LEN` graceful-degradation path below
+        // instead of being rejected here too. Unlike that marker guard,
+        // there's no cheap subset to fall back to for extras: the quadratic
+        // cost lives in the name/extras/version portion itself, so the whole
+        // dependency is skipped instead.
+        let pre_marker_len = semicolon_idx.unwrap_or(requirement_str.len());
+        if pre_marker_len > MAX_REQUIREMENT_LEN {
+            tracing::warn!(
+                "Requirement string exceeds the {MAX_REQUIREMENT_LEN}-byte length cap ({} bytes), skipping: {}",
+                pre_marker_len,
+                truncate_for_log(requirement_str)
+            );
+            return Err(PypiError::RequirementTooLong {
+                len: pre_marker_len,
+                max: MAX_REQUIREMENT_LEN,
+            });
+        }
 
         // Pathologically long or deeply nested marker expressions can overflow
         // the stack in `pep508_rs`'s unbounded recursive-descent parser. Parse
@@ -380,7 +431,7 @@ fn normalize_marker_string(raw: &str) -> Option<String> {
             trimmed.len(),
             MAX_MARKER_LEN,
             MAX_MARKER_DEPTH,
-            trimmed
+            truncate_for_log(trimmed)
         );
         return Some(trimmed.to_string());
     }
