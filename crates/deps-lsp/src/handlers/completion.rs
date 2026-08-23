@@ -37,6 +37,10 @@ pub async fn handle_completion(
         position.character
     );
 
+    // Snapshot before any document lookup, matching hover.rs/diagnostics.rs's ordering —
+    // this acquires the config RwLock before the DashMap shard guard, never the reverse.
+    let freshness = { config.read().await.freshness.to_settings() };
+
     // Check if document is loaded, if not try to load with short timeout
     // Completion is latency-critical, so we use a 200ms timeout
     if state.get_document(uri).is_none() {
@@ -90,7 +94,7 @@ pub async fn handle_completion(
         let ecosystem = state.ecosystem_registry.get(ecosystem_id)?;
         let completion_result = tokio::time::timeout(
             std::time::Duration::from_secs(COMPLETION_SEARCH_TIMEOUT_SECS),
-            ecosystem.generate_completions(parse_result, position, &content),
+            ecosystem.generate_completions(parse_result, position, &content, freshness),
         )
         .await;
         drop(doc);
@@ -1376,6 +1380,7 @@ serde
                 _parse_result: &'a dyn ParseResult,
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
             ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
                 Box::pin(async move {
                     // Well beyond COMPLETION_SEARCH_TIMEOUT_SECS; paused time resolves

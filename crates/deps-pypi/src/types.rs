@@ -102,6 +102,7 @@ pub use deps_core::parser::DependencySource as PypiDependencySource;
 /// let version = PypiVersion {
 ///     version: "2.28.2".into(),
 ///     yanked: false,
+///     published_at: None,
 /// };
 ///
 /// assert!(!version.yanked);
@@ -113,6 +114,12 @@ pub struct PypiVersion {
     pub version: String,
     /// Whether this version has been yanked from PyPI
     pub yanked: bool,
+    /// Earliest `upload-time` across this version's release files.
+    ///
+    /// `None` when no file reports one, or every reported value fails to
+    /// parse as RFC 3339 — degrades gracefully, per
+    /// [US-003](https://github.com/bug-ops/deps-lsp/issues/145).
+    pub published_at: Option<deps_core::PublishTime>,
 }
 
 impl PypiVersion {
@@ -125,10 +132,10 @@ impl PypiVersion {
     /// ```
     /// use deps_pypi::types::PypiVersion;
     ///
-    /// let stable = PypiVersion { version: "1.0.0".into(), yanked: false };
-    /// let alpha = PypiVersion { version: "1.0.0a1".into(), yanked: false };
-    /// let beta = PypiVersion { version: "1.0.0b2".into(), yanked: false };
-    /// let rc = PypiVersion { version: "1.0.0rc1".into(), yanked: false };
+    /// let stable = PypiVersion { version: "1.0.0".into(), yanked: false, published_at: None };
+    /// let alpha = PypiVersion { version: "1.0.0a1".into(), yanked: false, published_at: None };
+    /// let beta = PypiVersion { version: "1.0.0b2".into(), yanked: false, published_at: None };
+    /// let rc = PypiVersion { version: "1.0.0rc1".into(), yanked: false, published_at: None };
     ///
     /// assert!(!stable.is_prerelease());
     /// assert!(alpha.is_prerelease());
@@ -149,6 +156,7 @@ impl PypiVersion {
 deps_core::impl_version!(PypiVersion {
     version: version,
     yanked: yanked,
+    published_at: published_at,
 });
 
 /// Package metadata from PyPI.
@@ -372,6 +380,7 @@ mod tests {
         let version = PypiVersion {
             version: "1.0.0".into(),
             yanked: false,
+            published_at: None,
         };
 
         assert_eq!(version.version, "1.0.0");
@@ -384,18 +393,22 @@ mod tests {
         let stable = PypiVersion {
             version: "1.0.0".into(),
             yanked: false,
+            published_at: None,
         };
         let alpha = PypiVersion {
             version: "1.0.0a1".into(),
             yanked: false,
+            published_at: None,
         };
         let beta = PypiVersion {
             version: "1.0.0b2".into(),
             yanked: false,
+            published_at: None,
         };
         let rc = PypiVersion {
             version: "1.0.0rc1".into(),
             yanked: false,
+            published_at: None,
         };
 
         assert!(!stable.is_prerelease());
@@ -409,6 +422,7 @@ mod tests {
         let version = PypiVersion {
             version: "2.28.2".into(),
             yanked: true,
+            published_at: None,
         };
 
         assert_eq!(version.version_string(), "2.28.2");

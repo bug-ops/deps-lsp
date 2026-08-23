@@ -49,12 +49,14 @@ impl NpmEcosystem {
         &self,
         package_name: &deps_core::PackageName,
         prefix: &str,
+        freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
             prefix,
             &['^', '~', '=', '<', '>', '*'],
+            freshness,
         )
         .await
     }
@@ -107,6 +109,7 @@ impl Ecosystem for NpmEcosystem {
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
         content: &'a str,
+        freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
@@ -120,7 +123,10 @@ impl Ecosystem for NpmEcosystem {
                 CompletionContext::Version {
                     package_name,
                     prefix,
-                } => self.complete_versions(&package_name, &prefix).await,
+                } => {
+                    self.complete_versions(&package_name, &prefix, freshness)
+                        .await
+                }
                 CompletionContext::Feature { .. } => vec![],
                 CompletionContext::None => vec![],
             }
@@ -210,7 +216,13 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions(&pkg("express"), "4.").await;
+        let results = ecosystem
+            .complete_versions(
+                &pkg("express"),
+                "4.",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("4.")));
     }
@@ -221,7 +233,13 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions(&pkg("express"), "^4.").await;
+        let results = ecosystem
+            .complete_versions(
+                &pkg("express"),
+                "^4.",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("4.")));
     }
@@ -233,7 +251,11 @@ mod tests {
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
-            .complete_versions(&pkg("this-package-does-not-exist-12345"), "1.0")
+            .complete_versions(
+                &pkg("this-package-does-not-exist-12345"),
+                "1.0",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.is_empty());
     }
@@ -273,7 +295,13 @@ mod tests {
         let ecosystem = NpmEcosystem::new(cache);
 
         // Test that we respect the 20 result limit
-        let results = ecosystem.complete_versions(&pkg("express"), "4").await;
+        let results = ecosystem
+            .complete_versions(
+                &pkg("express"),
+                "4",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
         assert!(results.len() <= 20);
     }
 
@@ -388,7 +416,12 @@ mod tests {
         };
 
         let completions = ecosystem
-            .generate_completions(parse_result.as_ref(), position, content)
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
 
         assert!(completions.is_empty());
@@ -410,7 +443,12 @@ mod tests {
         };
 
         let completions = ecosystem
-            .generate_completions(parse_result.as_ref(), position, content)
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
 
         // Should not crash, returns empty or package/version completions
@@ -438,6 +476,7 @@ mod tests {
                 parse_result.as_ref(),
                 position,
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
             )
             .await;
 
@@ -481,6 +520,7 @@ mod tests {
                 parse_result.as_ref(),
                 VersionData::new(&cached_versions, &resolved_versions),
                 &uri,
+                deps_core::FreshnessSettings::default(),
             )
             .await;
 
@@ -494,7 +534,11 @@ mod tests {
 
         // Empty prefix should show non-deprecated versions (up to 20)
         let results = ecosystem
-            .complete_versions(&pkg("this-package-does-not-exist-12345"), "")
+            .complete_versions(
+                &pkg("this-package-does-not-exist-12345"),
+                "",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         // Should not panic, returns empty for unknown package
         assert!(results.is_empty());
@@ -507,7 +551,11 @@ mod tests {
 
         // Test ~ operator stripping
         let results = ecosystem
-            .complete_versions(&pkg("this-package-does-not-exist-12345"), "~4.0")
+            .complete_versions(
+                &pkg("this-package-does-not-exist-12345"),
+                "~4.0",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.is_empty());
     }
@@ -519,7 +567,11 @@ mod tests {
 
         // Test * wildcard stripping
         let results = ecosystem
-            .complete_versions(&pkg("this-package-does-not-exist-12345"), "*")
+            .complete_versions(
+                &pkg("this-package-does-not-exist-12345"),
+                "*",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.is_empty());
     }
@@ -531,7 +583,11 @@ mod tests {
 
         // Test < and > operator stripping
         let results = ecosystem
-            .complete_versions(&pkg("this-package-does-not-exist-12345"), "<2.0")
+            .complete_versions(
+                &pkg("this-package-does-not-exist-12345"),
+                "<2.0",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.is_empty());
     }

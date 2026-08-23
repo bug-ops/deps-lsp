@@ -9,7 +9,8 @@ use tower_lsp_server::ls_types::{
 
 use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome, VulnerabilityMap, diagnostic_severity_for};
 use crate::{
-    Dependency, EcosystemConfig, InvalidPackageName, PackageName, ParseResult, Registry, VersionReq,
+    Dependency, EcosystemConfig, InvalidPackageName, PackageName, ParseResult, PublishTime,
+    Registry, Version, VersionReq, format_relative_age,
 };
 
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
@@ -638,12 +639,28 @@ pub fn generate_inlay_hints(
     hints
 }
 
+/// Formats the relative-age suffix for one "Recent versions" hover entry.
+///
+/// Returns an empty string when the registry doesn't expose a publish timestamp for
+/// `version` (`published_at()` is `None`), so the entry renders exactly as it did
+/// before this feature existed (graceful degradation, US-003).
+///
+/// `now` is taken as an explicit parameter rather than read internally so every entry
+/// in the same "Recent versions" list is aged against one consistent instant.
+fn version_age_suffix(version: &dyn Version, now: PublishTime) -> String {
+    version
+        .published_at()
+        .map(|published| format!(" — {}", format_relative_age(published.age_secs_from(now))))
+        .unwrap_or_default()
+}
+
 pub async fn generate_hover<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
     versions: VersionData<'_>,
     registry: &R,
     formatter: &dyn EcosystemFormatter,
+    freshness: crate::freshness::FreshnessSettings,
 ) -> Option<Hover> {
     use std::fmt::Write;
 
@@ -720,20 +737,27 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     push_vulnerability_hover_section(&mut markdown, vuln_outcome);
 
     markdown.push_str("**Recent versions**:\n");
+    let now = PublishTime::now();
     for (i, version) in available_versions.iter().take(8).enumerate() {
         let version_span = markdown_code_span(version.version_string());
+        let age_suffix = if freshness.enabled {
+            version_age_suffix(version.as_ref(), now)
+        } else {
+            String::new()
+        };
         if i == 0 {
-            writeln!(&mut markdown, "- {version_span} *(latest)*").unwrap();
+            writeln!(&mut markdown, "- {version_span} *(latest)*{age_suffix}").unwrap();
         } else if version.is_yanked() {
             writeln!(
                 &mut markdown,
-                "- {} {}",
+                "- {} {}{}",
                 version_span,
-                formatter.yanked_label()
+                formatter.yanked_label(),
+                age_suffix
             )
             .unwrap();
         } else {
-            writeln!(&mut markdown, "- {version_span}").unwrap();
+            writeln!(&mut markdown, "- {version_span}{age_suffix}").unwrap();
         }
     }
 
@@ -822,6 +846,7 @@ pub fn generate_diagnostics_from_cache(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
+    _freshness: crate::freshness::FreshnessSettings,
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
@@ -1332,6 +1357,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     registry: &R,
     formatter: &dyn EcosystemFormatter,
+    _freshness: crate::freshness::FreshnessSettings,
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
@@ -1894,6 +1920,251 @@ mod tests {
         }
     }
 
+    /// A version with a configurable yanked flag and publish time, used for the
+    /// "Recent versions" hover freshness tests below.
+    struct MockVersionWithAge {
+        version: String,
+        yanked: bool,
+        published_at: Option<PublishTime>,
+    }
+
+    impl crate::Version for MockVersionWithAge {
+        fn version_string(&self) -> &str {
+            &self.version
+        }
+
+        fn is_yanked(&self) -> bool {
+            self.yanked
+        }
+
+        fn published_at(&self) -> Option<PublishTime> {
+            self.published_at
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A registry whose `get_versions` returns a fixed, caller-supplied version list —
+    /// used to exercise hover's "Recent versions" rendering, which `MockRegistry`
+    /// above (always empty) cannot.
+    struct MockRegistryWithVersions {
+        versions: Vec<MockVersionWithAge>,
+    }
+
+    impl crate::Registry for MockRegistryWithVersions {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a crate::PackageName,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            let versions = self
+                .versions
+                .iter()
+                .map(|v| {
+                    Box::new(MockVersionWithAge {
+                        version: v.version.clone(),
+                        yanked: v.yanked,
+                        published_at: v.published_at,
+                    }) as Box<dyn crate::Version>
+                })
+                .collect();
+            Box::pin(async move { Ok(versions) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a crate::PackageName,
+            _req: &'a crate::VersionReq,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn package_url(&self, _name: &crate::PackageName) -> String {
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Builds a single-dependency parse result for the freshness hover tests, cursor
+    /// positioned on the dependency name.
+    fn freshness_test_parse_result(name: &str) -> MockParseResult {
+        MockParseResult {
+            deps: vec![MockDep {
+                name: name.into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_recent_versions_shows_age_when_known() {
+        use std::collections::HashMap;
+
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "1.2.3".to_string(),
+                yanked: false,
+                // 2 days ago — safely mid-bucket, immune to sub-second test flakiness.
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 2 * 24 * 60 * 60,
+                )),
+            }],
+        };
+        let parse_result = freshness_test_parse_result("serde");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("- `1.2.3` *(latest)* — 2 days ago"),
+            "got: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_recent_versions_omits_age_when_unknown() {
+        use std::collections::HashMap;
+
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "1.2.3".to_string(),
+                yanked: false,
+                published_at: None,
+            }],
+        };
+        let parse_result = freshness_test_parse_result("serde");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        // Exactly the pre-feature line: no trailing age suffix.
+        assert!(content.value.contains("- `1.2.3` *(latest)*\n"));
+        assert!(!content.value.contains("ago"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_recent_versions_preserves_yanked_marker_with_age() {
+        use std::collections::HashMap;
+
+        let registry = MockRegistryWithVersions {
+            versions: vec![
+                MockVersionWithAge {
+                    version: "1.2.3".to_string(),
+                    yanked: false,
+                    published_at: None,
+                },
+                MockVersionWithAge {
+                    version: "1.2.1".to_string(),
+                    yanked: true,
+                    // ~5 months ago.
+                    published_at: Some(PublishTime::from_unix_secs(
+                        PublishTime::now().as_unix_secs() - 5 * 30 * 24 * 60 * 60,
+                    )),
+                },
+            ],
+        };
+        let parse_result = freshness_test_parse_result("serde");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("- `1.2.1` *(yanked)* — 5 months ago"),
+            "got: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_recent_versions_respects_freshness_disabled() {
+        use std::collections::HashMap;
+
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "1.2.3".to_string(),
+                yanked: false,
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 2 * 24 * 60 * 60,
+                )),
+            }],
+        };
+        let parse_result = freshness_test_parse_result("serde");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings {
+                enabled: false,
+                cooldown_secs: crate::freshness::DEFAULT_COOLDOWN_SECS,
+            },
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("- `1.2.3` *(latest)*\n"));
+        assert!(!content.value.contains("ago"));
+    }
+
     #[tokio::test]
     async fn test_generate_hover_surfaces_markers() {
         use std::collections::HashMap;
@@ -1914,6 +2185,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -1948,6 +2220,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -1984,6 +2257,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -2040,6 +2314,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -2091,6 +2366,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
             &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -2409,6 +2685,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            crate::freshness::FreshnessSettings::default(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -2444,6 +2721,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            crate::FreshnessSettings::default(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -2470,7 +2748,13 @@ mod tests {
             uri: crate::test_util::test_uri("/test/package.json"),
         };
 
-        let diagnostics = generate_diagnostics(&parse_result, &ErrorRegistry, &formatter).await;
+        let diagnostics = generate_diagnostics(
+            &parse_result,
+            &ErrorRegistry,
+            &formatter,
+            crate::FreshnessSettings::default(),
+        )
+        .await;
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
@@ -2504,6 +2788,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            crate::freshness::FreshnessSettings::default(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -2538,6 +2823,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            crate::freshness::FreshnessSettings::default(),
         );
 
         assert!(
@@ -2587,6 +2873,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            crate::freshness::FreshnessSettings::default(),
         );
 
         assert_eq!(diagnostics.len(), 2);
@@ -2731,6 +3018,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            crate::freshness::FreshnessSettings::default(),
         );
 
         assert!(
@@ -3267,7 +3555,12 @@ mod tests {
             let versions = VersionData::new(&cached, &resolved);
 
             let edits = collect_update_all_edits(&pr, content, versions, &MockFormatter);
-            let diagnostics = generate_diagnostics_from_cache(&pr, versions, &MockFormatter);
+            let diagnostics = generate_diagnostics_from_cache(
+                &pr,
+                versions,
+                &MockFormatter,
+                crate::FreshnessSettings::default(),
+            );
             let newer_version_diagnostics = diagnostics
                 .iter()
                 .filter(|d| d.message.contains("Newer version available"))
@@ -3358,6 +3651,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &formatter,
+            crate::FreshnessSettings::default(),
         );
 
         let vuln_diag = diagnostics
@@ -3403,6 +3697,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &formatter,
+            crate::FreshnessSettings::default(),
         );
 
         let more_diag = diagnostics
@@ -3439,6 +3734,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &formatter,
+            crate::FreshnessSettings::default(),
         );
 
         assert!(
@@ -3467,6 +3763,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
+            crate::FreshnessSettings::default(),
         )
         .await
         .expect("hover should be generated");
@@ -3500,6 +3797,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
+            crate::FreshnessSettings::default(),
         )
         .await
         .expect("hover should be generated");
@@ -3543,6 +3841,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
             &MockFormatter,
+            crate::FreshnessSettings::default(),
         )
         .await
         .expect("hover should be generated");

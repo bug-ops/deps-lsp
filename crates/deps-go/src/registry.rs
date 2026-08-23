@@ -347,7 +347,9 @@ fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
             let sort_key = parse_sort_key(line, is_pseudo);
             let version = GoVersion {
                 version: line.to_string(),
-                time: None,
+                // `/@v/list` carries no dates — a documented Go-specific
+                // limitation of this Ch2 path, not a parse failure.
+                published_at: None,
                 is_pseudo,
                 retracted: false,
             };
@@ -394,7 +396,7 @@ fn parse_version_info(module_path: &str, data: &[u8]) -> Result<GoVersion> {
     let is_pseudo = is_pseudo_version(&info.version);
     Ok(GoVersion {
         version: info.version,
-        time: Some(info.time),
+        published_at: deps_core::PublishTime::parse_rfc3339(&info.time),
         is_pseudo,
         retracted: false,
     })
@@ -503,8 +505,21 @@ mod tests {
         let json = r#"{"Version":"v1.9.1","Time":"2023-07-18T14:30:00Z"}"#;
         let version = parse_version_info("github.com/gin-gonic/gin", json.as_bytes()).unwrap();
         assert_eq!(version.version, "v1.9.1");
-        assert_eq!(version.time, Some("2023-07-18T14:30:00Z".into()));
+        assert_eq!(
+            version.published_at,
+            deps_core::PublishTime::parse_rfc3339("2023-07-18T14:30:00Z")
+        );
         assert!(!version.is_pseudo);
+    }
+
+    #[test]
+    fn test_parse_version_info_with_malformed_time() {
+        let json = r#"{"Version":"v1.9.1","Time":"not-a-timestamp"}"#;
+        let version = parse_version_info("github.com/gin-gonic/gin", json.as_bytes()).unwrap();
+        assert!(
+            version.published_at.is_none(),
+            "malformed Time degrades to None, not an error"
+        );
     }
 
     #[test]
@@ -624,7 +639,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(info.version, "v1.9.1");
-        assert!(info.time.is_some());
+        assert!(info.published_at.is_some());
     }
 
     #[tokio::test]

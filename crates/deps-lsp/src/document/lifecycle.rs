@@ -647,12 +647,16 @@ pub async fn handle_document_open(
 
     state.update_document(uri.clone(), doc_state);
 
-    // Clone cache and diagnostics config before spawning background task
-    // (both are read here, before any OSV request is built, so disabling
-    // the feature suppresses the network call itself — FR-011).
-    let (cache_config, vulnerabilities_enabled) = {
+    // Clone cache, diagnostics, and freshness config before spawning background task
+    // (all read here, before any OSV request is built, so disabling the feature
+    // suppresses the network call itself — FR-011).
+    let (cache_config, vulnerabilities_enabled, freshness_settings) = {
         let cfg = config.read().await;
-        (cfg.cache.clone(), cfg.diagnostics.vulnerabilities_enabled)
+        (
+            cfg.cache.clone(),
+            cfg.diagnostics.vulnerabilities_enabled,
+            cfg.freshness.to_settings(),
+        )
     };
 
     // Spawn background task to fetch versions
@@ -811,8 +815,12 @@ pub async fn handle_document_open(
         }
 
         // Publish diagnostics (may be slower, runs after hints are already visible)
-        let diags =
-            diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone).await;
+        let diags = diagnostics::generate_diagnostics_internal(
+            Arc::clone(&state_clone),
+            &uri_clone,
+            freshness_settings,
+        )
+        .await;
 
         client_clone
             .publish_diagnostics(uri_clone.clone(), diags, None)
@@ -902,11 +910,15 @@ pub async fn handle_document_change(
 
     state.update_document(uri.clone(), doc_state);
 
-    // Clone cache and diagnostics config before spawning background task
-    // (both are read here, before any OSV request is built — FR-011).
-    let (cache_config, vulnerabilities_enabled) = {
+    // Clone cache, diagnostics, and freshness config before spawning background task
+    // (all read here, before any OSV request is built — FR-011).
+    let (cache_config, vulnerabilities_enabled, freshness_settings) = {
         let cfg = config.read().await;
-        (cfg.cache.clone(), cfg.diagnostics.vulnerabilities_enabled)
+        (
+            cfg.cache.clone(),
+            cfg.diagnostics.vulnerabilities_enabled,
+            cfg.freshness.to_settings(),
+        )
     };
 
     // Spawn background task to update diagnostics
@@ -978,9 +990,12 @@ pub async fn handle_document_change(
                 }
             }
 
-            let diags =
-                diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone)
-                    .await;
+            let diags = diagnostics::generate_diagnostics_internal(
+                Arc::clone(&state_clone),
+                &uri_clone,
+                freshness_settings,
+            )
+            .await;
             client_clone
                 .publish_diagnostics(uri_clone.clone(), diags, None)
                 .await;
@@ -1080,8 +1095,12 @@ pub async fn handle_document_change(
             }
         }
 
-        let diags =
-            diagnostics::generate_diagnostics_internal(Arc::clone(&state_clone), &uri_clone).await;
+        let diags = diagnostics::generate_diagnostics_internal(
+            Arc::clone(&state_clone),
+            &uri_clone,
+            freshness_settings,
+        )
+        .await;
 
         client_clone
             .publish_diagnostics(uri_clone.clone(), diags, None)

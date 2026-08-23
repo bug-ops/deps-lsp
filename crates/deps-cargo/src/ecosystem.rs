@@ -47,12 +47,14 @@ impl CargoEcosystem {
         &self,
         package_name: &deps_core::PackageName,
         prefix: &str,
+        freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
             prefix,
             &['^', '~', '=', '<', '>'],
+            freshness,
         )
         .await
     }
@@ -141,6 +143,7 @@ impl Ecosystem for CargoEcosystem {
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
         content: &'a str,
+        freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
@@ -154,7 +157,10 @@ impl Ecosystem for CargoEcosystem {
                 CompletionContext::Version {
                     package_name,
                     prefix,
-                } => self.complete_versions(&package_name, &prefix).await,
+                } => {
+                    self.complete_versions(&package_name, &prefix, freshness)
+                        .await
+                }
                 CompletionContext::Feature {
                     package_name,
                     prefix,
@@ -516,7 +522,13 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions(&pkg("serde"), "1.0").await;
+        let results = ecosystem
+            .complete_versions(
+                &pkg("serde"),
+                "1.0",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("1.0")));
     }
@@ -527,7 +539,13 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions(&pkg("serde"), "^1.0").await;
+        let results = ecosystem
+            .complete_versions(
+                &pkg("serde"),
+                "^1.0",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("1.0")));
     }
@@ -561,7 +579,11 @@ mod tests {
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
-            .complete_versions(&pkg("this-package-does-not-exist-12345"), "1.0")
+            .complete_versions(
+                &pkg("this-package-does-not-exist-12345"),
+                "1.0",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.is_empty());
     }
@@ -613,7 +635,9 @@ mod tests {
         let ecosystem = CargoEcosystem::new(cache);
 
         // Test that we respect the 20 result limit
-        let results = ecosystem.complete_versions(&pkg("serde"), "1").await;
+        let results = ecosystem
+            .complete_versions(&pkg("serde"), "1", deps_core::FreshnessSettings::default())
+            .await;
         assert!(results.len() <= 20);
     }
 

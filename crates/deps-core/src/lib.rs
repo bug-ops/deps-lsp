@@ -15,6 +15,7 @@ pub mod completion;
 pub mod ecosystem;
 pub mod ecosystem_registry;
 pub mod error;
+pub mod freshness;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;
@@ -31,6 +32,9 @@ pub use cache::{CachedResponse, HttpCache};
 pub use ecosystem::{Dependency, Ecosystem, EcosystemConfig, EcosystemId, ParseResult};
 pub use ecosystem_registry::EcosystemRegistry;
 pub use error::{DepsError, Result};
+pub use freshness::{
+    DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age, is_within_cooldown,
+};
 pub use lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,
 };

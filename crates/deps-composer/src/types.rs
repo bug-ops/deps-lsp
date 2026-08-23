@@ -70,6 +70,7 @@ pub enum ComposerSection {
 ///     version: "6.0.0".into(),
 ///     version_normalized: "6.0.0.0".into(),
 ///     abandoned: false,
+///     published_at: None,
 /// };
 ///
 /// assert!(!version.abandoned);
@@ -79,11 +80,19 @@ pub struct ComposerVersion {
     pub version: String,
     pub version_normalized: String,
     pub abandoned: bool,
+    /// Publish timestamp, parsed from the p2 entry's own `time` field.
+    ///
+    /// Taken only from the entry itself, never inherited from a previous
+    /// minified entry — the Packagist v2 API's field-inheritance scheme does
+    /// not apply to `time`, since inheriting it would attribute one
+    /// release's publish date to another.
+    pub published_at: Option<deps_core::PublishTime>,
 }
 
 deps_core::impl_version!(ComposerVersion {
     version: version,
     yanked: abandoned,
+    published_at: published_at,
 });
 
 /// Package metadata from Packagist search.
@@ -159,6 +168,7 @@ mod tests {
             version: "2.0.0".into(),
             version_normalized: "2.0.0.0".into(),
             abandoned: true,
+            published_at: None,
         };
 
         assert_eq!(version.version_string(), "2.0.0");

@@ -33,12 +33,14 @@ impl DartEcosystem {
         &self,
         package_name: &deps_core::PackageName,
         prefix: &str,
+        freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
             prefix,
             &['^', '>', '<', '='],
+            freshness,
         )
         .await
     }
@@ -91,6 +93,7 @@ impl Ecosystem for DartEcosystem {
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
         content: &'a str,
+        freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
@@ -104,7 +107,10 @@ impl Ecosystem for DartEcosystem {
                 CompletionContext::Version {
                     package_name,
                     prefix,
-                } => self.complete_versions(&package_name, &prefix).await,
+                } => {
+                    self.complete_versions(&package_name, &prefix, freshness)
+                        .await
+                }
                 CompletionContext::Feature { .. } | CompletionContext::None => vec![],
             }
         })

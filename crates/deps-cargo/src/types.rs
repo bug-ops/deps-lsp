@@ -74,7 +74,8 @@ pub enum DependencySection {
 /// Version information for a crate from crates.io.
 ///
 /// Retrieved from the sparse index at `https://index.crates.io/{cr}/{at}/{crate}`.
-/// Contains version number, yanked status, and available feature flags.
+/// Contains version number, yanked status, available feature flags, and
+/// publish timestamp.
 ///
 /// # Examples
 ///
@@ -90,6 +91,7 @@ pub enum DependencySection {
 ///         f.insert("derive".into(), vec!["serde_derive".into()]);
 ///         f
 ///     },
+///     published_at: None,
 /// };
 ///
 /// assert!(!version.yanked);
@@ -100,6 +102,12 @@ pub struct CargoVersion {
     pub num: String,
     pub yanked: bool,
     pub features: HashMap<String, Vec<String>>,
+    /// Publish timestamp, parsed from the sparse index's `pubtime` field.
+    ///
+    /// `None` when the index entry omits `pubtime` (older cached entries) or
+    /// the value fails to parse as RFC 3339 — degrades gracefully, per
+    /// [US-003](https://github.com/bug-ops/deps-lsp/issues/145).
+    pub published_at: Option<deps_core::PublishTime>,
 }
 
 /// Crate metadata from crates.io search API.
@@ -178,6 +186,10 @@ impl deps_core::Version for CargoVersion {
 
     fn features(&self) -> Vec<String> {
         self.features.keys().cloned().collect()
+    }
+
+    fn published_at(&self) -> Option<deps_core::PublishTime> {
+        self.published_at
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -260,10 +272,12 @@ mod tests {
             num: "1.0.0".into(),
             yanked: false,
             features: HashMap::new(),
+            published_at: None,
         };
 
         assert_eq!(version.num, "1.0.0");
         assert!(!version.yanked);
         assert!(version.features.is_empty());
+        assert!(version.published_at.is_none());
     }
 }

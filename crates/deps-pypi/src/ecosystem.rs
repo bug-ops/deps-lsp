@@ -49,12 +49,14 @@ impl PypiEcosystem {
         &self,
         package_name: &deps_core::PackageName,
         prefix: &str,
+        freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
             prefix,
             &['>', '<', '=', '~', '!'],
+            freshness,
         )
         .await
     }
@@ -112,6 +114,7 @@ impl Ecosystem for PypiEcosystem {
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
         content: &'a str,
+        freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
@@ -125,7 +128,10 @@ impl Ecosystem for PypiEcosystem {
                 CompletionContext::Version {
                     package_name,
                     prefix,
-                } => self.complete_versions(&package_name, &prefix).await,
+                } => {
+                    self.complete_versions(&package_name, &prefix, freshness)
+                        .await
+                }
                 CompletionContext::Feature { .. } => vec![],
                 CompletionContext::None => vec![],
             }
@@ -215,7 +221,13 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions(&pkg("requests"), "2.").await;
+        let results = ecosystem
+            .complete_versions(
+                &pkg("requests"),
+                "2.",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("2.")));
     }
@@ -226,7 +238,13 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions(&pkg("requests"), ">=2.").await;
+        let results = ecosystem
+            .complete_versions(
+                &pkg("requests"),
+                ">=2.",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("2.")));
     }
@@ -238,7 +256,11 @@ mod tests {
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
-            .complete_versions(&pkg("this-package-does-not-exist-12345"), "1.0")
+            .complete_versions(
+                &pkg("this-package-does-not-exist-12345"),
+                "1.0",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.is_empty());
     }
@@ -278,7 +300,13 @@ mod tests {
         let ecosystem = PypiEcosystem::new(cache);
 
         // Test that we respect the 20 result limit
-        let results = ecosystem.complete_versions(&pkg("requests"), "2").await;
+        let results = ecosystem
+            .complete_versions(
+                &pkg("requests"),
+                "2",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
         assert!(results.len() <= 20);
     }
 
@@ -403,7 +431,12 @@ name = "test"
         };
 
         let completions = ecosystem
-            .generate_completions(parse_result.as_ref(), position, content)
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
 
         assert!(completions.is_empty());
@@ -430,7 +463,12 @@ dependencies = ["requests"]
         };
 
         let completions = ecosystem
-            .generate_completions(parse_result.as_ref(), position, content)
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
 
         // Should not crash, returns empty or package/version completions
@@ -460,6 +498,7 @@ name = "test"
                 parse_result.as_ref(),
                 position,
                 VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::FreshnessSettings::default(),
             )
             .await;
 
@@ -508,6 +547,7 @@ dependencies = []
                 parse_result.as_ref(),
                 VersionData::new(&cached_versions, &resolved_versions),
                 &uri,
+                deps_core::FreshnessSettings::default(),
             )
             .await;
 
@@ -521,7 +561,11 @@ dependencies = []
 
         // Empty prefix should show non-yanked versions (up to 20)
         let results = ecosystem
-            .complete_versions(&pkg("nonexistent-package"), "")
+            .complete_versions(
+                &pkg("nonexistent-package"),
+                "",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         // Should not panic, returns empty for unknown package
         assert!(results.is_empty());
@@ -534,7 +578,11 @@ dependencies = []
 
         // Test PEP 440 operators are stripped correctly
         let results = ecosystem
-            .complete_versions(&pkg("nonexistent-pkg"), "~=2.0")
+            .complete_versions(
+                &pkg("nonexistent-pkg"),
+                "~=2.0",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.is_empty());
     }
@@ -546,7 +594,11 @@ dependencies = []
 
         // Test != operator stripping
         let results = ecosystem
-            .complete_versions(&pkg("nonexistent-pkg"), "!=2.0")
+            .complete_versions(
+                &pkg("nonexistent-pkg"),
+                "!=2.0",
+                deps_core::FreshnessSettings::default(),
+            )
             .await;
         assert!(results.is_empty());
     }

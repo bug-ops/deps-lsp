@@ -125,18 +125,29 @@ struct PackagistResponse {
 ///
 /// The v2 API returns only the first version as complete. Subsequent entries
 /// contain only fields that changed from the previous entry.
+///
+/// `time` is deliberately excluded from this inheritance scheme (see
+/// [`expand_minified_versions`]): every entry carries its own `time` (87/87
+/// live-verified on `monolog/monolog`), and inheriting it across entries
+/// would attribute one release's publish date to another.
 #[derive(Deserialize, Clone, Default)]
 struct MinifiedVersion {
     version: Option<String>,
     version_normalized: Option<String>,
     abandoned: Option<serde_json::Value>,
+    /// Publish timestamp (RFC 3339, e.g. `"2026-01-02T08:56:05+00:00"`).
+    #[serde(default)]
+    time: Option<String>,
 }
 
 /// Expands minified Packagist v2 versions using field inheritance.
 ///
 /// The v2 API compresses responses: only the first entry is complete.
 /// Each subsequent entry inherits fields from the previous one and overrides
-/// only the fields that changed.
+/// only the fields that changed. `time` is the one exception: it is read
+/// only from the entry itself, never inherited, since a missing `time` means
+/// the release genuinely has no known publish date, not that it shares the
+/// previous release's date.
 ///
 /// Dev versions (`dev-*` or `*-dev`) are filtered out.
 fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersion> {
@@ -144,6 +155,13 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
     let mut current = MinifiedVersion::default();
 
     for entry in entries {
+        // `time` is not part of the inherited state; read it before `entry`
+        // is partially consumed below.
+        let published_at = entry
+            .time
+            .as_deref()
+            .and_then(deps_core::PublishTime::parse_rfc3339);
+
         // Inherit previous state, then apply overrides
         if entry.version.is_some() {
             current.version = entry.version;
@@ -176,6 +194,7 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
                 .clone()
                 .unwrap_or_else(|| version.clone()),
             abandoned,
+            published_at,
         });
     }
 
@@ -322,11 +341,13 @@ mod tests {
                 version: Some("3.0.0".into()),
                 version_normalized: Some("3.0.0.0".into()),
                 abandoned: None,
+                time: None,
             },
             MinifiedVersion {
                 version: Some("2.0.0".into()),
                 version_normalized: Some("2.0.0.0".into()),
                 abandoned: None,
+                time: None,
             },
         ];
 
@@ -345,11 +366,13 @@ mod tests {
                 version: Some("3.0.0".into()),
                 version_normalized: Some("3.0.0.0".into()),
                 abandoned: None,
+                time: None,
             },
             MinifiedVersion {
                 version: Some("2.9.0".into()),
                 version_normalized: None, // inherited
                 abandoned: None,
+                time: None,
             },
         ];
 
@@ -366,16 +389,19 @@ mod tests {
                 version: Some("3.0.0".into()),
                 version_normalized: Some("3.0.0.0".into()),
                 abandoned: None,
+                time: None,
             },
             MinifiedVersion {
                 version: Some("dev-main".into()),
                 version_normalized: None,
                 abandoned: None,
+                time: None,
             },
             MinifiedVersion {
                 version: Some("2.0.0-dev".into()),
                 version_normalized: None,
                 abandoned: None,
+                time: None,
             },
         ];
 
@@ -390,11 +416,89 @@ mod tests {
             version: Some("3.0.0".into()),
             version_normalized: Some("3.0.0.0".into()),
             abandoned: Some(serde_json::Value::String("Use other/package".into())),
+            time: None,
         }];
 
         let versions = expand_minified_versions(entries);
         assert_eq!(versions.len(), 1);
         assert!(versions[0].abandoned);
+    }
+
+    #[test]
+    fn test_expand_minified_versions_with_time() {
+        let entries = vec![MinifiedVersion {
+            version: Some("3.0.0".into()),
+            version_normalized: Some("3.0.0.0".into()),
+            abandoned: None,
+            time: Some("2026-01-02T08:56:05+00:00".into()),
+        }];
+
+        let versions = expand_minified_versions(entries);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            versions[0].published_at,
+            deps_core::PublishTime::parse_rfc3339("2026-01-02T08:56:05+00:00")
+        );
+    }
+
+    #[test]
+    fn test_expand_minified_versions_without_time() {
+        let entries = vec![MinifiedVersion {
+            version: Some("3.0.0".into()),
+            version_normalized: Some("3.0.0.0".into()),
+            abandoned: None,
+            time: None,
+        }];
+
+        let versions = expand_minified_versions(entries);
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].published_at.is_none());
+    }
+
+    #[test]
+    fn test_expand_minified_versions_with_malformed_time() {
+        let entries = vec![MinifiedVersion {
+            version: Some("3.0.0".into()),
+            version_normalized: Some("3.0.0.0".into()),
+            abandoned: None,
+            time: Some("not-a-timestamp".into()),
+        }];
+
+        let versions = expand_minified_versions(entries);
+        assert_eq!(versions.len(), 1);
+        assert!(
+            versions[0].published_at.is_none(),
+            "malformed time degrades to None, not an error"
+        );
+    }
+
+    #[test]
+    fn test_expand_minified_versions_time_is_not_inherited() {
+        // Correctness requirement: an entry with no `time` must yield `None`
+        // for that entry, never the previous entry's `time` — unlike
+        // `version_normalized`/`abandoned`, which do inherit.
+        let entries = vec![
+            MinifiedVersion {
+                version: Some("3.0.0".into()),
+                version_normalized: Some("3.0.0.0".into()),
+                abandoned: None,
+                time: Some("2026-01-02T08:56:05+00:00".into()),
+            },
+            MinifiedVersion {
+                version: Some("2.9.0".into()),
+                version_normalized: None, // inherited
+                abandoned: None,
+                time: None, // must NOT inherit the previous entry's time
+            },
+        ];
+
+        let versions = expand_minified_versions(entries);
+        assert_eq!(versions.len(), 2);
+        assert!(versions[0].published_at.is_some());
+        assert!(
+            versions[1].published_at.is_none(),
+            "time must not be inherited from the previous entry"
+        );
     }
 
     #[test]

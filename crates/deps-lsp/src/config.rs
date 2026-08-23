@@ -36,6 +36,8 @@ pub struct DepsConfig {
     pub loading_indicator: LoadingIndicatorConfig,
     #[serde(default)]
     pub code_lens: CodeLensConfig,
+    #[serde(default)]
+    pub freshness: FreshnessConfig,
 }
 
 /// Configuration for inlay hints (inline version annotations).
@@ -423,6 +425,102 @@ impl Default for CodeLensConfig {
     }
 }
 
+/// Configuration for the release-freshness signal (issue #145).
+///
+/// Controls whether a recently published "latest" version is flagged as
+/// still within a cooldown window, mirroring GitHub Dependabot's default
+/// 3-day package cooldown. Applied uniformly across all ecosystems — no
+/// per-ecosystem override.
+///
+/// # Defaults
+///
+/// - `enabled`: `true`
+/// - `cooldown_secs`: `259200` (3 days)
+///
+/// # Examples
+///
+/// ```
+/// use deps_lsp::config::FreshnessConfig;
+///
+/// let config = FreshnessConfig {
+///     enabled: true,
+///     cooldown_secs: 3600,
+/// };
+///
+/// assert_eq!(config.cooldown_secs, 3600);
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct FreshnessConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Cooldown window in seconds, clamped to 0..=30 days (default: 3 days)
+    #[serde(
+        default = "default_cooldown_secs",
+        deserialize_with = "deserialize_cooldown_secs"
+    )]
+    pub cooldown_secs: u64,
+}
+
+impl Default for FreshnessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cooldown_secs: default_cooldown_secs(),
+        }
+    }
+}
+
+impl FreshnessConfig {
+    /// Converts this LSP-facing config into the `deps-core` DTO threaded
+    /// through `Ecosystem::generate_hover`/`generate_diagnostics`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::FreshnessConfig;
+    ///
+    /// let config = FreshnessConfig::default();
+    /// let settings = config.to_settings();
+    /// assert!(settings.enabled);
+    /// ```
+    #[must_use]
+    pub const fn to_settings(&self) -> deps_core::FreshnessSettings {
+        deps_core::FreshnessSettings {
+            enabled: self.enabled,
+            cooldown_secs: self.cooldown_secs,
+        }
+    }
+}
+
+const fn default_cooldown_secs() -> u64 {
+    deps_core::DEFAULT_COOLDOWN_SECS
+}
+
+/// Minimum cooldown window (seconds) — 0 disables the cooldown callout
+/// while keeping age display.
+const MIN_COOLDOWN_SECS: u64 = 0;
+/// Maximum cooldown window (seconds) — 30 days.
+const MAX_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Custom deserializer for `cooldown_secs` that validates bounds.
+fn deserialize_cooldown_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let secs = u64::deserialize(deserializer)?;
+    let clamped = secs.clamp(MIN_COOLDOWN_SECS, MAX_COOLDOWN_SECS);
+    if clamped != secs {
+        tracing::warn!(
+            "freshness.cooldown_secs {} clamped to {} (valid range: {}-{})",
+            secs,
+            clamped,
+            MIN_COOLDOWN_SECS,
+            MAX_COOLDOWN_SECS
+        );
+    }
+    Ok(clamped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +856,71 @@ mod tests {
         // `enabled: false` if CodeLensConfig ever switched to a derived Default.
         let config = DepsConfig::default();
         assert!(config.code_lens.enabled);
+    }
+
+    #[test]
+    fn test_freshness_config_defaults() {
+        let config = FreshnessConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.cooldown_secs, 259_200);
+    }
+
+    #[test]
+    fn test_freshness_config_partial_deserialization() {
+        let json = r#"{"enabled": false}"#;
+        let config: FreshnessConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.cooldown_secs, 259_200, "Should use default");
+    }
+
+    #[test]
+    fn test_freshness_config_custom_cooldown() {
+        let json = r#"{"cooldown_secs": 3600}"#;
+        let config: FreshnessConfig = serde_json::from_str(json).unwrap();
+        assert!(config.enabled, "Should use default");
+        assert_eq!(config.cooldown_secs, 3600);
+    }
+
+    #[test]
+    fn test_freshness_config_cooldown_clamped_min() {
+        let json = r#"{"cooldown_secs": 0}"#;
+        let config: FreshnessConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.cooldown_secs, 0, "0 disables the cooldown callout");
+    }
+
+    #[test]
+    fn test_freshness_config_cooldown_clamped_max() {
+        let json = r#"{"cooldown_secs": 99999999}"#;
+        let config: FreshnessConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.cooldown_secs,
+            30 * 24 * 60 * 60,
+            "Should clamp to 30 days"
+        );
+    }
+
+    #[test]
+    fn test_freshness_config_to_settings() {
+        let config = FreshnessConfig {
+            enabled: false,
+            cooldown_secs: 1800,
+        };
+        let settings = config.to_settings();
+        assert!(!settings.enabled);
+        assert_eq!(settings.cooldown_secs, 1800);
+    }
+
+    #[test]
+    fn test_deps_config_includes_freshness_default() {
+        let config = DepsConfig::default();
+        assert!(config.freshness.enabled);
+        assert_eq!(config.freshness.cooldown_secs, 259_200);
+    }
+
+    #[test]
+    fn test_deps_config_empty_json_includes_freshness_default() {
+        let config: DepsConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.freshness.enabled);
+        assert_eq!(config.freshness.cooldown_secs, 259_200);
     }
 }

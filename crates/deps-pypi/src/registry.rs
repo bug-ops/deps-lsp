@@ -358,6 +358,12 @@ struct SimpleFile {
     filename: String,
     #[serde(default)]
     yanked: Yanked,
+    /// PEP 700 upload timestamp (RFC 3339), per file rather than per version.
+    ///
+    /// Absent on older Simple API responses; `#[serde(default)]` keeps such
+    /// entries parseable.
+    #[serde(rename = "upload-time", default)]
+    upload_time: Option<String>,
 }
 
 /// A file's yanked status per PEP 592: either `false` (not yanked) or a
@@ -407,7 +413,7 @@ const KNOWN_ARCHIVE_EXTENSIONS: &[&str] = &[
 ///
 /// Returns `None` if `filename` doesn't conform closely enough to derive a
 /// version unambiguously; callers skip attributing that file rather than
-/// guess (see [`build_yanked_map`]).
+/// guess (see [`build_version_metadata`]).
 fn parse_version_from_filename<'a>(filename: &'a str, normalized_name: &str) -> Option<&'a str> {
     let bytes = filename.as_bytes();
     let mut fi = 0usize;
@@ -439,11 +445,20 @@ fn parse_version_from_filename<'a>(filename: &'a str, normalized_name: &str) -> 
     }
 }
 
-/// Builds a per-version yanked map from a Simple API `files` list.
-///
-/// A version is yanked if any of its release files are yanked (PyPI itself
-/// treats a release as yanked once any file under it is, since new uploads
-/// to an already-yanked version are rejected).
+/// Aggregated per-version metadata derived from a Simple API `files` list.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VersionMetadata {
+    /// A version is yanked if any of its release files are yanked (PyPI
+    /// itself treats a release as yanked once any file under it is, since
+    /// new uploads to an already-yanked version are rejected).
+    yanked: bool,
+    /// Earliest `upload-time` across the version's release files (a version
+    /// can ship multiple files/wheels uploaded at different times). `None`
+    /// if no file reports one.
+    published_at: Option<deps_core::PublishTime>,
+}
+
+/// Builds a per-version metadata map from a Simple API `files` list.
 ///
 /// Derives each file's version in O(1) via [`parse_version_from_filename`]
 /// and resolves it against `versions` in two tiers, the second tried only
@@ -462,11 +477,11 @@ fn parse_version_from_filename<'a>(filename: &'a str, normalized_name: &str) -> 
 /// a file to an unrelated version whose digits happened to appear elsewhere
 /// in the filename (e.g. a platform tag), which is worse than the version's
 /// yanked status resting on its other, better-formed release files.
-fn build_yanked_map(
+fn build_version_metadata(
     files: &[SimpleFile],
     versions: &[String],
     normalized_name: &str,
-) -> std::collections::HashMap<String, bool> {
+) -> std::collections::HashMap<String, VersionMetadata> {
     let version_set: std::collections::HashSet<&str> =
         versions.iter().map(String::as_str).collect();
 
@@ -474,7 +489,8 @@ fn build_yanked_map(
     // exact-string tier and never need this.
     let mut parsed_versions: Option<std::collections::HashMap<Version, &str>> = None;
 
-    let mut yanked: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut metadata: std::collections::HashMap<String, VersionMetadata> =
+        std::collections::HashMap::new();
     for file in files {
         let matched =
             parse_version_from_filename(&file.filename, normalized_name).and_then(|candidate| {
@@ -493,10 +509,21 @@ fn build_yanked_map(
         let Some(version) = matched else {
             continue;
         };
-        let entry = yanked.entry(version.to_string()).or_insert(false);
-        *entry |= file.yanked.is_yanked();
+        let entry = metadata.entry(version.to_string()).or_default();
+        entry.yanked |= file.yanked.is_yanked();
+        if let Some(uploaded) = file
+            .upload_time
+            .as_deref()
+            .and_then(deps_core::PublishTime::parse_rfc3339)
+        {
+            entry.published_at = Some(
+                entry
+                    .published_at
+                    .map_or(uploaded, |existing| existing.max(uploaded)),
+            );
+        }
     }
-    yanked
+    metadata
 }
 
 /// Parse the version list from a PyPI Simple API (PEP 691) JSON response.
@@ -509,18 +536,22 @@ fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<Pypi
         })?;
 
     let normalized_name = normalize_package_name(package_name);
-    let yanked_map = build_yanked_map(&response.files, &response.versions, &normalized_name);
+    let metadata_map =
+        build_version_metadata(&response.files, &response.versions, &normalized_name);
 
     let mut versions_with_parsed: Vec<(PypiVersion, Version)> = response
         .versions
         .into_iter()
         .filter_map(|version_str| {
             let parsed = Version::from_str(&version_str).ok()?;
-            let yanked = yanked_map.get(&version_str).copied().unwrap_or(false);
+            let meta = metadata_map.get(&version_str);
+            let yanked = meta.is_some_and(|m| m.yanked);
+            let published_at = meta.and_then(|m| m.published_at);
             Some((
                 PypiVersion {
                     version: version_str,
                     yanked,
+                    published_at,
                 },
                 parsed,
             ))
@@ -702,6 +733,60 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_simple_api_response_with_upload_time() {
+        let json = r#"{
+            "meta": {"api-version": "1.4"},
+            "name": "requests",
+            "versions": ["2.28.2"],
+            "files": [
+                {"filename": "requests-2.28.2.tar.gz", "yanked": false, "upload-time": "2026-05-14T19:25:27.735762Z"}
+            ]
+        }"#;
+
+        let versions = parse_simple_api_response("requests", json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            versions[0].published_at,
+            deps_core::PublishTime::parse_rfc3339("2026-05-14T19:25:27.735762Z")
+        );
+    }
+
+    #[test]
+    fn test_parse_simple_api_response_without_upload_time() {
+        let json = r#"{
+            "meta": {"api-version": "1.4"},
+            "name": "requests",
+            "versions": ["2.28.2"],
+            "files": [
+                {"filename": "requests-2.28.2.tar.gz", "yanked": false}
+            ]
+        }"#;
+
+        let versions = parse_simple_api_response("requests", json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].published_at.is_none());
+    }
+
+    #[test]
+    fn test_parse_simple_api_response_with_malformed_upload_time() {
+        let json = r#"{
+            "meta": {"api-version": "1.4"},
+            "name": "requests",
+            "versions": ["2.28.2"],
+            "files": [
+                {"filename": "requests-2.28.2.tar.gz", "yanked": false, "upload-time": "not-a-timestamp"}
+            ]
+        }"#;
+
+        let versions = parse_simple_api_response("requests", json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(
+            versions[0].published_at.is_none(),
+            "malformed upload-time degrades to None, not an error"
+        );
+    }
+
+    #[test]
     fn test_parse_simple_api_response_yanked_with_reason_string() {
         // PEP 592: `yanked` may be a non-empty string giving the reason,
         // which still means "yanked" (only `false` means not yanked).
@@ -721,39 +806,42 @@ mod tests {
     }
 
     #[test]
-    fn test_build_yanked_map_disambiguates_version_prefixes() {
+    fn test_build_version_metadata_disambiguates_version_prefixes() {
         // "1.0" is a substring of the "1.0.0" filename; trying the longer
         // version first must ensure "1.0"'s own (absent) file isn't
         // conflated with "1.0.0"'s file.
         let files = vec![SimpleFile {
             filename: "pkg-1.0.0.tar.gz".to_string(),
             yanked: Yanked::Flag(true),
+            upload_time: None,
         }];
         let versions = vec!["1.0".to_string(), "1.0.0".to_string()];
-        let map = build_yanked_map(&files, &versions, "pkg");
-        assert_eq!(map.get("1.0.0"), Some(&true));
-        assert_eq!(map.get("1.0"), None);
+        let map = build_version_metadata(&files, &versions, "pkg");
+        assert!(map.get("1.0.0").unwrap().yanked);
+        assert!(!map.contains_key("1.0"));
     }
 
     #[test]
-    fn test_build_yanked_map_any_file_yanked_marks_version_yanked() {
+    fn test_build_version_metadata_any_file_yanked_marks_version_yanked() {
         let files = vec![
             SimpleFile {
                 filename: "pkg-1.0.0-py3-none-any.whl".to_string(),
                 yanked: Yanked::Flag(false),
+                upload_time: None,
             },
             SimpleFile {
                 filename: "pkg-1.0.0.tar.gz".to_string(),
                 yanked: Yanked::Flag(true),
+                upload_time: None,
             },
         ];
         let versions = vec!["1.0.0".to_string()];
-        let map = build_yanked_map(&files, &versions, "pkg");
-        assert_eq!(map.get("1.0.0"), Some(&true));
+        let map = build_version_metadata(&files, &versions, "pkg");
+        assert!(map.get("1.0.0").unwrap().yanked);
     }
 
     #[test]
-    fn test_build_yanked_map_disambiguates_in_both_directions() {
+    fn test_build_version_metadata_disambiguates_in_both_directions() {
         // Both "1.0" and "1.0.0" are real releases with their own files.
         // Matching must not let the longer version's absent file bleed into
         // the shorter version's real one, nor vice versa.
@@ -761,38 +849,44 @@ mod tests {
             SimpleFile {
                 filename: "pkg-1.0.tar.gz".to_string(),
                 yanked: Yanked::Flag(true),
+                upload_time: None,
             },
             SimpleFile {
                 filename: "pkg-1.0.0.tar.gz".to_string(),
                 yanked: Yanked::Flag(false),
+                upload_time: None,
             },
         ];
         let versions = vec!["1.0".to_string(), "1.0.0".to_string()];
-        let map = build_yanked_map(&files, &versions, "pkg");
-        assert_eq!(map.get("1.0"), Some(&true));
-        assert_eq!(map.get("1.0.0"), Some(&false));
+        let map = build_version_metadata(&files, &versions, "pkg");
+        assert!(map.get("1.0").unwrap().yanked);
+        assert!(!map.get("1.0.0").unwrap().yanked);
     }
 
     #[test]
-    fn test_build_yanked_map_pre_post_dev_suffixes() {
+    fn test_build_version_metadata_pre_post_dev_suffixes() {
         // Pre/post/dev-release version strings are '.'-delimited suffixes on
         // the base version and must not be conflated with it or each other.
         let files = vec![
             SimpleFile {
                 filename: "pkg-1.0.0.tar.gz".to_string(),
                 yanked: Yanked::Flag(false),
+                upload_time: None,
             },
             SimpleFile {
                 filename: "pkg-1.0.0rc1.tar.gz".to_string(),
                 yanked: Yanked::Flag(true),
+                upload_time: None,
             },
             SimpleFile {
                 filename: "pkg-1.0.0.post1.tar.gz".to_string(),
                 yanked: Yanked::Flag(false),
+                upload_time: None,
             },
             SimpleFile {
                 filename: "pkg-1.0.0.dev1.tar.gz".to_string(),
                 yanked: Yanked::Flag(true),
+                upload_time: None,
             },
         ];
         let versions = vec![
@@ -801,11 +895,65 @@ mod tests {
             "1.0.0.post1".to_string(),
             "1.0.0.dev1".to_string(),
         ];
-        let map = build_yanked_map(&files, &versions, "pkg");
-        assert_eq!(map.get("1.0.0"), Some(&false));
-        assert_eq!(map.get("1.0.0rc1"), Some(&true));
-        assert_eq!(map.get("1.0.0.post1"), Some(&false));
-        assert_eq!(map.get("1.0.0.dev1"), Some(&true));
+        let map = build_version_metadata(&files, &versions, "pkg");
+        assert!(!map.get("1.0.0").unwrap().yanked);
+        assert!(map.get("1.0.0rc1").unwrap().yanked);
+        assert!(!map.get("1.0.0.post1").unwrap().yanked);
+        assert!(map.get("1.0.0.dev1").unwrap().yanked);
+    }
+
+    #[test]
+    fn test_build_version_metadata_takes_maximum_upload_time() {
+        // A version can ship multiple files (sdist + wheels) uploaded at
+        // different times, and PyPI allows adding a new file to an already
+        // published version. The most-recently-added file is what should
+        // count for freshness (fail-closed against the cooldown window),
+        // not the version's original release.
+        let files = vec![
+            SimpleFile {
+                filename: "pkg-1.0.0-py3-none-any.whl".to_string(),
+                yanked: Yanked::Flag(false),
+                upload_time: Some("2026-05-14T19:25:27Z".to_string()),
+            },
+            SimpleFile {
+                filename: "pkg-1.0.0.tar.gz".to_string(),
+                yanked: Yanked::Flag(false),
+                upload_time: Some("2026-05-14T10:00:00Z".to_string()),
+            },
+        ];
+        let versions = vec!["1.0.0".to_string()];
+        let map = build_version_metadata(&files, &versions, "pkg");
+        assert_eq!(
+            map.get("1.0.0").unwrap().published_at,
+            deps_core::PublishTime::parse_rfc3339("2026-05-14T19:25:27Z")
+        );
+    }
+
+    #[test]
+    fn test_build_version_metadata_absent_upload_time_is_none() {
+        let files = vec![SimpleFile {
+            filename: "pkg-1.0.0.tar.gz".to_string(),
+            yanked: Yanked::Flag(false),
+            upload_time: None,
+        }];
+        let versions = vec!["1.0.0".to_string()];
+        let map = build_version_metadata(&files, &versions, "pkg");
+        assert!(map.get("1.0.0").unwrap().published_at.is_none());
+    }
+
+    #[test]
+    fn test_build_version_metadata_malformed_upload_time_is_none() {
+        let files = vec![SimpleFile {
+            filename: "pkg-1.0.0.tar.gz".to_string(),
+            yanked: Yanked::Flag(false),
+            upload_time: Some("not-a-timestamp".to_string()),
+        }];
+        let versions = vec!["1.0.0".to_string()];
+        let map = build_version_metadata(&files, &versions, "pkg");
+        assert!(
+            map.get("1.0.0").unwrap().published_at.is_none(),
+            "malformed upload-time degrades to None, not an error"
+        );
     }
 
     #[test]
@@ -860,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_yanked_map_uses_fast_path_not_quadratic_fallback() {
+    fn test_build_version_metadata_uses_fast_path_not_quadratic_fallback() {
         // Regression guard for the O(files x versions) blowup: a well-formed
         // filename must resolve via the O(1) structural fast path,
         // regardless of how many other versions exist.
@@ -869,18 +1017,19 @@ mod tests {
         let files = vec![SimpleFile {
             filename: "pkg-9.9.9.tar.gz".to_string(),
             yanked: Yanked::Flag(true),
+            upload_time: None,
         }];
         assert_eq!(
             parse_version_from_filename(&files[0].filename, "pkg"),
             Some("9.9.9"),
             "fast path must derive the version directly from filename structure"
         );
-        let map = build_yanked_map(&files, &versions, "pkg");
-        assert_eq!(map.get("9.9.9"), Some(&true));
+        let map = build_version_metadata(&files, &versions, "pkg");
+        assert!(map.get("9.9.9").unwrap().yanked);
     }
 
     #[test]
-    fn test_build_yanked_map_ignores_platform_tag_false_match() {
+    fn test_build_version_metadata_ignores_platform_tag_false_match() {
         // Regression for a live PyPI file (`pyobjc_core-2.2-py2.6-macosx-10.3-fat.egg`):
         // the old whole-filename substring scan could misattribute this file
         // to version "10.3" (a platform tag that happens to look like a
@@ -890,15 +1039,16 @@ mod tests {
         let files = vec![SimpleFile {
             filename: "pyobjc_core-2.2-py2.6-macosx-10.3-fat.egg".to_string(),
             yanked: Yanked::Flag(true),
+            upload_time: None,
         }];
         let versions = vec!["2.2".to_string(), "10.3".to_string()];
-        let map = build_yanked_map(&files, &versions, "pyobjc-core");
-        assert_eq!(map.get("2.2"), Some(&true));
-        assert_eq!(map.get("10.3"), None);
+        let map = build_version_metadata(&files, &versions, "pyobjc-core");
+        assert!(map.get("2.2").unwrap().yanked);
+        assert!(!map.contains_key("10.3"));
     }
 
     #[test]
-    fn test_build_yanked_map_pep440_underscore_normalization() {
+    fn test_build_version_metadata_pep440_underscore_normalization() {
         // Regression for a live PyPI file
         // (`protobuf-4.21.0_rc_1-cp310-abi3-win_amd64.whl`): the wheel
         // filename spells the pre-release as `4.21.0_rc_1` while the
@@ -908,29 +1058,32 @@ mod tests {
         let files = vec![SimpleFile {
             filename: "protobuf-4.21.0_rc_1-cp310-abi3-win_amd64.whl".to_string(),
             yanked: Yanked::Flag(false),
+            upload_time: None,
         }];
         let versions = vec!["4.21.0rc1".to_string()];
-        let map = build_yanked_map(&files, &versions, "protobuf");
-        assert_eq!(map.get("4.21.0rc1"), Some(&false));
+        let map = build_version_metadata(&files, &versions, "protobuf");
+        assert!(!map.get("4.21.0rc1").unwrap().yanked);
     }
 
     #[test]
-    fn test_build_yanked_map_skips_non_conforming_filename_instead_of_guessing() {
+    fn test_build_version_metadata_skips_non_conforming_filename_instead_of_guessing() {
         // A filename whose leading segment doesn't match the package's
         // normalized name at all can't resolve via the structural fast path.
         // Rather than fall back to a substring guess (the mechanism behind
         // the pyobjc-core misattribution above), that file is skipped —
-        // it contributes nothing to the yanked map, but doesn't corrupt it
+        // it contributes nothing to the metadata map, but doesn't corrupt it
         // either. A well-formed file for the same version still resolves
         // correctly, and an unrelated version stays untouched.
         let files = vec![
             SimpleFile {
                 filename: "unrelated-file-1.0.0.zip".to_string(),
                 yanked: Yanked::Flag(true),
+                upload_time: None,
             },
             SimpleFile {
                 filename: "pkg-1.0.0-py3-none-any.whl".to_string(),
                 yanked: Yanked::Flag(true),
+                upload_time: None,
             },
         ];
         let versions = vec!["1.0.0".to_string(), "2.0.0".to_string()];
@@ -939,9 +1092,9 @@ mod tests {
             None,
             "filename doesn't start with the package name, must be skipped"
         );
-        let map = build_yanked_map(&files, &versions, "pkg");
-        assert_eq!(map.get("1.0.0"), Some(&true));
-        assert_eq!(map.get("2.0.0"), None);
+        let map = build_version_metadata(&files, &versions, "pkg");
+        assert!(map.get("1.0.0").unwrap().yanked);
+        assert!(!map.contains_key("2.0.0"));
     }
 
     #[test]

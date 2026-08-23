@@ -34,12 +34,14 @@ impl GradleEcosystem {
         &self,
         package_name: &deps_core::PackageName,
         prefix: &str,
+        freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
             prefix,
             &[],
+            freshness,
         )
         .await
     }
@@ -200,6 +202,7 @@ impl Ecosystem for GradleEcosystem {
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
         content: &'a str,
+        freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
         Box::pin(async move {
             let uri = parse_result.uri();
@@ -213,7 +216,7 @@ impl Ecosystem for GradleEcosystem {
                             || d.name_range().start.line == position.line
                     });
                     if let Some(dep) = dep {
-                        self.complete_versions(dep.name(), value).await
+                        self.complete_versions(dep.name(), value, freshness).await
                     } else {
                         vec![]
                     }
