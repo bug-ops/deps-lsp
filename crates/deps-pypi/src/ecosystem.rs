@@ -666,6 +666,7 @@ dependencies = []
                 VersionData::new(&cached_versions, &resolved_versions),
                 &uri,
                 deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
             )
             .await;
 

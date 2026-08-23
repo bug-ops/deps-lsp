@@ -610,6 +610,7 @@ mod tests {
                 VersionData::new(&cached_versions, &resolved_versions),
                 parse_result.uri(),
                 deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
             ),
         )
         .await;

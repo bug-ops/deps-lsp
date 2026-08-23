@@ -569,6 +569,41 @@ pub trait EcosystemFormatter: Send + Sync {
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
         Some(dep.name().to_string())
     }
+
+    /// Rewrites a native-ecosystem version string into the spelling OSV.dev's
+    /// SEMVER range matching expects.
+    ///
+    /// Deliberately the inverse of [`Self::osv_package_name`] rather than a
+    /// field on [`crate::osv::ScanTarget`] itself: the caller (`deps-lsp`'s
+    /// scan-target builder) has only the native version string at hand, so
+    /// each ecosystem's formatter is the natural place to own the transform.
+    /// The default implementation is the identity: OSV accepts every
+    /// supported ecosystem's native version spelling unchanged except Go,
+    /// whose module versions carry a mandatory `v` prefix
+    /// (`golang.org/x/mod/module` convention) that OSV's SEMVER matcher
+    /// rejects — overridden in `deps-go` to strip it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::PackageName;
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(DefaultFormatter.osv_version("1.2.3"), "1.2.3");
+    /// ```
+    fn osv_version(&self, version: &str) -> String {
+        version.to_string()
+    }
 }
 
 pub fn generate_inlay_hints(
@@ -902,6 +937,43 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     actions
 }
 
+/// Diagnostic severity levels for the three per-dependency issue categories.
+///
+/// Threaded from `DiagnosticsConfig` (`deps-lsp`) through
+/// [`crate::Ecosystem::generate_diagnostics`] into [`generate_diagnostics_from_cache`]
+/// and [`generate_diagnostics`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::DiagnosticSeverities;
+/// use tower_lsp_server::ls_types::DiagnosticSeverity;
+///
+/// let severities = DiagnosticSeverities::default();
+/// assert_eq!(severities.outdated, DiagnosticSeverity::HINT);
+/// assert_eq!(severities.unknown, DiagnosticSeverity::WARNING);
+/// assert_eq!(severities.yanked, DiagnosticSeverity::WARNING);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiagnosticSeverities {
+    /// Severity for a dependency with a newer version available.
+    pub outdated: DiagnosticSeverity,
+    /// Severity for a dependency not found in the registry (or with an invalid name).
+    pub unknown: DiagnosticSeverity,
+    /// Severity for a dependency pinned to a yanked/deprecated version.
+    pub yanked: DiagnosticSeverity,
+}
+
+impl Default for DiagnosticSeverities {
+    fn default() -> Self {
+        Self {
+            outdated: DiagnosticSeverity::HINT,
+            unknown: DiagnosticSeverity::WARNING,
+            yanked: DiagnosticSeverity::WARNING,
+        }
+    }
+}
+
 /// Generates diagnostics using cached versions (no network calls).
 ///
 /// Uses pre-fetched version information from the lifecycle's parallel fetch.
@@ -912,11 +984,13 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 /// * `parse_result` - Parsed dependencies from manifest
 /// * `versions` - Latest (registry) and resolved (lock file) version maps, keyed by package name
 /// * `formatter` - Ecosystem-specific formatting and comparison logic
+/// * `severities` - Configured severity for each diagnostic category
 pub fn generate_diagnostics_from_cache(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
     _freshness: crate::freshness::FreshnessSettings,
+    severities: DiagnosticSeverities,
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
@@ -952,7 +1026,7 @@ pub fn generate_diagnostics_from_cache(
                 };
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
-                    severity: Some(DiagnosticSeverity::WARNING),
+                    severity: Some(severities.unknown),
                     message,
                     source: Some("deps-lsp".into()),
                     ..Default::default()
@@ -975,7 +1049,7 @@ pub fn generate_diagnostics_from_cache(
         if status == RequirementStatus::Outdated {
             diagnostics.push(Diagnostic {
                 range: version_range,
-                severity: Some(DiagnosticSeverity::HINT),
+                severity: Some(severities.outdated),
                 message: format!("Newer version available: {}", latest),
                 source: Some("deps-lsp".into()),
                 ..Default::default()
@@ -1428,6 +1502,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
     registry: &R,
     formatter: &dyn EcosystemFormatter,
     _freshness: crate::freshness::FreshnessSettings,
+    severities: DiagnosticSeverities,
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
@@ -1442,7 +1517,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
                 };
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
-                    severity: Some(DiagnosticSeverity::WARNING),
+                    severity: Some(severities.unknown),
                     message,
                     source: Some("deps-lsp".into()),
                     ..Default::default()
@@ -1468,7 +1543,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
             if current.is_yanked() {
                 diagnostics.push(Diagnostic {
                     range: version_range,
-                    severity: Some(DiagnosticSeverity::WARNING),
+                    severity: Some(severities.yanked),
                     message: formatter.yanked_message().into(),
                     source: Some("deps-lsp".into()),
                     ..Default::default()
@@ -1482,7 +1557,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
             {
                 diagnostics.push(Diagnostic {
                     range: version_range,
-                    severity: Some(DiagnosticSeverity::HINT),
+                    severity: Some(severities.outdated),
                     message: format!("Newer version available: {}", latest.version_string()),
                     source: Some("deps-lsp".into()),
                     ..Default::default()
@@ -2001,6 +2076,105 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn package_url(&self, _name: &PackageName) -> String {
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A registry whose `get_latest_matching` always returns a yanked version,
+    /// for exercising `generate_diagnostics`'s yanked-severity wiring.
+    struct YankedRegistry;
+
+    impl crate::Registry for YankedRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a PackageName,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move {
+                Ok(Some(Box::new(MockVersionWithAge {
+                    version: "1.0.0".to_string(),
+                    yanked: true,
+                    published_at: None,
+                }) as Box<dyn crate::Version>))
+            })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn package_url(&self, _name: &PackageName) -> String {
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A registry whose `get_versions` succeeds with a newer stable version and
+    /// whose `get_latest_matching` returns a non-yanked current version, for
+    /// exercising `generate_diagnostics`'s outdated-severity wiring.
+    struct OutdatedRegistry;
+
+    impl crate::Registry for OutdatedRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a PackageName,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move {
+                Ok(vec![Box::new(MockVersionWithAge {
+                    version: "2.0.0".to_string(),
+                    yanked: false,
+                    published_at: None,
+                }) as Box<dyn crate::Version>])
+            })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move {
+                Ok(Some(Box::new(MockVersionWithAge {
+                    version: "1.0.0".to_string(),
+                    yanked: false,
+                    published_at: None,
+                }) as Box<dyn crate::Version>))
+            })
         }
 
         fn search<'a>(
@@ -2787,6 +2961,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -2823,6 +2998,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
             crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -2854,6 +3030,7 @@ mod tests {
             &ErrorRegistry,
             &formatter,
             crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         )
         .await;
 
@@ -2861,6 +3038,155 @@ mod tests {
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
         assert!(diagnostics[0].message.starts_with("Invalid package name"));
         assert!(!diagnostics[0].message.contains("Unknown package"));
+    }
+
+    // The two tests below cover `generate_diagnostics` (the registry-calling public API,
+    // re-exported as `deps_core::lsp_generate_diagnostics`), not the live LSP path —
+    // `deps-lsp` always has cached versions by the time diagnostics run and calls
+    // `generate_diagnostics_from_cache` instead. `yanked_severity` is not yet honored
+    // on that live path (see #233): `Registry::get_latest_matching`, which populates
+    // the cache, filters out yanked versions by contract on every current registry
+    // implementation, so a yanked flag threaded through the cache would always read
+    // `false`.
+    #[tokio::test]
+    async fn test_generate_diagnostics_yanked_uses_configured_severity() {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let severities = DiagnosticSeverities {
+            yanked: DiagnosticSeverity::ERROR,
+            ..DiagnosticSeverities::default()
+        };
+
+        let diagnostics = generate_diagnostics(
+            &parse_result,
+            &YankedRegistry,
+            &formatter,
+            crate::FreshnessSettings::default(),
+            severities,
+        )
+        .await;
+
+        let yanked_diag = diagnostics
+            .iter()
+            .find(|d| d.message == formatter.yanked_message())
+            .expect("expected a yanked diagnostic");
+        assert_eq!(yanked_diag.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_yanked_default_severity_unchanged() {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let diagnostics = generate_diagnostics(
+            &parse_result,
+            &YankedRegistry,
+            &formatter,
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        )
+        .await;
+
+        let yanked_diag = diagnostics
+            .iter()
+            .find(|d| d.message == formatter.yanked_message())
+            .expect("expected a yanked diagnostic");
+        assert_eq!(yanked_diag.severity, Some(DiagnosticSeverity::WARNING));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_unknown_uses_configured_severity() {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let severities = DiagnosticSeverities {
+            unknown: DiagnosticSeverity::ERROR,
+            ..DiagnosticSeverities::default()
+        };
+
+        let diagnostics = generate_diagnostics(
+            &parse_result,
+            &ErrorRegistry,
+            &formatter,
+            crate::FreshnessSettings::default(),
+            severities,
+        )
+        .await;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.starts_with("Unknown package"));
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_outdated_uses_configured_severity() {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let severities = DiagnosticSeverities {
+            outdated: DiagnosticSeverity::ERROR,
+            ..DiagnosticSeverities::default()
+        };
+
+        let diagnostics = generate_diagnostics(
+            &parse_result,
+            &OutdatedRegistry,
+            &formatter,
+            crate::FreshnessSettings::default(),
+            severities,
+        )
+        .await;
+
+        let outdated_diag = diagnostics
+            .iter()
+            .find(|d| d.message.starts_with("Newer version available"))
+            .expect("expected an outdated diagnostic");
+        assert_eq!(outdated_diag.severity, Some(DiagnosticSeverity::ERROR));
     }
 
     #[test]
@@ -2890,6 +3216,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -2925,6 +3252,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         );
 
         assert!(
@@ -2975,6 +3303,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         );
 
         assert_eq!(diagnostics.len(), 2);
@@ -3120,6 +3449,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         );
 
         assert!(
@@ -3661,6 +3991,7 @@ mod tests {
                 versions,
                 &MockFormatter,
                 crate::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
             );
             let newer_version_diagnostics = diagnostics
                 .iter()
@@ -3753,6 +4084,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &formatter,
             crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         );
 
         let vuln_diag = diagnostics
@@ -3799,6 +4131,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &formatter,
             crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         );
 
         let more_diag = diagnostics
@@ -3836,6 +4169,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &formatter,
             crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
         );
 
         assert!(

@@ -227,9 +227,13 @@ impl OsvClient {
             return HashMap::new();
         }
 
+        // Use `display_version`, not `version`: `version` is OSV's wire
+        // spelling (e.g. Go's `v`-prefix stripped), while the version
+        // surfaced back to the user via `UpgradeStatus` must stay in the
+        // ecosystem-native spelling (see `ScanTarget`'s doc).
         let versions: HashMap<&str, &str> = candidates
             .iter()
-            .map(|c| (c.key.as_str(), c.version.as_str()))
+            .map(|c| (c.key.as_str(), c.display_version.as_str()))
             .collect();
 
         let outcomes = self.resolve(ecosystem, candidates, timeout).await;
@@ -715,6 +719,7 @@ mod tests {
             key: name.to_string(),
             osv_name: name.to_string(),
             version: version.to_string(),
+            display_version: version.to_string(),
         }
     }
 
@@ -1202,6 +1207,37 @@ mod tests {
             statuses.get("bad-pkg"),
             Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids })
                 if version == "2.0.0" && advisory_ids == &vec!["ADV-1".to_string()]
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_candidates_uses_display_version_not_wire_version() {
+        // S1 regression guard: `ScanTarget.version` is the OSV wire spelling
+        // (e.g. Go's "v" prefix stripped), but `UpgradeStatus` is rendered
+        // back to the user (hover's "Latest version {} is also affected") —
+        // it must carry `display_version`, the ecosystem-native spelling,
+        // never the wire one.
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .create_async()
+            .await;
+
+        let candidate = ScanTarget {
+            key: "golang.org/x/text".to_string(),
+            osv_name: "golang.org/x/text".to_string(),
+            version: "0.4.0".to_string(),
+            display_version: "v0.4.0".to_string(),
+        };
+        let statuses = client
+            .check_candidates(EcosystemId::Go, &[candidate], TEST_TIMEOUT)
+            .await;
+
+        assert!(matches!(
+            statuses.get("golang.org/x/text"),
+            Some(UpgradeStatus::CandidateClean { version }) if version == "v0.4.0"
         ));
     }
 
