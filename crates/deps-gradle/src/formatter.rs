@@ -14,6 +14,10 @@ impl EcosystemFormatter for GradleFormatter {
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+        // Unresolved Gradle variable reference (`$var` or `${var}`) — skip comparison
+        if requirement.contains('$') {
+            return true;
+        }
         if requirement == "latest" || requirement.starts_with("latest.") {
             return true;
         }
@@ -100,6 +104,24 @@ mod tests {
         // Exclusive-lower-bound notation, which leads with `]` rather than `[`/`(`.
         assert!(!f.version_satisfies_requirement("1.2", "]1.2,1.5]"));
         assert!(f.version_satisfies_requirement("1.3", "]1.2,1.5]"));
+    }
+
+    #[test]
+    fn test_version_satisfies_unresolved_bare_variable() {
+        let f = GradleFormatter;
+        assert!(f.version_satisfies_requirement("3.14.0", "$someVersion"));
+    }
+
+    #[test]
+    fn test_version_satisfies_unresolved_braced_variable() {
+        let f = GradleFormatter;
+        assert!(f.version_satisfies_requirement("3.14.0", "${someVersion}"));
+    }
+
+    #[test]
+    fn test_version_satisfies_unresolved_compound_variable() {
+        let f = GradleFormatter;
+        assert!(f.version_satisfies_requirement("3.14.0", "1.0.0-$suffix"));
     }
 
     #[test]
