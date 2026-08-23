@@ -436,14 +436,16 @@ impl {Ecosystem}Registry {
     }
 }
 
-// Implement deps_core::Registry trait using BoxFuture (no async_trait)
+// Implement deps_core::Registry trait using BoxFuture (no async_trait).
+// The trait takes PackageName/VersionReq; the inherent methods above stay
+// &str, so each forward converts with .as_str().
 impl deps_core::Registry for {Ecosystem}Registry {
     fn get_versions<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a deps_core::PackageName,
     ) -> BoxFuture<'a, deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            let versions = self.get_versions(name).await?;
+            let versions = self.get_versions(name.as_str()).await?;
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -453,11 +455,11 @@ impl deps_core::Registry for {Ecosystem}Registry {
 
     fn get_latest_matching<'a>(
         &'a self,
-        name: &'a str,
-        req: &'a str,
+        name: &'a deps_core::PackageName,
+        req: &'a deps_core::VersionReq,
     ) -> BoxFuture<'a, deps_core::error::Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            let version = self.get_latest_matching(name, req).await?;
+            let version = self.get_latest_matching(name.as_str(), req.as_str()).await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
     }
@@ -470,8 +472,8 @@ impl deps_core::Registry for {Ecosystem}Registry {
         Box::pin(async move { Ok(vec![]) })
     }
 
-    fn package_url(&self, name: &str) -> String {
-        format!("{}/{}", REGISTRY_URL, urlencoding::encode(name))
+    fn package_url(&self, name: &deps_core::PackageName) -> String {
+        format!("{}/{}", REGISTRY_URL, urlencoding::encode(name.as_str()))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -641,7 +643,7 @@ impl EcosystemFormatter for {Ecosystem}Formatter {
         format!("\"{}\"", version)
     }
 
-    fn package_url(&self, name: &str) -> String {
+    fn package_url(&self, name: &deps_core::PackageName) -> String {
         format!("https://registry.example.com/packages/{}", name)
     }
 
