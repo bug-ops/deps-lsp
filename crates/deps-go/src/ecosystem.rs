@@ -54,7 +54,11 @@ impl GoEcosystem {
         std::future::ready(vec![])
     }
 
-    async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
+    async fn complete_versions(
+        &self,
+        package_name: &deps_core::PackageName,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
@@ -70,7 +74,7 @@ impl GoEcosystem {
     /// Returns empty results.
     fn complete_features(
         &self,
-        _package_name: &str,
+        _package_name: &deps_core::PackageName,
         _prefix: &str,
     ) -> impl Future<Output = Vec<CompletionItem>> {
         // Go modules don't have feature flags
@@ -160,6 +164,10 @@ mod tests {
     use deps_core::{Dependency, EcosystemConfig, VersionData};
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
+
+    fn pkg(s: &str) -> deps_core::PackageName {
+        deps_core::PackageName::new(s)
+    }
 
     /// Mock dependency for testing
     fn mock_dependency(name: &str, version: Option<&str>, line: u32) -> GoDependency {
@@ -418,7 +426,7 @@ mod tests {
         let ecosystem = GoEcosystem::new(cache);
 
         let results = ecosystem
-            .complete_versions("github.com/gin-gonic/gin", "v1.9")
+            .complete_versions(&pkg("github.com/gin-gonic/gin"), "v1.9")
             .await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("v1.9")));
@@ -431,7 +439,7 @@ mod tests {
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
-            .complete_versions("github.com/nonexistent/package12345", "v1.0")
+            .complete_versions(&pkg("github.com/nonexistent/package12345"), "v1.0")
             .await;
         assert!(results.is_empty());
     }
@@ -443,7 +451,7 @@ mod tests {
 
         // Go doesn't have features, should always return empty
         let results = ecosystem
-            .complete_features("github.com/gin-gonic/gin", "")
+            .complete_features(&pkg("github.com/gin-gonic/gin"), "")
             .await;
         assert!(results.is_empty());
     }
@@ -456,7 +464,7 @@ mod tests {
 
         // Test that we respect the 20 result limit
         let results = ecosystem
-            .complete_versions("github.com/gin-gonic/gin", "v")
+            .complete_versions(&pkg("github.com/gin-gonic/gin"), "v")
             .await;
         assert!(results.len() <= 20);
     }

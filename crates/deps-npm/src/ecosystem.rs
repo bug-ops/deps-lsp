@@ -45,7 +45,11 @@ impl NpmEcosystem {
             .await
     }
 
-    async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
+    async fn complete_versions(
+        &self,
+        package_name: &deps_core::PackageName,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
@@ -134,6 +138,10 @@ mod tests {
     use deps_core::{EcosystemConfig, VersionData};
     use std::collections::HashMap;
 
+    fn pkg(s: &str) -> deps_core::PackageName {
+        deps_core::PackageName::new(s)
+    }
+
     #[test]
     fn test_ecosystem_id() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -202,7 +210,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions("express", "4.").await;
+        let results = ecosystem.complete_versions(&pkg("express"), "4.").await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("4.")));
     }
@@ -213,7 +221,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions("express", "^4.").await;
+        let results = ecosystem.complete_versions(&pkg("express"), "^4.").await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("4.")));
     }
@@ -225,7 +233,7 @@ mod tests {
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
-            .complete_versions("this-package-does-not-exist-12345", "1.0")
+            .complete_versions(&pkg("this-package-does-not-exist-12345"), "1.0")
             .await;
         assert!(results.is_empty());
     }
@@ -265,7 +273,7 @@ mod tests {
         let ecosystem = NpmEcosystem::new(cache);
 
         // Test that we respect the 20 result limit
-        let results = ecosystem.complete_versions("express", "4").await;
+        let results = ecosystem.complete_versions(&pkg("express"), "4").await;
         assert!(results.len() <= 20);
     }
 
@@ -486,7 +494,7 @@ mod tests {
 
         // Empty prefix should show non-deprecated versions (up to 20)
         let results = ecosystem
-            .complete_versions("this-package-does-not-exist-12345", "")
+            .complete_versions(&pkg("this-package-does-not-exist-12345"), "")
             .await;
         // Should not panic, returns empty for unknown package
         assert!(results.is_empty());
@@ -499,7 +507,7 @@ mod tests {
 
         // Test ~ operator stripping
         let results = ecosystem
-            .complete_versions("this-package-does-not-exist-12345", "~4.0")
+            .complete_versions(&pkg("this-package-does-not-exist-12345"), "~4.0")
             .await;
         assert!(results.is_empty());
     }
@@ -511,7 +519,7 @@ mod tests {
 
         // Test * wildcard stripping
         let results = ecosystem
-            .complete_versions("this-package-does-not-exist-12345", "*")
+            .complete_versions(&pkg("this-package-does-not-exist-12345"), "*")
             .await;
         assert!(results.is_empty());
     }
@@ -523,7 +531,7 @@ mod tests {
 
         // Test < and > operator stripping
         let results = ecosystem
-            .complete_versions("this-package-does-not-exist-12345", "<2.0")
+            .complete_versions(&pkg("this-package-does-not-exist-12345"), "<2.0")
             .await;
         assert!(results.is_empty());
     }

@@ -713,7 +713,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         return actions;
     };
 
-    let display_items = prepare_version_display_items(&versions, dep.name().as_str());
+    let display_items = prepare_version_display_items(&versions, dep.name());
 
     for item in display_items {
         let new_text = formatter.format_version_for_text_edit(&item.version);
