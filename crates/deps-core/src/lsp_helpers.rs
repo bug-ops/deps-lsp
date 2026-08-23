@@ -1111,7 +1111,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let resolvable = dep.source().is_version_resolvable();
 
     let available_versions = if resolvable {
-        Some(registry.get_versions_with(dep.name(), freshness).await.ok()?)
+        Some(
+            registry
+                .get_versions_with(dep.name(), freshness)
+                .await
+                .ok()?,
+        )
     } else {
         None
     };
