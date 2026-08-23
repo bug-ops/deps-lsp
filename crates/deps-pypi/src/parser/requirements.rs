@@ -658,6 +658,121 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_marker_extras_bracket_injection_rejected() {
+        // Regression test for #261: a `;` landing before an oversized
+        // extras/version tail (rather than before an actual marker) must not
+        // have that tail stored verbatim on `markers`.
+        let huge_extras = "a".repeat(60_000);
+        let content = format!("pkg;[{huge_extras}]==1.0\n");
+        let result = parse(&content);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "pkg");
+        assert_eq!(result.dependencies[0].markers, None);
+    }
+
+    #[test]
+    fn test_marker_keyword_repeated_without_separators_rejected() {
+        // Regression test for the substring-only `looks_like_marker` bypass:
+        // a marker variable name repeated with no separators contains
+        // "extra" as a substring but tokenizes as one giant unrecognized
+        // identifier, not a real reference to the `extra` marker variable.
+        let garbage = "extra".repeat(1600);
+        assert!(garbage.len() > super::super::MAX_MARKER_LEN);
+        let content = format!("pkg; {garbage}\n");
+        let result = parse(&content);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "pkg");
+        assert_eq!(result.dependencies[0].markers, None);
+    }
+
+    #[test]
+    fn test_marker_keyword_padded_with_unquoted_garbage_rejected() {
+        // Regression test for the substring-only `looks_like_marker` bypass:
+        // a real marker variable followed by an unquoted run of filler bytes
+        // used to pass (keyword present as a substring, all bytes in the
+        // allowed character set); the filler is not a quoted string literal,
+        // a known identifier, or an operator, so it must now be rejected.
+        let filler = "A".repeat(5000);
+        let raw_marker = format!("python_version <{filler}>");
+        assert!(raw_marker.len() > super::super::MAX_MARKER_LEN);
+        let content = format!("pkg; {raw_marker}\n");
+        let result = parse(&content);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "pkg");
+        assert_eq!(result.dependencies[0].markers, None);
+    }
+
+    #[test]
+    fn test_marker_repeated_token_no_operator_rejected() {
+        // Regression test for the reviewer's residual #261 bypass: bare
+        // whitespace-separated repetition of a recognized marker variable,
+        // with no comparison operator anywhere, used to still tokenize as
+        // "marker-shaped" (at least one recognized token present) and be
+        // retained verbatim.
+        let garbage = "python_version ".repeat(500);
+        let content = format!("pkg; {garbage}\n");
+        let result = parse(&content);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "pkg");
+        assert_eq!(result.dependencies[0].markers, None);
+    }
+
+    #[test]
+    fn test_marker_and_joined_repeated_token_no_operator_rejected() {
+        // Same bypass shape, joined by `and` instead of bare whitespace —
+        // still no comparison operator anywhere in the text.
+        let garbage = "python_version and ".repeat(400) + "python_version";
+        let content = format!("pkg; {garbage}\n");
+        let result = parse(&content);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "pkg");
+        assert_eq!(result.dependencies[0].markers, None);
+    }
+
+    #[test]
+    fn test_marker_chained_comparison_rejected() {
+        // Regression test for the reviewer's round-3 #261 bypass: chained
+        // comparisons share one operand across more than one clause
+        // (`a == b == c == ...`), which PEP 508's grammar has no production
+        // for — `pep508_rs` itself rejects a short version of this shape
+        // outright.
+        let chain = "python_version==".repeat(500) + "python_version";
+        assert!(chain.len() > super::super::MAX_MARKER_LEN);
+        let content = format!("pkg; {chain}\n");
+        let result = parse(&content);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "pkg");
+        assert_eq!(result.dependencies[0].markers, None);
+    }
+
+    #[test]
+    fn test_marker_chained_in_rejected() {
+        // Same bypass shape using `in` instead of `==`.
+        let chain = "python_version in ".repeat(500) + "python_version";
+        assert!(chain.len() > super::super::MAX_MARKER_LEN);
+        let content = format!("pkg; {chain}\n");
+        let result = parse(&content);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "pkg");
+        assert_eq!(result.dependencies[0].markers, None);
+    }
+
+    #[test]
+    fn test_oversized_in_operator_marker_still_normalizes() {
+        // Legitimate use of the `in` operator must still be preserved
+        // through the raw fallback once it's oversized enough to bypass
+        // `pep508_rs`'s parser.
+        let marker =
+            "python_version in '3.8'".to_string() + &" or python_version in '3.8'".repeat(200);
+        assert!(marker.len() > super::super::MAX_MARKER_LEN);
+        let content = format!("pkg; {marker}\n");
+        let result = parse(&content);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "pkg");
+        assert_eq!(result.dependencies[0].markers, Some(marker));
+    }
+
     // --- Options (§3.4) ---
 
     #[test]

@@ -1411,9 +1411,29 @@ django = { version = "^4.0", markers = "not a valid marker (((" }
 
         assert_eq!(deps.len(), 1);
         let dep = &deps[0];
-        // Unparseable marker text is preserved verbatim rather than dropped.
-        assert_eq!(dep.markers, Some("not a valid marker (((".to_string()));
-        assert!(dep.markers_range.is_some());
+        // Unparseable text that also isn't marker-shaped (no recognized
+        // marker variable token) is dropped rather than preserved verbatim.
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_table_form_unbalanced_parens_rejected() {
+        let toml = r#"[tool.poetry.dependencies]
+django = { version = "^4.0", markers = "os_name == 'a' (((" }
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        // Text that references a real marker variable but has unbalanced
+        // trailing parens no longer decomposes into the grammar's
+        // `marker_atom := '(' marker_expr ')' | marker_clause` production, so
+        // it's dropped rather than preserved (the grammar validator now
+        // checks paren balance, unlike the earlier per-operand adjacency
+        // check it replaced).
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
     }
 
     #[test]
@@ -1535,8 +1555,10 @@ requests = "^2.28.0"
             dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
             Some("^2.28.0")
         );
-        assert_eq!(dep.markers, Some("not a valid marker (((".to_string()));
-        assert!(dep.markers_range.is_some());
+        // Unparseable text that also isn't marker-shaped (no recognized
+        // marker variable token) is dropped rather than preserved verbatim.
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
     }
 
     #[test]
@@ -1852,5 +1874,258 @@ dependencies = [
         let markers = dep.markers.as_ref().expect("marker should normalize");
         assert!(markers.contains("os_name"));
         assert!(markers.contains("sys_platform"));
+    }
+
+    #[test]
+    fn test_pep621_marker_extras_bracket_injection_rejected() {
+        // Regression test for #261: a `;` landing before an oversized
+        // extras/version tail (rather than before an actual marker) used to
+        // have that whole tail — `[...]==1.0`, not a marker expression at
+        // all — stored verbatim on `markers` via the length-cap bypass in
+        // #146, then rendered into hover.
+        let huge_extras = "a".repeat(60_000);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg;[{huge_extras}]==1.0\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.version_req, None);
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_table_form_oversized_non_marker_text_rejected() {
+        // Same #261 gap via the Poetry `markers` key, which goes through
+        // `normalize_marker_string` rather than `parse_pep508_requirement`:
+        // oversized text with no marker-like shape must not be retained.
+        let garbage = "[".to_string() + &"x".repeat(60_000) + "]";
+        assert!(garbage.len() > MAX_MARKER_LEN);
+        let toml = format!(
+            "[tool.poetry.dependencies]\ndjango = {{ version = \"^4.0\", markers = \"{garbage}\" }}\n"
+        );
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_pep621_marker_keyword_repeated_without_separators_rejected() {
+        // Regression test for the substring-only `looks_like_marker` bypass:
+        // a marker variable name repeated with no separators contains
+        // "extra" as a substring but tokenizes as one giant unrecognized
+        // identifier, not a real reference to the `extra` marker variable.
+        let garbage = "extra".repeat(1600);
+        assert!(garbage.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg; {garbage}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_pep621_marker_keyword_padded_with_unquoted_garbage_rejected() {
+        // Regression test for the substring-only `looks_like_marker` bypass:
+        // a real marker variable followed by an unquoted run of filler bytes
+        // used to pass (keyword present as a substring, all bytes in the
+        // allowed character set); the filler is not a quoted string literal,
+        // a known identifier, or an operator, so it must now be rejected.
+        let filler = "A".repeat(5000);
+        let raw_marker = format!("python_version <{filler}>");
+        assert!(raw_marker.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg; {raw_marker}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_table_form_oversized_garbage_under_length_cap_rejected() {
+        // Regression test for M2: text under MAX_MARKER_LEN that fails to
+        // parse used to be retained unconditionally via the `MarkerTree::
+        // from_str` error path, which had no shape validation of its own —
+        // identical garbage was kept or dropped purely on whether it crossed
+        // MAX_MARKER_LEN, not on whether it looked like a marker at all.
+        let garbage = format!("[{}]==1.0", "a".repeat(1980));
+        assert!(garbage.len() < MAX_MARKER_LEN);
+        let toml = format!(
+            "[tool.poetry.dependencies]\ndjango = {{ version = \"^4.0\", markers = \"{garbage}\" }}\n"
+        );
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_pep621_marker_repeated_token_no_operator_rejected() {
+        // Regression test for the reviewer's residual #261 bypass: bare
+        // whitespace-separated repetition of a recognized marker variable,
+        // with no comparison operator anywhere, used to still tokenize as
+        // "marker-shaped" (at least one recognized token present) and be
+        // retained verbatim.
+        let garbage = "python_version ".repeat(500);
+        assert!(garbage.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg; {garbage}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_pep621_marker_and_joined_repeated_token_no_operator_rejected() {
+        // Same bypass shape, joined by `and` instead of bare whitespace —
+        // still no comparison operator anywhere in the text.
+        let garbage = "python_version and ".repeat(400) + "python_version";
+        assert!(garbage.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg; {garbage}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_table_form_repeated_token_no_operator_rejected() {
+        // Same bypass shape via the Poetry `markers` key, which goes through
+        // `normalize_marker_string` rather than `parse_pep508_requirement`.
+        let garbage = "python_version ".repeat(500);
+        assert!(garbage.len() > MAX_MARKER_LEN);
+        let toml = format!(
+            "[tool.poetry.dependencies]\ndjango = {{ version = \"^4.0\", markers = \"{garbage}\" }}\n"
+        );
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_pep621_marker_chained_comparison_rejected() {
+        // Regression test for the reviewer's round-3 #261 bypass: chained
+        // comparisons share one operand across more than one clause
+        // (`a == b == c == ...`). The per-operand adjacency check this
+        // replaces treated every operand as valid ("touches an operator on
+        // some side"), but PEP 508's grammar has no production for chaining
+        // — `pep508_rs` itself rejects a short version of this shape
+        // outright (confirmed: `pkg; python_version==python_version==
+        // python_version` fails to parse at all).
+        let chain = "python_version==".repeat(500) + "python_version";
+        assert!(chain.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg; {chain}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_pep621_marker_chained_in_rejected() {
+        // Same bypass shape using `in` instead of `==`.
+        let chain = "python_version in ".repeat(500) + "python_version";
+        assert!(chain.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg; {chain}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_poetry_table_form_chained_comparison_rejected() {
+        // Same bypass shape via the Poetry `markers` key.
+        let chain = "python_version==".repeat(500) + "python_version";
+        assert!(chain.len() > MAX_MARKER_LEN);
+        let toml = format!(
+            "[tool.poetry.dependencies]\ndjango = {{ version = \"^4.0\", markers = \"{chain}\" }}\n"
+        );
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.markers, None);
+        assert_eq!(dep.markers_range, None);
+    }
+
+    #[test]
+    fn test_pep621_oversized_in_operator_marker_still_normalizes() {
+        // Legitimate use of the `in` operator must still be preserved
+        // through the raw fallback once it's oversized enough to bypass
+        // `pep508_rs`'s parser.
+        let marker =
+            "python_version in '3.8'".to_string() + &" or python_version in '3.8'".repeat(200);
+        assert!(marker.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg; {marker}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.markers, Some(marker));
+        assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_pep621_oversized_not_in_operator_marker_still_normalizes() {
+        // Same as above for `not in`.
+        let marker = "python_version not in '3.8'".to_string()
+            + &" or python_version not in '3.8'".repeat(200);
+        assert!(marker.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg; {marker}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.markers, Some(marker));
+        assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_pep621_non_ascii_marker_literal_still_normalizes() {
+        // Regression test for M3: a genuine, if oversized, marker whose
+        // quoted string literal contains non-ASCII bytes must not be
+        // rejected just because those bytes aren't ASCII — only unquoted
+        // text is required to tokenize as known marker-grammar elements.
+        let filler = "é".repeat(1500);
+        let raw_marker = format!("platform_release == '{filler}' or python_version >= '3.8'");
+        assert!(raw_marker.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"pkg; {raw_marker}\",\n]\n");
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+
+        assert_eq!(dep.name, "pkg");
+        assert_eq!(dep.markers, Some(raw_marker));
+        assert!(dep.markers_range.is_some());
     }
 }
