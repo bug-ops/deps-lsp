@@ -845,6 +845,7 @@ dependencies = []
                 versions,
                 &formatter,
                 deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
             );
             assert!(
                 diagnostics
