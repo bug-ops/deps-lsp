@@ -427,12 +427,16 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// Generate code actions for a position.
     ///
     /// Default implementation delegates to `lsp_helpers::generate_code_actions`
-    /// using `self.formatter()` and `self.registry()`.
+    /// using `self.formatter()` and `self.registry()`. `versions` carries the
+    /// same OSV scan results `generate_hover` and `generate_diagnostics` use,
+    /// so a vulnerable dependency at `position` gets a "fix vulnerability"
+    /// quickfix alongside the plain version-update actions.
     fn generate_code_actions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
         position: Position,
         uri: &'a Uri,
+        versions: VersionData<'a>,
     ) -> BoxFuture<'a, Vec<CodeAction>> {
         Box::pin(async move {
             let registry = self.registry();
@@ -440,6 +444,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 parse_result,
                 position,
                 uri,
+                versions,
                 registry.as_ref(),
                 self.formatter(),
             )

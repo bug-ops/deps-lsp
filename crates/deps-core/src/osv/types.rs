@@ -141,6 +141,140 @@ pub struct DependencyVulnerabilities {
     pub upgrade_status: UpgradeStatus,
 }
 
+/// A single upgrade target recommended by [`DependencyVulnerabilities::recommended_fix`].
+///
+/// `version` is in OSV's version namespace (see
+/// [`crate::lsp_helpers::EcosystemFormatter::osv_version_to_native`] for the
+/// conversion callers must apply before using it in a manifest edit or a
+/// registry lookup).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixRecommendation {
+    /// The highest [`Advisory::fixed_versions`] entry across the advisories
+    /// named in `advisory_ids` — the lowest version that resolves everything
+    /// this recommendation actually claims to fix.
+    pub version: String,
+    /// Advisory ids this recommendation actually resolves, sorted by
+    /// severity descending (worst first) and tied by id — the order a
+    /// title should list them in.
+    pub advisory_ids: Vec<String>,
+}
+
+/// Numeric ranking used only to sort [`FixRecommendation::advisory_ids`],
+/// worst severity first.
+const fn severity_rank(severity: VulnSeverity) -> u8 {
+    match severity {
+        VulnSeverity::Critical => 4,
+        VulnSeverity::High => 3,
+        VulnSeverity::Medium => 2,
+        VulnSeverity::Low => 1,
+        VulnSeverity::Unknown => 0,
+    }
+}
+
+impl DependencyVulnerabilities {
+    /// Recommends a single upgrade target that resolves as many of this
+    /// dependency's known advisories as possible.
+    ///
+    /// `advisory_ids` is computed first: every advisory with a known fix,
+    /// minus — when phase B ([`UpgradeStatus::CandidateVulnerable`]) reports
+    /// that some ids still apply to the checked candidate — those ids,
+    /// since claiming a fix for them would be false. `version` is then the
+    /// highest [`Advisory::fixed_versions`] entry across only the
+    /// *remaining* claimed advisories, not every advisory: computing it over
+    /// the full set first would let an advisory this method just excluded
+    /// (because its own fix is known not to hold) drag the recommendation
+    /// past a lower version that already clears everything actually being
+    /// claimed. Returns `None` when no advisory has a claimable fix.
+    ///
+    /// The subtraction's premise is that the checked candidate is at least
+    /// as new as `version`; when phase B checked an older candidate the
+    /// subtraction is merely over-conservative (it only ever removes
+    /// claims), so this is documented rather than guarded against.
+    ///
+    /// # Limitations
+    ///
+    /// `advisories` is capped at fetch time
+    /// ([`crate::osv::ADVISORY_DISPLAY_CAP`]), so `version` is the max over a
+    /// possibly incomplete subset — the "+N more advisories" hint already
+    /// signals that incompleteness, so this is an accepted under-report, not
+    /// a bug. `Advisory` also retains only `fixed_versions`, never
+    /// `introduced` events, so a version reintroduced above its own last
+    /// known fix (and not yet re-fixed) can still be claimed as a fix
+    /// whenever phase B has not run for this dependency
+    /// ([`UpgradeStatus::NotChecked`]) — the post-edit rescan is what
+    /// surfaces that case.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+    /// use std::sync::Arc;
+    ///
+    /// fn advisory(id: &str, fixed: &str) -> Arc<Advisory> {
+    ///     Arc::new(Advisory {
+    ///         id: id.to_string(),
+    ///         modified: "2023-01-01T00:00:00Z".to_string(),
+    ///         summary: None,
+    ///         aliases: vec![],
+    ///         severity: VulnSeverity::High,
+    ///         cvss_vector: None,
+    ///         fixed_versions: vec![fixed.to_string()],
+    ///         url: String::new(),
+    ///     })
+    /// }
+    ///
+    /// let dv = DependencyVulnerabilities {
+    ///     advisories: vec![advisory("RUSTSEC-1", "1.2.0")],
+    ///     total_known: 1,
+    ///     upgrade_status: UpgradeStatus::NotChecked,
+    /// };
+    ///
+    /// let fix = dv.recommended_fix().unwrap();
+    /// assert_eq!(fix.version, "1.2.0");
+    /// assert_eq!(fix.advisory_ids, vec!["RUSTSEC-1".to_string()]);
+    /// ```
+    #[must_use]
+    pub fn recommended_fix(&self) -> Option<FixRecommendation> {
+        let still_applying: &[String] = match &self.upgrade_status {
+            UpgradeStatus::CandidateVulnerable { advisory_ids, .. } => advisory_ids,
+            UpgradeStatus::NotChecked | UpgradeStatus::CandidateClean { .. } => &[],
+        };
+
+        let mut claimed: Vec<&Advisory> = self
+            .advisories
+            .iter()
+            .map(Arc::as_ref)
+            .filter(|a| !a.fixed_versions.is_empty())
+            .filter(|a| !still_applying.contains(&a.id))
+            .collect();
+
+        if claimed.is_empty() {
+            return None;
+        }
+
+        // The minimum version that clears every *claimed* advisory — not the
+        // max over every advisory (including ones just excluded above),
+        // which could push the recommendation past a version that resolves
+        // nothing beyond what a lower, still-claimed fix already covers.
+        let version = claimed
+            .iter()
+            .filter_map(|a| a.fixed_versions.last())
+            .max_by(|a, b| super::compare_version_strings(a, b))?
+            .clone();
+
+        claimed.sort_by(|a, b| {
+            severity_rank(b.severity)
+                .cmp(&severity_rank(a.severity))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        Some(FixRecommendation {
+            version,
+            advisory_ids: claimed.into_iter().map(|a| a.id.clone()).collect(),
+        })
+    }
+}
+
 /// Why a dependency produced no advisories.
 ///
 /// Absence from [`VulnerabilityMap`] is never a synonym for "clean" — every
@@ -315,9 +449,12 @@ pub(super) struct OsvEvent {
 }
 
 /// Returns `true` if `id` matches OSV's advisory id grammar
-/// (`[A-Za-z0-9._-]+`, non-empty) — the same alphabet every real id scheme
-/// in this space uses (`RUSTSEC-2020-0071`, `GHSA-xxxx-yyyy-zzzz`,
-/// `CVE-2020-26235`). `id` is echoed verbatim into a markdown link
+/// (`[A-Za-z0-9._-]+`, non-empty, capped at 128 bytes) — the same alphabet
+/// every real id scheme in this space uses (`RUSTSEC-2020-0071`,
+/// `GHSA-xxxx-yyyy-zzzz`, `CVE-2020-26235`); real ids are a few dozen
+/// characters, so the cap exists only to bound how much of a record-supplied
+/// string can ride along into `Diagnostic.code`, hover markdown, and a
+/// `CodeAction` title. `id` is echoed verbatim into a markdown link
 /// destination (`push_vulnerability_hover_section`) and a `Diagnostic.code`,
 /// so this is the parse-boundary chokepoint that keeps a malformed id from
 /// ever reaching either — rejecting it here means every downstream consumer
@@ -325,16 +462,44 @@ pub(super) struct OsvEvent {
 /// sanitize it again at each render site.
 fn is_valid_osv_id(id: &str) -> bool {
     !id.is_empty()
+        && id.len() <= 128
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Returns `true` if `version` matches the character set real version
+/// strings use across every ecosystem this workspace supports
+/// (`[A-Za-z0-9.+_~:*^-]`, non-empty, capped at 64 bytes) — deliberately
+/// permissive (SemVer, PEP 440, Maven qualifiers, npm's `^`/`~`/`*` range
+/// tokens, and Go's `+incompatible` suffix all fit), but excludes quotes,
+/// commas, and newlines.
+///
+/// `Advisory::fixed_versions` is the only OSV-sourced field this workspace
+/// ever writes into a manifest `TextEdit`
+/// (`DependencyVulnerabilities::recommended_fix` ->
+/// `EcosystemFormatter::osv_version_to_native` ->
+/// `EcosystemFormatter::format_version_for_text_edit`), so an unvalidated
+/// `fixed` value from a compromised or malformed advisory record could
+/// inject arbitrary manifest syntax next to the version literal it is
+/// meant to replace. This is the parse-boundary chokepoint for that value,
+/// mirroring [`is_valid_osv_id`] for the id field.
+fn is_valid_osv_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '_' | '~' | ':' | '*' | '^' | '-')
+        })
 }
 
 impl OsvVulnRecord {
     /// Converts a raw wire record into the `deps-lsp`-facing [`Advisory`],
     /// or `None` if the record's id fails [`is_valid_osv_id`] (dropped, same
     /// as a 404 on `/v1/vulns/{id}` — the dependency renders with whichever
-    /// advisories did resolve, never a half-trusted one).
+    /// advisories did resolve, never a half-trusted one). Individual `fixed`
+    /// events failing [`is_valid_osv_version`] are dropped the same way, but
+    /// only that entry — the record as a whole still renders with its
+    /// remaining, valid `fixed_versions`.
     ///
     /// `osv_name`/`osv_eco` are the package actually queried: a record can
     /// legitimately cover several unrelated packages sharing one advisory id
@@ -384,6 +549,16 @@ impl OsvVulnRecord {
             .flat_map(|a| a.ranges.iter())
             .flat_map(|r| r.events.iter())
             .filter_map(|e| e.fixed.clone())
+            .filter(|v| {
+                let valid = is_valid_osv_version(v);
+                if !valid {
+                    tracing::warn!(
+                        id = %self.id, version = %v,
+                        "OSV record has a malformed fixed version, dropping"
+                    );
+                }
+                valid
+            })
             .collect();
         fixed_versions.sort_by(|a, b| super::compare_version_strings(a, b));
         fixed_versions.dedup();
@@ -400,5 +575,247 @@ impl OsvVulnRecord {
             fixed_versions,
             url,
         })
+    }
+}
+
+#[cfg(test)]
+mod recommended_fix_tests {
+    use super::*;
+
+    fn advisory(id: &str, severity: VulnSeverity, fixed_versions: &[&str]) -> Arc<Advisory> {
+        Arc::new(Advisory {
+            id: id.to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity,
+            cvss_vector: None,
+            fixed_versions: fixed_versions.iter().map(ToString::to_string).collect(),
+            url: String::new(),
+        })
+    }
+
+    fn dv(
+        advisories: Vec<Arc<Advisory>>,
+        upgrade_status: UpgradeStatus,
+    ) -> DependencyVulnerabilities {
+        DependencyVulnerabilities {
+            total_known: advisories.len(),
+            advisories,
+            upgrade_status,
+        }
+    }
+
+    #[test]
+    fn no_advisory_has_a_fix_returns_none() {
+        let vulns = dv(
+            vec![advisory("A1", VulnSeverity::High, &[])],
+            UpgradeStatus::NotChecked,
+        );
+        assert!(vulns.recommended_fix().is_none());
+    }
+
+    #[test]
+    fn multiple_advisories_combine_into_one_fix_at_the_highest_version() {
+        // A1 fixed at 1.1.0, A2 fixed at 1.3.0: the recommendation targets
+        // the highest of the two and claims both ids.
+        let vulns = dv(
+            vec![
+                advisory("A1", VulnSeverity::High, &["1.1.0"]),
+                advisory("A2", VulnSeverity::Critical, &["1.3.0"]),
+            ],
+            UpgradeStatus::NotChecked,
+        );
+
+        let fix = vulns.recommended_fix().unwrap();
+        assert_eq!(fix.version, "1.3.0");
+        // Sorted by severity descending: Critical (A2) before High (A1).
+        assert_eq!(fix.advisory_ids, vec!["A2".to_string(), "A1".to_string()]);
+    }
+
+    #[test]
+    fn candidate_vulnerable_subtracts_only_the_ids_it_names() {
+        // Critic's counterexample: A1 fixed 1.1.0, A2 fixed 1.2.0. Phase B
+        // reports the candidate is still affected by A1 only, so A1 must be
+        // dropped from the claim while A2 survives.
+        let vulns = dv(
+            vec![
+                advisory("A1", VulnSeverity::High, &["1.1.0"]),
+                advisory("A2", VulnSeverity::Medium, &["1.2.0"]),
+            ],
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.2.0".to_string(),
+                advisory_ids: vec!["A1".to_string()],
+            },
+        );
+
+        let fix = vulns.recommended_fix().unwrap();
+        assert_eq!(fix.version, "1.2.0");
+        assert_eq!(fix.advisory_ids, vec!["A2".to_string()]);
+    }
+
+    #[test]
+    fn candidate_vulnerable_subtracting_every_claimed_id_returns_none() {
+        let vulns = dv(
+            vec![advisory("A1", VulnSeverity::High, &["1.1.0"])],
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.1.0".to_string(),
+                advisory_ids: vec!["A1".to_string()],
+            },
+        );
+        assert!(vulns.recommended_fix().is_none());
+    }
+
+    #[test]
+    fn candidate_clean_subtracts_nothing() {
+        let vulns = dv(
+            vec![advisory("A1", VulnSeverity::High, &["1.1.0"])],
+            UpgradeStatus::CandidateClean {
+                version: "2.0.0".to_string(),
+            },
+        );
+        let fix = vulns.recommended_fix().unwrap();
+        assert_eq!(fix.advisory_ids, vec!["A1".to_string()]);
+    }
+
+    #[test]
+    fn advisory_without_a_fix_is_excluded_from_the_claim() {
+        let vulns = dv(
+            vec![
+                advisory("A1", VulnSeverity::High, &["1.1.0"]),
+                advisory("A2", VulnSeverity::Critical, &[]),
+            ],
+            UpgradeStatus::NotChecked,
+        );
+
+        let fix = vulns.recommended_fix().unwrap();
+        assert_eq!(fix.version, "1.1.0");
+        assert_eq!(fix.advisory_ids, vec!["A1".to_string()]);
+    }
+
+    #[test]
+    fn subtracted_advisory_with_a_higher_fix_does_not_inflate_the_recommended_version() {
+        // Critic S1 counterexample: A1 is fixed at a high version (3.0.0)
+        // but still applies at the checked candidate, so it is excluded.
+        // A2 is fixed at a much lower version (1.2.0) and is claimed. The
+        // recommended version must be 1.2.0 — computed over what is
+        // actually claimed — not 3.0.0, which A1's exclusion proves does
+        // not even resolve A1.
+        let vulns = dv(
+            vec![
+                advisory("A1", VulnSeverity::High, &["3.0.0"]),
+                advisory("A2", VulnSeverity::Medium, &["1.2.0"]),
+            ],
+            UpgradeStatus::CandidateVulnerable {
+                version: "3.0.0".to_string(),
+                advisory_ids: vec!["A1".to_string()],
+            },
+        );
+
+        let fix = vulns.recommended_fix().unwrap();
+        assert_eq!(fix.version, "1.2.0");
+        assert_eq!(fix.advisory_ids, vec!["A2".to_string()]);
+    }
+
+    #[test]
+    fn equal_severity_ties_break_lexicographically_by_id() {
+        let vulns = dv(
+            vec![
+                advisory("B1", VulnSeverity::High, &["1.0.0"]),
+                advisory("A1", VulnSeverity::High, &["1.0.0"]),
+            ],
+            UpgradeStatus::NotChecked,
+        );
+
+        let fix = vulns.recommended_fix().unwrap();
+        assert_eq!(fix.advisory_ids, vec!["A1".to_string(), "B1".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod osv_version_validation_tests {
+    use super::*;
+
+    fn record_with_fixed(fixed: &[&str]) -> OsvVulnRecord {
+        OsvVulnRecord {
+            id: "RUSTSEC-2020-0071".to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity: vec![],
+            database_specific: None,
+            affected: vec![OsvAffected {
+                package: None,
+                ecosystem_specific: None,
+                ranges: vec![OsvRange {
+                    events: fixed
+                        .iter()
+                        .map(|f| OsvEvent {
+                            fixed: Some((*f).to_string()),
+                        })
+                        .collect(),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn is_valid_osv_id_rejects_over_length_cap() {
+        let long_id = "A".repeat(129);
+        assert!(!is_valid_osv_id(&long_id));
+        assert!(is_valid_osv_id(&"A".repeat(128)));
+    }
+
+    #[test]
+    fn malformed_fixed_version_is_dropped_but_record_still_resolves() {
+        // Security S-1: a `fixed` value containing manifest-breakout
+        // characters (quotes, comma, newline) must never reach
+        // `Advisory::fixed_versions`, since that field is later written
+        // verbatim into a `TextEdit`.
+        let record = record_with_fixed(&["1.0.0", "1.0.0\", git = \"https://evil/x"]);
+        let advisory = record
+            .into_advisory("pkg", "crates.io")
+            .expect("valid id, should still resolve");
+
+        assert_eq!(advisory.fixed_versions, vec!["1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn fixed_version_over_length_cap_is_dropped() {
+        let long_version = format!("1.0.0-{}", "a".repeat(64));
+        let record = record_with_fixed(&["1.0.0", &long_version]);
+        let advisory = record.into_advisory("pkg", "crates.io").unwrap();
+
+        assert_eq!(advisory.fixed_versions, vec!["1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn every_fixed_version_malformed_yields_empty_fixed_versions_not_a_dropped_advisory() {
+        let record = record_with_fixed(&["1.0.0\nEvil"]);
+        let advisory = record
+            .into_advisory("pkg", "crates.io")
+            .expect("the advisory itself is still valid, just with no usable fix");
+
+        assert!(advisory.fixed_versions.is_empty());
+    }
+
+    #[test]
+    fn realistic_version_syntax_is_accepted() {
+        // SemVer, PEP 440 pre/post-release segments, Go's `+incompatible`.
+        for v in [
+            "1.2.3",
+            "1.2.3-alpha.1",
+            "1.2.3+incompatible",
+            "1.2.3.post1",
+        ] {
+            assert!(is_valid_osv_version(v), "expected {v:?} to be valid");
+        }
+    }
+
+    #[test]
+    fn manifest_breakout_characters_are_rejected() {
+        for v in ["1.0.0\", git = \"evil", "1.0.0,2.0.0", "1.0.0\nEvil", ""] {
+            assert!(!is_valid_osv_version(v), "expected {v:?} to be rejected");
+        }
     }
 }

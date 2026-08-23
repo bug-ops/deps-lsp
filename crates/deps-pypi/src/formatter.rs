@@ -155,6 +155,22 @@ mod tests {
     }
 
     #[test]
+    fn test_osv_version_to_native_round_trips_through_own_parser() {
+        // Critic S2 gate: `osv_version_to_native` is identity for PyPI (OSV
+        // records use PEP 440 verbatim), so the version it hands to
+        // `format_version_for_text_edit` — which expands it into a
+        // `>=v,<next-major` range, unlike the identity edit most other
+        // ecosystems use — must itself satisfy the requirement text that
+        // edit produces.
+        let formatter = PypiFormatter;
+        let osv_version = "2.28.0";
+        let native = formatter.osv_version_to_native(osv_version);
+        assert_eq!(native, osv_version);
+        let edit_text = formatter.format_version_for_text_edit(&native);
+        assert!(formatter.version_satisfies_requirement(&native, &edit_text));
+    }
+
+    #[test]
     fn test_normalize_fast_path() {
         let formatter = PypiFormatter;
         // Already lowercase, no hyphens - should hit fast path

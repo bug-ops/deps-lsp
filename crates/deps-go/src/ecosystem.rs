@@ -569,9 +569,16 @@ mod tests {
         };
 
         let position = Position::new(5, 5);
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
 
         let actions = ecosystem
-            .generate_code_actions(&parse_result, position, &uri)
+            .generate_code_actions(
+                &parse_result,
+                position,
+                &uri,
+                VersionData::new(&cached_versions, &resolved_versions),
+            )
             .await;
 
         // Returns actions (open documentation link)
