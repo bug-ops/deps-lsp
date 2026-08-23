@@ -382,6 +382,7 @@ mod tests {
             VersionData::new(&cached, &resolved),
             uri,
             deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
         )
         .await
         .into_iter()

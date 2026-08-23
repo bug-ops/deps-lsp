@@ -172,6 +172,16 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// 3. Otherwise skip — querying a fabricated version is a silent false
 ///    negative, which is worse than not scanning at all.
 ///
+/// **Go exception** (#228 follow-up): step 1 is skipped entirely for
+/// `EcosystemId::Go`, going straight to step 2. Go's `go.mod` `require` line
+/// is already an exact pinned version, never a range, unlike Cargo/npm where
+/// the manifest is a range and the lockfile holds the pin. go.sum-derived
+/// `resolved_versions` is unreliable here: go.sum is a checksum ledger that
+/// `go get`/`go build` only ever append to (only `go mod tidy` prunes it), so
+/// its last-occurrence-wins parse can surface a version still recorded in the
+/// file but no longer selected by Go's MVS — silently querying OSV against
+/// the wrong version.
+///
 /// Every dependency that does **not** become a [`deps_core::osv::ScanTarget`]
 /// gets an explicit [`deps_core::osv::ScanOutcome::Skipped`] entry in the
 /// returned map instead of silently vanishing (critique C1) — absence from
@@ -199,15 +209,30 @@ fn build_scan_targets(
             continue;
         }
 
-        let version = resolved_versions
-            .get(key.as_str())
-            .or_else(|| resolved_versions.get(dep.name()))
-            .cloned()
-            .or_else(|| {
-                dep.version_requirement()
-                    .filter(|req| is_concrete_version(req.as_str(), ecosystem))
-                    .map(|req| req.as_str().to_string())
-            });
+        // Go's go.mod `require` line is already an exact pinned version, never
+        // a range (unlike Cargo/npm, where the manifest is a range and the
+        // lockfile holds the pin) — so for Go the manifest itself is the
+        // authoritative version, not go.sum. go.sum is a checksum ledger that
+        // `go get`/`go build` only ever append to (only `go mod tidy` prunes
+        // it), so its last-occurrence-wins parse can yield a stale version
+        // still recorded in the file but no longer selected by Go's MVS,
+        // silently mismatching whatever's actually in use. Skipping the
+        // lockfile lookup for Go avoids feeding that stale version to OSV.
+        let version = if ecosystem == EcosystemId::Go {
+            dep.version_requirement()
+                .filter(|req| is_concrete_version(req.as_str(), ecosystem))
+                .map(|req| req.as_str().to_string())
+        } else {
+            resolved_versions
+                .get(key.as_str())
+                .or_else(|| resolved_versions.get(dep.name()))
+                .cloned()
+                .or_else(|| {
+                    dep.version_requirement()
+                        .filter(|req| is_concrete_version(req.as_str(), ecosystem))
+                        .map(|req| req.as_str().to_string())
+                })
+        };
 
         let Some(version) = version else {
             skipped.insert(key, ScanOutcome::Skipped(SkipReason::NoConcreteVersion));
@@ -222,7 +247,8 @@ fn build_scan_targets(
         targets.push(deps_core::osv::ScanTarget {
             key,
             osv_name,
-            version,
+            version: formatter.osv_version(&version),
+            display_version: version,
         });
     }
 
@@ -357,6 +383,7 @@ async fn run_osv_phase_b_and_commit(
     uri: &Uri,
     state: &Arc<ServerState>,
     ecosystem_id: EcosystemId,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     fetch_timeout_secs: u64,
     mut result: OsvScanResult,
 ) {
@@ -387,7 +414,8 @@ async fn run_osv_phase_b_and_commit(
                     Some(deps_core::osv::ScanTarget {
                         key: key.clone(),
                         osv_name,
-                        version: latest,
+                        version: formatter.osv_version(&latest),
+                        display_version: latest,
                     })
                 })
                 .collect()
@@ -650,12 +678,13 @@ pub async fn handle_document_open(
     // Clone cache, diagnostics, and freshness config before spawning background task
     // (all read here, before any OSV request is built, so disabling the feature
     // suppresses the network call itself — FR-011).
-    let (cache_config, vulnerabilities_enabled, freshness_settings) = {
+    let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities) = {
         let cfg = config.read().await;
         (
             cfg.cache.clone(),
             cfg.diagnostics.vulnerabilities_enabled,
             cfg.freshness.to_settings(),
+            cfg.diagnostics.to_severities(),
         )
     };
 
@@ -804,6 +833,7 @@ pub async fn handle_document_open(
                         &uri_clone,
                         &state_clone,
                         ecosystem_id,
+                        ecosystem_clone.formatter(),
                         cache_config.fetch_timeout_secs,
                         phase_a_result,
                     )
@@ -819,6 +849,7 @@ pub async fn handle_document_open(
             Arc::clone(&state_clone),
             &uri_clone,
             freshness_settings,
+            diagnostic_severities,
         )
         .await;
 
@@ -912,12 +943,13 @@ pub async fn handle_document_change(
 
     // Clone cache, diagnostics, and freshness config before spawning background task
     // (all read here, before any OSV request is built — FR-011).
-    let (cache_config, vulnerabilities_enabled, freshness_settings) = {
+    let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities) = {
         let cfg = config.read().await;
         (
             cfg.cache.clone(),
             cfg.diagnostics.vulnerabilities_enabled,
             cfg.freshness.to_settings(),
+            cfg.diagnostics.to_severities(),
         )
     };
 
@@ -980,6 +1012,7 @@ pub async fn handle_document_change(
                             &uri_clone,
                             &state_clone,
                             ecosystem_id,
+                            ecosystem_clone.formatter(),
                             cache_config.fetch_timeout_secs,
                             phase_a_result,
                         )
@@ -994,6 +1027,7 @@ pub async fn handle_document_change(
                 Arc::clone(&state_clone),
                 &uri_clone,
                 freshness_settings,
+                diagnostic_severities,
             )
             .await;
             client_clone
@@ -1085,6 +1119,7 @@ pub async fn handle_document_change(
                         &uri_clone,
                         &state_clone,
                         ecosystem_id,
+                        ecosystem_clone.formatter(),
                         cache_config.fetch_timeout_secs,
                         phase_a_result,
                     )
@@ -1099,6 +1134,7 @@ pub async fn handle_document_change(
             Arc::clone(&state_clone),
             &uri_clone,
             freshness_settings,
+            diagnostic_severities,
         )
         .await;
 
@@ -2858,6 +2894,110 @@ tokio = "1.0"
                 build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].version, "1.0.195");
+            assert!(skipped.is_empty());
+        }
+
+        struct MockVPrefixFormatter;
+        impl EcosystemFormatter for MockVPrefixFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn osv_version(&self, version: &str) -> String {
+                version.strip_prefix('v').unwrap_or(version).to_string()
+            }
+        }
+
+        #[test]
+        fn build_scan_targets_normalizes_version_via_formatter_osv_version_hook() {
+            // Go module versions carry a mandatory "v" prefix that OSV's
+            // SEMVER range matching forbids (#228) — build_scan_targets must
+            // route the resolved version through the formatter hook rather
+            // than sending the native spelling on the wire.
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("github.com/gin-gonic/gin"),
+                    version_req: Some(VersionReq::new("v1.9.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let mut resolved = HashMap::new();
+            resolved.insert(
+                PackageName::new("github.com/gin-gonic/gin"),
+                "v1.9.0".to_string(),
+            );
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &resolved,
+                &MockVPrefixFormatter,
+                EcosystemId::Go,
+            );
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].version, "1.9.0");
+            // display_version keeps the ecosystem-native "v" spelling (S1
+            // regression guard) — only the wire-format `version` is stripped.
+            assert_eq!(targets[0].display_version, "v1.9.0");
+            assert!(skipped.is_empty());
+        }
+
+        #[test]
+        fn build_scan_targets_leaves_version_unaffected_for_default_identity_formatter() {
+            // Regression guard: ecosystems that do not override osv_version
+            // must keep sending the native spelling verbatim (no regression
+            // from introducing the hook).
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("serde"),
+                    version_req: Some(VersionReq::new("^1.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let mut resolved = HashMap::new();
+            resolved.insert(PackageName::new("serde"), "1.0.195".to_string());
+
+            let (targets, skipped) =
+                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].version, "1.0.195");
+            assert_eq!(targets[0].display_version, "1.0.195");
+            assert!(skipped.is_empty());
+        }
+
+        #[test]
+        fn build_scan_targets_go_ignores_stale_lockfile_version_uses_go_mod_requirement() {
+            // go.sum is a checksum ledger that `go get`/`go build` only ever
+            // append to — a stale, no-longer-selected higher version can
+            // remain recorded there after a downgrade (only `go mod tidy`
+            // prunes it), and since go.sum is written sorted ascending by
+            // semver, that stale entry always sorts last and wins
+            // last-occurrence-wins parsing. Unlike Cargo/npm, go.mod's
+            // `require` line is already an exact pinned version, so for Go
+            // the manifest itself — not the lockfile-derived
+            // `resolved_versions` — must be authoritative for OSV scanning.
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("github.com/pkg/errors"),
+                    version_req: Some(VersionReq::new("v0.8.1")),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let mut resolved = HashMap::new();
+            // Stale entry: go.sum still records v0.9.1 from before a
+            // downgrade back to v0.8.1 that only `go get` (not `go mod
+            // tidy`) performed.
+            resolved.insert(
+                PackageName::new("github.com/pkg/errors"),
+                "v0.9.1".to_string(),
+            );
+
+            let (targets, skipped) =
+                build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Go);
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].version, "v0.8.1");
+            assert_eq!(targets[0].display_version, "v0.8.1");
             assert!(skipped.is_empty());
         }
 

@@ -229,6 +229,9 @@ Configure via LSP initialization options:
 }
 ```
 
+> [!NOTE]
+> `diagnostics.outdated_severity` and `diagnostics.unknown_severity` are honored end-to-end. `diagnostics.yanked_severity` is parsed and validated but not yet honored on the live diagnostics path — no yanked-version diagnostic is emitted yet regardless of this setting ([#233](https://github.com/bug-ops/deps-lsp/issues/233)).
+
 ### Configuration reference
 
 | Section | Option | Default | Description |

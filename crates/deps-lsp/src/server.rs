@@ -181,19 +181,30 @@ impl Backend {
             }
         };
 
-        let config = self.config.read().await;
+        // Snapshot before the loop and drop the guard: `generate_diagnostics_internal`
+        // doesn't touch `self.config`, but the affected documents are already open
+        // (sourced from `self.state.documents` above), so re-loading them via
+        // `handle_diagnostics` (which re-reads `self.config` per URI) would hold this
+        // guard across a nested read of the same write-preferring `RwLock` — a writer
+        // queued in between would then block that nested read forever.
+        let (freshness, severities) = {
+            let config = self.config.read().await;
+            (
+                config.freshness.to_settings(),
+                config.diagnostics.to_severities(),
+            )
+        };
 
         for uri in affected_uris {
             if let Some(mut doc) = self.state.documents.get_mut(&uri) {
                 doc.update_resolved_versions(resolved_versions.clone());
             }
 
-            let items = diagnostics::handle_diagnostics(
+            let items = diagnostics::generate_diagnostics_internal(
                 Arc::clone(&self.state),
                 &uri,
-                &config.diagnostics,
-                self.client.clone(),
-                Arc::clone(&self.config),
+                freshness,
+                severities,
             )
             .await;
 

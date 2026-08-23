@@ -137,6 +137,29 @@ impl Default for DiagnosticsConfig {
     }
 }
 
+impl DiagnosticsConfig {
+    /// Converts this LSP-facing config into the `deps-core` DTO threaded
+    /// through `Ecosystem::generate_diagnostics`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_lsp::config::DiagnosticsConfig;
+    ///
+    /// let config = DiagnosticsConfig::default();
+    /// let severities = config.to_severities();
+    /// assert_eq!(severities.outdated, config.outdated_severity);
+    /// ```
+    #[must_use]
+    pub const fn to_severities(&self) -> deps_core::DiagnosticSeverities {
+        deps_core::DiagnosticSeverities {
+            outdated: self.outdated_severity,
+            unknown: self.unknown_severity,
+            yanked: self.yanked_severity,
+        }
+    }
+}
+
 /// Configuration for HTTP caching behavior.
 ///
 /// Controls cache settings for registry requests. The cache uses ETag and

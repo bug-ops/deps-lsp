@@ -83,6 +83,7 @@ async fn diagnostics_snapshot_for(
             VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities),
             &uri,
             deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
         )
         .await;
 
