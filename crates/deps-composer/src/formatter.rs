@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use deps_core::Dependency;
 use deps_core::PackageName;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
 
 /// Composer requirement matcher, compiled once per dependency by
 /// [`ComposerFormatter::compile_requirement`]. Shares `version_satisfies_requirement`'s
@@ -169,28 +169,23 @@ impl EcosystemFormatter for ComposerFormatter {
 
     /// Compiles `requirement` into a `ComposerMatcher` using the same
     /// `version_satisfies_requirement` comparator — Composer requirements have no separate
-    /// "loose" vs. "precise" form to distinguish.
-    /// Returns `None` for a `dev-*`/`*-dev` branch requirement (e.g. `"dev-master"`,
-    /// `"1.0.x-dev"`): `PackagistRegistry::get_versions` (`expand_minified_versions`)
-    /// filters exactly those version strings out of every result, so `available` — unlike
-    /// every other ecosystem's, which is the plan's "unfiltered `get_versions` output"
-    /// invariant — can never contain one, even when the branch itself is real and
-    /// installable. Scanning would always decide `Some(false)` for every candidate,
-    /// producing a false "no published version satisfies" warning.
+    /// "loose" vs. "precise" form to distinguish. Uses [`compile_requirement_unless`] (see
+    /// that function and [`EcosystemFormatter::compile_requirement`] for the shared
+    /// "undecidable" contract).
     ///
-    /// Also returns `None` for a bare `@dev` minimum-stability flag (e.g. `"1.0.*@dev"`,
-    /// `"2.0@dev"`): Composer resolves that flag against dev-stability packages, which
-    /// normalize to the same `x-dev` version shape `expand_minified_versions` filters out —
-    /// the same undecidable-from-`available` case as a `dev-*`/`*-dev` branch itself.
+    /// The undecidable predicate rejects a `dev-*`/`*-dev` branch requirement (e.g.
+    /// `"dev-master"`, `"1.0.x-dev"`) and a bare `@dev` minimum-stability flag (e.g.
+    /// `"1.0.*@dev"`, `"2.0@dev"`): `PackagistRegistry::get_versions`
+    /// (`expand_minified_versions`) filters exactly those version strings — and the `x-dev`
+    /// shape `@dev` normalizes to — out of every result, so `available` — unlike every other
+    /// ecosystem's, which is the plan's "unfiltered `get_versions` output" invariant — can
+    /// never contain one, even when the branch itself is real and installable.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        let requirement = requirement.as_str().trim();
-        if requirement.starts_with("dev-") || requirement.ends_with("-dev") {
-            return None;
-        }
-        if requirement.contains("@dev") {
-            return None;
-        }
-        Some(Box::new(ComposerMatcher(requirement.to_string())))
+        compile_requirement_unless(
+            requirement.as_str().trim(),
+            |r| r.starts_with("dev-") || r.ends_with("-dev") || r.contains("@dev"),
+            ComposerMatcher,
+        )
     }
 
     /// Restricts the yanked-only-match diagnostic to an exact-pin requirement.
