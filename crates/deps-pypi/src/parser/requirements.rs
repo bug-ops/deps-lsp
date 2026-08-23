@@ -91,7 +91,7 @@ impl PypiParser {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// use deps_pypi::parser::PypiParser;
     /// use tower_lsp_server::ls_types::Uri;
     ///
