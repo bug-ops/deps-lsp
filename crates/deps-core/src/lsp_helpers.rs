@@ -2,11 +2,12 @@
 
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, CodeLens, Command, Diagnostic, DiagnosticSeverity, Hover,
-    HoverContents, InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip, MarkupContent,
-    MarkupKind, Position, Range, TextEdit, Uri, WorkspaceEdit,
+    CodeAction, CodeActionKind, CodeDescription, CodeLens, Command, Diagnostic, DiagnosticSeverity,
+    Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip,
+    MarkupContent, MarkupKind, NumberOrString, Position, Range, TextEdit, Uri, WorkspaceEdit,
 };
 
+use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome, VulnerabilityMap, diagnostic_severity_for};
 use crate::{
     Dependency, EcosystemConfig, InvalidPackageName, PackageName, ParseResult, Registry, VersionReq,
 };
@@ -40,10 +41,17 @@ pub struct VersionData<'a> {
     pub cached: &'a HashMap<PackageName, String>,
     /// Versions actually resolved in the lock file, keyed by package name.
     pub resolved: &'a HashMap<PackageName, String>,
+    /// OSV scan results, keyed by normalized package name. `None` when no
+    /// scan has run yet (e.g. the feature is disabled) — distinct from an
+    /// empty map, which would mean "scanned, nothing found".
+    pub vulnerabilities: Option<&'a VulnerabilityMap>,
 }
 
 impl<'a> VersionData<'a> {
     /// Creates a new `VersionData` from the cached and resolved version maps.
+    ///
+    /// `vulnerabilities` starts `None`; chain [`Self::with_vulnerabilities`]
+    /// to attach a scan result.
     ///
     /// # Examples
     ///
@@ -55,12 +63,38 @@ impl<'a> VersionData<'a> {
     /// let resolved = HashMap::new();
     /// let versions = VersionData::new(&cached, &resolved);
     /// assert!(versions.cached.is_empty());
+    /// assert!(versions.vulnerabilities.is_none());
     /// ```
     pub fn new(
         cached: &'a HashMap<PackageName, String>,
         resolved: &'a HashMap<PackageName, String>,
     ) -> Self {
-        Self { cached, resolved }
+        Self {
+            cached,
+            resolved,
+            vulnerabilities: None,
+        }
+    }
+
+    /// Attaches an OSV scan result to this `VersionData`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use deps_core::osv::VulnerabilityMap;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let vulns = VulnerabilityMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulns);
+    /// assert!(versions.vulnerabilities.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_vulnerabilities(mut self, vulnerabilities: &'a VulnerabilityMap) -> Self {
+        self.vulnerabilities = Some(vulnerabilities);
+        self
     }
 }
 
@@ -463,6 +497,28 @@ pub trait EcosystemFormatter: Send + Sync {
         dep.version_range()
             .is_some_and(|r| position_in_range(position, r))
     }
+
+    /// OSV.dev's canonical spelling for `dep`'s package name, or `None` if
+    /// this dependency cannot be mapped (e.g. a non-GitHub Swift package).
+    ///
+    /// Deliberately **not** routed through [`Self::normalize_package_name`]:
+    /// that method produces this project's internal lookup key, while this
+    /// one produces the name sent on the wire to OSV. They coincide for most
+    /// ecosystems and diverge for NuGet (case-preserving; normalizing would
+    /// lowercase it and zero out results), Composer (OSV wants lowercase,
+    /// overridden in `deps-composer`), and Swift (prefixed to
+    /// `github.com/{owner}/{repo}`, overridden in `deps-swift`). Takes
+    /// `&dyn Dependency` rather than `&str` because the Swift override needs
+    /// to downcast to inspect the dependency's source URL host — see
+    /// `architecture.md` §2.
+    ///
+    /// The default implementation is the identity: OSV is case-sensitive in
+    /// every ecosystem this project supports except PyPI, and for Cargo, npm,
+    /// Go, Maven, Gradle, Dart, Bundler, NuGet, and PyPI the manifest's raw
+    /// name already matches OSV's canonical spelling.
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
+        Some(dep.name().to_string())
+    }
 }
 
 pub fn generate_inlay_hints(
@@ -657,6 +713,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .unwrap();
     }
 
+    let vuln_outcome = versions.vulnerabilities.and_then(|m| {
+        m.get(&normalized_name)
+            .or_else(|| m.get(dep.name().as_str()))
+    });
+    push_vulnerability_hover_section(&mut markdown, vuln_outcome);
+
     markdown.push_str("**Recent versions**:\n");
     for (i, version) in available_versions.iter().take(8).enumerate() {
         let version_span = markdown_code_span(version.version_string());
@@ -686,6 +748,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     })
 }
 
+// TODO(critic): FR-006 (upgrade code actions for vulnerable dependencies) is
+// deferred to a follow-up PR — this is the one helper that does not take
+// `VersionData`, so wiring it up requires an `Ecosystem` trait signature
+// change that no crate currently overrides. See architecture.md §7/§10 Q3.
 pub async fn generate_code_actions<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
@@ -762,6 +828,18 @@ pub fn generate_diagnostics_from_cache(
 
     for dep in deps {
         let normalized_name = formatter.normalize_package_name(dep.name());
+
+        // Emitted before either early-`continue` below (registry outage,
+        // no version range) so a registry failure never suppresses an OSV
+        // finding — the two are independent data sources (FR-007/US-004).
+        if let Some(vulnerabilities) = versions.vulnerabilities
+            && let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities
+                .get(&normalized_name)
+                .or_else(|| vulnerabilities.get(dep.name().as_str()))
+        {
+            push_vulnerability_diagnostics(&mut diagnostics, dep, dv);
+        }
+
         let latest_version = versions
             .cached
             .get(normalized_name.as_str())
@@ -1099,6 +1177,148 @@ pub fn generate_code_lenses(
         }),
         data: None,
     }]
+}
+
+/// Pushes one [`Diagnostic`] per advisory (each with its own severity, code,
+/// and clickable `code_description`), capped at
+/// [`ADVISORY_DISPLAY_CAP`] plus a trailing "+N more advisories" entry.
+///
+/// `N` is derived from `dv.total_known` — the batch result's reported count —
+/// never from `dv.advisories.len()`, since invariant 3 (`architecture.md` §8)
+/// caps the record *fetch* independently of the render cap.
+fn push_vulnerability_diagnostics(
+    diagnostics: &mut Vec<Diagnostic>,
+    dep: &dyn Dependency,
+    dv: &crate::osv::DependencyVulnerabilities,
+) {
+    let range = dep.version_range().unwrap_or_else(|| dep.name_range());
+
+    let shown = dv.advisories.iter().take(ADVISORY_DISPLAY_CAP);
+    let mut shown_count = 0usize;
+    for advisory in shown {
+        shown_count += 1;
+        let code_description = advisory
+            .url
+            .parse::<Uri>()
+            .ok()
+            .map(|href| CodeDescription { href });
+
+        diagnostics.push(Diagnostic {
+            range,
+            severity: Some(diagnostic_severity_for(advisory.severity)),
+            message: format!(
+                "{}: {}",
+                advisory.id,
+                advisory
+                    .summary
+                    .as_deref()
+                    .unwrap_or("(no summary provided)")
+            ),
+            code: Some(NumberOrString::String(advisory.id.clone())),
+            code_description,
+            source: Some("deps-lsp".into()),
+            ..Default::default()
+        });
+    }
+
+    let remaining = dv.total_known.saturating_sub(shown_count);
+    if remaining > 0 {
+        diagnostics.push(Diagnostic {
+            range,
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            message: format!("+{remaining} more advisories"),
+            source: Some("deps-lsp".into()),
+            ..Default::default()
+        });
+    }
+}
+
+/// Lowercase display label for a [`crate::osv::VulnSeverity`], used only in hover text.
+const fn severity_label(severity: crate::osv::VulnSeverity) -> &'static str {
+    match severity {
+        crate::osv::VulnSeverity::Critical => "critical",
+        crate::osv::VulnSeverity::High => "high",
+        crate::osv::VulnSeverity::Medium => "medium",
+        crate::osv::VulnSeverity::Low => "low",
+        crate::osv::VulnSeverity::Unknown => "unknown severity",
+    }
+}
+
+/// Appends the hover "Security advisories" section, gated strictly on the
+/// scan outcome — never on map absence.
+///
+/// `Vulnerable` gets the advisories list, `Clean` may state the affirmative
+/// "no known vulnerabilities", and `Skipped` (or no scan at all) says
+/// **nothing**: saying "clean" about a dependency that was never queried is
+/// worse than saying nothing at all (`architecture.md` §8 invariant 0).
+fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&ScanOutcome>) {
+    use std::fmt::Write;
+
+    match outcome {
+        Some(ScanOutcome::Vulnerable(dv)) => {
+            markdown.push_str("### Security advisories\n\n");
+
+            let shown = dv.advisories.iter().take(ADVISORY_DISPLAY_CAP);
+            for advisory in shown {
+                writeln!(
+                    markdown,
+                    "- **[{}]({})** — {}",
+                    escape_markdown(&advisory.id),
+                    advisory.url,
+                    severity_label(advisory.severity)
+                )
+                .unwrap();
+                writeln!(
+                    markdown,
+                    "  {}",
+                    escape_markdown(
+                        advisory
+                            .summary
+                            .as_deref()
+                            .unwrap_or("(no summary provided)")
+                    )
+                )
+                .unwrap();
+
+                let mut details = Vec::with_capacity(2);
+                if let Some(fixed) = advisory.fixed_versions.last() {
+                    details.push(format!("Fixed in: {}", markdown_code_span(fixed)));
+                }
+                if !advisory.aliases.is_empty() {
+                    details.push(format!(
+                        "Aliases: {}",
+                        escape_markdown(&advisory.aliases.join(", "))
+                    ));
+                }
+                if !details.is_empty() {
+                    writeln!(markdown, "  {}", details.join(" \u{b7} ")).unwrap();
+                }
+            }
+
+            let shown_count = dv.advisories.len().min(ADVISORY_DISPLAY_CAP);
+            let remaining = dv.total_known.saturating_sub(shown_count);
+            if remaining > 0 {
+                writeln!(markdown, "- *(+{remaining} more advisories)*").unwrap();
+            }
+
+            if let crate::osv::UpgradeStatus::CandidateVulnerable { version, .. } =
+                &dv.upgrade_status
+            {
+                writeln!(
+                    markdown,
+                    "\n\u{26a0}\u{fe0f} Latest version {} is also affected.",
+                    markdown_code_span(version)
+                )
+                .unwrap();
+            }
+
+            markdown.push('\n');
+        }
+        Some(ScanOutcome::Clean) => {
+            markdown.push_str("**No known vulnerabilities** (OSV.dev)\n\n");
+        }
+        Some(ScanOutcome::Skipped(_)) | None => {}
+    }
 }
 
 /// Generates diagnostics by fetching from registry (makes network calls).
@@ -3079,5 +3299,265 @@ mod tests {
             );
             assert_eq!(edits.len(), 1, "the overlapping later edit must be dropped");
         }
+    }
+
+    fn sample_advisory(
+        id: &str,
+        severity: crate::osv::VulnSeverity,
+    ) -> std::sync::Arc<crate::osv::Advisory> {
+        std::sync::Arc::new(crate::osv::Advisory {
+            id: id.to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: Some("Something went wrong".to_string()),
+            aliases: vec!["CVE-2020-0001".to_string()],
+            severity,
+            cvss_vector: None,
+            fixed_versions: vec!["1.2.0".to_string(), "1.5.0".to_string()],
+            url: format!("https://osv.dev/vulnerability/{id}"),
+        })
+    }
+
+    fn dep_at(name: &str) -> MockDep {
+        MockDep {
+            name: PackageName::new(name),
+            version_req: VersionReq::new("1.0.0"),
+            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, name.len() as u32)),
+        }
+    }
+
+    #[test]
+    fn test_generate_diagnostics_vulnerable_dependency_emits_advisory_diagnostic_even_without_registry_data()
+     {
+        use crate::osv::{
+            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+        };
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("vulnerable-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        // Registry data is entirely absent (as if the registry fetch failed),
+        // which must never suppress the OSV finding.
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "vulnerable-pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+        );
+
+        let vuln_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .expect("vulnerability diagnostic must be emitted even without registry data");
+        assert_eq!(vuln_diag.severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(
+            vuln_diag.code,
+            Some(NumberOrString::String("RUSTSEC-2020-0071".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_advisory_cap_emits_more_count_from_total_known() {
+        use crate::osv::{
+            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+        };
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("noisy-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let advisories: Vec<_> = (0..ADVISORY_DISPLAY_CAP)
+            .map(|i| sample_advisory(&format!("ADV-{i}"), VulnSeverity::Low))
+            .collect();
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "noisy-pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories,
+                total_known: 40,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+        );
+
+        let more_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("more advisories"))
+            .expect("expected a trailing +N more advisories diagnostic");
+        assert!(
+            more_diag.message.contains("+35"),
+            "got: {}",
+            more_diag.message
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_skipped_outcome_emits_no_vulnerability_diagnostic() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("git-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("git-pkg".into(), "1.0.0".to_string());
+        let resolved_versions = HashMap::new();
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "git-pkg".to_string(),
+            ScanOutcome::Skipped(SkipReason::NonRegistrySource),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+        );
+
+        assert!(
+            diagnostics.iter().all(|d| d.code.is_none()),
+            "a Skipped outcome must never render an advisory diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_clean_outcome_states_no_known_vulnerabilities() {
+        use crate::osv::{ScanOutcome, VulnerabilityMap};
+
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("clean-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert("clean-pkg".to_string(), ScanOutcome::Clean);
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("No known vulnerabilities"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_skipped_outcome_says_nothing_about_vulnerabilities() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("path-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "path-pkg".to_string(),
+            ScanOutcome::Skipped(SkipReason::NonRegistrySource),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(!content.value.contains("Security advisories"));
+        assert!(!content.value.contains("No known vulnerabilities"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_vulnerable_outcome_shows_advisories_and_more_count() {
+        use crate::osv::{
+            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("bad-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "bad-pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
+                total_known: 3,
+                upgrade_status: UpgradeStatus::CandidateVulnerable {
+                    version: "2.0.0".to_string(),
+                    advisory_ids: vec!["RUSTSEC-2020-0071".to_string()],
+                },
+            }),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("Security advisories"));
+        assert!(content.value.contains("RUSTSEC-2020-0071"));
+        assert!(content.value.contains("Fixed in"));
+        assert!(
+            content.value.contains("1.5.0"),
+            "must show highest fixed version"
+        );
+        assert!(content.value.contains("+2 more advisories"));
+        assert!(content.value.contains("also affected"));
     }
 }

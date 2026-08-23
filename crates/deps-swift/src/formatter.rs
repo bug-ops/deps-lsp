@@ -1,7 +1,10 @@
 //! Swift ecosystem formatter.
 
+use deps_core::Dependency;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
+
+use crate::types::SwiftDependency;
 
 /// Returns `true` if `name` matches the `owner/repo` GitHub identifier pattern.
 fn is_valid_owner_repo(name: &str) -> bool {
@@ -48,6 +51,21 @@ impl EcosystemFormatter for SwiftFormatter {
 
     fn yanked_label(&self) -> &'static str {
         "*(yanked)*"
+    }
+
+    /// Raw `dep.name()`, NOT [`Self::normalize_package_name`]: that
+    /// lowercases, and OSV's `SwiftURL` matching is case-sensitive, so
+    /// lowercasing would mangle mixed-case repos. Gated on the dependency's
+    /// source host being `github.com`: only that host is populated in OSV's
+    /// `SwiftURL` ecosystem, and `dep.name()`'s `owner/repo` shape alone
+    /// cannot distinguish a GitHub coordinate from a same-shaped GitLab/self-hosted
+    /// one — attributing a GitHub project's advisories to an unrelated
+    /// same-named repo elsewhere would be a false positive, not just a miss.
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
+        let swift_dep = dep.as_any().downcast_ref::<SwiftDependency>()?;
+        let host = reqwest::Url::parse(&swift_dep.url).ok()?;
+        matches!(host.host_str(), Some("github.com" | "www.github.com"))
+            .then(|| format!("github.com/{}", dep.name()))
     }
 }
 
@@ -140,6 +158,81 @@ mod tests {
     fn test_version_satisfies_invalid_requirement_returns_false() {
         let fmt = SwiftFormatter;
         assert!(!fmt.version_satisfies_requirement("1.0.0", "not-a-req"));
+    }
+
+    fn dep_with_url(name: &str, url: &str) -> SwiftDependency {
+        use deps_core::parser::DependencySource;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        SwiftDependency {
+            name: name.into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_req: Some(">=1.0.0".into()),
+            version_range: None,
+            url: url.to_string(),
+            source: DependencySource::Registry,
+        }
+    }
+
+    #[test]
+    fn test_osv_package_name_github_host_prefixes_and_preserves_case() {
+        let fmt = SwiftFormatter;
+        let dep = dep_with_url("apple/swift-nio", "https://github.com/apple/swift-nio.git");
+        assert_eq!(
+            fmt.osv_package_name(&dep),
+            Some("github.com/apple/swift-nio".to_string())
+        );
+    }
+
+    #[test]
+    fn test_osv_package_name_www_github_host_accepted() {
+        let fmt = SwiftFormatter;
+        let dep = dep_with_url(
+            "apple/swift-nio",
+            "https://www.github.com/apple/swift-nio.git",
+        );
+        assert_eq!(
+            fmt.osv_package_name(&dep),
+            Some("github.com/apple/swift-nio".to_string())
+        );
+    }
+
+    #[test]
+    fn test_osv_package_name_non_github_host_returns_none() {
+        let fmt = SwiftFormatter;
+        let dep = dep_with_url("foo/bar", "https://gitlab.com/foo/bar.git");
+        assert_eq!(fmt.osv_package_name(&dep), None);
+    }
+
+    #[test]
+    fn test_osv_package_name_self_hosted_host_returns_none() {
+        let fmt = SwiftFormatter;
+        let dep = dep_with_url("foo/bar", "https://git.corp.internal/foo/bar.git");
+        assert_eq!(fmt.osv_package_name(&dep), None);
+    }
+
+    #[test]
+    fn test_osv_package_name_unparseable_url_returns_none() {
+        let fmt = SwiftFormatter;
+        let dep = dep_with_url("foo/bar", "not a url");
+        assert_eq!(fmt.osv_package_name(&dep), None);
+    }
+
+    #[test]
+    fn test_osv_package_name_differs_from_normalize_package_name() {
+        // Regression guard: normalize_package_name lowercases (this project's
+        // internal lookup key), while osv_package_name must NOT lowercase the
+        // owner/repo segment (OSV's SwiftURL matching is case-sensitive).
+        let fmt = SwiftFormatter;
+        let dep = dep_with_url("Apple/Swift-NIO", "https://github.com/Apple/Swift-NIO.git");
+        assert_eq!(
+            fmt.osv_package_name(&dep),
+            Some("github.com/Apple/Swift-NIO".to_string())
+        );
+        assert_eq!(
+            fmt.normalize_package_name(&dep.name),
+            "apple/swift-nio".to_string()
+        );
     }
 
     #[test]

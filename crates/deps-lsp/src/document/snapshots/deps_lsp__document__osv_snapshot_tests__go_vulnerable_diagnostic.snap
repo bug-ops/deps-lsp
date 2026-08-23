@@ -1,0 +1,8 @@
+---
+source: crates/deps-lsp/src/document/osv_snapshot_tests.rs
+assertion_line: 128
+expression: rendered
+---
+Some(Warning) | GHSA-xxxx-yyyy-zzzz: Example vulnerability for snapshot testing | code=true
+Some(Information) | +5 more advisories | code=false
+Some(Warning) | Unknown package 'github.com/gin-gonic/gin' | code=false

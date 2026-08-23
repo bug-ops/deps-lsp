@@ -12,9 +12,11 @@ target
 *~
 .DS_Store
 
-# Testing
+# Testing (insta): ignore pending review artifacts only — accepted `.snap`
+# files under `**/snapshots/` must be committed per .claude/rules/testing.md
 .snapshots/
-**/snapshots/
+**/snapshots/*.snap.new
+**/snapshots/*.pending-snap
 
 # Local development
 .local/

@@ -18,6 +18,7 @@ pub mod error;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;
+pub mod osv;
 pub mod package;
 pub mod parser;
 pub mod registry;

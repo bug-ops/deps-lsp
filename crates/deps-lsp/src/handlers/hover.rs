@@ -34,7 +34,8 @@ pub async fn handle_hover(
         .generate_hover(
             parse_result,
             position,
-            VersionData::new(&doc.cached_versions, &doc.resolved_versions),
+            VersionData::new(&doc.cached_versions, &doc.resolved_versions)
+                .with_vulnerabilities(&doc.vulnerabilities),
         )
         .await
 }

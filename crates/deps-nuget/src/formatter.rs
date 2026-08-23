@@ -145,4 +145,36 @@ mod tests {
             "newtonsoft.json"
         );
     }
+
+    #[test]
+    fn test_osv_package_name_preserves_case_unlike_normalize_package_name() {
+        // OSV's NuGet ecosystem is case-preserving (`Newtonsoft.Json`, verified
+        // live — architecture.md §2), unlike `normalize_package_name`'s
+        // lowercase internal lookup key. `osv_package_name` has no override
+        // here (the default identity impl is already correct for NuGet), so
+        // this test is the regression guard: a future "tidy-up" routing it
+        // through `normalize_package_name` would silently zero out NuGet OSV
+        // scanning, and this is the test that would catch it (critique #10).
+        use deps_core::Dependency;
+        use deps_core::parser::DependencySource;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let dep = crate::types::NuGetDependency {
+            name: "Newtonsoft.Json".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_requirement: Some("12.0.1".into()),
+            version_range: None,
+        };
+        assert_eq!(dep.source(), DependencySource::Registry);
+
+        let f = NuGetFormatter;
+        assert_eq!(
+            f.osv_package_name(&dep),
+            Some("Newtonsoft.Json".to_string())
+        );
+        assert_ne!(
+            f.osv_package_name(&dep).unwrap(),
+            f.normalize_package_name(&dep.name)
+        );
+    }
 }

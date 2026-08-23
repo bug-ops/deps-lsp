@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
+use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{EcosystemId, EcosystemRegistry, PackageName, ParseResult};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,6 +46,10 @@ pub struct DocumentState {
     pub cached_versions: HashMap<PackageName, String>,
     /// Resolved versions from lock file
     pub resolved_versions: HashMap<PackageName, String>,
+    /// OSV.dev scan results, keyed by normalized package name. Empty until
+    /// the first background scan completes; carried across document edits
+    /// by `preserve_cache` so it is not wiped on every keystroke.
+    pub vulnerabilities: VulnerabilityMap,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -68,6 +73,7 @@ impl Clone for DocumentState {
             parse_result: None, // Don't clone trait object
             cached_versions: self.cached_versions.clone(),
             resolved_versions: self.resolved_versions.clone(),
+            vulnerabilities: self.vulnerabilities.clone(),
             parsed_at: self.parsed_at,
             loading_state: self.loading_state,
             // Note: Instant is Copy. Clones share the same loading start time.
@@ -165,6 +171,7 @@ impl std::fmt::Debug for DocumentState {
             .field("has_parse_result", &self.parse_result.is_some())
             .field("cached_versions_count", &self.cached_versions.len())
             .field("resolved_versions_count", &self.resolved_versions.len())
+            .field("vulnerabilities_count", &self.vulnerabilities.len())
             .field("parsed_at", &self.parsed_at)
             .field("loading_state", &self.loading_state)
             .field("loading_started_at", &self.loading_started_at)
@@ -188,6 +195,7 @@ impl DocumentState {
             parse_result: Some(parse_result),
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
+            vulnerabilities: VulnerabilityMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -206,6 +214,7 @@ impl DocumentState {
             parse_result: None,
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
+            vulnerabilities: VulnerabilityMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -233,6 +242,11 @@ impl DocumentState {
     /// Updates the resolved versions from lock file.
     pub fn update_resolved_versions(&mut self, versions: HashMap<PackageName, String>) {
         self.resolved_versions = versions;
+    }
+
+    /// Updates the OSV.dev scan results.
+    pub fn update_vulnerabilities(&mut self, vulnerabilities: VulnerabilityMap) {
+        self.vulnerabilities = vulnerabilities;
     }
 
     /// Sets the LSP document version from the client's `didOpen`/`didChange`, or clears
@@ -388,6 +402,9 @@ pub struct ServerState {
     pub documents: DashMap<Uri, DocumentState>,
     /// HTTP cache for registry requests
     pub cache: Arc<HttpCache>,
+    /// OSV.dev vulnerability scan client, shared server-lifetime so every
+    /// open document's scan benefits from the same query/record cache.
+    pub osv: Arc<OsvClient>,
     /// Lock file cache for parsed lock files
     pub lockfile_cache: Arc<LockFileCache>,
     /// Ecosystem registry for trait-based architecture
@@ -402,6 +419,7 @@ impl ServerState {
     /// Creates a new server state with default configuration.
     pub fn new() -> Self {
         let cache = Arc::new(HttpCache::new());
+        let osv = Arc::new(OsvClient::new(Arc::clone(&cache)));
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
 
@@ -414,6 +432,7 @@ impl ServerState {
         Self {
             documents: DashMap::new(),
             cache,
+            osv,
             lockfile_cache,
             ecosystem_registry,
             cold_start_limiter,
