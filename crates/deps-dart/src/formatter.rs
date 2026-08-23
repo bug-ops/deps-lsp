@@ -1,6 +1,7 @@
 //! Version formatting for Dart ecosystem.
 
 use crate::version::version_matches_constraint;
+use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 
 pub struct DartFormatter;
@@ -10,8 +11,8 @@ impl EcosystemFormatter for DartFormatter {
         format!("^{version}")
     }
 
-    fn package_url(&self, name: &str) -> String {
-        crate::registry::package_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -34,7 +35,7 @@ mod tests {
     fn test_package_url() {
         let f = DartFormatter;
         assert_eq!(
-            f.package_url("provider"),
+            f.package_url(&PackageName::new("provider")),
             "https://pub.dev/packages/provider"
         );
     }
@@ -49,6 +50,9 @@ mod tests {
     #[test]
     fn test_normalize_is_identity() {
         let f = DartFormatter;
-        assert_eq!(f.normalize_package_name("flutter_bloc"), "flutter_bloc");
+        assert_eq!(
+            f.normalize_package_name(&PackageName::new("flutter_bloc")),
+            "flutter_bloc"
+        );
     }
 }

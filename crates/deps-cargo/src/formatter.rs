@@ -1,3 +1,4 @@
+use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 
 pub struct CargoFormatter;
@@ -7,8 +8,8 @@ impl EcosystemFormatter for CargoFormatter {
         version.to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        crate::registry::crate_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::crate_url(name.as_str())
     }
 }
 
@@ -27,11 +28,11 @@ mod tests {
     fn test_package_url() {
         let formatter = CargoFormatter;
         assert_eq!(
-            formatter.package_url("serde"),
+            formatter.package_url(&PackageName::new("serde")),
             "https://crates.io/crates/serde"
         );
         assert_eq!(
-            formatter.package_url("tokio-util"),
+            formatter.package_url(&PackageName::new("tokio-util")),
             "https://crates.io/crates/tokio-util"
         );
     }
@@ -39,8 +40,14 @@ mod tests {
     #[test]
     fn test_default_normalize_is_identity() {
         let formatter = CargoFormatter;
-        assert_eq!(formatter.normalize_package_name("serde"), "serde");
-        assert_eq!(formatter.normalize_package_name("tokio-util"), "tokio-util");
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("serde")),
+            "serde"
+        );
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("tokio-util")),
+            "tokio-util"
+        );
     }
 
     #[test]

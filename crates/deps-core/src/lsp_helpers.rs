@@ -261,7 +261,7 @@ pub enum RequirementStatus {
 /// Ecosystem-specific formatting and comparison logic.
 pub trait EcosystemFormatter: Send + Sync {
     /// Normalize package name for lookup (default: identity).
-    fn normalize_package_name(&self, name: &str) -> String {
+    fn normalize_package_name(&self, name: &PackageName) -> String {
         name.to_string()
     }
 
@@ -282,6 +282,7 @@ pub trait EcosystemFormatter: Send + Sync {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::PackageName;
     /// use deps_core::lsp_helpers::EcosystemFormatter;
     ///
     /// struct PermissiveFormatter;
@@ -291,7 +292,7 @@ pub trait EcosystemFormatter: Send + Sync {
     ///         version.to_string()
     ///     }
     ///
-    ///     fn package_url(&self, name: &str) -> String {
+    ///     fn package_url(&self, name: &PackageName) -> String {
     ///         format!("https://example.com/{name}")
     ///     }
     /// }
@@ -364,8 +365,8 @@ pub trait EcosystemFormatter: Send + Sync {
     /// than an auto-following range (NuGet's bare `Version="1.0.0"`) must override this,
     /// since "does the floor accept `latest`" and "is the pin already `latest`" are
     /// different questions there.
-    fn is_requirement_up_to_date(&self, requirement: &str, latest: &str) -> bool {
-        self.version_satisfies_requirement(latest, requirement)
+    fn is_requirement_up_to_date(&self, requirement: &VersionReq, latest: &str) -> bool {
+        self.version_satisfies_requirement(latest, requirement.as_str())
     }
 
     /// Whether `requirement` could not be resolved to a concrete version constraint (e.g. an
@@ -381,20 +382,21 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// ```
     /// use deps_core::lsp_helpers::EcosystemFormatter;
+    /// use deps_core::{PackageName, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
     ///     fn format_version_for_text_edit(&self, version: &str) -> String {
     ///         version.to_string()
     ///     }
-    ///     fn package_url(&self, name: &str) -> String {
+    ///     fn package_url(&self, name: &PackageName) -> String {
     ///         name.to_string()
     ///     }
     /// }
     ///
-    /// assert!(!DefaultFormatter.requirement_is_unresolved("^1.2"));
+    /// assert!(!DefaultFormatter.requirement_is_unresolved(&VersionReq::new("^1.2")));
     /// ```
-    fn requirement_is_unresolved(&self, _requirement: &str) -> bool {
+    fn requirement_is_unresolved(&self, _requirement: &VersionReq) -> bool {
         false
     }
 
@@ -411,27 +413,28 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// ```
     /// use deps_core::lsp_helpers::{EcosystemFormatter, RequirementStatus};
+    /// use deps_core::{PackageName, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
     ///     fn format_version_for_text_edit(&self, version: &str) -> String {
     ///         version.to_string()
     ///     }
-    ///     fn package_url(&self, name: &str) -> String {
+    ///     fn package_url(&self, name: &PackageName) -> String {
     ///         name.to_string()
     ///     }
     /// }
     ///
     /// assert_eq!(
-    ///     DefaultFormatter.requirement_status("^1.2", "1.5.0"),
+    ///     DefaultFormatter.requirement_status(&VersionReq::new("^1.2"), "1.5.0"),
     ///     RequirementStatus::UpToDate
     /// );
     /// assert_eq!(
-    ///     DefaultFormatter.requirement_status("^1.2", "2.0.0"),
+    ///     DefaultFormatter.requirement_status(&VersionReq::new("^1.2"), "2.0.0"),
     ///     RequirementStatus::Outdated
     /// );
     /// ```
-    fn requirement_status(&self, requirement: &str, latest: &str) -> RequirementStatus {
+    fn requirement_status(&self, requirement: &VersionReq, latest: &str) -> RequirementStatus {
         if self.requirement_is_unresolved(requirement) {
             return RequirementStatus::Unresolved;
         }
@@ -443,7 +446,7 @@ pub trait EcosystemFormatter: Send + Sync {
     }
 
     /// Get package URL for hover markdown.
-    fn package_url(&self, name: &str) -> String;
+    fn package_url(&self, name: &PackageName) -> String;
 
     /// Message for yanked/deprecated versions in diagnostics.
     fn yanked_message(&self) -> &'static str {
@@ -477,7 +480,7 @@ pub fn generate_inlay_hints(
             continue;
         };
 
-        let normalized_name = formatter.normalize_package_name(dep.name().as_str());
+        let normalized_name = formatter.normalize_package_name(dep.name());
         let latest_version = versions
             .cached
             .get(normalized_name.as_str())
@@ -539,7 +542,7 @@ pub fn generate_inlay_hints(
             }
         } else {
             match dep.version_requirement() {
-                Some(version_req) => formatter.requirement_status(version_req.as_str(), latest),
+                Some(version_req) => formatter.requirement_status(version_req, latest),
                 // No declared requirement at all (e.g. a dangling alias/reference the
                 // parser couldn't resolve to any string) — nothing was verified.
                 None => RequirementStatus::Unresolved,
@@ -598,7 +601,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     let available_versions = registry.get_versions(dep.name().as_str()).await.ok()?;
 
-    let url = formatter.package_url(dep.name().as_str());
+    let url = formatter.package_url(dep.name());
 
     // Pre-allocate with estimated capacity to reduce allocations
     let mut markdown = String::with_capacity(512);
@@ -610,7 +613,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     )
     .unwrap();
 
-    let normalized_name = formatter.normalize_package_name(dep.name().as_str());
+    let normalized_name = formatter.normalize_package_name(dep.name());
 
     let resolved = versions
         .resolved
@@ -758,7 +761,7 @@ pub fn generate_diagnostics_from_cache(
     let mut diagnostics = Vec::with_capacity(deps.len());
 
     for dep in deps {
-        let normalized_name = formatter.normalize_package_name(dep.name().as_str());
+        let normalized_name = formatter.normalize_package_name(dep.name());
         let latest_version = versions
             .cached
             .get(normalized_name.as_str())
@@ -790,7 +793,7 @@ pub fn generate_diagnostics_from_cache(
         };
 
         let status = match dep.version_requirement() {
-            Some(version_req) => formatter.requirement_status(version_req.as_str(), latest),
+            Some(version_req) => formatter.requirement_status(version_req, latest),
             // No declared requirement at all (e.g. a dangling alias/reference the parser
             // couldn't resolve to any string) — nothing was verified.
             None => RequirementStatus::Unresolved,
@@ -890,7 +893,7 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 ///     fn format_version_for_text_edit(&self, version: &str) -> String {
 ///         version.to_string()
 ///     }
-///     fn package_url(&self, name: &str) -> String {
+///     fn package_url(&self, name: &PackageName) -> String {
 ///         format!("https://example.com/{name}")
 ///     }
 /// }
@@ -964,17 +967,19 @@ pub fn collect_update_all_edits(
             continue;
         };
 
-        let normalized_name = formatter.normalize_package_name(dep.name().as_str());
+        let normalized_name = formatter.normalize_package_name(dep.name());
         let Some(latest) = versions
             .cached
             .get(normalized_name.as_str())
-            .or_else(|| versions.cached.get(dep.name().as_str()))
+            .or_else(|| versions.cached.get(dep.name()))
         else {
             continue;
         };
 
-        let version_req = dep.version_requirement().map_or("", VersionReq::as_str);
-        if version_req.is_empty() {
+        let Some(version_req) = dep.version_requirement() else {
+            continue;
+        };
+        if version_req.as_str().is_empty() {
             // Defense-in-depth: an empty requirement would trivially satisfy the guard
             // below (both sides normalize to ""), so without this, a future formatter
             // whose `is_requirement_up_to_date` doesn't treat "" as up to date could
@@ -986,7 +991,7 @@ pub fn collect_update_all_edits(
         }
 
         let slice = slice_for_range(content, &line_offsets, version_range);
-        if !literal_span_matches(slice, version_req) {
+        if !literal_span_matches(slice, version_req.as_str()) {
             continue;
         }
 
@@ -1029,7 +1034,7 @@ pub fn collect_update_all_edits(
 ///
 /// ```
 /// use deps_core::lsp_helpers::{generate_code_lenses, EcosystemFormatter, VersionData};
-/// use deps_core::ParseResult;
+/// use deps_core::{PackageName, ParseResult};
 /// use std::collections::HashMap;
 ///
 /// struct MockFormatter;
@@ -1037,7 +1042,7 @@ pub fn collect_update_all_edits(
 ///     fn format_version_for_text_edit(&self, version: &str) -> String {
 ///         version.to_string()
 ///     }
-///     fn package_url(&self, name: &str) -> String {
+///     fn package_url(&self, name: &PackageName) -> String {
 ///         format!("https://example.com/{name}")
 ///     }
 /// }
@@ -1156,7 +1161,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
 
             let latest = crate::registry::find_latest_stable(&versions);
             if let Some(latest) = latest
-                && formatter.requirement_status(version_req.as_str(), latest.version_string())
+                && formatter.requirement_status(version_req, latest.version_string())
                     == RequirementStatus::Outdated
             {
                 diagnostics.push(Diagnostic {
@@ -1178,6 +1183,10 @@ mod tests {
     use super::*;
     use crate::{PackageName, VersionReq};
     use std::any::Any;
+
+    fn pkg(s: &str) -> PackageName {
+        PackageName::new(s)
+    }
 
     #[test]
     fn test_position_in_range_inside() {
@@ -1376,7 +1385,7 @@ mod tests {
             format!("\"{}\"", version)
         }
 
-        fn package_url(&self, name: &str) -> String {
+        fn package_url(&self, name: &PackageName) -> String {
             format!("https://example.com/{}", name)
         }
     }
@@ -1390,11 +1399,15 @@ mod tests {
             version.to_string()
         }
 
-        fn package_url(&self, name: &str) -> String {
+        fn package_url(&self, name: &PackageName) -> String {
             format!("https://example.com/{}", name)
         }
 
-        fn requirement_status(&self, _requirement: &str, _latest: &str) -> RequirementStatus {
+        fn requirement_status(
+            &self,
+            _requirement: &VersionReq,
+            _latest: &str,
+        ) -> RequirementStatus {
             RequirementStatus::Unresolved
         }
     }
@@ -1408,7 +1421,7 @@ mod tests {
             version.to_string()
         }
 
-        fn package_url(&self, name: &str) -> String {
+        fn package_url(&self, name: &PackageName) -> String {
             format!("https://example.com/{}", name)
         }
 
@@ -1468,7 +1481,10 @@ mod tests {
     #[test]
     fn test_ecosystem_formatter_defaults() {
         let formatter = MockFormatter;
-        assert_eq!(formatter.normalize_package_name("test-pkg"), "test-pkg");
+        assert_eq!(
+            formatter.normalize_package_name(&pkg("test-pkg")),
+            "test-pkg"
+        );
         assert_eq!(formatter.yanked_message(), "This version has been yanked");
         assert_eq!(formatter.yanked_label(), "*(yanked)*");
     }
@@ -1494,8 +1510,8 @@ mod tests {
         struct PyPIFormatter;
 
         impl EcosystemFormatter for PyPIFormatter {
-            fn normalize_package_name(&self, name: &str) -> String {
-                name.to_lowercase().replace('-', "_")
+            fn normalize_package_name(&self, name: &PackageName) -> String {
+                name.as_str().to_lowercase().replace('-', "_")
             }
 
             fn format_version_for_text_edit(&self, version: &str) -> String {
@@ -1506,14 +1522,14 @@ mod tests {
                 )
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &PackageName) -> String {
                 format!("https://pypi.org/project/{}", name)
             }
         }
 
         let formatter = PyPIFormatter;
         assert_eq!(
-            formatter.normalize_package_name("Test-Package"),
+            formatter.normalize_package_name(&pkg("Test-Package")),
             "test_package"
         );
         assert_eq!(
@@ -1521,7 +1537,7 @@ mod tests {
             ">=1.2.3,<1"
         );
         assert_eq!(
-            formatter.package_url("requests"),
+            formatter.package_url(&pkg("requests")),
             "https://pypi.org/project/requests"
         );
     }
@@ -2628,10 +2644,10 @@ mod tests {
             fn format_version_for_text_edit(&self, version: &str) -> String {
                 version.to_string()
             }
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
-            fn is_requirement_up_to_date(&self, _requirement: &str, _latest: &str) -> bool {
+            fn is_requirement_up_to_date(&self, _requirement: &VersionReq, _latest: &str) -> bool {
                 false
             }
         }

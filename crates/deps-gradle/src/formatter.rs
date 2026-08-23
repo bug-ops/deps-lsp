@@ -1,6 +1,7 @@
 //! Version formatting for Gradle ecosystem.
 
 use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::{PackageName, VersionReq};
 
 pub struct GradleFormatter;
 
@@ -9,14 +10,14 @@ impl EcosystemFormatter for GradleFormatter {
         version.to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        deps_maven::registry::package_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        deps_maven::registry::package_url(name.as_str())
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
         // Unresolved Gradle variable reference (`$var`/`${var}`), or an empty version-catalog
         // entry (`[versions] foo = ""`) — skip comparison
-        if self.requirement_is_unresolved(requirement) {
+        if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
             return true;
         }
         if requirement == "latest" || requirement.starts_with("latest.") {
@@ -34,10 +35,10 @@ impl EcosystemFormatter for GradleFormatter {
         version == requirement
     }
 
-    fn requirement_is_unresolved(&self, requirement: &str) -> bool {
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         // Unresolved Gradle variable reference (`$var`, `${var}`), or an explicit empty
         // version-catalog entry (`[versions] foo = ""`) that a `version.ref` could point at.
-        requirement.is_empty() || requirement.contains('$')
+        requirement.as_str().is_empty() || requirement.as_str().contains('$')
     }
 }
 
@@ -60,7 +61,9 @@ mod tests {
     fn test_package_url() {
         let f = GradleFormatter;
         assert_eq!(
-            f.package_url("org.springframework.boot:spring-boot-starter"),
+            f.package_url(&PackageName::new(
+                "org.springframework.boot:spring-boot-starter"
+            )),
             "https://central.sonatype.com/artifact/org.springframework.boot/spring-boot-starter"
         );
     }
@@ -136,7 +139,7 @@ mod tests {
     fn test_normalize_is_identity() {
         let f = GradleFormatter;
         assert_eq!(
-            f.normalize_package_name("com.google.guava:guava"),
+            f.normalize_package_name(&PackageName::new("com.google.guava:guava")),
             "com.google.guava:guava"
         );
     }
@@ -145,7 +148,7 @@ mod tests {
     fn test_requirement_status_unresolved_bare_variable() {
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status("$someVersion", "3.14.0"),
+            f.requirement_status(&VersionReq::new("$someVersion"), "3.14.0"),
             RequirementStatus::Unresolved
         );
     }
@@ -154,7 +157,7 @@ mod tests {
     fn test_requirement_status_unresolved_braced_variable() {
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status("${someVersion}", "3.14.0"),
+            f.requirement_status(&VersionReq::new("${someVersion}"), "3.14.0"),
             RequirementStatus::Unresolved
         );
     }
@@ -165,7 +168,7 @@ mod tests {
         // missing from `[versions]` — must be treated the same as an unresolved variable.
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status("$missing", "3.14.0"),
+            f.requirement_status(&VersionReq::new("$missing"), "3.14.0"),
             RequirementStatus::Unresolved
         );
     }
@@ -174,7 +177,7 @@ mod tests {
     fn test_requirement_status_up_to_date() {
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status("3.2.0", "3.2.0"),
+            f.requirement_status(&VersionReq::new("3.2.0"), "3.2.0"),
             RequirementStatus::UpToDate
         );
     }
@@ -183,7 +186,7 @@ mod tests {
     fn test_requirement_status_outdated() {
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status("3.1.0", "3.2.0"),
+            f.requirement_status(&VersionReq::new("3.1.0"), "3.2.0"),
             RequirementStatus::Outdated
         );
     }

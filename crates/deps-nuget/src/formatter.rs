@@ -1,6 +1,7 @@
 //! Version formatting for the NuGet ecosystem.
 
 use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::{PackageName, VersionReq};
 
 pub struct NuGetFormatter;
 
@@ -10,8 +11,8 @@ impl EcosystemFormatter for NuGetFormatter {
         version.to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        crate::registry::package_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
     }
 
     /// Overridden because the default npm caret/tilde semantics do not apply to NuGet's
@@ -25,8 +26,8 @@ impl EcosystemFormatter for NuGetFormatter {
     }
 
     /// NuGet package ids are case-insensitive and every V3 API path segment is lowercased.
-    fn normalize_package_name(&self, name: &str) -> String {
-        name.to_lowercase()
+    fn normalize_package_name(&self, name: &PackageName) -> String {
+        name.as_str().to_lowercase()
     }
 
     /// Overridden because a minimum-only range (a bare `Version="1.0.0"`, or its explicit
@@ -38,7 +39,8 @@ impl EcosystemFormatter for NuGetFormatter {
     /// `latest <= floor` here, not `latest == floor`. Exact pins, maximums, bounded ranges,
     /// and floating patterns (`1.1.*`) already express the intended forward-compatibility
     /// window, so those keep the general satisfies check.
-    fn is_requirement_up_to_date(&self, requirement: &str, latest: &str) -> bool {
+    fn is_requirement_up_to_date(&self, requirement: &VersionReq, latest: &str) -> bool {
+        let requirement = requirement.as_str();
         if requirement.contains('*') {
             return self.version_satisfies_requirement(latest, requirement);
         }
@@ -63,7 +65,7 @@ mod tests {
     fn test_package_url() {
         let f = NuGetFormatter;
         assert_eq!(
-            f.package_url("Newtonsoft.Json"),
+            f.package_url(&PackageName::new("Newtonsoft.Json")),
             "https://www.nuget.org/packages/Newtonsoft.Json"
         );
     }
@@ -94,24 +96,24 @@ mod tests {
         let f = NuGetFormatter;
         // Bare floors are pins under PackageReference: a newer latest is outdated,
         // even though it satisfies the floor (>= 13.0.3).
-        assert!(!f.is_requirement_up_to_date("13.0.3", "13.0.4"));
-        assert!(!f.is_requirement_up_to_date("13.0.3", "14.0.0"));
+        assert!(!f.is_requirement_up_to_date(&VersionReq::new("13.0.3"), "13.0.4"));
+        assert!(!f.is_requirement_up_to_date(&VersionReq::new("13.0.3"), "14.0.0"));
     }
 
     #[test]
     fn test_is_up_to_date_bare_floor_matches_latest() {
         let f = NuGetFormatter;
-        assert!(f.is_requirement_up_to_date("13.0.3", "13.0.3"));
+        assert!(f.is_requirement_up_to_date(&VersionReq::new("13.0.3"), "13.0.3"));
     }
 
     #[test]
     fn test_is_up_to_date_open_ended_minimum_bracket_forms_outdated() {
         let f = NuGetFormatter;
         // Same floor semantics as a bare version, spelled with explicit interval brackets.
-        assert!(!f.is_requirement_up_to_date("[13.0.3,)", "13.0.4"));
-        assert!(!f.is_requirement_up_to_date("(13.0.3,)", "13.0.4"));
-        assert!(!f.is_requirement_up_to_date("[13.0.3,]", "13.0.4"));
-        assert!(f.is_requirement_up_to_date("[13.0.3,)", "13.0.3"));
+        assert!(!f.is_requirement_up_to_date(&VersionReq::new("[13.0.3,)"), "13.0.4"));
+        assert!(!f.is_requirement_up_to_date(&VersionReq::new("(13.0.3,)"), "13.0.4"));
+        assert!(!f.is_requirement_up_to_date(&VersionReq::new("[13.0.3,]"), "13.0.4"));
+        assert!(f.is_requirement_up_to_date(&VersionReq::new("[13.0.3,)"), "13.0.3"));
     }
 
     #[test]
@@ -119,27 +121,27 @@ mod tests {
         let f = NuGetFormatter;
         // A floor already ahead of the registry's latest (a preview/prerelease pin, or a
         // latest that regressed) must not render a downgrade suggestion.
-        assert!(f.is_requirement_up_to_date("13.0.5", "13.0.4"));
-        assert!(f.is_requirement_up_to_date("9.0.0-preview.5", "8.0.11"));
+        assert!(f.is_requirement_up_to_date(&VersionReq::new("13.0.5"), "13.0.4"));
+        assert!(f.is_requirement_up_to_date(&VersionReq::new("9.0.0-preview.5"), "8.0.11"));
         // A prerelease pin genuinely behind a newer stable release is still outdated.
-        assert!(!f.is_requirement_up_to_date("9.0.0-preview.5", "9.0.0"));
+        assert!(!f.is_requirement_up_to_date(&VersionReq::new("9.0.0-preview.5"), "9.0.0"));
     }
 
     #[test]
     fn test_is_up_to_date_exact_pin_and_ranges_keep_satisfies_semantics() {
         let f = NuGetFormatter;
-        assert!(f.is_requirement_up_to_date("[13.0.3]", "13.0.3"));
-        assert!(!f.is_requirement_up_to_date("[13.0.3]", "14.0.0"));
-        assert!(f.is_requirement_up_to_date("[1.0,2.0)", "1.5.0"));
-        assert!(f.is_requirement_up_to_date("1.1.*", "1.1.5"));
-        assert!(!f.is_requirement_up_to_date("1.1.*", "1.2.0"));
+        assert!(f.is_requirement_up_to_date(&VersionReq::new("[13.0.3]"), "13.0.3"));
+        assert!(!f.is_requirement_up_to_date(&VersionReq::new("[13.0.3]"), "14.0.0"));
+        assert!(f.is_requirement_up_to_date(&VersionReq::new("[1.0,2.0)"), "1.5.0"));
+        assert!(f.is_requirement_up_to_date(&VersionReq::new("1.1.*"), "1.1.5"));
+        assert!(!f.is_requirement_up_to_date(&VersionReq::new("1.1.*"), "1.2.0"));
     }
 
     #[test]
     fn test_normalize_lowercases() {
         let f = NuGetFormatter;
         assert_eq!(
-            f.normalize_package_name("Newtonsoft.Json"),
+            f.normalize_package_name(&PackageName::new("Newtonsoft.Json")),
             "newtonsoft.json"
         );
     }
