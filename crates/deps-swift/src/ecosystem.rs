@@ -46,13 +46,6 @@ fn build_url_completion(package: &SwiftPackage, replace_range: Option<LspRange>)
         })
     });
 
-    // Swift search() deliberately leaves latest_version empty to avoid an N+1 GitHub API
-    // call per result (see SwiftRegistry::search docs); the base builder's `detail` is
-    // `format!("v{latest}")`, which would otherwise render as the misleading bare "v".
-    if package.latest_version.is_empty() {
-        item.detail = None;
-    }
-
     item
 }
 

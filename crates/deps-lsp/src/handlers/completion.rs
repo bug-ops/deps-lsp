@@ -565,12 +565,16 @@ fn create_package_completion_item(
     };
 
     // Build detail text
-    let detail = format!("Latest: {latest}");
+    let detail = if latest.is_empty() {
+        None
+    } else {
+        Some(format!("Latest: {latest}"))
+    };
 
     CompletionItem {
         label: name.to_string(),
         kind: Some(CompletionItemKind::MODULE),
-        detail: Some(detail),
+        detail,
         documentation: description
             .map(|d| tower_lsp_server::ls_types::Documentation::String(d.into())),
         insert_text: Some(insert_text),
