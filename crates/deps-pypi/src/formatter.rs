@@ -150,10 +150,21 @@ impl EcosystemFormatter for PypiFormatter {
     /// same precise contains-check `version_satisfies_requirement` above already uses, so
     /// this is not a new comparator, just its result cached across candidates instead of
     /// reparsed per call.
+    ///
+    /// Returns `None` when any specifier pins a PEP 440 [local version identifier]
+    /// (e.g. `torch==2.0.1+cu118`). Local versions are conventionally published only on
+    /// custom/alternate indexes (e.g. the PyTorch wheel index), not the default registry
+    /// this matcher checks candidates against — so an empty match set there does not mean
+    /// the requirement is unsatisfiable everywhere, and the diagnostic would be a false
+    /// positive.
+    ///
+    /// [local version identifier]: https://peps.python.org/pep-0440/#local-version-identifiers
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        VersionSpecifiers::from_str(requirement.as_str())
-            .ok()
-            .map(|specs| Box::new(Pep440Matcher(specs)) as Box<dyn RequirementMatcher>)
+        let specs = VersionSpecifiers::from_str(requirement.as_str()).ok()?;
+        if specs.iter().any(|spec| spec.version().is_local()) {
+            return None;
+        }
+        Some(Box::new(Pep440Matcher(specs)))
     }
 }
 
@@ -284,6 +295,16 @@ mod tests {
         assert!(
             formatter
                 .compile_requirement(&VersionReq::new("not-a-specifier"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_local_version_returns_none() {
+        let formatter = PypiFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("==2.0.1+cu118"))
                 .is_none()
         );
     }

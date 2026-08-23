@@ -4,6 +4,7 @@
 //! Non-GitHub URLs get empty version lists with a tracing warning.
 
 use crate::types::{SwiftPackage, SwiftVersion};
+use bytes::Bytes;
 use deps_core::{DepsError, HttpCache, Result};
 use serde::Deserialize;
 use std::any::Any;
@@ -104,11 +105,9 @@ impl SwiftRegistry {
     /// pages exist).
     pub async fn get_versions(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         validate_owner_repo(name)?;
-        let mut tags = Vec::new();
-        for page in 1..=MAX_TAG_PAGES {
+        let tags = paginate_tags(name, |page| async move {
             let url = format!("{GITHUB_API}/repos/{name}/tags?per_page=100&page={page}");
-            let data = self
-                .cache
+            self.cache
                 .get_cached_with_headers(&url, &self.headers())
                 .await
                 .map_err(|e| match &e {
@@ -122,14 +121,9 @@ impl SwiftRegistry {
                         registry: REGISTRY,
                     },
                     _ => e,
-                })?;
-            let page_tags = parse_tags_page(&data)?;
-            let page_len = page_tags.len();
-            tags.extend(page_tags);
-            if !page_has_more(page_len) {
-                break;
-            }
-        }
+                })
+        })
+        .await?;
         Ok(tags_to_versions(tags))
     }
 
@@ -188,6 +182,48 @@ struct GithubErrorResponse {
 /// A page with fewer entries is necessarily the last one.
 const fn page_has_more(page_len: usize) -> bool {
     page_len >= 100
+}
+
+/// Logs a warning when tag pagination for `name` stops at [`MAX_TAG_PAGES`]
+/// while GitHub still had more pages available (`page_has_more(page_len)`).
+///
+/// Without this, hitting the safety ceiling on a pathological repo is
+/// indistinguishable in logs from "the repo genuinely has no matching
+/// version" — this makes truncation diagnosable.
+fn warn_if_pagination_truncated(name: &str, page: u32, page_len: usize) {
+    if page == MAX_TAG_PAGES && page_has_more(page_len) {
+        tracing::warn!(
+            package = name,
+            pages_fetched = MAX_TAG_PAGES,
+            "Swift tags pagination for '{name}' stopped at the {MAX_TAG_PAGES}-page cap while \
+             GitHub reported more pages available; the fetched version list may be truncated"
+        );
+    }
+}
+
+/// Drives the GitHub tags pagination loop, fetching pages via `fetch_page`
+/// until a partial page is seen or [`MAX_TAG_PAGES`] is reached.
+///
+/// Extracted out of [`SwiftRegistry::get_versions`] so tests can inject a
+/// fake `fetch_page` and exercise the real loop — including the
+/// [`warn_if_pagination_truncated`] call site — without a live GitHub API.
+async fn paginate_tags<F, Fut>(name: &str, mut fetch_page: F) -> Result<Vec<GithubTag>>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Bytes>>,
+{
+    let mut tags = Vec::new();
+    for page in 1..=MAX_TAG_PAGES {
+        let data = fetch_page(page).await?;
+        let page_tags = parse_tags_page(&data)?;
+        let page_len = page_tags.len();
+        tags.extend(page_tags);
+        if !page_has_more(page_len) {
+            break;
+        }
+        warn_if_pagination_truncated(name, page, page_len);
+    }
+    Ok(tags)
 }
 
 /// Parses a single GitHub tags API page into raw tag entries.
@@ -516,6 +552,162 @@ mod tests {
     fn test_page_has_more_partial_page_stops() {
         assert!(!page_has_more(99));
         assert!(!page_has_more(0));
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capturing_subscriber() -> (CapturingWriter, impl tracing::Subscriber) {
+        let writer = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_target(false)
+            .finish();
+        (writer, subscriber)
+    }
+
+    /// Captures `tracing` output emitted during `f` into a `String`, so
+    /// pagination-truncation warnings can be asserted on without a real
+    /// GitHub server (the tags endpoint's base URL isn't test-injectable).
+    fn capture_tracing_output(f: impl FnOnce()) -> String {
+        let (writer, subscriber) = capturing_subscriber();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+    }
+
+    /// Async counterpart of [`capture_tracing_output`]: sets the capturing
+    /// subscriber as the thread-local default for the duration of `fut`.
+    /// Relies on the `#[tokio::test]` current-thread runtime polling `fut`
+    /// on the same thread that installed the default.
+    async fn capture_tracing_output_async(fut: impl std::future::Future<Output = ()>) -> String {
+        let (writer, subscriber) = capturing_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        fut.await;
+        drop(guard);
+        String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+    }
+
+    #[test]
+    fn test_pagination_warns_when_truncated_at_cap() {
+        let output = capture_tracing_output(|| {
+            warn_if_pagination_truncated("owner/repo", MAX_TAG_PAGES, 100);
+        });
+        assert!(output.contains("owner/repo"), "output was: {output}");
+        assert!(output.contains("cap"), "output was: {output}");
+    }
+
+    #[test]
+    fn test_pagination_silent_when_under_cap() {
+        let output = capture_tracing_output(|| {
+            warn_if_pagination_truncated("owner/repo", MAX_TAG_PAGES - 1, 100);
+        });
+        assert!(output.is_empty(), "output was: {output}");
+    }
+
+    #[test]
+    fn test_pagination_silent_when_last_page_at_cap_is_partial() {
+        let output = capture_tracing_output(|| {
+            warn_if_pagination_truncated("owner/repo", MAX_TAG_PAGES, 42);
+        });
+        assert!(output.is_empty(), "output was: {output}");
+    }
+
+    /// Builds a JSON tags page with `count` uniquely named entries.
+    fn tags_page_json(count: usize) -> Bytes {
+        let entries: Vec<String> = (0..count)
+            .map(|i| format!(r#"{{"name":"tag{i}"}}"#))
+            .collect();
+        Bytes::from(format!("[{}]", entries.join(",")))
+    }
+
+    /// Drives [`paginate_tags`] with a full page followed by a partial page,
+    /// then a third page that must never be fetched. This exercises the
+    /// real loop (accumulation + `break` on a partial page) end-to-end,
+    /// unlike the tests above which only call [`warn_if_pagination_truncated`]
+    /// directly — a reordered or dropped call site inside the loop, or a
+    /// broken `break` condition, would surface here as a wrong tag count,
+    /// an unexpected third fetch, or a spurious warning.
+    #[tokio::test]
+    async fn test_paginate_tags_stops_after_partial_page() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let calls = AtomicU32::new(0);
+        let mut tags = Vec::new();
+        let output = capture_tracing_output_async(async {
+            let result = paginate_tags("owner/repo", |page| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match page {
+                        1 => Ok(tags_page_json(100)),
+                        2 => Ok(tags_page_json(42)),
+                        _ => panic!("page {page} must not be fetched after a partial page"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            tags = result;
+        })
+        .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "must stop after the partial page 2"
+        );
+        assert_eq!(tags.len(), 142);
+        assert!(
+            output.is_empty(),
+            "must not warn below the page cap: {output}"
+        );
+    }
+
+    /// Drives [`paginate_tags`] to the [`MAX_TAG_PAGES`] cap with every page
+    /// full, so the loop exits via the `for` bound rather than the `break`.
+    /// Only the real call site inside the loop can produce this warning —
+    /// dropping it, or moving it outside the loop where `page`/`page_len`
+    /// are unavailable, fails this test where it would not fail a test of
+    /// `warn_if_pagination_truncated` in isolation.
+    #[tokio::test]
+    async fn test_paginate_tags_warns_when_cap_reached_with_full_last_page() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let calls = AtomicU32::new(0);
+        let output = capture_tracing_output_async(async {
+            let result = paginate_tags("owner/repo", |_page| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(tags_page_json(100)) }
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.len(), 100 * MAX_TAG_PAGES as usize);
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_TAG_PAGES);
+        assert!(output.contains("owner/repo"), "output was: {output}");
+        assert!(output.contains("cap"), "output was: {output}");
     }
 
     #[test]

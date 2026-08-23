@@ -30,6 +30,34 @@ fn is_snapshot(requirement: &str) -> bool {
     requirement.ends_with("-SNAPSHOT")
 }
 
+/// A resolved timestamped-snapshot deployment (e.g. `1.0-20260101.120000-1`) — the form a
+/// `-SNAPSHOT` version takes once actually deployed to the snapshot repository, replacing
+/// the `-SNAPSHOT` suffix with a `-<yyyyMMdd>.<HHmmss>-<buildNumber>` unique-version stamp.
+/// Same undecidable case as [`is_snapshot`]: this registry client never queries the
+/// snapshot repository, so `available` can never contain one.
+fn is_timestamped_snapshot(requirement: &str) -> bool {
+    let mut segments = requirement.rsplitn(3, '-');
+    let Some(build_number) = segments.next() else {
+        return false;
+    };
+    let Some(timestamp) = segments.next() else {
+        return false;
+    };
+    if segments.next().is_none() {
+        return false;
+    }
+    if build_number.is_empty() || !build_number.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Some((date, time)) = timestamp.split_once('.') else {
+        return false;
+    };
+    date.len() == 8
+        && date.bytes().all(|b| b.is_ascii_digit())
+        && time.len() == 6
+        && time.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Precise Maven version/range matcher, compiled once per dependency by
 /// [`MavenFormatter::compile_requirement`] — the range union (if any) is parsed once into
 /// [`crate::interval::VersionRange`]s here rather than being re-parsed for every candidate
@@ -106,7 +134,10 @@ impl EcosystemFormatter for MavenFormatter {
         if crate::range::is_range(requirement) && crate::range::parse_range(requirement).is_none() {
             return None;
         }
-        if is_unresolved(requirement) || is_latest_keyword(requirement) || is_snapshot(requirement)
+        if is_unresolved(requirement)
+            || is_latest_keyword(requirement)
+            || is_snapshot(requirement)
+            || is_timestamped_snapshot(requirement)
         {
             return Some(Box::new(MavenMatcher::AlwaysSatisfied));
         }
@@ -303,5 +334,23 @@ mod tests {
             f.compile_requirement(&VersionReq::new("[1.0,${max}"))
                 .is_none()
         );
+    }
+
+    /// A resolved timestamped-snapshot deployment (the form `-SNAPSHOT` takes once
+    /// actually published to the snapshot repository) is subject to the same
+    /// never-queried-repository limitation as the plain `-SNAPSHOT` pin above.
+    #[test]
+    fn test_compile_requirement_timestamped_snapshot_always_satisfied() {
+        let f = MavenFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("1.0-20260101.120000-1"))
+            .unwrap();
+        assert_eq!(matcher.matches("6.9.0"), Some(true));
+
+        // A version with a trailing numeric qualifier that merely looks similar but isn't
+        // a `yyyyMMdd.HHmmss-N` stamp must still be compared normally.
+        let matcher = f.compile_requirement(&VersionReq::new("1.0-1-2")).unwrap();
+        assert_eq!(matcher.matches("1.0-1-2"), Some(true));
+        assert_eq!(matcher.matches("1.0-1-3"), Some(false));
     }
 }
