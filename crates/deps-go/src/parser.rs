@@ -17,7 +17,7 @@ use regex::Regex;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 /// Result of parsing a go.mod file.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone)]
 pub struct GoParseResult {
     /// All dependencies found in the file
     pub dependencies: Vec<GoDependency>,
