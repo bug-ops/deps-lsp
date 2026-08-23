@@ -162,7 +162,7 @@ deps_core::impl_version!(PypiVersion {
 /// use deps_pypi::types::PypiPackage;
 ///
 /// let pkg = PypiPackage {
-///     name: "requests".into(),
+///     name: deps_core::PackageName::new("requests"),
 ///     summary: Some("Python HTTP for Humans.".into()),
 ///     project_urls: vec![
 ///         ("Homepage".into(), "https://requests.readthedocs.io".into()),
@@ -176,7 +176,7 @@ deps_core::impl_version!(PypiVersion {
 #[derive(Debug, Clone)]
 pub struct PypiPackage {
     /// Package name (canonical form)
-    pub name: String,
+    pub name: deps_core::PackageName,
     /// Short package summary/description
     pub summary: Option<String>,
     /// Project URLs (homepage, repository, documentation, etc.)
@@ -226,7 +226,7 @@ impl deps_core::Dependency for PypiDependency {
 }
 
 impl deps_core::Metadata for PypiPackage {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 

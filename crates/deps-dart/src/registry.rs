@@ -139,7 +139,7 @@ fn parse_package_info(data: &[u8]) -> Result<PackageInfo> {
     });
 
     Ok(PackageInfo {
-        name: pubspec.name.unwrap_or(response.name),
+        name: pubspec.name.unwrap_or(response.name).into(),
         description: pubspec.description,
         homepage: pubspec.homepage,
         repository: pubspec.repository,
@@ -164,7 +164,7 @@ impl deps_core::Version for DartVersion {
 }
 
 impl deps_core::Metadata for PackageInfo {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 

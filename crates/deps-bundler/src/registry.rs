@@ -124,7 +124,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<GemInfo>> {
     Ok(entries
         .into_iter()
         .map(|e| GemInfo {
-            name: e.name,
+            name: e.name.into(),
             info: e.info,
             homepage_uri: None,
             source_code_uri: None,
@@ -156,7 +156,7 @@ fn parse_gem_info(data: &[u8]) -> Result<GemInfo> {
     let response: GemInfoResponse = serde_json::from_slice(data)?;
 
     Ok(GemInfo {
-        name: response.name,
+        name: response.name.into(),
         info: response.info,
         homepage_uri: response.homepage_uri,
         source_code_uri: response.source_code_uri,
@@ -183,7 +183,7 @@ impl deps_core::Version for BundlerVersion {
 }
 
 impl deps_core::Metadata for GemInfo {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 

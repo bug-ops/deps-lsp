@@ -108,7 +108,7 @@ deps_core::impl_version!(NpmVersion {
 /// use deps_npm::types::NpmPackage;
 ///
 /// let pkg = NpmPackage {
-///     name: "express".into(),
+///     name: deps_core::PackageName::new("express"),
 ///     description: Some("Fast, unopinionated, minimalist web framework".into()),
 ///     homepage: Some("http://expressjs.com/".into()),
 ///     repository: Some("expressjs/express".into()),
@@ -119,7 +119,7 @@ deps_core::impl_version!(NpmVersion {
 /// ```
 #[derive(Debug, Clone)]
 pub struct NpmPackage {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub description: Option<String>,
     pub homepage: Option<String>,
     pub repository: Option<String>,

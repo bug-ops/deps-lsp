@@ -550,7 +550,7 @@ fn parse_package_info(package_name: &str, data: &[u8]) -> Result<PypiPackage> {
         .collect();
 
     Ok(PypiPackage {
-        name: response.info.name,
+        name: response.info.name.into(),
         summary: response.info.summary,
         project_urls,
         latest_version: response.info.version,

@@ -260,7 +260,7 @@ fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<ArtifactInfo>>
             ArtifactInfo {
                 group_id: d.g,
                 artifact_id: d.a,
-                name,
+                name: name.into(),
                 description: None,
                 latest_version: d.latest_version.unwrap_or_default(),
                 repository: None,

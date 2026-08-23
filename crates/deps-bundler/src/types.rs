@@ -54,7 +54,7 @@ impl BundlerVersion {
 /// Gem metadata from rubygems.org.
 #[derive(Debug, Clone)]
 pub struct GemInfo {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub info: Option<String>,
     pub homepage_uri: Option<String>,
     pub source_code_uri: Option<String>,

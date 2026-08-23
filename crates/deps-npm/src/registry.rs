@@ -298,7 +298,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<NpmPackage>> {
         .map(|obj| {
             let pkg = obj.package;
             NpmPackage {
-                name: pkg.name,
+                name: pkg.name.into(),
                 description: pkg.description,
                 homepage: pkg.links.as_ref().and_then(|l| l.homepage.clone()),
                 repository: pkg.links.as_ref().and_then(|l| l.repository.clone()),

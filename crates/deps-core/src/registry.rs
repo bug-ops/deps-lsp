@@ -20,7 +20,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// # Examples
 ///
 /// ```no_run
-/// use deps_core::{Registry, Version, Metadata};
+/// use deps_core::{Registry, Version, Metadata, PackageName};
 /// use std::any::Any;
 /// use std::pin::Pin;
 ///
@@ -36,10 +36,10 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// }
 ///
 /// #[derive(Clone)]
-/// struct MyMetadata { name: String }
+/// struct MyMetadata { name: PackageName }
 ///
 /// impl Metadata for MyMetadata {
-///     fn name(&self) -> &str { &self.name }
+///     fn name(&self) -> &PackageName { &self.name }
 ///     fn description(&self) -> Option<&str> { None }
 ///     fn repository(&self) -> Option<&str> { None }
 ///     fn documentation(&self) -> Option<&str> { None }
@@ -207,8 +207,17 @@ pub fn find_latest_stable(versions: &[Box<dyn Version>]) -> Option<&dyn Version>
 ///
 /// Used for completion items and hover documentation.
 pub trait Metadata: Send + Sync {
-    /// Package name.
-    fn name(&self) -> &str;
+    /// The package name as the *registry* reports it.
+    ///
+    /// This is the identifier the registry displays and that completion
+    /// pastes into a manifest. It is not guaranteed byte-identical to the
+    /// manifest-declared [`Dependency::name`](crate::ecosystem::Dependency::name)
+    /// for the same package: casing may differ (NuGet, Composer, Swift), and
+    /// for Maven/Gradle it is a `"group:artifact"` value synthesized from two
+    /// separate response fields. Do not compare it to a manifest name
+    /// without going through
+    /// [`EcosystemFormatter::normalize_package_name`](crate::lsp_helpers::EcosystemFormatter::normalize_package_name).
+    fn name(&self) -> &crate::PackageName;
 
     /// Short description (optional).
     fn description(&self) -> Option<&str>;
@@ -285,12 +294,12 @@ mod tests {
     }
 
     struct MockMetadata {
-        name: String,
+        name: crate::PackageName,
         latest: String,
     }
 
     impl Metadata for MockMetadata {
-        fn name(&self) -> &str {
+        fn name(&self) -> &crate::PackageName {
             &self.name
         }
 
@@ -318,7 +327,7 @@ mod tests {
     #[test]
     fn test_metadata_trait_object() {
         let metadata = MockMetadata {
-            name: "test-package".into(),
+            name: crate::PackageName::new("test-package"),
             latest: "2.0.0".into(),
         };
 
@@ -333,7 +342,7 @@ mod tests {
     #[test]
     fn test_metadata_with_full_info() {
         struct FullMetadata {
-            name: String,
+            name: crate::PackageName,
             desc: String,
             repo: String,
             docs: String,
@@ -341,7 +350,7 @@ mod tests {
         }
 
         impl Metadata for FullMetadata {
-            fn name(&self) -> &str {
+            fn name(&self) -> &crate::PackageName {
                 &self.name
             }
             fn description(&self) -> Option<&str> {
@@ -362,7 +371,7 @@ mod tests {
         }
 
         let meta = FullMetadata {
-            name: "serde".into(),
+            name: crate::PackageName::new("serde"),
             desc: "Serialization framework".into(),
             repo: "https://github.com/serde-rs/serde".into(),
             docs: "https://docs.rs/serde".into(),

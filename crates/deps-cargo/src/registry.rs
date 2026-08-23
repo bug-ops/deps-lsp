@@ -295,7 +295,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<CrateInfo>> {
         .crates
         .into_iter()
         .map(|c| CrateInfo {
-            name: c.name,
+            name: c.name.into(),
             description: c.description,
             repository: c.repository,
             documentation: c.documentation,

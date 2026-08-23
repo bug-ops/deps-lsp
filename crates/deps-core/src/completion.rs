@@ -372,7 +372,7 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 /// # async fn example(metadata: &dyn deps_core::Metadata) {
 /// let range = Range::default(); // Use actual range from context
 /// let item = build_package_completion(metadata, range);
-/// assert_eq!(item.label, metadata.name());
+/// assert_eq!(item.label, metadata.name().as_str());
 /// # }
 /// ```
 pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) -> CompletionItem {
@@ -382,7 +382,7 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
     // Build markdown documentation
     let mut doc_parts = vec![format!(
         "**{}** v{}",
-        escape_markdown(name),
+        escape_markdown(name.as_str()),
         escape_markdown(latest)
     )];
 
@@ -805,7 +805,7 @@ mod tests {
     }
 
     struct MockMetadata {
-        name: String,
+        name: crate::PackageName,
         description: Option<String>,
         repository: Option<String>,
         documentation: Option<String>,
@@ -813,7 +813,7 @@ mod tests {
     }
 
     impl crate::registry::Metadata for MockMetadata {
-        fn name(&self) -> &str {
+        fn name(&self) -> &crate::PackageName {
             &self.name
         }
 
@@ -1177,7 +1177,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_full() {
         let metadata = MockMetadata {
-            name: "serde".to_string(),
+            name: "serde".to_string().into(),
             description: Some("Serialization framework".to_string()),
             repository: Some("https://github.com/serde-rs/serde".to_string()),
             documentation: Some("https://docs.rs/serde".to_string()),
@@ -1206,7 +1206,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_minimal() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: None,
             repository: None,
             documentation: None,
@@ -1228,7 +1228,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_escapes_description_markdown() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some("Fast *bold* _italic_ [link](evil) `code`".to_string()),
             repository: None,
             documentation: None,
@@ -1255,7 +1255,7 @@ mod tests {
         // link early and splice in a new, attacker-controlled markdown link.
         let malicious_repo = "https://legit.example)[Click here](https://evil.example";
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: None,
             repository: Some(malicious_repo.to_string()),
             documentation: None,
@@ -1277,7 +1277,7 @@ mod tests {
     fn test_build_package_completion_escapes_documentation_link_breakout() {
         let malicious_docs = "https://legit.example)[Click here](https://evil.example";
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: None,
             repository: None,
             documentation: Some(malicious_docs.to_string()),
@@ -1306,7 +1306,7 @@ mod tests {
         desc.push_str(&"b".repeat(50));
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(desc),
             repository: None,
             documentation: None,
@@ -1338,7 +1338,7 @@ mod tests {
         let malicious_name = "a** [Official Download](https://evil.example) **b";
         let malicious_latest = "1.0.0)[click](https://evil.example";
         let metadata = MockMetadata {
-            name: malicious_name.to_string(),
+            name: malicious_name.to_string().into(),
             description: None,
             repository: None,
             documentation: None,
@@ -1376,7 +1376,7 @@ mod tests {
         // strips the backslash for the literal character), so a normal URL must still
         // render as the same, unmangled link once those escapes are stripped.
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: None,
             repository: Some("https://github.com/owner/repo".to_string()),
             documentation: None,
@@ -1397,7 +1397,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_escapes_html_in_description() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some("<img src=x onerror=alert(1)>".to_string()),
             repository: None,
             documentation: None,
@@ -1422,7 +1422,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_empty_description() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(String::new()),
             repository: None,
             documentation: None,
@@ -1452,7 +1452,7 @@ mod tests {
         desc.push_str(&"b".repeat(50));
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(desc),
             repository: None,
             documentation: None,
@@ -1974,7 +1974,7 @@ mod tests {
     fn test_build_package_completion_long_description_ascii() {
         let long_desc = "a".repeat(250);
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(long_desc),
             repository: None,
             documentation: None,
@@ -2004,7 +2004,7 @@ mod tests {
         }
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(long_desc),
             repository: None,
             documentation: None,
@@ -2032,7 +2032,7 @@ mod tests {
         let long_desc = "😀".repeat(51);
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(long_desc),
             repository: None,
             documentation: None,

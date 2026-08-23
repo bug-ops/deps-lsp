@@ -97,7 +97,7 @@ deps_core::impl_version!(ComposerVersion {
 /// use deps_composer::types::ComposerPackage;
 ///
 /// let pkg = ComposerPackage {
-///     name: "symfony/console".into(),
+///     name: deps_core::PackageName::new("symfony/console"),
 ///     description: Some("Symfony Console Component".into()),
 ///     repository: Some("https://github.com/symfony/console".into()),
 ///     homepage: Some("https://packagist.org/packages/symfony/console".into()),
@@ -108,7 +108,7 @@ deps_core::impl_version!(ComposerVersion {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ComposerPackage {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub description: Option<String>,
     pub repository: Option<String>,
     pub homepage: Option<String>,

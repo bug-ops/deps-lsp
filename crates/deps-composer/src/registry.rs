@@ -221,7 +221,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<ComposerPackage>> {
         .results
         .into_iter()
         .map(|r| ComposerPackage {
-            name: r.name,
+            name: r.name.into(),
             description: r.description,
             repository: r.repository,
             homepage: r.url,

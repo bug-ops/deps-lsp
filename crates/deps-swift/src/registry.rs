@@ -203,7 +203,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<SwiftPackage>> {
         .items
         .into_iter()
         .map(|item| SwiftPackage {
-            name: item.full_name,
+            name: item.full_name.into(),
             description: item.description,
             repository: Some(item.html_url.clone()),
             homepage: Some(item.html_url),

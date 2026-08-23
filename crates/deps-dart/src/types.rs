@@ -35,7 +35,7 @@ pub struct DartVersion {
 
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub description: Option<String>,
     pub homepage: Option<String>,
     pub repository: Option<String>,

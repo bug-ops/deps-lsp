@@ -262,7 +262,7 @@ fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<PackageInfo>> 
         .into_iter()
         .take(limit)
         .map(|d| PackageInfo {
-            name: d.id,
+            name: d.id.into(),
             description: d.description,
             repository: d.project_url,
             documentation: None,
