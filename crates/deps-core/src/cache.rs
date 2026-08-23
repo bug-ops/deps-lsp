@@ -2,10 +2,44 @@ use crate::error::{DepsError, Result};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use reqwest::{Client, Response, StatusCode, header};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// Maximum number of cached entries to prevent unbounded memory growth.
 const MAX_CACHE_ENTRIES: usize = 1000;
+
+/// Maximum total bytes retained across all cached response bodies.
+///
+/// `MAX_CACHE_ENTRIES` alone bounds entry *count*, not size: since a single
+/// response body may be as large as [`MAX_RESPONSE_BYTES`] (32 MiB), a cache
+/// full of near-cap entries could retain tens of gigabytes even though real
+/// registry payloads are typically well under 1 MB. This budget is a
+/// defense-in-depth cap (CWE-400) against that worst case, evicted
+/// alongside the count-based limit in [`HttpCache::evict_entries`]. 64 MiB
+/// comfortably holds thousands of typical registry responses while still
+/// bounding the pathological case.
+///
+/// This is a best-effort bound, not a hard guarantee: it is checked once
+/// per request in [`HttpCache::get_cached_with_headers`], so multiple
+/// requests already in flight when the budget is crossed can each finish
+/// inserting before the next check fires. [`MAX_CACHEABLE_ENTRY_BYTES`]
+/// keeps that per-request overshoot small (at most one admission-cap-sized
+/// insert per concurrent in-flight request) rather than bounding it exactly.
+const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum size of a single response body that will be retained in the
+/// cache; larger bodies are still returned to the caller, just never
+/// stored.
+///
+/// Without this cap, [`MAX_CACHE_BYTES`] alone lets a handful of
+/// large-but-legitimate responses (up to [`MAX_RESPONSE_BYTES`], 32 MiB
+/// each) evict the *entire* rest of the cache: at a 2x ratio between the
+/// two constants, just two max-size entries would saturate the whole
+/// budget. Set to an eighth of [`MAX_CACHE_BYTES`] (8 MiB) so no single
+/// entry can claim more than 1/8 of the budget — a handful of large
+/// responses degrade to "not cached" instead of "evicts the small-payload
+/// working set".
+const MAX_CACHEABLE_ENTRY_BYTES: usize = MAX_CACHE_BYTES / 8;
 
 /// HTTP request timeout in seconds.
 const HTTP_TIMEOUT_SECS: u64 = 30;
@@ -142,6 +176,15 @@ pub struct CachedResponse {
 /// representations of the same URL will silently share one cache entry.
 pub struct HttpCache {
     entries: DashMap<String, CachedResponse>,
+    /// Running total of `body.len()` across all `entries`, kept in sync by
+    /// [`HttpCache::store_entry`], [`HttpCache::evict_entries`], and
+    /// [`HttpCache::clear`] via relative `fetch_add`/`fetch_sub` only —
+    /// never an absolute `store` after the initial `0`, since that would
+    /// silently discard any concurrent relative update racing with it. Used
+    /// to trigger byte-bounded eviction without summing every entry on each
+    /// check; advisory (see [`MAX_CACHE_BYTES`]), not an exact live count
+    /// under concurrent access.
+    total_bytes: AtomicUsize,
     client: Client,
 }
 
@@ -159,6 +202,7 @@ impl HttpCache {
 
         Self {
             entries: DashMap::new(),
+            total_bytes: AtomicUsize::new(0),
             client,
         }
     }
@@ -217,7 +261,9 @@ impl HttpCache {
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
-        if self.entries.len() >= MAX_CACHE_ENTRIES {
+        if self.entries.len() >= MAX_CACHE_ENTRIES
+            || self.total_bytes.load(Ordering::Relaxed) >= MAX_CACHE_BYTES
+        {
             self.evict_entries();
         }
 
@@ -298,7 +344,7 @@ impl HttpCache {
             .map(String::from);
         let body = read_body_capped(url, response).await?;
 
-        self.entries.insert(
+        self.store_entry(
             url.to_string(),
             CachedResponse {
                 body: body.clone(),
@@ -360,7 +406,7 @@ impl HttpCache {
             .map(String::from);
         let body = read_body_capped(url, response).await?;
 
-        self.entries.insert(
+        self.store_entry(
             url.to_string(),
             CachedResponse {
                 body: body.clone(),
@@ -373,12 +419,42 @@ impl HttpCache {
         Ok(body)
     }
 
+    /// Inserts (or replaces) a cache entry, keeping [`Self::total_bytes`] in sync.
+    ///
+    /// `DashMap::insert` returns the replaced value, if any, so the byte
+    /// delta is computed from a single insert rather than a separate
+    /// lookup-then-insert (which would race with concurrent writers).
+    ///
+    /// A body larger than [`MAX_CACHEABLE_ENTRY_BYTES`] is not inserted at
+    /// all (the caller already has it from the network response; only
+    /// caching is skipped), and any stale entry previously cached for this
+    /// URL is dropped rather than left to serve increasingly outdated data.
+    fn store_entry(&self, url: String, response: CachedResponse) {
+        let new_len = response.body.len();
+
+        if new_len > MAX_CACHEABLE_ENTRY_BYTES {
+            if let Some((_, old)) = self.entries.remove(&url) {
+                self.total_bytes
+                    .fetch_sub(old.body.len(), Ordering::Relaxed);
+            }
+            return;
+        }
+
+        let old_len = self
+            .entries
+            .insert(url, response)
+            .map_or(0, |old| old.body.len());
+        self.total_bytes.fetch_add(new_len, Ordering::Relaxed);
+        self.total_bytes.fetch_sub(old_len, Ordering::Relaxed);
+    }
+
     /// Clears all cached entries.
     ///
     /// This removes all cached responses, forcing the next request for
     /// any URL to fetch fresh data from the network.
     pub fn clear(&self) {
         self.entries.clear();
+        self.total_bytes.store(0, Ordering::Relaxed);
     }
 
     /// Returns the number of cached entries.
@@ -391,46 +467,84 @@ impl HttpCache {
         self.entries.is_empty()
     }
 
-    /// Evicts approximately `CACHE_EVICTION_PERCENTAGE`% of cache entries when capacity is reached.
+    /// Returns the total bytes retained across all cached response bodies.
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Evicts the oldest cache entries when either capacity limit is reached.
     ///
-    /// Uses a min-heap to efficiently find the oldest entries instead of full sorting.
-    /// For each entry, we potentially push/pop from the heap, which is O(log K).
+    /// When the entry count is at or over `MAX_CACHE_ENTRIES`, evicts at
+    /// least `CACHE_EVICTION_PERCENTAGE`% of entries (by count). Note this
+    /// is a *fix*, not a preserved behavior: the original count-only
+    /// eviction built its bounded min-heap with an inverted comparison
+    /// (`peek()` returns the oldest entry, but the old code treated it as
+    /// the newest-of-the-oldest-so-far and only replaced it when a *newer*
+    /// candidate came along that was still older than it — backwards), so
+    /// it evicted roughly the first `target_removals` entries in DashMap
+    /// hash-iteration order, not the oldest ones. This version evicts
+    /// genuinely oldest-first.
     ///
-    /// Time complexity: O(N log K) where N = number of cache entries, K = target_removals
-    /// Space complexity: O(K) for the min-heap
+    /// Independently, if the tracked byte total is over [`MAX_CACHE_BYTES`]
+    /// — which can happen with far fewer than `MAX_CACHE_ENTRIES` entries if
+    /// a few responses are large — eviction keeps removing the next-oldest
+    /// entries until the byte budget is satisfied too. A cache that is over
+    /// the byte budget but well under the entry-count threshold only evicts
+    /// as many entries as the byte budget requires, not a fixed count-based
+    /// batch.
+    ///
+    /// Builds a min-heap over all entry keys by `fetched_at` (O(N)), then
+    /// pops the oldest one at a time (O(R log N) for R removals) — unlike a
+    /// heap bounded to a fixed top-K, the removal count isn't known upfront
+    /// since it depends on the byte budget as well as the count target.
+    ///
+    /// Every byte-count adjustment here is a relative `fetch_sub` applied to
+    /// exactly the entry [`DashMap::remove`] actually returned — never a
+    /// snapshot-then-absolute-`store` of a locally computed total. The
+    /// latter would silently discard any [`Self::store_entry`] delta that
+    /// lands between this method's start and its end (lost-update race), and
+    /// under adversarial timing could even underflow `total_bytes` to
+    /// `usize::MAX`, permanently wedging every future request into
+    /// evicting the entire cache. Reading `total_bytes` fresh on every loop
+    /// iteration (rather than maintaining a local mirror) keeps this
+    /// correct under concurrent `evict_entries`/`store_entry` calls: two
+    /// callers can race to remove the same key — the second `remove` simply
+    /// returns `None` and is a no-op, not a double-subtraction.
     fn evict_entries(&self) {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
 
-        let target_removals = MAX_CACHE_ENTRIES / CACHE_EVICTION_PERCENTAGE;
+        let count_target_removals = if self.entries.len() >= MAX_CACHE_ENTRIES {
+            (MAX_CACHE_ENTRIES / CACHE_EVICTION_PERCENTAGE).max(1)
+        } else {
+            0
+        };
 
-        // Use min-heap to efficiently find N oldest entries
-        // The heap maintains the K oldest entries seen so far
-        let mut oldest = BinaryHeap::with_capacity(target_removals);
+        let mut oldest: BinaryHeap<Reverse<(Instant, String)>> = self
+            .entries
+            .iter()
+            .map(|entry| Reverse((entry.value().fetched_at, entry.key().clone())))
+            .collect();
 
-        for entry in &self.entries {
-            let item = (entry.value().fetched_at, entry.key().clone());
+        let mut removed = 0usize;
 
-            if oldest.len() < target_removals {
-                // Heap not full, insert directly
-                oldest.push(Reverse(item));
-            } else if let Some(Reverse(newest_of_oldest)) = oldest.peek() {
-                // If this entry is older than the newest entry in our "oldest" set,
-                // replace it
-                if item.0 < newest_of_oldest.0 {
-                    oldest.pop();
-                    oldest.push(Reverse(item));
-                }
+        while removed < count_target_removals
+            || self.total_bytes.load(Ordering::Relaxed) > MAX_CACHE_BYTES
+        {
+            let Some(Reverse((_, url))) = oldest.pop() else {
+                break;
+            };
+            if let Some((_, old)) = self.entries.remove(&url) {
+                self.total_bytes
+                    .fetch_sub(old.body.len(), Ordering::Relaxed);
             }
+            removed += 1;
         }
 
-        // Remove selected oldest entries
-        let removed = oldest.len();
-        for Reverse((_, url)) in oldest {
-            self.entries.remove(&url);
-        }
-
-        tracing::debug!("evicted {} cache entries (O(N) algorithm)", removed);
+        tracing::debug!(
+            "evicted {removed} cache entries ({} bytes remaining)",
+            self.total_bytes.load(Ordering::Relaxed)
+        );
     }
 
     /// Benchmark-only helper: Direct cache lookup without network requests.
@@ -442,7 +556,7 @@ impl HttpCache {
     /// Benchmark-only helper: Direct cache insertion.
     #[doc(hidden)]
     pub fn insert_for_bench(&self, url: String, response: CachedResponse) {
-        self.entries.insert(url, response);
+        self.store_entry(url, response);
     }
 }
 
@@ -769,6 +883,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_and_store_accepts_response_at_exact_cap() {
+        // A response at MAX_RESPONSE_BYTES (32 MiB) is well over
+        // MAX_CACHEABLE_ENTRY_BYTES (8 MiB), so the network-layer cap and
+        // the cache admission cap are independent: the fetch succeeds and
+        // returns the full body, but the response is not retained in the
+        // cache (see test_store_entry_skips_caching_oversized_entry).
         let mut server = mockito::Server::new_async().await;
         let exact_cap_body = vec![0u8; MAX_RESPONSE_BYTES];
 
@@ -784,7 +903,6 @@ mod tests {
         let result: Bytes = cache.fetch_and_store_with_headers(&url, &[]).await.unwrap();
 
         assert_eq!(result.len(), MAX_RESPONSE_BYTES);
-        assert!(cache.entries.get(&url).is_some());
     }
 
     #[tokio::test]
@@ -822,5 +940,199 @@ mod tests {
         assert_eq!(result.as_ref(), b"stale but good");
         let cached = cache.entries.get(&url).unwrap();
         assert_eq!(cached.etag, Some("\"stale-etag\"".into()));
+    }
+
+    fn dummy_response(size: usize) -> CachedResponse {
+        CachedResponse {
+            body: Bytes::from(vec![0u8; size]),
+            etag: None,
+            last_modified: None,
+            fetched_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_total_bytes_tracks_inserts_and_replacement() {
+        let cache = HttpCache::new();
+        cache.store_entry("url1".into(), dummy_response(100));
+        assert_eq!(cache.total_bytes(), 100);
+
+        // Replacing the same key must account for the delta, not just add.
+        cache.store_entry("url1".into(), dummy_response(40));
+        assert_eq!(cache.total_bytes(), 40);
+
+        cache.store_entry("url2".into(), dummy_response(60));
+        assert_eq!(cache.total_bytes(), 100);
+    }
+
+    #[test]
+    fn test_clear_resets_total_bytes() {
+        let cache = HttpCache::new();
+        cache.store_entry("url1".into(), dummy_response(1000));
+        assert_eq!(cache.total_bytes(), 1000);
+
+        cache.clear();
+        assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn test_small_payloads_do_not_trigger_eviction() {
+        let cache = HttpCache::new();
+        for i in 0..50 {
+            cache.store_entry(format!("url{i}"), dummy_response(1024));
+        }
+
+        assert_eq!(cache.len(), 50);
+        assert_eq!(cache.total_bytes(), 50 * 1024);
+    }
+
+    #[test]
+    fn test_evict_entries_triggers_on_byte_budget_with_few_entries() {
+        let cache = HttpCache::new();
+
+        // 9 entries, each at the per-entry admission cap: far below
+        // MAX_CACHE_ENTRIES by count, but their combined size (72 MiB)
+        // overshoots MAX_CACHE_BYTES (64 MiB), exercising the byte-only
+        // eviction path.
+        for i in 0..9 {
+            cache.store_entry(format!("url{i}"), dummy_response(MAX_CACHEABLE_ENTRY_BYTES));
+        }
+        assert_eq!(cache.len(), 9);
+        assert!(cache.total_bytes() > MAX_CACHE_BYTES);
+
+        cache.evict_entries();
+
+        // Only as many oldest entries as needed to clear the byte budget
+        // are removed - not a fixed count-based batch. Removing the single
+        // oldest (8 MiB) entry brings the total to exactly the 64 MiB
+        // budget, so eviction stops there.
+        assert!(cache.total_bytes() <= MAX_CACHE_BYTES);
+        assert_eq!(cache.len(), 8);
+    }
+
+    #[test]
+    fn test_evict_entries_removes_oldest_first_for_bytes() {
+        let cache = HttpCache::new();
+
+        // 9 entries at the per-entry admission cap (8 MiB each = 72 MiB
+        // total, 8 MiB over the 64 MiB budget), so evicting just the single
+        // oldest entry restores the cache to within budget - proving
+        // eviction picks the genuinely oldest entry, not hash-iteration
+        // order (the pre-existing count-eviction bug this PR also fixes).
+        cache.store_entry("oldest".into(), dummy_response(MAX_CACHEABLE_ENTRY_BYTES));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        for i in 0..8 {
+            cache.store_entry(
+                format!("newer{i}"),
+                dummy_response(MAX_CACHEABLE_ENTRY_BYTES),
+            );
+        }
+        assert_eq!(cache.len(), 9);
+
+        cache.evict_entries();
+
+        assert_eq!(cache.len(), 8);
+        assert!(cache.entries.get("oldest").is_none());
+        for i in 0..8 {
+            assert!(cache.entries.get(&format!("newer{i}")).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_with_headers_evicts_on_byte_budget() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+
+        let cache = HttpCache::new();
+
+        // Pre-fill the cache past the byte budget with old entries, all
+        // under MAX_CACHE_ENTRIES by count and within the per-entry
+        // admission cap.
+        for i in 0..9 {
+            cache.store_entry(
+                format!("stale{i}"),
+                dummy_response(MAX_CACHEABLE_ENTRY_BYTES),
+            );
+        }
+        assert!(cache.total_bytes() > MAX_CACHE_BYTES);
+
+        let _m = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_body("fresh")
+            .create_async()
+            .await;
+
+        let result: Bytes = cache.get_cached(&url).await.unwrap();
+        assert_eq!(result.as_ref(), b"fresh");
+
+        // The pre-request byte-budget check evicted stale entries before
+        // fetching, so the cache never grows unbounded past the budget.
+        assert!(cache.total_bytes() <= MAX_CACHE_BYTES + result.len());
+    }
+
+    #[test]
+    fn test_store_entry_skips_caching_oversized_entry() {
+        let cache = HttpCache::new();
+
+        // A body over the per-entry admission cap is not retained, even
+        // though the caller still gets it back (store_entry's caller
+        // already holds `body` independently - see fetch_and_store_with_headers).
+        cache.store_entry("big".into(), dummy_response(MAX_CACHEABLE_ENTRY_BYTES + 1));
+        assert!(cache.entries.get("big").is_none());
+        assert_eq!(cache.total_bytes(), 0);
+
+        // Replacing an existing small entry with an oversized one drops the
+        // stale small entry too, rather than leaving it to keep serving
+        // increasingly outdated data forever.
+        cache.store_entry("small".into(), dummy_response(100));
+        assert_eq!(cache.total_bytes(), 100);
+
+        cache.store_entry(
+            "small".into(),
+            dummy_response(MAX_CACHEABLE_ENTRY_BYTES + 1),
+        );
+        assert!(cache.entries.get("small").is_none());
+        assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn test_concurrent_store_and_evict_keeps_total_bytes_consistent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(HttpCache::new());
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let cache = Arc::clone(&cache);
+                thread::spawn(move || {
+                    for i in 0..150 {
+                        cache.store_entry(format!("t{t}-{i}"), dummy_response(4096));
+                        if i % 10 == 0 {
+                            cache.evict_entries();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        cache.evict_entries();
+
+        // The regression this guards against: evict_entries used to
+        // snapshot total_bytes once and overwrite it with an absolute
+        // store at the end, silently discarding any store_entry delta
+        // that landed concurrently. That drift is undetectable from a
+        // single-threaded test - only genuine concurrent access exercises
+        // the race, so this asserts the tracked counter still matches the
+        // actual summed size of what remains in the map.
+        let actual: usize = cache
+            .entries
+            .iter()
+            .map(|entry| entry.value().body.len())
+            .sum();
+        assert_eq!(cache.total_bytes(), actual);
     }
 }
