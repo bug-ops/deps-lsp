@@ -7,6 +7,7 @@
 pub mod ecosystem;
 pub mod error;
 pub mod formatter;
+pub mod interval;
 pub mod parser;
 pub mod range;
 pub mod registry;
