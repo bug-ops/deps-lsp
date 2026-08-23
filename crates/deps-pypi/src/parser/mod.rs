@@ -28,7 +28,8 @@ pub mod requirements;
 /// recursive-descent parser, which has no depth limit and can overflow the
 /// stack on deeply nested expressions (verified: ~5000 nested parens, ~10 KiB,
 /// aborts the process; ~4000 survives). Text over the cap falls back to its
-/// raw, unnormalized form rather than being parsed.
+/// raw, unnormalized form (see [`bounded_marker_fallback`]) rather than
+/// being parsed.
 const MAX_MARKER_LEN: usize = 2048;
 
 /// Requirement strings (name + extras + version specifier, excluding the
@@ -50,6 +51,237 @@ const MAX_REQUIREMENT_LEN: usize = 4096;
 /// bytes aborts the process on a 256 KiB stack). Real-world markers rarely
 /// nest more than 2-3 levels, so this cap leaves ample headroom.
 const MAX_MARKER_DEPTH: u32 = 32;
+
+/// PEP 508 marker environment variable names (`marker.rs`'s `env_var`
+/// production), plus `extra`. A genuine marker expression is built around
+/// one of these; text that lacks all of them is not a marker at all — e.g.
+/// leftover extras/version syntax that ended up past a `;` by accident.
+const MARKER_VARIABLE_NAMES: &[&str] = &[
+    "python_version",
+    "python_full_version",
+    "os_name",
+    "sys_platform",
+    "platform_release",
+    "platform_system",
+    "platform_version",
+    "platform_machine",
+    "platform_python_implementation",
+    "implementation_name",
+    "implementation_version",
+    "extra",
+];
+
+/// Independent, generous ceiling on marker text retained by the raw-marker
+/// fallback below (triggered when text is too long or too deeply nested for
+/// `pep508_rs`'s parser). Kept well above [`MAX_MARKER_LEN`] so
+/// legitimate-if-verbose marker chains that only barely miss the parser's
+/// cap are still retained, while still bounding what a crafted
+/// marker-shaped payload can push into a dependency's `markers` field and,
+/// from there, hover.
+const MAX_FALLBACK_MARKER_LEN: usize = MAX_MARKER_LEN * 4;
+
+/// One lexical unit of a candidate marker expression, as classified by
+/// [`tokenize_marker`] and consumed by [`validate_marker_grammar`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MarkerToken {
+    /// `(`, opening a grouped sub-expression.
+    LParen,
+    /// `)`, closing a grouped sub-expression.
+    RParen,
+    /// The `and` boolean connective.
+    And,
+    /// The `or` boolean connective.
+    Or,
+    /// A comparison operator: `==`, `!=`, `<=`, `>=`, `~=`, `<`, `>`.
+    CmpOp,
+    /// The `in` keyword (also the second half of a `not in` operator).
+    In,
+    /// The `not` keyword, valid only as the first half of `not in`.
+    Not,
+    /// A recognized marker variable name (an operand).
+    Var,
+    /// A quoted string literal (an operand).
+    Str,
+}
+
+/// Tokenizes `text` for [`looks_like_marker`], or returns `None` if any byte
+/// or word doesn't fit one of PEP 508's marker-expression lexical classes.
+///
+/// Quote-matching mirrors `pep508_rs`'s tokenizer: a quote opens on an
+/// unquoted `'`/`"` and closes on the next occurrence of that same byte, with
+/// no escape handling — so quoted content, including non-ASCII bytes, is
+/// opaque to this scanner.
+fn tokenize_marker(text: &str) -> Option<Vec<MarkerToken>> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut tokens: Vec<MarkerToken> = Vec::new();
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' => i += 1,
+            b'(' => {
+                tokens.push(MarkerToken::LParen);
+                i += 1;
+            }
+            b')' => {
+                tokens.push(MarkerToken::RParen);
+                i += 1;
+            }
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return None; // unterminated string literal
+                }
+                i += 1; // consume closing quote
+                tokens.push(MarkerToken::Str);
+            }
+            b'=' | b'!' | b'<' | b'>' | b'~' => {
+                let start = i;
+                while i < bytes.len() && matches!(bytes[i], b'=' | b'!' | b'<' | b'>' | b'~') {
+                    i += 1;
+                }
+                if !matches!(
+                    &text[start..i],
+                    "==" | "!=" | "<=" | ">=" | "~=" | "<" | ">"
+                ) {
+                    return None;
+                }
+                tokens.push(MarkerToken::CmpOp);
+            }
+            b if b.is_ascii_alphanumeric() || b == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &text[start..i];
+                tokens.push(if MARKER_VARIABLE_NAMES.contains(&word) {
+                    MarkerToken::Var
+                } else {
+                    match word {
+                        "and" => MarkerToken::And,
+                        "or" => MarkerToken::Or,
+                        "not" => MarkerToken::Not,
+                        "in" => MarkerToken::In,
+                        _ => return None,
+                    }
+                });
+            }
+            _ => return None,
+        }
+    }
+
+    Some(tokens)
+}
+
+/// One step in the bounded grammar walk performed by [`validate_marker_grammar`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClauseState {
+    /// Expecting the start of a new atom: `(` or an operand.
+    ExpectAtom,
+    /// Consumed a clause's first operand; expecting its comparison operator.
+    ExpectOperator,
+    /// Consumed `not`; the only valid continuation is `in`.
+    ExpectIn,
+    /// Consumed a clause's operator; expecting its second operand.
+    ExpectSecondOperand,
+    /// Just completed a full atom (clause or parenthesized group); expecting
+    /// `and`, `or`, `)`, or end of input.
+    AfterAtom,
+}
+
+/// Validates that `tokens` decomposes as a PEP 508 `marker_expr`:
+///
+/// ```text
+/// marker_expr    := marker_and ('or' marker_and)*
+/// marker_and     := marker_atom ('and' marker_atom)*
+/// marker_atom    := '(' marker_expr ')' | marker_clause
+/// marker_clause  := operand comparison_op operand
+/// operand        := marker_variable | quoted_string
+/// comparison_op  := '==' | '!=' | '<=' | '>=' | '<' | '>' | '~=' | 'in' | 'not' 'in'
+/// ```
+///
+/// Each `marker_clause` consumes exactly one `operand op operand` triple, so
+/// an operand can never be shared between two clauses — this is what rejects
+/// chained comparisons like `a == b == c` or `a in b in c`, which PEP 508's
+/// grammar has no production for (`pep508_rs` itself rejects them).
+///
+/// This walks the token stream once, left to right, tracking only the
+/// current [`ClauseState`] and a paren-nesting counter — no recursion and no
+/// per-level state stack, so nesting depth is unbounded (needed: a genuine
+/// marker can nest hundreds of levels within [`MAX_FALLBACK_MARKER_LEN`] and
+/// must still validate, since parenthesis-nesting depth is already handled
+/// separately by routing such text away from `pep508_rs`'s own unbounded
+/// recursive-descent parser — see [`MAX_MARKER_DEPTH`], [`marker_too_deep`]).
+/// A closing `)` always returns the *enclosing* level to `AfterAtom`
+/// regardless of depth, since a parenthesized group is itself a complete atom
+/// to whatever follows it — no per-level bookkeeping beyond the depth count
+/// is needed to know that.
+fn validate_marker_grammar(tokens: &[MarkerToken]) -> bool {
+    let mut state = ClauseState::ExpectAtom;
+    let mut depth: usize = 0;
+
+    for &tok in tokens {
+        state = match (state, tok) {
+            (ClauseState::ExpectAtom, MarkerToken::LParen) => {
+                depth += 1;
+                ClauseState::ExpectAtom
+            }
+            (ClauseState::ExpectAtom, MarkerToken::Var | MarkerToken::Str) => {
+                ClauseState::ExpectOperator
+            }
+            (ClauseState::ExpectOperator, MarkerToken::CmpOp | MarkerToken::In) => {
+                ClauseState::ExpectSecondOperand
+            }
+            (ClauseState::ExpectOperator, MarkerToken::Not) => ClauseState::ExpectIn,
+            (ClauseState::ExpectIn, MarkerToken::In) => ClauseState::ExpectSecondOperand,
+            (ClauseState::ExpectSecondOperand, MarkerToken::Var | MarkerToken::Str) => {
+                ClauseState::AfterAtom
+            }
+            (ClauseState::AfterAtom, MarkerToken::And | MarkerToken::Or) => ClauseState::ExpectAtom,
+            (ClauseState::AfterAtom, MarkerToken::RParen) if depth > 0 => {
+                depth -= 1;
+                ClauseState::AfterAtom
+            }
+            _ => return false,
+        };
+    }
+
+    state == ClauseState::AfterAtom && depth == 0
+}
+
+/// Returns `true` if `text` tokenizes and parses cleanly as a PEP 508
+/// `marker_expr` (see [`validate_marker_grammar`] for the grammar).
+///
+/// This is enough to reject the length/depth-bypass fallback's actual threat
+/// model: arbitrary attacker-controlled bytes with no marker structure at
+/// all — e.g. PEP 508 extras/version syntax that ends up past a `;` by
+/// accident (#261), a marker keyword padded with unrelated filler, bare
+/// repetition of recognized marker-variable tokens with no operator between
+/// them, or operand-sharing chained comparisons (`a == b == c`, `a in b in
+/// c`) that a per-operand adjacency check cannot distinguish from a real
+/// clause. Genuine, if oversized or deeply-nested, marker expressions still
+/// tokenize and parse cleanly and are preserved verbatim.
+fn looks_like_marker(text: &str) -> bool {
+    tokenize_marker(text).is_some_and(|tokens| validate_marker_grammar(&tokens))
+}
+
+/// Bounds raw marker text before it is stored verbatim on a dependency's
+/// `markers` field (and, from there, rendered into hover), for text that
+/// bypassed `pep508_rs`'s parser entirely because it was too long or too
+/// deeply nested (see [`marker_too_deep`], [`MAX_MARKER_LEN`]).
+///
+/// Text that isn't plausibly a marker expression ([`looks_like_marker`]) or
+/// that exceeds [`MAX_FALLBACK_MARKER_LEN`] is dropped rather than
+/// retained.
+fn bounded_marker_fallback(raw: &str) -> Option<String> {
+    if raw.is_empty() || raw.len() > MAX_FALLBACK_MARKER_LEN || !looks_like_marker(raw) {
+        return None;
+    }
+    Some(raw.to_string())
+}
 
 /// Returns `true` if `marker` nests parentheses deeper than [`MAX_MARKER_DEPTH`].
 ///
@@ -354,7 +586,7 @@ impl PypiParser {
                     MAX_MARKER_LEN,
                     MAX_MARKER_DEPTH
                 );
-                Some(raw_marker.to_string())
+                bounded_marker_fallback(raw_marker)
             }
         } else {
             requirement.marker.try_to_string()
@@ -417,9 +649,11 @@ fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::S
 /// Returns `None` for an empty/whitespace-only expression, or one that
 /// normalizes to the trivially-true marker (which has no string form, e.g.
 /// `os_name == 'a' or os_name != 'a'`) — matching the PEP 621 path, which
-/// likewise yields `None` for an absent or always-true marker. Falls back to
-/// the raw string, unmodified, if the expression fails to parse or exceeds
-/// [`MAX_MARKER_LEN`] or [`MAX_MARKER_DEPTH`].
+/// likewise yields `None` for an absent or always-true marker. If the
+/// expression fails to parse, or exceeds [`MAX_MARKER_LEN`] or
+/// [`MAX_MARKER_DEPTH`] and bypasses the parser entirely, it falls back to
+/// [`bounded_marker_fallback`], which drops text that isn't plausibly a
+/// marker expression or that exceeds [`MAX_FALLBACK_MARKER_LEN`].
 fn normalize_marker_string(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -433,13 +667,13 @@ fn normalize_marker_string(raw: &str) -> Option<String> {
             MAX_MARKER_DEPTH,
             truncate_for_log(trimmed)
         );
-        return Some(trimmed.to_string());
+        return bounded_marker_fallback(trimmed);
     }
     match MarkerTree::from_str(trimmed) {
         Ok(tree) => tree.try_to_string(),
         Err(e) => {
             tracing::warn!("Failed to parse marker expression '{}': {}", trimmed, e);
-            Some(trimmed.to_string())
+            bounded_marker_fallback(trimmed)
         }
     }
 }
