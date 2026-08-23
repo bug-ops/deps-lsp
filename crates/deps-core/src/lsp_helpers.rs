@@ -2034,9 +2034,10 @@ pub fn generate_diagnostics_from_cache(
 /// differ only in spacing compare equal.
 ///
 /// Shared by every no-op/literal-match guard in this module (`build_vulnerability_fix_action`'s
-/// N1 guard, `generate_code_actions`'s REFACTOR-loop guard, and `literal_span_matches`), all of
-/// which compare a declared requirement string against a differently-normalized counterpart —
-/// e.g. pep508's `>=1.7, <2.0` vs. a formatter's `>=1.7,<2.0`.
+/// N1 guard, `generate_code_actions`'s REFACTOR-loop guard, `literal_span_matches`, and
+/// `collect_update_all_edits`'s no-op guard), all of which compare a declared requirement
+/// string against a differently-normalized counterpart — e.g. pep508's `>=1.7, <2.0` vs. a
+/// formatter's `>=1.7,<2.0`.
 fn strip_whitespace(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
@@ -2226,9 +2227,22 @@ pub fn collect_update_all_edits(
             continue;
         }
 
+        let new_text = formatter.format_version_replacing(latest, version_req.as_str());
+        // No-op guard, mirroring the REFACTOR-loop dedup and vulnerability-fix N1
+        // guard elsewhere in this module: a formatter can decide a declared
+        // requirement has no single unambiguous rewrite (e.g. `deps-gradle`'s
+        // `{strictly}!!{preferred}` shorthand, left unchanged rather than risking a
+        // destructive or misleading edit) and return it unchanged. Without this
+        // check, such a dependency would still count toward — and appear fixed
+        // by — the "Update N outdated dependencies" lens while its click applies
+        // nothing.
+        if strip_whitespace(&new_text) == strip_whitespace(version_req.as_str()) {
+            continue;
+        }
+
         edits.push(TextEdit {
             range: version_range,
-            new_text: formatter.format_version_replacing(latest, version_req.as_str()),
+            new_text,
         });
     }
 
@@ -6066,12 +6080,17 @@ mod tests {
         /// A formatter whose `is_requirement_up_to_date` ignores range semantics and
         /// always reports "not up to date" — mirrors NuGet's bare-requirement-is-a-floor
         /// override (`crates/deps-nuget/src/formatter.rs`), used to prove the override
-        /// point is actually consulted rather than the trait default.
+        /// point is actually consulted rather than the trait default. Appends `-forced`
+        /// in `format_version_for_text_edit` so the resulting edit is never a no-op: the
+        /// override-is-honored test below intentionally declares a requirement already
+        /// textually identical to `latest` (to isolate "was the hook consulted" from "is
+        /// this genuinely outdated"), which would otherwise be indistinguishable from a
+        /// real no-op and get filtered by `collect_update_all_edits`'s no-op guard.
         struct FloorFormatter;
 
         impl EcosystemFormatter for FloorFormatter {
             fn format_version_for_text_edit(&self, version: &str) -> String {
-                version.to_string()
+                format!("{version}-forced")
             }
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
@@ -6266,6 +6285,49 @@ mod tests {
                 &FloorFormatter,
             );
             assert_eq!(edits.len(), 1);
+            assert_eq!(edits[0].new_text, "1.0.0-forced");
+        }
+
+        #[test]
+        fn test_no_op_edit_is_excluded() {
+            // M2: a formatter can decide a declared requirement has no single
+            // unambiguous rewrite and return it unchanged (e.g. `deps-gradle`'s
+            // `{strictly}!!{preferred}` infix shorthand). Without a no-op guard, this
+            // dependency would still count toward, and be "fixed" by, the "Update N
+            // outdated dependencies" lens while applying nothing.
+            struct NoOpFormatter;
+            impl EcosystemFormatter for NoOpFormatter {
+                fn format_version_for_text_edit(&self, version: &str) -> String {
+                    version.to_string()
+                }
+                fn package_url(&self, name: &PackageName) -> String {
+                    format!("https://example.com/{name}")
+                }
+                fn format_version_replacing(&self, _version: &str, current: &str) -> String {
+                    current.to_string()
+                }
+                fn is_requirement_up_to_date(
+                    &self,
+                    _requirement: &VersionReq,
+                    _latest: &str,
+                ) -> bool {
+                    false
+                }
+            }
+
+            let content = r#"pkg = "1.0.0""#;
+            let pr = parse_result(vec![dep("pkg", Some("1.0.0"), Some(range(0, 7, 0, 12)))]);
+            let mut cached = HashMap::new();
+            cached.insert("pkg".into(), PackageVersions::latest_only("1.2.0"));
+            let resolved = HashMap::new();
+
+            let edits = collect_update_all_edits(
+                &pr,
+                content,
+                VersionData::new(&cached, &resolved),
+                &NoOpFormatter,
+            );
+            assert!(edits.is_empty());
         }
 
         #[test]
