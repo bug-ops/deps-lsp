@@ -34,8 +34,7 @@ use std::fmt;
 /// assert_eq!(name.as_str(), "serde");
 /// assert_eq!(name, "serde");
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackageName(String);
 
 impl PackageName {
@@ -191,8 +190,7 @@ impl InvalidPackageName {
 /// assert_eq!(req.as_str(), "^1.0");
 /// assert_eq!(req, "^1.0");
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VersionReq(String);
 
 impl VersionReq {
@@ -334,14 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn package_name_serializes_as_bare_string() {
-        assert_eq!(
-            serde_json::to_string(&PackageName::new("a/b")).unwrap(),
-            "\"a/b\""
-        );
-    }
-
-    #[test]
     fn version_req_round_trips_empty_string() {
         let req = VersionReq::new("");
         assert_eq!(req.as_str(), "");
@@ -372,13 +362,5 @@ mod tests {
         let original = String::from("~2.3.4");
         let req = VersionReq::new(original.clone());
         assert_eq!(req.into_string(), original);
-    }
-
-    #[test]
-    fn version_req_serializes_as_bare_string() {
-        assert_eq!(
-            serde_json::to_string(&VersionReq::new(">=1.0,<2.0")).unwrap(),
-            "\">=1.0,<2.0\""
-        );
     }
 }
