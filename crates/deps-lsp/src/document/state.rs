@@ -35,10 +35,6 @@ pub use deps_core::LoadingState;
 pub struct DocumentState {
     /// Package ecosystem identifier, exhaustively typed.
     pub ecosystem: EcosystemId,
-    /// Ecosystem identifier as a `&'static str` (matches `ecosystem.id()`), kept
-    /// alongside `ecosystem` since registry lookups (`EcosystemRegistry::get`) are
-    /// keyed by string.
-    pub ecosystem_id: &'static str,
     /// Original document content
     pub content: String,
     /// Parsed result as trait object (new architecture)
@@ -61,7 +57,6 @@ impl Clone for DocumentState {
     fn clone(&self) -> Self {
         Self {
             ecosystem: self.ecosystem,
-            ecosystem_id: self.ecosystem_id,
             content: self.content.clone(),
             parse_result: None, // Don't clone trait object
             cached_versions: self.cached_versions.clone(),
@@ -157,7 +152,7 @@ impl std::fmt::Debug for DocumentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DocumentState")
             .field("ecosystem", &self.ecosystem)
-            .field("ecosystem_id", &self.ecosystem_id)
+            .field("ecosystem_id", &self.ecosystem_id())
             .field("content_len", &self.content.len())
             .field("has_parse_result", &self.parse_result.is_some())
             .field("cached_versions_count", &self.cached_versions.len())
@@ -178,11 +173,8 @@ impl DocumentState {
         content: String,
         parse_result: Box<dyn ParseResult>,
     ) -> Self {
-        let ecosystem_id = ecosystem.id();
-
         Self {
             ecosystem,
-            ecosystem_id,
             content,
             parse_result: Some(parse_result),
             cached_versions: HashMap::new(),
@@ -198,11 +190,8 @@ impl DocumentState {
     /// Used when parsing fails but the document should still be stored
     /// to enable fallback completion and other LSP features.
     pub fn new_without_parse_result(ecosystem: EcosystemId, content: String) -> Self {
-        let ecosystem_id = ecosystem.id();
-
         Self {
             ecosystem,
-            ecosystem_id,
             content,
             parse_result: None,
             cached_versions: HashMap::new(),
@@ -211,6 +200,13 @@ impl DocumentState {
             loading_state: LoadingState::Idle,
             loading_started_at: None,
         }
+    }
+
+    /// Returns the ecosystem identifier as a `&'static str`, derived from
+    /// [`DocumentState::ecosystem`]. Registry lookups (`EcosystemRegistry::get`)
+    /// are keyed by string, so this mirrors `ecosystem.id()`.
+    pub fn ecosystem_id(&self) -> &'static str {
+        self.ecosystem.id()
     }
 
     /// Gets a reference to the parse result if available.
@@ -908,7 +904,7 @@ mod tests {
 
             let doc = DocumentState::new_without_parse_result(expected, String::new());
             assert_eq!(doc.ecosystem, expected);
-            assert_eq!(doc.ecosystem_id, id);
+            assert_eq!(doc.ecosystem_id(), id);
         }
     }
 
@@ -944,7 +940,7 @@ mod tests {
             .expect("maven must resolve to an EcosystemId");
         let doc_state = DocumentState::new_from_parse_result(ecosystem_id, content, parse_result);
 
-        assert_eq!(doc_state.ecosystem_id, "maven");
+        assert_eq!(doc_state.ecosystem_id(), "maven");
         assert_eq!(doc_state.ecosystem, EcosystemId::Maven);
     }
 
@@ -1003,7 +999,7 @@ mod tests {
                 parse_result,
             );
 
-            assert_eq!(doc_state.ecosystem_id, "cargo");
+            assert_eq!(doc_state.ecosystem_id(), "cargo");
             assert_eq!(doc_state.content, content);
             assert!(doc_state.parse_result.is_some());
         }
@@ -1013,7 +1009,7 @@ mod tests {
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
-            assert_eq!(doc_state.ecosystem_id, "cargo");
+            assert_eq!(doc_state.ecosystem_id(), "cargo");
             assert_eq!(doc_state.ecosystem, EcosystemId::Cargo);
             assert!(doc_state.parse_result.is_none());
         }
@@ -1084,7 +1080,7 @@ mod tests {
             let content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Npm, content);
 
-            assert_eq!(doc_state.ecosystem_id, "npm");
+            assert_eq!(doc_state.ecosystem_id(), "npm");
             assert_eq!(doc_state.ecosystem, EcosystemId::Npm);
             assert!(doc_state.parse_result.is_none());
         }
@@ -1103,7 +1099,7 @@ mod tests {
             let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n".to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Pypi, content);
 
-            assert_eq!(doc_state.ecosystem_id, "pypi");
+            assert_eq!(doc_state.ecosystem_id(), "pypi");
             assert_eq!(doc_state.ecosystem, EcosystemId::Pypi);
             assert!(doc_state.parse_result.is_none());
         }
@@ -1124,7 +1120,7 @@ mod tests {
                     .to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Go, content);
 
-            assert_eq!(doc_state.ecosystem_id, "go");
+            assert_eq!(doc_state.ecosystem_id(), "go");
             assert_eq!(doc_state.ecosystem, EcosystemId::Go);
             assert!(doc_state.parse_result.is_none());
         }
@@ -1149,7 +1145,7 @@ mod tests {
                 parse_result,
             );
 
-            assert_eq!(doc_state.ecosystem_id, "go");
+            assert_eq!(doc_state.ecosystem_id(), "go");
             assert!(doc_state.parse_result.is_some());
         }
     }

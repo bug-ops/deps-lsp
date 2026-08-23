@@ -26,7 +26,7 @@ pub async fn handle_hover(
 
     // Single document lookup: extract all needed data at once
     let doc = state.get_document(uri)?;
-    let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id)?;
+    let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
     let parse_result = doc.parse_result()?;
 
     // Generate hover while holding the lock
