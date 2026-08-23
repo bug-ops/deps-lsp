@@ -115,8 +115,8 @@ fn parse_package_element(
     // silently disguises "no version" as a real, always-unsatisfiable requirement instead
     // of being skipped by the empty-`VersionReq` guards downstream.
     let (version_requirement, version_range) = match version {
-        Some(v) if !v.is_empty() && !v.contains("$(") => (
-            Some(format!("[{v}]")),
+        Some(v) if !v.trim().is_empty() && !v.contains("$(") => (
+            Some(format!("[{}]", v.trim())),
             Some(span_to_range(content, line_table, version_span)),
         ),
         _ => (None, None),
@@ -239,9 +239,11 @@ fn finalize_dep(
     })
 }
 
-/// Unresolvable MSBuild property expressions (`Version="$(SerilogVersion)"`) and central
-/// package management entries (no `Version` at all) both degrade to `version_requirement:
-/// None` rather than a bogus or unresolved-looking requirement (spec §3, deferred scope).
+/// Unresolvable MSBuild property expressions (`Version="$(SerilogVersion)"`), central
+/// package management entries (no `Version` at all), and an empty/whitespace-only
+/// `Version=""` attribute all degrade to `version_requirement: None` rather than a bogus
+/// or unresolved-looking requirement (spec §3, deferred scope) — matching the
+/// `packages.config` path's `version=""` guard in `parse_package_element` above.
 fn resolve_version_field(
     content: &str,
     line_table: &LineOffsetTable,
@@ -249,7 +251,10 @@ fn resolve_version_field(
     span: (usize, usize),
 ) -> (Option<String>, Option<Range>) {
     match version {
-        Some(v) if !v.contains("$(") => (Some(v), Some(span_to_range(content, line_table, span))),
+        Some(ref v) if !v.trim().is_empty() && !v.contains("$(") => (
+            Some(v.trim().to_string()),
+            Some(span_to_range(content, line_table, span)),
+        ),
         _ => (None, None),
     }
 }
@@ -525,6 +530,37 @@ mod tests {
         assert_eq!(result.dependencies[0].version_range, None);
     }
 
+    /// M1: a whitespace-only `version` attribute must degrade to `None` the same as a
+    /// truly empty one — otherwise it produces the bogus `"[   ]"` exact pin.
+    #[test]
+    fn test_packages_config_whitespace_only_version_degrades_to_none() {
+        let xml = r#"<packages>
+  <package id="Foo" version="   " targetFramework="net48" />
+</packages>"#;
+        let uri = deps_core::test_util::test_uri("/test/packages.config");
+        let result = parse_packages_config(xml, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].version_requirement, None);
+        assert_eq!(result.dependencies[0].version_range, None);
+    }
+
+    /// M11: a non-empty `version` attribute with leading/trailing whitespace must have
+    /// that whitespace trimmed before being wrapped into the exact-pin syntax, or the
+    /// stray spaces end up baked into `"[ 1.0.0 ]"` instead of `"[1.0.0]"`.
+    #[test]
+    fn test_packages_config_version_with_surrounding_whitespace_is_trimmed() {
+        let xml = r#"<packages>
+  <package id="Foo" version=" 1.0.0 " targetFramework="net48" />
+</packages>"#;
+        let uri = deps_core::test_util::test_uri("/test/packages.config");
+        let result = parse_packages_config(xml, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].version_requirement,
+            Some("[1.0.0]".into())
+        );
+    }
+
     #[test]
     fn test_packages_config_multiple_packages() {
         let xml = r#"<packages>
@@ -544,6 +580,41 @@ mod tests {
         assert_eq!(result.dependencies[0].name, "Serilog");
         assert!(result.dependencies[0].version_requirement.is_none());
         assert!(result.dependencies[0].version_range.is_none());
+    }
+
+    /// M2: `Version=""` on a `PackageReference` must degrade to `None`, aligning with the
+    /// `packages.config` `version=""` guard instead of yielding `Some("")`.
+    #[test]
+    fn test_package_reference_empty_version_degrades_to_none() {
+        let xml = r#"<Project><ItemGroup><PackageReference Include="Foo" Version="" /></ItemGroup></Project>"#;
+        let result = parse_project_file(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "Foo");
+        assert!(result.dependencies[0].version_requirement.is_none());
+        assert!(result.dependencies[0].version_range.is_none());
+    }
+
+    /// M1/M2 sibling: whitespace-only `Version` must also degrade to `None`.
+    #[test]
+    fn test_package_reference_whitespace_only_version_degrades_to_none() {
+        let xml = r#"<Project><ItemGroup><PackageReference Include="Foo" Version="   " /></ItemGroup></Project>"#;
+        let result = parse_project_file(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(result.dependencies[0].version_requirement.is_none());
+        assert!(result.dependencies[0].version_range.is_none());
+    }
+
+    /// M11 sibling: same whitespace trimming for the `PackageReference`/central-package
+    /// resolution path (`resolve_version_field`).
+    #[test]
+    fn test_package_reference_version_with_surrounding_whitespace_is_trimmed() {
+        let xml = r#"<Project><ItemGroup><PackageReference Include="Foo" Version=" 1.0.0 " /></ItemGroup></Project>"#;
+        let result = parse_project_file(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].version_requirement,
+            Some("1.0.0".into())
+        );
     }
 
     #[test]
