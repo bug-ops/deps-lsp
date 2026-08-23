@@ -86,6 +86,12 @@ impl Backend {
             }
             Err(e) => {
                 tracing::error!("failed to process document change {:?}: {}", uri, e);
+                // Without this, a rejected change (e.g. oversized content) leaves the
+                // client editing against a stale server-side DocumentState with no
+                // indication the edit was never applied.
+                self.client
+                    .log_message(MessageType::ERROR, format!("Change rejected: {e}"))
+                    .await;
             }
         }
     }
@@ -109,7 +115,7 @@ impl Backend {
             .filter_map(|entry| {
                 let uri = entry.key();
                 let doc = entry.value();
-                if doc.ecosystem_id != ecosystem_id {
+                if doc.ecosystem_id() != ecosystem_id {
                     return None;
                 }
                 let doc_lockfile = lock_provider.locate_lockfile(uri)?;
@@ -282,9 +288,9 @@ impl LanguageServer for Backend {
         });
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    fn shutdown(&self) -> impl Future<Output = Result<()>> {
         tracing::info!("shutting down deps-lsp server");
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {

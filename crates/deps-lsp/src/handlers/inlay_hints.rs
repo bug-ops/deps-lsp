@@ -43,10 +43,10 @@ pub async fn handle_inlay_hints(
         }
     };
 
-    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id) {
+    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id()) {
         Some(e) => e,
         None => {
-            tracing::warn!("Ecosystem not found: {}", doc.ecosystem_id);
+            tracing::warn!("Ecosystem not found: {}", doc.ecosystem_id());
             return vec![];
         }
     };

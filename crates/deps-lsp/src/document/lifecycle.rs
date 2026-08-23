@@ -3,7 +3,7 @@
 //! This module provides unified open/change/close handlers that work with
 //! the ecosystem trait architecture, eliminating per-ecosystem duplication.
 
-use super::loader::load_document_from_disk;
+use super::loader::{MAX_FILE_SIZE, load_document_from_disk};
 use super::state::{DocumentState, ServerState};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
@@ -29,6 +29,33 @@ fn resolve_ecosystem_id(ecosystem: &dyn Ecosystem) -> EcosystemId {
         .id()
         .parse()
         .expect("ecosystem.id() must be a registered EcosystemId")
+}
+
+/// Rejects document content larger than [`MAX_FILE_SIZE`].
+///
+/// Content from `textDocument/didOpen`/`didChange` reaches this crate directly
+/// over the LSP protocol, with no filesystem `metadata()` size check to gate on
+/// beforehand (unlike [`load_document_from_disk`], which checks before reading).
+/// This applies the same bound so an oversized payload is rejected before it
+/// ever reaches `ecosystem.parse_manifest`.
+///
+/// # Errors
+///
+/// Returns `Err(DepsError::CacheError)` if `content` exceeds `MAX_FILE_SIZE`.
+fn check_content_size(content: &str, uri: &Uri) -> Result<()> {
+    let size = content.len() as u64;
+    if size > MAX_FILE_SIZE {
+        tracing::error!(
+            "Document content exceeds maximum size: {} bytes (limit: {} bytes) for {:?}",
+            size,
+            MAX_FILE_SIZE,
+            uri
+        );
+        return Err(deps_core::error::DepsError::CacheError(format!(
+            "document too large: {size} bytes (max: {MAX_FILE_SIZE} bytes)"
+        )));
+    }
+    Ok(())
 }
 
 /// Preserves cached version data from old document state to new state.
@@ -198,6 +225,8 @@ pub async fn handle_document_open(
             )));
         }
     };
+
+    check_content_size(&content, &uri)?;
 
     tracing::info!(
         "Opening {:?} with ecosystem: {}",
@@ -372,6 +401,8 @@ pub async fn handle_document_change(
             )));
         }
     };
+
+    check_content_size(&content, &uri)?;
 
     // Extract old dependency names before parsing (for diff computation)
     let old_dep_names: HashSet<String> =
@@ -731,6 +762,26 @@ mod tests {
         let state = ServerState::new();
         let unknown_uri = deps_core::test_util::test_uri("/test/unknown.txt");
         assert!(state.ecosystem_registry.get_for_uri(&unknown_uri).is_none());
+    }
+
+    #[test]
+    fn test_check_content_size_accepts_content_within_limit() {
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let content = "a".repeat(MAX_FILE_SIZE as usize);
+        assert!(check_content_size(&content, &uri).is_ok());
+    }
+
+    #[test]
+    fn test_check_content_size_rejects_content_over_limit() {
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let content = "a".repeat(MAX_FILE_SIZE as usize + 1);
+        let result = check_content_size(&content, &uri);
+        match result {
+            Err(deps_core::error::DepsError::CacheError(msg)) => {
+                assert!(msg.contains("too large"), "unexpected message: {msg}");
+            }
+            other => panic!("Expected CacheError, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1259,7 +1310,7 @@ serde = "1.0"
 
             assert_eq!(state.document_count(), 1);
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.ecosystem_id, "cargo");
+            assert_eq!(doc.ecosystem_id(), "cargo");
         }
 
         #[tokio::test]
@@ -1300,7 +1351,7 @@ serde = "1.0"
             );
 
             let doc = doc.unwrap();
-            assert_eq!(doc.ecosystem_id, "cargo");
+            assert_eq!(doc.ecosystem_id(), "cargo");
             assert_eq!(doc.content, content);
             assert!(
                 doc.parse_result().is_none(),
@@ -1417,6 +1468,147 @@ serde = "1.0""#;
                 "Should still have only 1 document"
             );
         }
+
+        #[tokio::test]
+        async fn test_handle_document_open_rejects_oversized_content() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let oversized_content = "a".repeat(MAX_FILE_SIZE as usize + 1);
+            let (client, config) = create_test_client_and_config();
+
+            let result = handle_document_open(
+                uri.clone(),
+                oversized_content,
+                state.clone(),
+                client,
+                config,
+            )
+            .await;
+
+            assert!(result.is_err(), "Oversized content should be rejected");
+            match result {
+                Err(deps_core::error::DepsError::CacheError(msg)) => {
+                    assert!(
+                        msg.contains("too large"),
+                        "Error message should indicate size issue: {msg}"
+                    );
+                }
+                other => panic!("Expected CacheError for oversized content, got {other:?}"),
+            }
+            assert_eq!(
+                state.document_count(),
+                0,
+                "Oversized content must not be stored/parsed"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_handle_document_open_accepts_normal_sized_content() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let content = r#"[dependencies]
+serde = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+
+            let result =
+                handle_document_open(uri.clone(), content, state.clone(), client, config).await;
+
+            assert!(result.is_ok(), "Normal-sized content should be accepted");
+            assert_eq!(state.document_count(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_handle_document_change_rejects_oversized_content() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let oversized_content = "a".repeat(MAX_FILE_SIZE as usize + 1);
+            let (client, config) = create_test_client_and_config();
+
+            let result = handle_document_change(
+                uri.clone(),
+                oversized_content,
+                state.clone(),
+                client,
+                config,
+            )
+            .await;
+
+            assert!(result.is_err(), "Oversized content should be rejected");
+            match result {
+                Err(deps_core::error::DepsError::CacheError(msg)) => {
+                    assert!(
+                        msg.contains("too large"),
+                        "Error message should indicate size issue: {msg}"
+                    );
+                }
+                other => panic!("Expected CacheError for oversized content, got {other:?}"),
+            }
+            assert_eq!(
+                state.document_count(),
+                0,
+                "Oversized content must not be stored/parsed"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_handle_document_change_rejects_oversized_content_preserves_existing_document()
+        {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let original_content = r#"[dependencies]
+serde = "1.0"
+"#
+            .to_string();
+
+            // Open a valid document first (mirrors an already-open editor buffer).
+            let (client, config) = create_test_client_and_config();
+            handle_document_open(
+                uri.clone(),
+                original_content.clone(),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("initial open should succeed");
+            assert_eq!(state.document_count(), 1);
+
+            // An oversized didChange must be rejected without touching the stored document.
+            let oversized_content = "a".repeat(MAX_FILE_SIZE as usize + 1);
+            let (client, config) = create_test_client_and_config();
+            let result = handle_document_change(
+                uri.clone(),
+                oversized_content,
+                state.clone(),
+                client,
+                config,
+            )
+            .await;
+
+            assert!(result.is_err(), "Oversized change should be rejected");
+            assert_eq!(
+                state.document_count(),
+                1,
+                "The previously stored document must survive a rejected change"
+            );
+            let doc = state
+                .get_document(&uri)
+                .expect("original document should still be present");
+            assert_eq!(
+                doc.content, original_content,
+                "Document content must be unchanged by the rejected change"
+            );
+        }
     }
 
     // npm-specific tests
@@ -1453,7 +1645,7 @@ serde = "1.0""#;
             state.update_document(uri.clone(), doc_state);
 
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.ecosystem_id, "npm");
+            assert_eq!(doc.ecosystem_id(), "npm");
         }
     }
 
@@ -1493,7 +1685,7 @@ dependencies = ["requests>=2.0.0"]
             state.update_document(uri.clone(), doc_state);
 
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.ecosystem_id, "pypi");
+            assert_eq!(doc.ecosystem_id(), "pypi");
         }
     }
 
@@ -1536,7 +1728,7 @@ require github.com/gorilla/mux v1.8.0
             state.update_document(uri.clone(), doc_state);
 
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.ecosystem_id, "go");
+            assert_eq!(doc.ecosystem_id(), "go");
         }
     }
 
