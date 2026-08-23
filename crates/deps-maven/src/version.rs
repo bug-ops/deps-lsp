@@ -26,20 +26,27 @@ pub fn is_prerelease(version: &str) -> bool {
 
 /// Compares two Maven version strings by dot/dash-separated segment.
 ///
-/// Each segment is classified as purely numeric (all ASCII digits) or a
-/// non-numeric qualifier. A numeric segment always outranks a non-numeric
-/// qualifier at the same position, which keeps legacy Maven identifiers such
-/// as Guava's bare `r03`..`r09` release tags below properly-formed numeric
-/// releases (e.g. `33.7.1-jre`). A missing segment (the shorter version ran
-/// out of components) is ranked against a non-numeric qualifier at that
-/// position by the same Maven qualifier precedence used for two real
-/// qualifiers (see `compare_qualifiers`): a version's own trailing
-/// dash-qualifier that ranks below release (e.g. `-RC1`, `-SNAPSHOT`) sorts
-/// below its base release (`6.1.0-RC1` < `6.1.0`), while one that ranks above
-/// release (e.g. `-sp`, or an unrecognized vendor suffix) sorts above it.
-/// Two numeric segments compare by magnitude (leading zeros ignored, no size
-/// limit); two real non-numeric segments are ranked by Maven qualifier
-/// precedence (see `compare_qualifiers`).
+/// This is a total order (antisymmetric, transitive, and consistent with equality — verified by
+/// `test_compare_versions_total_order_invariants`), so it is safe to use as a `sort_by`
+/// comparator, e.g. sorting `maven-metadata.xml`'s version list in
+/// `crate::registry::parse_metadata_xml`. Each segment is classified as purely numeric (all
+/// ASCII digits) or a non-numeric qualifier. A numeric segment always outranks a non-numeric
+/// qualifier at the same position, which keeps legacy Maven identifiers such as Guava's bare
+/// `r03`..`r09` release tags below properly-formed numeric releases (e.g. `33.7.1-jre`). A
+/// missing segment (the shorter version ran out of components) is ranked against a non-numeric
+/// qualifier at that position by the same Maven qualifier precedence used for two real
+/// qualifiers (see `compare_qualifiers`): a version's own trailing dash-qualifier that ranks
+/// below release (e.g. `-RC1`, `-SNAPSHOT`) sorts below its base release (`6.1.0-RC1` < `6.1.0`),
+/// while one that ranks above release (e.g. `-sp`, or an unrecognized vendor suffix) sorts above
+/// it. Two numeric segments compare by magnitude (leading zeros ignored, no size limit); two real
+/// non-numeric segments are ranked by Maven qualifier precedence (see `compare_qualifiers`).
+///
+/// Note this does *not* treat a missing segment as equal to a present-but-zero one (`1.0` and
+/// `1.0.0` compare unequal here) — doing so would break the total order, since the zero-valued
+/// segment and the missing one can each compare differently against a qualifier at that position
+/// depending on which side of the pair supplies it. Range/interval bound matching, which does
+/// want that normalization (`[1.0]` should match `1.0.0`), uses the dedicated pairwise
+/// `compare_versions_for_range` instead.
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
     let a_parts = split_version(a);
     let b_parts = split_version(b);
@@ -50,6 +57,42 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
         let bp = b_parts.get(i).map_or("", |s| s.as_str());
 
         let ord = compare_segment(ap, bp);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+
+    Ordering::Equal
+}
+
+/// Compares two Maven version strings for range/interval bound matching only.
+///
+/// Unlike [`compare_versions`], a missing trailing segment (the shorter version ran out of
+/// components) normalizes as equal to a present-but-zero numeric segment at that position, per
+/// Maven's `IntItem.compareTo(null)` rule (the same rule [`compare_qualifiers`] already applies
+/// one level down, to qualifier-token digit runs): `1.0` == `1.0.0` == `1.0.0.0`. This is what
+/// lets a range bound with a different segment count than the version being checked still match
+/// correctly (`[1.0]` contains `1.0.0`; `[4.0,4.1]` contains `4.1.0`).
+///
+/// # Not a total order
+///
+/// This function is **not** transitive and must never be used as a `sort_by` comparator: because
+/// [`split_version`] flattens `.`/`-` into one flat segment list, a zero-valued segment and an
+/// absent one can each compare differently against a same-position qualifier depending on which
+/// version supplies it, producing ordering cycles (e.g. `1.0.0 > 1.0-jre`, `1.0-jre > 1.0`, but
+/// `1.0 == 1.0.0`). It is safe only for the pairwise range-containment checks in
+/// `crate::interval`, which never sort — see [`compare_versions`] for the total-order sorting
+/// comparator.
+pub(crate) fn compare_versions_for_range(a: &str, b: &str) -> Ordering {
+    let a_parts = split_version(a);
+    let b_parts = split_version(b);
+
+    let max_len = a_parts.len().max(b_parts.len());
+    for i in 0..max_len {
+        let ap = a_parts.get(i).map(String::as_str);
+        let bp = b_parts.get(i).map(String::as_str);
+
+        let ord = compare_segment_for_range(ap, bp);
         if ord != Ordering::Equal {
             return ord;
         }
@@ -81,6 +124,34 @@ fn compare_segment(a: &str, b: &str) -> Ordering {
     }
 }
 
+/// Compares a single dot/dash-separated version segment for
+/// [`compare_versions_for_range`]; `None` means the shorter version ran out
+/// of components at this position.
+///
+/// When both segments are present, this defers to [`compare_segment`].
+/// When one side is missing, it applies Maven's `IntItem.compareTo(null)`
+/// rule: a present numeric segment that is all zeros (e.g. the third
+/// component of `1.0.0` vs `1.0`) is equivalent to a missing one, so the
+/// segments compare equal; any other numeric segment outranks the missing
+/// one. A present non-numeric qualifier is instead compared against the
+/// empty qualifier via [`compare_qualifiers`], preserving Maven qualifier
+/// precedence at a missing segment (e.g. `6.1.0-RC1` < `6.1.0`).
+fn compare_segment_for_range(a: Option<&str>, b: Option<&str>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => compare_segment(a, b),
+        (Some(a), None) if is_numeric_segment(a) => {
+            if is_zero_digits(a) {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Some(a), None) => compare_qualifiers(a, ""),
+        (None, Some(_)) => compare_segment_for_range(b, a).reverse(),
+        (None, None) => Ordering::Equal,
+    }
+}
+
 /// A segment is numeric only if every byte is an ASCII digit; classifying by
 /// character class (rather than `str::parse::<u64>` success) means a segment
 /// with more than 20 digits is still treated as numeric instead of silently
@@ -104,13 +175,14 @@ fn compare_numeric_segments(a: &str, b: &str) -> Ordering {
 /// `ComparableVersion` precedence: `alpha < beta < milestone < rc/cr <
 /// snapshot < (release, i.e. "", "ga", "final") < sp`, case-insensitively.
 ///
-/// A missing segment is padded to `""` by [`compare_versions`] (`split_version`
-/// never yields empty segments itself) and represents "no further
-/// qualifier", i.e. the release rank: a dash-qualifier segment ranking below
-/// release (`alpha`, `beta`, `milestone`, `rc`/`cr`, `snapshot`, e.g. `RC1`
-/// or `SNAPSHOT`) sorts below the base release it padded against, while one
-/// ranking above release (`sp`, or any unrecognized qualifier such as a
-/// vendor suffix) sorts above it — the same per-token rank comparison used
+/// A missing segment is compared against `""` — padded by [`compare_versions`] itself when the
+/// other version simply runs out of components, or passed explicitly by
+/// [`compare_segment_for_range`] when the present side is a non-numeric qualifier
+/// (`split_version` never yields empty segments itself); `""` represents "no further
+/// qualifier", i.e. the release rank: a dash-qualifier segment ranking below release (`alpha`,
+/// `beta`, `milestone`, `rc`/`cr`, `snapshot`, e.g. `RC1` or `SNAPSHOT`) sorts below the base
+/// release it is compared against, while one ranking above release (`sp`, or any unrecognized
+/// qualifier such as a vendor suffix) sorts above it — the same per-token rank comparison used
 /// for two real qualifiers, not a special case.
 ///
 /// Both segments are tokenized into maximal alpha/digit runs (see
@@ -527,5 +599,109 @@ mod tests {
         assert_eq!(compare_versions("1.0-ga", "1.0"), Ordering::Equal);
         assert_eq!(compare_versions("1.0-vaadin", "1.0"), Ordering::Greater);
         assert_eq!(compare_versions("9.9", "9.9-vaadin"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_versions_for_range_normalizes_trailing_zero_segments() {
+        // #182, range/interval bound matching only: a missing trailing segment
+        // normalizes as equal to a zero-valued numeric segment, matching
+        // Maven's IntItem.compareTo(null). compare_versions itself must NOT do
+        // this — see test_compare_versions_does_not_normalize_trailing_zero_segments
+        // and test_compare_versions_total_order_invariants (C1 regression).
+        assert_eq!(compare_versions_for_range("1.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions_for_range("1.0.0", "1.0"), Ordering::Equal);
+        assert_eq!(
+            compare_versions_for_range("1.0", "1.0.0.0"),
+            Ordering::Equal
+        );
+        assert_eq!(compare_versions_for_range("1", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions_for_range("1.0.00", "1.0"), Ordering::Equal);
+        assert_eq!(
+            compare_versions_for_range("1.0.1", "1.0"),
+            Ordering::Greater
+        );
+        assert_eq!(compare_versions_for_range("1.0", "1.0.1"), Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_versions_for_range_normalization_does_not_affect_qualifiers() {
+        // A missing segment must still lose to a present non-numeric
+        // qualifier per Maven qualifier precedence, not be swallowed by the
+        // zero-normalization rule (#182).
+        assert_eq!(
+            compare_versions_for_range("6.1.0-RC1", "6.1.0"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions_for_range("1.0-sp", "1.0"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions_for_range("1.0.0-SNAPSHOT", "1.0"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_does_not_normalize_trailing_zero_segments() {
+        // compare_versions must stay a total order for sort_by callers
+        // (crate::registry::parse_metadata_xml). Unlike
+        // compare_versions_for_range, a missing trailing segment is ranked as
+        // an empty qualifier here, not treated as equal to a zero-valued
+        // numeric one.
+        assert_eq!(compare_versions("1.0", "1.0.0"), Ordering::Less);
+        assert_eq!(compare_versions("1.0.0", "1.0"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_versions_total_order_invariants() {
+        // C1 regression guard: a version corpus mixing segment-count spellings
+        // of the same release with a same-base above-release qualifier used to
+        // produce ordering cycles (1.0.0 > 1.0-jre, 1.0-jre > 1.0, 1.0 == 1.0.0)
+        // once compare_versions treated a missing segment as zero. Antisymmetry,
+        // transitivity of `<`, and equal-substitution must all hold, or
+        // `Vec::sort_by` panics ("does not correctly implement a total order")
+        // on realistic maven-metadata.xml version lists (crate::registry).
+        let corpus = [
+            "1.0",
+            "1.0.0",
+            "1.0.0.0",
+            "1.0-jre",
+            "1.0-android",
+            "1.0-sp",
+            "1.0-RC1",
+            "1.0-SNAPSHOT",
+            "1.0.1",
+            "1.1",
+            "1.1.0",
+            "2.0",
+        ];
+        for &a in &corpus {
+            for &b in &corpus {
+                assert_eq!(
+                    compare_versions(a, b),
+                    compare_versions(b, a).reverse(),
+                    "antisymmetry: compare({a}, {b}) vs compare({b}, {a})"
+                );
+                for &c in &corpus {
+                    if compare_versions(a, b) == Ordering::Less
+                        && compare_versions(b, c) == Ordering::Less
+                    {
+                        assert_eq!(
+                            compare_versions(a, c),
+                            Ordering::Less,
+                            "transitivity: {a} < {b} < {c} but not {a} < {c}"
+                        );
+                    }
+                    if compare_versions(a, b) == Ordering::Equal {
+                        assert_eq!(
+                            compare_versions(a, c),
+                            compare_versions(b, c),
+                            "equal-substitution: {a} == {b} but compare({a},{c}) != compare({b},{c})"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

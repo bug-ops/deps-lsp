@@ -507,6 +507,33 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_metadata_xml_mixed_segment_count_sort_does_not_panic() {
+        // C1 regression guard: an artifact publishing both a 2- and 3-segment
+        // spelling of the same release plus a same-base above-release
+        // qualifier build used to make compare_versions a non-total order
+        // (#182's absent-as-zero rule collided with qualifier ranking at the
+        // flat segment index), which panics `Vec::sort_by`'s total-order
+        // detector. compare_versions must stay total-order; range/interval
+        // normalization lives in compare_versions_for_range instead.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.example</groupId>
+  <artifactId>widget</artifactId>
+  <versioning>
+    <versions>
+      <version>1.0</version>
+      <version>1.0.0</version>
+      <version>1.0-jre</version>
+    </versions>
+  </versioning>
+</metadata>"#;
+
+        let (versions, _release) = parse_metadata_xml(xml.as_bytes()).unwrap();
+        let ordered: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(ordered, vec!["1.0.0", "1.0-jre", "1.0"]);
+    }
+
+    #[test]
     fn test_parse_search_response() {
         let json = r#"{
             "response": {
