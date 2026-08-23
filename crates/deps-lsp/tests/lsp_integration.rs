@@ -294,6 +294,59 @@ fn test_malformed_document_content() {
     );
 }
 
+#[cfg(feature = "cargo")]
+#[test]
+fn test_oversized_did_change_notifies_client_and_keeps_stale_document() {
+    let mut client = LspClient::spawn();
+    client.initialize();
+
+    let uri = "file:///test/Cargo.toml";
+    let valid_content = r#"[package]
+name = "test-package"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+"#;
+    client.did_open(uri, "toml", valid_content);
+    thread::sleep(Duration::from_millis(100));
+    // Drain (via flush) then discard notifications so far — this includes the
+    // startup `window/logMessage` sent from `initialized`, which would otherwise
+    // shadow the rejection message searched for below.
+    client.flush_notifications();
+    client.clear_notifications();
+
+    // Content over the 10MB manifest size bound (issue #161) must be rejected
+    // rather than replacing the previously stored document.
+    let oversized_content = "a".repeat(10_000_001);
+    client.did_change(uri, 2, &oversized_content);
+    client.flush_notifications();
+
+    let rejection = client
+        .get_notifications()
+        .into_iter()
+        .find(|n| {
+            n.method == "window/logMessage"
+                && n.params["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("Change rejected"))
+        })
+        .expect("Server should notify the client that the change was rejected");
+    let message = rejection.params["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Change rejected"),
+        "Unexpected window/logMessage content: {message:?}"
+    );
+
+    // The server must keep serving the last known-good (pre-rejection) document
+    // rather than crashing or dropping it silently.
+    let hints = client.inlay_hints(60, uri);
+    assert!(
+        hints.get("error").is_none(),
+        "Server should still serve the stale-but-valid document after a rejected change"
+    );
+}
+
 #[test]
 fn test_multiple_documents() {
     let mut client = LspClient::spawn();

@@ -10,7 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused `async-trait` workspace dependency from root `Cargo.toml` and 10 crate manifests (never invoked via `#[async_trait]`; native async traits used throughout) (#159)
 
+### Fixed
+- **deps-lsp**: content received via `textDocument/didOpen`/`didChange` had no size bound before reaching `ecosystem.parse_manifest`, unlike disk-loaded documents (cold start), which were already capped at `MAX_FILE_SIZE` (10MB) in `document::loader`. `document::lifecycle::{handle_document_open, handle_document_change}` now reject content over the same 10MB limit before parsing; the rejected content is never stored or parsed. Both `Backend::handle_open` and `Backend::handle_change` (`server.rs`) now surface the rejection to the client via `window/logMessage` (previously `handle_change`'s error arm only logged server-side via `tracing::error!`, so a rejected `didChange` left the client editing against a stale server-side document with no client-visible signal that the edit was never applied) (resolves #161).
+
 ### Changed
+- **deps-lsp**: `DocumentState::ecosystem_id: &'static str` is now a method (`ecosystem_id()`) instead of a stored field, since it was always fully derived from `ecosystem: EcosystemId` — removes the possibility of the two falling out of sync. `handlers::completion::fallback_completion` now takes the already-typed `EcosystemId` instead of re-parsing it from the `&str` id (resolves #155).
 - Converted `PypiRegistry::search`, `GoEcosystem::complete_package_names`, `GoEcosystem::complete_features`, and `Backend::shutdown` from `async fn` to `fn` returning `impl Future` directly, satisfying clippy's `unused_async_trait_impl` lint (no `.await` in any of these bodies); behavior is unchanged
 
 ## [0.10.1] - 2026-08-20

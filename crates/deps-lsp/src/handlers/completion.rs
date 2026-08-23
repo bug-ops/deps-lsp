@@ -70,7 +70,8 @@ pub async fn handle_completion(
             return None;
         }
     };
-    let ecosystem_id = doc.ecosystem_id;
+    let ecosystem_id = doc.ecosystem_id();
+    let ecosystem_kind = doc.ecosystem;
     let content = doc.content.clone();
     let has_parse_result = doc.parse_result().is_some();
     drop(doc);
@@ -99,7 +100,7 @@ pub async fn handle_completion(
             // case where the user is typing a NEW package name.
             Ok(completions) if completions.is_empty() => {
                 tracing::info!("completion: ecosystem returned empty, trying fallback");
-                fallback_completion(&state, ecosystem_id, position, &content).await
+                fallback_completion(&state, ecosystem_kind, position, &content).await
             }
             Ok(completions) => completions,
             // Timed out, not genuinely empty: the registry is slow right now, so a
@@ -115,7 +116,7 @@ pub async fn handle_completion(
         }
     } else {
         // Fallback: detect context from raw text
-        fallback_completion(&state, ecosystem_id, position, &content).await
+        fallback_completion(&state, ecosystem_kind, position, &content).await
     };
 
     tracing::info!("completion: returning {} items", items.len());
@@ -132,13 +133,13 @@ pub async fn handle_completion(
 /// Detects dependencies sections from raw text and provides package name suggestions.
 async fn fallback_completion(
     state: &ServerState,
-    ecosystem_id: &str,
+    ecosystem_kind: EcosystemId,
     position: tower_lsp_server::ls_types::Position,
     content: &str,
 ) -> Vec<CompletionItem> {
     tracing::info!(
         "fallback_completion: starting for ecosystem={}",
-        ecosystem_id
+        ecosystem_kind
     );
 
     // Get the current line
@@ -152,13 +153,6 @@ async fn fallback_completion(
 
     tracing::info!("fallback_completion: line content = {:?}", line);
 
-    // Check if we're in a dependencies section. An ecosystem id that doesn't parse is
-    // not registered, so there is no fallback to offer (mirrors the `ecosystem_registry
-    // .get` lookup below, which fails the same way for the same reason).
-    let Ok(ecosystem_kind) = ecosystem_id.parse::<EcosystemId>() else {
-        tracing::warn!("fallback_completion: unknown ecosystem id {ecosystem_id:?}");
-        return vec![];
-    };
     if !is_in_dependencies_section(content, position.line as usize, ecosystem_kind) {
         tracing::info!("fallback_completion: not in dependencies section");
         return vec![];
@@ -176,7 +170,7 @@ async fn fallback_completion(
     }
 
     // Get ecosystem and search for packages
-    let ecosystem = match state.ecosystem_registry.get(ecosystem_id) {
+    let ecosystem = match state.ecosystem_registry.get(ecosystem_kind.id()) {
         Some(e) => e,
         None => return vec![],
     };
@@ -1087,15 +1081,6 @@ ser"
         // Just verify it doesn't panic - actual results depend on registry availability
         // In a real scenario with mocked registry, we'd verify it returns search results
         drop(result);
-    }
-
-    #[tokio::test]
-    async fn test_fallback_completion_unknown_ecosystem_id_returns_empty() {
-        let state = ServerState::new();
-        let content = "[dependencies]\nserde\n".to_string();
-
-        let items = fallback_completion(&state, "unknown", Position::new(1, 5), &content).await;
-        assert!(items.is_empty());
     }
 
     #[test]
