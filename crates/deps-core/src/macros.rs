@@ -142,7 +142,7 @@ macro_rules! impl_version {
 /// # Examples
 ///
 /// ```ignore
-/// use deps_core::impl_metadata;
+/// use deps_core::{PackageName, impl_metadata};
 ///
 /// pub struct MyPackage {
 ///     pub name: PackageName,

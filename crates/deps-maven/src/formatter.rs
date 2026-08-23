@@ -5,6 +5,11 @@ use deps_core::{PackageName, VersionReq};
 
 pub struct MavenFormatter;
 
+/// Unexpanded property (missing from `<properties>`).
+fn is_unresolved(requirement: &str) -> bool {
+    requirement.contains("${")
+}
+
 impl EcosystemFormatter for MavenFormatter {
     fn format_version_for_text_edit(&self, version: &str) -> String {
         // Maven uses exact versions, no prefix
@@ -17,7 +22,7 @@ impl EcosystemFormatter for MavenFormatter {
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
         // Unresolved properties (missing from <properties>) — skip comparison
-        if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
+        if is_unresolved(requirement) {
             return true;
         }
         if crate::range::is_range(requirement) {
@@ -27,8 +32,7 @@ impl EcosystemFormatter for MavenFormatter {
     }
 
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        // Unexpanded property (missing from <properties>)
-        requirement.as_str().contains("${")
+        is_unresolved(requirement.as_str())
     }
 }
 

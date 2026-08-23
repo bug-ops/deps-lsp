@@ -5,6 +5,12 @@ use deps_core::{PackageName, VersionReq};
 
 pub struct GradleFormatter;
 
+/// Unresolved Gradle variable reference (`$var`, `${var}`), or an explicit empty
+/// version-catalog entry (`[versions] foo = ""`) that a `version.ref` could point at.
+fn is_unresolved(requirement: &str) -> bool {
+    requirement.is_empty() || requirement.contains('$')
+}
+
 impl EcosystemFormatter for GradleFormatter {
     fn format_version_for_text_edit(&self, version: &str) -> String {
         version.to_string()
@@ -17,7 +23,7 @@ impl EcosystemFormatter for GradleFormatter {
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
         // Unresolved Gradle variable reference (`$var`/`${var}`), or an empty version-catalog
         // entry (`[versions] foo = ""`) — skip comparison
-        if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
+        if is_unresolved(requirement) {
             return true;
         }
         if requirement == "latest" || requirement.starts_with("latest.") {
@@ -36,9 +42,7 @@ impl EcosystemFormatter for GradleFormatter {
     }
 
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        // Unresolved Gradle variable reference (`$var`, `${var}`), or an explicit empty
-        // version-catalog entry (`[versions] foo = ""`) that a `version.ref` could point at.
-        requirement.as_str().is_empty() || requirement.as_str().contains('$')
+        is_unresolved(requirement.as_str())
     }
 }
 
