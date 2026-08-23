@@ -620,9 +620,9 @@ impl PypiParser {
         });
 
         Ok(PypiDependency {
-            name,
+            name: name.into(),
             name_range,
-            version_req,
+            version_req: version_req.map(Into::into),
             version_range,
             extras,
             extras_range: None,
@@ -699,9 +699,9 @@ impl PypiParser {
             };
 
             return Ok(PypiDependency {
-                name: name.to_string(),
+                name: name.into(),
                 name_range,
-                version_req: Some(version_str.trim().to_string()),
+                version_req: Some(version_str.trim().into()),
                 version_range,
                 extras: Vec::new(),
                 extras_range: None,
@@ -766,9 +766,9 @@ impl PypiParser {
             };
 
             return Ok(PypiDependency {
-                name: name.to_string(),
+                name: name.into(),
                 name_range,
-                version_req,
+                version_req: version_req.map(Into::into),
                 version_range: None,
                 extras,
                 extras_range: None,
@@ -881,7 +881,13 @@ dependencies = [
 
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].name, "requests");
-        assert_eq!(deps[0].version_req, Some(">=2.28.0".to_string()));
+        assert_eq!(
+            deps[0]
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some(">=2.28.0")
+        );
         assert!(matches!(
             deps[0].section,
             PypiDependencySection::Dependencies
@@ -1295,7 +1301,13 @@ django = { version = "^4.0", python = "^3.9" }
         // Poetry table-style with python constraints may not be fully parsed yet
         if !deps.is_empty() {
             assert_eq!(deps[0].name, "django");
-            assert_eq!(deps[0].version_req.as_deref(), Some("^4.0"));
+            assert_eq!(
+                deps[0]
+                    .version_req
+                    .as_ref()
+                    .map(deps_core::VersionReq::as_str),
+                Some("^4.0")
+            );
         }
     }
 
@@ -1360,7 +1372,13 @@ dependencies = [
         let result = parser.parse_content(toml, &test_uri()).unwrap();
         let deps = &result.dependencies;
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].version_req.as_deref(), Some("==4.*"));
+        assert_eq!(
+            deps[0]
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some("==4.*")
+        );
     }
 
     #[test]
@@ -1445,10 +1463,22 @@ build-backend = "setuptools.build_meta"
         );
 
         let setuptools = deps.iter().find(|d| d.name == "setuptools").unwrap();
-        assert_eq!(setuptools.version_req, Some(">=61.0".to_string()));
+        assert_eq!(
+            setuptools
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some(">=61.0")
+        );
 
         let maturin = deps.iter().find(|d| d.name == "maturin").unwrap();
-        assert_eq!(maturin.version_req, Some(">=1.7, <2.0".to_string()));
+        assert_eq!(
+            maturin
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some(">=1.7, <2.0")
+        );
 
         // wheel has no version constraint
         let wheel = deps.iter().find(|d| d.name == "wheel").unwrap();
@@ -1763,7 +1793,10 @@ requests = "^2.28.0"
 
         assert_eq!(deps.len(), 1);
         let dep = &deps[0];
-        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("^2.28.0")
+        );
         assert_eq!(dep.markers, None);
         assert_eq!(dep.markers_range, None);
     }
@@ -1779,7 +1812,10 @@ requests = "^2.28.0"
         let dep = &deps[0];
         assert_eq!(dep.name, "requests");
         // The marker suffix is split out of version_req and normalized.
-        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("^2.28.0")
+        );
         assert_eq!(
             dep.markers,
             Some("python_full_version >= '3.8'".to_string())
@@ -1802,7 +1838,10 @@ requests = "^2.28.0"
 
         assert_eq!(deps.len(), 1);
         let dep = &deps[0];
-        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("^2.28.0")
+        );
         assert_eq!(dep.markers, Some("not a valid marker (((".to_string()));
         assert!(dep.markers_range.is_some());
     }
@@ -1825,7 +1864,10 @@ requests = "^2.28.0"
         let result = parser.parse_content(toml, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
 
-        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("^2.28.0")
+        );
         assert_eq!(dep.markers, None);
         assert_eq!(dep.markers_range, None);
     }
@@ -1840,7 +1882,10 @@ requests = "^2.28.0"
         let dep = &result.dependencies[0];
 
         assert_eq!(dep.name, "requests");
-        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("^2.28.0")
+        );
         assert_eq!(
             dep.markers,
             Some("python_full_version >= '3.8'".to_string())
@@ -1861,7 +1906,10 @@ requests = "^2.28.0"
         let dep = &result.dependencies[0];
 
         assert_eq!(dep.name, "requests");
-        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("^2.28.0")
+        );
 
         let version_range = dep.version_range.expect("version_range should be set");
         assert_eq!(slice_range(toml, version_range), "^2.28.0");
@@ -1879,7 +1927,10 @@ requests = "^2.28.0"
         let result = parser.parse_content(toml, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
 
-        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("^2.28.0")
+        );
         assert_eq!(
             dep.markers,
             Some("python_full_version >= '3.8'".to_string())
@@ -1899,7 +1950,10 @@ requests = "^2.28.0"
         let result = parser.parse_content(toml, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
 
-        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("^2.28.0")
+        );
 
         let version_range = dep.version_range.expect("version_range should be set");
         assert_eq!(slice_range(toml, version_range), "^2.28.0");
@@ -1920,7 +1974,10 @@ requests = "^2.28.0"
         let result = parser.parse_content(&toml, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
 
-        assert_eq!(dep.version_req, Some("^2.28.0".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some("^2.28.0")
+        );
         assert_eq!(dep.markers, Some(long_marker));
         assert!(dep.markers_range.is_some());
     }
@@ -1935,7 +1992,10 @@ requests = "^2.28.0"
         let dep = &result.dependencies[0];
 
         assert_eq!(dep.name, "numpy");
-        assert_eq!(dep.version_req, Some(">=1.24".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some(">=1.24")
+        );
         // Skips normalization (would blow the stack in pep508_rs's parser)
         // but preserves the raw marker text rather than dropping it.
         assert_eq!(dep.markers, Some(long_marker));
@@ -1958,7 +2018,10 @@ requests = "^2.28.0"
         let dep = &result.dependencies[0];
 
         assert_eq!(dep.name, "numpy");
-        assert_eq!(dep.version_req, Some(">=1.24".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some(">=1.24")
+        );
         assert_eq!(dep.markers, Some(nested_marker));
         assert!(dep.markers_range.is_some());
     }
@@ -2010,7 +2073,10 @@ requests = "^2.28.0"
         let dep = &result.dependencies[0];
 
         assert_eq!(dep.name, "numpy");
-        assert_eq!(dep.version_req, Some(">=1.24".to_string()));
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some(">=1.24")
+        );
         // Routed through the raw fallback rather than handed to pep508_rs.
         assert_eq!(dep.markers, Some(marker));
         assert!(dep.markers_range.is_some());

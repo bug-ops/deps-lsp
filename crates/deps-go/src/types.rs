@@ -8,11 +8,11 @@ use tower_lsp_server::ls_types::Range;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GoDependency {
     /// Module path (e.g., "github.com/gin-gonic/gin")
-    pub module_path: String,
+    pub module_path: deps_core::PackageName,
     /// LSP range of the module path in source
     pub module_path_range: Range,
     /// Version requirement (e.g., "v1.9.1", "v0.0.0-20191109021931-daa7c04131f5")
-    pub version: Option<String>,
+    pub version: Option<deps_core::VersionReq>,
     /// LSP range of version in source
     pub version_range: Option<Range>,
     /// Dependency directive type
@@ -66,7 +66,7 @@ pub struct GoMetadata {
 // features() implementation (Go modules don't have features like Cargo).
 // The macro would provide features() but we need to override it anyway.
 impl deps_core::ecosystem::Dependency for GoDependency {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.module_path
     }
 
@@ -74,8 +74,8 @@ impl deps_core::ecosystem::Dependency for GoDependency {
         self.module_path_range
     }
 
-    fn version_requirement(&self) -> Option<&str> {
-        self.version.as_deref()
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version.as_ref()
     }
 
     fn version_range(&self) -> Option<Range> {
@@ -140,16 +140,19 @@ mod tests {
     #[test]
     fn test_go_dependency_trait() {
         let dep = GoDependency {
-            module_path: "github.com/gin-gonic/gin".to_string(),
+            module_path: "github.com/gin-gonic/gin".into(),
             module_path_range: Range::new(Position::new(0, 0), Position::new(0, 10)),
-            version: Some("v1.9.1".to_string()),
+            version: Some("v1.9.1".into()),
             version_range: Some(Range::new(Position::new(0, 11), Position::new(0, 17))),
             directive: GoDirective::Require,
             indirect: false,
         };
 
         assert_eq!(dep.name(), "github.com/gin-gonic/gin");
-        assert_eq!(dep.version_requirement(), Some("v1.9.1"));
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("v1.9.1")
+        );
         assert!(matches!(dep.source(), DependencySource::Registry));
         assert_eq!(dep.features().len(), 0);
     }
@@ -198,7 +201,7 @@ mod tests {
     #[test]
     fn test_go_metadata_trait() {
         let metadata = GoMetadata {
-            module_path: "github.com/gin-gonic/gin".to_string(),
+            module_path: "github.com/gin-gonic/gin".into(),
             latest_version: "v1.9.1".to_string(),
             description: Some("Gin is a HTTP web framework".to_string()),
             repository: Some("https://github.com/gin-gonic/gin".to_string()),

@@ -715,14 +715,14 @@ mod tests {
     // Mock implementations for testing
 
     struct MockDependency {
-        name: String,
+        name: crate::PackageName,
         name_range: Range,
         version_range: Option<Range>,
         features_range: Option<Range>,
     }
 
     impl crate::ecosystem::Dependency for MockDependency {
-        fn name(&self) -> &str {
+        fn name(&self) -> &crate::PackageName {
             &self.name
         }
 
@@ -730,8 +730,10 @@ mod tests {
             self.name_range
         }
 
-        fn version_requirement(&self) -> Option<&str> {
-            Some("1.0")
+        fn version_requirement(&self) -> Option<&crate::VersionReq> {
+            static VERSION_REQ: std::sync::LazyLock<crate::VersionReq> =
+                std::sync::LazyLock::new(|| crate::VersionReq::new("1.0"));
+            Some(&VERSION_REQ)
         }
 
         fn version_range(&self) -> Option<Range> {
@@ -893,7 +895,7 @@ mod tests {
     fn test_detect_package_name_context_at_start() {
         let parse_result = MockParseResult {
             dependencies: vec![MockDependency {
-                name: "serde".to_string(),
+                name: "serde".into(),
                 name_range: Range {
                     start: Position {
                         line: 0,
@@ -929,7 +931,7 @@ mod tests {
     fn test_detect_package_name_context_partial() {
         let parse_result = MockParseResult {
             dependencies: vec![MockDependency {
-                name: "serde".to_string(),
+                name: "serde".into(),
                 name_range: Range {
                     start: Position {
                         line: 0,
@@ -965,7 +967,7 @@ mod tests {
     fn test_detect_version_context() {
         let parse_result = MockParseResult {
             dependencies: vec![MockDependency {
-                name: "serde".to_string(),
+                name: "serde".into(),
                 name_range: Range {
                     start: Position {
                         line: 0,
@@ -1014,7 +1016,7 @@ mod tests {
     fn test_detect_no_context_before_dependencies() {
         let parse_result = MockParseResult {
             dependencies: vec![MockDependency {
-                name: "serde".to_string(),
+                name: "serde".into(),
                 name_range: Range {
                     start: Position {
                         line: 5,
@@ -2306,7 +2308,7 @@ mod tests {
         features_range: Range,
     ) -> MockDependency {
         MockDependency {
-            name: name.to_string(),
+            name: name.into(),
             name_range,
             version_range: None,
             features_range: Some(features_range),

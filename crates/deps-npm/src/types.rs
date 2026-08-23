@@ -25,9 +25,9 @@ use tower_lsp_server::ls_types::Range;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NpmDependency {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub name_range: Range,
-    pub version_req: Option<String>,
+    pub version_req: Option<deps_core::VersionReq>,
     pub version_range: Option<Range>,
     pub section: NpmDependencySection,
 }

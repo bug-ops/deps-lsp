@@ -109,9 +109,9 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
                         parse_dependency_entry(name, value, content, &line_table);
 
                     dependencies.push(DartDependency {
-                        name: name.to_string(),
+                        name: name.into(),
                         name_range,
-                        version_req,
+                        version_req: version_req.map(Into::into),
                         version_range,
                         section: section.clone(),
                         source,

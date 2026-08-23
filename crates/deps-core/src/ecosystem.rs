@@ -137,13 +137,13 @@ pub trait ParseResult: Send + Sync {
 /// All parsed dependencies must implement this for generic handler access.
 pub trait Dependency: Send + Sync {
     /// Package name
-    fn name(&self) -> &str;
+    fn name(&self) -> &crate::PackageName;
 
     /// LSP range of the dependency name
     fn name_range(&self) -> tower_lsp_server::ls_types::Range;
 
     /// Version requirement string (e.g., "^1.0", ">=2.0")
-    fn version_requirement(&self) -> Option<&str>;
+    fn version_requirement(&self) -> Option<&crate::VersionReq>;
 
     /// LSP range of the version string
     fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range>;
@@ -514,13 +514,15 @@ mod tests {
     fn test_dependency_default_features() {
         struct MockDep;
         impl Dependency for MockDep {
-            fn name(&self) -> &'static str {
-                "test"
+            fn name(&self) -> &crate::PackageName {
+                static NAME: std::sync::LazyLock<crate::PackageName> =
+                    std::sync::LazyLock::new(|| crate::PackageName::new("test"));
+                &NAME
             }
             fn name_range(&self) -> tower_lsp_server::ls_types::Range {
                 tower_lsp_server::ls_types::Range::default()
             }
-            fn version_requirement(&self) -> Option<&str> {
+            fn version_requirement(&self) -> Option<&crate::VersionReq> {
                 None
             }
             fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {

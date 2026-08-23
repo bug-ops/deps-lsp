@@ -10,11 +10,11 @@ use tower_lsp_server::ls_types::Range;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwiftDependency {
     /// Package identity: owner/repo (e.g. "apple/swift-nio")
-    pub name: String,
+    pub name: deps_core::PackageName,
     /// LSP range of the URL string content (excluding quotes)
     pub name_range: Range,
     /// Normalized version requirement or None for branch/revision/path deps
-    pub version_req: Option<String>,
+    pub version_req: Option<deps_core::VersionReq>,
     /// LSP range of the version string content (excluding quotes), None for non-registry deps
     pub version_range: Option<Range>,
     /// Original Git URL from Package.swift
@@ -24,7 +24,7 @@ pub struct SwiftDependency {
 }
 
 impl deps_core::ecosystem::Dependency for SwiftDependency {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 
@@ -32,8 +32,8 @@ impl deps_core::ecosystem::Dependency for SwiftDependency {
         self.name_range
     }
 
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
     }
 
     fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
@@ -132,7 +132,10 @@ mod tests {
         };
 
         assert_eq!(dep.name(), "apple/swift-nio");
-        assert_eq!(dep.version_requirement(), Some(">=2.0.0, <3.0.0"));
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some(">=2.0.0, <3.0.0")
+        );
         assert!(matches!(dep.source(), DependencySource::Registry));
     }
 

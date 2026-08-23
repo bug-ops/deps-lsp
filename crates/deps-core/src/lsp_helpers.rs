@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::{
     TextEdit, Uri, WorkspaceEdit,
 };
 
-use crate::{Dependency, EcosystemConfig, ParseResult, Registry};
+use crate::{Dependency, EcosystemConfig, ParseResult, Registry, VersionReq};
 
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
 /// together everywhere.
@@ -319,15 +319,15 @@ pub fn generate_inlay_hints(
             continue;
         };
 
-        let normalized_name = formatter.normalize_package_name(dep.name());
+        let normalized_name = formatter.normalize_package_name(dep.name().as_str());
         let latest_version = versions
             .cached
             .get(&normalized_name)
-            .or_else(|| versions.cached.get(dep.name()));
+            .or_else(|| versions.cached.get(dep.name().as_str()));
         let resolved_version = versions
             .resolved
             .get(&normalized_name)
-            .or_else(|| versions.resolved.get(dep.name()));
+            .or_else(|| versions.resolved.get(dep.name().as_str()));
 
         // Show loading hint if loading and no cached version
         if loading_state == crate::LoadingState::Loading
@@ -376,7 +376,7 @@ pub fn generate_inlay_hints(
         let is_up_to_date = if let Some(resolved) = resolved_version {
             resolved.as_str() == latest.as_str()
         } else {
-            let version_req = dep.version_requirement().unwrap_or("");
+            let version_req = dep.version_requirement().map_or("", VersionReq::as_str);
             formatter.is_requirement_up_to_date(version_req, latest)
         };
 
@@ -426,26 +426,26 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         on_name || on_version
     })?;
 
-    let available_versions = registry.get_versions(dep.name()).await.ok()?;
+    let available_versions = registry.get_versions(dep.name().as_str()).await.ok()?;
 
-    let url = formatter.package_url(dep.name());
+    let url = formatter.package_url(dep.name().as_str());
 
     // Pre-allocate with estimated capacity to reduce allocations
     let mut markdown = String::with_capacity(512);
     write!(
         &mut markdown,
         "# [{}]({})\n\n",
-        escape_markdown(dep.name()),
+        escape_markdown(dep.name().as_str()),
         url
     )
     .unwrap();
 
-    let normalized_name = formatter.normalize_package_name(dep.name());
+    let normalized_name = formatter.normalize_package_name(dep.name().as_str());
 
     let resolved = versions
         .resolved
         .get(&normalized_name)
-        .or_else(|| versions.resolved.get(dep.name()));
+        .or_else(|| versions.resolved.get(dep.name().as_str()));
     if let Some(resolved_ver) = resolved {
         write!(
             &mut markdown,
@@ -457,7 +457,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         write!(
             &mut markdown,
             "**Requirement**: {}\n\n",
-            markdown_code_span(version_req)
+            markdown_code_span(version_req.as_str())
         )
         .unwrap();
     }
@@ -474,7 +474,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let latest = versions
         .cached
         .get(&normalized_name)
-        .or_else(|| versions.cached.get(dep.name()));
+        .or_else(|| versions.cached.get(dep.name().as_str()));
     if let Some(latest_ver) = latest {
         write!(
             &mut markdown,
@@ -536,11 +536,11 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         return actions;
     };
 
-    let Ok(versions) = registry.get_versions(dep.name()).await else {
+    let Ok(versions) = registry.get_versions(dep.name().as_str()).await else {
         return actions;
     };
 
-    let display_items = prepare_version_display_items(&versions, dep.name());
+    let display_items = prepare_version_display_items(&versions, dep.name().as_str());
 
     for item in display_items {
         let new_text = formatter.format_version_for_text_edit(&item.version);
@@ -588,17 +588,17 @@ pub fn generate_diagnostics_from_cache(
     let mut diagnostics = Vec::with_capacity(deps.len());
 
     for dep in deps {
-        let normalized_name = formatter.normalize_package_name(dep.name());
+        let normalized_name = formatter.normalize_package_name(dep.name().as_str());
         let latest_version = versions
             .cached
             .get(&normalized_name)
-            .or_else(|| versions.cached.get(dep.name()));
+            .or_else(|| versions.cached.get(dep.name().as_str()));
 
         let Some(latest) = latest_version else {
             // Skip "unknown" diagnostic if package exists in lock file
             // (registry fetch may have failed due to rate limiting)
             let in_lockfile = versions.resolved.contains_key(&normalized_name)
-                || versions.resolved.contains_key(dep.name());
+                || versions.resolved.contains_key(dep.name().as_str());
             if !in_lockfile {
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
@@ -615,7 +615,7 @@ pub fn generate_diagnostics_from_cache(
             continue;
         };
 
-        let version_req = dep.version_requirement().unwrap_or("");
+        let version_req = dep.version_requirement().map_or("", VersionReq::as_str);
         let is_up_to_date = formatter.is_requirement_up_to_date(version_req, latest);
 
         if !is_up_to_date {
@@ -648,7 +648,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
     let mut diagnostics = Vec::with_capacity(deps.len());
 
     for dep in deps {
-        let versions = match registry.get_versions(dep.name()).await {
+        let versions = match registry.get_versions(dep.name().as_str()).await {
             Ok(v) => v,
             Err(_) => {
                 diagnostics.push(Diagnostic {
@@ -670,7 +670,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
         };
 
         let matching = registry
-            .get_latest_matching(dep.name(), version_req)
+            .get_latest_matching(dep.name().as_str(), version_req.as_str())
             .await
             .ok()
             .flatten();
@@ -688,7 +688,8 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
 
             let latest = crate::registry::find_latest_stable(&versions);
             if let Some(latest) = latest
-                && !formatter.is_requirement_up_to_date(version_req, latest.version_string())
+                && !formatter
+                    .is_requirement_up_to_date(version_req.as_str(), latest.version_string())
             {
                 diagnostics.push(Diagnostic {
                     range: version_range,
@@ -707,6 +708,7 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PackageName;
     use std::any::Any;
 
     #[test]
@@ -932,20 +934,20 @@ mod tests {
     }
 
     struct MockDep {
-        name: String,
-        version_req: String,
+        name: PackageName,
+        version_req: VersionReq,
         version_range: Range,
         name_range: Range,
     }
 
     impl Dependency for MockDep {
-        fn name(&self) -> &str {
+        fn name(&self) -> &PackageName {
             &self.name
         }
         fn name_range(&self) -> Range {
             self.name_range
         }
-        fn version_requirement(&self) -> Option<&str> {
+        fn version_requirement(&self) -> Option<&VersionReq> {
             Some(&self.version_req)
         }
         fn version_range(&self) -> Option<Range> {
@@ -1021,19 +1023,19 @@ mod tests {
     }
 
     struct MockMarkedDep {
-        name: String,
+        name: PackageName,
         name_range: Range,
         markers: Option<String>,
     }
 
     impl Dependency for MockMarkedDep {
-        fn name(&self) -> &str {
+        fn name(&self) -> &PackageName {
             &self.name
         }
         fn name_range(&self) -> Range {
             self.name_range
         }
-        fn version_requirement(&self) -> Option<&str> {
+        fn version_requirement(&self) -> Option<&VersionReq> {
             None
         }
         fn version_range(&self) -> Option<Range> {
@@ -1115,7 +1117,7 @@ mod tests {
 
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
-                name: "numpy".to_string(),
+                name: "numpy".into(),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 markers: Some("python_full_version >= '3.9'".to_string()),
             },
@@ -1149,7 +1151,7 @@ mod tests {
 
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
-                name: "requests".to_string(),
+                name: "requests".into(),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
                 markers: None,
             },
@@ -1181,8 +1183,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: malicious_name.to_string(),
-                version_req: "1.0.0".to_string(),
+                name: malicious_name.into(),
+                version_req: "1.0.0".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(
                     Position::new(0, 0),
@@ -1237,8 +1239,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: malicious_name.to_string(),
-                version_req: "1.0.0".to_string(),
+                name: malicious_name.into(),
+                version_req: "1.0.0".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(
                     Position::new(0, 0),
@@ -1292,7 +1294,7 @@ mod tests {
         let marker = "python_version >= \"3.8\" and (sys_platform == \"linux\")";
         let parse_result = MockMarkedParseResult {
             dep: MockMarkedDep {
-                name: "numpy".to_string(),
+                name: "numpy".into(),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 markers: Some(marker.to_string()),
             },
@@ -1335,8 +1337,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "serde".to_string(),
-                version_req: "=2.0.12".to_string(),
+                name: "serde".into(),
+                version_req: "=2.0.12".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
@@ -1382,8 +1384,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "serde".to_string(),
-                version_req: "^2.0".to_string(),
+                name: "serde".into(),
+                version_req: "^2.0".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
@@ -1433,8 +1435,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "tokio".to_string(),
-                version_req: "1.0".to_string(),
+                name: "tokio".into(),
+                version_req: "1.0".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
@@ -1483,8 +1485,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "tokio".to_string(),
-                version_req: "1.0".to_string(),
+                name: "tokio".into(),
+                version_req: "1.0".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
@@ -1563,8 +1565,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "serde".to_string(),
-                version_req: "1.0".to_string(),
+                name: "serde".into(),
+                version_req: "1.0".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
@@ -1608,8 +1610,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "unknown-pkg".to_string(),
-                version_req: "1.0.0".to_string(),
+                name: "unknown-pkg".into(),
+                version_req: "1.0.0".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
             }],
@@ -1640,8 +1642,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "serde".to_string(),
-                version_req: "1.0".to_string(),
+                name: "serde".into(),
+                version_req: "1.0".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
@@ -1674,8 +1676,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "serde".to_string(),
-                version_req: "^1.0".to_string(),
+                name: "serde".into(),
+                version_req: "^1.0".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
             }],
@@ -1709,20 +1711,20 @@ mod tests {
         let parse_result = MockParseResult {
             deps: vec![
                 MockDep {
-                    name: "serde".to_string(),
-                    version_req: "^1.0".to_string(),
+                    name: "serde".into(),
+                    version_req: "^1.0".into(),
                     version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                     name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
                 },
                 MockDep {
-                    name: "tokio".to_string(),
-                    version_req: "1.0".to_string(),
+                    name: "tokio".into(),
+                    version_req: "1.0".into(),
                     version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
                     name_range: Range::new(Position::new(1, 0), Position::new(1, 5)),
                 },
                 MockDep {
-                    name: "unknown".to_string(),
-                    version_req: "1.0".to_string(),
+                    name: "unknown".into(),
+                    version_req: "1.0".into(),
                     version_range: Range::new(Position::new(2, 10), Position::new(2, 20)),
                     name_range: Range::new(Position::new(2, 0), Position::new(2, 7)),
                 },
@@ -1771,8 +1773,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "criterion".to_string(),
-                version_req: "0.5".to_string(),
+                name: "criterion".into(),
+                version_req: "0.5".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 9)),
             }],
@@ -1822,8 +1824,8 @@ mod tests {
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
-                name: "criterion".to_string(),
-                version_req: "0.4".to_string(),
+                name: "criterion".into(),
+                version_req: "0.4".into(),
                 version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 9)),
             }],

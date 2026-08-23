@@ -32,11 +32,11 @@ use tower_lsp_server::ls_types::Range;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PypiDependency {
     /// Package name (normalized to lowercase with underscores replaced by hyphens)
-    pub name: String,
+    pub name: deps_core::PackageName,
     /// LSP range of the package name
     pub name_range: Range,
     /// PEP 440 version specifier (e.g., ">=2.28.0,<3.0")
-    pub version_req: Option<String>,
+    pub version_req: Option<deps_core::VersionReq>,
     /// LSP range of the version specifier
     pub version_range: Option<Range>,
     /// PEP 508 extras (e.g., ["security", "socks"])
@@ -188,7 +188,7 @@ pub struct PypiPackage {
 // Implement deps_core traits
 
 impl deps_core::Dependency for PypiDependency {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 
@@ -196,8 +196,8 @@ impl deps_core::Dependency for PypiDependency {
         self.name_range
     }
 
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
     }
 
     fn version_range(&self) -> Option<Range> {

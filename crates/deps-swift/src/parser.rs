@@ -230,9 +230,9 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let version_req = format!(">={ver_str}, <{}.0.0", next_major(major));
 
         dependencies.push(SwiftDependency {
-            name: identity,
+            name: identity.into(),
             name_range: make_range(url.start(), url.end()),
-            version_req: Some(version_req),
+            version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             url: url_str.to_string(),
             source: DependencySource::Registry,
@@ -263,9 +263,9 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let version_req = format!(">={ver_str}, <{}", next_minor(major, minor));
 
         dependencies.push(SwiftDependency {
-            name: identity,
+            name: identity.into(),
             name_range: make_range(url.start(), url.end()),
-            version_req: Some(version_req),
+            version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             url: url_str.to_string(),
             source: DependencySource::Registry,
@@ -293,9 +293,9 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let version_req = format!("={ver_str}");
 
         dependencies.push(SwiftDependency {
-            name: identity,
+            name: identity.into(),
             name_range: make_range(url.start(), url.end()),
-            version_req: Some(version_req),
+            version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             url: url_str.to_string(),
             source: DependencySource::Registry,
@@ -325,9 +325,9 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let version_req = format!(">={lower_str}, <{upper_str}");
 
         dependencies.push(SwiftDependency {
-            name: identity,
+            name: identity.into(),
             name_range: make_range(url.start(), url.end()),
-            version_req: Some(version_req),
+            version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
             url: url_str.to_string(),
             source: DependencySource::Registry,
@@ -357,9 +357,9 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let version_req = format!(">={lower_str}, <={upper_str}");
 
         dependencies.push(SwiftDependency {
-            name: identity,
+            name: identity.into(),
             name_range: make_range(url.start(), url.end()),
-            version_req: Some(version_req),
+            version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
             url: url_str.to_string(),
             source: DependencySource::Registry,
@@ -387,9 +387,9 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let version_req = format!(">={ver_str}, <{}.0.0", next_major(ver_str));
 
         dependencies.push(SwiftDependency {
-            name: identity,
+            name: identity.into(),
             name_range: make_range(url.start(), url.end()),
-            version_req: Some(version_req),
+            version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
             url: url_str.to_string(),
             source: DependencySource::Registry,
@@ -412,7 +412,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let identity = url_to_identity(url_str).unwrap_or_else(|| url_str.to_string());
 
         dependencies.push(SwiftDependency {
-            name: identity,
+            name: identity.into(),
             name_range: make_range(url.start(), url.end()),
             version_req: None,
             version_range: None,
@@ -440,7 +440,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
         let identity = url_to_identity(url_str).unwrap_or_else(|| url_str.to_string());
 
         dependencies.push(SwiftDependency {
-            name: identity,
+            name: identity.into(),
             name_range: make_range(url.start(), url.end()),
             version_req: None,
             version_range: None,
@@ -469,7 +469,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             .to_string();
 
         dependencies.push(SwiftDependency {
-            name,
+            name: name.into(),
             name_range: make_range(path.start(), path.end()),
             version_req: None,
             version_range: None,
@@ -533,7 +533,10 @@ let package = Package(
         assert_eq!(result.dependencies.len(), 1);
         let dep = &result.dependencies[0];
         assert_eq!(dep.name(), "apple/swift-nio");
-        assert_eq!(dep.version_requirement(), Some(">=2.40.0, <3.0.0"));
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some(">=2.40.0, <3.0.0")
+        );
         assert!(dep.version_range().is_some());
     }
 
@@ -546,7 +549,10 @@ let package = Package(
         assert_eq!(result.dependencies.len(), 1);
         let dep = &result.dependencies[0];
         assert_eq!(dep.name(), "apple/swift-log");
-        assert_eq!(dep.version_requirement(), Some(">=1.5.0, <2.0.0"));
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some(">=1.5.0, <2.0.0")
+        );
     }
 
     #[test]
@@ -557,7 +563,10 @@ let package = Package(
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         let dep = &result.dependencies[0];
-        assert_eq!(dep.version_requirement(), Some(">=2.3.0, <2.4.0"));
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some(">=2.3.0, <2.4.0")
+        );
     }
 
     #[test]
@@ -565,7 +574,12 @@ let package = Package(
         let content = r#".package(url: "https://github.com/apple/swift-crypto", .exact("3.0.0"))"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert_eq!(result.dependencies[0].version_requirement(), Some("=3.0.0"));
+        assert_eq!(
+            result.dependencies[0]
+                .version_requirement()
+                .map(deps_core::VersionReq::as_str),
+            Some("=3.0.0")
+        );
     }
 
     #[test]
@@ -574,7 +588,9 @@ let package = Package(
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(
-            result.dependencies[0].version_requirement(),
+            result.dependencies[0]
+                .version_requirement()
+                .map(deps_core::VersionReq::as_str),
             Some(">=1.0.0, <2.0.0")
         );
     }
@@ -585,7 +601,9 @@ let package = Package(
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(
-            result.dependencies[0].version_requirement(),
+            result.dependencies[0]
+                .version_requirement()
+                .map(deps_core::VersionReq::as_str),
             Some(">=1.0.0, <=1.9.9")
         );
     }
@@ -847,7 +865,9 @@ let package = Package(
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(
-            result.dependencies[0].version_requirement(),
+            result.dependencies[0]
+                .version_requirement()
+                .map(deps_core::VersionReq::as_str),
             Some(">=1.5.0, <2.0.0")
         );
     }
@@ -862,7 +882,12 @@ let package = Package(
 "#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert_eq!(result.dependencies[0].version_requirement(), Some("=3.0.0"));
+        assert_eq!(
+            result.dependencies[0]
+                .version_requirement()
+                .map(deps_core::VersionReq::as_str),
+            Some("=3.0.0")
+        );
     }
 
     // --- version range position tracking ---

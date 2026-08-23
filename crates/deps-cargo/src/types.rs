@@ -33,9 +33,9 @@ pub use deps_core::parser::DependencySource;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedDependency {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub name_range: Range,
-    pub version_req: Option<String>,
+    pub version_req: Option<deps_core::VersionReq>,
     pub version_range: Option<Range>,
     pub features: Vec<String>,
     pub features_range: Option<Range>,
@@ -134,7 +134,7 @@ pub struct CrateInfo {
 // Trait implementations for deps-core integration
 
 impl deps_core::Dependency for ParsedDependency {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 
@@ -142,8 +142,8 @@ impl deps_core::Dependency for ParsedDependency {
         self.name_range
     }
 
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
     }
 
     fn version_range(&self) -> Option<Range> {

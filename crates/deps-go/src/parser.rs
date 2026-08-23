@@ -223,9 +223,9 @@ fn parse_require_line(
     );
 
     Some(GoDependency {
-        module_path: module_path.to_string(),
+        module_path: module_path.into(),
         module_path_range,
-        version: Some(version.to_string()),
+        version: Some(version.into()),
         version_range: Some(version_range),
         directive: GoDirective::Require,
         indirect,
@@ -261,9 +261,9 @@ fn parse_replace_line(
     };
 
     Some(GoDependency {
-        module_path: module.to_string(),
+        module_path: module.into(),
         module_path_range,
-        version: version_str,
+        version: version_str.map(Into::into),
         version_range,
         directive: GoDirective::Replace,
         indirect: false,
@@ -294,9 +294,9 @@ fn parse_exclude_line(
     );
 
     Some(GoDependency {
-        module_path: module.to_string(),
+        module_path: module.into(),
         module_path_range,
-        version: Some(version.to_string()),
+        version: Some(version.into()),
         version_range: Some(version_range),
         directive: GoDirective::Exclude,
         indirect: false,
@@ -333,7 +333,13 @@ require github.com/gin-gonic/gin v1.9.1
             result.dependencies[0].module_path,
             "github.com/gin-gonic/gin"
         );
-        assert_eq!(result.dependencies[0].version, Some("v1.9.1".to_string()));
+        assert_eq!(
+            result.dependencies[0]
+                .version
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some("v1.9.1")
+        );
         assert!(!result.dependencies[0].indirect);
     }
 
@@ -380,7 +386,13 @@ require github.com/gin-gonic/gin v1.9.1
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].directive, GoDirective::Exclude);
         assert_eq!(result.dependencies[0].module_path, "github.com/bad/module");
-        assert_eq!(result.dependencies[0].version, Some("v0.1.0".to_string()));
+        assert_eq!(
+            result.dependencies[0]
+                .version
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some("v0.1.0")
+        );
     }
 
     #[test]
@@ -389,7 +401,9 @@ require github.com/gin-gonic/gin v1.9.1
         let result = parse_go_mod(content, &test_uri()).unwrap();
         assert_eq!(
             result.dependencies[0].version,
-            Some("v0.0.0-20191109021931-daa7c04131f5".to_string())
+            Some(deps_core::VersionReq::new(
+                "v0.0.0-20191109021931-daa7c04131f5"
+            ))
         );
     }
 
@@ -502,14 +516,20 @@ exclude github.com/bad/module v0.1.0
         // Check gin-gonic (require, direct)
         let gin = &result.dependencies[0];
         assert_eq!(gin.module_path, "github.com/gin-gonic/gin");
-        assert_eq!(gin.version, Some("v1.9.1".to_string()));
+        assert_eq!(
+            gin.version.as_ref().map(deps_core::VersionReq::as_str),
+            Some("v1.9.1")
+        );
         assert_eq!(gin.directive, GoDirective::Require);
         assert!(!gin.indirect);
 
         // Check crypto (require, indirect)
         let crypto = &result.dependencies[1];
         assert_eq!(crypto.module_path, "golang.org/x/crypto");
-        assert_eq!(crypto.version, Some("v0.17.0".to_string()));
+        assert_eq!(
+            crypto.version.as_ref().map(deps_core::VersionReq::as_str),
+            Some("v0.17.0")
+        );
         assert_eq!(crypto.directive, GoDirective::Require);
         assert!(crypto.indirect);
 
@@ -522,7 +542,10 @@ exclude github.com/bad/module v0.1.0
         // Check exclude directive
         let exclude = &result.dependencies[3];
         assert_eq!(exclude.module_path, "github.com/bad/module");
-        assert_eq!(exclude.version, Some("v0.1.0".to_string()));
+        assert_eq!(
+            exclude.version.as_ref().map(deps_core::VersionReq::as_str),
+            Some("v0.1.0")
+        );
         assert_eq!(exclude.directive, GoDirective::Exclude);
     }
 

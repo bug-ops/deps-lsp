@@ -6,9 +6,9 @@ use tower_lsp_server::ls_types::Range;
 /// Parsed dependency from Gemfile with position tracking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundlerDependency {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub name_range: Range,
-    pub version_req: Option<String>,
+    pub version_req: Option<deps_core::VersionReq>,
     pub version_range: Option<Range>,
     pub group: DependencyGroup,
     pub source: DependencySource,
@@ -68,7 +68,7 @@ pub struct GemInfo {
 // Trait implementations for deps-core integration
 
 impl deps_core::Dependency for BundlerDependency {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 
@@ -76,8 +76,8 @@ impl deps_core::Dependency for BundlerDependency {
         self.name_range
     }
 
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
     }
 
     fn version_range(&self) -> Option<Range> {
@@ -215,7 +215,10 @@ mod tests {
         };
 
         assert_eq!(dep.name(), "rails");
-        assert_eq!(dep.version_requirement(), Some("~> 7.0"));
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("~> 7.0")
+        );
     }
 
     #[test]
@@ -225,7 +228,10 @@ mod tests {
         let dep = create_test_dependency(DependencySource::Registry);
         assert_eq!(dep.name(), "test_gem");
         assert_eq!(dep.name_range().start.line, 1);
-        assert_eq!(dep.version_requirement(), Some("~> 1.0"));
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("~> 1.0")
+        );
         assert!(dep.version_range().is_some());
         assert!(dep.features().is_empty());
         assert!(dep.source().is_registry());

@@ -7,21 +7,21 @@
 /// # Arguments
 ///
 /// * `$type` - The struct type name
-/// * `name` - Field name for the dependency name (`String`)
+/// * `name` - Field name for the dependency name (`PackageName`)
 /// * `name_range` - Field name for the name range (`Range`)
-/// * `version` - Field name for version requirement (`Option<String>`)
+/// * `version` - Field name for version requirement (`Option<VersionReq>`)
 /// * `version_range` - Field name for version range (`Option<Range>`)
 /// * `source` - Optional: expression for dependency source (defaults to `Registry`)
 ///
 /// # Examples
 ///
 /// ```ignore
-/// use deps_core::impl_dependency;
+/// use deps_core::{impl_dependency, PackageName, VersionReq};
 ///
 /// pub struct MyDependency {
-///     pub name: String,
+///     pub name: PackageName,
 ///     pub name_range: Range,
-///     pub version_req: Option<String>,
+///     pub version_req: Option<VersionReq>,
 ///     pub version_range: Option<Range>,
 /// }
 ///
@@ -56,7 +56,7 @@ macro_rules! impl_dependency {
         source: $source:expr $(,)?
     }) => {
         impl $crate::ecosystem::Dependency for $type {
-            fn name(&self) -> &str {
+            fn name(&self) -> &$crate::PackageName {
                 &self.$name
             }
 
@@ -64,8 +64,8 @@ macro_rules! impl_dependency {
                 self.$name_range
             }
 
-            fn version_requirement(&self) -> Option<&str> {
-                self.$version.as_deref()
+            fn version_requirement(&self) -> Option<&$crate::VersionReq> {
+                self.$version.as_ref()
             }
 
             fn version_range(&self) -> Option<::tower_lsp_server::ls_types::Range> {
@@ -291,9 +291,9 @@ mod tests {
     // Test structs
     #[derive(Debug, Clone)]
     struct TestDependency {
-        name: String,
+        name: crate::PackageName,
         name_range: Range,
-        version_req: Option<String>,
+        version_req: Option<crate::VersionReq>,
         version_range: Option<Range>,
     }
 
@@ -359,7 +359,10 @@ mod tests {
         };
 
         assert_eq!(dep.name(), "test-pkg");
-        assert_eq!(dep.version_requirement(), Some("1.0.0"));
+        assert_eq!(
+            dep.version_requirement().map(crate::VersionReq::as_str),
+            Some("1.0.0")
+        );
         assert!(dep.as_any().is::<TestDependency>());
     }
 

@@ -148,7 +148,7 @@ impl Ecosystem for MavenEcosystem {
                             || d.name_range().start.line == position.line
                     });
                     if let Some(dep) = dep {
-                        self.complete_versions(dep.name(), value).await
+                        self.complete_versions(dep.name().as_str(), value).await
                     } else {
                         vec![]
                     }

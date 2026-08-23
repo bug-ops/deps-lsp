@@ -179,9 +179,9 @@ fn parse_dependency_section(
             find_dependency_positions(content, name, version_req.as_ref(), line_table);
 
         result.push(NpmDependency {
-            name: name.clone(),
+            name: name.clone().into(),
             name_range,
-            version_req,
+            version_req: version_req.map(Into::into),
             version_range,
             section,
         });
