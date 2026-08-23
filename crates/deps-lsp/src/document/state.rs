@@ -51,6 +51,15 @@ pub struct DocumentState {
     /// the first background scan completes; carried across document edits
     /// by `preserve_cache` so it is not wiped on every keystroke.
     pub vulnerabilities: VulnerabilityMap,
+    /// Yanked-version findings from the lifecycle's registry fetch, keyed by
+    /// **normalized** package name -> the version string found yanked. This
+    /// is deliberately a different type from `FetchResult::yanked_versions`
+    /// (raw-keyed): the split makes a forgotten normalization at a
+    /// store/merge site a compile error rather than a silent bug for
+    /// ecosystems where normalization changes the name (e.g. PyPI). Empty
+    /// until the first fetch completes; carried across document edits by
+    /// `preserve_cache`.
+    pub yanked_versions: HashMap<String, String>,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -75,6 +84,7 @@ impl Clone for DocumentState {
             cached_versions: self.cached_versions.clone(),
             resolved_versions: self.resolved_versions.clone(),
             vulnerabilities: self.vulnerabilities.clone(),
+            yanked_versions: self.yanked_versions.clone(),
             parsed_at: self.parsed_at,
             loading_state: self.loading_state,
             // Note: Instant is Copy. Clones share the same loading start time.
@@ -173,6 +183,7 @@ impl std::fmt::Debug for DocumentState {
             .field("cached_versions_count", &self.cached_versions.len())
             .field("resolved_versions_count", &self.resolved_versions.len())
             .field("vulnerabilities_count", &self.vulnerabilities.len())
+            .field("yanked_versions_count", &self.yanked_versions.len())
             .field("parsed_at", &self.parsed_at)
             .field("loading_state", &self.loading_state)
             .field("loading_started_at", &self.loading_started_at)
@@ -197,6 +208,7 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
+            yanked_versions: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -216,6 +228,7 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
+            yanked_versions: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -248,6 +261,11 @@ impl DocumentState {
     /// Updates the OSV.dev scan results.
     pub fn update_vulnerabilities(&mut self, vulnerabilities: VulnerabilityMap) {
         self.vulnerabilities = vulnerabilities;
+    }
+
+    /// Updates the yanked-version findings, keyed by normalized package name.
+    pub fn update_yanked_versions(&mut self, yanked_versions: HashMap<String, String>) {
+        self.yanked_versions = yanked_versions;
     }
 
     /// Sets the LSP document version from the client's `didOpen`/`didChange`, or clears

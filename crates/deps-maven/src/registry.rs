@@ -396,6 +396,13 @@ impl deps_core::Registry for MavenCentralRegistry {
         versions.iter().position(|v| v.version_string() == req_str)
     }
 
+    // Maven Central has no retraction concept (`types.rs:98`) — `is_yanked`
+    // is hardcoded `false`. Also covers Gradle, whose `registry()` returns
+    // its own instance of this same `MavenCentralRegistry` type (#233).
+    fn reports_yanked(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

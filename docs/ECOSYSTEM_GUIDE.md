@@ -20,6 +20,30 @@ deps-lsp provides comprehensive LSP support for 11 package ecosystems:
 | **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, GitHub API support (code lens not covered — see below) |
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling |
 
+### Yanked-Version Diagnostics
+
+`diagnostics.yanked_severity` flags a dependency pinned to a version the registry
+reports as yanked/deprecated/retracted, covering either the lock-file-resolved
+version or an exact manifest pin (e.g. `requirements.txt`'s `==1.2.3`) when no lock
+file exists. The check is conditional: it only runs for a dependency whose in-use
+version differs from the registry's reported latest, and only against a registry
+that exposes real per-version yank data — an up-to-date dependency costs nothing
+extra.
+
+| Ecosystem | Yanked diagnostic | Registry signal |
+|-----------|--------------------|------------------|
+| Cargo | Yes | crates.io sparse-index `yanked` |
+| npm | Yes | npm `deprecated` |
+| PyPI | Yes | PEP 592 per-file yank status |
+| Bundler | Yes | RubyGems `yanked` |
+| Dart | Yes | pub.dev `retracted` |
+| Go | No | module proxy reports no retraction data |
+| Maven | No | Maven Central has no retraction concept |
+| Gradle | No | delegates to the same Maven Central registry as Maven |
+| Swift | No | Swift package registries expose no per-tag yank signal |
+| NuGet | No | unlisted versions are not distinguishable from listed ones today |
+| Composer | No | Packagist's `abandoned` flag is package-level, not per-version — enabling it would fire on nearly every dependency of an abandoned package rather than the specific withdrawn release |
+
 ### PyPI Environment Markers (PEP 508)
 
 When a Python dependency is gated by an environment marker (e.g., `numpy>=1.24; python_version>='3.9'`), the hover popup displays:
