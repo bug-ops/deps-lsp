@@ -5,7 +5,14 @@ use thiserror::Error;
 /// These errors cover parsing pyproject.toml files and validating PEP 508
 /// dependency specifications. Registry communication errors are reported as
 /// `deps_core::DepsError` directly (see `crate::registry`).
+///
+/// `#[non_exhaustive]` (matching [`crate::types::PypiDependencySection`]):
+/// this enum grows as new parse-failure modes are distinguished (e.g.
+/// [`PypiError::RequirementTooLong`], added without a matching
+/// `cargo-semver-checks` gate), so an external exhaustive `match` must not
+/// be able to break on a future addition.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum PypiError {
     /// Failed to parse pyproject.toml
     #[error("Failed to parse pyproject.toml: {message}")]
@@ -21,6 +28,16 @@ pub enum PypiError {
     /// Unsupported dependency format
     #[error("Unsupported dependency format: {message}")]
     UnsupportedFormat { message: String },
+
+    /// PEP 508 requirement string exceeded the length cap protecting against
+    /// `pep508_rs`'s O(n²) extras-list parser (see
+    /// `crate::parser::MAX_REQUIREMENT_LEN`). Kept as a distinct variant
+    /// (rather than folded into `UnsupportedFormat`) so callers can tell a
+    /// deliberate length rejection apart from a genuine syntax error — the
+    /// two must be counted differently by heuristics like the
+    /// `requirements.txt` "is this really a manifest" signal.
+    #[error("requirement string too long: {len} bytes (max {max} bytes)")]
+    RequirementTooLong { len: usize, max: usize },
 }
 
 /// Result type alias for PyPI operations.

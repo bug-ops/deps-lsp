@@ -129,7 +129,11 @@ impl PypiParser {
                         dependencies.push(dep);
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to parse build-system require '{}': {}", dep_str, e);
+                        tracing::warn!(
+                            "Failed to parse build-system require '{}': {}",
+                            super::truncate_for_log(dep_str),
+                            e
+                        );
                     }
                 }
             }
@@ -168,7 +172,11 @@ impl PypiParser {
                         dependencies.push(dep);
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to parse dependency '{}': {}", dep_str, e);
+                        tracing::warn!(
+                            "Failed to parse dependency '{}': {}",
+                            super::truncate_for_log(dep_str),
+                            e
+                        );
                     }
                 }
             }
@@ -211,7 +219,11 @@ impl PypiParser {
                                 dependencies.push(dep);
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to parse dependency '{}': {}", dep_str, e);
+                                tracing::warn!(
+                                    "Failed to parse dependency '{}': {}",
+                                    super::truncate_for_log(dep_str),
+                                    e
+                                );
                             }
                         }
                     }
@@ -259,7 +271,7 @@ impl PypiParser {
                                 tracing::warn!(
                                     "Failed to parse dependency group '{}' item '{}': {}",
                                     group_key.name,
-                                    dep_str,
+                                    super::truncate_for_log(dep_str),
                                     e
                                 );
                             }
@@ -1681,6 +1693,66 @@ requests = "^2.28.0"
         // but preserves the raw marker text rather than dropping it.
         assert_eq!(dep.markers, Some(long_marker));
         assert!(dep.markers_range.is_some());
+    }
+
+    #[test]
+    fn test_pep621_oversized_extras_list_rejected_fast() {
+        // Regression test for #229: `pep508_rs` 0.9.2 parses an extras list
+        // in O(n²). Before the length cap, a single requirement this size
+        // would take on the order of seconds to parse (extrapolating the
+        // measured quadratic growth); with the cap it is rejected in O(1)
+        // and the rest of the manifest still parses normally.
+        let huge_extras = "a,".repeat(500_000); // ~1 MiB extras list
+        let requirement = format!("pkg[{huge_extras}]==1.0");
+        assert!(requirement.len() > super::super::MAX_REQUIREMENT_LEN);
+        let toml = format!(
+            "[project]\ndependencies = [\n    \"{requirement}\",\n    \"good-pkg==2.0\",\n]\n"
+        );
+        let parser = PypiParser::new();
+
+        let start = std::time::Instant::now();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "oversized extras dependency took too long to reject: {elapsed:?}"
+        );
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "good-pkg");
+    }
+
+    #[test]
+    fn test_pep621_oversized_marker_beyond_total_cap_still_survives() {
+        // Regression test for critic finding S1: the length cap must measure
+        // only the pre-marker (name/extras/version) portion, not the whole
+        // requirement string including the marker. This requirement's
+        // pre-marker portion ("numpy>=1.24") is tiny, but the marker alone
+        // pushes the total past MAX_REQUIREMENT_LEN — it must still be kept,
+        // with the marker falling back to raw text via the pre-existing
+        // MAX_MARKER_LEN guard, not dropped by the new cap.
+        let long_marker: String = "os_name == 'a' or ".repeat(230) + "os_name == 'a'";
+        assert!(long_marker.len() > MAX_MARKER_LEN);
+        let toml = format!("[project]\ndependencies = [\n    \"numpy>=1.24; {long_marker}\",\n]\n");
+        assert!(
+            "numpy>=1.24".len() < super::super::MAX_REQUIREMENT_LEN,
+            "pre-marker portion must stay under the cap"
+        );
+        assert!(
+            format!("numpy>=1.24; {long_marker}").len() > super::super::MAX_REQUIREMENT_LEN,
+            "total requirement (incl. marker) must exceed the cap for this test to be meaningful"
+        );
+        let parser = PypiParser::new();
+        let result = parser.parse_content(&toml, &test_uri()).unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "numpy");
+        assert_eq!(
+            dep.version_req.as_ref().map(deps_core::VersionReq::as_str),
+            Some(">=1.24")
+        );
+        assert_eq!(dep.markers, Some(long_marker));
     }
 
     #[test]
