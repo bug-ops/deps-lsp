@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
@@ -24,9 +24,14 @@ impl DartEcosystem {
         }
     }
 
-    async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
-        deps_core::completion::complete_package_names_generic(self.registry.as_ref(), prefix, 20)
-            .await
+    async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
+        deps_core::completion::complete_package_names_generic(
+            self.registry.as_ref(),
+            prefix,
+            20,
+            range,
+        )
+        .await
     }
 
     async fn complete_versions(
@@ -101,8 +106,8 @@ impl Ecosystem for DartEcosystem {
             let context = detect_completion_context(parse_result, position, content);
 
             match context {
-                CompletionContext::PackageName { prefix } => {
-                    self.complete_package_names(&prefix).await
+                CompletionContext::PackageName { prefix, range } => {
+                    self.complete_package_names(&prefix, range).await
                 }
                 CompletionContext::Version {
                     package_name,
@@ -161,11 +166,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_package_name_completion_context_has_real_range() {
+        // Regression test for #232: the textEdit range for a package-name completion
+        // must be the real name token span, not the (0,0)-(0,0) placeholder.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = DartEcosystem::new(cache);
+        let content = "name: my_app\ndependencies:\n  http: ^1.0.0\n";
+        let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let position = Position::new(2, 4); // cursor after "ht" in "http"
+
+        let context = deps_core::completion::detect_completion_context(
+            parse_result.as_ref(),
+            position,
+            content,
+        );
+
+        match context {
+            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                assert_eq!(prefix, "ht");
+                assert_ne!(range, Range::default());
+                assert_eq!(range, Range::new(Position::new(2, 2), Position::new(2, 6)));
+            }
+            other => panic!("Expected PackageName context, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_complete_package_names_min_prefix() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = DartEcosystem::new(cache);
-        assert!(eco.complete_package_names("h").await.is_empty());
-        assert!(eco.complete_package_names("").await.is_empty());
+        assert!(
+            eco.complete_package_names("h", Range::default())
+                .await
+                .is_empty()
+        );
+        assert!(
+            eco.complete_package_names("", Range::default())
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -173,7 +214,11 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = DartEcosystem::new(cache);
         let long = "a".repeat(201);
-        assert!(eco.complete_package_names(&long).await.is_empty());
+        assert!(
+            eco.complete_package_names(&long, Range::default())
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

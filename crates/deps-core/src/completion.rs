@@ -27,8 +27,8 @@
 //!     let context = detect_completion_context(parse_result, position, content);
 //!
 //!     match context {
-//!         CompletionContext::PackageName { prefix } => {
-//!             // Search registry and build completions
+//!         CompletionContext::PackageName { prefix, range } => {
+//!             // Search registry and build completions, replacing `range`
 //!             vec![]
 //!         }
 //!         CompletionContext::Version { package_name, prefix } => {
@@ -62,6 +62,9 @@ pub enum CompletionContext {
     PackageName {
         /// Partial package name typed so far (may be empty).
         prefix: String,
+        /// Range of the full package-name token, to be replaced by the completion's
+        /// `textEdit` (not just the already-typed prefix up to the cursor).
+        range: Range,
     },
 
     /// Cursor is within a version string.
@@ -126,9 +129,26 @@ pub fn detect_completion_context(
     for dep in dependencies {
         // Check if position is within the dependency name range
         let name_range = dep.name_range();
-        if position_in_range(position, name_range) {
+        // `position_in_range` tolerates a request position one column past
+        // `name_range.end` (a convenience for firing completion right after the
+        // last typed character), but the manifest text immediately following the
+        // name is often structurally significant (a closing quote, the space
+        // before `=`, ...). Widening the returned range to reach that far would
+        // consume it once the client applies the edit. So this branch requires
+        // *strict* containment (`position.character <= name_range.end.character`
+        // on the end line) rather than reusing that tolerance — the boundary
+        // case (cursor exactly at `name_range.end`) is already covered without
+        // it, and a position one further past falls through to the checks below
+        // instead of matching here.
+        if position_in_range(position, name_range)
+            && (name_range.end.line != position.line
+                || position.character <= name_range.end.character)
+        {
             let prefix = extract_prefix(content, position, name_range);
-            return CompletionContext::PackageName { prefix };
+            return CompletionContext::PackageName {
+                prefix,
+                range: name_range,
+            };
         }
 
         // Check if position is within the version range
@@ -726,12 +746,13 @@ const MAX_COMPLETION_VERSIONS: usize = 5;
 /// Generic package name completion using any `Registry` implementation.
 ///
 /// Searches the registry for packages matching `prefix` and returns up to `limit`
-/// completion items. Returns empty vec if `prefix` is shorter than 2 characters or
-/// longer than 200 characters.
+/// completion items, each with its `textEdit` set to replace `insert_range`. Returns
+/// empty vec if `prefix` is shorter than 2 characters or longer than 200 characters.
 pub async fn complete_package_names_generic(
     registry: &dyn crate::Registry,
     prefix: &str,
     limit: usize,
+    insert_range: Range,
 ) -> Vec<CompletionItem> {
     if prefix.len() < 2 || prefix.len() > 200 {
         return vec![];
@@ -744,8 +765,6 @@ pub async fn complete_package_names_generic(
             return vec![];
         }
     };
-
-    let insert_range = tower_lsp_server::ls_types::Range::default();
 
     results
         .into_iter()
@@ -918,6 +937,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct MockMetadata {
         name: crate::PackageName,
         description: Option<String>,
@@ -1003,6 +1023,107 @@ mod tests {
         }
     }
 
+    /// Registry stub whose `search` returns preconfigured metadata, used to verify
+    /// [`complete_package_names_generic`] threads its `insert_range` into every
+    /// returned item's `text_edit` instead of defaulting to a placeholder range.
+    struct MockSearchRegistry {
+        results: Vec<MockMetadata>,
+    }
+
+    impl crate::Registry for MockSearchRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _package_name: &'a crate::PackageName,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a crate::PackageName,
+            _req: &'a crate::VersionReq,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            let results: Vec<Box<dyn crate::Metadata>> = self
+                .results
+                .iter()
+                .cloned()
+                .map(|m| Box::new(m) as Box<dyn crate::Metadata>)
+                .collect();
+            Box::pin(async move { Ok(results) })
+        }
+
+        fn package_url(&self, _name: &crate::PackageName) -> String {
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_generic_uses_insert_range() {
+        let registry = MockSearchRegistry {
+            results: vec![MockMetadata {
+                name: pkg("serde"),
+                description: None,
+                repository: None,
+                documentation: None,
+                latest_version: "1.0.0".to_string(),
+            }],
+        };
+
+        let insert_range = Range {
+            start: Position {
+                line: 3,
+                character: 4,
+            },
+            end: Position {
+                line: 3,
+                character: 7,
+            },
+        };
+
+        let items = complete_package_names_generic(&registry, "ser", 5, insert_range).await;
+
+        assert_eq!(items.len(), 1);
+        assert_ne!(insert_range, Range::default());
+        match &items[0].text_edit {
+            Some(CompletionTextEdit::Edit(edit)) => {
+                assert_eq!(edit.range, insert_range);
+                assert_eq!(edit.new_text, "serde");
+            }
+            other => panic!("Expected a textEdit::Edit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_generic_short_prefix_empty() {
+        let registry = MockSearchRegistry {
+            results: vec![MockMetadata {
+                name: pkg("serde"),
+                description: None,
+                repository: None,
+                documentation: None,
+                latest_version: "1.0.0".to_string(),
+            }],
+        };
+
+        let items = complete_package_names_generic(&registry, "s", 5, Range::default()).await;
+        assert!(items.is_empty());
+    }
+
     // Context detection tests
 
     #[test]
@@ -1034,8 +1155,21 @@ mod tests {
         let context = detect_completion_context(&parse_result, position, content);
 
         match context {
-            CompletionContext::PackageName { prefix } => {
+            CompletionContext::PackageName { prefix, range } => {
                 assert_eq!(prefix, "");
+                assert_eq!(
+                    range,
+                    Range {
+                        start: Position {
+                            line: 0,
+                            character: 0
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 5
+                        },
+                    }
+                );
             }
             _ => panic!("Expected PackageName context, got {:?}", context),
         }
@@ -1070,8 +1204,111 @@ mod tests {
         let context = detect_completion_context(&parse_result, position, content);
 
         match context {
-            CompletionContext::PackageName { prefix } => {
+            CompletionContext::PackageName { prefix, range } => {
                 assert_eq!(prefix, "ser");
+                assert_eq!(
+                    range,
+                    Range {
+                        start: Position {
+                            line: 0,
+                            character: 0
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 5
+                        },
+                    }
+                );
+            }
+            _ => panic!("Expected PackageName context, got {:?}", context),
+        }
+    }
+
+    #[test]
+    fn test_detect_package_name_context_one_past_end_does_not_widen_range() {
+        // `position_in_range` tolerates a request one column past `name_range.end`,
+        // but the text right after a name is often structurally significant (a
+        // closing quote, the space before `=`, ...) — widening the range to reach
+        // a position past the name would consume that character once a client
+        // applies the edit, corrupting the manifest. So a one-past-end position
+        // must NOT produce a PackageName context (there is nothing else on this
+        // line for it to match either, so it falls through to `None`).
+        let parse_result = MockParseResult {
+            dependencies: vec![MockDependency {
+                name: "serde".into(),
+                name_range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                version_range: None,
+                features_range: None,
+            }],
+        };
+
+        let content = "serde";
+        let position = Position {
+            line: 0,
+            character: 6,
+        };
+
+        let context = detect_completion_context(&parse_result, position, content);
+
+        assert_eq!(context, CompletionContext::None);
+    }
+
+    #[test]
+    fn test_detect_package_name_context_exactly_at_end_matches_unwidened_range() {
+        // The cursor sitting exactly at `name_range.end` (right after the last
+        // typed character, no tolerance needed) must still fire PackageName with
+        // the name's own unwidened range.
+        let parse_result = MockParseResult {
+            dependencies: vec![MockDependency {
+                name: "serde".into(),
+                name_range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 5,
+                    },
+                },
+                version_range: None,
+                features_range: None,
+            }],
+        };
+
+        let content = "serde";
+        let position = Position {
+            line: 0,
+            character: 5,
+        };
+
+        let context = detect_completion_context(&parse_result, position, content);
+
+        match context {
+            CompletionContext::PackageName { prefix, range } => {
+                assert_eq!(prefix, "serde");
+                assert_eq!(
+                    range,
+                    Range {
+                        start: Position {
+                            line: 0,
+                            character: 0
+                        },
+                        end: Position {
+                            line: 0,
+                            character: 5
+                        },
+                    }
+                );
             }
             _ => panic!("Expected PackageName context, got {:?}", context),
         }

@@ -139,7 +139,7 @@ impl Ecosystem for GoEcosystem {
             let context = detect_completion_context(parse_result, position, content);
 
             match context {
-                CompletionContext::PackageName { prefix } => {
+                CompletionContext::PackageName { prefix, .. } => {
                     self.complete_package_names(&prefix).await
                 }
                 CompletionContext::Version {

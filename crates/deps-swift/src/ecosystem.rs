@@ -8,7 +8,6 @@ use tower_lsp_server::ls_types::{
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-    position_in_range,
 };
 
 use crate::formatter::SwiftFormatter;
@@ -178,16 +177,12 @@ impl Ecosystem for SwiftEcosystem {
             let context = detect_completion_context(parse_result, position, content);
 
             match context {
-                CompletionContext::PackageName { prefix } => {
+                CompletionContext::PackageName { prefix, range } => {
                     // The completion context only fires with the cursor inside an existing
-                    // dependency's url: "..." literal (see module docs), so its name_range()
-                    // is the exact span the completion must replace.
-                    let replace_range = parse_result
-                        .dependencies()
-                        .into_iter()
-                        .find(|d| position_in_range(position, d.name_range()))
-                        .map(deps_core::Dependency::name_range);
-                    self.complete_package_urls(strip_github_prefix(&prefix), replace_range)
+                    // dependency's url: "..." literal (see module docs), so `range` (the
+                    // dependency's `name_range()`, computed by `detect_completion_context`)
+                    // is already the exact span the completion must replace.
+                    self.complete_package_urls(strip_github_prefix(&prefix), Some(range))
                         .await
                 }
                 CompletionContext::Version {

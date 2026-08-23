@@ -5,7 +5,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
@@ -37,9 +37,14 @@ impl ComposerEcosystem {
         }
     }
 
-    async fn complete_package_names(&self, prefix: &str) -> Vec<CompletionItem> {
-        deps_core::completion::complete_package_names_generic(self.registry.as_ref(), prefix, 20)
-            .await
+    async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
+        deps_core::completion::complete_package_names_generic(
+            self.registry.as_ref(),
+            prefix,
+            20,
+            range,
+        )
+        .await
     }
 
     async fn complete_versions(
@@ -114,8 +119,8 @@ impl Ecosystem for ComposerEcosystem {
             let context = detect_completion_context(parse_result, position, content);
 
             match context {
-                CompletionContext::PackageName { prefix } => {
-                    self.complete_package_names(&prefix).await
+                CompletionContext::PackageName { prefix, range } => {
+                    self.complete_package_names(&prefix, range).await
                 }
                 CompletionContext::Version {
                     package_name,
@@ -194,11 +199,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_package_name_completion_context_has_real_range() {
+        // Regression test for #232: the textEdit range for a package-name completion
+        // must be the real name token span, not the (0,0)-(0,0) placeholder.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = ComposerEcosystem::new(cache);
+        let content = "{\n  \"require\": {\n    \"symfony/console\": \"^6.0\"\n  }\n}";
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let position = Position::new(2, 9); // cursor after "symf" in "symfony/console"
+
+        let context = deps_core::completion::detect_completion_context(
+            parse_result.as_ref(),
+            position,
+            content,
+        );
+
+        match context {
+            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                assert_eq!(prefix, "symf");
+                assert_ne!(range, Range::default());
+                assert_eq!(range, Range::new(Position::new(2, 5), Position::new(2, 20)));
+            }
+            other => panic!("Expected PackageName context, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_complete_package_names_short_prefix() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = ComposerEcosystem::new(cache);
 
-        let results = ecosystem.complete_package_names("s").await;
+        let results = ecosystem
+            .complete_package_names("s", Range::default())
+            .await;
         assert!(results.is_empty());
     }
 
