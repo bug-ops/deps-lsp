@@ -16,6 +16,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Inlay hints** — Show latest versions inline with loading indicators
 - **Hover info** — Package descriptions with resolved version from lock file
 - **Code actions** — Quick fixes to update dependencies
+- **Code lens** — "Update N outdated dependencies" batch update on every open manifest
 - **Diagnostics** — Warnings for outdated, yanked, or unknown packages
 - **Lock file support** — Reads resolved versions without network requests
 

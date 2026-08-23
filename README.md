@@ -20,6 +20,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
 - **Hover information** — Package descriptions with resolved version from lock file
 - **Code actions** — Quick fixes to update dependencies
+- **Code lens** — "Update N outdated dependencies" batch update on every open manifest
 - **High performance** — Parallel fetching with per-dependency timeouts, optimized caching
 
 ## Supported ecosystems
@@ -219,6 +220,9 @@ Configure via LSP initialization options:
   "cold_start": {
     "enabled": true,
     "rate_limit_ms": 100
+  },
+  "code_lens": {
+    "enabled": true
   }
 }
 ```
@@ -232,6 +236,7 @@ Configure via LSP initialization options:
 | `loading_indicator` | `enabled` | `true` | Show loading feedback during fetches |
 | `loading_indicator` | `fallback_to_hints` | `true` | Show loading in inlay hints if LSP progress unsupported |
 | `loading_indicator` | `loading_text` | `"..."` | Text shown during loading (max 100 chars) |
+| `code_lens` | `enabled` | `true` | Show the "Update N outdated dependencies" code lens |
 
 > [!TIP]
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.
@@ -272,6 +277,7 @@ deps-lsp is optimized for responsiveness:
 | Inlay hints | <100ms | Cached version lookups |
 | Hover | <50ms | Pre-fetched metadata |
 | Code actions | <50ms | No network calls |
+| Code lens | <50ms | No network calls; in-memory only |
 
 > [!TIP]
 > Lock file support provides instant resolved versions without network requests.

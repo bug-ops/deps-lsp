@@ -211,6 +211,7 @@ async fn fetch_latest_versions_parallel(
 pub async fn handle_document_open(
     uri: Uri,
     content: String,
+    version: Option<i32>,
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
@@ -238,12 +239,13 @@ pub async fn handle_document_open(
     let parse_result = ecosystem.parse_manifest(&content, &uri).await.ok();
 
     // Create document state (parse_result may be None)
-    let doc_state = if let Some(pr) = parse_result {
+    let mut doc_state = if let Some(pr) = parse_result {
         DocumentState::new_from_parse_result(resolve_ecosystem_id(&*ecosystem), content, pr)
     } else {
         tracing::debug!("Failed to parse manifest, storing document without parse result");
         DocumentState::new_without_parse_result(resolve_ecosystem_id(&*ecosystem), content)
     };
+    doc_state.set_version(version);
 
     state.update_document(uri.clone(), doc_state);
 
@@ -367,6 +369,9 @@ pub async fn handle_document_open(
         if let Err(e) = client_clone.inlay_hint_refresh().await {
             tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
         }
+        if let Err(e) = client_clone.code_lens_refresh().await {
+            tracing::debug!("code_lens_refresh not supported: {:?}", e);
+        }
 
         // Publish diagnostics (may be slower, runs after hints are already visible)
         let diags =
@@ -387,6 +392,7 @@ pub async fn handle_document_open(
 pub async fn handle_document_change(
     uri: Uri,
     content: String,
+    version: Option<i32>,
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
@@ -445,6 +451,7 @@ pub async fn handle_document_change(
         tracing::debug!("Failed to parse manifest, storing document without parse result");
         DocumentState::new_without_parse_result(resolve_ecosystem_id(&*ecosystem), content)
     };
+    doc_state.set_version(version);
 
     if let Some(old_doc) = state.get_document(&uri) {
         preserve_cache(&mut doc_state, &old_doc);
@@ -494,6 +501,9 @@ pub async fn handle_document_change(
 
             if let Err(e) = client_clone.inlay_hint_refresh().await {
                 tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+            }
+            if let Err(e) = client_clone.code_lens_refresh().await {
+                tracing::debug!("code_lens_refresh not supported: {:?}", e);
             }
 
             let diags =
@@ -575,6 +585,9 @@ pub async fn handle_document_change(
 
         if let Err(e) = client_clone.inlay_hint_refresh().await {
             tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
+        }
+        if let Err(e) = client_clone.code_lens_refresh().await {
+            tracing::debug!("code_lens_refresh not supported: {:?}", e);
         }
 
         let diags =
@@ -729,10 +742,13 @@ pub async fn ensure_document_loaded(
         }
     };
 
-    // Reuse existing handle_document_open logic
+    // Reuse existing handle_document_open logic. `version: None` — content came from
+    // disk, not an LSP didOpen, so there is no client-tracked version to record (see
+    // `DocumentState::version` and the cold-start refusal in `handlers::code_lens`).
     match handle_document_open(
         uri.clone(),
         content,
+        None,
         Arc::clone(&state),
         client.clone(),
         Arc::clone(&config),
@@ -1481,6 +1497,7 @@ serde = "1.0""#;
             let result = handle_document_open(
                 uri.clone(),
                 oversized_content,
+                Some(1),
                 state.clone(),
                 client,
                 config,
@@ -1517,7 +1534,8 @@ serde = "1.0"
             let (client, config) = create_test_client_and_config();
 
             let result =
-                handle_document_open(uri.clone(), content, state.clone(), client, config).await;
+                handle_document_open(uri.clone(), content, Some(1), state.clone(), client, config)
+                    .await;
 
             assert!(result.is_ok(), "Normal-sized content should be accepted");
             assert_eq!(state.document_count(), 1);
@@ -1535,6 +1553,7 @@ serde = "1.0"
             let result = handle_document_change(
                 uri.clone(),
                 oversized_content,
+                Some(2),
                 state.clone(),
                 client,
                 config,
@@ -1575,6 +1594,7 @@ serde = "1.0"
             handle_document_open(
                 uri.clone(),
                 original_content.clone(),
+                Some(1),
                 state.clone(),
                 client,
                 config,
@@ -1589,6 +1609,7 @@ serde = "1.0"
             let result = handle_document_change(
                 uri.clone(),
                 oversized_content,
+                Some(2),
                 state.clone(),
                 client,
                 config,

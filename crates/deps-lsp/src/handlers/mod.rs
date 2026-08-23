@@ -8,6 +8,7 @@
 //! - [`inlay_hints`]: Inline version annotations
 //! - [`diagnostics`]: Outdated/yanked version warnings
 //! - [`code_actions`]: Quick fixes (e.g., "Update to latest version")
+//! - [`code_lens`]: "Update N outdated dependencies" document-scoped lens
 //!
 //! # Handler Architecture
 //!
@@ -32,6 +33,7 @@
 //! ```
 
 pub mod code_actions;
+pub mod code_lens;
 pub mod completion;
 pub mod diagnostics;
 pub mod hover;

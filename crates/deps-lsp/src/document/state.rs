@@ -51,6 +51,13 @@ pub struct DocumentState {
     pub loading_state: LoadingState,
     /// When the current loading operation started (for timeout/metrics)
     pub loading_started_at: Option<Instant>,
+    /// LSP document version from the client's `didOpen`/`didChange`, `None` if this
+    /// state was populated from disk (cold start) rather than an LSP notification.
+    ///
+    /// Threaded into `WorkspaceEdit.document_changes` so the client can reject a batch
+    /// edit whose ranges were computed against a buffer state it has since moved past
+    /// (see `handlers::code_lens`).
+    pub version: Option<i32>,
 }
 
 impl Clone for DocumentState {
@@ -65,6 +72,7 @@ impl Clone for DocumentState {
             loading_state: self.loading_state,
             // Note: Instant is Copy. Clones share the same loading start time.
             loading_started_at: self.loading_started_at,
+            version: self.version,
         }
     }
 }
@@ -160,6 +168,7 @@ impl std::fmt::Debug for DocumentState {
             .field("parsed_at", &self.parsed_at)
             .field("loading_state", &self.loading_state)
             .field("loading_started_at", &self.loading_started_at)
+            .field("version", &self.version)
             .finish()
     }
 }
@@ -182,6 +191,7 @@ impl DocumentState {
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
+            version: None,
         }
     }
 
@@ -199,6 +209,7 @@ impl DocumentState {
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
+            version: None,
         }
     }
 
@@ -222,6 +233,53 @@ impl DocumentState {
     /// Updates the resolved versions from lock file.
     pub fn update_resolved_versions(&mut self, versions: HashMap<String, String>) {
         self.resolved_versions = versions;
+    }
+
+    /// Sets the LSP document version from the client's `didOpen`/`didChange`, or clears
+    /// it (`None`) for a document populated from disk rather than an LSP notification.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::EcosystemId;
+    /// use deps_lsp::document::DocumentState;
+    ///
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
+    /// assert!(doc.version.is_none());
+    /// doc.set_version(Some(3));
+    /// assert_eq!(doc.version, Some(3));
+    /// ```
+    pub fn set_version(&mut self, version: Option<i32>) {
+        self.version = version;
+    }
+
+    /// Whether this document has everything `deps-lsp.updateAllOutdated` (and the code
+    /// lens that surfaces it) need to safely act: version data isn't currently
+    /// `Loading`, and the document has a known LSP version.
+    ///
+    /// `version: None` means this state was populated from disk after a missed
+    /// `didOpen` (server restart/crash) — the client's buffer may hold unsaved edits
+    /// the disk copy does not reflect, so batch-editing it is unsafe even though the
+    /// document is otherwise loaded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::EcosystemId;
+    /// use deps_lsp::document::DocumentState;
+    ///
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
+    /// assert!(!doc.is_ready_for_batch_update(), "no version yet");
+    ///
+    /// doc.set_version(Some(1));
+    /// assert!(doc.is_ready_for_batch_update());
+    ///
+    /// doc.set_loading();
+    /// assert!(!doc.is_ready_for_batch_update(), "still loading");
+    /// ```
+    #[must_use]
+    pub fn is_ready_for_batch_update(&self) -> bool {
+        self.loading_state != LoadingState::Loading && self.version.is_some()
     }
 
     /// Mark document as loading registry data.
@@ -704,6 +762,60 @@ mod tests {
 
             doc.set_loaded();
             assert_eq!(doc.loading_state, LoadingState::Loaded);
+        }
+    }
+
+    // =========================================================================
+    // `is_ready_for_batch_update` tests — the shared predicate `handlers::code_lens`
+    // and `server::execute_update_all_outdated` both consult (M7/S1).
+    // =========================================================================
+
+    mod is_ready_for_batch_update_tests {
+        use super::*;
+
+        #[test]
+        fn test_not_ready_without_a_version() {
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.set_loaded();
+            assert!(!doc.is_ready_for_batch_update());
+        }
+
+        #[test]
+        fn test_not_ready_while_loading_even_with_a_version() {
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.set_version(Some(1));
+            doc.set_loading();
+            assert!(!doc.is_ready_for_batch_update());
+        }
+
+        #[test]
+        fn test_ready_when_loaded_with_a_version() {
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.set_version(Some(1));
+            doc.set_loaded();
+            assert!(doc.is_ready_for_batch_update());
+        }
+
+        #[test]
+        fn test_ready_when_failed_with_a_version() {
+            // `Failed` is not `Loading` — a document whose registry fetch failed but
+            // which still has a known LSP version is safe to batch-edit (the edit only
+            // touches spans already present in `cached_versions`, which may simply be
+            // sparse after a failure).
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.set_version(Some(1));
+            doc.set_failed();
+            assert!(doc.is_ready_for_batch_update());
+        }
+
+        #[test]
+        fn test_not_ready_without_version_or_loaded_state() {
+            let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            assert!(!doc.is_ready_for_batch_update());
         }
     }
 
