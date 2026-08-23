@@ -35,9 +35,10 @@ enum MavenNameField {
 /// Reuses [`deps_core::completion::build_package_completion`] for documentation/detail
 /// formatting, then overrides the insertable text to just the requested field so it fits
 /// the single `<groupId>` or `<artifactId>` tag the cursor is inside. `replace_range` must
-/// span exactly the already-typed value text (see [`MavenEcosystem::detect_xml_context`]) —
-/// the base builder's own range is a placeholder `(0,0)-(0,0)` that does not contain the
-/// real cursor position and would corrupt the document if used as-is.
+/// span the entire existing tag value, not just the already-typed prefix (see
+/// [`MavenEcosystem::detect_xml_context`]) — the base builder's own range is a placeholder
+/// `(0,0)-(0,0)` that does not contain the real cursor position and would corrupt the
+/// document if used as-is.
 fn build_field_completion(
     artifact: &ArtifactInfo,
     field: MavenNameField,
@@ -134,14 +135,19 @@ impl MavenEcosystem {
     /// Detects Maven XML completion context at the given position.
     ///
     /// Returns `(context_type, value, value_range)` where `context_type` is "version",
-    /// "artifactId", "groupId", or empty string for no completion; `value_range` spans the
-    /// already-typed value text (from the opening tag to the cursor) and is the range a
-    /// completion's `text_edit` must replace — it is meaningless when `context_type` is empty.
+    /// "artifactId", "groupId", or empty string for no completion; `value` is the
+    /// already-typed prefix up to the cursor, used as the search query; `value_range` spans
+    /// the *entire* existing tag value (opening tag to closing tag, not just up to the
+    /// cursor) and is the range a completion's `text_edit` must replace so the whole value
+    /// is overwritten instead of leaving trailing characters behind — it is meaningless when
+    /// `context_type` is empty.
     ///
-    /// Note: `position.character` is a UTF-16 code unit offset (LSP spec). The slicing
-    /// `&line[..col_idx]` uses byte indexing. For typical pom.xml content (ASCII groupId,
-    /// artifactId, version values) these are equivalent. Files with multi-byte characters
-    /// in XML tag content near dependency fields may produce incorrect context detection.
+    /// `position.character` is a UTF-16 code unit offset (LSP spec) and is converted to a
+    /// byte offset once via [`deps_core::completion::utf16_to_byte_offset`] before any
+    /// slicing; the returned `value_range`'s `character` fields are converted back to UTF-16
+    /// units via [`deps_core::completion::byte_to_utf16_offset`]. This avoids panics on
+    /// multi-byte tag content (e.g. accented characters) and keeps the returned range valid
+    /// for LSP clients.
     fn detect_xml_context<'a>(
         content: &'a str,
         position: Position,
@@ -149,21 +155,18 @@ impl MavenEcosystem {
     ) -> (&'static str, &'a str, LspRange) {
         let lines: Vec<&str> = content.lines().collect();
         let line_idx = position.line as usize;
-        let col_idx = position.character as usize;
 
         if line_idx >= lines.len() {
             return ("", "", LspRange::default());
         }
 
         let line = lines[line_idx];
+        let col_idx = deps_core::completion::utf16_to_byte_offset(line, position.character)
+            .unwrap_or(line.len());
 
         // Find if cursor is inside a tag value: <tag>|value|</tag>
         // Walk back from cursor to find opening tag
-        let before_cursor = if col_idx <= line.len() {
-            &line[..col_idx]
-        } else {
-            line
-        };
+        let before_cursor = &line[..col_idx];
 
         // Check if we're inside a known element by looking for the most recent opening tag
         for tag in &["version", "artifactId", "groupId"] {
@@ -175,16 +178,22 @@ impl MavenEcosystem {
                 if !between.contains("</") {
                     // Check if cursor is on a dependency line (use parse_result for context)
                     let _ = parse_result;
-                    let clamped_col = col_idx.min(line.len());
-                    let value = &line[value_start..clamped_col];
+                    let value = &line[value_start..col_idx];
+                    let value_end = line[value_start..]
+                        .find("</")
+                        .map_or(col_idx, |rel| value_start + rel)
+                        .max(col_idx);
                     let value_range = LspRange {
                         start: Position {
                             line: position.line,
-                            character: value_start as u32,
+                            character: deps_core::completion::byte_to_utf16_offset(
+                                line,
+                                value_start,
+                            ),
                         },
                         end: Position {
                             line: position.line,
-                            character: clamped_col as u32,
+                            character: deps_core::completion::byte_to_utf16_offset(line, value_end),
                         },
                     };
                     return (tag, value, value_range);
@@ -414,26 +423,128 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_xml_context_artifact_id_range_spans_typed_value() {
+    fn test_detect_xml_context_artifact_id_range_spans_full_value() {
         // <artifactId>jun|it</artifactId> — indented by 4 spaces in xml_context_with_range
+        // The range must span the FULL existing value ("junit"), not just up to the
+        // cursor, so a completion replaces the whole tag content instead of leaving
+        // trailing characters behind (issue #218a).
         let line = "<artifactId>junit</artifactId>";
-        let (t, _v, range) = xml_context_with_range(line, 15);
+        let (t, v, range) = xml_context_with_range(line, 15);
         assert_eq!(t, "artifactId");
-        // value_start = 4 (indent) + 12 ("<artifactId>") = 16; cursor col = 4 + 15 = 19
+        assert_eq!(v, "jun");
+        // value_start = 4 (indent) + 12 ("<artifactId>") = 16; value_end = 16 + "junit".len() = 21
         assert_eq!(range.start, Position::new(0, 16));
-        assert_eq!(range.end, Position::new(0, 19));
+        assert_eq!(range.end, Position::new(0, 21));
     }
 
     #[test]
-    fn test_detect_xml_context_group_id_range_spans_typed_value() {
+    fn test_detect_xml_context_group_id_range_spans_full_value() {
         // <groupId>org.apache.comm|ons</groupId>
         let line = "<groupId>org.apache.commons</groupId>";
         let (t, v, range) = xml_context_with_range(line, 24);
         assert_eq!(t, "groupId");
         assert_eq!(v, "org.apache.comm");
-        // value_start = 4 (indent) + 9 ("<groupId>") = 13; cursor col = 4 + 24 = 28
+        // value_start = 4 (indent) + 9 ("<groupId>") = 13; value_end = 13 + "org.apache.commons".len() = 31
         assert_eq!(range.start, Position::new(0, 13));
-        assert_eq!(range.end, Position::new(0, 28));
+        assert_eq!(range.end, Position::new(0, 31));
+    }
+
+    #[test]
+    fn test_detect_xml_context_surrogate_pair_value_no_panic() {
+        // <artifactId>🎉|lib</artifactId> — 🎉 (U+1F389) is 4 UTF-8 bytes but a UTF-16
+        // surrogate pair (2 code units); cursor placed right after it via UTF-16 units.
+        let line = "<artifactId>🎉lib</artifactId>";
+        let (t, v, range) = xml_context_with_range(line, 14); // value_start=12 + 2 (🎉)
+        assert_eq!(t, "artifactId");
+        assert_eq!(v, "🎉");
+        assert_eq!(range.start, Position::new(0, 16)); // 4 (indent) + 12
+        assert_eq!(range.end, Position::new(0, 21)); // 16 + "🎉lib".len() in UTF-16 units (2+3)
+    }
+
+    #[test]
+    fn test_detect_xml_context_value_end_fallback_no_closing_tag_on_line() {
+        // <artifactId>jun|it — no closing tag anywhere on the line. After the S1 fix the
+        // range falls back to the cursor position (insert-mode) rather than swallowing the
+        // rest of the line, since there is no proof of where the value actually ends.
+        let line = "<artifactId>junit";
+        let (t, v, range) = xml_context_with_range(line, 15);
+        assert_eq!(t, "artifactId");
+        assert_eq!(v, "jun");
+        assert_eq!(range.start, Position::new(0, 16)); // 4 (indent) + 12
+        assert_eq!(range.end, Position::new(0, 19)); // falls back to cursor: 4 + 15
+    }
+
+    #[test]
+    fn test_detect_xml_context_no_closing_tag_range_excludes_trailing_comment() {
+        // <artifactId>ju|    <!-- todo --> — regression for S1: the old `line.len()`
+        // fallback swallowed the trailing comment into the replace range. The range must
+        // stop at the cursor, not extend into unrelated trailing content.
+        let line = "<artifactId>ju    <!-- todo -->";
+        let (t, v, range) = xml_context_with_range(line, 14);
+        assert_eq!(t, "artifactId");
+        assert_eq!(v, "ju");
+        assert_eq!(range.start, Position::new(0, 16)); // 4 (indent) + 12
+        assert_eq!(range.end, Position::new(0, 18)); // 4 + 14 — does not reach the comment
+    }
+
+    #[test]
+    fn test_detect_xml_context_range_always_contains_cursor() {
+        // <artifactId>ju|</artifactId> — cursor sits between '<' and '/' of the closing
+        // tag, so `find("</")` locates a match *before* the cursor. Regression for S2:
+        // per LSP 3.17, `textEdit.range` must contain the request position, so `range.end`
+        // must never fall before the cursor.
+        let line = "<artifactId>ju</artifactId>";
+        let cursor_col = 15u32; // indented cursor position
+        let (t, v, range) = xml_context_with_range(line, 15);
+        assert_eq!(t, "artifactId");
+        assert_eq!(v, "ju<");
+        let cursor = Position::new(0, cursor_col + 4);
+        assert!(
+            range.end >= cursor,
+            "range {range:?} must contain cursor {cursor:?}"
+        );
+        assert_eq!(range.end, Position::new(0, 19));
+    }
+
+    #[test]
+    fn test_detect_xml_context_empty_value_zero_width_range() {
+        // <version>|</version> — empty existing value produces a zero-width range at the
+        // value's start.
+        let line = "<version></version>";
+        let (t, v, range) = xml_context_with_range(line, 9);
+        assert_eq!(t, "version");
+        assert_eq!(v, "");
+        assert_eq!(range.start, range.end);
+        assert_eq!(range.start, Position::new(0, 13)); // 4 (indent) + "<version>".len()
+    }
+
+    #[test]
+    fn test_detect_xml_context_cursor_at_value_start_full_replace_range() {
+        // <version>|4.13.2</version> — range must span the full existing value even
+        // though the typed prefix is empty.
+        let line = "<version>4.13.2</version>";
+        let (t, v, range) = xml_context_with_range(line, 9);
+        assert_eq!(t, "version");
+        assert_eq!(v, "");
+        assert_eq!(range.start, Position::new(0, 13)); // 4 (indent) + "<version>".len()
+        assert_eq!(range.end, Position::new(0, 19)); // 13 + "4.13.2".len()
+    }
+
+    #[test]
+    fn test_detect_xml_context_multibyte_value_no_panic() {
+        // <artifactId>café|-lib</artifactId> — cursor positioned via UTF-16 units right
+        // after the multi-byte 'é' (col 16 = value_start 12 + 4 UTF-16 units into "café"),
+        // reflecting how a real LSP client reports the position (issue #217 regression:
+        // this used to panic on the byte/UTF-16 mismatch).
+        let line = "<artifactId>café-lib</artifactId>";
+        let (t, v, range) = xml_context_with_range(line, 16);
+        assert_eq!(t, "artifactId");
+        assert_eq!(v, "café");
+
+        // value_start (UTF-16 units) = 4 (indent) + "<artifactId>".len() = 16
+        assert_eq!(range.start, Position::new(0, 16));
+        // full value "café-lib" is 8 UTF-16 units long -> end = 16 + 8 = 24
+        assert_eq!(range.end, Position::new(0, 24));
     }
 
     #[tokio::test]

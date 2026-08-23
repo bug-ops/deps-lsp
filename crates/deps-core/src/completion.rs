@@ -228,6 +228,34 @@ pub fn utf16_to_byte_offset(s: &str, utf16_offset: u32) -> Option<usize> {
     None
 }
 
+/// Converts a byte offset within `s` to a UTF-16 code unit offset (LSP `Position.character`).
+///
+/// `byte_offset` must fall on a UTF-8 char boundary of `s` (e.g. one produced by
+/// `str::find`/`rfind`/slicing, never an arbitrary user-controlled value).
+///
+/// # Panics
+///
+/// Panics if `byte_offset` is out of bounds or does not fall on a UTF-8 char boundary of `s`.
+///
+/// # Examples
+///
+/// ```
+/// # use deps_core::completion::byte_to_utf16_offset;
+/// // ASCII: byte offset equals UTF-16 offset
+/// assert_eq!(byte_to_utf16_offset("hello", 2), 2);
+///
+/// // Unicode: "日本語" - each char is 3 bytes but 1 UTF-16 code unit
+/// assert_eq!(byte_to_utf16_offset("日本語", 0), 0);
+/// assert_eq!(byte_to_utf16_offset("日本語", 3), 1);
+/// assert_eq!(byte_to_utf16_offset("日本語", 6), 2);
+///
+/// // Emoji: "😀" is 4 bytes but 2 UTF-16 code units (surrogate pair)
+/// assert_eq!(byte_to_utf16_offset("😀test", 4), 2);
+/// ```
+pub fn byte_to_utf16_offset(s: &str, byte_offset: usize) -> u32 {
+    s[..byte_offset].encode_utf16().count() as u32
+}
+
 /// Extracts the prefix text from content at a position within a range.
 ///
 /// This function finds the text from the start of the range up to the
@@ -383,11 +411,16 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
     let latest = metadata.latest_version();
 
     // Build markdown documentation
-    let mut doc_parts = vec![format!(
-        "**{}** v{}",
-        escape_markdown(name.as_str()),
-        escape_markdown(latest)
-    )];
+    let header = if latest.is_empty() {
+        format!("**{}**", escape_markdown(name.as_str()))
+    } else {
+        format!(
+            "**{}** v{}",
+            escape_markdown(name.as_str()),
+            escape_markdown(latest)
+        )
+    };
+    let mut doc_parts = vec![header];
 
     if let Some(desc) = metadata.description() {
         doc_parts.push(String::new()); // Empty line
@@ -419,7 +452,11 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
     CompletionItem {
         label: name.to_string(),
         kind: Some(CompletionItemKind::MODULE),
-        detail: Some(format!("v{}", latest)),
+        detail: if latest.is_empty() {
+            None
+        } else {
+            Some(format!("v{}", latest))
+        },
         documentation: Some(Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
             value: doc_parts.join("\n"),
@@ -1303,6 +1340,27 @@ mod tests {
     }
 
     #[test]
+    fn test_build_package_completion_empty_latest_version() {
+        let metadata = MockMetadata {
+            name: "swift-nio".to_string().into(),
+            description: None,
+            repository: None,
+            documentation: None,
+            latest_version: String::new(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range);
+
+        assert_eq!(item.detail, None);
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(content.value.contains("**swift\\-nio**"));
+            assert!(!content.value.trim_end().ends_with('v'));
+        }
+    }
+
+    #[test]
     fn test_build_package_completion_escapes_description_markdown() {
         let metadata = MockMetadata {
             name: "test-pkg".to_string().into(),
@@ -2049,6 +2107,52 @@ mod tests {
         let s = "";
         assert_eq!(utf16_to_byte_offset(s, 0), Some(0));
         assert_eq!(utf16_to_byte_offset(s, 1), None);
+    }
+
+    // Byte to UTF-16 offset conversion tests
+
+    #[test]
+    fn test_byte_to_utf16_offset_ascii() {
+        let s = "hello";
+        assert_eq!(byte_to_utf16_offset(s, 0), 0);
+        assert_eq!(byte_to_utf16_offset(s, 2), 2);
+        assert_eq!(byte_to_utf16_offset(s, 5), 5);
+    }
+
+    #[test]
+    fn test_byte_to_utf16_offset_multibyte() {
+        // "日本語" - each character is 3 bytes, 1 UTF-16 code unit
+        let s = "日本語";
+        assert_eq!(byte_to_utf16_offset(s, 0), 0);
+        assert_eq!(byte_to_utf16_offset(s, 3), 1);
+        assert_eq!(byte_to_utf16_offset(s, 6), 2);
+        assert_eq!(byte_to_utf16_offset(s, 9), 3);
+    }
+
+    #[test]
+    fn test_byte_to_utf16_offset_emoji() {
+        // "😀" is 4 bytes but 2 UTF-16 code units (surrogate pair)
+        let s = "😀test";
+        assert_eq!(byte_to_utf16_offset(s, 0), 0);
+        assert_eq!(byte_to_utf16_offset(s, 4), 2); // After emoji
+        assert_eq!(byte_to_utf16_offset(s, 5), 3); // After 't'
+    }
+
+    #[test]
+    fn test_byte_to_utf16_offset_mixed() {
+        // Mix of ASCII, multi-byte, and emoji
+        let s = "hello 世界 😀!";
+        assert_eq!(byte_to_utf16_offset(s, 0), 0); // 'h'
+        assert_eq!(byte_to_utf16_offset(s, 6), 6); // '世'
+        assert_eq!(byte_to_utf16_offset(s, 9), 7); // '界'
+        assert_eq!(byte_to_utf16_offset(s, 13), 9); // '😀' (2 UTF-16 units)
+        assert_eq!(byte_to_utf16_offset(s, 17), 11); // '!'
+    }
+
+    #[test]
+    fn test_byte_to_utf16_offset_empty() {
+        let s = "";
+        assert_eq!(byte_to_utf16_offset(s, 0), 0);
     }
 
     // Unicode truncation tests
