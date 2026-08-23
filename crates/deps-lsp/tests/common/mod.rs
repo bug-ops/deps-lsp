@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A captured notification with timing and ordering information.
 #[derive(Debug, Clone)]
@@ -85,6 +85,37 @@ impl LspClient {
         // Send a benign workspace/symbol request with empty query
         // This is guaranteed to succeed and return quickly
         let _ = self.workspace_symbol(999, "");
+    }
+
+    /// Poll for a notification matching `predicate`, retrying with bounded flushes.
+    ///
+    /// `flush_notifications()` drives a `workspace/symbol` round trip to capture
+    /// any notification queued ahead of it, but `tower-lsp-server` dispatches
+    /// handlers via `buffer_unordered`, so a notification from a concurrently
+    /// handled request can still reach the stdout sink after that round trip's
+    /// response — a single flush is not guaranteed to have captured it. This
+    /// retries the flush-and-search cycle, sleeping briefly between attempts, to
+    /// tolerate that without an unbounded wait. Measured against the real binary,
+    /// the relevant notification typically lands within 35-155ms of being sent;
+    /// the default budget here (10 attempts, ~100ms apart) leaves ample headroom.
+    /// Intended for positive waits only — a `None` result after exhausting
+    /// `max_attempts` does not prove the notification will never arrive.
+    #[allow(dead_code)] // Used in size-bound integration tests
+    pub(crate) fn wait_for_notification(
+        &mut self,
+        max_attempts: u32,
+        mut predicate: impl FnMut(&CapturedNotification) -> bool,
+    ) -> Option<CapturedNotification> {
+        for attempt in 0..max_attempts {
+            if let Some(found) = self.get_notifications().into_iter().find(|n| predicate(n)) {
+                return Some(found);
+            }
+            if attempt + 1 < max_attempts {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            self.flush_notifications();
+        }
+        self.get_notifications().into_iter().find(|n| predicate(n))
     }
 
     /// Find a notification by method name from already captured notifications.
