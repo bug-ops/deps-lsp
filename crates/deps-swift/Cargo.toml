@@ -12,6 +12,7 @@ description = "Swift Package Manager support for deps-lsp"
 workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 deps-core = { workspace = true }
 reqwest = { workspace = true }
 regex = { workspace = true }
