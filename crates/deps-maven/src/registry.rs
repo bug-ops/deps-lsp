@@ -5,6 +5,7 @@
 
 use crate::types::{ArtifactInfo, MavenVersion};
 use crate::version::compare_versions;
+use bytes::Bytes;
 use deps_core::{DepsError, HttpCache, PublishTime, Result};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -12,6 +13,7 @@ use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
 
@@ -21,6 +23,43 @@ pub const REGISTRY: &str = "Maven Central";
 const GOOGLE_MAVEN_BASE: &str = "https://dl.google.com/dl/android/maven2";
 const GRADLE_PLUGIN_PORTAL_BASE: &str = "https://plugins.gradle.org/m2";
 const MAVEN_SEARCH_BASE: &str = "https://search.maven.org/solrsearch/select";
+
+/// Per-attempt timeouts for `search_typed`'s retry loop: first attempt, then second.
+///
+/// `search.maven.org/solrsearch` fails intermittently as a silent, zero-byte hang
+/// rather than a clean HTTP error — live-verified 2026-08-24 (#274): identical
+/// back-to-back requests for the same popular query (`guava`, `spring`) alternate
+/// between a fast success and a full hang, with no correlation to query content that
+/// would make the failure predictable or avoidable by query shape alone; failures also
+/// arrive in multi-second correlated bursts, not independently per request.
+///
+/// The second attempt gets a larger timeout than the first: a cold TCP+TLS handshake
+/// on a higher-latency link can push a genuinely healthy response past a tight budget
+/// (live-verified successful response time: ~0.4s on a low-latency link vs. an
+/// estimated ~1.0s on a 150ms-RTT one), and `tokio::time::timeout` cancels the first
+/// attempt's connection without returning it to `reqwest`'s pool, so the second attempt
+/// always pays the handshake cold again and needs the extra headroom.
+///
+/// Their sum, plus [`SEARCH_RETRY_DELAY`], is deliberately larger than
+/// `deps_core::completion::COMPLETION_SEARCH_TIMEOUT` — enforced by
+/// `test_search_attempt_budget_exceeds_completion_search_timeout` below. On a total
+/// failure with no stale cache to serve (see `search_with_retry`'s `stale` fallback),
+/// `search_typed` must not finish before the caller's own timeout does: `deps-lsp`'s
+/// completion handler otherwise cannot tell a fast empty/error result apart from
+/// "genuinely no results," and re-runs a wasted fallback search against the same
+/// struggling registry instead of taking its existing skip-fallback path.
+///
+/// This guarantee only covers `solrsearch`'s dominant *hang* failure mode, where both
+/// attempts run their full timeout. A fast-failing, retryable error (e.g. connection
+/// refused, DNS failure) still exhausts both attempts and returns well inside the 2s
+/// deadline — the handler's `Ok(empty)` branch still runs the fallback search for that
+/// failure mode, same as before this fix. Not a regression, but worth noting since M1's
+/// 4xx-is-terminal guard means that failure mode is the one most likely to return fast.
+const SEARCH_ATTEMPT_TIMEOUTS: [Duration; 2] =
+    [Duration::from_millis(1000), Duration::from_millis(1200)];
+
+/// Delay between `search_typed` retry attempts.
+const SEARCH_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 const GOOGLE_PREFIXES: &[&str] = &[
     "androidx.",
@@ -264,15 +303,102 @@ impl MavenCentralRegistry {
         Ok(versions.into_iter().find(|v| v.version == req))
     }
 
+    /// Searches Maven Central for artifacts matching `query`.
+    ///
+    /// Retries against `solrsearch` via `search_with_retry`, falling back to a stale
+    /// cached result (if any) on failure, to work around its silent-timeout
+    /// unreliability (#274) without exceeding the caller's own completion deadline. See
+    /// `SEARCH_ATTEMPT_TIMEOUTS` and `search_with_retry` for the retry/fallback policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the last error (an HTTP/network error, or a synthesized timeout error)
+    /// if every attempt fails and no cached result is available to fall back to.
     pub async fn search_typed(&self, query: &str, limit: usize) -> Result<Vec<ArtifactInfo>> {
         let url = format!(
             "{MAVEN_SEARCH_BASE}?q={q}&rows={limit}&wt=json",
             q = urlencoding::encode(query),
         );
 
-        let data = self.cache.get_cached(&url).await?;
+        let data = search_with_retry(
+            || self.cache.get_cached(&url),
+            || self.cache.peek_cached(&url),
+        )
+        .await?;
         parse_search_response(&data, limit)
     }
+}
+
+/// Whether a failed search attempt is worth retrying live (#274).
+///
+/// A client-side timeout is always worth retrying — `solrsearch`'s dominant failure
+/// mode is a silent hang, not a clean error. An HTTP 5xx may be transient. Any 4xx is
+/// treated as terminal: a 400 means the query itself is malformed and retrying changes
+/// nothing, and a 429 specifically must NOT be retried immediately — that adds to the
+/// very request volume this endpoint's undocumented rate limiting reacts to.
+fn is_retryable_error(e: &DepsError) -> bool {
+    !matches!(e, DepsError::HttpStatus { status, .. } if (400..500).contains(status))
+}
+
+/// Retries `fetch` across [`SEARCH_ATTEMPT_TIMEOUTS`], each attempt bounded by its own
+/// timeout, falling back to a synchronous, non-network `stale` cache peek after any
+/// failed attempt (whether it timed out or returned a retryable error) before trying
+/// again or giving up (#274).
+///
+/// The stale check runs after *every* failed attempt, not only once all attempts are
+/// exhausted: `solrsearch`'s dominant failure mode is a multi-second hang, and
+/// [`SEARCH_ATTEMPT_TIMEOUTS`] plus [`SEARCH_RETRY_DELAY`] are deliberately sized to
+/// outlast the caller's own completion deadline on total failure — checking only after
+/// full exhaustion would mean this fallback rarely gets a chance to run for that
+/// dominant failure mode, since the caller's own timeout would cancel the whole future
+/// first. Checking eagerly also serves a repeat query without paying out the full
+/// retry budget when cached data is already available (though still only after the
+/// first attempt's timeout has elapsed, not instantly).
+///
+/// Extracted from `search_typed` so the retry/timeout/backoff/stale-fallback mechanics
+/// can be unit-tested with a fake `fetch`/`stale` pair under `tokio::time::pause`,
+/// without a real HTTPS endpoint: `HttpCache` has no test-mode escape hatch for a
+/// mocked server across a crate boundary (its `ensure_https`, in
+/// `crates/deps-core/src/cache.rs`, only relaxes for `#[cfg(test)]` within `deps-core`'s
+/// own compilation, which does not apply when `deps-maven` links it as a normal
+/// dependency).
+async fn search_with_retry<F, Fut, S>(mut fetch: F, stale: S) -> Result<Bytes>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Bytes>>,
+    S: Fn() -> Option<Bytes>,
+{
+    let mut last_err = None;
+    for (i, attempt_timeout) in SEARCH_ATTEMPT_TIMEOUTS.iter().enumerate() {
+        let retryable = match tokio::time::timeout(*attempt_timeout, fetch()).await {
+            Ok(Ok(body)) => return Ok(body),
+            Ok(Err(e)) => {
+                let retryable = is_retryable_error(&e);
+                tracing::debug!(attempt = i + 1, error = %e, retryable, "solrsearch attempt failed");
+                last_err = Some(e);
+                retryable
+            }
+            Err(_) => {
+                tracing::debug!(attempt = i + 1, timeout = ?attempt_timeout, "solrsearch attempt timed out");
+                last_err = Some(DepsError::CacheError(format!(
+                    "search request timed out after {attempt_timeout:?}"
+                )));
+                true
+            }
+        };
+
+        if let Some(body) = stale() {
+            tracing::warn!("solrsearch: serving stale cached result after a failed live attempt");
+            return Ok(body);
+        }
+
+        if !retryable || i + 1 == SEARCH_ATTEMPT_TIMEOUTS.len() {
+            break;
+        }
+        tokio::time::sleep(SEARCH_RETRY_DELAY).await;
+    }
+    Err(last_err
+        .expect("SEARCH_ATTEMPT_TIMEOUTS is non-empty, so at least one attempt always runs"))
 }
 
 /// Returns ordered list of maven-metadata.xml URLs to try for the given package.
@@ -844,6 +970,199 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].name, "org.apache.commons:commons-lang3");
         assert_eq!(results[0].latest_version, "3.14.0");
+    }
+
+    /// Manual live probe against the real endpoint (#274) — NOT deterministic
+    /// regression coverage: `solrsearch`'s live health varies run to run, so this can
+    /// pass or fail independently of whether `search_with_retry`'s logic is correct.
+    /// Deterministic coverage for the retry/timeout/backoff/stale-fallback mechanics
+    /// lives in the `search_with_retry` tests below, which use fakes under
+    /// `tokio::time::pause` and don't depend on network health. Run this one manually
+    /// via `cargo test -p deps-maven -- --ignored` to sanity-check against the real
+    /// endpoint.
+    #[tokio::test]
+    #[ignore]
+    async fn test_search_typed_real_guava() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = MavenCentralRegistry::new(cache);
+        let results = registry.search_typed("guava", 20).await.unwrap();
+
+        assert!(!results.is_empty());
+        assert!(
+            results
+                .iter()
+                .any(|r| r.group_id == "com.google.guava" && r.artifact_id == "guava")
+        );
+    }
+
+    /// S1 guard rail: a total-failure `search_typed` call (no stale cache to fall back
+    /// on) must take longer than `deps-lsp`'s completion deadline, so that deadline's
+    /// own timeout fires first and takes its existing skip-fallback path, rather than
+    /// `search_typed` finishing fast with an empty/error result the caller cannot
+    /// distinguish from "genuinely no results" (see [`SEARCH_ATTEMPT_TIMEOUTS`]'s doc).
+    #[test]
+    fn test_search_attempt_budget_exceeds_completion_search_timeout() {
+        let attempts_total: Duration = SEARCH_ATTEMPT_TIMEOUTS.iter().sum();
+        let delays_total = SEARCH_RETRY_DELAY * (SEARCH_ATTEMPT_TIMEOUTS.len() as u32 - 1);
+        assert!(
+            attempts_total + delays_total > deps_core::completion::COMPLETION_SEARCH_TIMEOUT,
+            "search_typed's worst-case retry budget must outlast the completion \
+             handler's own timeout (#274/S1)"
+        );
+    }
+
+    /// R4 (code review of #274/S1's guard): the constant-arithmetic assertion in
+    /// `test_search_attempt_budget_exceeds_completion_search_timeout` holds even under
+    /// a fast-failing retryable error, where the invariant it's meant to guard doesn't
+    /// actually apply (see [`SEARCH_ATTEMPT_TIMEOUTS`]'s doc). This test exercises the
+    /// actual hang-mode behavior instead: a total-failure `search_with_retry` call (no
+    /// stale cache) must not resolve before `COMPLETION_SEARCH_TIMEOUT` elapses.
+    #[tokio::test(start_paused = true)]
+    async fn test_search_with_retry_total_failure_outlasts_completion_search_timeout() {
+        let start = tokio::time::Instant::now();
+        let result = search_with_retry(
+            || async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(Bytes::new())
+            },
+            || None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            start.elapsed() >= deps_core::completion::COMPLETION_SEARCH_TIMEOUT,
+            "a total-failure call must not resolve before the completion handler's own \
+             timeout does (#274/S1), elapsed={:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_with_retry_first_attempt_fails_second_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result = search_with_retry(
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err(DepsError::CacheError("boom".into()))
+                    } else {
+                        Ok(Bytes::from_static(b"ok"))
+                    }
+                }
+            },
+            || None,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), Bytes::from_static(b"ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_with_retry_all_attempts_timeout_no_cache_returns_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result = search_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(Bytes::new())
+                }
+            },
+            || None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// #274/S2: a hung live attempt must not prevent a known-good stale cached result
+    /// from being served, and it must be served after the *first* failed attempt, not
+    /// only once every attempt is exhausted (see `search_with_retry`'s doc for why).
+    #[tokio::test(start_paused = true)]
+    async fn test_search_with_retry_serves_stale_cache_after_first_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result = search_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok(Bytes::new())
+                }
+            },
+            || Some(Bytes::from_static(b"stale")),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), Bytes::from_static(b"stale"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "stale cache should short-circuit after the first failed attempt, not wait \
+             for both"
+        );
+    }
+
+    /// #274/M1: a 4xx (e.g. malformed query, or 429 rate-limiting) must not be retried
+    /// immediately — retrying 429 specifically would add to the load suspected of
+    /// triggering the rate limit in the first place.
+    #[tokio::test]
+    async fn test_search_with_retry_4xx_status_is_not_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result = search_with_retry(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(DepsError::HttpStatus {
+                        url: MAVEN_SEARCH_BASE.to_string(),
+                        status: 400,
+                    })
+                }
+            },
+            || None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_search_with_retry_5xx_status_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = AtomicUsize::new(0);
+        let result = search_with_retry(
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        Err(DepsError::HttpStatus {
+                            url: MAVEN_SEARCH_BASE.to_string(),
+                            status: 503,
+                        })
+                    } else {
+                        Ok(Bytes::from_static(b"ok"))
+                    }
+                }
+            },
+            || None,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), Bytes::from_static(b"ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

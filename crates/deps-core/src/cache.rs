@@ -275,6 +275,26 @@ impl HttpCache {
         self.get_cached_with_headers(url, &[]).await
     }
 
+    /// Returns the cached body for `url` without making any network request.
+    ///
+    /// Unlike `get_cached`'s own stale-while-revalidate fallback (the `Err` arm of
+    /// `conditional_request_with_headers`'s match in `get_cached_with_headers`), this
+    /// is reachable even when a caller wraps `get_cached` in a short outer timeout: a
+    /// hung conditional request that never resolves within that timeout gets its whole
+    /// future cancelled, so `get_cached`'s internal fallback logic never runs and the
+    /// caller sees a timeout instead of stale data. A caller in that position can call
+    /// this instead — a synchronous map lookup, no I/O — to serve the last known-good
+    /// body itself. Returns `None` if `url` has never been successfully cached.
+    ///
+    /// The returned body carries no age bound: this bypasses `get_cached`'s own
+    /// freshness/revalidation logic entirely, so a caller that surfaces this body to
+    /// the user (e.g. inserting it into a manifest edit) should treat it as
+    /// arbitrarily stale, not just-expired.
+    #[must_use]
+    pub fn peek_cached(&self, url: &str) -> Option<Bytes> {
+        self.entries.get(url).map(|r| r.body.clone())
+    }
+
     /// Fetches a URL with additional request headers, using the cache.
     ///
     /// Works the same as `get_cached` but injects extra headers (e.g., Authorization)

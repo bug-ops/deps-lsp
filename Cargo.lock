@@ -584,6 +584,7 @@ dependencies = [
 name = "deps-maven"
 version = "0.10.1"
 dependencies = [
+ "bytes",
  "deps-core",
  "insta",
  "mockito",
