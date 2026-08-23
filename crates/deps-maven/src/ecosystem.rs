@@ -101,7 +101,7 @@ impl MavenEcosystem {
         field: MavenNameField,
         replace_range: LspRange,
     ) -> Vec<CompletionItem> {
-        if prefix.len() < 2 || prefix.len() > 200 {
+        if !deps_core::completion::is_valid_completion_prefix_len(prefix) {
             return vec![];
         }
 
