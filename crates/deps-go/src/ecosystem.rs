@@ -47,10 +47,10 @@ impl GoEcosystem {
     /// - Popular packages database
     /// - Local workspace module paths
     /// - Integration with go.sum for recently used modules
-    async fn complete_package_names(&self, _prefix: &str) -> Vec<CompletionItem> {
+    fn complete_package_names(&self, _prefix: &str) -> impl Future<Output = Vec<CompletionItem>> {
         // Go modules don't have a centralized search API
         // Users typically know the full module path
-        vec![]
+        std::future::ready(vec![])
     }
 
     async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
@@ -67,9 +67,13 @@ impl GoEcosystem {
     ///
     /// Go modules don't have a feature flag system like Cargo.
     /// Returns empty results.
-    async fn complete_features(&self, _package_name: &str, _prefix: &str) -> Vec<CompletionItem> {
+    fn complete_features(
+        &self,
+        _package_name: &str,
+        _prefix: &str,
+    ) -> impl Future<Output = Vec<CompletionItem>> {
         // Go modules don't have feature flags
-        vec![]
+        std::future::ready(vec![])
     }
 }
 

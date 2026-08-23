@@ -32,12 +32,17 @@
 use deps_core::error::{DepsError, Result};
 use tower_lsp_server::ls_types::Uri;
 
-/// Maximum allowed file size in bytes (10MB).
+/// Maximum allowed file/document size in bytes (10MB).
 ///
 /// Files larger than this limit will be rejected to prevent excessive memory usage
 /// and performance degradation. This is a hard limit - files exceeding it cannot be loaded.
 /// Typical manifest files are <100KB, so 10MB provides ample headroom.
-const MAX_FILE_SIZE: u64 = 10_000_000; // 10MB
+///
+/// `pub(crate)` since [`super::lifecycle`] applies the same bound to content
+/// received directly over the LSP protocol (`textDocument/didOpen` /
+/// `textDocument/didChange`), which has no filesystem `metadata()` call to
+/// gate on before it reaches this crate.
+pub(crate) const MAX_FILE_SIZE: u64 = 10_000_000; // 10MB
 
 /// Large file warning threshold (1MB).
 ///

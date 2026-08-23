@@ -29,7 +29,7 @@ pub async fn handle_code_actions(
         None => return vec![],
     };
 
-    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id) {
+    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id()) {
         Some(e) => e,
         None => return vec![],
     };
