@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **deps-lsp**: `DocumentState::ecosystem_id: &'static str` is now a method (`ecosystem_id()`) instead of a stored field, since it was always fully derived from `ecosystem: EcosystemId` — removes the possibility of the two falling out of sync. `handlers::completion::fallback_completion` now takes the already-typed `EcosystemId` instead of re-parsing it from the `&str` id (resolves #155).
+- **deps-go, deps-pypi, deps-lsp**: resolved a pre-existing `clippy::unused_async_trait_impl` failure (`deps-go::GoEcosystem::{complete_package_names, complete_features}`, `deps-pypi::PypiRegistry::search`, `deps-lsp::Backend::shutdown`) by dropping `async` from these trait/inherent methods with no `.await` in their body and returning `std::future::ready(..)` instead; behavior is unchanged since no branch of any of these functions ever awaited anything.
 
 ## [0.10.1] - 2026-08-20
 

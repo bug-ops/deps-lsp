@@ -288,9 +288,9 @@ impl LanguageServer for Backend {
         });
     }
 
-    async fn shutdown(&self) -> Result<()> {
+    fn shutdown(&self) -> impl Future<Output = Result<()>> {
         tracing::info!("shutting down deps-lsp server");
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
