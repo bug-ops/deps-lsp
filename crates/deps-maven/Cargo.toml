@@ -14,7 +14,6 @@ workspace = true
 
 [dependencies]
 deps-core = { workspace = true }
-async-trait = { workspace = true }
 quick-xml = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

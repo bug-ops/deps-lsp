@@ -15,7 +15,6 @@ workspace = true
 [dependencies]
 deps-core = { workspace = true }
 deps-maven = { workspace = true }
-async-trait = { workspace = true }
 regex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

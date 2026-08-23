@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Removed unused `async-trait` workspace dependency from root `Cargo.toml` and 10 crate manifests (never invoked via `#[async_trait]`; native async traits used throughout) (#159)
+
 ## [0.10.1] - 2026-08-20
 
 ### Removed
