@@ -226,8 +226,23 @@ impl PypiParser {
                     }
                     dependencies.push(dep);
                 }
+                // A length-cap rejection is "we refused to parse this",
+                // not evidence the file isn't a requirements file — unlike
+                // a genuine syntax error, it must not count toward
+                // `failed_lines`, or a handful of oversized lines could
+                // starve the keep heuristic below and blank hover/diagnostics
+                // for every legitimate dependency in the file.
+                Err(crate::error::PypiError::RequirementTooLong { len, max }) => {
+                    tracing::warn!(
+                        "Requirements line too long ({len} bytes, max {max}), skipping: {}",
+                        super::truncate_for_log(req_text)
+                    );
+                }
                 Err(e) => {
-                    tracing::debug!("Failed to parse requirements line '{req_text}': {e}");
+                    tracing::debug!(
+                        "Failed to parse requirements line '{}': {e}",
+                        super::truncate_for_log(req_text)
+                    );
                     failed_lines += 1;
                 }
             }
@@ -557,6 +572,90 @@ mod tests {
         let result = parse(&content);
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].markers, Some(nested_marker));
+    }
+
+    // --- Requirement length cap (issue #229) ---
+
+    #[test]
+    fn test_oversized_extras_list_rejected_fast() {
+        // Regression test for #229: `pep508_rs` 0.9.2 parses an extras list
+        // in O(n²). Before the length cap, a single line this size would
+        // take on the order of seconds to parse (extrapolating the measured
+        // quadratic growth); with the cap it is rejected in O(1) and the
+        // rest of the file still parses normally.
+        let huge_extras = "a,".repeat(500_000); // ~1 MiB extras list
+        let oversized_requirement = format!("pkg[{huge_extras}]==1.0");
+        assert!(oversized_requirement.len() > super::super::MAX_REQUIREMENT_LEN);
+        let content = format!("{oversized_requirement}\ngood-pkg==2.0\n");
+
+        let start = std::time::Instant::now();
+        let result = parse(&content);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "oversized extras line took too long to reject: {elapsed:?}"
+        );
+        // The oversized line is skipped entirely (never handed to
+        // `pep508_rs`), but the rest of the file is unaffected.
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "good-pkg");
+    }
+
+    #[test]
+    fn test_oversized_line_rejection_does_not_count_as_failed_line() {
+        // Regression test for critic finding S2: a length-cap rejection must
+        // not count toward `failed_lines`, which feeds the "is this really a
+        // requirements file" keep heuristic. Bare package names (no version
+        // specifier, no strong signal) alone are kept only while
+        // `failed_lines < dependencies.len()`; before the fix, 3 oversized
+        // lines pushed `failed_lines` past that threshold and blanked the
+        // whole file, including the two legitimate bare-name dependencies.
+        let huge_extras = "a,".repeat(500_000);
+        let oversized = format!("pkg[{huge_extras}]==1.0");
+        assert!(oversized.len() > super::super::MAX_REQUIREMENT_LEN);
+        let content = format!("{oversized}\n{oversized}\n{oversized}\nrequests\nflask\n");
+
+        let result = parse(&content);
+
+        let mut names: Vec<&str> = result
+            .dependencies
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["flask", "requests"]);
+    }
+
+    #[test]
+    fn test_requirement_length_boundary() {
+        // Regression test for critic finding M1: pins the 4096/4097 boundary
+        // against the requirement string's own length, not incidental file
+        // length. A single extra name made entirely of 'a' gives exact,
+        // syntactically-valid control over the total byte length.
+        let build = |total_len: usize| {
+            let fixed = "pkg[]==1.0".len();
+            format!("pkg[{}]==1.0", "a".repeat(total_len - fixed))
+        };
+        let max = super::super::MAX_REQUIREMENT_LEN;
+
+        let at_cap = build(max);
+        assert_eq!(at_cap.len(), max);
+        let result = parse(&format!("{at_cap}\n"));
+        assert_eq!(
+            result.dependencies.len(),
+            1,
+            "a requirement exactly at the cap must be accepted"
+        );
+
+        let over_cap = build(max + 1);
+        assert_eq!(over_cap.len(), max + 1);
+        let result = parse(&format!("{over_cap}\n"));
+        assert_eq!(
+            result.dependencies.len(),
+            0,
+            "a requirement one byte over the cap must be rejected"
+        );
     }
 
     // --- Options (§3.4) ---
