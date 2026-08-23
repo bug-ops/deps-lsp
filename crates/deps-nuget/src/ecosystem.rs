@@ -278,7 +278,7 @@ mod tests {
 
         let parse_result = eco.parse_manifest(content, uri).await.unwrap();
         let mut cached = std::collections::HashMap::new();
-        cached.insert("newtonsoft.json".to_string(), latest.to_string());
+        cached.insert("newtonsoft.json".into(), latest.to_string());
         let resolved = std::collections::HashMap::new();
 
         let hints = eco
@@ -364,7 +364,7 @@ mod tests {
 
         let parse_result = eco.parse_manifest(content, uri).await.unwrap();
         let mut cached = std::collections::HashMap::new();
-        cached.insert("newtonsoft.json".to_string(), latest.to_string());
+        cached.insert("newtonsoft.json".into(), latest.to_string());
         let resolved = std::collections::HashMap::new();
 
         eco.generate_diagnostics(

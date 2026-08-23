@@ -7,6 +7,7 @@
 //! separator rewriting, etc.) belongs to `EcosystemFormatter`, not to these
 //! types. See each type's documentation for details.
 
+use std::borrow::Borrow;
 use std::fmt;
 
 /// A package/crate name as it appears in a manifest file.
@@ -107,6 +108,18 @@ impl From<&str> for PackageName {
 
 impl AsRef<str> for PackageName {
     fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Enables `&str` lookups into `HashMap<PackageName, _>`/`HashSet<PackageName>`.
+///
+/// Sound because derived `Hash`/`Eq` on `PackageName(String)` delegate to
+/// `String`'s implementations, which in turn are defined to match `str`'s
+/// exactly (`String: Borrow<str>` in `std` rests on the same guarantee) — so
+/// `PackageName` and the `str` it borrows always hash and compare equal.
+impl Borrow<str> for PackageName {
+    fn borrow(&self) -> &str {
         &self.0
     }
 }
@@ -273,6 +286,17 @@ mod tests {
         let original = String::from("tokio");
         let name = PackageName::new(original.clone());
         assert_eq!(name.into_string(), original);
+    }
+
+    #[test]
+    fn package_name_hashmap_reachable_by_str_and_by_package_name() {
+        use std::collections::HashMap;
+
+        let mut map: HashMap<PackageName, u32> = HashMap::new();
+        map.insert(PackageName::new("serde"), 1);
+
+        assert_eq!(map.get("serde"), Some(&1));
+        assert_eq!(map.get(&PackageName::new("serde")), Some(&1));
     }
 
     #[test]

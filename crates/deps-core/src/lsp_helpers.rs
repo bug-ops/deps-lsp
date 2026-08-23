@@ -7,25 +7,25 @@ use tower_lsp_server::ls_types::{
     TextEdit, Uri, WorkspaceEdit,
 };
 
-use crate::{Dependency, EcosystemConfig, ParseResult, Registry};
+use crate::{Dependency, EcosystemConfig, PackageName, ParseResult, Registry};
 
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
 /// together everywhere.
 ///
-/// Grouping them prevents accidentally swapping the two `&HashMap<String, String>`
+/// Grouping them prevents accidentally swapping the two `&HashMap<PackageName, String>`
 /// arguments at a call site, since the compiler can no longer typecheck them positionally.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::VersionData;
+/// use deps_core::{PackageName, VersionData};
 /// use std::collections::HashMap;
 ///
 /// let mut cached = HashMap::new();
-/// cached.insert("serde".to_string(), "1.0.214".to_string());
+/// cached.insert(PackageName::new("serde"), "1.0.214".to_string());
 ///
 /// let mut resolved = HashMap::new();
-/// resolved.insert("serde".to_string(), "1.0.200".to_string());
+/// resolved.insert(PackageName::new("serde"), "1.0.200".to_string());
 ///
 /// let versions = VersionData::new(&cached, &resolved);
 ///
@@ -35,9 +35,9 @@ use crate::{Dependency, EcosystemConfig, ParseResult, Registry};
 #[derive(Debug, Clone, Copy)]
 pub struct VersionData<'a> {
     /// Latest versions known from the registry, keyed by package name.
-    pub cached: &'a HashMap<String, String>,
+    pub cached: &'a HashMap<PackageName, String>,
     /// Versions actually resolved in the lock file, keyed by package name.
-    pub resolved: &'a HashMap<String, String>,
+    pub resolved: &'a HashMap<PackageName, String>,
 }
 
 impl<'a> VersionData<'a> {
@@ -54,7 +54,10 @@ impl<'a> VersionData<'a> {
     /// let versions = VersionData::new(&cached, &resolved);
     /// assert!(versions.cached.is_empty());
     /// ```
-    pub fn new(cached: &'a HashMap<String, String>, resolved: &'a HashMap<String, String>) -> Self {
+    pub fn new(
+        cached: &'a HashMap<PackageName, String>,
+        resolved: &'a HashMap<PackageName, String>,
+    ) -> Self {
         Self { cached, resolved }
     }
 }
@@ -417,12 +420,12 @@ pub fn generate_inlay_hints(
         let normalized_name = formatter.normalize_package_name(dep.name().as_str());
         let latest_version = versions
             .cached
-            .get(&normalized_name)
-            .or_else(|| versions.cached.get(dep.name().as_str()));
+            .get(normalized_name.as_str())
+            .or_else(|| versions.cached.get(dep.name()));
         let resolved_version = versions
             .resolved
-            .get(&normalized_name)
-            .or_else(|| versions.resolved.get(dep.name().as_str()));
+            .get(normalized_name.as_str())
+            .or_else(|| versions.resolved.get(dep.name()));
 
         // Show loading hint if loading and no cached version
         if loading_state == crate::LoadingState::Loading
@@ -551,8 +554,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     let resolved = versions
         .resolved
-        .get(&normalized_name)
-        .or_else(|| versions.resolved.get(dep.name().as_str()));
+        .get(normalized_name.as_str())
+        .or_else(|| versions.resolved.get(dep.name()));
     if let Some(resolved_ver) = resolved {
         write!(
             &mut markdown,
@@ -580,8 +583,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     let latest = versions
         .cached
-        .get(&normalized_name)
-        .or_else(|| versions.cached.get(dep.name().as_str()));
+        .get(normalized_name.as_str())
+        .or_else(|| versions.cached.get(dep.name()));
     if let Some(latest_ver) = latest {
         write!(
             &mut markdown,
@@ -698,14 +701,14 @@ pub fn generate_diagnostics_from_cache(
         let normalized_name = formatter.normalize_package_name(dep.name().as_str());
         let latest_version = versions
             .cached
-            .get(&normalized_name)
-            .or_else(|| versions.cached.get(dep.name().as_str()));
+            .get(normalized_name.as_str())
+            .or_else(|| versions.cached.get(dep.name()));
 
         let Some(latest) = latest_version else {
             // Skip "unknown" diagnostic if package exists in lock file
             // (registry fetch may have failed due to rate limiting)
-            let in_lockfile = versions.resolved.contains_key(&normalized_name)
-                || versions.resolved.contains_key(dep.name().as_str());
+            let in_lockfile = versions.resolved.contains_key(normalized_name.as_str())
+                || versions.resolved.contains_key(dep.name());
             if !in_lockfile {
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
@@ -1475,10 +1478,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "2.1.1".to_string());
+        cached_versions.insert("serde".into(), "2.1.1".to_string());
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".to_string(), "2.0.12".to_string());
+        resolved_versions.insert("serde".into(), "2.0.12".to_string());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1522,10 +1525,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "2.1.1".to_string());
+        cached_versions.insert("serde".into(), "2.1.1".to_string());
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".to_string(), "2.1.1".to_string());
+        resolved_versions.insert("serde".into(), "2.1.1".to_string());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1703,11 +1706,11 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), "1.0.214".to_string());
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".to_string(), "1.0.214".to_string());
+        resolved_versions.insert("serde".into(), "1.0.214".to_string());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1780,7 +1783,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "2.0.0".to_string());
+        cached_versions.insert("serde".into(), "2.0.0".to_string());
 
         let resolved_versions = HashMap::new();
 
@@ -1814,7 +1817,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), "1.0.214".to_string());
 
         let resolved_versions = HashMap::new();
 
@@ -1862,8 +1865,8 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "1.0.214".to_string());
-        cached_versions.insert("tokio".to_string(), "2.0.0".to_string());
+        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("tokio".into(), "2.0.0".to_string());
 
         let resolved_versions = HashMap::new();
 
@@ -1911,7 +1914,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("criterion".to_string(), "0.5.1".to_string());
+        cached_versions.insert("criterion".into(), "0.5.1".to_string());
 
         // Not in lock file (empty resolved_versions)
         let resolved_versions = HashMap::new();
@@ -1962,7 +1965,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("criterion".to_string(), "0.5.1".to_string());
+        cached_versions.insert("criterion".into(), "0.5.1".to_string());
 
         // Not in lock file (empty resolved_versions)
         let resolved_versions = HashMap::new();
@@ -2007,7 +2010,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("spring-boot-starter".to_string(), "3.2.0".to_string());
+        cached_versions.insert("spring-boot-starter".into(), "3.2.0".to_string());
 
         let resolved_versions = HashMap::new();
 
@@ -2047,7 +2050,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("spring-boot-starter".to_string(), "3.2.0".to_string());
+        cached_versions.insert("spring-boot-starter".into(), "3.2.0".to_string());
 
         // Not in lock file, so status is derived from `requirement_status` on the
         // formatter (which the caller sets to `Unresolved`) rather than a resolved-vs-latest
