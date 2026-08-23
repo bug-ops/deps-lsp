@@ -143,7 +143,7 @@ jobs:
 
   cross-check:
     name: Cross-compile Check (${{ matrix.target }})
-    needs: [changes, fmt, check]
+    needs: [changes, fmt]
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
