@@ -218,7 +218,7 @@ spring-boot = { module = "org.springframework.boot:spring-boot-starter", version
 
     let mut cached_versions = HashMap::new();
     cached_versions.insert(
-        "org.springframework.boot:spring-boot-starter".to_string(),
+        "org.springframework.boot:spring-boot-starter".into(),
         "3.2.0".to_string(),
     );
     let resolved_versions = HashMap::new();

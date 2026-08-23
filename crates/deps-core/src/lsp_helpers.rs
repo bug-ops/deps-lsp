@@ -7,25 +7,28 @@ use tower_lsp_server::ls_types::{
     MarkupKind, Position, Range, TextEdit, Uri, WorkspaceEdit,
 };
 
-use crate::{Dependency, EcosystemConfig, ParseResult, Registry, VersionReq};
+use crate::{
+    Dependency, EcosystemConfig, InvalidPackageName, PackageName, ParseResult, Registry,
+    VersionReq,
+};
 
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
 /// together everywhere.
 ///
-/// Grouping them prevents accidentally swapping the two `&HashMap<String, String>`
+/// Grouping them prevents accidentally swapping the two `&HashMap<PackageName, String>`
 /// arguments at a call site, since the compiler can no longer typecheck them positionally.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::VersionData;
+/// use deps_core::{PackageName, VersionData};
 /// use std::collections::HashMap;
 ///
 /// let mut cached = HashMap::new();
-/// cached.insert("serde".to_string(), "1.0.214".to_string());
+/// cached.insert(PackageName::new("serde"), "1.0.214".to_string());
 ///
 /// let mut resolved = HashMap::new();
-/// resolved.insert("serde".to_string(), "1.0.200".to_string());
+/// resolved.insert(PackageName::new("serde"), "1.0.200".to_string());
 ///
 /// let versions = VersionData::new(&cached, &resolved);
 ///
@@ -35,9 +38,9 @@ use crate::{Dependency, EcosystemConfig, ParseResult, Registry, VersionReq};
 #[derive(Debug, Clone, Copy)]
 pub struct VersionData<'a> {
     /// Latest versions known from the registry, keyed by package name.
-    pub cached: &'a HashMap<String, String>,
+    pub cached: &'a HashMap<PackageName, String>,
     /// Versions actually resolved in the lock file, keyed by package name.
-    pub resolved: &'a HashMap<String, String>,
+    pub resolved: &'a HashMap<PackageName, String>,
 }
 
 impl<'a> VersionData<'a> {
@@ -54,7 +57,10 @@ impl<'a> VersionData<'a> {
     /// let versions = VersionData::new(&cached, &resolved);
     /// assert!(versions.cached.is_empty());
     /// ```
-    pub fn new(cached: &'a HashMap<String, String>, resolved: &'a HashMap<String, String>) -> Self {
+    pub fn new(
+        cached: &'a HashMap<PackageName, String>,
+        resolved: &'a HashMap<PackageName, String>,
+    ) -> Self {
         Self { cached, resolved }
     }
 }
@@ -260,6 +266,45 @@ pub trait EcosystemFormatter: Send + Sync {
         name.to_string()
     }
 
+    /// Lints `name` against ecosystem-specific naming rules.
+    ///
+    /// Default: permissive, always `Ok(())`. This is a diagnostic lint, not a
+    /// construction-time gate — [`PackageName::new`](crate::PackageName::new)
+    /// stays infallible regardless of what this returns. Override only to warn
+    /// on names an ecosystem's own tooling would never accept; err on the side
+    /// of accepting anything ambiguous, since a false positive here is a
+    /// warning on a manifest the user's actual package manager treats as fine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] carrying the reason `name` fails this
+    /// ecosystem's naming rules. The default implementation never errs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    ///
+    /// struct PermissiveFormatter;
+    ///
+    /// impl EcosystemFormatter for PermissiveFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///
+    ///     fn package_url(&self, name: &str) -> String {
+    ///         format!("https://example.com/{name}")
+    ///     }
+    /// }
+    ///
+    /// // The default is permissive: any name, including one that would fail an
+    /// // ecosystem-specific override, is accepted.
+    /// assert!(PermissiveFormatter.validate_package_name("../not/a/real/rule").is_ok());
+    /// ```
+    fn validate_package_name(&self, _name: &str) -> Result<(), InvalidPackageName> {
+        Ok(())
+    }
+
     /// Format version string for code action text edit.
     fn format_version_for_text_edit(&self, version: &str) -> String;
 
@@ -436,12 +481,12 @@ pub fn generate_inlay_hints(
         let normalized_name = formatter.normalize_package_name(dep.name().as_str());
         let latest_version = versions
             .cached
-            .get(&normalized_name)
-            .or_else(|| versions.cached.get(dep.name().as_str()));
+            .get(normalized_name.as_str())
+            .or_else(|| versions.cached.get(dep.name()));
         let resolved_version = versions
             .resolved
-            .get(&normalized_name)
-            .or_else(|| versions.resolved.get(dep.name().as_str()));
+            .get(normalized_name.as_str())
+            .or_else(|| versions.resolved.get(dep.name()));
 
         // Show loading hint if loading and no cached version
         if loading_state == crate::LoadingState::Loading
@@ -570,8 +615,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     let resolved = versions
         .resolved
-        .get(&normalized_name)
-        .or_else(|| versions.resolved.get(dep.name().as_str()));
+        .get(normalized_name.as_str())
+        .or_else(|| versions.resolved.get(dep.name()));
     if let Some(resolved_ver) = resolved {
         write!(
             &mut markdown,
@@ -599,8 +644,8 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     let latest = versions
         .cached
-        .get(&normalized_name)
-        .or_else(|| versions.cached.get(dep.name().as_str()));
+        .get(normalized_name.as_str())
+        .or_else(|| versions.cached.get(dep.name()));
     if let Some(latest_ver) = latest {
         write!(
             &mut markdown,
@@ -717,19 +762,23 @@ pub fn generate_diagnostics_from_cache(
         let normalized_name = formatter.normalize_package_name(dep.name().as_str());
         let latest_version = versions
             .cached
-            .get(&normalized_name)
-            .or_else(|| versions.cached.get(dep.name().as_str()));
+            .get(normalized_name.as_str())
+            .or_else(|| versions.cached.get(dep.name()));
 
         let Some(latest) = latest_version else {
             // Skip "unknown" diagnostic if package exists in lock file
             // (registry fetch may have failed due to rate limiting)
-            let in_lockfile = versions.resolved.contains_key(&normalized_name)
-                || versions.resolved.contains_key(dep.name().as_str());
+            let in_lockfile = versions.resolved.contains_key(normalized_name.as_str())
+                || versions.resolved.contains_key(dep.name());
             if !in_lockfile {
+                let message = match formatter.validate_package_name(dep.name().as_str()) {
+                    Err(reason) => format!("Invalid package name '{}': {reason}", dep.name()),
+                    Ok(()) => format!("Unknown package '{}'", dep.name()),
+                };
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
                     severity: Some(DiagnosticSeverity::WARNING),
-                    message: format!("Unknown package '{}'", dep.name()),
+                    message,
                     source: Some("deps-lsp".into()),
                     ..Default::default()
                 });
@@ -919,7 +968,7 @@ pub fn collect_update_all_edits(
         let normalized_name = formatter.normalize_package_name(dep.name().as_str());
         let Some(latest) = versions
             .cached
-            .get(&normalized_name)
+            .get(normalized_name.as_str())
             .or_else(|| versions.cached.get(dep.name().as_str()))
         else {
             continue;
@@ -1067,10 +1116,14 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
         let versions = match registry.get_versions(dep.name().as_str()).await {
             Ok(v) => v,
             Err(_) => {
+                let message = match formatter.validate_package_name(dep.name().as_str()) {
+                    Err(reason) => format!("Invalid package name '{}': {reason}", dep.name()),
+                    Ok(()) => format!("Unknown package '{}'", dep.name()),
+                };
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
                     severity: Some(DiagnosticSeverity::WARNING),
-                    message: format!("Unknown package '{}'", dep.name()),
+                    message,
                     source: Some("deps-lsp".into()),
                     ..Default::default()
                 });
@@ -1347,6 +1400,24 @@ mod tests {
         }
     }
 
+    /// A formatter whose `validate_package_name` always rejects, for exercising
+    /// the "Invalid package name" diagnostic path independently of "Unknown package".
+    struct RejectingFormatter;
+
+    impl EcosystemFormatter for RejectingFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            version.to_string()
+        }
+
+        fn package_url(&self, name: &str) -> String {
+            format!("https://example.com/{}", name)
+        }
+
+        fn validate_package_name(&self, _name: &str) -> Result<(), InvalidPackageName> {
+            Err(InvalidPackageName::new("name is rejected for testing"))
+        }
+    }
+
     struct MockParseResult {
         deps: Vec<MockDep>,
         uri: Uri,
@@ -1515,6 +1586,50 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a str,
+            _req: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn package_url(&self, _name: &str) -> String {
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A registry whose `get_versions` always errs, for exercising
+    /// `generate_diagnostics`'s `Err` arm.
+    struct ErrorRegistry;
+
+    impl crate::Registry for ErrorRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move {
+                Err(crate::error::DepsError::CacheError(
+                    "mock registry error".to_string(),
+                ))
+            })
         }
 
         fn get_latest_matching<'a>(
@@ -1780,10 +1895,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "2.1.1".to_string());
+        cached_versions.insert("serde".into(), "2.1.1".to_string());
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".to_string(), "2.0.12".to_string());
+        resolved_versions.insert("serde".into(), "2.0.12".to_string());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -1827,10 +1942,10 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "2.1.1".to_string());
+        cached_versions.insert("serde".into(), "2.1.1".to_string());
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".to_string(), "2.1.1".to_string());
+        resolved_versions.insert("serde".into(), "2.1.1".to_string());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -2008,11 +2123,11 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), "1.0.214".to_string());
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".to_string(), "1.0.214".to_string());
+        resolved_versions.insert("serde".into(), "1.0.214".to_string());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -2068,6 +2183,67 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_diagnostics_from_cache_invalid_package_name() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // A formatter that rejects every name must produce exactly one
+        // "Invalid package name" diagnostic per unresolved dependency, never
+        // both that and "Unknown package".
+        let formatter = RejectingFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "bad-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diagnostics[0].message.starts_with("Invalid package name"));
+        assert!(!diagnostics[0].message.contains("Unknown package"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_invalid_package_name() {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // Network variant: a registry lookup failure combined with a rejected
+        // name must produce "Invalid package name", not "Unknown package".
+        let formatter = RejectingFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "bad-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let diagnostics = generate_diagnostics(&parse_result, &ErrorRegistry, &formatter).await;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diagnostics[0].message.starts_with("Invalid package name"));
+        assert!(!diagnostics[0].message.contains("Unknown package"));
+    }
+
+    #[test]
     fn test_generate_diagnostics_from_cache_outdated_version() {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
@@ -2085,7 +2261,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "2.0.0".to_string());
+        cached_versions.insert("serde".into(), "2.0.0".to_string());
 
         let resolved_versions = HashMap::new();
 
@@ -2119,7 +2295,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "1.0.214".to_string());
+        cached_versions.insert("serde".into(), "1.0.214".to_string());
 
         let resolved_versions = HashMap::new();
 
@@ -2167,8 +2343,8 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".to_string(), "1.0.214".to_string());
-        cached_versions.insert("tokio".to_string(), "2.0.0".to_string());
+        cached_versions.insert("serde".into(), "1.0.214".to_string());
+        cached_versions.insert("tokio".into(), "2.0.0".to_string());
 
         let resolved_versions = HashMap::new();
 
@@ -2216,7 +2392,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("criterion".to_string(), "0.5.1".to_string());
+        cached_versions.insert("criterion".into(), "0.5.1".to_string());
 
         // Not in lock file (empty resolved_versions)
         let resolved_versions = HashMap::new();
@@ -2267,7 +2443,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("criterion".to_string(), "0.5.1".to_string());
+        cached_versions.insert("criterion".into(), "0.5.1".to_string());
 
         // Not in lock file (empty resolved_versions)
         let resolved_versions = HashMap::new();
@@ -2312,7 +2488,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("spring-boot-starter".to_string(), "3.2.0".to_string());
+        cached_versions.insert("spring-boot-starter".into(), "3.2.0".to_string());
 
         let resolved_versions = HashMap::new();
 
@@ -2352,7 +2528,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("spring-boot-starter".to_string(), "3.2.0".to_string());
+        cached_versions.insert("spring-boot-starter".into(), "3.2.0".to_string());
 
         // Not in lock file, so status is derived from `requirement_status` on the
         // formatter (which the caller sets to `Unresolved`) rather than a resolved-vs-latest

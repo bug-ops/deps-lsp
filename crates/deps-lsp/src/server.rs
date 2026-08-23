@@ -2,6 +2,7 @@ use crate::config::DepsConfig;
 use crate::document::{ServerState, handle_document_change, handle_document_open};
 use crate::file_watcher;
 use crate::handlers::{code_actions, code_lens, completion, diagnostics, hover, inlay_hints};
+use deps_core::PackageName;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -165,8 +166,8 @@ impl Backend {
         {
             Ok(packages) => packages
                 .iter()
-                .map(|(name, pkg)| (name.clone(), pkg.version.clone()))
-                .collect::<HashMap<String, String>>(),
+                .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone()))
+                .collect::<HashMap<PackageName, String>>(),
             Err(e) => {
                 tracing::error!("Failed to reload lock file: {}", e);
                 self.client

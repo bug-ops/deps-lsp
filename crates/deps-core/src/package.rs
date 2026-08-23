@@ -7,6 +7,7 @@
 //! separator rewriting, etc.) belongs to `EcosystemFormatter`, not to these
 //! types. See each type's documentation for details.
 
+use std::borrow::Borrow;
 use std::fmt;
 
 /// A package/crate name as it appears in a manifest file.
@@ -110,6 +111,18 @@ impl AsRef<str> for PackageName {
     }
 }
 
+/// Enables `&str` lookups into `HashMap<PackageName, _>`/`HashSet<PackageName>`.
+///
+/// Sound because derived `Hash`/`Eq` on `PackageName(String)` delegate to
+/// `String`'s implementations, which in turn are defined to match `str`'s
+/// exactly (`String: Borrow<str>` in `std` rests on the same guarantee) — so
+/// `PackageName` and the `str` it borrows always hash and compare equal.
+impl Borrow<str> for PackageName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 impl PartialEq<str> for PackageName {
     fn eq(&self, other: &str) -> bool {
         self.0 == other
@@ -119,6 +132,40 @@ impl PartialEq<str> for PackageName {
 impl PartialEq<&str> for PackageName {
     fn eq(&self, other: &&str) -> bool {
         self.0 == *other
+    }
+}
+
+/// A package name that failed an [`EcosystemFormatter::validate_package_name`] lint.
+///
+/// This is not a construction-time gate — [`PackageName::new`] stays infallible — it
+/// only carries *why* a name looks wrong so an LSP diagnostic can say something more
+/// specific than "invalid name".
+///
+/// [`EcosystemFormatter::validate_package_name`]: crate::lsp_helpers::EcosystemFormatter::validate_package_name
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::InvalidPackageName;
+///
+/// let err = InvalidPackageName::new("name is longer than 214 characters");
+/// assert_eq!(err.reason(), "name is longer than 214 characters");
+/// assert_eq!(err.to_string(), "name is longer than 214 characters");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidPackageName(std::borrow::Cow<'static, str>);
+
+impl InvalidPackageName {
+    /// Creates an `InvalidPackageName` carrying `reason` as the explanation.
+    pub fn new(reason: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self(reason.into())
+    }
+
+    /// Returns why the name was rejected.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.0
     }
 }
 
@@ -271,6 +318,17 @@ mod tests {
         let original = String::from("tokio");
         let name = PackageName::new(original.clone());
         assert_eq!(name.into_string(), original);
+    }
+
+    #[test]
+    fn package_name_hashmap_reachable_by_str_and_by_package_name() {
+        use std::collections::HashMap;
+
+        let mut map: HashMap<PackageName, u32> = HashMap::new();
+        map.insert(PackageName::new("serde"), 1);
+
+        assert_eq!(map.get("serde"), Some(&1));
+        assert_eq!(map.get(&PackageName::new("serde")), Some(&1));
     }
 
     #[test]

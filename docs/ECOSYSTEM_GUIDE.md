@@ -93,6 +93,15 @@ in that case is regenerating the lock file, which only the package manager can d
 there is nothing for the lens to edit. Unifying the two definitions is tracked as a
 follow-up.
 
+### npm Package Name Validation
+
+When a dependency in `package.json` fails to resolve against the npm registry, the diagnostic distinguishes between two cases instead of always reporting "Unknown package":
+
+- **`Invalid package name '<name>': <reason>`** — the name itself violates npm's own naming rules (e.g. it starts with `.`/`_`, exceeds 214 characters, contains a character outside npm's URL-friendly set, or is a reserved name like `node_modules`).
+- **`Unknown package '<name>'`** — the name is syntactically valid but was not found in the registry (typo, private/unpublished package, etc.).
+
+The check is deliberately permissive: uppercase names are still accepted (npm only warns on those for legacy packages, never rejects), and it accepts every character npm's own `encodeURIComponent(segment) === segment` predicate accepts, including `! ' ( ) * - . _ ~` — not just alphanumerics and hyphens.
+
 ## Architecture Overview
 
 Each ecosystem is implemented as a separate crate under `crates/deps-{ecosystem}/` with the following structure:
@@ -634,6 +643,15 @@ impl EcosystemFormatter for {Ecosystem}Formatter {
 
     fn package_url(&self, name: &str) -> String {
         format!("https://registry.example.com/packages/{}", name)
+    }
+
+    // Optional: lint manifest-declared names against this ecosystem's naming
+    // rules. Default is always `Ok(())` — only override to warn on names the
+    // ecosystem's own tooling would never accept (see `deps-npm`'s
+    // `NpmFormatter` for a full example). Never used as a construction gate:
+    // `PackageName::new` stays infallible regardless of this check.
+    fn validate_package_name(&self, _name: &str) -> Result<(), deps_core::InvalidPackageName> {
+        Ok(())
     }
 }
 ```
