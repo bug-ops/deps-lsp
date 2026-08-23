@@ -586,6 +586,7 @@ version = "0.10.1"
 dependencies = [
  "deps-core",
  "insta",
+ "mockito",
  "quick-xml",
  "serde",
  "serde_json",

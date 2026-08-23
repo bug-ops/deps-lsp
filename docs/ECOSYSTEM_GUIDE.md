@@ -88,6 +88,25 @@ A requirement that couldn't be resolved to a concrete version (Maven's `${proper
 - **Inlay hints**: no badge is shown at all, neither "up to date" nor "needs update" — showing "up to date" for a requirement that was never actually checked against the latest version would be misleading.
 - **CodeLens "Update N outdated dependencies"** (below): an unresolved requirement is also never counted or edited — it already fails the literal-span guard (the tracked span covers a placeholder/variable, not a version literal), so the two mechanisms agree independently rather than one depending on the other.
 
+### Maven/Gradle Release-Freshness Coverage
+
+Hover's "Recent versions" age suffix and completion's age `label_details` (gated by
+`freshness.enabled`, default `true`) depend on Maven Central's `repo1.maven.org` HTML
+directory listing, which is not available for every artifact source Maven/Gradle resolve
+through:
+
+- **Maven Central** (`repo1.maven.org`) ✅ — the directory listing is fetched and parsed;
+  ages render normally.
+- **Google Maven** (`dl.google.com`, `androidx.*`/`com.google.firebase.*`/
+  `com.google.android.*`/`com.google.gms.*`/`com.android.*` group IDs) ✗ — the listing 404s
+  for every artifact, so no extra request is even attempted; `published_at()` is always
+  `None` and the version list itself is unaffected.
+- **Gradle Plugin Portal** (`plugins.gradle.org`, the fallback for a group ID not found on
+  Maven Central) ✗ — the listing has no date column; same result as above.
+
+This is intentional graceful degradation (US-003), the same shape as Go's documented
+partial freshness coverage (`/@v/list` carries no per-version dates either) — not a bug.
+
 ### CodeLens: "Update N Outdated Dependencies"
 
 An open manifest with at least one outdated, safely-editable dependency shows a code lens at

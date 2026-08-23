@@ -71,27 +71,6 @@ impl PublishTime {
         Self(secs)
     }
 
-    /// Builds a [`PublishTime`] from Unix epoch milliseconds, truncating to
-    /// whole seconds.
-    ///
-    /// Kept for a future ecosystem whose registry reports millisecond
-    /// timestamps (e.g. Maven's solrsearch `core=gav` API); unused by any
-    /// v1 ecosystem, which all report second- or sub-second-precision
-    /// RFC 3339 strings via [`PublishTime::parse_rfc3339`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::PublishTime;
-    ///
-    /// let t = PublishTime::from_unix_millis(1_753_052_713_000);
-    /// assert_eq!(t.as_unix_secs(), 1_753_052_713);
-    /// ```
-    #[must_use]
-    pub const fn from_unix_millis(ms: i64) -> Self {
-        Self(ms / 1000)
-    }
-
     /// Parses an RFC 3339 timestamp string into a [`PublishTime`].
     ///
     /// Accepts every shape seen across v1 registries: a bare `Z` suffix,

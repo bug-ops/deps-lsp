@@ -5,11 +5,12 @@
 
 use crate::types::{ArtifactInfo, MavenVersion};
 use crate::version::compare_versions;
-use deps_core::{DepsError, HttpCache, Result};
+use deps_core::{DepsError, HttpCache, PublishTime, Result};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use serde::Deserialize;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
@@ -124,7 +125,7 @@ fn pick_wildcard_latest(versions: &[MavenVersion], release: Option<&str>) -> Opt
                 .cloned()
                 .unwrap_or(MavenVersion {
                     version: rel.to_string(),
-                    timestamp: None,
+                    published_at: None,
                 }),
         );
     }
@@ -133,6 +134,29 @@ fn pick_wildcard_latest(versions: &[MavenVersion], release: Option<&str>) -> Opt
         .find(|v| !crate::version::is_prerelease(&v.version))
         .or_else(|| versions.first())
         .cloned()
+}
+
+/// Whether `base` (a metadata directory URL returned by `get_metadata`) is served by
+/// Maven Central specifically, i.e. whether fetching its directory listing is worth the
+/// request.
+///
+/// Google Maven's listing always 404s (no negative caching in [`HttpCache`], so an
+/// unconditional fetch would retry forever) and the Gradle Plugin Portal's listing has no
+/// date column (a wasted fetch+parse every time) — both must cost zero extra requests, not
+/// one doomed one, so this checks the specific winning base rather than "some base exists".
+fn should_fetch_listing(base: &str) -> bool {
+    base.starts_with(MAVEN_REPO_BASE)
+}
+
+/// Attaches `published_at` to each version whose string matches an entry in `times`.
+///
+/// A version present in `versions` but absent from `times` (or vice versa) is not an
+/// error: it simply keeps/never gets a `published_at`. Order is untouched — this must run
+/// before [`move_release_to_front`] so ordering stays governed by that function alone.
+fn attach_publish_times(versions: &mut [MavenVersion], times: &HashMap<String, PublishTime>) {
+    for v in versions {
+        v.published_at = times.get(&v.version).copied();
+    }
 }
 
 #[derive(Clone)]
@@ -145,17 +169,28 @@ impl MavenCentralRegistry {
         Self { cache }
     }
 
-    async fn get_metadata(&self, name: &str) -> Result<(Vec<MavenVersion>, Option<String>)> {
+    /// Fetches and parses `maven-metadata.xml`, also returning the directory URL of
+    /// whichever repository base (Maven Central, Google Maven, or the Gradle Plugin
+    /// Portal fallback) actually served it — `metadata_urls`' bases differ per group, so
+    /// the winning base can only be known after the fetch succeeds, not guessed upfront.
+    async fn get_metadata(
+        &self,
+        name: &str,
+    ) -> Result<(Vec<MavenVersion>, Option<String>, Option<String>)> {
         let urls = metadata_urls(name);
         if urls.is_empty() {
             tracing::debug!(package = %name, "skipping: invalid groupId:artifactId format");
-            return Ok((vec![], None));
+            return Ok((vec![], None, None));
         }
 
         let mut last_err = None;
         for url in &urls {
             match self.cache.get_cached(url).await {
-                Ok(data) => return parse_metadata_xml(&data),
+                Ok(data) => {
+                    let (versions, release) = parse_metadata_xml(&data)?;
+                    let base = url.strip_suffix("maven-metadata.xml").map(str::to_string);
+                    return Ok((versions, release, base));
+                }
                 Err(e) => {
                     tracing::debug!(package = %name, url = %url, error = %e, "metadata fetch failed, trying next");
                     last_err = Some(e);
@@ -168,10 +203,52 @@ impl MavenCentralRegistry {
         Err(e)
     }
 
-    pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
-        let (mut versions, release) = self.get_metadata(name).await?;
+    /// Fetches the directory listing at `base` (a Maven Central artifact directory URL,
+    /// trailing slash) and returns the version → publish-time map parsed from it.
+    ///
+    /// Never fails the caller: any fetch error, timeout, or unparseable body degrades to
+    /// an empty map, logged at `debug`, so a listing outage never affects the version list
+    /// itself — only whether ages are shown alongside it.
+    async fn fetch_publish_times(&self, base: &str) -> HashMap<String, PublishTime> {
+        match self.cache.get_cached(base).await {
+            Ok(data) => parse_publish_times(&data),
+            Err(e) => {
+                tracing::debug!(url = %base, error = %e, "listing fetch failed, publish times unavailable");
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Same as [`Self::get_versions_typed`], but attaches [`MavenVersion::published_at`]
+    /// from the `repo1.maven.org` directory listing when `freshness_enabled` and the
+    /// artifact resolved through Maven Central.
+    ///
+    /// The listing fetch is gated on the winning base being Maven Central specifically —
+    /// not merely present — because Google Maven's listing always 404s (no negative
+    /// caching in [`HttpCache`], so an unconditional fetch would retry forever) and the
+    /// Gradle Plugin Portal's listing has no date column (a wasted fetch+parse on every
+    /// call). Both degrade to zero extra requests here rather than one doomed one.
+    pub async fn get_versions_typed_with(
+        &self,
+        name: &str,
+        freshness_enabled: bool,
+    ) -> Result<Vec<MavenVersion>> {
+        let (mut versions, release, base) = self.get_metadata(name).await?;
+        if freshness_enabled && let Some(base) = base.as_deref().filter(|b| should_fetch_listing(b))
+        {
+            let times = self.fetch_publish_times(base).await;
+            attach_publish_times(&mut versions, &times);
+        }
         move_release_to_front(&mut versions, release.as_deref());
         Ok(versions)
+    }
+
+    /// Fetches all available versions, without publish-time enrichment.
+    ///
+    /// Delegates to [`Self::get_versions_typed_with`] with freshness disabled so the two
+    /// paths cannot drift apart.
+    pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<MavenVersion>> {
+        self.get_versions_typed_with(name, false).await
     }
 
     pub async fn get_latest_matching_typed(
@@ -179,7 +256,7 @@ impl MavenCentralRegistry {
         name: &str,
         req: &str,
     ) -> Result<Option<MavenVersion>> {
-        let (versions, release) = self.get_metadata(name).await?;
+        let (versions, release, _base) = self.get_metadata(name).await?;
         // For Maven MVP: exact string match, or latest stable if req is empty/wildcard
         if req.is_empty() || req == "*" {
             return Ok(pick_wildcard_latest(&versions, release.as_deref()));
@@ -269,7 +346,7 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
                 if in_version {
                     versions.push(MavenVersion {
                         version: s,
-                        timestamp: None,
+                        published_at: None,
                     });
                 } else if in_release {
                     release = Some(s);
@@ -288,6 +365,109 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
 
     versions.sort_by(|a, b| compare_versions(&b.version, &a.version));
     Ok((versions, release))
+}
+
+/// Parses a Maven Central directory listing (`repo1.maven.org/maven2/{g}/{a}/`) into a
+/// version → publish-time map.
+///
+/// Line-oriented, not a full HTML parser: each line is checked independently for both an
+/// anchor `href` (never the display text, which Maven Central sometimes pads or wraps in
+/// a `title=` attribute) and a `YYYY-MM-DD HH:MM` timestamp anywhere on the line; a line
+/// missing either yields nothing. This is what makes the Gradle Plugin Portal's dateless
+/// `<pre><a href="X/">X/</a></pre>` listing format — and any other listing that carries no
+/// date column — parse to an empty map instead of a guess.
+///
+/// Bounded by the same 32 MiB response cap [`HttpCache`] applies to every fetch (not a
+/// meaningfully tight bound on its own); real listings are far smaller (up to ~245 KB /
+/// ~2000 anchors observed for a large artifact).
+fn parse_publish_times(html: &[u8]) -> HashMap<String, PublishTime> {
+    let mut map = HashMap::new();
+    let text = String::from_utf8_lossy(html);
+    let Some(pre) = extract_pre_block(&text) else {
+        return map;
+    };
+
+    for line in pre.lines() {
+        let Some(href) = extract_href(line) else {
+            continue;
+        };
+        // Only directory entries (trailing `/`) are version directories — a sibling file
+        // entry (`maven-metadata.xml`, `.md5`, `.sha1`, ...) also carries an href and a
+        // date, but is never a version, so keeping it out of the map avoids polluting it
+        // with keys that will just never be looked up.
+        let Some(version) = href.strip_suffix('/') else {
+            continue;
+        };
+        if version.is_empty() || version == ".." {
+            continue;
+        }
+        let Some(date_str) = find_date_time(line) else {
+            continue;
+        };
+        let rfc3339 = format!("{}T{}:00Z", &date_str[..10], &date_str[11..16]);
+        if let Some(published) = PublishTime::parse_rfc3339(&rfc3339) {
+            map.insert(version.to_string(), published);
+        }
+    }
+
+    map
+}
+
+/// Slices out the body of the first `<pre>...</pre>` block, case-sensitively (Maven
+/// Central and the Gradle Plugin Portal both emit lowercase tags). Returns `None` when no
+/// `<pre>` block is present, so a page shaped nothing like a directory listing yields an
+/// empty map rather than scanning arbitrary HTML for anchor-shaped text.
+fn extract_pre_block(html: &str) -> Option<&str> {
+    let open = html.find("<pre")?;
+    let content_start = html[open..].find('>')? + open + 1;
+    let close = html[content_start..].find("</pre")?;
+    Some(&html[content_start..content_start + close])
+}
+
+/// Extracts an anchor's `href` attribute value from a listing line, ignoring display text.
+fn extract_href(line: &str) -> Option<&str> {
+    let idx = line.find("href=\"")?;
+    let rest = &line[idx + 6..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// Finds the first `YYYY-MM-DD HH:MM` substring anywhere in `line`, independent of column
+/// alignment or padding. All matched bytes are ASCII, so the returned slice's byte offsets
+/// are always valid `str` char boundaries.
+fn find_date_time(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let window = 16; // "YYYY-MM-DD HH:MM"
+    if bytes.len() < window {
+        return None;
+    }
+    for start in 0..=(bytes.len() - window) {
+        let candidate = &bytes[start..start + window];
+        if is_date_time_shape(candidate) {
+            return Some(&line[start..start + window]);
+        }
+    }
+    None
+}
+
+fn is_date_time_shape(b: &[u8]) -> bool {
+    let digit = u8::is_ascii_digit;
+    digit(&b[0])
+        && digit(&b[1])
+        && digit(&b[2])
+        && digit(&b[3])
+        && b[4] == b'-'
+        && digit(&b[5])
+        && digit(&b[6])
+        && b[7] == b'-'
+        && digit(&b[8])
+        && digit(&b[9])
+        && b[10] == b' '
+        && digit(&b[11])
+        && digit(&b[12])
+        && b[13] == b':'
+        && digit(&b[14])
+        && digit(&b[15])
 }
 
 #[derive(Deserialize)]
@@ -340,6 +520,22 @@ impl deps_core::Registry for MavenCentralRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let versions = self.get_versions_typed(name.as_str()).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
+    }
+
+    fn get_versions_with<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        freshness: deps_core::FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let versions = self
+                .get_versions_typed_with(name.as_str(), freshness.enabled)
+                .await?;
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -688,11 +884,11 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> = vec![
             Box::new(MavenVersion {
                 version: "1.0.0".into(),
-                timestamp: None,
+                published_at: None,
             }),
             Box::new(MavenVersion {
                 version: "2.0.0-SNAPSHOT".into(),
-                timestamp: None,
+                published_at: None,
             }),
         ];
         let req = VersionReq::new("*");
@@ -704,11 +900,11 @@ mod tests {
         let mut versions = vec![
             MavenVersion {
                 version: "3.4.0".into(),
-                timestamp: None,
+                published_at: None,
             },
             MavenVersion {
                 version: "4.0.0-M1".into(),
-                timestamp: None,
+                published_at: None,
             },
         ];
         // <release> designates the milestone even though it isn't the "stable-looking"
@@ -723,11 +919,11 @@ mod tests {
         let mut versions = vec![
             MavenVersion {
                 version: "1.0.0".into(),
-                timestamp: None,
+                published_at: None,
             },
             MavenVersion {
                 version: "0.9.0".into(),
-                timestamp: None,
+                published_at: None,
             },
         ];
         move_release_to_front(&mut versions, Some("1.0.0"));
@@ -740,11 +936,11 @@ mod tests {
         let mut versions = vec![
             MavenVersion {
                 version: "1.0.0".into(),
-                timestamp: None,
+                published_at: None,
             },
             MavenVersion {
                 version: "0.9.0".into(),
-                timestamp: None,
+                published_at: None,
             },
         ];
         move_release_to_front(&mut versions, Some("2.0.0"));
@@ -756,7 +952,7 @@ mod tests {
     fn test_move_release_to_front_no_release_is_a_no_op() {
         let mut versions = vec![MavenVersion {
             version: "1.0.0".into(),
-            timestamp: None,
+            published_at: None,
         }];
         move_release_to_front(&mut versions, None);
         assert_eq!(versions[0].version, "1.0.0");
@@ -769,11 +965,11 @@ mod tests {
         let mut versions = vec![
             MavenVersion {
                 version: "1.5.0-alpha01".into(),
-                timestamp: None,
+                published_at: None,
             },
             MavenVersion {
                 version: "1.4.0".into(),
-                timestamp: None,
+                published_at: None,
             },
         ];
         move_release_to_front(&mut versions, None);
@@ -786,11 +982,11 @@ mod tests {
         let mut versions = vec![
             MavenVersion {
                 version: "2.0.0-alpha".into(),
-                timestamp: None,
+                published_at: None,
             },
             MavenVersion {
                 version: "1.0.0-beta".into(),
-                timestamp: None,
+                published_at: None,
             },
         ];
         move_release_to_front(&mut versions, None);
@@ -802,11 +998,11 @@ mod tests {
         let versions = vec![
             MavenVersion {
                 version: "1.4.0".into(),
-                timestamp: None,
+                published_at: None,
             },
             MavenVersion {
                 version: "1.5.0-M1".into(),
-                timestamp: None,
+                published_at: None,
             },
         ];
         let picked = pick_wildcard_latest(&versions, Some("1.5.0-M1")).unwrap();
@@ -821,7 +1017,7 @@ mod tests {
         // move_release_to_front can only return an index into the existing slice.
         let versions = vec![MavenVersion {
             version: "1.0.0".into(),
-            timestamp: None,
+            published_at: None,
         }];
         let picked = pick_wildcard_latest(&versions, Some("9.9.9")).unwrap();
         assert_eq!(picked.version, "9.9.9");
@@ -832,11 +1028,11 @@ mod tests {
         let versions = vec![
             MavenVersion {
                 version: "2.0.0-alpha".into(),
-                timestamp: None,
+                published_at: None,
             },
             MavenVersion {
                 version: "1.0.0".into(),
-                timestamp: None,
+                published_at: None,
             },
         ];
         let picked = pick_wildcard_latest(&versions, None).unwrap();
@@ -881,11 +1077,11 @@ mod tests {
             vec![
                 MavenVersion {
                     version: "1.4.0".into(),
-                    timestamp: None,
+                    published_at: None,
                 },
                 MavenVersion {
                     version: "1.5.0-M1".into(),
-                    timestamp: None,
+                    published_at: None,
                 },
             ],
             Some("1.5.0-M1"),
@@ -899,11 +1095,11 @@ mod tests {
             vec![
                 MavenVersion {
                     version: "1.5.0-alpha01".into(),
-                    timestamp: None,
+                    published_at: None,
                 },
                 MavenVersion {
                     version: "1.4.0".into(),
-                    timestamp: None,
+                    published_at: None,
                 },
             ],
             None,
@@ -917,14 +1113,309 @@ mod tests {
             vec![
                 MavenVersion {
                     version: "2.0.0-alpha".into(),
-                    timestamp: None,
+                    published_at: None,
                 },
                 MavenVersion {
                     version: "1.0.0-beta".into(),
-                    timestamp: None,
+                    published_at: None,
                 },
             ],
             None,
         );
+    }
+
+    // --- parse_publish_times: fixtures captured live from repo1.maven.org and
+    // plugins.gradle.org on 2026-08-24 (see handoff for the exact `curl` commands) ---
+
+    /// A trimmed excerpt of the real `repo1.maven.org/maven2/org/apache/commons/commons-lang3/`
+    /// listing: the `../` parent anchor, several version directories (padded display text +
+    /// `title=` attribute, exactly as Maven Central emits), and a couple of sibling file
+    /// entries (`maven-metadata.xml.md5` etc.) that carry dates too but are not versions.
+    const REPO1_FIXTURE: &str = r#"<pre id="contents">
+<a href="../">../</a>
+<a href="3.12.0/" title="3.12.0/">3.12.0/</a>                                           2021-02-26 20:40         -
+<a href="3.13.0/" title="3.13.0/">3.13.0/</a>                                           2023-07-23 19:44         -
+<a href="3.14.0/" title="3.14.0/">3.14.0/</a>                                           2023-11-18 15:03         -
+<a href="maven-metadata.xml" title="maven-metadata.xml">maven-metadata.xml</a>                                2025-11-16 12:55       817
+<a href="maven-metadata.xml.md5" title="maven-metadata.xml.md5">maven-metadata.xml.md5</a>                            2025-11-16 12:55        32
+</pre>"#;
+
+    #[test]
+    fn test_parse_publish_times_repo1_fixture() {
+        let map = parse_publish_times(REPO1_FIXTURE.as_bytes());
+
+        assert_eq!(
+            map.get("3.14.0").copied(),
+            PublishTime::parse_rfc3339("2023-11-18T15:03:00Z")
+        );
+        assert_eq!(
+            map.get("3.12.0").copied(),
+            PublishTime::parse_rfc3339("2021-02-26T20:40:00Z")
+        );
+        // The `../` parent anchor never becomes a "version".
+        assert!(!map.contains_key(".."));
+        assert!(!map.contains_key(""));
+        // Sibling file entries (no trailing `/` in their href) are not versions either,
+        // even though they carry a date too (M2).
+        assert!(!map.contains_key("maven-metadata.xml"));
+        assert!(!map.contains_key("maven-metadata.xml.md5"));
+    }
+
+    /// Real `plugins.gradle.org/m2/.../spring-boot-gradle-plugin/` shape: one `<pre>` per
+    /// anchor, no date column at all. `extract_pre_block` only ever sees the first `<pre>`,
+    /// but the outcome is the same either way — no line here carries a date, so nothing
+    /// is ever inserted.
+    const GRADLE_PLUGIN_PORTAL_FIXTURE: &str = r#"<pre><a href="1.4.2.RELEASE/">1.4.2.RELEASE/</a></pre>
+<pre><a href="1.5.0.RELEASE/">1.5.0.RELEASE/</a></pre>"#;
+
+    #[test]
+    fn test_parse_publish_times_gradle_plugin_portal_dateless_is_empty() {
+        let map = parse_publish_times(GRADLE_PLUGIN_PORTAL_FIXTURE.as_bytes());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_publish_times_malformed_date_entry_absent_rest_parsed() {
+        let html = r#"<pre id="contents">
+<a href="1.0.0/" title="1.0.0/">1.0.0/</a>                                            2011-13-45 99:99         -
+<a href="1.0.1/" title="1.0.1/">1.0.1/</a>                                            2011-09-28 16:04         -
+</pre>"#;
+        let map = parse_publish_times(html.as_bytes());
+        assert!(!map.contains_key("1.0.0"));
+        assert_eq!(
+            map.get("1.0.1").copied(),
+            PublishTime::parse_rfc3339("2011-09-28T16:04:00Z")
+        );
+    }
+
+    #[test]
+    fn test_parse_publish_times_no_pre_block_is_empty() {
+        let html = r"<html><body>not a listing at all</body></html>";
+        let map = parse_publish_times(html.as_bytes());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_publish_times_empty_body_is_empty() {
+        let map = parse_publish_times(b"");
+        assert!(map.is_empty());
+    }
+
+    // --- should_fetch_listing (S2: gate on the winning base, not "some base exists") ---
+
+    #[test]
+    fn test_should_fetch_listing_maven_central_base() {
+        assert!(should_fetch_listing(
+            "https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/"
+        ));
+    }
+
+    #[test]
+    fn test_should_fetch_listing_google_maven_base_is_false() {
+        assert!(!should_fetch_listing(
+            "https://dl.google.com/dl/android/maven2/androidx/core/core/"
+        ));
+    }
+
+    #[test]
+    fn test_should_fetch_listing_gradle_plugin_portal_base_is_false() {
+        assert!(!should_fetch_listing(
+            "https://plugins.gradle.org/m2/org/example/plugin/"
+        ));
+    }
+
+    // --- attach_publish_times: version/date pairing edge cases ---
+
+    #[test]
+    fn test_attach_publish_times_matches_by_version_string() {
+        let mut versions = vec![
+            MavenVersion {
+                version: "1.0.0".into(),
+                published_at: None,
+            },
+            MavenVersion {
+                version: "2.0.0".into(),
+                published_at: None,
+            },
+        ];
+        let mut times = HashMap::new();
+        times.insert(
+            "1.0.0".to_string(),
+            PublishTime::parse_rfc3339("2020-01-01T00:00:00Z").unwrap(),
+        );
+        attach_publish_times(&mut versions, &times);
+
+        assert_eq!(
+            versions[0].published_at,
+            PublishTime::parse_rfc3339("2020-01-01T00:00:00Z")
+        );
+        assert_eq!(versions[1].published_at, None);
+        // Order is untouched.
+        assert_eq!(versions[0].version, "1.0.0");
+        assert_eq!(versions[1].version, "2.0.0");
+    }
+
+    #[test]
+    fn test_attach_publish_times_extra_map_entry_does_not_panic_or_cross_assign() {
+        let mut versions = vec![MavenVersion {
+            version: "1.0.0".into(),
+            published_at: None,
+        }];
+        let mut times = HashMap::new();
+        // A version present in the listing but absent from maven-metadata.xml — must not
+        // be assigned to an unrelated entry, and must not panic.
+        times.insert(
+            "9.9.9-not-in-metadata".to_string(),
+            PublishTime::parse_rfc3339("2020-01-01T00:00:00Z").unwrap(),
+        );
+        attach_publish_times(&mut versions, &times);
+        assert_eq!(versions[0].published_at, None);
+    }
+
+    #[test]
+    fn test_attach_publish_times_empty_map_leaves_all_none() {
+        let mut versions = vec![
+            MavenVersion {
+                version: "1.0.0".into(),
+                published_at: None,
+            },
+            MavenVersion {
+                version: "2.0.0".into(),
+                published_at: None,
+            },
+        ];
+        attach_publish_times(&mut versions, &HashMap::new());
+        assert!(versions.iter().all(|v| v.published_at.is_none()));
+    }
+
+    // --- fetch_publish_times: HTTP degradation (mockito) ---
+
+    #[tokio::test]
+    async fn test_fetch_publish_times_success_parses_and_attaches() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/org/example/widget/")
+            .with_status(200)
+            .with_body(REPO1_FIXTURE)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let url = format!("{}/org/example/widget/", server.url());
+        let times = registry.fetch_publish_times(&url).await;
+
+        assert_eq!(
+            times.get("3.14.0").copied(),
+            PublishTime::parse_rfc3339("2023-11-18T15:03:00Z")
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_publish_times_404_degrades_to_empty_map() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/org/example/widget/")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let url = format!("{}/org/example/widget/", server.url());
+        let times = registry.fetch_publish_times(&url).await;
+
+        assert!(times.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_publish_times_500_degrades_to_empty_map() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/org/example/widget/")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let url = format!("{}/org/example/widget/", server.url());
+        let times = registry.fetch_publish_times(&url).await;
+
+        assert!(times.is_empty());
+    }
+
+    // --- get_versions_typed_with: end-to-end gating and degradation on the metadata path ---
+
+    #[tokio::test]
+    async fn test_get_versions_typed_with_invalid_name_short_circuits_before_any_request() {
+        // No colon in the name => `metadata_urls` returns empty and `get_metadata` never
+        // issues a request at all, so this also exercises `get_versions_typed`'s delegation
+        // to `get_versions_typed_with(name, false)` (M1) without needing a network mock.
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        assert!(
+            registry
+                .get_versions_typed("bad-name")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .get_versions_typed_with("bad-name", true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // --- NFR-006 live verification (real network, run explicitly with `--ignored`) ---
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_maven_central_attaches_publish_times() {
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let versions = registry
+            .get_versions_typed_with("org.apache.commons:commons-lang3", true)
+            .await
+            .unwrap();
+
+        assert!(!versions.is_empty());
+        // Maven Central: the listing exists, so at least the most recent releases carry a
+        // publish date (some very old/legacy entries may not, but recent ones always do).
+        assert!(versions.iter().take(5).any(|v| v.published_at.is_some()));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_google_maven_never_attaches_publish_times() {
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let versions = registry
+            .get_versions_typed_with("androidx.core:core", true)
+            .await
+            .unwrap();
+
+        assert!(!versions.is_empty());
+        // Google Maven's listing 404s by design (§1.3) — the version list itself must be
+        // unaffected, exactly as before this feature.
+        assert!(versions.iter().all(|v| v.published_at.is_none()));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_gradle_plugin_portal_never_attaches_publish_times() {
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        // The Gradle plugin marker artifact for `com.gradle.develocity` (404s on Maven
+        // Central; verified `repo1` 404 / plugin portal 200 on 2026-08-24) — resolves only
+        // via the Gradle Plugin Portal fallback.
+        let versions = registry
+            .get_versions_typed_with(
+                "com.gradle.develocity:com.gradle.develocity.gradle.plugin",
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(!versions.is_empty());
+        assert!(versions.iter().all(|v| v.published_at.is_none()));
     }
 }

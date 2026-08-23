@@ -803,7 +803,7 @@ pub async fn complete_versions_generic(
     operator_chars: &[char],
     freshness: FreshnessSettings,
 ) -> Vec<CompletionItem> {
-    let versions = match registry.get_versions(package_name).await {
+    let versions = match registry.get_versions_with(package_name, freshness).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
