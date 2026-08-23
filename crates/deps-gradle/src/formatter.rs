@@ -126,7 +126,8 @@ impl EcosystemFormatter for GradleFormatter {
         // string would make e.g. `Exact` compare against a target that includes `"!!"`.
         let requirement = requirement.as_str();
         let requirement = requirement.strip_suffix("!!").unwrap_or(requirement);
-        if requirement.starts_with(['[', '(', ']']) && crate::range::parse_range(requirement).is_none()
+        if requirement.starts_with(['[', '(', ']'])
+            && crate::range::parse_range(requirement).is_none()
         {
             return None;
         }
