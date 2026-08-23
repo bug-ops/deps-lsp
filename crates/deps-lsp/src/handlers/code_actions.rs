@@ -50,6 +50,7 @@ pub async fn handle_code_actions(
             uri,
             VersionData::new(&doc.cached_versions, &doc.resolved_versions)
                 .with_vulnerabilities(&doc.vulnerabilities),
+            &doc.content,
         )
         .await;
 

@@ -15,9 +15,11 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **PEP 621** — Parse `[project.dependencies]` and `[project.optional-dependencies]`
 - **PEP 735** — Parse `[dependency-groups]` (new standard)
 - **Poetry** — Parse `[tool.poetry.dependencies]` and dependency groups
+- **requirements.txt / constraints.txt** — Parse pip's line-oriented requirements file format (comments, continuations, per-requirement options, recognized pip options), reusing the same PEP 508 machinery as the TOML paths
 - **Lock file parsing** — Extract resolved versions from `poetry.lock` and `uv.lock`
-- **PEP 508 parsing** — Handle complex dependency specifications with extras and environment markers, normalized consistently across PEP 621, PEP 735, and Poetry table/string syntaxes and surfaced on `PypiDependency.markers`
+- **PEP 508 parsing** — Handle complex dependency specifications with extras and environment markers, normalized consistently across PEP 621, PEP 735, Poetry table/string syntaxes, and requirements.txt lines, and surfaced on `PypiDependency.markers`
 - **PEP 440 versions** — Validate and compare Python version specifiers
+- **PEP 503 name normalization** — One canonical normalizer (`name::normalize`) shared by registry lookups, the formatter, and lock file parsing
 - **PyPI API client** — Fetch package metadata from the PyPI JSON API
 
 ## Installation
@@ -33,10 +35,14 @@ deps-pypi = "0.10"
 ## Usage
 
 ```rust
-use deps_pypi::{parse_pyproject_toml, PyPiRegistry};
+use deps_pypi::{PypiParser, PypiRegistry};
+use tower_lsp_server::ls_types::Uri;
 
-let dependencies = parse_pyproject_toml(content)?;
-let registry = PyPiRegistry::new(cache);
+let parser = PypiParser::new();
+let uri = Uri::from_file_path("/project/pyproject.toml").unwrap();
+let result = parser.parse_content(content, &uri)?;
+
+let registry = PypiRegistry::new(cache);
 let versions = registry.get_versions("requests").await?;
 ```
 
@@ -73,6 +79,18 @@ requests = "^2.28.0"
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0"
 ```
+
+### requirements.txt / constraints.txt
+
+```text
+requests==2.31.0
+flask[async]>=3.0
+numpy>=1.24; python_version >= '3.9'
+-r base.txt
+--index-url https://pypi.example.com/simple
+```
+
+Files matching `requirements*.txt`, `*-requirements.txt`, `*.requirements.txt`, or `constraints*.txt` are routed here by filename pattern rather than a fixed name; a content heuristic keeps a prose file that happens to match (e.g. `product-requirements.txt`) from being treated as a manifest.
 
 ## Benchmarks
 

@@ -30,7 +30,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | ---------- | ----------- | --------------- | -------- |
 | Rust | Cargo | `Cargo.toml` | Supported |
 | JavaScript | npm | `package.json` | Supported |
-| Python | PyPI | `pyproject.toml` | Supported |
+| Python | PyPI | `pyproject.toml`, `requirements.txt`, `constraints.txt` | Supported |
 | Go | Go Modules | `go.mod` | Supported |
 | Ruby | Bundler | `Gemfile` | Supported |
 | Dart | Pub | `pubspec.yaml` | Supported |
@@ -102,7 +102,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | --------- | ---------- | ----------- | ------- |
 | `cargo` | Rust | Cargo.toml | Yes |
 | `npm` | JavaScript | package.json | Yes |
-| `pypi` | Python | pyproject.toml | Yes |
+| `pypi` | Python | pyproject.toml, requirements.txt, constraints.txt | Yes |
 | `go` | Go | go.mod | Yes |
 | `bundler` | Ruby | Gemfile | Yes |
 | `dart` | Dart | pubspec.yaml | Yes |
@@ -147,7 +147,7 @@ Enable inlay hints in Zed settings:
 ```lua
 require('lspconfig').deps_lsp.setup({
   cmd = { "deps-lsp", "--stdio" },
-  filetypes = { "toml", "json", "gomod", "ruby", "yaml", "xml", "swift", "php" },
+  filetypes = { "toml", "json", "gomod", "ruby", "yaml", "xml", "swift", "php", "requirements" },
 })
 
 -- Enable inlay hints (Neovim 0.10+)
@@ -329,7 +329,7 @@ deps-lsp/
 │   ├── deps-core/      # Shared traits, cache, generic handlers
 │   ├── deps-cargo/     # Cargo.toml parser + crates.io registry
 │   ├── deps-npm/       # package.json parser + npm registry
-│   ├── deps-pypi/      # pyproject.toml parser + PyPI registry
+│   ├── deps-pypi/      # pyproject.toml/requirements.txt parser + PyPI registry
 │   ├── deps-go/        # go.mod parser + proxy.golang.org
 │   ├── deps-bundler/   # Gemfile parser + rubygems.org registry
 │   ├── deps-dart/      # pubspec.yaml parser + pub.dev registry

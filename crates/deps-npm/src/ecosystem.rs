@@ -504,6 +504,7 @@ mod tests {
                 position,
                 &uri,
                 VersionData::new(&cached_versions, &resolved_versions),
+                content,
             )
             .await;
 

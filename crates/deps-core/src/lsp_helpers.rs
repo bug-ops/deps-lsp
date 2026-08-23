@@ -134,9 +134,44 @@ impl LineOffsetTable {
         Self { line_starts }
     }
 
+    /// Absolute byte offset where `line` (0-indexed) starts, or `None` if
+    /// `line` is out of range.
+    ///
+    /// Prefer this over re-deriving a line's start via cursor arithmetic
+    /// (`cursor += line.len() + 1`): `str::lines()` strips a trailing `\r`,
+    /// so that approach under-counts by one byte per CRLF line and corrupts
+    /// every subsequent offset in the file. This table is built by scanning
+    /// `char_indices()` for `\n` (see [`new`](Self::new)), which counts the
+    /// `\r`, so it stays correct for LF, CRLF and mixed line endings alike.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::LineOffsetTable;
+    ///
+    /// let table = LineOffsetTable::new("a\r\nb\r\nc");
+    /// assert_eq!(table.line_start(0), Some(0));
+    /// assert_eq!(table.line_start(1), Some(3));
+    /// assert_eq!(table.line_start(2), Some(6));
+    /// assert_eq!(table.line_start(3), None);
+    /// ```
+    pub fn line_start(&self, line: usize) -> Option<usize> {
+        self.line_starts.get(line).copied()
+    }
+
     /// Converts a byte offset into an LSP `Position`.
     pub fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
         let offset = offset.min(content.len());
+        // `offset` is not always a toml-span offset (boundary-safe by
+        // construction) — the requirements.txt line parser derives offsets
+        // via hand-rolled byte arithmetic, which can land inside a
+        // multi-byte character (e.g. a non-ASCII comment or marker string
+        // combined with an off-by-a-byte cut). Clamp down to the nearest
+        // char boundary rather than panicking on the slice below.
+        let mut offset = offset;
+        while offset > 0 && !content.is_char_boundary(offset) {
+            offset -= 1;
+        }
         let line = self
             .line_starts
             .partition_point(|&start| start <= offset)
@@ -342,6 +377,20 @@ pub trait EcosystemFormatter: Send + Sync {
 
     /// Format version string for code action text edit.
     fn format_version_for_text_edit(&self, version: &str) -> String;
+
+    /// Format `version` as a replacement for the existing requirement text
+    /// `current`, preserving `current`'s operator/pin style where the
+    /// ecosystem supports more than one.
+    ///
+    /// Default: ignores `current`, delegating to
+    /// [`format_version_for_text_edit`](Self::format_version_for_text_edit).
+    /// Override when a bare `format_version_for_text_edit` replacement would
+    /// silently change the requirement's semantics — e.g. PyPI's `==1.0.1`
+    /// pin becoming `>=1.0.1,<2` on "update version" would defeat the point
+    /// of pinning.
+    fn format_version_replacing(&self, version: &str, _current: &str) -> String {
+        self.format_version_for_text_edit(version)
+    }
 
     /// Check if a version satisfies a requirement string.
     ///
@@ -819,15 +868,16 @@ struct VulnerabilityFixAction {
 ///
 /// Registry-independent by construction (FR-007, mirroring the rule already
 /// enforced in [`generate_diagnostics_from_cache`]): computed entirely from
-/// `versions.vulnerabilities` and `dep`'s own declared requirement, never
-/// from a registry fetch. Callers must still reconcile the result against a
-/// successful registry fetch when one is available — see the yank check in
-/// [`generate_code_actions`].
+/// `versions.vulnerabilities` and `version_req` (the caller's already-fetched
+/// `dep.version_requirement()`), never from a registry fetch. Callers must
+/// still reconcile the result against a successful registry fetch when one
+/// is available — see the yank check in [`generate_code_actions`].
 fn build_vulnerability_fix_action(
     dep: &dyn Dependency,
     uri: &Uri,
     version_range: Range,
     versions: VersionData<'_>,
+    version_req: &str,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<VulnerabilityFixAction> {
     let normalized_name = formatter.normalize_package_name(dep.name());
@@ -840,19 +890,23 @@ fn build_vulnerability_fix_action(
     };
     let fix = dv.recommended_fix()?;
     let version_native = formatter.osv_version_to_native(&fix.version);
-    // Computed before the N1 guard below: `format_version_for_text_edit` is
-    // not identity everywhere (e.g. `deps-dart` wraps in `^`, `deps-pypi`
-    // expands to a `>=,<` range), so the guard must compare the text that
-    // would actually be written, not the bare version.
-    let new_text = formatter.format_version_for_text_edit(&version_native);
+    // Computed before the N1 guard below against the *same* formatting the
+    // plain "update version" action uses (`format_version_replacing`), not
+    // the bare version: several ecosystems wrap or expand it (`deps-dart`'s
+    // `^`-prefix, a range), and `deps-pypi` rewrites it in place to preserve
+    // the manifest's existing pin style (`==1.0.1` -> `==1.0.2`) — the guard
+    // must compare the text that would actually be written.
+    let new_text = formatter.format_version_replacing(&version_native, version_req);
 
     // N1: skip a no-op edit — the manifest already declares exactly the text
     // this action would write, so applying it would rewrite the text to
-    // itself.
-    if dep
-        .version_requirement()
-        .is_some_and(|req| req.as_str() == new_text)
-    {
+    // itself. Whitespace-insensitive, mirroring `literal_span_matches`:
+    // `version_req` can be a normalized requirement string with spacing the
+    // declared text and the freshly-formatted text don't agree on (e.g.
+    // pep508's `>=1.7, <2.0` vs. a formatter's `>=1.7,<2.0`), which would
+    // otherwise let a whitespace-only edit slip past this guard.
+    let strip_ws = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    if strip_ws(version_req) == strip_ws(&new_text) {
         return None;
     }
 
@@ -915,15 +969,25 @@ fn build_vulnerability_fix_action(
 /// Generates the code actions offered for the dependency at `position`.
 ///
 /// Finds the dependency whose declared version `position` falls on
-/// (`formatter.is_position_on_dependency`) and returns two kinds of action
-/// for it, in this order:
+/// (`formatter.is_position_on_dependency`). Returns an empty `Vec`
+/// immediately if no dependency is at `position`, it has no `version_range`
+/// to edit, it has no declared (or an empty) `version_requirement`, or the
+/// **literal-span guard** rejects it — `content` sliced over `version_range`
+/// no longer holds the literal requirement text (see `literal_span_matches`,
+/// e.g. a Maven `${property}` reference, a Gradle DSL variable/alias, or a
+/// synthesized comparator's lower bound). Writing a `TextEdit` at that range
+/// would corrupt the manifest instead of fixing it, so this mirrors the
+/// guard `collect_update_all_edits` already applies on the bulk-edit path,
+/// and gates *both* kinds of action below since either could write there.
+///
+/// Otherwise returns up to two kinds of action, in this order:
 ///
 /// 1. At most one `QUICKFIX` "fix vulnerability" action, if `versions`
 ///    carries an OSV scan result flagging this dependency and
 ///    [`crate::osv::DependencyVulnerabilities::recommended_fix`] has a
 ///    claimable target (see the private `build_vulnerability_fix_action` helper
 ///    just above). This action
-///    is computed entirely from `versions` and `dep`'s own declared
+///    is computed entirely from `versions` and the dependency's declared
 ///    requirement, deliberately *before* the `registry.get_versions` call
 ///    below — a registry outage must never hide a known-vulnerable
 ///    dependency's fix (FR-007), so this action is still returned even when
@@ -935,11 +999,14 @@ fn build_vulnerability_fix_action(
 ///    selects from the registry response — skipping whichever entry (if any)
 ///    exactly duplicates the fix action's own target, and demoting
 ///    `is_preferred` to `None` on all of them when a fix action is present,
-///    since only one preferred action is meaningful per response.
+///    since only one preferred action is meaningful per response. Each
+///    action's edit text comes from [`EcosystemFormatter::format_version_replacing`],
+///    which preserves the manifest's existing pin/operator style where an
+///    ecosystem overrides it (e.g. PyPI's `==1.0.1` stays `==1.0.2` rather
+///    than expanding to a `>=,<` range).
 ///
-/// Returns an empty `Vec` if no dependency is at `position`, the dependency
-/// has no version range to edit, or (when no fix action applies) the
-/// registry fetch fails.
+/// Returns an empty `Vec` also when (no fix action applies and) the registry
+/// fetch fails.
 ///
 /// No `# Examples` here: exercising this meaningfully needs a `Registry`
 /// impl plus `ParseResult`/`Dependency` mocks, which live as private test
@@ -950,6 +1017,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     position: Position,
     uri: &Uri,
     versions: VersionData<'_>,
+    content: &str,
     registry: &R,
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<CodeAction> {
@@ -969,9 +1037,36 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         return actions;
     };
 
+    let Some(version_req) = dep.version_requirement() else {
+        return actions;
+    };
+    if version_req.as_str().is_empty() {
+        // Defense-in-depth, mirroring `collect_update_all_edits`: an empty
+        // requirement would trivially satisfy the guard below.
+        return actions;
+    }
+
+    let line_offsets = LineOffsetTable::new(content);
+    let slice = slice_for_range(content, &line_offsets, version_range);
+    if !literal_span_matches(slice, version_req.as_str()) {
+        // `version_range` no longer slices to the declared requirement text
+        // (e.g. a Maven `${property}`, a Gradle DSL variable/alias, or a
+        // synthesized comparator's lower bound) — writing a TextEdit there
+        // would corrupt the manifest instead of fixing it. Mirrors the guard
+        // `collect_update_all_edits` already applies on the bulk-edit path.
+        return actions;
+    }
+
     // Built before the registry fetch below so a registry outage never
     // suppresses an OSV-derived fix (FR-007).
-    let fix = build_vulnerability_fix_action(dep, uri, version_range, versions, formatter);
+    let fix = build_vulnerability_fix_action(
+        dep,
+        uri,
+        version_range,
+        versions,
+        version_req.as_str(),
+        formatter,
+    );
 
     let Ok(registry_versions) = registry.get_versions(dep.name()).await else {
         if let Some(fix) = fix {
@@ -1005,7 +1100,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
             continue;
         }
 
-        let new_text = formatter.format_version_for_text_edit(&item.version);
+        let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());
 
         let mut edits = HashMap::new();
         edits.insert(
@@ -1301,7 +1396,7 @@ pub fn collect_update_all_edits(
 
         edits.push(TextEdit {
             range: version_range,
-            new_text: formatter.format_version_for_text_edit(latest),
+            new_text: formatter.format_version_replacing(latest, version_req.as_str()),
         });
     }
 
@@ -1633,6 +1728,37 @@ mod tests {
 
     fn pkg(s: &str) -> PackageName {
         PackageName::new(s)
+    }
+
+    #[test]
+    fn test_line_offset_table_line_start_crlf() {
+        let table = LineOffsetTable::new("a\r\nbb\r\nc");
+        assert_eq!(table.line_start(0), Some(0));
+        assert_eq!(table.line_start(1), Some(3));
+        assert_eq!(table.line_start(2), Some(7));
+        assert_eq!(table.line_start(3), None);
+    }
+
+    #[test]
+    fn test_byte_offset_to_position_clamps_to_char_boundary_instead_of_panicking() {
+        // "é" is a 2-byte UTF-8 sequence; offset 1 lands inside it.
+        let content = "é";
+        let table = LineOffsetTable::new(content);
+        // Must not panic; clamps down to the nearest boundary (offset 0).
+        let pos = table.byte_offset_to_position(content, 1);
+        assert_eq!(pos, Position::new(0, 0));
+    }
+
+    #[test]
+    fn test_byte_offset_to_position_multi_byte_boundary_in_longer_line() {
+        let content = "ab é cd";
+        let table = LineOffsetTable::new(content);
+        // Byte 3 is 'é's leading byte (boundary); byte 4 is its continuation
+        // byte (not a boundary) and must clamp back to 3 rather than panic.
+        assert!(content.is_char_boundary(3));
+        assert!(!content.is_char_boundary(4));
+        let pos = table.byte_offset_to_position(content, 4);
+        assert_eq!(pos, table.byte_offset_to_position(content, 3));
     }
 
     #[test]
@@ -2469,10 +2595,41 @@ mod tests {
         }
     }
 
-    fn vulnerable_dep(version_req: &str) -> (MockDep, tower_lsp_server::ls_types::Range) {
+    /// A formatter mimicking `deps-pypi`'s non-identity
+    /// `format_version_replacing` override (preserves an `==` pin instead of
+    /// falling back to `format_version_for_text_edit`) — used to prove the
+    /// vulnerability-fix action's `TextEdit` goes through the override, not
+    /// the default delegation (critic S3).
+    struct PinPreservingFormatter;
+
+    impl EcosystemFormatter for PinPreservingFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            format!(">={version}")
+        }
+
+        fn format_version_replacing(&self, version: &str, current: &str) -> String {
+            if current.starts_with("==") {
+                format!("=={version}")
+            } else {
+                self.format_version_for_text_edit(version)
+            }
+        }
+
+        fn package_url(&self, name: &PackageName) -> String {
+            format!("https://example.com/{name}")
+        }
+    }
+
+    /// Builds a `pkg = "<version_req>"`-shaped fixture: a dependency whose
+    /// `version_range` slices `content` to exactly `version_req` (so the
+    /// literal-span guard in `generate_code_actions` never rejects it).
+    fn vulnerable_dep(version_req: &str) -> (MockDep, tower_lsp_server::ls_types::Range, String) {
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let version_range = Range::new(Position::new(0, 9), Position::new(0, 16));
+        let content = format!("pkg = \"{version_req}\"");
+        let start = 7u32; // len(`pkg = "`)
+        let end = start + version_req.chars().count() as u32;
+        let version_range = Range::new(Position::new(0, start), Position::new(0, end));
         (
             MockDep {
                 name: pkg("pkg"),
@@ -2481,6 +2638,7 @@ mod tests {
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 3)),
             },
             version_range,
+            content,
         )
     }
 
@@ -2496,9 +2654,8 @@ mod tests {
     async fn test_generate_code_actions_combines_advisories_sharing_the_highest_fix() {
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::Position;
 
-        let (dep, version_range) = vulnerable_dep("1.0.0");
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -2541,9 +2698,10 @@ mod tests {
 
         let actions = generate_code_actions(
             &parse_result,
-            Position::new(0, 12),
+            version_range.start,
             parse_result.uri(),
             versions,
+            &content,
             &MockRegistry,
             &MockFormatter,
         )
@@ -2559,7 +2717,6 @@ mod tests {
             actions[0].data,
             Some(serde_json::json!({ "advisory_ids": ["A2", "A1"] }))
         );
-        let _ = version_range;
     }
 
     #[tokio::test]
@@ -2573,9 +2730,8 @@ mod tests {
         // for a fix A1 that version does not even resolve.
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::Position;
 
-        let (dep, _) = vulnerable_dep("1.0.0");
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -2621,9 +2777,10 @@ mod tests {
 
         let actions = generate_code_actions(
             &parse_result,
-            Position::new(0, 12),
+            version_range.start,
             parse_result.uri(),
             versions,
+            &content,
             &MockRegistry,
             &MockFormatter,
         )
@@ -2637,9 +2794,8 @@ mod tests {
     async fn test_generate_code_actions_drops_yanked_fix_target() {
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::Position;
 
-        let (dep, _) = vulnerable_dep("1.0.0");
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -2673,9 +2829,10 @@ mod tests {
 
         let actions = generate_code_actions(
             &parse_result,
-            Position::new(0, 12),
+            version_range.start,
             parse_result.uri(),
             versions,
+            &content,
             &registry,
             &MockFormatter,
         )
@@ -2693,10 +2850,9 @@ mod tests {
     async fn test_generate_code_actions_no_op_edit_is_skipped() {
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::Position;
 
         // Manifest already declares exactly the fixed version.
-        let (dep, _) = vulnerable_dep("1.2.0");
+        let (dep, version_range, content) = vulnerable_dep("1.2.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -2727,9 +2883,10 @@ mod tests {
 
         let actions = generate_code_actions(
             &parse_result,
-            Position::new(0, 12),
+            version_range.start,
             parse_result.uri(),
             versions,
+            &content,
             &MockRegistry,
             &IdentityFormatter,
         )
@@ -2748,9 +2905,8 @@ mod tests {
         // against the formatted text instead.
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::Position;
 
-        let (dep, _) = vulnerable_dep("^1.2.0");
+        let (dep, version_range, content) = vulnerable_dep("^1.2.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
             uri: crate::test_util::test_uri("/test/pubspec.yaml"),
@@ -2781,9 +2937,10 @@ mod tests {
 
         let actions = generate_code_actions(
             &parse_result,
-            Position::new(0, 12),
+            version_range.start,
             parse_result.uri(),
             versions,
+            &content,
             &MockRegistry,
             &CaretWrappingFormatter,
         )
@@ -2796,9 +2953,8 @@ mod tests {
     async fn test_generate_code_actions_lockfile_hit_gets_title_suffix() {
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::Position;
 
-        let (dep, _) = vulnerable_dep("^1.0");
+        let (dep, version_range, content) = vulnerable_dep("^1.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -2830,9 +2986,10 @@ mod tests {
 
         let actions = generate_code_actions(
             &parse_result,
-            Position::new(0, 12),
+            version_range.start,
             parse_result.uri(),
             versions,
+            &content,
             &MockRegistry,
             &MockFormatter,
         )
@@ -2853,9 +3010,8 @@ mod tests {
         // return on `Err` specifically, which no prior test reached.
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::Position;
 
-        let (dep, _) = vulnerable_dep("1.0.0");
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -2886,9 +3042,10 @@ mod tests {
 
         let actions = generate_code_actions(
             &parse_result,
-            Position::new(0, 12),
+            version_range.start,
             parse_result.uri(),
             versions,
+            &content,
             &ErrorRegistry,
             &MockFormatter,
         )
@@ -2910,9 +3067,8 @@ mod tests {
         // action exists.
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::Position;
 
-        let (dep, _) = vulnerable_dep("1.0.0");
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
         let parse_result = MockParseResult {
             deps: vec![dep],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -2948,9 +3104,10 @@ mod tests {
 
         let actions = generate_code_actions(
             &parse_result,
-            Position::new(0, 12),
+            version_range.start,
             parse_result.uri(),
             versions,
+            &content,
             &registry,
             &MockFormatter,
         )
@@ -2975,6 +3132,79 @@ mod tests {
                 .filter(|a| a.kind == Some(CodeActionKind::REFACTOR))
                 .all(|a| a.is_preferred.is_none()),
             "only the fix action may be preferred once it exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_fix_uses_ecosystem_format_version_replacing_override() {
+        // Critic S3: `format_version_replacing` is overridden in exactly one
+        // place workspace-wide (`deps-pypi`); no test anywhere proved the
+        // vulnerability-fix action's `TextEdit` actually goes through such
+        // an override rather than the default delegation to
+        // `format_version_for_text_edit` — the same bug class the original
+        // #216 critique caught (a guard/edit comparing the wrong string,
+        // silently bypassed per-ecosystem).
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("==1.0.0");
+        let uri = crate::test_util::test_uri("/test/requirements.txt");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: uri.clone(),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.0.2".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &PinPreservingFormatter,
+        )
+        .await;
+
+        let quickfix = actions
+            .iter()
+            .find(|a| a.kind == Some(CodeActionKind::QUICKFIX))
+            .expect("a vulnerability-fix quickfix should be offered");
+        let new_text = quickfix
+            .edit
+            .as_ref()
+            .and_then(|e| e.changes.as_ref())
+            .and_then(|c| c.get(&uri))
+            .and_then(|edits| edits.first())
+            .map(|e| e.new_text.as_str())
+            .expect("quickfix should carry a TextEdit for the document uri");
+
+        assert_eq!(
+            new_text, "==1.0.2",
+            "the fix action's TextEdit must go through format_version_replacing's \
+             pin-preserving override, not the default format_version_for_text_edit delegation"
         );
     }
 
@@ -4671,5 +4901,284 @@ mod tests {
         );
         assert!(content.value.contains("+2 more advisories"));
         assert!(content.value.contains("also affected"));
+    }
+
+    /// Tests for the `literal_span_matches` guard on `generate_code_actions`
+    /// (§6.3): a dependency whose `version_range` no longer slices to its
+    /// declared requirement must yield no code action, mirroring the guard
+    /// `collect_update_all_edits` already applies.
+    mod code_actions_guard_tests {
+        use super::*;
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct CaDep {
+            name: PackageName,
+            version_req: Option<VersionReq>,
+            version_range: Option<Range>,
+        }
+
+        impl Dependency for CaDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::default()
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                self.version_req.as_ref()
+            }
+            fn version_range(&self) -> Option<Range> {
+                self.version_range
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct CaParseResult {
+            deps: Vec<CaDep>,
+            uri: Uri,
+        }
+
+        impl ParseResult for CaParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct CaVersion {
+            version: String,
+            yanked: bool,
+        }
+
+        crate::impl_version!(CaVersion {
+            version: version,
+            yanked: yanked,
+        });
+
+        struct CaRegistry;
+
+        impl crate::Registry for CaRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(CaVersion {
+                        version: "2.0.0".to_string(),
+                        yanked: false,
+                    }) as Box<dyn crate::Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+            ) -> crate::ecosystem::BoxFuture<
+                'a,
+                crate::error::Result<Option<Box<dyn crate::Version>>>,
+            > {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+            {
+                Box::pin(async move { Ok(Vec::new()) })
+            }
+
+            fn package_url(&self, _name: &PackageName) -> String {
+                String::new()
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        fn range(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
+            Range::new(Position::new(sl, sc), Position::new(el, ec))
+        }
+
+        #[tokio::test]
+        async fn test_guard_rejects_span_that_does_not_match_requirement() {
+            // content has "1.0.0" at 0..5, but the dependency claims its
+            // version_range covers 6..11 (out of bounds / wrong slice) —
+            // simulate via a version_range that slices to different text.
+            let content = "1.0.0 extra";
+            let dep = CaDep {
+                name: pkg("serde"),
+                version_req: Some(VersionReq::new("1.0.0")),
+                version_range: Some(range(0, 6, 0, 11)), // slices to "extra"
+            };
+            let pr = CaParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            // Must fall inside `version_range` (6..11) for
+            // `is_position_on_dependency`'s default impl to select this
+            // dependency at all — the point of this test is the guard past
+            // that selection, not the selection itself.
+            let position = Position::new(0, 7);
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                versions,
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(actions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_guard_rejects_span_even_with_a_pending_vulnerability_fix() {
+            // Critic S2: the guard must gate the vulnerability-fix quickfix
+            // too, not just the plain "update version" action — a future
+            // refactor moving `build_vulnerability_fix_action` above the
+            // guard would reintroduce manifest corruption on a rejected
+            // span (e.g. a Maven `${property}` reference) at P0 severity.
+            // Every other test in this module uses an empty `VersionData`,
+            // which would pass even if the guard only gated the plain
+            // action; this one carries a real OSV hit so a regression that
+            // reorders the two checks fails here.
+            use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+
+            let content = "1.0.0 extra";
+            let dep = CaDep {
+                name: pkg("serde"),
+                version_req: Some(VersionReq::new("1.0.0")),
+                version_range: Some(range(0, 6, 0, 11)), // slices to "extra"
+            };
+            let pr = CaParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let position = Position::new(0, 7);
+
+            let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+            vulnerabilities.insert(
+                "serde".to_string(),
+                ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    advisories: vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["2.0.0".to_string()],
+                        url: String::new(),
+                    })],
+                    total_known: 1,
+                    upgrade_status: UpgradeStatus::NotChecked,
+                }),
+            );
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions =
+                VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                versions,
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(quickfix_titles(&actions).is_empty());
+            assert!(actions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_guard_accepts_matching_span() {
+            let content = "1.0.0";
+            let dep = CaDep {
+                name: pkg("serde"),
+                version_req: Some(VersionReq::new("1.0.0")),
+                version_range: Some(range(0, 0, 0, 5)),
+            };
+            let pr = CaParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let position = Position::new(0, 0);
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                versions,
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(!actions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_guard_rejects_empty_requirement() {
+            let content = "1.0.0";
+            let dep = CaDep {
+                name: pkg("serde"),
+                version_req: Some(VersionReq::new("")),
+                version_range: Some(range(0, 0, 0, 5)),
+            };
+            let pr = CaParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let position = Position::new(0, 0);
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                versions,
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(actions.is_empty());
+        }
     }
 }

@@ -10,7 +10,7 @@ deps-lsp provides comprehensive LSP support for 11 package ecosystems:
 |-----------|----------|-----------------|--------------|----------|
 | **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens, feature flag completion |
 | **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
-| **PyPI** | Python | `pyproject.toml`, `setup.py` | `poetry.lock`, `uv.lock`, `requirements.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens |
+| **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens |
 | **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support |
 | **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
 | **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
@@ -27,6 +27,10 @@ When a Python dependency is gated by an environment marker (e.g., `numpy>=1.24; 
 Active when: python_version >= '3.9'
 ```
 This helps you understand when conditional dependencies apply. Markers are shown for dependencies in `pyproject.toml` (PEP 621), Poetry `[tool.poetry.dependencies]` tables, and both PEP 621 requirement strings and Poetry string-form suffixes.
+
+### PyPI requirements.txt / constraints.txt
+
+Files matching `requirements*.txt`, `*-requirements.txt`, `*.requirements.txt`, or `constraints*.txt` are routed to the PyPI ecosystem and parsed line-by-line (pip's requirements file format), reusing the same PEP 508 machinery as `pyproject.toml` — hover, diagnostics, markers and extras render identically across both. Comments, blank lines, `\`-continuations, per-requirement options (`--hash=...`), and recognized pip options (`-r`, `-c`, `-e`, `--index-url`, `--pre`, etc.) are handled; `-r`/`-c` includes are recognized but not followed (each included file must be opened directly for its own dependencies to be checked). A pinned dependency (`django==5.0.1`) keeps its `==` pin on "update version" instead of widening to a range. Because the routing is by filename pattern rather than a fixed name, a non-manifest file that happens to match (e.g. a `product-requirements.txt` prose document) is detected via a content heuristic and produces no hover/diagnostics/network requests.
 
 ### Maven/Gradle Version Comparison
 
@@ -818,7 +822,7 @@ Before submitting a PR for a new ecosystem:
 See existing implementations for reference:
 - `crates/deps-cargo/` - Rust/Cargo.toml with crates.io sparse index
 - `crates/deps-npm/` - JavaScript/package.json with npm registry
-- `crates/deps-pypi/` - Python/pyproject.toml/poetry with PyPI API and PEP 508 marker support
+- `crates/deps-pypi/` - Python/pyproject.toml/poetry/requirements.txt with PyPI API and PEP 508 marker support
 - `crates/deps-go/` - Go/go.mod with proxy.golang.org
 - `crates/deps-bundler/` - Ruby/Gemfile with RubyGems API
 - `crates/deps-dart/` - Dart/pubspec.yaml with pub.dev API

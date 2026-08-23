@@ -1,7 +1,9 @@
 //! PyPI ecosystem implementation for deps-lsp.
 //!
 //! This module implements the `Ecosystem` trait for Python projects,
-//! providing LSP functionality for `pyproject.toml` files.
+//! providing LSP functionality for `pyproject.toml` files and for
+//! `requirements.txt`/`constraints.txt` files (pip's requirements file
+//! format).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -14,6 +16,33 @@ use deps_core::{
 use crate::formatter::PypiFormatter;
 use crate::parser::PypiParser;
 use crate::registry::PypiRegistry;
+
+/// Which manifest shape a URI's basename identifies, so `parse_manifest` can
+/// dispatch to the right parser method and report the right `file_type` on
+/// error.
+#[derive(Clone, Copy)]
+enum PypiManifestKind {
+    PyProject,
+    Requirements,
+}
+
+impl PypiManifestKind {
+    fn from_uri(uri: &Uri) -> Self {
+        let basename = uri.path().as_str().rsplit('/').next().unwrap_or_default();
+        if basename == "pyproject.toml" {
+            Self::PyProject
+        } else {
+            Self::Requirements
+        }
+    }
+
+    const fn file_type(self) -> &'static str {
+        match self {
+            Self::PyProject => "pyproject.toml",
+            Self::Requirements => "requirements.txt",
+        }
+    }
+}
 
 /// PyPI ecosystem implementation.
 ///
@@ -77,6 +106,15 @@ impl Ecosystem for PypiEcosystem {
         &["pyproject.toml"]
     }
 
+    fn manifest_patterns(&self) -> &[&'static str] {
+        &[
+            "requirements*.txt",
+            "*-requirements.txt",
+            "*.requirements.txt",
+            "constraints*.txt",
+        ]
+    }
+
     fn lockfile_filenames(&self) -> &[&'static str] {
         &["poetry.lock", "uv.lock"]
     }
@@ -87,11 +125,14 @@ impl Ecosystem for PypiEcosystem {
         uri: &'a Uri,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result = self.parser.parse_content(content, uri).map_err(|e| {
-                deps_core::DepsError::ParseError {
-                    file_type: "pyproject.toml".into(),
-                    source: Box::new(e),
-                }
+            let kind = PypiManifestKind::from_uri(uri);
+            let result = match kind {
+                PypiManifestKind::PyProject => self.parser.parse_content(content, uri),
+                PypiManifestKind::Requirements => self.parser.parse_requirements(content, uri),
+            }
+            .map_err(|e| deps_core::DepsError::ParseError {
+                file_type: kind.file_type().into(),
+                source: Box::new(e),
             })?;
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
@@ -158,6 +199,83 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
         assert_eq!(ecosystem.id(), "pypi");
+    }
+
+    #[test]
+    fn test_ecosystem_manifest_patterns() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        assert_eq!(
+            ecosystem.manifest_patterns(),
+            &[
+                "requirements*.txt",
+                "*-requirements.txt",
+                "*.requirements.txt",
+                "constraints*.txt",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_requirements_txt_uri_yields_dependencies() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/requirements.txt");
+
+        let result = ecosystem
+            .parse_manifest("requests==2.31.0\nflask>=3.0\n", &uri)
+            .await
+            .unwrap();
+
+        assert_eq!(result.dependencies().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_pyproject_toml_unchanged() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+
+        let result = ecosystem
+            .parse_manifest("[project]\ndependencies = [\"requests>=2.0.0\"]\n", &uri)
+            .await
+            .unwrap();
+
+        assert_eq!(result.dependencies().len(), 1);
+    }
+
+    #[test]
+    fn test_manifest_kind_file_type_reflects_uri() {
+        let requirements_uri = deps_core::test_util::test_uri("/test/requirements.txt");
+        assert_eq!(
+            PypiManifestKind::from_uri(&requirements_uri).file_type(),
+            "requirements.txt"
+        );
+
+        let pyproject_uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+        assert_eq!(
+            PypiManifestKind::from_uri(&pyproject_uri).file_type(),
+            "pyproject.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_pyproject_toml_invalid_reports_pyproject_file_type() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+
+        let result = ecosystem
+            .parse_manifest("[project\nname = invalid", &uri)
+            .await;
+
+        let Err(err) = result else {
+            panic!("expected a parse error");
+        };
+        assert!(matches!(
+            err,
+            deps_core::DepsError::ParseError { file_type, .. } if file_type == "pyproject.toml"
+        ));
     }
 
     #[test]
@@ -528,6 +646,7 @@ name = "test"
                 position,
                 &uri,
                 VersionData::new(&cached_versions, &resolved_versions),
+                content,
             )
             .await;
 
@@ -608,5 +727,138 @@ dependencies = []
             )
             .await;
         assert!(results.is_empty());
+    }
+
+    /// End-to-end regression for #212: a dotted package name declared as a
+    /// Poetry table key must resolve against its `poetry.lock` entry. Unlike
+    /// a PEP 621 fixture (which already worked before the fix, since
+    /// `pep508_rs::PackageName` normalizes at construction), the Poetry
+    /// table-key path takes the name verbatim from the TOML key — this is
+    /// the actual bug #212 fixes.
+    mod poetry_lockfile_regression_tests {
+        use super::*;
+        use crate::lockfile::PypiLockParser;
+        use deps_core::PackageName;
+        use deps_core::lockfile::LockFileProvider;
+
+        /// A registry mock returning an empty (but `Ok`) version list —
+        /// `generate_hover` requires a successful registry call before it
+        /// reaches the `versions.resolved`-driven "Current" line, but the
+        /// content of that call is irrelevant to this regression.
+        struct EmptyOkRegistry;
+
+        impl deps_core::Registry for EmptyOkRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
+            > {
+                Box::pin(async move { Ok(Vec::new()) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
+            > {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>,
+            > {
+                Box::pin(async move { Ok(Vec::new()) })
+            }
+
+            fn package_url(&self, _name: &PackageName) -> String {
+                String::new()
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        #[tokio::test]
+        async fn test_poetry_table_key_dotted_name_resolves_against_lockfile() {
+            let toml = "[tool.poetry.dependencies]\n\"zope.interface\" = \"^5.0\"\n";
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let parser = PypiParser::new();
+            let parse_result = parser.parse_content(toml, &uri).unwrap();
+
+            // The raw TOML key is taken verbatim — unnormalized — confirming
+            // this fixture actually exercises the Poetry table-key path
+            // rather than a PEP 508 string path (which already normalizes).
+            assert_eq!(parse_result.dependencies[0].name, "zope.interface");
+            let dep_position = parse_result.dependencies[0].name_range.start;
+
+            // Real poetry.lock/uv.lock files store the canonical hyphenated
+            // form on write, never the dotted source name — a dotted lockfile
+            // fixture here would make the headline assertions pass even
+            // before the #212 fix (only an intermediate `contains_key`
+            // mechanics check would fail), so this must be hyphenated to
+            // actually discriminate pre/post fix.
+            let lockfile_content = "[[package]]\nname = \"zope-interface\"\nversion = \"5.2.0\"\n";
+            let temp_dir = tempfile::tempdir().unwrap();
+            let lockfile_path = temp_dir.path().join("poetry.lock");
+            std::fs::write(&lockfile_path, lockfile_content).unwrap();
+
+            let lock_parser = PypiLockParser;
+            let resolved_packages = lock_parser.parse_lockfile(&lockfile_path).await.unwrap();
+            let resolved_versions: HashMap<PackageName, String> = resolved_packages
+                .iter()
+                .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone()))
+                .collect();
+            // Canonical PEP 503 normalization: both the lockfile key and the
+            // formatter-normalized manifest name land on "zope-interface".
+            assert!(resolved_versions.contains_key("zope-interface"));
+
+            let cached_versions: HashMap<PackageName, String> = HashMap::new();
+            let versions = VersionData::new(&cached_versions, &resolved_versions);
+            let formatter = PypiFormatter;
+
+            let hover = deps_core::lsp_helpers::generate_hover(
+                &parse_result,
+                dep_position,
+                versions,
+                &EmptyOkRegistry,
+                &formatter,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be produced for a dependency at its name position");
+
+            let markdown = match hover.contents {
+                tower_lsp_server::ls_types::HoverContents::Markup(m) => m.value,
+                _ => panic!("expected Markup hover contents"),
+            };
+            assert!(
+                markdown.contains("**Current**") && markdown.contains("5.2.0"),
+                "hover should render the resolved lock file version: {markdown}"
+            );
+
+            let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
+                &parse_result,
+                versions,
+                &formatter,
+                deps_core::FreshnessSettings::default(),
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|d| !d.message.contains("Unknown package")),
+                "no 'Unknown package' diagnostic should be emitted: {diagnostics:?}"
+            );
+        }
     }
 }

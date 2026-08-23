@@ -1,4 +1,5 @@
 use deps_core::Dependency;
+use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 use pep440_rs::{Version, VersionSpecifiers};
@@ -9,11 +10,31 @@ pub struct PypiFormatter;
 
 impl EcosystemFormatter for PypiFormatter {
     fn normalize_package_name(&self, name: &PackageName) -> String {
-        let name = name.as_str();
-        if !name.chars().any(|c| c.is_uppercase() || c == '-') {
-            return name.to_string();
+        crate::name::normalize(name.as_str())
+    }
+
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        // PEP 508: ^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$
+        let valid = !name.is_empty()
+            && name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            && name
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+
+        if valid {
+            Ok(())
+        } else {
+            Err(InvalidPackageName::new(
+                "must match PEP 508 name pattern ^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9])$",
+            ))
         }
-        name.to_lowercase().replace('-', "_")
     }
 
     fn format_version_for_text_edit(&self, version: &str) -> String {
@@ -25,6 +46,60 @@ impl EcosystemFormatter for PypiFormatter {
             .unwrap_or(1);
 
         format!(">={version},<{next_major}")
+    }
+
+    fn format_version_replacing(&self, version: &str, current: &str) -> String {
+        let terms: Vec<&str> = current.trim().split(',').map(str::trim).collect();
+
+        if terms.iter().any(|t| t.starts_with("===")) {
+            return format!("==={version}");
+        }
+
+        if let Some(term) = terms.iter().find(|t| t.starts_with("==")) {
+            return match term.strip_prefix("==").and_then(|r| r.strip_suffix(".*")) {
+                Some(base) => {
+                    let candidate = truncate_release_to_match(base, version)
+                        .map(|truncated| format!("=={truncated}.*"))
+                        .unwrap_or_else(|| format!("=={version}"));
+                    // Truncating `version` back down to the wildcard's own
+                    // precision can reproduce `current` byte-for-byte (e.g.
+                    // `==1.0.*` stays `==1.0.*` for a 1.0.2 fix) even though
+                    // the wildcard still admits the vulnerable range it
+                    // started from — fall back to the untruncated exact pin
+                    // rather than silently no-oping a live finding.
+                    if candidate == *term {
+                        format!("=={version}")
+                    } else {
+                        candidate
+                    }
+                }
+                None => format!("=={version}"),
+            };
+        }
+
+        if let Some(term) = terms.iter().find(|t| t.starts_with("~=")) {
+            let rest = term.strip_prefix("~=").unwrap_or_default().trim();
+            let release_len = Version::from_str(rest)
+                .map(|v| v.release().len())
+                .unwrap_or(0);
+            return if release_len >= 2 {
+                let candidate = truncate_release_to_match(rest, version)
+                    .map(|truncated| format!("~={truncated}"))
+                    .unwrap_or_else(|| format!("~={version}"));
+                // Same no-op fallback as the `==` wildcard case above.
+                if candidate == *term {
+                    format!("~={version}")
+                } else {
+                    candidate
+                }
+            } else {
+                // `~=3` has a single release segment, which is not valid PEP 440
+                // on its own — don't emit another invalid pin.
+                self.format_version_for_text_edit(version)
+            };
+        }
+
+        self.format_version_for_text_edit(version)
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -61,6 +136,27 @@ impl EcosystemFormatter for PypiFormatter {
     }
 }
 
+/// Truncates `latest`'s PEP 440 release segments to the same segment count
+/// as `source_version`'s release, joined with `.`. Returns `None` if either
+/// fails to parse, or `latest` has fewer release segments than
+/// `source_version` (in which case the caller falls back to the untruncated
+/// version rather than losing precision).
+fn truncate_release_to_match(source_version: &str, latest: &str) -> Option<String> {
+    let source_release_len = Version::from_str(source_version).ok()?.release().len();
+    let latest_release = Version::from_str(latest).ok()?;
+    let latest_release = latest_release.release();
+    if latest_release.len() < source_release_len {
+        return None;
+    }
+    Some(
+        latest_release[..source_release_len]
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,11 +170,15 @@ mod tests {
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("Django-REST-Framework")),
-            "django_rest_framework"
+            "django-rest-framework"
         );
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("My-Package")),
-            "my_package"
+            "my-package"
+        );
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("zope.interface")),
+            "zope-interface"
         );
     }
 
@@ -171,6 +271,27 @@ mod tests {
     }
 
     #[test]
+    fn test_osv_version_to_native_round_trips_through_format_version_replacing() {
+        // Critic M2: the vulnerability-fix `TextEdit` is now built via
+        // `format_version_replacing`, not `format_version_for_text_edit` —
+        // the round-trip gate above no longer guards the code it was
+        // written for. Same property, retargeted at the method the fix
+        // path actually calls, across every `current` shape it recognizes.
+        let formatter = PypiFormatter;
+        let osv_version = "2.28.0";
+        let native = formatter.osv_version_to_native(osv_version);
+        assert_eq!(native, osv_version);
+
+        for current in ["==2.20.0", "==2.20.*", "~=2.20", "~=2.20.0", ">=2.20,<2.21"] {
+            let edit_text = formatter.format_version_replacing(&native, current);
+            assert!(
+                formatter.version_satisfies_requirement(&native, &edit_text),
+                "current={current:?} produced edit_text={edit_text:?}, which does not admit {native:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_normalize_fast_path() {
         let formatter = PypiFormatter;
         // Already lowercase, no hyphens - should hit fast path
@@ -185,6 +306,118 @@ mod tests {
         assert_eq!(
             formatter.normalize_package_name(&PackageName::new("numpy")),
             "numpy"
+        );
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_valid_names() {
+        let formatter = PypiFormatter;
+        assert!(formatter.validate_package_name("zope.interface").is_ok());
+        assert!(formatter.validate_package_name("Django").is_ok());
+        assert!(formatter.validate_package_name("a").is_ok());
+        assert!(formatter.validate_package_name("my-package_1.0").is_ok());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_invalid_names() {
+        let formatter = PypiFormatter;
+        assert!(formatter.validate_package_name("---").is_err());
+        assert!(formatter.validate_package_name("-x").is_err());
+        assert!(formatter.validate_package_name("x-").is_err());
+        assert!(formatter.validate_package_name("a b").is_err());
+        assert!(formatter.validate_package_name("").is_err());
+    }
+
+    #[test]
+    fn test_format_version_replacing_table() {
+        let formatter = PypiFormatter;
+
+        // starts `===`
+        assert_eq!(
+            formatter.format_version_replacing("1.2", "===1.0"),
+            "===1.2"
+        );
+
+        // starts `==`, no wildcard
+        assert_eq!(formatter.format_version_replacing("1.2", "==1.0"), "==1.2");
+
+        // starts `==`, wildcard, latest has enough segments
+        assert_eq!(
+            formatter.format_version_replacing("1.6.2", "==1.4.*"),
+            "==1.6.*"
+        );
+
+        // `~=` with >=2 release segments truncates, never over-specifies
+        assert_eq!(
+            formatter.format_version_replacing("1.26.4", "~=1.24"),
+            "~=1.26"
+        );
+
+        // `~=` with a single release segment is invalid PEP 440 on its own; default
+        assert_eq!(
+            formatter.format_version_replacing("4.0.0", "~=3"),
+            ">=4.0.0,<5"
+        );
+
+        // multi-specifier collapse: any comma-separated term starting with `==` wins,
+        // regardless of position (N1 fix — pep440_rs sorts specifiers by version, so
+        // `!=0.9,==1.0` in source may render sorted either way)
+        assert_eq!(
+            formatter.format_version_replacing("1.2", "==1.0, !=1.0.1"),
+            "==1.2"
+        );
+        assert_eq!(
+            formatter.format_version_replacing("1.2", "!=0.9, ==1.0"),
+            "==1.2"
+        );
+
+        // comma-separated, no `==`/`===`/`~=` term -> default range
+        assert_eq!(
+            formatter.format_version_replacing("2.0.0", ">=1.0, !=1.5, <2.0"),
+            ">=2.0.0,<3"
+        );
+
+        // anything else -> default
+        assert_eq!(
+            formatter.format_version_replacing("2.0.0", ">=1.0"),
+            ">=2.0.0,<3"
+        );
+    }
+
+    #[test]
+    fn test_format_version_replacing_wildcard_pin_no_op_falls_back_to_exact_fix() {
+        // Critic S1: truncating the fix version back down to the pin's own
+        // precision can reproduce `current` byte-for-byte even though the
+        // pin still admits the vulnerable range it started from (`~=1.0`
+        // and `==1.0.*` both still match 1.0.0/1.0.1). If that happens, the
+        // untruncated exact version must be emitted instead, or the N1
+        // no-op guard in `deps-core` silently drops the vulnerability
+        // quickfix entirely.
+        let formatter = PypiFormatter;
+
+        assert_eq!(
+            formatter.format_version_replacing("1.0.2", "~=1.0"),
+            "~=1.0.2"
+        );
+        assert_eq!(
+            formatter.format_version_replacing("1.0.2", "==1.0.*"),
+            "==1.0.2"
+        );
+
+        // `~=`'s floor equals the fix version's own precision: the
+        // untruncated fallback text is identical to the truncated one, so
+        // this is a genuine no-op either way (unaffected by the fallback).
+        assert_eq!(
+            formatter.format_version_replacing("1.0.2", "~=1.0.2"),
+            "~=1.0.2"
+        );
+        // `==V.*` has no floor semantics (it is a release-prefix match, not
+        // a lower bound), so there is no textually-identical "genuine
+        // no-op" fallback for it — the wildcard is narrowed to an exact pin
+        // instead, which is always at least as safe as leaving it alone.
+        assert_eq!(
+            formatter.format_version_replacing("1.0.2", "==1.0.2.*"),
+            "==1.0.2"
         );
     }
 

@@ -48,6 +48,14 @@ pub struct EcosystemRegistry {
     /// silently last-write-wins, so the outcome is registration-order-dependent,
     /// not deterministic.
     extension_map: DashMap<&'static str, &'static str>,
+    /// Map from a basename pattern (e.g. `"requirements*.txt"`) to
+    /// `(prefix, suffix, ecosystem_id)`, split on the pattern's single `*` at
+    /// [`register`](EcosystemRegistry::register) time. Consulted between the
+    /// exact-filename and extension stages in
+    /// [`get_for_filename`](EcosystemRegistry::get_for_filename), using
+    /// most-specific-wins selection over all matches for determinism
+    /// regardless of `DashMap` iteration order.
+    patterns: DashMap<&'static str, (&'static str, &'static str, &'static str)>,
 }
 
 impl EcosystemRegistry {
@@ -66,6 +74,7 @@ impl EcosystemRegistry {
             ecosystems: DashMap::new(),
             filename_map: DashMap::new(),
             extension_map: DashMap::new(),
+            patterns: DashMap::new(),
         }
     }
 
@@ -105,6 +114,34 @@ impl EcosystemRegistry {
                 self.extension_map.get(extension).map(|o| *o),
             );
             self.extension_map.insert(*extension, id);
+        }
+
+        // Register pattern mappings (e.g. `requirements*.txt`)
+        for &pattern in ecosystem.manifest_patterns() {
+            let Some((prefix, suffix)) = pattern.split_once('*') else {
+                debug_assert!(
+                    false,
+                    "manifest pattern {pattern:?} must contain exactly one '*'"
+                );
+                continue;
+            };
+            debug_assert!(
+                !prefix.is_empty() || !suffix.is_empty(),
+                "manifest pattern {pattern:?} must not be a bare '*', which would claim every file"
+            );
+            debug_assert!(
+                !suffix.contains('*'),
+                "manifest pattern {pattern:?} must contain exactly one '*'"
+            );
+            debug_assert!(
+                self.patterns
+                    .iter()
+                    .all(|e| e.value().2 == id || *e.key() == pattern),
+                "pattern {pattern:?} would introduce a second ecosystem ({id:?}) into the \
+                 single-owner pattern set; the most-specific-wins selection in \
+                 get_for_filename assumes all patterns belong to one ecosystem"
+            );
+            self.patterns.insert(pattern, (prefix, suffix, id));
         }
 
         // Register ecosystem
@@ -173,6 +210,10 @@ impl EcosystemRegistry {
             return self.get(*id);
         }
 
+        if let Some(id) = self.match_pattern(filename) {
+            return self.get(id);
+        }
+
         // Avoid the rsplit_once/format! allocation below when no ecosystem has registered
         // an extension (extension routing is only used by nuget today) — this runs on
         // every exact-match miss, including every did_open/did_change via get_for_uri.
@@ -184,6 +225,34 @@ impl EcosystemRegistry {
         let lowercased = format!(".{}", extension.to_lowercase());
         let id = self.extension_map.get(lowercased.as_str())?;
         self.get(*id)
+    }
+
+    /// Matches `filename` against registered [`Ecosystem::manifest_patterns`],
+    /// case-sensitively, returning the ecosystem id of the most specific
+    /// match (greatest `prefix.len() + suffix.len()`, ties broken by pattern
+    /// string ascending) rather than the first `DashMap` hit — so the result
+    /// is deterministic regardless of map iteration order.
+    fn match_pattern(&self, filename: &str) -> Option<&'static str> {
+        if self.patterns.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<(usize, &'static str, &'static str)> = None; // (specificity, pattern, id)
+        for e in self.patterns.iter() {
+            let (prefix, suffix, id) = *e.value();
+            if filename.len() >= prefix.len() + suffix.len()
+                && filename.starts_with(prefix)
+                && filename.ends_with(suffix)
+            {
+                let score = prefix.len() + suffix.len();
+                let pattern = *e.key();
+                if best.is_none_or(|(s, p, _)| (score, pattern) > (s, p)) {
+                    best = Some((score, pattern, id));
+                }
+            }
+        }
+
+        best.map(|(_, _, id)| id)
     }
 
     /// Get ecosystem from URI
@@ -212,6 +281,7 @@ impl EcosystemRegistry {
     ///     println!("File handled by: {}", ecosystem.display_name());
     /// }
     /// ```
+    // TODO(critic): support requirements/*.txt layout (needs path, not basename)
     pub fn get_for_uri(&self, uri: &Uri) -> Option<Arc<dyn Ecosystem>> {
         let path = uri.path().as_str();
         let filename = path.rsplit('/').next()?;
@@ -444,6 +514,168 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
+    }
+
+    // Mock ecosystem with basename patterns (mirrors PyPI's `requirements*.txt`)
+    struct MockPatternEcosystem {
+        id: &'static str,
+        patterns: &'static [&'static str],
+    }
+
+    impl crate::ecosystem::private::Sealed for MockPatternEcosystem {}
+
+    impl Ecosystem for MockPatternEcosystem {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn display_name(&self) -> &'static str {
+            self.id
+        }
+
+        fn manifest_filenames(&self) -> &[&'static str] {
+            &[]
+        }
+
+        fn manifest_patterns(&self) -> &[&'static str] {
+            self.patterns
+        }
+
+        fn parse_manifest<'a>(
+            &'a self,
+            _content: &'a str,
+            _uri: &'a Uri,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
+            Box::pin(async move { unimplemented!() })
+        }
+
+        fn registry(&self) -> Arc<dyn Registry> {
+            unimplemented!()
+        }
+
+        fn formatter(&self) -> &dyn EcosystemFormatter {
+            &MockFormatter
+        }
+
+        fn generate_completions<'a>(
+            &'a self,
+            _parse_result: &'a dyn ParseResult,
+            _position: Position,
+            _content: &'a str,
+            _freshness: crate::FreshnessSettings,
+        ) -> crate::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+            Box::pin(async move { vec![] })
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn pypi_pattern_registry() -> EcosystemRegistry {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockPatternEcosystem {
+            id: "pypi",
+            patterns: &[
+                "requirements*.txt",
+                "*-requirements.txt",
+                "*.requirements.txt",
+                "constraints*.txt",
+            ],
+        }));
+        registry
+    }
+
+    #[test]
+    fn test_get_for_filename_pattern_matches_requirements_variants() {
+        let registry = pypi_pattern_registry();
+        for name in [
+            "requirements.txt",
+            "requirements-dev.txt",
+            "requirements.dev.txt",
+            "requirements_test.txt",
+            "dev-requirements.txt",
+            "test.requirements.txt",
+            "constraints.txt",
+            "constraints-prod.txt",
+        ] {
+            assert_eq!(
+                registry.get_for_filename(name).map(|e| e.id()),
+                Some("pypi"),
+                "{name} should match a PyPI pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_for_filename_pattern_does_not_match_unrelated_files() {
+        let registry = pypi_pattern_registry();
+        for name in [
+            "notes.txt",
+            "LICENSE.txt",
+            "myrequirements.txt",
+            "requirements.txt.bak",
+            "Requirements.txt",
+            "requirements",
+        ] {
+            assert!(
+                registry.get_for_filename(name).is_none(),
+                "{name} should not match any PyPI pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_for_filename_exact_name_wins_over_pattern() {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockEcosystem {
+            id: "exact",
+            display_name: "Exact",
+            filenames: &["requirements.txt"],
+            lockfiles: &[],
+        }));
+        registry.register(Arc::new(MockPatternEcosystem {
+            id: "pattern",
+            patterns: &["requirements*.txt"],
+        }));
+
+        assert_eq!(
+            registry.get_for_filename("requirements.txt").unwrap().id(),
+            "exact"
+        );
+    }
+
+    #[test]
+    fn test_get_for_filename_pattern_wins_over_extension() {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockExtEcosystem {
+            id: "ext",
+            filenames: &[],
+            extensions: &[".txt"],
+        }));
+        registry.register(Arc::new(MockPatternEcosystem {
+            id: "pattern",
+            patterns: &["requirements*.txt"],
+        }));
+
+        assert_eq!(
+            registry.get_for_filename("requirements.txt").unwrap().id(),
+            "pattern"
+        );
+    }
+
+    #[test]
+    fn test_get_for_filename_pattern_most_specific_wins_deterministically() {
+        let registry = pypi_pattern_registry();
+        // Matches both `requirements*.txt` (score 16) and `*.requirements.txt`
+        // (score 17) — the longer, more specific pattern must win.
+        assert_eq!(
+            registry
+                .get_for_filename("requirements.requirements.txt")
+                .unwrap()
+                .id(),
+            "pypi"
+        );
     }
 
     #[test]
