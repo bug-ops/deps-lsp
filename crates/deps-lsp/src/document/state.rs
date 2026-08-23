@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
-use deps_core::{EcosystemId, EcosystemRegistry, ParseResult};
+use deps_core::{EcosystemId, EcosystemRegistry, PackageName, ParseResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,9 +42,9 @@ pub struct DocumentState {
     #[allow(dead_code)]
     parse_result: Option<Box<dyn ParseResult>>,
     /// Simplified cached versions (just strings) for new architecture
-    pub cached_versions: HashMap<String, String>,
+    pub cached_versions: HashMap<PackageName, String>,
     /// Resolved versions from lock file
-    pub resolved_versions: HashMap<String, String>,
+    pub resolved_versions: HashMap<PackageName, String>,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -215,12 +215,12 @@ impl DocumentState {
     }
 
     /// Updates the simplified cached versions (new architecture).
-    pub fn update_cached_versions(&mut self, versions: HashMap<String, String>) {
+    pub fn update_cached_versions(&mut self, versions: HashMap<PackageName, String>) {
         self.cached_versions = versions;
     }
 
     /// Updates the resolved versions from lock file.
-    pub fn update_resolved_versions(&mut self, versions: HashMap<String, String>) {
+    pub fn update_resolved_versions(&mut self, versions: HashMap<PackageName, String>) {
         self.resolved_versions = versions;
     }
 

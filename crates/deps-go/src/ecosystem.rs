@@ -248,7 +248,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
+        cached_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -260,7 +260,7 @@ mod tests {
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
+        resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
@@ -291,7 +291,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
+        cached_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -332,7 +332,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
+        cached_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
@@ -344,7 +344,7 @@ mod tests {
 
         // Lock file has the latest version - but show_up_to_date_hints is false
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
+        resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
@@ -370,7 +370,7 @@ mod tests {
         };
 
         let mut cached_versions = HashMap::new();
-        cached_versions.insert("github.com/gin-gonic/gin".to_string(), "v1.9.1".to_string());
+        cached_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
 
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),

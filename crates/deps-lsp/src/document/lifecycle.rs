@@ -10,6 +10,7 @@ use crate::handlers::diagnostics;
 use crate::progress::{ProgressSender, RegistryProgress};
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
+use deps_core::PackageName;
 use deps_core::Registry;
 use deps_core::Result;
 use std::collections::{HashMap, HashSet};
@@ -77,13 +78,12 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
 /// Diff between old and new dependency sets.
 #[derive(Debug, Clone, Default)]
 struct DependencyDiff {
-    added: Vec<String>,
-    #[allow(dead_code)]
-    removed: Vec<String>,
+    added: Vec<PackageName>,
+    removed: Vec<PackageName>,
 }
 
 impl DependencyDiff {
-    fn compute(old_deps: &HashSet<String>, new_deps: &HashSet<String>) -> Self {
+    fn compute(old_deps: &HashSet<PackageName>, new_deps: &HashSet<PackageName>) -> Self {
         Self {
             added: new_deps.difference(old_deps).cloned().collect(),
             removed: old_deps.difference(new_deps).cloned().collect(),
@@ -99,7 +99,7 @@ impl DependencyDiff {
 /// Result of parallel version fetching.
 struct FetchResult {
     /// Successfully fetched versions (package -> latest version)
-    versions: HashMap<String, String>,
+    versions: HashMap<PackageName, String>,
     /// Number of packages that failed to fetch (timeout or error)
     failed_count: usize,
     /// First actionable error message (shown to user via `window/showMessage`)
@@ -136,7 +136,7 @@ struct FetchResult {
 /// - Parallel (10s timeout, 1 slow package at 30s): max(10s) ≈ 10s
 async fn fetch_latest_versions_parallel(
     registry: Arc<dyn Registry>,
-    package_names: Vec<String>,
+    package_names: Vec<PackageName>,
     progress_sender: Option<ProgressSender>,
     timeout_secs: u64,
     max_concurrent: usize,
@@ -158,7 +158,8 @@ async fn fetch_latest_versions_parallel(
             let progress_sender = progress_sender.clone();
             async move {
                 let result =
-                    tokio::time::timeout(timeout, registry.get_latest_matching(&name, "*")).await;
+                    tokio::time::timeout(timeout, registry.get_latest_matching(name.as_str(), "*"))
+                        .await;
 
                 let version = match result {
                     Ok(Ok(Some(v))) => {
@@ -273,7 +274,7 @@ pub async fn handle_document_open(
         }
 
         // Collect dependency names while holding reference (can't hold across await)
-        let dep_names: Vec<String> = {
+        let dep_names: Vec<PackageName> = {
             let doc = match state_clone.get_document(&uri_clone) {
                 Some(d) => d,
                 None => {
@@ -291,7 +292,7 @@ pub async fn handle_document_open(
             parse_result
                 .dependencies()
                 .into_iter()
-                .map(|d| d.name().to_string())
+                .map(|d| d.name().clone())
                 .collect()
         };
 
@@ -405,13 +406,13 @@ pub async fn handle_document_change(
     check_content_size(&content, &uri)?;
 
     // Extract old dependency names before parsing (for diff computation)
-    let old_dep_names: HashSet<String> =
+    let old_dep_names: HashSet<PackageName> =
         state.get_document(&uri).map_or_else(HashSet::new, |doc| {
             doc.parse_result()
                 .map(|pr| {
                     pr.dependencies()
                         .into_iter()
-                        .map(|d| d.name().to_string())
+                        .map(|d| d.name().clone())
                         .collect()
                 })
                 .unwrap_or_default()
@@ -421,12 +422,12 @@ pub async fn handle_document_change(
     let parse_result = ecosystem.parse_manifest(&content, &uri).await.ok();
 
     // Extract new dependency names for diff
-    let new_dep_names: HashSet<String> = parse_result
+    let new_dep_names: HashSet<PackageName> = parse_result
         .as_ref()
         .map(|pr| {
             pr.dependencies()
                 .into_iter()
-                .map(|d| d.name().to_string())
+                .map(|d| d.name().clone())
                 .collect()
         })
         .unwrap_or_default();
@@ -597,7 +598,7 @@ async fn load_resolved_versions(
     uri: &Uri,
     state: &ServerState,
     ecosystem: &dyn Ecosystem,
-) -> HashMap<String, String> {
+) -> HashMap<PackageName, String> {
     let lock_provider = match ecosystem.lockfile_provider() {
         Some(p) => p,
         None => {
@@ -627,7 +628,7 @@ async fn load_resolved_versions(
             );
             resolved
                 .iter()
-                .map(|(name, pkg)| (name.clone(), pkg.version.clone()))
+                .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone()))
                 .collect()
         }
         Err(e) => {
@@ -867,7 +868,7 @@ mod tests {
         }
 
         let registry: Arc<dyn Registry> = Arc::new(TimeoutRegistry);
-        let packages = vec!["slow-package".to_string()];
+        let packages = vec![PackageName::new("slow-package")];
 
         // Use 1 second timeout for test speed
         let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
@@ -937,7 +938,10 @@ mod tests {
         }
 
         let registry: Arc<dyn Registry> = Arc::new(MixedRegistry);
-        let packages = vec!["slow-package".to_string(), "fast-package".to_string()];
+        let packages = vec![
+            PackageName::new("slow-package"),
+            PackageName::new("fast-package"),
+        ];
 
         let start = std::time::Instant::now();
         let result = fetch_latest_versions_parallel(registry, packages, None, 1, 10).await;
@@ -1047,7 +1051,9 @@ mod tests {
         });
 
         // Create 50 packages, limit concurrency to 20
-        let packages: Vec<String> = (0..50).map(|i| format!("package-{}", i)).collect();
+        let packages: Vec<PackageName> = (0..50)
+            .map(|i| PackageName::new(format!("package-{}", i)))
+            .collect();
 
         fetch_latest_versions_parallel(registry, packages, None, 5, 20).await;
 
@@ -1169,9 +1175,9 @@ mod tests {
 
         let registry: Arc<dyn Registry> = Arc::new(MixedOutcomeRegistry);
         let packages = vec![
-            "package-fast".to_string(),
-            "package-slow".to_string(),
-            "package-error".to_string(),
+            PackageName::new("package-fast"),
+            PackageName::new("package-slow"),
+            PackageName::new("package-error"),
         ];
 
         // Use 1 second timeout for test speed
@@ -1254,9 +1260,9 @@ mod tests {
 
         let registry: Arc<dyn Registry> = Arc::new(ErrorRegistry);
         let packages = vec![
-            "package-1".to_string(),
-            "package-2".to_string(),
-            "package-3".to_string(),
+            PackageName::new("package-1"),
+            PackageName::new("package-2"),
+            PackageName::new("package-3"),
         ];
 
         // Should not panic, just return empty result
@@ -1761,13 +1767,13 @@ tokio = "1.0"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.cached_versions
-                    .insert("serde".to_string(), "1.0.210".to_string());
+                    .insert("serde".into(), "1.0.210".to_string());
                 doc.cached_versions
-                    .insert("tokio".to_string(), "1.40.0".to_string());
+                    .insert("tokio".into(), "1.40.0".to_string());
                 doc.resolved_versions
-                    .insert("serde".to_string(), "1.0.195".to_string());
+                    .insert("serde".into(), "1.0.195".to_string());
                 doc.resolved_versions
-                    .insert("tokio".to_string(), "1.35.0".to_string());
+                    .insert("tokio".into(), "1.35.0".to_string());
             }
 
             // Verify cache populated
@@ -1872,7 +1878,7 @@ serde = "1.0"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.cached_versions
-                    .insert("serde".to_string(), "1.0.210".to_string());
+                    .insert("serde".into(), "1.0.210".to_string());
             }
 
             // Invalid TOML (parse will fail)
@@ -1910,40 +1916,44 @@ serde = "1.0"
 
         #[test]
         fn test_dependency_diff_detects_additions() {
-            let old: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
-            let new: HashSet<String> = ["serde", "tokio", "anyhow"]
+            let old: HashSet<PackageName> =
+                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
+            let new: HashSet<PackageName> = ["serde", "tokio", "anyhow"]
                 .iter()
-                .map(|s| s.to_string())
+                .map(|s| (*s).into())
                 .collect();
 
             let diff = DependencyDiff::compute(&old, &new);
 
             assert_eq!(diff.added.len(), 1);
-            assert!(diff.added.contains(&"anyhow".to_string()));
+            assert!(diff.added.contains(&PackageName::new("anyhow")));
             assert!(diff.removed.is_empty());
             assert!(diff.needs_fetch());
         }
 
         #[test]
         fn test_dependency_diff_detects_removals() {
-            let old: HashSet<String> = ["serde", "tokio", "anyhow"]
+            let old: HashSet<PackageName> = ["serde", "tokio", "anyhow"]
                 .iter()
-                .map(|s| s.to_string())
+                .map(|s| (*s).into())
                 .collect();
-            let new: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+            let new: HashSet<PackageName> =
+                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
 
             let diff = DependencyDiff::compute(&old, &new);
 
             assert!(diff.added.is_empty());
             assert_eq!(diff.removed.len(), 1);
-            assert!(diff.removed.contains(&"anyhow".to_string()));
+            assert!(diff.removed.contains(&PackageName::new("anyhow")));
             assert!(!diff.needs_fetch());
         }
 
         #[test]
         fn test_dependency_diff_no_changes() {
-            let old: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
-            let new: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+            let old: HashSet<PackageName> =
+                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
+            let new: HashSet<PackageName> =
+                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
 
             let diff = DependencyDiff::compute(&old, &new);
 
@@ -1954,8 +1964,9 @@ serde = "1.0"
 
         #[test]
         fn test_dependency_diff_empty_to_new() {
-            let old: HashSet<String> = HashSet::new();
-            let new: HashSet<String> = ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+            let old: HashSet<PackageName> = HashSet::new();
+            let new: HashSet<PackageName> =
+                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
 
             let diff = DependencyDiff::compute(&old, &new);
 
@@ -1989,11 +2000,11 @@ anyhow = "1.0"
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.cached_versions
-                    .insert("serde".to_string(), "1.0.210".to_string());
+                    .insert(PackageName::new("serde"), "1.0.210".to_string());
                 doc.cached_versions
-                    .insert("tokio".to_string(), "1.40.0".to_string());
+                    .insert(PackageName::new("tokio"), "1.40.0".to_string());
                 doc.cached_versions
-                    .insert("anyhow".to_string(), "1.0.89".to_string());
+                    .insert(PackageName::new("anyhow"), "1.0.89".to_string());
             }
 
             // Remove anyhow from manifest
@@ -2003,12 +2014,12 @@ tokio = "1.0"
 "#;
 
             // Compute diff and apply cache pruning
-            let old_dep_names: HashSet<String> = ["serde", "tokio", "anyhow"]
+            let old_dep_names: HashSet<PackageName> = ["serde", "tokio", "anyhow"]
                 .iter()
-                .map(|s| s.to_string())
+                .map(|s| (*s).into())
                 .collect();
-            let new_dep_names: HashSet<String> =
-                ["serde", "tokio"].iter().map(|s| s.to_string()).collect();
+            let new_dep_names: HashSet<PackageName> =
+                ["serde", "tokio"].iter().map(|s| (*s).into()).collect();
             let diff = DependencyDiff::compute(&old_dep_names, &new_dep_names);
 
             let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();

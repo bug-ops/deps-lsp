@@ -39,7 +39,7 @@ pub use lsp_helpers::{
     generate_diagnostics as lsp_generate_diagnostics, generate_hover as lsp_generate_hover,
     generate_inlay_hints as lsp_generate_inlay_hints, is_same_major_minor, position_in_range,
 };
-pub use package::{PackageName, VersionReq};
+pub use package::{InvalidPackageName, PackageName, VersionReq};
 pub use parser::{
     DependencySource, LoadingState, MAX_TOML_NESTING_DEPTH, MAX_YAML_EXPANDED_BYTES,
     MAX_YAML_NESTING_DEPTH, check_toml_nesting_depth, check_yaml_expansion,
