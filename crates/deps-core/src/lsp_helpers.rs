@@ -7,7 +7,7 @@ use tower_lsp_server::ls_types::{
     TextEdit, Uri, WorkspaceEdit,
 };
 
-use crate::{Dependency, EcosystemConfig, PackageName, ParseResult, Registry};
+use crate::{Dependency, EcosystemConfig, InvalidPackageName, PackageName, ParseResult, Registry};
 
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
 /// together everywhere.
@@ -242,6 +242,45 @@ pub trait EcosystemFormatter: Send + Sync {
     /// Normalize package name for lookup (default: identity).
     fn normalize_package_name(&self, name: &str) -> String {
         name.to_string()
+    }
+
+    /// Lints `name` against ecosystem-specific naming rules.
+    ///
+    /// Default: permissive, always `Ok(())`. This is a diagnostic lint, not a
+    /// construction-time gate — [`PackageName::new`](crate::PackageName::new)
+    /// stays infallible regardless of what this returns. Override only to warn
+    /// on names an ecosystem's own tooling would never accept; err on the side
+    /// of accepting anything ambiguous, since a false positive here is a
+    /// warning on a manifest the user's actual package manager treats as fine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] carrying the reason `name` fails this
+    /// ecosystem's naming rules. The default implementation never errs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    ///
+    /// struct PermissiveFormatter;
+    ///
+    /// impl EcosystemFormatter for PermissiveFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///
+    ///     fn package_url(&self, name: &str) -> String {
+    ///         format!("https://example.com/{name}")
+    ///     }
+    /// }
+    ///
+    /// // The default is permissive: any name, including one that would fail an
+    /// // ecosystem-specific override, is accepted.
+    /// assert!(PermissiveFormatter.validate_package_name("../not/a/real/rule").is_ok());
+    /// ```
+    fn validate_package_name(&self, _name: &str) -> Result<(), InvalidPackageName> {
+        Ok(())
     }
 
     /// Format version string for code action text edit.
@@ -710,10 +749,14 @@ pub fn generate_diagnostics_from_cache(
             let in_lockfile = versions.resolved.contains_key(normalized_name.as_str())
                 || versions.resolved.contains_key(dep.name());
             if !in_lockfile {
+                let message = match formatter.validate_package_name(dep.name().as_str()) {
+                    Err(reason) => format!("Invalid package name '{}': {reason}", dep.name()),
+                    Ok(()) => format!("Unknown package '{}'", dep.name()),
+                };
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
                     severity: Some(DiagnosticSeverity::WARNING),
-                    message: format!("Unknown package '{}'", dep.name()),
+                    message,
                     source: Some("deps-lsp".into()),
                     ..Default::default()
                 });
@@ -765,10 +808,14 @@ pub async fn generate_diagnostics<R: Registry + ?Sized>(
         let versions = match registry.get_versions(dep.name().as_str()).await {
             Ok(v) => v,
             Err(_) => {
+                let message = match formatter.validate_package_name(dep.name().as_str()) {
+                    Err(reason) => format!("Invalid package name '{}': {reason}", dep.name()),
+                    Ok(()) => format!("Unknown package '{}'", dep.name()),
+                };
                 diagnostics.push(Diagnostic {
                     range: dep.name_range(),
                     severity: Some(DiagnosticSeverity::WARNING),
-                    message: format!("Unknown package '{}'", dep.name()),
+                    message,
                     source: Some("deps-lsp".into()),
                     ..Default::default()
                 });
@@ -1045,6 +1092,24 @@ mod tests {
         }
     }
 
+    /// A formatter whose `validate_package_name` always rejects, for exercising
+    /// the "Invalid package name" diagnostic path independently of "Unknown package".
+    struct RejectingFormatter;
+
+    impl EcosystemFormatter for RejectingFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            version.to_string()
+        }
+
+        fn package_url(&self, name: &str) -> String {
+            format!("https://example.com/{}", name)
+        }
+
+        fn validate_package_name(&self, _name: &str) -> Result<(), InvalidPackageName> {
+            Err(InvalidPackageName::new("name is rejected for testing"))
+        }
+    }
+
     struct MockParseResult {
         deps: Vec<MockDep>,
         uri: Uri,
@@ -1213,6 +1278,50 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a str,
+            _req: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn package_url(&self, _name: &str) -> String {
+            String::new()
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A registry whose `get_versions` always errs, for exercising
+    /// `generate_diagnostics`'s `Err` arm.
+    struct ErrorRegistry;
+
+    impl crate::Registry for ErrorRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a str,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move {
+                Err(crate::error::DepsError::CacheError(
+                    "mock registry error".to_string(),
+                ))
+            })
         }
 
         fn get_latest_matching<'a>(
@@ -1763,6 +1872,67 @@ mod tests {
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
         assert!(diagnostics[0].message.contains("Unknown package"));
         assert!(diagnostics[0].message.contains("unknown-pkg"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_invalid_package_name() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // A formatter that rejects every name must produce exactly one
+        // "Invalid package name" diagnostic per unresolved dependency, never
+        // both that and "Unknown package".
+        let formatter = RejectingFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "bad-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diagnostics[0].message.starts_with("Invalid package name"));
+        assert!(!diagnostics[0].message.contains("Unknown package"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_invalid_package_name() {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // Network variant: a registry lookup failure combined with a rejected
+        // name must produce "Invalid package name", not "Unknown package".
+        let formatter = RejectingFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "bad-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let diagnostics = generate_diagnostics(&parse_result, &ErrorRegistry, &formatter).await;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diagnostics[0].message.starts_with("Invalid package name"));
+        assert!(!diagnostics[0].message.contains("Unknown package"));
     }
 
     #[test]

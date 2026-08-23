@@ -136,6 +136,40 @@ impl PartialEq<&str> for PackageName {
     }
 }
 
+/// A package name that failed an [`EcosystemFormatter::validate_package_name`] lint.
+///
+/// This is not a construction-time gate — [`PackageName::new`] stays infallible — it
+/// only carries *why* a name looks wrong so an LSP diagnostic can say something more
+/// specific than "invalid name".
+///
+/// [`EcosystemFormatter::validate_package_name`]: crate::lsp_helpers::EcosystemFormatter::validate_package_name
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::InvalidPackageName;
+///
+/// let err = InvalidPackageName::new("name is longer than 214 characters");
+/// assert_eq!(err.reason(), "name is longer than 214 characters");
+/// assert_eq!(err.to_string(), "name is longer than 214 characters");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidPackageName(std::borrow::Cow<'static, str>);
+
+impl InvalidPackageName {
+    /// Creates an `InvalidPackageName` carrying `reason` as the explanation.
+    pub fn new(reason: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self(reason.into())
+    }
+
+    /// Returns why the name was rejected.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A version requirement string as it appears in a manifest file.
 ///
 /// This is deliberately permissive: it stores whatever bytes the manifest
