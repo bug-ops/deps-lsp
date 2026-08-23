@@ -846,59 +846,6 @@ impl Default for PypiParser {
     }
 }
 
-// Implement deps_core traits for interoperability with LSP server
-
-impl deps_core::ManifestParser for PypiParser {
-    type Dependency = PypiDependency;
-    type ParseResult = ParseResult;
-
-    fn parse(&self, content: &str, doc_uri: &Uri) -> deps_core::error::Result<Self::ParseResult> {
-        self.parse_content(content, doc_uri)
-            .map_err(|e| deps_core::error::DepsError::ParseError {
-                file_type: "pyproject.toml".to_string(),
-                source: Box::new(e),
-            })
-    }
-}
-
-impl deps_core::DependencyInfo for PypiDependency {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> deps_core::DependencySource {
-        self.source.clone()
-    }
-
-    fn features(&self) -> &[String] {
-        &self.extras
-    }
-}
-
-impl deps_core::ParseResultInfo for ParseResult {
-    type Dependency = PypiDependency;
-
-    fn dependencies(&self) -> &[Self::Dependency] {
-        &self.dependencies
-    }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        self.workspace_root.as_deref()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -67,32 +67,6 @@ pub struct GemInfo {
 
 // Trait implementations for deps-core integration
 
-impl deps_core::DependencyInfo for BundlerDependency {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> deps_core::parser::DependencySource {
-        self.source.clone()
-    }
-
-    fn features(&self) -> &[String] {
-        &[]
-    }
-}
-
 impl deps_core::Dependency for BundlerDependency {
     fn name(&self) -> &str {
         &self.name
@@ -246,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_dependency_info_trait_registry() {
-        use deps_core::DependencyInfo;
+        use deps_core::Dependency;
 
         let dep = create_test_dependency(DependencySource::Registry);
         assert_eq!(dep.name(), "test_gem");
@@ -259,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_dependency_info_trait_git() {
-        use deps_core::DependencyInfo;
+        use deps_core::Dependency;
 
         let dep = create_test_dependency(DependencySource::Git {
             url: "https://github.com/rails/rails".into(),
@@ -277,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_dependency_info_trait_path() {
-        use deps_core::DependencyInfo;
+        use deps_core::Dependency;
 
         let dep = create_test_dependency(DependencySource::Path {
             path: "../local_gem".into(),
@@ -293,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_dependency_info_trait_custom_source() {
-        use deps_core::DependencyInfo;
+        use deps_core::Dependency;
 
         let dep = create_test_dependency(DependencySource::CustomRegistry {
             url: "https://gems.example.com".into(),

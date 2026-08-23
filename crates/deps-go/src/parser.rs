@@ -303,18 +303,6 @@ fn parse_exclude_line(
     })
 }
 
-impl deps_core::parser::ParseResultInfo for GoParseResult {
-    type Dependency = GoDependency;
-
-    fn dependencies(&self) -> &[Self::Dependency] {
-        &self.dependencies
-    }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-}
-
 deps_core::impl_parse_result!(
     GoParseResult,
     GoDependency {

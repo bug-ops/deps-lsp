@@ -2,7 +2,7 @@
 //!
 //! Provides macros for implementing common traits with minimal code duplication.
 
-/// Implement `Dependency` and `DependencyInfo` traits for a struct.
+/// Implement the `Dependency` trait for a struct.
 ///
 /// # Arguments
 ///
@@ -55,28 +55,6 @@ macro_rules! impl_dependency {
         version_range: $version_range:ident,
         source: $source:expr $(,)?
     }) => {
-        impl $crate::parser::DependencyInfo for $type {
-            fn name(&self) -> &str {
-                &self.$name
-            }
-
-            fn name_range(&self) -> ::tower_lsp_server::ls_types::Range {
-                self.$name_range
-            }
-
-            fn version_requirement(&self) -> Option<&str> {
-                self.$version.as_deref()
-            }
-
-            fn version_range(&self) -> Option<::tower_lsp_server::ls_types::Range> {
-                self.$version_range
-            }
-
-            fn source(&self) -> $crate::parser::DependencySource {
-                $source
-            }
-        }
-
         impl $crate::ecosystem::Dependency for $type {
             fn name(&self) -> &str {
                 &self.$name

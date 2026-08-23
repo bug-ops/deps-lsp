@@ -296,55 +296,6 @@ fn find_workspace_root(doc_uri: &Uri) -> Result<Option<PathBuf>> {
 /// Parser for Cargo.toml manifests implementing the deps-core traits.
 pub struct CargoParser;
 
-impl deps_core::ManifestParser for CargoParser {
-    type Dependency = ParsedDependency;
-    type ParseResult = ParseResult;
-
-    fn parse(&self, content: &str, doc_uri: &Uri) -> deps_core::Result<Self::ParseResult> {
-        parse_cargo_toml(content, doc_uri).map_err(Into::into)
-    }
-}
-
-// Implement DependencyInfo trait for ParsedDependency
-impl deps_core::DependencyInfo for ParsedDependency {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn name_range(&self) -> Range {
-        self.name_range
-    }
-
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
-    }
-
-    fn version_range(&self) -> Option<Range> {
-        self.version_range
-    }
-
-    fn source(&self) -> deps_core::DependencySource {
-        self.source.clone()
-    }
-
-    fn features(&self) -> &[String] {
-        &self.features
-    }
-}
-
-// Implement ParseResultInfo trait for ParseResult (legacy)
-impl deps_core::ParseResultInfo for ParseResult {
-    type Dependency = ParsedDependency;
-
-    fn dependencies(&self) -> &[Self::Dependency] {
-        &self.dependencies
-    }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        self.workspace_root.as_deref()
-    }
-}
-
 // Implement new ParseResult trait for trait object support
 impl deps_core::ParseResult for ParseResult {
     fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
