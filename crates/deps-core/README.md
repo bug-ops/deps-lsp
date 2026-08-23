@@ -16,7 +16,8 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 - **`EcosystemId` enum** — Exhaustive, typed identifier for every registered ecosystem, with `Display`/`FromStr` interop with `Ecosystem::id()`. Downstream code should match on this instead of the raw id string so a new ecosystem forces every relevant `match` to be updated at compile time
 - **`Registry` trait** — Abstraction over package registries with version lookup
 - **`LockFileProvider` trait** — Abstract lock file parsing for resolved versions
-- **Generic LSP handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics`, taking a bundled `VersionData` (cached + resolved version maps) to avoid swapping same-typed arguments at call sites
+- **Generic LSP handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics`, `generate_code_lenses`, taking a bundled `VersionData` (cached + resolved version maps) to avoid swapping same-typed arguments at call sites
+- **`collect_update_all_edits`** — batch `TextEdit`s bringing every safely-editable outdated dependency to latest, shared across all ecosystems; guards against rewriting a `version_range` that isn't actually the version literal (property references, DSL variables, catalog aliases, synthesized range bounds)
 - **`HttpCache`** — ETag/Last-Modified caching for registry HTTP requests, with a streaming 32 MiB response-size cap
 - **`check_toml_nesting_depth`** — single-pass structural guard rejecting pathologically nested TOML (bracket depth and dotted-key/header segment count) before it reaches the recursive-descent `toml_span` parser
 - **`check_yaml_nesting_depth`** — single-pass structural guard rejecting pathologically nested YAML (flow bracket depth and block-style indentation/dash-chain nesting) before it reaches the recursive-descent `yaml-rust2` parser

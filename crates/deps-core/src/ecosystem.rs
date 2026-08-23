@@ -2,7 +2,7 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
-    CodeAction, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
+    CodeAction, CodeLens, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
 };
 
 use crate::{
@@ -426,6 +426,30 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 parse_result,
                 versions,
                 self.formatter(),
+            )
+        })
+    }
+
+    /// Generate the "Update N outdated dependencies" code lens for the document.
+    ///
+    /// Default implementation delegates to `lsp_helpers::generate_code_lenses` using
+    /// `self.formatter()`. Override only if custom behavior is needed.
+    fn generate_code_lenses<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResult,
+        content: &'a str,
+        versions: VersionData<'a>,
+        uri: &'a Uri,
+        command_id: &'a str,
+    ) -> BoxFuture<'a, Vec<CodeLens>> {
+        Box::pin(async move {
+            crate::lsp_helpers::generate_code_lenses(
+                parse_result,
+                content,
+                versions,
+                self.formatter(),
+                uri,
+                command_id,
             )
         })
     }

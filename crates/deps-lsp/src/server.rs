@@ -1,20 +1,21 @@
 use crate::config::DepsConfig;
 use crate::document::{ServerState, handle_document_change, handle_document_open};
 use crate::file_watcher;
-use crate::handlers::{code_actions, completion, diagnostics, hover, inlay_hints};
+use crate::handlers::{code_actions, code_lens, completion, diagnostics, hover, inlay_hints};
 use deps_core::PackageName;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::ls_types::{
-    CodeActionOptions, CodeActionParams, CodeActionProviderCapability, CompletionOptions,
-    CompletionParams, CompletionResponse, DiagnosticOptions, DiagnosticServerCapabilities,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
-    DocumentDiagnosticReportResult, ExecuteCommandOptions, ExecuteCommandParams,
-    FullDocumentDiagnosticReport, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, InlayHint, InlayHintParams, MessageType, OneOf, Range,
-    RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo,
+    CodeActionOptions, CodeActionParams, CodeActionProviderCapability, CodeLens, CodeLensOptions,
+    CodeLensParams, CompletionOptions, CompletionParams, CompletionResponse, DiagnosticOptions,
+    DiagnosticServerCapabilities, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentChanges,
+    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
+    ExecuteCommandOptions, ExecuteCommandParams, FullDocumentDiagnosticReport, Hover, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, InlayHint,
+    InlayHintParams, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Range,
+    RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo, TextDocumentEdit,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
@@ -23,6 +24,9 @@ use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
 mod commands {
     /// Command to update a dependency version.
     pub(super) const UPDATE_VERSION: &str = "deps-lsp.updateVersion";
+    /// Command to update every outdated dependency in a document, bound to the code
+    /// lens produced by `handlers::code_lens`.
+    pub(super) const UPDATE_ALL_OUTDATED: &str = crate::handlers::code_lens::COMMAND_ID;
 }
 
 pub struct Backend {
@@ -49,10 +53,16 @@ impl Backend {
     }
 
     /// Handles opening a document using unified ecosystem registry.
-    async fn handle_open(&self, uri: tower_lsp_server::ls_types::Uri, content: String) {
+    async fn handle_open(
+        &self,
+        uri: tower_lsp_server::ls_types::Uri,
+        content: String,
+        version: i32,
+    ) {
         match handle_document_open(
             uri.clone(),
             content,
+            Some(version),
             Arc::clone(&self.state),
             self.client.clone(),
             Arc::clone(&self.config),
@@ -72,10 +82,16 @@ impl Backend {
     }
 
     /// Handles changes to a document using unified ecosystem registry.
-    async fn handle_change(&self, uri: tower_lsp_server::ls_types::Uri, content: String) {
+    async fn handle_change(
+        &self,
+        uri: tower_lsp_server::ls_types::Uri,
+        content: String,
+        version: i32,
+    ) {
         match handle_document_change(
             uri.clone(),
             content,
+            Some(version),
             Arc::clone(&self.state),
             self.client.clone(),
             Arc::clone(&self.config),
@@ -186,6 +202,9 @@ impl Backend {
         if let Err(e) = self.client.inlay_hint_refresh().await {
             tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
         }
+        if let Err(e) = self.client.code_lens_refresh().await {
+            tracing::debug!("code_lens_refresh not supported: {:?}", e);
+        }
     }
 
     /// Check if client supports work done progress.
@@ -212,6 +231,9 @@ impl Backend {
                 code_action_kinds: Some(vec![tower_lsp_server::ls_types::CodeActionKind::REFACTOR]),
                 ..Default::default()
             })),
+            code_lens_provider: Some(CodeLensOptions {
+                resolve_provider: Some(false),
+            }),
             diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
                 identifier: Some("deps".into()),
                 inter_file_dependencies: false,
@@ -219,7 +241,10 @@ impl Backend {
                 ..Default::default()
             })),
             execute_command_provider: Some(ExecuteCommandOptions {
-                commands: vec![commands::UPDATE_VERSION.into()],
+                commands: vec![
+                    commands::UPDATE_VERSION.into(),
+                    commands::UPDATE_ALL_OUTDATED.into(),
+                ],
                 ..Default::default()
             }),
             ..Default::default()
@@ -297,6 +322,7 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let content = params.text_document.text;
+        let version = params.text_document.version;
 
         tracing::info!("document opened: {:?}", uri);
 
@@ -306,11 +332,12 @@ impl LanguageServer for Backend {
             return;
         }
 
-        self.handle_open(uri, content).await;
+        self.handle_open(uri, content, version).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
+        let version = params.text_document.version;
 
         if let Some(change) = params.content_changes.first() {
             let content = change.text.clone();
@@ -321,7 +348,7 @@ impl LanguageServer for Backend {
                 return;
             }
 
-            self.handle_change(uri, content).await;
+            self.handle_change(uri, content, version).await;
         }
     }
 
@@ -422,6 +449,19 @@ impl LanguageServer for Backend {
         Ok(Some(actions))
     }
 
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let enabled = { self.config.read().await.code_lens.enabled };
+        let lenses = code_lens::handle_code_lens(
+            Arc::clone(&self.state),
+            params,
+            enabled,
+            self.client.clone(),
+            Arc::clone(&self.config),
+        )
+        .await;
+        Ok(Some(lenses))
+    }
+
     async fn diagnostic(
         &self,
         params: DocumentDiagnosticParams,
@@ -481,9 +521,143 @@ impl LanguageServer for Backend {
             if let Err(e) = self.client.apply_edit(edit).await {
                 tracing::error!("Failed to apply edit: {:?}", e);
             }
+        } else if params.command == commands::UPDATE_ALL_OUTDATED
+            && let Some(args) = params.arguments.first()
+            && let Ok(update_args) = serde_json::from_value::<UpdateAllOutdatedArgs>(args.clone())
+        {
+            self.execute_update_all_outdated(update_args.uri).await;
         }
 
         Ok(None)
+    }
+}
+
+impl Backend {
+    /// Warns the client that the "update all outdated" command was refused because the
+    /// document's dependency data isn't safely usable (see the three-condition cold-start
+    /// refusal below).
+    async fn warn_update_all_outdated_not_ready(&self) {
+        self.client
+            .show_message(
+                MessageType::WARNING,
+                "deps-lsp: dependency data is not ready for this document",
+            )
+            .await;
+    }
+
+    /// Recomputes and applies the batch, version-guarded `WorkspaceEdit` for
+    /// `deps-lsp.updateAllOutdated`.
+    ///
+    /// Refuses to act — no-op plus a `window/showMessage` — unless all of:
+    /// - the document is present in `state` (never calls `ensure_document_loaded` — a
+    ///   client-supplied URI must not trigger a cold disk read here);
+    /// - [`DocumentState::is_ready_for_batch_update`](crate::document::DocumentState::is_ready_for_batch_update)
+    ///   holds: `loading_state` is not `Loading`, and it has a known LSP `version`
+    ///   (`None` means this state was populated from disk after a missed `didOpen` —
+    ///   server restart/crash — where the client's buffer may hold unsaved edits disk
+    ///   does not reflect). The same predicate gates whether `handlers::code_lens` even
+    ///   renders the lens, so a visible lens never leads to this refusal;
+    /// - the ecosystem and parse result are resolvable (in practice always true once
+    ///   the above hold — surfaced with the same message as the conditions above, since
+    ///   the caller cannot act on the difference);
+    /// - recomputing the edits at click time still finds at least one outdated,
+    ///   safely-editable dependency — a distinct, non-`WARNING` message covers the case
+    ///   where the document changed between the lens render and this click.
+    ///
+    /// The edits are recomputed from the current document, not baked into the lens
+    /// arguments, so a lens computed at T and clicked at T+n reflects the state at click
+    /// time. When the client advertises `workspace.workspaceEdit.documentChanges`, the
+    /// `WorkspaceEdit` also carries the document's LSP version, so the client rejects
+    /// the whole batch if its buffer moved between computation and apply — this closes
+    /// the remaining race for clients that support it. Clients that don't advertise the
+    /// capability get the plain `changes` map instead, which carries no version; for
+    /// those, this recompute-at-click-time step is the only staleness mitigation.
+    async fn execute_update_all_outdated(&self, uri: Uri) {
+        let Some(doc) = self.state.get_document(&uri) else {
+            self.warn_update_all_outdated_not_ready().await;
+            return;
+        };
+
+        if !doc.is_ready_for_batch_update() {
+            drop(doc);
+            self.warn_update_all_outdated_not_ready().await;
+            return;
+        }
+
+        let Some(ecosystem) = self.state.ecosystem_registry.get(doc.ecosystem_id()) else {
+            tracing::warn!("Unknown ecosystem for {:?}", uri);
+            drop(doc);
+            self.warn_update_all_outdated_not_ready().await;
+            return;
+        };
+
+        let Some(parse_result) = doc.parse_result() else {
+            tracing::warn!("No parse result for {:?}", uri);
+            drop(doc);
+            self.warn_update_all_outdated_not_ready().await;
+            return;
+        };
+
+        let edits = deps_core::collect_update_all_edits(
+            parse_result,
+            &doc.content,
+            deps_core::VersionData::new(&doc.cached_versions, &doc.resolved_versions),
+            ecosystem.formatter(),
+        );
+        let version = doc.version;
+        drop(doc);
+
+        if edits.is_empty() {
+            // Not a failure — the document changed between the lens render and this
+            // click (or the client sent a stale command), so there is nothing left to
+            // apply. Still worth a message: a silent no-op after a visible click reads
+            // as a broken button (§4.6's rationale for not swallowing failures here).
+            self.client
+                .show_message(
+                    MessageType::INFO,
+                    "deps-lsp: no outdated dependencies to update",
+                )
+                .await;
+            return;
+        }
+
+        let supports_document_changes = self
+            .client_capabilities
+            .read()
+            .await
+            .as_ref()
+            .and_then(|c| c.workspace.as_ref())
+            .and_then(|w| w.workspace_edit.as_ref())
+            .and_then(|we| we.document_changes)
+            .unwrap_or(false);
+
+        let edit = build_update_all_outdated_edit(&uri, version, edits, supports_document_changes);
+
+        match self.client.apply_edit(edit).await {
+            Ok(response) if response.applied => {}
+            Ok(response) => {
+                tracing::warn!(
+                    "workspace/applyEdit for {:?} was rejected: {:?}",
+                    uri,
+                    response.failure_reason
+                );
+                self.client
+                    .show_message(
+                        MessageType::WARNING,
+                        "deps-lsp: failed to apply dependency updates",
+                    )
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to apply edit for {:?}: {:?}", uri, e);
+                self.client
+                    .show_message(
+                        MessageType::WARNING,
+                        "deps-lsp: failed to apply dependency updates",
+                    )
+                    .await;
+            }
+        }
     }
 }
 
@@ -492,6 +666,47 @@ struct UpdateVersionArgs {
     uri: Uri,
     range: Range,
     version: String,
+}
+
+/// Arguments for `deps-lsp.updateAllOutdated` — the URI only. Ranges are recomputed at
+/// execution time (see `Backend::execute_update_all_outdated`), never baked into the
+/// command arguments.
+#[derive(serde::Deserialize)]
+struct UpdateAllOutdatedArgs {
+    uri: Uri,
+}
+
+/// Builds the `WorkspaceEdit` for `deps-lsp.updateAllOutdated`.
+///
+/// Emits `document_changes` (versioned per `TextDocumentEdit`) when
+/// `supports_document_changes` is `true` — gated on the client's
+/// `workspace.workspaceEdit.documentChanges` capability — and falls back to the untyped
+/// `changes` map otherwise.
+fn build_update_all_outdated_edit(
+    uri: &Uri,
+    version: Option<i32>,
+    edits: Vec<TextEdit>,
+    supports_document_changes: bool,
+) -> WorkspaceEdit {
+    if supports_document_changes {
+        WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version,
+                },
+                edits: edits.into_iter().map(OneOf::Left).collect(),
+            }])),
+            ..Default::default()
+        }
+    } else {
+        let mut changes = HashMap::new();
+        changes.insert(uri.clone(), edits);
+        WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -643,5 +858,188 @@ mod tests {
         assert_eq!(args.version, "1.0.0");
         assert_eq!(args.range.start.line, 5);
         assert_eq!(args.range.start.character, 10);
+    }
+
+    #[test]
+    fn test_server_capabilities_code_lens() {
+        let caps = Backend::server_capabilities();
+        let code_lens = caps
+            .code_lens_provider
+            .expect("code lens provider should exist");
+        assert_eq!(code_lens.resolve_provider, Some(false));
+    }
+
+    #[test]
+    fn test_server_capabilities_execute_command_includes_update_all_outdated() {
+        let caps = Backend::server_capabilities();
+        let execute = caps
+            .execute_command_provider
+            .expect("execute command provider should exist");
+        assert!(
+            execute
+                .commands
+                .contains(&commands::UPDATE_ALL_OUTDATED.to_string())
+        );
+    }
+
+    #[test]
+    fn test_commands_update_all_outdated_matches_code_lens_command_id() {
+        assert_eq!(commands::UPDATE_ALL_OUTDATED, "deps-lsp.updateAllOutdated");
+    }
+
+    #[test]
+    fn test_update_all_outdated_args_deserialization() {
+        let json = serde_json::json!({ "uri": "file:///test/Cargo.toml" });
+        let args: UpdateAllOutdatedArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(args.uri.as_str(), "file:///test/Cargo.toml");
+    }
+
+    #[test]
+    fn test_build_update_all_outdated_edit_uses_document_changes_with_version() {
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let edits = vec![TextEdit {
+            range: Range::default(),
+            new_text: "1.2.0".into(),
+        }];
+
+        let edit = build_update_all_outdated_edit(&uri, Some(7), edits, true);
+
+        assert!(edit.changes.is_none());
+        let DocumentChanges::Edits(doc_edits) =
+            edit.document_changes.expect("document_changes present")
+        else {
+            panic!("expected DocumentChanges::Edits variant");
+        };
+        assert_eq!(doc_edits.len(), 1);
+        assert_eq!(doc_edits[0].text_document.uri, uri);
+        assert_eq!(doc_edits[0].text_document.version, Some(7));
+        assert_eq!(doc_edits[0].edits.len(), 1);
+    }
+
+    #[test]
+    fn test_build_update_all_outdated_edit_falls_back_to_changes_map() {
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let edits = vec![TextEdit {
+            range: Range::default(),
+            new_text: "1.2.0".into(),
+        }];
+
+        let edit = build_update_all_outdated_edit(&uri, Some(7), edits, false);
+
+        assert!(edit.document_changes.is_none());
+        let changes = edit.changes.expect("changes present");
+        assert_eq!(changes.get(&uri).map(Vec::len), Some(1));
+    }
+
+    #[cfg(feature = "cargo")]
+    mod update_all_outdated_execute_command_tests {
+        use super::*;
+        use crate::document::DocumentState;
+        use deps_core::EcosystemId;
+
+        fn command_params(uri: &Uri) -> ExecuteCommandParams {
+            ExecuteCommandParams {
+                command: commands::UPDATE_ALL_OUTDATED.to_string(),
+                arguments: vec![serde_json::json!({ "uri": uri.as_str() })],
+                work_done_progress_params: Default::default(),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_execute_command_update_all_outdated_closed_document_no_op() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            // Pin the precondition the refusal actually depends on: no document at all.
+            assert!(backend.state.get_document(&uri).is_none());
+
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+            assert!(
+                backend.state.get_document(&uri).is_none(),
+                "a refused command must not create a document"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_execute_command_update_all_outdated_loading_document_no_op() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.clone(),
+                parse_result,
+            );
+            doc_state.set_version(Some(1));
+            doc_state.set_loading();
+            // Pin the precondition directly: this fixture must actually be "not ready"
+            // per the same predicate `execute_command` consults, not just assumed to be.
+            assert!(!doc_state.is_ready_for_batch_update());
+            backend.state.update_document(uri.clone(), doc_state);
+
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+            assert_eq!(
+                backend.state.get_document(&uri).unwrap().content,
+                content,
+                "a refused command must not touch document content"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_execute_command_update_all_outdated_no_version_no_op() {
+            // `version: None` mirrors a document populated from disk after a missed
+            // didOpen (server restart/crash) — must be refused even though loaded and
+            // not `Loading`.
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            doc_state.set_loaded();
+            // `version` deliberately left as `None`.
+            assert!(!doc_state.is_ready_for_batch_update());
+            backend.state.update_document(uri.clone(), doc_state);
+
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn test_execute_command_update_all_outdated_apply_edit_failure_does_not_panic() {
+            // This test `Backend` is never `initialize`d, so `apply_edit` returns `Err`
+            // (per its documented behavior) — exercises the failure/warning path.
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            doc_state.set_version(Some(1));
+            doc_state.set_loaded();
+            // This fixture must actually pass the readiness gate — the failure below is
+            // from `apply_edit`, not from the refusal predicate this pins as satisfied.
+            assert!(doc_state.is_ready_for_batch_update());
+            let mut cached = HashMap::new();
+            cached.insert("serde".into(), "1.2.0".to_string());
+            doc_state.update_cached_versions(cached);
+            backend.state.update_document(uri.clone(), doc_state);
+
+            let result = backend.execute_command(command_params(&uri)).await;
+            assert!(result.is_ok());
+        }
     }
 }

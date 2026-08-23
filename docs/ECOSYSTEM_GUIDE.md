@@ -8,17 +8,17 @@ deps-lsp provides comprehensive LSP support for 11 package ecosystems:
 
 | Ecosystem | Language | Manifest File(s) | Lock File(s) | Features |
 |-----------|----------|-----------------|--------------|----------|
-| **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, feature flag completion |
-| **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics |
-| **PyPI** | Python | `pyproject.toml`, `setup.py` | `poetry.lock`, `uv.lock`, `requirements.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics |
-| **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, pseudo-version support |
-| **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics |
-| **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover, inlay hints, completion, code actions, diagnostics |
-| **Maven** | Java | `pom.xml` | `maven-metadata.xml` (CDN) | Hover with corrected version ordering (numeric segments outrank qualifiers, prereleases sort below base release), inlay hints, completion, code actions, diagnostics |
-| **Gradle** | Kotlin/Groovy | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | — | Hover with corrected version ordering (same as Maven), inlay hints, completion, code actions, diagnostics, variable resolution (`gradle.properties`) |
-| **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics |
-| **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, GitHub API support |
-| **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, central package management support, SemVer2 prerelease handling |
+| **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens, feature flag completion |
+| **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
+| **PyPI** | Python | `pyproject.toml`, `setup.py` | `poetry.lock`, `uv.lock`, `requirements.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens |
+| **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support |
+| **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
+| **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
+| **Maven** | Java | `pom.xml` | `maven-metadata.xml` (CDN) | Hover with corrected version ordering (numeric segments outrank qualifiers, prereleases sort below base release), inlay hints, completion, code actions, diagnostics, code lens (property-versioned dependencies not covered — see below) |
+| **Gradle** | Kotlin/Groovy | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | — | Hover with corrected version ordering (same as Maven), inlay hints, completion, code actions, diagnostics, code lens (variable/catalog-versioned dependencies not covered — see below), variable resolution (`gradle.properties`) |
+| **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
+| **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, GitHub API support (code lens not covered — see below) |
+| **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling |
 
 ### PyPI Environment Markers (PEP 508)
 
@@ -52,6 +52,46 @@ A requirement that couldn't be resolved to a concrete version (Maven's `${proper
 
 - **Diagnostics**: no "Newer version available" hint is shown — same as before, since the server can't verify either way.
 - **Inlay hints**: no badge is shown at all, neither "up to date" nor "needs update" — showing "up to date" for a requirement that was never actually checked against the latest version would be misleading.
+- **CodeLens "Update N outdated dependencies"** (below): an unresolved requirement is also never counted or edited — it already fails the literal-span guard (the tracked span covers a placeholder/variable, not a version literal), so the two mechanisms agree independently rather than one depending on the other.
+
+### CodeLens: "Update N Outdated Dependencies"
+
+An open manifest with at least one outdated, safely-editable dependency shows a code lens at
+the top of the document, titled `Update N outdated dependencies`. Clicking it applies a
+single batch edit that rewrites every such dependency's version to the latest known
+version, sharing the same "is this outdated" definition as diagnostics (a requirement
+already satisfied by the latest version — e.g. Cargo's `^1.2` accepting `1.9` — is left
+alone; that lag is the lock file's, not the manifest's, to fix).
+
+**Coverage caveat.** Before rewriting a dependency's declared version text, the feature
+verifies the manifest span it is about to edit actually *is* that version literal. Some
+ecosystems point the tracked span at something else instead:
+
+- **`pom.xml`** dependencies versioned through a `<properties>` placeholder (`<version>${my.version}</version>`) are skipped — the span covers the placeholder, not a literal.
+- **Gradle** dependencies versioned through a DSL variable (`"...:$myVersion"`, resolved from `gradle.properties`) or a `libs.versions.toml` version-catalog alias (`version.ref = "spring"`) are skipped for the same reason.
+- **`Package.swift`** dependencies are always skipped, for every declaration form (`from:`, `.upToNextMajor`, `.exact`, a `..<`/`...` range, `.branch`, `.revision`) — the tracked span is only ever the lower-bound literal of a synthesized comparator range, never the full requirement.
+
+For these, no lens appears even when the dependency is genuinely outdated — this is the
+correct, conservative behavior (silently declining to edit is far better than corrupting a
+build file), not a bug.
+
+> [!WARNING]
+> The per-line "Update to latest version" code action does **not** have this guard yet —
+> for these same declarations, it currently applies the edit anyway, which corrupts the
+> property reference, DSL variable, catalog alias, or Swift comparator range it targets.
+> Until that is fixed, edit these specific declarations by hand rather than through the
+> code action. Lifting the restriction requires moving the same check into each
+> affected parser, which fixes both surfaces at once and is tracked as a follow-up, out
+> of scope for the initial CodeLens implementation.
+
+**Known divergence from inlay hints (accepted, documented).** Inlay hints use a
+lock-file-aware "outdated" check (resolved version vs. latest), while the lens and
+diagnostics use the manifest-requirement check described above. With a lagging lock file
+and a requirement permissive enough to already accept the latest version, inlay hints can
+render `❌ <version>` on a dependency with no matching diagnostic and no lens — the fix
+in that case is regenerating the lock file, which only the package manager can do, so
+there is nothing for the lens to edit. Unifying the two definitions is tracked as a
+follow-up.
 
 ### npm Package Name Validation
 

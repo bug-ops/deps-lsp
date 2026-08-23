@@ -34,6 +34,8 @@ pub struct DepsConfig {
     pub cold_start: ColdStartConfig,
     #[serde(default)]
     pub loading_indicator: LoadingIndicatorConfig,
+    #[serde(default)]
+    pub code_lens: CodeLensConfig,
 }
 
 /// Configuration for inlay hints (inline version annotations).
@@ -384,6 +386,35 @@ const fn default_rate_limit_ms() -> u64 {
     100 // 10 req/sec per URI
 }
 
+/// Configuration for the "Update N outdated dependencies" code lens.
+///
+/// # Defaults
+///
+/// - `enabled`: `true`
+///
+/// # Examples
+///
+/// ```
+/// use deps_lsp::config::CodeLensConfig;
+///
+/// let config = CodeLensConfig::default();
+/// assert!(config.enabled);
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct CodeLensConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+// Deliberately hand-written rather than `#[derive(Default)]`: `DepsConfig` derives
+// `Default` for its own `code_lens` field, so a derived `Default` here (`enabled: false`)
+// would silently ship the feature disabled.
+impl Default for CodeLensConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,5 +706,32 @@ mod tests {
             config.max_concurrent_fetches, 50,
             "Valid value should not be clamped"
         );
+    }
+
+    #[test]
+    fn test_code_lens_config_defaults() {
+        let config = CodeLensConfig::default();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_code_lens_config_deserialization() {
+        let json = r#"{"enabled": false}"#;
+        let config: CodeLensConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    fn test_code_lens_config_empty_object_defaults_to_enabled() {
+        let config: CodeLensConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_deps_config_default_has_code_lens_enabled() {
+        // Regression guard: DepsConfig derives Default, which would silently produce
+        // `enabled: false` if CodeLensConfig ever switched to a derived Default.
+        let config = DepsConfig::default();
+        assert!(config.code_lens.enabled);
     }
 }
