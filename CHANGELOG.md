@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused `async-trait` workspace dependency from root `Cargo.toml` and 10 crate manifests (never invoked via `#[async_trait]`; native async traits used throughout) (#159)
 
+### Changed
+- Converted `PypiRegistry::search`, `GoEcosystem::complete_package_names`, `GoEcosystem::complete_features`, and `Backend::shutdown` from `async fn` to `fn` returning `impl Future` directly, satisfying clippy's `unused_async_trait_impl` lint (no `.await` in any of these bodies); behavior is unchanged
+
 ## [0.10.1] - 2026-08-20
 
 ### Removed

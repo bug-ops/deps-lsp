@@ -14,6 +14,7 @@ use deps_core::{DepsError, HttpCache, Result};
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
 use std::any::Any;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -240,10 +241,14 @@ impl PypiRegistry {
     /// // Currently returns empty, to be implemented
     /// # }
     /// ```
-    pub async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<PypiPackage>> {
+    pub fn search(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> impl Future<Output = Result<Vec<PypiPackage>>> {
         // TODO: Implement search using third-party API or scraping
         // PyPI deprecated their XML-RPC search API
-        Ok(Vec::new())
+        std::future::ready(Ok(Vec::new()))
     }
 
     /// Fetches package metadata including description and project URLs.
