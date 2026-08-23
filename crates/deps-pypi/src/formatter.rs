@@ -1,4 +1,5 @@
 use deps_core::Dependency;
+use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 use pep440_rs::{Version, VersionSpecifiers};
 use std::str::FromStr;
@@ -7,7 +8,8 @@ use tower_lsp_server::ls_types::Position;
 pub struct PypiFormatter;
 
 impl EcosystemFormatter for PypiFormatter {
-    fn normalize_package_name(&self, name: &str) -> String {
+    fn normalize_package_name(&self, name: &PackageName) -> String {
+        let name = name.as_str();
         if !name.chars().any(|c| c.is_uppercase() || c == '-') {
             return name.to_string();
         }
@@ -37,8 +39,8 @@ impl EcosystemFormatter for PypiFormatter {
         specs.contains(&ver)
     }
 
-    fn package_url(&self, name: &str) -> String {
-        crate::registry::package_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
     }
 
     fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
@@ -66,12 +68,18 @@ mod tests {
     #[test]
     fn test_normalize_package_name() {
         let formatter = PypiFormatter;
-        assert_eq!(formatter.normalize_package_name("requests"), "requests");
         assert_eq!(
-            formatter.normalize_package_name("Django-REST-Framework"),
+            formatter.normalize_package_name(&PackageName::new("requests")),
+            "requests"
+        );
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("Django-REST-Framework")),
             "django_rest_framework"
         );
-        assert_eq!(formatter.normalize_package_name("My-Package"), "my_package");
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("My-Package")),
+            "my_package"
+        );
     }
 
     #[test]
@@ -105,11 +113,11 @@ mod tests {
     fn test_package_url() {
         let formatter = PypiFormatter;
         assert_eq!(
-            formatter.package_url("requests"),
+            formatter.package_url(&PackageName::new("requests")),
             "https://pypi.org/project/requests"
         );
         assert_eq!(
-            formatter.package_url("django"),
+            formatter.package_url(&PackageName::new("django")),
             "https://pypi.org/project/django"
         );
     }
@@ -150,9 +158,18 @@ mod tests {
     fn test_normalize_fast_path() {
         let formatter = PypiFormatter;
         // Already lowercase, no hyphens - should hit fast path
-        assert_eq!(formatter.normalize_package_name("requests"), "requests");
-        assert_eq!(formatter.normalize_package_name("flask"), "flask");
-        assert_eq!(formatter.normalize_package_name("numpy"), "numpy");
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("requests")),
+            "requests"
+        );
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("flask")),
+            "flask"
+        );
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("numpy")),
+            "numpy"
+        );
     }
 
     mod is_position_on_dependency_tests {

@@ -133,7 +133,7 @@ macro_rules! impl_version {
 /// # Arguments
 ///
 /// * `$type` - The struct type name
-/// * `name` - Field name for package name (`String`)
+/// * `name` - Field name for package name (`PackageName`)
 /// * `description` - Field name for description (`Option<String>`)
 /// * `repository` - Field name for repository (`Option<String>`)
 /// * `documentation` - Field name for documentation URL (`Option<String>`)
@@ -142,10 +142,10 @@ macro_rules! impl_version {
 /// # Examples
 ///
 /// ```ignore
-/// use deps_core::impl_metadata;
+/// use deps_core::{PackageName, impl_metadata};
 ///
 /// pub struct MyPackage {
-///     pub name: String,
+///     pub name: PackageName,
 ///     pub description: Option<String>,
 ///     pub repository: Option<String>,
 ///     pub homepage: Option<String>,
@@ -170,7 +170,7 @@ macro_rules! impl_metadata {
         latest_version: $latest_version:ident $(,)?
     }) => {
         impl $crate::registry::Metadata for $type {
-            fn name(&self) -> &str {
+            fn name(&self) -> &$crate::PackageName {
                 &self.$name
             }
 
@@ -305,7 +305,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct TestPackage {
-        name: String,
+        name: crate::PackageName,
         description: Option<String>,
         repository: Option<String>,
         homepage: Option<String>,
@@ -385,7 +385,7 @@ mod tests {
         use crate::registry::Metadata;
 
         let pkg = TestPackage {
-            name: "my-pkg".into(),
+            name: crate::PackageName::new("my-pkg"),
             description: Some("A test package".into()),
             repository: Some("user/repo".into()),
             homepage: Some("https://example.com".into()),

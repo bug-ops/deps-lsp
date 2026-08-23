@@ -403,11 +403,11 @@ fn parse_version_info(module_path: &str, data: &[u8]) -> Result<GoVersion> {
 impl deps_core::Registry for GoRegistry {
     fn get_versions<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a deps_core::PackageName,
     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Version>>>>
     {
         Box::pin(async move {
-            let versions = self.get_versions(name).await?;
+            let versions = self.get_versions(name.as_str()).await?;
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -417,17 +417,17 @@ impl deps_core::Registry for GoRegistry {
 
     fn get_latest_matching<'a>(
         &'a self,
-        name: &'a str,
-        _req: &'a str,
+        name: &'a deps_core::PackageName,
+        _req: &'a deps_core::VersionReq,
     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn deps_core::Version>>>>
     {
         Box::pin(async move {
             // Try /@latest first (fast path)
-            if let Ok(version) = self.get_latest(name).await {
+            if let Ok(version) = self.get_latest(name.as_str()).await {
                 return Ok(Some(Box::new(version) as Box<dyn deps_core::Version>));
             }
             // Fallback to /@v/list (/@latest is optional per Go proxy spec)
-            let versions = self.get_versions(name).await?;
+            let versions = self.get_versions(name.as_str()).await?;
             let latest = versions.into_iter().find(|v| !v.is_pseudo && !v.retracted);
             Ok(latest.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
@@ -443,8 +443,8 @@ impl deps_core::Registry for GoRegistry {
         Box::pin(async move { Ok(vec![]) })
     }
 
-    fn package_url(&self, name: &str) -> String {
-        package_url(name)
+    fn package_url(&self, name: &deps_core::PackageName) -> String {
+        package_url(name.as_str())
     }
 
     fn as_any(&self) -> &dyn Any {

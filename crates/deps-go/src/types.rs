@@ -51,7 +51,7 @@ pub struct GoVersion {
 #[derive(Debug, Clone)]
 pub struct GoMetadata {
     /// Module path
-    pub module_path: String,
+    pub module_path: deps_core::PackageName,
     /// Latest stable version
     pub latest_version: String,
     /// Description (if available from go.mod or README)

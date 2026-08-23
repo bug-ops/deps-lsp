@@ -113,7 +113,7 @@ pub struct CargoVersion {
 /// use deps_cargo::types::CrateInfo;
 ///
 /// let info = CrateInfo {
-///     name: "serde".into(),
+///     name: deps_core::PackageName::new("serde"),
 ///     description: Some("A serialization framework".into()),
 ///     repository: Some("https://github.com/serde-rs/serde".into()),
 ///     documentation: Some("https://docs.rs/serde".into()),
@@ -124,7 +124,7 @@ pub struct CargoVersion {
 /// ```
 #[derive(Debug, Clone)]
 pub struct CrateInfo {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub description: Option<String>,
     pub repository: Option<String>,
     pub documentation: Option<String>,
@@ -186,7 +186,7 @@ impl deps_core::Version for CargoVersion {
 }
 
 impl deps_core::Metadata for CrateInfo {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 

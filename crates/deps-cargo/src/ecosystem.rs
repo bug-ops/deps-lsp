@@ -43,7 +43,11 @@ impl CargoEcosystem {
             .await
     }
 
-    async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
+    async fn complete_versions(
+        &self,
+        package_name: &deps_core::PackageName,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
@@ -56,11 +60,15 @@ impl CargoEcosystem {
     /// Completes feature flags for a specific package.
     ///
     /// Fetches features from the latest stable version.
-    async fn complete_features(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
+    async fn complete_features(
+        &self,
+        package_name: &deps_core::PackageName,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
         use deps_core::completion::build_feature_completion;
 
         // Fetch all versions to find latest stable
-        let versions = match self.registry.get_versions(package_name).await {
+        let versions = match self.registry.get_versions(package_name.as_str()).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
@@ -168,6 +176,10 @@ mod tests {
     use deps_core::{EcosystemConfig, VersionData};
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
+
+    fn pkg(s: &str) -> deps_core::PackageName {
+        deps_core::PackageName::new(s)
+    }
 
     /// Mock dependency for testing
     fn mock_dependency(
@@ -504,7 +516,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions("serde", "1.0").await;
+        let results = ecosystem.complete_versions(&pkg("serde"), "1.0").await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("1.0")));
     }
@@ -515,7 +527,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions("serde", "^1.0").await;
+        let results = ecosystem.complete_versions(&pkg("serde"), "^1.0").await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("1.0")));
     }
@@ -526,7 +538,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        let results = ecosystem.complete_features("serde", "").await;
+        let results = ecosystem.complete_features(&pkg("serde"), "").await;
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.label == "derive"));
     }
@@ -537,7 +549,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
-        let results = ecosystem.complete_features("serde", "der").await;
+        let results = ecosystem.complete_features(&pkg("serde"), "der").await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("der")));
     }
@@ -549,7 +561,7 @@ mod tests {
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
-            .complete_versions("this-package-does-not-exist-12345", "1.0")
+            .complete_versions(&pkg("this-package-does-not-exist-12345"), "1.0")
             .await;
         assert!(results.is_empty());
     }
@@ -561,7 +573,7 @@ mod tests {
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
-            .complete_features("this-package-does-not-exist-12345", "")
+            .complete_features(&pkg("this-package-does-not-exist-12345"), "")
             .await;
         assert!(results.is_empty());
     }
@@ -601,7 +613,7 @@ mod tests {
         let ecosystem = CargoEcosystem::new(cache);
 
         // Test that we respect the 20 result limit
-        let results = ecosystem.complete_versions("serde", "1").await;
+        let results = ecosystem.complete_versions(&pkg("serde"), "1").await;
         assert!(results.len() <= 20);
     }
 
@@ -613,7 +625,9 @@ mod tests {
 
         // Some packages have no features - should handle gracefully
         // (Using a package that likely has no features, or empty prefix on a small package)
-        let results = ecosystem.complete_features("anyhow", "nonexistent").await;
+        let results = ecosystem
+            .complete_features(&pkg("anyhow"), "nonexistent")
+            .await;
         assert!(results.is_empty());
     }
 

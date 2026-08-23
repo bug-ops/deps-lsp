@@ -76,7 +76,7 @@ impl deps_core::Version for NuGetVersion {
 /// Package metadata from a NuGet search result.
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub description: Option<String>,
     pub repository: Option<String>,
     pub documentation: Option<String>,

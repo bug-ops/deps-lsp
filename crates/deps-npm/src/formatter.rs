@@ -1,5 +1,5 @@
-use deps_core::InvalidPackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::{InvalidPackageName, PackageName};
 
 /// Maximum name length npm's registry accepts.
 ///
@@ -32,8 +32,8 @@ impl EcosystemFormatter for NpmFormatter {
         version.to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        crate::registry::package_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
     }
 
     fn yanked_message(&self) -> &'static str {
@@ -223,11 +223,11 @@ mod tests {
     fn test_package_url() {
         let formatter = NpmFormatter;
         assert_eq!(
-            formatter.package_url("react"),
+            formatter.package_url(&PackageName::new("react")),
             "https://www.npmjs.com/package/react"
         );
         assert_eq!(
-            formatter.package_url("@types/node"),
+            formatter.package_url(&PackageName::new("@types/node")),
             "https://www.npmjs.com/package/@types/node"
         );
     }
@@ -235,9 +235,12 @@ mod tests {
     #[test]
     fn test_default_normalize_is_identity() {
         let formatter = NpmFormatter;
-        assert_eq!(formatter.normalize_package_name("react"), "react");
         assert_eq!(
-            formatter.normalize_package_name("@types/node"),
+            formatter.normalize_package_name(&PackageName::new("react")),
+            "react"
+        );
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("@types/node")),
             "@types/node"
         );
     }

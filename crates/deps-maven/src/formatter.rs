@@ -1,8 +1,14 @@
 //! Version formatting for Maven ecosystem.
 
 use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::{PackageName, VersionReq};
 
 pub struct MavenFormatter;
+
+/// Unexpanded property (missing from `<properties>`).
+fn is_unresolved(requirement: &str) -> bool {
+    requirement.contains("${")
+}
 
 impl EcosystemFormatter for MavenFormatter {
     fn format_version_for_text_edit(&self, version: &str) -> String {
@@ -10,13 +16,13 @@ impl EcosystemFormatter for MavenFormatter {
         version.to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        crate::registry::package_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
         // Unresolved properties (missing from <properties>) — skip comparison
-        if self.requirement_is_unresolved(requirement) {
+        if is_unresolved(requirement) {
             return true;
         }
         if crate::range::is_range(requirement) {
@@ -25,9 +31,8 @@ impl EcosystemFormatter for MavenFormatter {
         version == requirement
     }
 
-    fn requirement_is_unresolved(&self, requirement: &str) -> bool {
-        // Unexpanded property (missing from <properties>)
-        requirement.contains("${")
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        is_unresolved(requirement.as_str())
     }
 }
 
@@ -50,7 +55,7 @@ mod tests {
     fn test_package_url() {
         let f = MavenFormatter;
         assert_eq!(
-            f.package_url("org.apache.commons:commons-lang3"),
+            f.package_url(&PackageName::new("org.apache.commons:commons-lang3")),
             "https://central.sonatype.com/artifact/org.apache.commons/commons-lang3"
         );
     }
@@ -84,7 +89,7 @@ mod tests {
     fn test_normalize_is_identity() {
         let f = MavenFormatter;
         assert_eq!(
-            f.normalize_package_name("org.apache.commons:commons-lang3"),
+            f.normalize_package_name(&PackageName::new("org.apache.commons:commons-lang3")),
             "org.apache.commons:commons-lang3"
         );
     }
@@ -93,11 +98,11 @@ mod tests {
     fn test_requirement_status_unresolved_property() {
         let f = MavenFormatter;
         assert_eq!(
-            f.requirement_status("${woodstoxVersion}", "7.1.1"),
+            f.requirement_status(&VersionReq::new("${woodstoxVersion}"), "7.1.1"),
             RequirementStatus::Unresolved
         );
         assert_eq!(
-            f.requirement_status("${project.version}", "1.0.0"),
+            f.requirement_status(&VersionReq::new("${project.version}"), "1.0.0"),
             RequirementStatus::Unresolved
         );
     }
@@ -106,7 +111,7 @@ mod tests {
     fn test_requirement_status_up_to_date() {
         let f = MavenFormatter;
         assert_eq!(
-            f.requirement_status("3.14.0", "3.14.0"),
+            f.requirement_status(&VersionReq::new("3.14.0"), "3.14.0"),
             RequirementStatus::UpToDate
         );
     }
@@ -115,7 +120,7 @@ mod tests {
     fn test_requirement_status_outdated() {
         let f = MavenFormatter;
         assert_eq!(
-            f.requirement_status("3.13.0", "3.14.0"),
+            f.requirement_status(&VersionReq::new("3.13.0"), "3.14.0"),
             RequirementStatus::Outdated
         );
     }

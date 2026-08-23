@@ -1,5 +1,6 @@
 //! Swift ecosystem formatter.
 
+use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 
 /// Returns `true` if `name` matches the `owner/repo` GitHub identifier pattern.
@@ -19,16 +20,16 @@ impl EcosystemFormatter for SwiftFormatter {
         version.to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        if is_valid_owner_repo(name) {
+    fn package_url(&self, name: &PackageName) -> String {
+        if is_valid_owner_repo(name.as_str()) {
             format!("https://github.com/{name}")
         } else {
             String::new()
         }
     }
 
-    fn normalize_package_name(&self, name: &str) -> String {
-        name.to_lowercase()
+    fn normalize_package_name(&self, name: &PackageName) -> String {
+        name.as_str().to_lowercase()
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -64,7 +65,7 @@ mod tests {
     fn test_package_url() {
         let fmt = SwiftFormatter;
         assert_eq!(
-            fmt.package_url("apple/swift-nio"),
+            fmt.package_url(&PackageName::new("apple/swift-nio")),
             "https://github.com/apple/swift-nio"
         );
     }
@@ -72,16 +73,16 @@ mod tests {
     #[test]
     fn test_package_url_invalid_returns_empty() {
         let fmt = SwiftFormatter;
-        assert_eq!(fmt.package_url("../../etc/passwd"), "");
-        assert_eq!(fmt.package_url("no-slash"), "");
-        assert_eq!(fmt.package_url("owner/repo/extra"), "");
+        assert_eq!(fmt.package_url(&PackageName::new("../../etc/passwd")), "");
+        assert_eq!(fmt.package_url(&PackageName::new("no-slash")), "");
+        assert_eq!(fmt.package_url(&PackageName::new("owner/repo/extra")), "");
     }
 
     #[test]
     fn test_normalize_package_name() {
         let fmt = SwiftFormatter;
         assert_eq!(
-            fmt.normalize_package_name("Apple/Swift-NIO"),
+            fmt.normalize_package_name(&PackageName::new("Apple/Swift-NIO")),
             "apple/swift-nio"
         );
     }

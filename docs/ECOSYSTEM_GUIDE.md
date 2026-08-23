@@ -251,11 +251,11 @@ pub use deps_core::parser::DependencySource;
 #[derive(Debug, Clone)]
 pub struct {Ecosystem}Dependency {
     /// Package name
-    pub name: String,
+    pub name: deps_core::PackageName,
     /// LSP range of the name in source
     pub name_range: Range,
     /// Version requirement (e.g., "^1.0", ">=2.0")
-    pub version_req: Option<String>,
+    pub version_req: Option<deps_core::VersionReq>,
     /// LSP range of version in source
     pub version_range: Option<Range>,
     /// Dependency source (registry, git, path)
@@ -282,7 +282,7 @@ pub struct {Ecosystem}Version {
 
 // Implement deps_core traits
 impl deps_core::Dependency for {Ecosystem}Dependency {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 
@@ -290,8 +290,8 @@ impl deps_core::Dependency for {Ecosystem}Dependency {
         self.name_range
     }
 
-    fn version_requirement(&self) -> Option<&str> {
-        self.version_req.as_deref()
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
     }
 
     fn version_range(&self) -> Option<Range> {
@@ -436,14 +436,16 @@ impl {Ecosystem}Registry {
     }
 }
 
-// Implement deps_core::Registry trait using BoxFuture (no async_trait)
+// Implement deps_core::Registry trait using BoxFuture (no async_trait).
+// The trait takes PackageName/VersionReq; the inherent methods above stay
+// &str, so each forward converts with .as_str().
 impl deps_core::Registry for {Ecosystem}Registry {
     fn get_versions<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a deps_core::PackageName,
     ) -> BoxFuture<'a, deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            let versions = self.get_versions(name).await?;
+            let versions = self.get_versions(name.as_str()).await?;
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -453,11 +455,11 @@ impl deps_core::Registry for {Ecosystem}Registry {
 
     fn get_latest_matching<'a>(
         &'a self,
-        name: &'a str,
-        req: &'a str,
+        name: &'a deps_core::PackageName,
+        req: &'a deps_core::VersionReq,
     ) -> BoxFuture<'a, deps_core::error::Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            let version = self.get_latest_matching(name, req).await?;
+            let version = self.get_latest_matching(name.as_str(), req.as_str()).await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
     }
@@ -470,8 +472,8 @@ impl deps_core::Registry for {Ecosystem}Registry {
         Box::pin(async move { Ok(vec![]) })
     }
 
-    fn package_url(&self, name: &str) -> String {
-        format!("{}/{}", REGISTRY_URL, urlencoding::encode(name))
+    fn package_url(&self, name: &deps_core::PackageName) -> String {
+        format!("{}/{}", REGISTRY_URL, urlencoding::encode(name.as_str()))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -641,7 +643,7 @@ impl EcosystemFormatter for {Ecosystem}Formatter {
         format!("\"{}\"", version)
     }
 
-    fn package_url(&self, name: &str) -> String {
+    fn package_url(&self, name: &deps_core::PackageName) -> String {
         format!("https://registry.example.com/packages/{}", name)
     }
 

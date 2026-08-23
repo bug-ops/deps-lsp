@@ -1,6 +1,7 @@
 //! Version formatting for Bundler ecosystem.
 
 use crate::version::version_matches_requirement;
+use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 
 /// Formatter for Bundler/Ruby gem versions.
@@ -11,8 +12,8 @@ impl EcosystemFormatter for BundlerFormatter {
         version.to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        crate::registry::gem_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::gem_url(name.as_str())
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -35,11 +36,11 @@ mod tests {
     fn test_package_url() {
         let formatter = BundlerFormatter;
         assert_eq!(
-            formatter.package_url("rails"),
+            formatter.package_url(&PackageName::new("rails")),
             "https://rubygems.org/gems/rails"
         );
         assert_eq!(
-            formatter.package_url("nokogiri"),
+            formatter.package_url(&PackageName::new("nokogiri")),
             "https://rubygems.org/gems/nokogiri"
         );
     }
@@ -98,9 +99,12 @@ mod tests {
     #[test]
     fn test_default_normalize_is_identity() {
         let formatter = BundlerFormatter;
-        assert_eq!(formatter.normalize_package_name("rails"), "rails");
         assert_eq!(
-            formatter.normalize_package_name("rspec-rails"),
+            formatter.normalize_package_name(&PackageName::new("rails")),
+            "rails"
+        );
+        assert_eq!(
+            formatter.normalize_package_name(&PackageName::new("rspec-rails")),
             "rspec-rails"
         );
     }

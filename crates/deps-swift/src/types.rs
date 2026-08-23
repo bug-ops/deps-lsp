@@ -67,7 +67,7 @@ deps_core::impl_version!(SwiftVersion {
 #[derive(Debug, Clone)]
 pub struct SwiftPackage {
     /// owner/repo identity
-    pub name: String,
+    pub name: deps_core::PackageName,
     /// GitHub repo description
     pub description: Option<String>,
     /// GitHub URL

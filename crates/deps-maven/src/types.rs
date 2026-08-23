@@ -52,7 +52,7 @@ pub struct ArtifactInfo {
     pub group_id: String,
     pub artifact_id: String,
     /// "{groupId}:{artifactId}"
-    pub name: String,
+    pub name: deps_core::PackageName,
     pub description: Option<String>,
     pub latest_version: String,
     pub repository: Option<String>,
@@ -114,7 +114,7 @@ impl deps_core::Version for MavenVersion {
 }
 
 impl deps_core::Metadata for ArtifactInfo {
-    fn name(&self) -> &str {
+    fn name(&self) -> &deps_core::PackageName {
         &self.name
     }
 
@@ -282,7 +282,7 @@ mod tests {
         let info = ArtifactInfo {
             group_id: "org.apache.commons".into(),
             artifact_id: "commons-lang3".into(),
-            name: "org.apache.commons:commons-lang3".into(),
+            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
             description: Some("Apache Commons Lang".into()),
             latest_version: "3.14.0".into(),
             repository: None,

@@ -41,7 +41,7 @@
 //! ```
 
 use crate::lsp_helpers::escape_markdown;
-use crate::{Metadata, ParseResult, Version};
+use crate::{Metadata, PackageName, ParseResult, Version};
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Documentation, MarkupContent,
     MarkupKind, Position, Range, TextEdit,
@@ -66,7 +66,7 @@ pub enum CompletionContext {
     /// Example: `"1.0|"` or `"^2.|"` where | represents cursor position.
     Version {
         /// Package name this version belongs to.
-        package_name: String,
+        package_name: PackageName,
         /// Partial version typed so far (may include operators like ^, ~).
         prefix: String,
     },
@@ -76,7 +76,7 @@ pub enum CompletionContext {
     /// Example: `features = ["deri|"]` where | represents cursor position.
     Feature {
         /// Package name whose features are being completed.
-        package_name: String,
+        package_name: PackageName,
         /// Partial feature name typed so far (may be empty).
         prefix: String,
     },
@@ -134,7 +134,7 @@ pub fn detect_completion_context(
         {
             let prefix = extract_prefix(content, position, version_range);
             return CompletionContext::Version {
-                package_name: dep.name().to_string(),
+                package_name: dep.name().clone(),
                 prefix,
             };
         }
@@ -145,7 +145,7 @@ pub fn detect_completion_context(
         {
             let prefix = extract_feature_prefix(content, position);
             return CompletionContext::Feature {
-                package_name: dep.name().to_string(),
+                package_name: dep.name().clone(),
                 prefix,
             };
         }
@@ -372,7 +372,7 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 /// # async fn example(metadata: &dyn deps_core::Metadata) {
 /// let range = Range::default(); // Use actual range from context
 /// let item = build_package_completion(metadata, range);
-/// assert_eq!(item.label, metadata.name());
+/// assert_eq!(item.label, metadata.name().as_str());
 /// # }
 /// ```
 pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) -> CompletionItem {
@@ -382,7 +382,7 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
     // Build markdown documentation
     let mut doc_parts = vec![format!(
         "**{}** v{}",
-        escape_markdown(name),
+        escape_markdown(name.as_str()),
         escape_markdown(latest)
     )];
 
@@ -458,11 +458,12 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
 ///
 /// ```no_run
 /// use deps_core::completion::{build_version_completion, VersionDisplayItem};
+/// use deps_core::PackageName;
 /// use tower_lsp_server::ls_types::Range;
 ///
 /// # async fn example(version: &dyn deps_core::Version) {
 /// // Without range - insert at cursor
-/// let display_item = VersionDisplayItem::new(version, "serde", 0, true);
+/// let display_item = VersionDisplayItem::new(version, &PackageName::new("serde"), 0, true);
 /// let item = build_version_completion(&display_item, None);
 /// assert_eq!(item.label, display_item.label);
 ///
@@ -515,7 +516,12 @@ pub struct VersionDisplayItem {
 
 impl VersionDisplayItem {
     /// Creates a display item from version metadata.
-    pub fn new(version: &dyn Version, package_name: &str, index: usize, is_latest: bool) -> Self {
+    pub fn new(
+        version: &dyn Version,
+        package_name: &PackageName,
+        index: usize,
+        is_latest: bool,
+    ) -> Self {
         let version_str = version.version_string();
         let label = if is_latest {
             format!("{} (latest)", version_str)
@@ -539,7 +545,7 @@ impl VersionDisplayItem {
 /// Returns up to 5 non-yanked versions with display metadata.
 pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
     versions: &[V],
-    package_name: &str,
+    package_name: &PackageName,
 ) -> Vec<VersionDisplayItem> {
     versions
         .iter()
@@ -572,12 +578,12 @@ pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
 /// ```no_run
 /// use deps_core::completion::build_feature_completion;
 ///
-/// let item = build_feature_completion("derive", "serde", None);
+/// let item = build_feature_completion("derive", &deps_core::PackageName::new("serde"), None);
 /// assert_eq!(item.label, "derive");
 /// ```
 pub fn build_feature_completion(
     feature_name: &str,
-    package_name: &str,
+    package_name: &PackageName,
     insert_range: Option<Range>,
 ) -> CompletionItem {
     CompletionItem {
@@ -622,12 +628,13 @@ const MAX_COMPLETION_VERSIONS: usize = 5;
 ///
 /// ```no_run
 /// use deps_core::completion::complete_versions_generic;
+/// use deps_core::PackageName;
 ///
 /// # async fn example(registry: &dyn deps_core::Registry) {
 /// // Cargo: strip ^, ~, =, <, > operators
 /// let items = complete_versions_generic(
 ///     registry,
-///     "serde",
+///     &PackageName::new("serde"),
 ///     "^1.0",
 ///     &['^', '~', '=', '<', '>'],
 /// ).await;
@@ -635,7 +642,7 @@ const MAX_COMPLETION_VERSIONS: usize = 5;
 /// // Go: no operators to strip
 /// let items = complete_versions_generic(
 ///     registry,
-///     "github.com/gin-gonic/gin",
+///     &PackageName::new("github.com/gin-gonic/gin"),
 ///     "v1.9",
 ///     &[],
 /// ).await;
@@ -673,7 +680,7 @@ pub async fn complete_package_names_generic(
 
 pub async fn complete_versions_generic(
     registry: &dyn crate::Registry,
-    package_name: &str,
+    package_name: &PackageName,
     prefix: &str,
     operator_chars: &[char],
 ) -> Vec<CompletionItem> {
@@ -711,6 +718,10 @@ pub async fn complete_versions_generic(
 mod tests {
     use super::*;
     use std::any::Any;
+
+    fn pkg(s: &str) -> PackageName {
+        PackageName::new(s)
+    }
 
     // Mock implementations for testing
 
@@ -805,7 +816,7 @@ mod tests {
     }
 
     struct MockMetadata {
-        name: String,
+        name: crate::PackageName,
         description: Option<String>,
         repository: Option<String>,
         documentation: Option<String>,
@@ -813,7 +824,7 @@ mod tests {
     }
 
     impl crate::registry::Metadata for MockMetadata {
-        fn name(&self) -> &str {
+        fn name(&self) -> &crate::PackageName {
             &self.name
         }
 
@@ -845,7 +856,7 @@ mod tests {
     impl crate::Registry for MockRegistry {
         fn get_versions<'a>(
             &'a self,
-            _package_name: &'a str,
+            _package_name: &'a crate::PackageName,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
         {
             let versions: Vec<Box<dyn crate::Version>> = self
@@ -864,8 +875,8 @@ mod tests {
 
         fn get_latest_matching<'a>(
             &'a self,
-            _name: &'a str,
-            _req: &'a str,
+            _name: &'a crate::PackageName,
+            _req: &'a crate::VersionReq,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(None) })
@@ -880,7 +891,7 @@ mod tests {
             Box::pin(async move { Ok(vec![]) })
         }
 
-        fn package_url(&self, _name: &str) -> String {
+        fn package_url(&self, _name: &crate::PackageName) -> String {
             String::new()
         }
 
@@ -1177,7 +1188,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_full() {
         let metadata = MockMetadata {
-            name: "serde".to_string(),
+            name: "serde".to_string().into(),
             description: Some("Serialization framework".to_string()),
             repository: Some("https://github.com/serde-rs/serde".to_string()),
             documentation: Some("https://docs.rs/serde".to_string()),
@@ -1206,7 +1217,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_minimal() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: None,
             repository: None,
             documentation: None,
@@ -1228,7 +1239,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_escapes_description_markdown() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some("Fast *bold* _italic_ [link](evil) `code`".to_string()),
             repository: None,
             documentation: None,
@@ -1255,7 +1266,7 @@ mod tests {
         // link early and splice in a new, attacker-controlled markdown link.
         let malicious_repo = "https://legit.example)[Click here](https://evil.example";
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: None,
             repository: Some(malicious_repo.to_string()),
             documentation: None,
@@ -1277,7 +1288,7 @@ mod tests {
     fn test_build_package_completion_escapes_documentation_link_breakout() {
         let malicious_docs = "https://legit.example)[Click here](https://evil.example";
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: None,
             repository: None,
             documentation: Some(malicious_docs.to_string()),
@@ -1306,7 +1317,7 @@ mod tests {
         desc.push_str(&"b".repeat(50));
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(desc),
             repository: None,
             documentation: None,
@@ -1338,7 +1349,7 @@ mod tests {
         let malicious_name = "a** [Official Download](https://evil.example) **b";
         let malicious_latest = "1.0.0)[click](https://evil.example";
         let metadata = MockMetadata {
-            name: malicious_name.to_string(),
+            name: malicious_name.to_string().into(),
             description: None,
             repository: None,
             documentation: None,
@@ -1376,7 +1387,7 @@ mod tests {
         // strips the backslash for the literal character), so a normal URL must still
         // render as the same, unmangled link once those escapes are stripped.
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: None,
             repository: Some("https://github.com/owner/repo".to_string()),
             documentation: None,
@@ -1397,7 +1408,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_escapes_html_in_description() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some("<img src=x onerror=alert(1)>".to_string()),
             repository: None,
             documentation: None,
@@ -1422,7 +1433,7 @@ mod tests {
     #[test]
     fn test_build_package_completion_empty_description() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(String::new()),
             repository: None,
             documentation: None,
@@ -1452,7 +1463,7 @@ mod tests {
         desc.push_str(&"b".repeat(50));
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(desc),
             repository: None,
             documentation: None,
@@ -1480,7 +1491,7 @@ mod tests {
             prerelease: false,
         };
 
-        let display_item = VersionDisplayItem::new(&version, "serde", 0, false);
+        let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, false);
         let item = build_version_completion(&display_item, None);
 
         assert_eq!(item.label, "1.0.0");
@@ -1500,7 +1511,7 @@ mod tests {
             prerelease: false,
         };
 
-        let display_item = VersionDisplayItem::new(&version, "serde", 0, true);
+        let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
         let item = build_version_completion(&display_item, None);
 
         assert_eq!(item.label, "1.0.0 (latest)");
@@ -1520,7 +1531,7 @@ mod tests {
             prerelease: false,
         };
 
-        let display_item = VersionDisplayItem::new(&version, "tokio", 1, false);
+        let display_item = VersionDisplayItem::new(&version, &pkg("tokio"), 1, false);
         let item = build_version_completion(&display_item, None);
 
         assert_eq!(item.label, "0.9.0");
@@ -1549,9 +1560,9 @@ mod tests {
             prerelease: false,
         };
 
-        let display_item1 = VersionDisplayItem::new(&v1, "test", 0, true);
-        let display_item2 = VersionDisplayItem::new(&v2, "test", 1, false);
-        let display_item3 = VersionDisplayItem::new(&v3, "test", 2, false);
+        let display_item1 = VersionDisplayItem::new(&v1, &pkg("test"), 0, true);
+        let display_item2 = VersionDisplayItem::new(&v2, &pkg("test"), 1, false);
+        let display_item3 = VersionDisplayItem::new(&v3, &pkg("test"), 2, false);
         let item1 = build_version_completion(&display_item1, None);
         let item2 = build_version_completion(&display_item2, None);
         let item3 = build_version_completion(&display_item3, None);
@@ -1591,7 +1602,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(idx, v)| {
-                let display_item = VersionDisplayItem::new(v, "test", idx, idx == 0);
+                let display_item = VersionDisplayItem::new(v, &pkg("test"), idx, idx == 0);
                 build_version_completion(&display_item, None)
             })
             .collect();
@@ -1626,7 +1637,7 @@ mod tests {
                     yanked: false,
                     prerelease: false,
                 };
-                let display_item = VersionDisplayItem::new(&v, "test", idx, idx == 0);
+                let display_item = VersionDisplayItem::new(&v, &pkg("test"), idx, idx == 0);
                 build_version_completion(&display_item, None)
             })
             .collect();
@@ -1660,7 +1671,7 @@ mod tests {
             prerelease: false,
         };
 
-        let item = VersionDisplayItem::new(&version, "serde", 0, true);
+        let item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
         assert_eq!(item.version, "1.0.0");
         assert_eq!(item.label, "1.0.0 (latest)");
@@ -1677,7 +1688,7 @@ mod tests {
             prerelease: false,
         };
 
-        let item = VersionDisplayItem::new(&version, "tokio", 1, false);
+        let item = VersionDisplayItem::new(&version, &pkg("tokio"), 1, false);
 
         assert_eq!(item.version, "0.9.0");
         assert_eq!(item.label, "0.9.0");
@@ -1706,7 +1717,7 @@ mod tests {
             }),
         ];
 
-        let items = prepare_version_display_items(&versions, "test");
+        let items = prepare_version_display_items(&versions, &pkg("test"));
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].version, "1.0.0");
@@ -1729,7 +1740,7 @@ mod tests {
             })
             .collect();
 
-        let items = prepare_version_display_items(&versions, "test");
+        let items = prepare_version_display_items(&versions, &pkg("test"));
 
         assert_eq!(items.len(), 5);
         assert_eq!(items[0].version, "1.0.0");
@@ -1742,7 +1753,7 @@ mod tests {
     fn test_prepare_version_display_items_empty() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![];
 
-        let items = prepare_version_display_items(&versions, "test");
+        let items = prepare_version_display_items(&versions, &pkg("test"));
 
         assert_eq!(items.len(), 0);
     }
@@ -1762,14 +1773,14 @@ mod tests {
             }),
         ];
 
-        let items = prepare_version_display_items(&versions, "test");
+        let items = prepare_version_display_items(&versions, &pkg("test"));
 
         assert_eq!(items.len(), 0);
     }
 
     #[test]
     fn test_build_feature_completion() {
-        let item = build_feature_completion("derive", "serde", None);
+        let item = build_feature_completion("derive", &pkg("serde"), None);
 
         assert_eq!(item.label, "derive");
         assert_eq!(item.kind, Some(CompletionItemKind::PROPERTY));
@@ -1782,7 +1793,7 @@ mod tests {
     #[test]
     fn test_build_feature_completion_with_range() {
         let range = Range::default();
-        let item = build_feature_completion("derive", "serde", Some(range));
+        let item = build_feature_completion("derive", &pkg("serde"), Some(range));
 
         assert_eq!(item.label, "derive");
         assert!(item.text_edit.is_some());
@@ -1974,7 +1985,7 @@ mod tests {
     fn test_build_package_completion_long_description_ascii() {
         let long_desc = "a".repeat(250);
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(long_desc),
             repository: None,
             documentation: None,
@@ -2004,7 +2015,7 @@ mod tests {
         }
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(long_desc),
             repository: None,
             documentation: None,
@@ -2032,7 +2043,7 @@ mod tests {
         let long_desc = "😀".repeat(51);
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string(),
+            name: "test-pkg".to_string().into(),
             description: Some(long_desc),
             repository: None,
             documentation: None,
@@ -2129,9 +2140,13 @@ mod tests {
         };
 
         // Test with Cargo-style operators (^, ~, =, <, >)
-        let items =
-            complete_versions_generic(&registry, "test-pkg", "^1.0", &['^', '~', '=', '<', '>'])
-                .await;
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "^1.0",
+            &['^', '~', '=', '<', '>'],
+        )
+        .await;
 
         // Should return versions starting with "1.0" (after stripping ^)
         assert_eq!(items.len(), 2);
@@ -2139,25 +2154,37 @@ mod tests {
         assert_eq!(items[1].label, "1.0.1");
 
         // Test with tilde operator
-        let items =
-            complete_versions_generic(&registry, "test-pkg", "~1.1", &['^', '~', '=', '<', '>'])
-                .await;
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "~1.1",
+            &['^', '~', '=', '<', '>'],
+        )
+        .await;
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "1.1.0 (latest)");
 
         // Test with equals operator
-        let items =
-            complete_versions_generic(&registry, "test-pkg", "=2.0", &['^', '~', '=', '<', '>'])
-                .await;
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "=2.0",
+            &['^', '~', '=', '<', '>'],
+        )
+        .await;
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "2.0.0 (latest)");
 
         // Test with no operator (should work the same)
-        let items =
-            complete_versions_generic(&registry, "test-pkg", "1.0", &['^', '~', '=', '<', '>'])
-                .await;
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "1.0",
+            &['^', '~', '=', '<', '>'],
+        )
+        .await;
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "1.0.0 (latest)");
@@ -2192,9 +2219,13 @@ mod tests {
         };
 
         // Test with prefix that doesn't match any version
-        let items =
-            complete_versions_generic(&registry, "test-pkg", "3.0", &['^', '~', '=', '<', '>'])
-                .await;
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "3.0",
+            &['^', '~', '=', '<', '>'],
+        )
+        .await;
 
         // Should fallback to showing all non-yanked versions
         assert_eq!(items.len(), 3);
@@ -2206,7 +2237,7 @@ mod tests {
         assert!(!items.iter().any(|item| item.label == "2.1.0"));
 
         // Test with empty prefix (should show all non-yanked)
-        let items = complete_versions_generic(&registry, "test-pkg", "", &[]).await;
+        let items = complete_versions_generic(&registry, &pkg("test-pkg"), "", &[]).await;
 
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].label, "1.0.0 (latest)");
@@ -2237,7 +2268,7 @@ mod tests {
         };
 
         // Test that yanked versions are filtered out even when prefix matches
-        let items = complete_versions_generic(&registry, "test-pkg", "1.0", &[]).await;
+        let items = complete_versions_generic(&registry, &pkg("test-pkg"), "1.0", &[]).await;
 
         // Should only include non-yanked versions
         assert_eq!(items.len(), 2);
@@ -2262,7 +2293,7 @@ mod tests {
         let registry = MockRegistry { versions };
 
         // Test that we only return 5 items
-        let items = complete_versions_generic(&registry, "test-pkg", "1.0", &[]).await;
+        let items = complete_versions_generic(&registry, &pkg("test-pkg"), "1.0", &[]).await;
 
         assert_eq!(items.len(), 5);
         assert_eq!(items[0].label, "1.0.0 (latest)");
@@ -2293,7 +2324,8 @@ mod tests {
 
         // Go has no operators, so empty array
         let items =
-            complete_versions_generic(&registry, "github.com/gin-gonic/gin", "v1.9", &[]).await;
+            complete_versions_generic(&registry, &pkg("github.com/gin-gonic/gin"), "v1.9", &[])
+                .await;
 
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "v1.9.0 (latest)");

@@ -45,7 +45,11 @@ impl PypiEcosystem {
             .await
     }
 
-    async fn complete_versions(&self, package_name: &str, prefix: &str) -> Vec<CompletionItem> {
+    async fn complete_versions(
+        &self,
+        package_name: &deps_core::PackageName,
+        prefix: &str,
+    ) -> Vec<CompletionItem> {
         deps_core::completion::complete_versions_generic(
             self.registry.as_ref(),
             package_name,
@@ -139,6 +143,10 @@ mod tests {
     use deps_core::{EcosystemConfig, VersionData};
     use std::collections::HashMap;
 
+    fn pkg(s: &str) -> deps_core::PackageName {
+        deps_core::PackageName::new(s)
+    }
+
     #[test]
     fn test_ecosystem_id() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -207,7 +215,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions("requests", "2.").await;
+        let results = ecosystem.complete_versions(&pkg("requests"), "2.").await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("2.")));
     }
@@ -218,7 +226,7 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
 
-        let results = ecosystem.complete_versions("requests", ">=2.").await;
+        let results = ecosystem.complete_versions(&pkg("requests"), ">=2.").await;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("2.")));
     }
@@ -230,7 +238,7 @@ mod tests {
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
-            .complete_versions("this-package-does-not-exist-12345", "1.0")
+            .complete_versions(&pkg("this-package-does-not-exist-12345"), "1.0")
             .await;
         assert!(results.is_empty());
     }
@@ -270,7 +278,7 @@ mod tests {
         let ecosystem = PypiEcosystem::new(cache);
 
         // Test that we respect the 20 result limit
-        let results = ecosystem.complete_versions("requests", "2").await;
+        let results = ecosystem.complete_versions(&pkg("requests"), "2").await;
         assert!(results.len() <= 20);
     }
 
@@ -512,7 +520,9 @@ dependencies = []
         let ecosystem = PypiEcosystem::new(cache);
 
         // Empty prefix should show non-yanked versions (up to 20)
-        let results = ecosystem.complete_versions("nonexistent-package", "").await;
+        let results = ecosystem
+            .complete_versions(&pkg("nonexistent-package"), "")
+            .await;
         // Should not panic, returns empty for unknown package
         assert!(results.is_empty());
     }
@@ -524,7 +534,7 @@ dependencies = []
 
         // Test PEP 440 operators are stripped correctly
         let results = ecosystem
-            .complete_versions("nonexistent-pkg", "~=2.0")
+            .complete_versions(&pkg("nonexistent-pkg"), "~=2.0")
             .await;
         assert!(results.is_empty());
     }
@@ -536,7 +546,7 @@ dependencies = []
 
         // Test != operator stripping
         let results = ecosystem
-            .complete_versions("nonexistent-pkg", "!=2.0")
+            .complete_versions(&pkg("nonexistent-pkg"), "!=2.0")
             .await;
         assert!(results.is_empty());
     }

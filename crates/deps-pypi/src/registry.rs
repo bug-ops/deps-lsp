@@ -276,13 +276,13 @@ impl PypiRegistry {
 impl deps_core::Registry for PypiRegistry {
     fn get_versions<'a>(
         &'a self,
-        name: &'a str,
+        name: &'a deps_core::PackageName,
     ) -> deps_core::ecosystem::BoxFuture<
         'a,
         deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
     > {
         Box::pin(async move {
-            let versions = Self::get_versions(self, name).await?;
+            let versions = Self::get_versions(self, name.as_str()).await?;
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -292,14 +292,14 @@ impl deps_core::Registry for PypiRegistry {
 
     fn get_latest_matching<'a>(
         &'a self,
-        name: &'a str,
-        req: &'a str,
+        name: &'a deps_core::PackageName,
+        req: &'a deps_core::VersionReq,
     ) -> deps_core::ecosystem::BoxFuture<
         'a,
         deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
     > {
         Box::pin(async move {
-            let version = Self::get_latest_matching(self, name, req).await?;
+            let version = Self::get_latest_matching(self, name.as_str(), req.as_str()).await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
     }
@@ -321,8 +321,8 @@ impl deps_core::Registry for PypiRegistry {
         })
     }
 
-    fn package_url(&self, name: &str) -> String {
-        package_url(name)
+    fn package_url(&self, name: &deps_core::PackageName) -> String {
+        package_url(name.as_str())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -550,7 +550,7 @@ fn parse_package_info(package_name: &str, data: &[u8]) -> Result<PypiPackage> {
         .collect();
 
     Ok(PypiPackage {
-        name: response.info.name,
+        name: response.info.name.into(),
         summary: response.info.summary,
         project_urls,
         latest_version: response.info.version,

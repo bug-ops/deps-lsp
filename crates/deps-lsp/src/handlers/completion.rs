@@ -954,10 +954,12 @@ requests
 
     #[test]
     fn test_create_package_completion_item_cargo() {
-        struct MockMetadata;
+        struct MockMetadata {
+            name: deps_core::PackageName,
+        }
         impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &'static str {
-                "serde"
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
             }
             fn description(&self) -> Option<&str> {
                 Some("A serialization framework")
@@ -976,7 +978,9 @@ requests
             }
         }
 
-        let meta = MockMetadata;
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("serde"),
+        };
         let item = create_package_completion_item(&meta, EcosystemId::Cargo);
 
         assert_eq!(item.label, "serde");
@@ -988,10 +992,12 @@ requests
 
     #[test]
     fn test_create_package_completion_item_npm() {
-        struct MockMetadata;
+        struct MockMetadata {
+            name: deps_core::PackageName,
+        }
         impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &'static str {
-                "express"
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
             }
             fn description(&self) -> Option<&str> {
                 Some("Fast web framework")
@@ -1010,7 +1016,9 @@ requests
             }
         }
 
-        let meta = MockMetadata;
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("express"),
+        };
         let item = create_package_completion_item(&meta, EcosystemId::Npm);
 
         assert_eq!(item.label, "express");
@@ -1022,10 +1030,12 @@ requests
 
     #[test]
     fn test_create_package_completion_item_pypi() {
-        struct MockMetadata;
+        struct MockMetadata {
+            name: deps_core::PackageName,
+        }
         impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &'static str {
-                "requests"
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
             }
             fn description(&self) -> Option<&str> {
                 None
@@ -1044,7 +1054,9 @@ requests
             }
         }
 
-        let meta = MockMetadata;
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("requests"),
+        };
         let item = create_package_completion_item(&meta, EcosystemId::Pypi);
 
         assert_eq!(item.label, "requests");
@@ -1185,10 +1197,12 @@ serde
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
 
-        struct MockMetadata;
+        struct MockMetadata {
+            name: deps_core::PackageName,
+        }
         impl Metadata for MockMetadata {
-            fn name(&self) -> &'static str {
-                "express"
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
             }
             fn description(&self) -> Option<&str> {
                 None
@@ -1211,7 +1225,7 @@ serde
         impl Registry for FastRegistry {
             fn get_versions<'a>(
                 &'a self,
-                _name: &'a str,
+                _name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
@@ -1219,8 +1233,8 @@ serde
 
             fn get_latest_matching<'a>(
                 &'a self,
-                _name: &'a str,
-                _req: &'a str,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1232,10 +1246,14 @@ serde
                 _limit: usize,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
-                Box::pin(async move { Ok(vec![Box::new(MockMetadata) as Box<dyn Metadata>]) })
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockMetadata {
+                        name: deps_core::PackageName::new("express"),
+                    }) as Box<dyn Metadata>])
+                })
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{name}")
             }
 
@@ -1260,7 +1278,7 @@ serde
         impl Registry for SlowRegistry {
             fn get_versions<'a>(
                 &'a self,
-                _name: &'a str,
+                _name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
@@ -1268,8 +1286,8 @@ serde
 
             fn get_latest_matching<'a>(
                 &'a self,
-                _name: &'a str,
-                _req: &'a str,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1289,7 +1307,7 @@ serde
                 })
             }
 
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{name}")
             }
 
@@ -1319,7 +1337,7 @@ serde
             fn format_version_for_text_edit(&self, version: &str) -> String {
                 version.to_string()
             }
-            fn package_url(&self, name: &str) -> String {
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
                 format!("https://example.com/{name}")
             }
         }

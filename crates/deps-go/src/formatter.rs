@@ -1,3 +1,4 @@
+use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 
 /// Formatter for Go module version strings and package URLs.
@@ -15,8 +16,8 @@ impl EcosystemFormatter for GoFormatter {
         version.to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        crate::registry::package_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -74,28 +75,31 @@ mod tests {
 
         // Standard package
         assert_eq!(
-            formatter.package_url("github.com/gin-gonic/gin"),
+            formatter.package_url(&PackageName::new("github.com/gin-gonic/gin")),
             "https://pkg.go.dev/github.com/gin-gonic/gin"
         );
 
         // Package with version path
         assert_eq!(
-            formatter.package_url("github.com/go-redis/redis/v8"),
+            formatter.package_url(&PackageName::new("github.com/go-redis/redis/v8")),
             "https://pkg.go.dev/github.com/go-redis/redis/v8"
         );
 
         // Standard library package
-        assert_eq!(formatter.package_url("fmt"), "https://pkg.go.dev/fmt");
+        assert_eq!(
+            formatter.package_url(&PackageName::new("fmt")),
+            "https://pkg.go.dev/fmt"
+        );
 
         // Package with @ character (should be URL encoded)
         assert_eq!(
-            formatter.package_url("github.com/user@org/package"),
+            formatter.package_url(&PackageName::new("github.com/user@org/package")),
             "https://pkg.go.dev/github.com/user%40org/package"
         );
 
         // Package with space (should be URL encoded)
         assert_eq!(
-            formatter.package_url("github.com/user/pkg name"),
+            formatter.package_url(&PackageName::new("github.com/user/pkg name")),
             "https://pkg.go.dev/github.com/user/pkg%20name"
         );
     }

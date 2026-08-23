@@ -319,14 +319,14 @@ mod tests {
     use std::any::Any;
     use tower_lsp_server::ls_types::{CompletionItem, Position};
 
-    use crate::{ParseResult, Registry, lsp_helpers::EcosystemFormatter};
+    use crate::{PackageName, ParseResult, Registry, lsp_helpers::EcosystemFormatter};
 
     struct MockFormatter;
     impl EcosystemFormatter for MockFormatter {
         fn format_version_for_text_edit(&self, version: &str) -> String {
             version.to_string()
         }
-        fn package_url(&self, name: &str) -> String {
+        fn package_url(&self, name: &PackageName) -> String {
             format!("https://example.com/{name}")
         }
     }

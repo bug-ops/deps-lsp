@@ -1,3 +1,4 @@
+use deps_core::PackageName;
 use deps_core::lsp_helpers::EcosystemFormatter;
 
 /// Composer-specific LSP formatting.
@@ -9,16 +10,16 @@ use deps_core::lsp_helpers::EcosystemFormatter;
 pub struct ComposerFormatter;
 
 impl EcosystemFormatter for ComposerFormatter {
-    fn normalize_package_name(&self, name: &str) -> String {
-        name.to_lowercase()
+    fn normalize_package_name(&self, name: &PackageName) -> String {
+        name.as_str().to_lowercase()
     }
 
     fn format_version_for_text_edit(&self, version: &str) -> String {
         version.to_string()
     }
 
-    fn package_url(&self, name: &str) -> String {
-        crate::registry::package_url(name)
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
     }
 
     fn yanked_message(&self) -> &'static str {
@@ -217,9 +218,12 @@ mod tests {
     #[test]
     fn test_normalize_package_name() {
         let f = ComposerFormatter;
-        assert_eq!(f.normalize_package_name("Vendor/Package"), "vendor/package");
         assert_eq!(
-            f.normalize_package_name("symfony/console"),
+            f.normalize_package_name(&PackageName::new("Vendor/Package")),
+            "vendor/package"
+        );
+        assert_eq!(
+            f.normalize_package_name(&PackageName::new("symfony/console")),
             "symfony/console"
         );
     }
@@ -228,7 +232,7 @@ mod tests {
     fn test_package_url() {
         let f = ComposerFormatter;
         assert_eq!(
-            f.package_url("symfony/console"),
+            f.package_url(&PackageName::new("symfony/console")),
             "https://packagist.org/packages/symfony/console"
         );
     }
