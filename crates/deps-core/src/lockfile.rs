@@ -424,23 +424,28 @@ impl LockFileCache {
     /// # Errors
     ///
     /// Returns error if file cannot be read or parsed
-    // TODO(#350): `cached` (a DashMap shard `Ref`) is held across the
-    // `tokio::fs::metadata(...).await` below — same hazard class as #333, tracked
-    // separately and out of scope here.
-    #[allow(clippy::await_holding_invalid_type)]
     pub async fn get_or_parse(
         &self,
         provider: &dyn LockFileProvider,
         lockfile_path: &Path,
     ) -> Result<ResolvedPackages> {
+        // Extract owned data from the cache entry before awaiting: the DashMap shard
+        // `Ref` returned by `entries.get` must not be held across `.await`, or a
+        // concurrent access to the same key blocks for the duration (#350, same hazard
+        // class as #333).
+        let cached = self
+            .entries
+            .get(lockfile_path)
+            .map(|entry| (entry.modified_at, entry.packages.clone()));
+
         // Check cache first
-        if let Some(cached) = self.entries.get(lockfile_path)
+        if let Some((cached_modified_at, cached_packages)) = cached
             && let Ok(metadata) = tokio::fs::metadata(lockfile_path).await
             && let Ok(mtime) = metadata.modified()
-            && mtime <= cached.modified_at
+            && mtime <= cached_modified_at
         {
             tracing::debug!("Lock file cache hit: {}", lockfile_path.display());
-            return Ok(cached.packages.clone());
+            return Ok(cached_packages);
         }
 
         // Cache miss - parse and store

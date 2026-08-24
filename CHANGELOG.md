@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: extract `Version::is_prerelease()`'s default heuristic into a reusable `has_default_prerelease_marker` function (resolves #327) (#330)
 
 ### Fixed
+- **deps-core**: `LockFileCache::get_or_parse` no longer holds a `DashMap` `Ref` across the `tokio::fs::metadata` staleness-check await, closing the last known hazard in this class after #333/#334 (resolves #350)
 - **deps-npm, deps-deno**: npm/JSR packages whose every published version is deprecated or yanked are no longer misreported as "Unknown package" (resolves #338) (#352)
 - **deps-lsp**: release-cooldown diagnostic message now fires for npm, Deno, Maven, NuGet, and Swift, not just hover (resolves #339) (#352)
 - **deps-maven, deps-gradle**: diagnostics and quick-fix no longer recommend a prerelease as "latest" when a newer stable release exists (resolves #340) (#352)
