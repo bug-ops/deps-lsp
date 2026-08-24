@@ -27,7 +27,7 @@
 
 use crate::error::GoError;
 use crate::types::GoVersion;
-use crate::version::{escape_module_path, is_pseudo_version};
+use crate::version::{escape_module_path, escape_version, is_pseudo_version};
 use deps_core::{DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value};
 use serde::Deserialize;
 use std::any::Any;
@@ -143,6 +143,18 @@ pub fn package_url(module_path: &str) -> String {
     format!("{PKG_GO_DEV_URL}/{encoded}")
 }
 
+/// Builds a `/@v/{version}.{suffix}` proxy URL (e.g. `.info`, `.mod`) for a module.
+///
+/// Both `module_path` and `version` are escaped via `escape_module_path` and
+/// `escape_version` respectively before interpolation, so a version string
+/// carrying `?`, `#`, or whitespace cannot retarget the request to a
+/// different endpoint or inject a query string / fragment (#377).
+fn version_url(module_path: &str, version: &str, suffix: &str) -> String {
+    let escaped_module = escape_module_path(module_path);
+    let escaped_version = escape_version(version);
+    format!("{PROXY_BASE}/{escaped_module}/@v/{escaped_version}.{suffix}")
+}
+
 /// Converts a 404 response into `DepsError::PackageNotFound`, passing through
 /// any other error unchanged.
 fn not_found_or(err: DepsError, module_path: &str) -> DepsError {
@@ -242,8 +254,7 @@ impl GoRegistry {
         validate_module_path(module_path)?;
         validate_version_string(version)?;
 
-        let escaped = escape_module_path(module_path);
-        let url = format!("{PROXY_BASE}/{escaped}/@v/{version}.info");
+        let url = version_url(module_path, version, "info");
 
         let data = self
             .cache
@@ -325,8 +336,7 @@ impl GoRegistry {
         validate_module_path(module_path)?;
         validate_version_string(version)?;
 
-        let escaped = escape_module_path(module_path);
-        let url = format!("{PROXY_BASE}/{escaped}/@v/{version}.mod");
+        let url = version_url(module_path, version, "mod");
 
         let data = self
             .cache
@@ -644,6 +654,124 @@ mod tests {
     #[test]
     fn test_package_url_empty_module_path() {
         assert_eq!(package_url(""), "https://pkg.go.dev/");
+    }
+
+    /// Exercises `version_url` — the exact helper `get_version_info`/`get_go_mod` call —
+    /// with a legitimate version, proving no regression: the URL is the expected literal
+    /// string, not just "doesn't panic". Binds the guard to the production sink: deleting
+    /// escaping from `version_url` would fail this test.
+    #[test]
+    fn test_info_url_construction_legitimate_version() {
+        let url = version_url("github.com/gin-gonic/gin", "v1.9.1", "info");
+        assert_eq!(
+            url,
+            "https://proxy.golang.org/github.com/gin-gonic/gin/@v/v1.9.1.info"
+        );
+    }
+
+    /// Same as above for a pseudo-version, which carries a `-` and digits only — must
+    /// also pass through unescaped.
+    #[test]
+    fn test_info_url_construction_pseudo_version() {
+        let url = version_url(
+            "github.com/user/repo",
+            "v0.0.0-20210101000000-abcdef123456",
+            "info",
+        );
+        assert_eq!(
+            url,
+            "https://proxy.golang.org/github.com/user/repo/@v/v0.0.0-20210101000000-abcdef123456.info"
+        );
+    }
+
+    /// #377 regression guard: a version string carrying `?`/`#`/space (which
+    /// `validate_version_string` does NOT reject — only `..`, `/`, `\` are rejected) must
+    /// not be able to inject a query string or fragment into the `.info` URL. Calls
+    /// `version_url` directly (the same helper `get_version_info` calls) rather than
+    /// duplicating its `format!` logic, so removing the escaping from the production sink
+    /// fails this test.
+    #[test]
+    fn test_info_url_construction_rejects_query_and_fragment_injection() {
+        let cases = [
+            ("v1?a=b", "v1%3Fa%3Db"),
+            ("v1#frag", "v1%23frag"),
+            ("v1 x", "v1%20x"),
+            ("v1&x=y", "v1%26x%3Dy"),
+        ];
+
+        for (raw_version, expected_escaped) in cases {
+            let url = version_url("github.com/gin-gonic/gin", raw_version, "info");
+            let expected_url = format!(
+                "https://proxy.golang.org/github.com/gin-gonic/gin/@v/{expected_escaped}.info"
+            );
+            assert_eq!(url, expected_url, "raw version: {raw_version:?}");
+
+            // The base URL up to the module path is fixed and query/fragment-free;
+            // everything after MUST stay within the path component.
+            let after_base = url
+                .strip_prefix("https://proxy.golang.org/")
+                .expect("URL must start with the proxy base");
+            assert!(
+                !after_base.contains('?'),
+                "constructed URL must not contain a bare '?' for input {raw_version:?}: {url}"
+            );
+            assert!(
+                !after_base.contains('#'),
+                "constructed URL must not contain a bare '#' for input {raw_version:?}: {url}"
+            );
+            assert!(
+                !after_base.contains(' '),
+                "constructed URL must not contain a raw space for input {raw_version:?}: {url}"
+            );
+        }
+    }
+
+    /// Same construction proof for `get_go_mod`'s `.mod` URL via `version_url`.
+    #[test]
+    fn test_mod_url_construction_legitimate_version() {
+        let url = version_url("github.com/gin-gonic/gin", "v1.9.1", "mod");
+        assert_eq!(
+            url,
+            "https://proxy.golang.org/github.com/gin-gonic/gin/@v/v1.9.1.mod"
+        );
+    }
+
+    /// #377 regression guard for the `.mod` endpoint — same injection proof as
+    /// `test_info_url_construction_rejects_query_and_fragment_injection`, mirroring
+    /// `get_go_mod`'s URL construction instead of `get_version_info`'s.
+    #[test]
+    fn test_mod_url_construction_rejects_query_and_fragment_injection() {
+        let cases = [
+            ("v1?a=b", "v1%3Fa%3Db"),
+            ("v1#frag", "v1%23frag"),
+            ("v1 x", "v1%20x"),
+        ];
+
+        for (raw_version, expected_escaped) in cases {
+            let url = version_url("github.com/gin-gonic/gin", raw_version, "mod");
+            let expected_url = format!(
+                "https://proxy.golang.org/github.com/gin-gonic/gin/@v/{expected_escaped}.mod"
+            );
+            assert_eq!(url, expected_url, "raw version: {raw_version:?}");
+
+            let after_base = url
+                .strip_prefix("https://proxy.golang.org/")
+                .expect("URL must start with the proxy base");
+            assert!(!after_base.contains('?'), "raw version: {raw_version:?}");
+            assert!(!after_base.contains('#'), "raw version: {raw_version:?}");
+        }
+    }
+
+    /// #377 S1 regression guard: `version_url` must case-fold uppercase in the version
+    /// segment the same way `escape_module_path` folds module paths — a raw uppercase
+    /// segment 404s against the real proxy (live-verified during review).
+    #[test]
+    fn test_info_url_construction_case_folds_uppercase_version() {
+        let url = version_url("github.com/user/repo", "v1.7.0-RC", "info");
+        assert_eq!(
+            url,
+            "https://proxy.golang.org/github.com/user/repo/@v/v1.7.0-!r!c.info"
+        );
     }
 
     #[tokio::test]

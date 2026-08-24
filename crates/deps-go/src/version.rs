@@ -48,6 +48,48 @@ pub fn escape_module_path(path: &str) -> String {
     result
 }
 
+/// Escapes a Go version string for safe interpolation into proxy.golang.org
+/// `@v/{version}.info` and `@v/{version}.mod` URLs.
+///
+/// Mirrors `escape_module_path`'s case-encoding convention: uppercase letters
+/// become `!` + lowercase (the Go module-proxy case-folding rule), since a raw
+/// uppercase version segment — legal in a semver prerelease identifier such as
+/// `v1.7.0-RC` — otherwise 404s against the proxy. Every other character
+/// outside `[a-z0-9.+-]` is percent-encoded, preventing `?`, `#`, or
+/// whitespace from being interpreted as URL syntax (starting a query string
+/// or fragment) instead of literal version content.
+///
+/// # Examples
+///
+/// ```
+/// use deps_go::escape_version;
+///
+/// assert_eq!(escape_version("v1.9.1"), "v1.9.1");
+/// assert_eq!(escape_version("v2.0.0+incompatible"), "v2.0.0+incompatible");
+/// assert_eq!(escape_version("v1.7.0-RC"), "v1.7.0-!r!c");
+/// assert_eq!(escape_version("v1?a=b"), "v1%3Fa%3Db");
+/// ```
+pub fn escape_version(version: &str) -> String {
+    let mut result = String::with_capacity(version.len());
+
+    for c in version.chars() {
+        if c.is_uppercase() {
+            result.push('!');
+            result.push(c.to_ascii_lowercase());
+        } else if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+' {
+            result.push(c);
+        } else {
+            let mut buf = [0u8; 4];
+            let encoded = c.encode_utf8(&mut buf);
+            for &byte in encoded.as_bytes() {
+                result.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+
+    result
+}
+
 /// Checks if a version string is a pseudo-version.
 ///
 /// Pseudo-version format: `vX.Y.Z-yyyymmddhhmmss-abcdefabcdef`
@@ -194,6 +236,35 @@ mod tests {
             escape_module_path("github.com/MyUser/MyRepo"),
             "github.com/!my!user/!my!repo"
         );
+    }
+
+    #[test]
+    fn test_escape_version_preserves_legitimate_versions() {
+        assert_eq!(escape_version("v1.9.1"), "v1.9.1");
+        assert_eq!(
+            escape_version("v0.0.0-20191109021931-daa7c04131f5"),
+            "v0.0.0-20191109021931-daa7c04131f5"
+        );
+        assert_eq!(escape_version("v2.0.0+incompatible"), "v2.0.0+incompatible");
+    }
+
+    #[test]
+    fn test_escape_version_encodes_query_and_fragment_chars() {
+        let escaped = escape_version("v1?a=b");
+        assert!(!escaped.contains('?'));
+        assert!(!escaped.contains('='));
+
+        let escaped = escape_version("v1#frag");
+        assert!(!escaped.contains('#'));
+
+        let escaped = escape_version("v1 space");
+        assert!(!escaped.contains(' '));
+    }
+
+    #[test]
+    fn test_escape_version_case_folds_uppercase() {
+        assert_eq!(escape_version("v1.7.0-RC"), "v1.7.0-!r!c");
+        assert_eq!(escape_version("V1.0.0"), "!v1.0.0");
     }
 
     #[test]
