@@ -7887,6 +7887,7 @@ mod tests {
                         "1.4.0".to_string(),
                     ]),
                     yanked: Arc::from(Vec::<String>::new()),
+                    published_at: None,
                 },
             );
             m
@@ -7906,6 +7907,7 @@ mod tests {
             &StrictSemverFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         let message = diagnostics
@@ -7929,6 +7931,7 @@ mod tests {
                     latest: "1.5.0".to_string(),
                     available: Arc::from(vec!["1.5.0".to_string(), "1.4.0".to_string()]),
                     yanked: Arc::from(Vec::<String>::new()),
+                    published_at: None,
                 },
             );
             m
@@ -7948,6 +7951,7 @@ mod tests {
             &StrictSemverFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         let message = diagnostics
@@ -8931,6 +8935,7 @@ mod tests {
                         available.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                     ),
                     yanked: Arc::from(Vec::new()),
+                    published_at: None,
                 },
             );
             m
