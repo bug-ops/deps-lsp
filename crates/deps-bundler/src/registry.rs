@@ -78,6 +78,12 @@ struct VersionEntry {
     number: String,
     #[serde(default)]
     prerelease: bool,
+    // RubyGems' `versions.json` never sends this key: yanked versions are
+    // omitted from the response entirely rather than flagged (verified live
+    // 2026-08-24 against rest-client's known-yanked 1.6.2/1.6.10-1.6.13,
+    // absent from the API but shown yanked on the HTML versions page). This
+    // field is therefore permanently `false` in practice — see
+    // `reports_yanked` below (#298).
     #[serde(default)]
     yanked: bool,
     created_at: Option<String>,
@@ -269,6 +275,18 @@ impl deps_core::Registry for RubyGemsRegistry {
         versions.iter().position(|v| {
             version_matches_requirement(v.version_string(), req.as_str()) && !v.is_yanked()
         })
+    }
+
+    // RubyGems' `versions.json` (the sole data source here) omits yanked
+    // versions from the response entirely instead of flagging them with a
+    // `yanked` key — confirmed live against rest-client's known-yanked
+    // versions, which are absent from the JSON array but shown yanked on the
+    // HTML versions page. `VersionEntry.yanked` above is therefore
+    // permanently `false`, so the yanked-diagnostic path must be told this
+    // registry cannot answer rather than silently reporting "not yanked"
+    // (#298).
+    fn reports_yanked(&self) -> bool {
+        false
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -602,6 +620,16 @@ mod tests {
             registry.package_url(&deps_core::PackageName::new("rails")),
             "https://rubygems.org/gems/rails"
         );
+    }
+
+    #[test]
+    fn test_registry_reports_yanked_false() {
+        use deps_core::Registry;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = RubyGemsRegistry::new(cache);
+
+        assert!(!registry.reports_yanked());
     }
 
     #[test]
