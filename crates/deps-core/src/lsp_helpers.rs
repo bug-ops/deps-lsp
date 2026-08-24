@@ -1092,6 +1092,101 @@ pub fn is_safe_version_string(version: &str) -> bool {
         })
 }
 
+/// Whether `segment` is safe to embed as a Maven `groupId`/`artifactId` value in a
+/// pom.xml [`TextEdit`] or completion item.
+///
+/// Guards Maven's group/artifact completion producer, which builds a completion item's
+/// `insert_text`/`text_edit` from one field of a Maven Central search result — a value
+/// type distinct from a version string (see [`is_safe_version_string`]'s doc comment for
+/// why version-derived and non-version-derived sinks each get their own allowlist).
+///
+/// An allowlist, not a denylist: `segment` must be non-empty, at most 128 bytes, and
+/// contain only `[A-Za-z0-9._-]` — the character set real Maven Central group ids
+/// (reverse-DNS style, e.g. `org.apache.commons`) and artifact ids (hyphen/underscore
+/// separated, e.g. `commons-lang3`) use. Deliberately excludes `:` — the
+/// `groupId:artifactId` separator — because this validates one already-split coordinate
+/// field at a time, never the joined pair. Failing closed on an unrecognized character
+/// (e.g. `<`, `"`, a newline) keeps a malicious/compromised search result from
+/// restructuring the pom.xml it's inserted into.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::is_safe_maven_coordinate_segment;
+///
+/// assert!(is_safe_maven_coordinate_segment("org.apache.commons"));
+/// assert!(is_safe_maven_coordinate_segment("commons-lang3"));
+/// assert!(!is_safe_maven_coordinate_segment("commons</artifactId><parent>"));
+/// ```
+pub fn is_safe_maven_coordinate_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= 128
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Whether `url` is safe to embed as a Swift Package Manager repository URL in a
+/// Package.swift [`TextEdit`] or completion item.
+///
+/// Guards Swift's URL-completion producer, which builds a `.package(url: "...")`
+/// string-literal replacement from a package registry search result's URL — a value
+/// type distinct from a version string (see [`is_safe_version_string`]'s doc comment for
+/// why version-derived and non-version-derived sinks each get their own allowlist).
+///
+/// An allowlist, not a denylist: `url` must be non-empty, at most 2048 bytes, start with
+/// `https://` — every real Swift package registry response is HTTPS (GitHub's `html_url`
+/// never downgrades), so accepting plain `http://` would only hand a
+/// compromised/malicious registry a transport-downgrade lever for zero legitimate
+/// benefit — and otherwise contain only RFC 3986 URL characters (`A-Za-z0-9` plus
+/// `` -._~:/?#[]@!$&'()*+,;=% ``). Deliberately excludes `"`, `\`, control characters,
+/// and whitespace — none of those are valid unencoded URL characters, and any of them
+/// could close the surrounding Swift string literal or otherwise corrupt the manifest.
+/// Failing closed on an unrecognized character keeps a malicious/compromised search
+/// result from breaking out of the string it's inserted into.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::is_safe_registry_url;
+///
+/// assert!(is_safe_registry_url("https://github.com/apple/swift-nio"));
+/// assert!(!is_safe_registry_url("https://evil.example\", .exact(\"1\")) // "));
+/// ```
+pub fn is_safe_registry_url(url: &str) -> bool {
+    !url.is_empty()
+        && url.len() <= 2048
+        && url.starts_with("https://")
+        && url.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '.'
+                        | '_'
+                        | '~'
+                        | ':'
+                        | '/'
+                        | '?'
+                        | '#'
+                        | '['
+                        | ']'
+                        | '@'
+                        | '!'
+                        | '$'
+                        | '&'
+                        | '\''
+                        | '('
+                        | ')'
+                        | '*'
+                        | '+'
+                        | ','
+                        | ';'
+                        | '='
+                        | '%'
+                )
+        })
+}
+
 pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
@@ -3379,6 +3474,96 @@ mod tests {
     fn test_is_safe_version_string_length_cap() {
         assert!(is_safe_version_string(&"1".repeat(64)));
         assert!(!is_safe_version_string(&"1".repeat(65)));
+    }
+
+    #[test]
+    fn test_is_safe_maven_coordinate_segment_accepts_real_ids() {
+        assert!(is_safe_maven_coordinate_segment("org.apache.commons"));
+        assert!(is_safe_maven_coordinate_segment("commons-lang3"));
+        assert!(is_safe_maven_coordinate_segment("jackson-core_2.13"));
+    }
+
+    #[test]
+    fn test_is_safe_maven_coordinate_segment_rejects_empty() {
+        assert!(!is_safe_maven_coordinate_segment(""));
+    }
+
+    #[test]
+    fn test_is_safe_maven_coordinate_segment_rejects_xml_structural_characters() {
+        for bad in [
+            "commons</artifactId><parent>",
+            "commons\"",
+            "commons'",
+            "commons&amp;",
+            "commons\nlang3",
+            "commons\tlang3",
+        ] {
+            assert!(
+                !is_safe_maven_coordinate_segment(bad),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_maven_coordinate_segment_rejects_group_artifact_colon() {
+        assert!(!is_safe_maven_coordinate_segment(
+            "org.apache.commons:commons-lang3"
+        ));
+    }
+
+    #[test]
+    fn test_is_safe_maven_coordinate_segment_length_cap() {
+        assert!(is_safe_maven_coordinate_segment(&"a".repeat(128)));
+        assert!(!is_safe_maven_coordinate_segment(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn test_is_safe_registry_url_accepts_real_urls() {
+        assert!(is_safe_registry_url("https://github.com/apple/swift-nio"));
+        assert!(is_safe_registry_url(
+            "https://github.com/apple/swift-nio.git"
+        ));
+        assert!(is_safe_registry_url("https://github.com/apple/swift%2Dnio"));
+    }
+
+    #[test]
+    fn test_is_safe_registry_url_rejects_non_https_scheme() {
+        // Every real Swift package registry response is HTTPS; accepting `http://` would
+        // only hand a compromised registry a transport-downgrade lever.
+        assert!(!is_safe_registry_url("http://example.com/repo"));
+        assert!(!is_safe_registry_url("file:///etc/passwd"));
+        assert!(!is_safe_registry_url("javascript:alert(1)"));
+        assert!(!is_safe_registry_url("ftp://example.com/repo"));
+        assert!(!is_safe_registry_url(""));
+    }
+
+    #[test]
+    fn test_is_safe_registry_url_rejects_swift_string_literal_breakout() {
+        for bad in [
+            "https://evil.example\", .exact(\"1.0.0\")), .package(url: \"https://real",
+            "https://evil.example\\",
+            "https://evil.example\nlet x = 1",
+            "https://evil.example`echo`",
+            "https://evil.example<script>",
+        ] {
+            assert!(
+                !is_safe_registry_url(bad),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_registry_url_length_cap() {
+        let prefix = "https://example.com/";
+        let at_cap = format!("{prefix}{}", "a".repeat(2048 - prefix.len()));
+        assert_eq!(at_cap.len(), 2048);
+        assert!(is_safe_registry_url(&at_cap));
+
+        let over_cap = format!("{at_cap}a");
+        assert_eq!(over_cap.len(), 2049);
+        assert!(!is_safe_registry_url(&over_cap));
     }
 
     #[test]

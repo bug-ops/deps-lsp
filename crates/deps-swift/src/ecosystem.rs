@@ -7,7 +7,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_registry_url,
+    lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::SwiftFormatter;
@@ -27,13 +28,24 @@ use crate::types::SwiftPackage;
 /// dependency containing the cursor could not be found), falls back to `insert_text`-only
 /// — the same safe pattern used by `create_package_completion_item` in `deps-lsp` — rather
 /// than guessing a range.
-fn build_url_completion(package: &SwiftPackage, replace_range: Option<LspRange>) -> CompletionItem {
-    let mut item = deps_core::completion::build_package_completion(package, LspRange::default());
-
+///
+/// Returns `None` when `url` doesn't pass [`is_safe_registry_url`] — a
+/// malicious/compromised search result must not reach the manifest as an unsanitized
+/// `TextEdit`, so the item is dropped rather than built with unsafe text.
+fn build_url_completion(
+    package: &SwiftPackage,
+    replace_range: Option<LspRange>,
+) -> Option<CompletionItem> {
     let url = package
         .repository
         .clone()
         .unwrap_or_else(|| format!("https://github.com/{}", package.name));
+
+    if !is_safe_registry_url(&url) {
+        return None;
+    }
+
+    let mut item = deps_core::completion::build_package_completion(package, LspRange::default());
 
     item.insert_text = Some(url.clone());
     item.filter_text = Some(url.clone());
@@ -45,7 +57,7 @@ fn build_url_completion(package: &SwiftPackage, replace_range: Option<LspRange>)
         })
     });
 
-    item
+    Some(item)
 }
 
 /// Strips a leading `https://github.com/` (or `https://github.com`) scheme from a
@@ -101,7 +113,7 @@ impl SwiftEcosystem {
 
         results
             .iter()
-            .map(|package| build_url_completion(package, replace_range))
+            .filter_map(|package| build_url_completion(package, replace_range))
             .collect()
     }
 
@@ -227,7 +239,7 @@ mod tests {
     #[test]
     fn test_build_url_completion_uses_repository_url() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
-        let item = build_url_completion(&package, None);
+        let item = build_url_completion(&package, None).unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -238,7 +250,7 @@ mod tests {
     #[test]
     fn test_build_url_completion_falls_back_to_constructed_url() {
         let package = test_package(None);
-        let item = build_url_completion(&package, None);
+        let item = build_url_completion(&package, None).unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -250,7 +262,7 @@ mod tests {
     fn test_build_url_completion_with_range_sets_text_edit() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
         let range = test_range();
-        let item = build_url_completion(&package, Some(range));
+        let item = build_url_completion(&package, Some(range)).unwrap();
 
         assert_eq!(
             item.text_edit,
@@ -266,7 +278,7 @@ mod tests {
         // Defensive fallback: when the containing dependency's range can't be resolved,
         // insert_text-only is safer than guessing a range that might not contain the cursor.
         let package = test_package(Some("https://github.com/apple/swift-nio"));
-        let item = build_url_completion(&package, None);
+        let item = build_url_completion(&package, None).unwrap();
 
         assert_eq!(item.text_edit, None);
     }
@@ -275,7 +287,7 @@ mod tests {
     fn test_build_url_completion_clears_detail_when_latest_version_empty() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
         assert!(package.latest_version.is_empty());
-        let item = build_url_completion(&package, None);
+        let item = build_url_completion(&package, None).unwrap();
 
         assert_eq!(item.detail, None);
     }
@@ -284,9 +296,33 @@ mod tests {
     fn test_build_url_completion_keeps_detail_when_latest_version_present() {
         let mut package = test_package(Some("https://github.com/apple/swift-nio"));
         package.latest_version = "2.40.0".to_string();
-        let item = build_url_completion(&package, None);
+        let item = build_url_completion(&package, None).unwrap();
 
         assert_eq!(item.detail, Some("v2.40.0".to_string()));
+    }
+
+    #[test]
+    fn test_build_url_completion_rejects_string_literal_breakout_repository() {
+        let package = test_package(Some(
+            "https://evil.example\", .exact(\"1.0.0\")), .package(url: \"https://real",
+        ));
+
+        assert!(build_url_completion(&package, None).is_none());
+    }
+
+    #[test]
+    fn test_build_url_completion_rejects_non_http_scheme() {
+        let package = test_package(Some("file:///etc/passwd"));
+
+        assert!(build_url_completion(&package, None).is_none());
+    }
+
+    #[test]
+    fn test_build_url_completion_rejects_malicious_name_in_fallback_url() {
+        let mut package = test_package(None);
+        package.name = "apple/swift-nio\", .exact(\"1\")) //".to_string().into();
+
+        assert!(build_url_completion(&package, None).is_none());
     }
 
     #[test]
