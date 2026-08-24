@@ -6,8 +6,17 @@
 //! ordering and `~>` requirement matching match `Gem::Version`/
 //! `Gem::Requirement` exactly, including prerelease-vs-prerelease
 //! tie-breaking and pessimistic-operator ceiling rules (#323, #327).
+//!
+//! `canonical_segments` itself is a literal string-level port of RubyGems' two
+//! `canonical_segments` regexes (see `strip_trailing_padding`/`strip_padding_before_tag`)
+//! rather than a token-level re-derivation of the same reduction, since a token-level
+//! re-derivation had twice previously diverged from Ruby's actual algorithm on narrow
+//! shapes it didn't happen to consider (#331).
 
 use std::cmp::Ordering;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 /// A single alternating digit/letter run extracted from a version string.
 ///
@@ -24,13 +33,6 @@ enum Token {
     /// A run of ASCII letters, compared case-sensitively like Ruby's default
     /// string `<=>`.
     Alpha(String),
-}
-
-impl Token {
-    /// Whether this token is a numeric run whose value is zero.
-    fn is_zero(&self) -> bool {
-        matches!(self, Self::Numeric(s) if is_zero_digits(s))
-    }
 }
 
 impl PartialEq for Token {
@@ -97,40 +99,78 @@ fn tokenize(version: &str) -> Vec<Token> {
     tokens
 }
 
-/// Ports `Gem::Version#canonical_segments`: strips the trailing zero
-/// segments that RubyGems considers redundant before comparing.
+/// Strips a trailing run of `.`/`0` bytes that is itself preceded by a letter or a literal
+/// `.`, mirroring RubyGems' `Gem::Version#canonical_segments` regex
+/// `/(?<=[a-zA-Z.])[.0]+\z/` — e.g. `"1.0.0"` -> `"1."` (dropping the redundant trailing
+/// zero segments; the leftover `.` is inert, `tokenize` ignores it).
 ///
-/// Two passes, applied in the same order RubyGems applies them:
-/// 1. Trailing `Numeric(0)` segments are dropped from the very end of the
-///    version (`"1.0.0"` canonicalizes to `[1]`), always leaving at least
-///    one segment.
-/// 2. For a prerelease version (one containing any alpha segment), the run
-///    of `Numeric(0)` segments immediately preceding the *first* alpha
-///    segment is also dropped (`"3.0.pre"` canonicalizes to `[3, "pre"]`).
-///
-/// Without step 2, a padded comparison would compare the implicit zero
-/// before a short prerelease tag against the zero before a longer one
-/// positionally, rather than comparing the tags themselves — the root cause
-/// of `"3.0.0.beta"` sorting on the wrong side of `"3.0.pre"` (#327 M6).
-fn canonical_segments(version: &str) -> Vec<Token> {
-    let mut tokens = tokenize(version);
-    let prerelease = tokens.iter().any(|t| matches!(t, Token::Alpha(_)));
-
-    while tokens.len() > 1 && tokens.last().is_some_and(Token::is_zero) {
-        tokens.pop();
-    }
-
-    if prerelease
-        && let Some(first_alpha) = tokens.iter().position(|t| matches!(t, Token::Alpha(_)))
-    {
-        let mut start = first_alpha;
-        while start > 0 && tokens[start - 1].is_zero() {
-            start -= 1;
+/// Rust's `regex` crate has no lookbehind, so this walks byte positions directly instead of
+/// porting the pattern as a literal `Regex`: it finds the smallest index `i` such that the
+/// byte before `i` is a letter or `.` and every byte from `i` onward is `.`/`0`, matching
+/// Ruby's leftmost-match semantics for an anchored-at-end pattern.
+fn strip_trailing_padding(version: &str) -> &str {
+    let bytes = version.as_bytes();
+    for i in 1..bytes.len() {
+        let prev = bytes[i - 1];
+        if (prev.is_ascii_alphabetic() || prev == b'.')
+            && bytes[i..].iter().all(|&b| b == b'.' || b == b'0')
+        {
+            return &version[..i];
         }
-        tokens.drain(start..first_alpha);
     }
+    version
+}
 
-    tokens
+/// Strips a run of `.`/`0` bytes anchored at the string start or right after a `.`, and
+/// immediately followed by a letter, mirroring RubyGems' `Gem::Version#canonical_segments`
+/// regex `/(?<=\.|\A)[0.]+(?=[a-zA-Z])/` — applied only to prerelease versions (those
+/// containing a letter), and only the leftmost such run (Ruby uses `sub!`, not `gsub!`, so a
+/// second zero-padding run elsewhere in the string is left untouched). E.g.
+/// `"1.pre.0.beta1"` -> `"1.pre.beta1"`, so a padding zero segment right before a prerelease
+/// tag does not become its own token (#331).
+fn strip_padding_before_tag(version: &str) -> String {
+    let bytes = version.as_bytes();
+    for i in 0..bytes.len() {
+        if i > 0 && bytes[i - 1] != b'.' {
+            continue;
+        }
+        if bytes[i] != b'.' && bytes[i] != b'0' {
+            continue;
+        }
+        let end = i + bytes[i..]
+            .iter()
+            .take_while(|b| **b == b'.' || **b == b'0')
+            .count();
+        if bytes.get(end).is_some_and(u8::is_ascii_alphabetic) {
+            return format!("{}{}", &version[..i], &version[end..]);
+        }
+    }
+    version.to_string()
+}
+
+/// Canonicalizes `version` into its string form for comparison, following RubyGems'
+/// `Gem::Version#canonical_segments` two-regex algorithm (see
+/// `strip_trailing_padding`/`strip_padding_before_tag`): the string is first trimmed and a
+/// hyphen expands to `.pre.` (mirroring `Gem::Version#initialize`'s `strip` then
+/// `gsub!("-", ".pre.")`), then redundant `.`/`0` padding is stripped from the end and, for
+/// prerelease versions, from immediately before a tag. This makes `"1.2.3-0.beta1"` and
+/// `"1.2.3-beta1"` canonicalize identically, matching Ruby's `canonical_segments` (#331)
+/// rather than leaving the padding `0` as its own token the way tokenizing the raw string
+/// would.
+fn canonicalize(version: &str) -> String {
+    let expanded = version.trim().replace('-', ".pre.");
+    let trimmed = strip_trailing_padding(&expanded).to_string();
+    if expanded.bytes().any(|b| b.is_ascii_alphabetic()) {
+        strip_padding_before_tag(&trimmed)
+    } else {
+        trimmed
+    }
+}
+
+/// Ports `Gem::Version#canonical_segments`, via the literal string-level port
+/// `canonicalize` composed with `tokenize`.
+fn canonical_segments(version: &str) -> Vec<Token> {
+    tokenize(&canonicalize(version))
 }
 
 /// Compares two version strings, prerelease-aware.
@@ -328,6 +368,29 @@ fn bump_string(requirement: &str) -> Option<String> {
     Some(join_tokens(&segments))
 }
 
+/// Matches RubyGems' `Gem::Version::VERSION_PATTERN`
+/// (`[0-9]+(?>\.[0-9a-zA-Z]+)*(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?`, confirmed against a live
+/// RubyGems install rather than the packaged source alone): a leading digit run, followed by
+/// zero or more dot-separated alphanumeric segments, with an optional hyphenated suffix that
+/// may itself have any number of further dot-separated segments.
+static RUBYGEMS_VERSION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[0-9]+(?:\.[0-9a-zA-Z]+)*(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
+        .expect("Invalid regex")
+});
+
+/// Checks whether `version` (the operand of a comparison operator in a Bundler requirement)
+/// is a syntactically valid RubyGems version, per `Gem::Version::VERSION_PATTERN`.
+///
+/// Not `Gem::Version.correct?`, which additionally accepts an empty or whitespace-only
+/// operand that `Gem::Requirement` itself rejects for every operator this gates. A malformed
+/// operand (e.g. `~> abc`, `< abc`, a bare `~>` with nothing after it) would
+/// otherwise make the corresponding comparison in [`version_matches_requirement`] evaluate
+/// `false` against every candidate, producing a misleading "no version satisfies
+/// requirement" diagnostic instead of flagging the requirement itself as invalid (#332).
+pub fn is_valid_rubygems_version(version: &str) -> bool {
+    RUBYGEMS_VERSION_PATTERN.is_match(version.trim())
+}
+
 /// Checks if a version matches a pessimistic requirement (`~>`).
 ///
 /// Ports RubyGems' own pessimistic-operator check
@@ -445,6 +508,39 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_versions_zero_padded_prerelease_tag_run() {
+        // Regression test for #331: a version with two prerelease tag runs separated by a
+        // zero segment (RubyGems internally expands "1.2.3-0.beta1" to
+        // "1.2.3.pre.0.beta1") must canonicalize identically to the same version without the
+        // padding zero — RubyGems' actual `canonical_segments` regexes only strip a zero run
+        // immediately before the *first* alpha segment ("pre" here), not before a later one
+        // ("beta"), so a token-level re-derivation of "drop zeros before the first alpha"
+        // (as opposed to this literal string-level port) leaves the "0" as its own segment
+        // and wrongly ranks it above the version without it.
+        assert_eq!(
+            compare_versions("1.2.3-0.beta1", "1.2.3-beta1"),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions("1.2.3-beta1", "1.2.3-0.beta1"),
+            Ordering::Equal
+        );
+        assert_ne!(
+            compare_versions("1.2.3-0.beta1", "1.2.3-beta1"),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_strip_padding_before_tag_single_match_only() {
+        // Pinning test: RubyGems' second canonical_segments regex uses `sub!`, not `gsub!`,
+        // so only the leftmost zero-padding run before a tag is stripped — a second
+        // zero-padding run before a later tag survives untouched. Confirmed correct against
+        // real RubyGems (critic #331 differential testing, 0/344k mismatches), not a bug.
+        assert_eq!(strip_padding_before_tag("1.0.pre.0.beta"), "1.pre.0.beta");
+    }
+
+    #[test]
     fn test_compare_versions_hyphen_is_implicit_pre() {
         // Regression test for #327 M7: RubyGems rewrites "1.0.0-1" to
         // "1.0.0.pre.1" internally, so it must sort as a prerelease of
@@ -472,6 +568,30 @@ mod tests {
             compare_versions("1.0.100000000000000000000", "1.0.99999999999999999999"),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn test_is_valid_rubygems_version() {
+        // Regression test for #332: RubyGems' Gem::Version::VERSION_PATTERN.
+        assert!(is_valid_rubygems_version("7.0"));
+        assert!(is_valid_rubygems_version("1.0.5"));
+        assert!(is_valid_rubygems_version("1.2.3.4.5.6.7.8.9.10.11"));
+        assert!(is_valid_rubygems_version("1.0.0-beta"));
+        assert!(is_valid_rubygems_version("1.0.0-beta.1"));
+
+        // Regression test for critic finding S1: the hyphenated suffix's trailing group is
+        // `*` (zero or more), not `?` (zero or one) — a multi-segment hyphenated prerelease
+        // tag is valid RubyGems syntax and must not be rejected.
+        assert!(is_valid_rubygems_version("1.0.0-beta.1.2"));
+        assert!(is_valid_rubygems_version("1.0.0-beta.1.2.3"));
+        assert!(is_valid_rubygems_version("1.0.0-a-b-c.d.e"));
+        assert!(is_valid_rubygems_version("1.0.0-x.7.z.92"));
+
+        // Malformed: no leading digit run, or nothing at all.
+        assert!(!is_valid_rubygems_version("abc"));
+        assert!(!is_valid_rubygems_version(""));
+        assert!(!is_valid_rubygems_version("   "));
+        assert!(!is_valid_rubygems_version(".1.0"));
     }
 
     #[test]
