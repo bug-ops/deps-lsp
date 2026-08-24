@@ -54,14 +54,10 @@ render the scheme as part of the package name. See the crate's module docs
 - The yanked-only-match diagnostic is restricted to exact-pin requirements for both `jsr:`
   and `npm:` specifiers (matches `deps-npm`'s own restriction, for the same reason:
   avoiding false positives from package-wide deprecation)
-- Package-name completion cannot bootstrap a bare `jsr:` specifier: typing `"jsr:"`,
-  `"jsr:@"`, `"jsr:@std"`, or `"jsr:@std/"` produces no suggestions, since `parse_specifier`
-  returns `None` for all four (no scoped name to route on yet) and completion requires an
-  existing parsed dependency to attach to. The dead zone closes as soon as one character of
-  the package name is typed (`"jsr:@std/f"` already completes); `npm:` and version
-  completion are unaffected, since `package.json` has no equivalent gap (the name is the
-  JSON key, always present). Tracked as a follow-up rather than fixed here — properly
-  supporting it means modeling a partial/in-progress name in `specifier.rs`.
+- Package-name completion works for a bare, still-being-typed `jsr:`/`npm:` specifier
+  (`"jsr:"`, `"jsr:@"`, `"jsr:@std"`, `"jsr:@std/"`): `partial_name_range` in
+  `specifier.rs` models the in-progress name so completion has a dependency to attach to,
+  even though `parse_specifier` itself correctly rejects those same values as incomplete
 
 ## License
 

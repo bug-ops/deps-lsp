@@ -7,7 +7,7 @@
 //! `deps-npm`'s own rules where a bare name check is enough (validation) or reuse
 //! `deps-npm`'s wording outright (yanked messages, S2).
 
-use crate::specifier::{Scheme, split_scheme, split_scoped};
+use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
 use deps_core::{Dependency, InvalidPackageName, PackageName, VersionReq};
 
@@ -37,7 +37,7 @@ const MAX_JSR_SEGMENT_LENGTH: usize = 64;
 /// intended `/@scope/pkg` shape) and caps segment length. `split_scoped` already
 /// guarantees non-empty segments, so emptiness is not re-checked here.
 fn validate_jsr_segment(segment: &str) -> Result<(), InvalidPackageName> {
-    if segment.starts_with('.') {
+    if is_dot_prefixed(segment) {
         return Err(InvalidPackageName::new(
             "jsr: scope and package name must not start with '.'",
         ));
