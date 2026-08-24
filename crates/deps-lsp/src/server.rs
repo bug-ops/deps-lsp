@@ -220,7 +220,6 @@ impl Backend {
     }
 
     /// Check if client supports work done progress.
-    #[allow(dead_code)]
     async fn supports_progress(&self) -> bool {
         let caps = self.client_capabilities.read().await;
         caps.as_ref()
@@ -276,6 +275,8 @@ impl LanguageServer for Backend {
 
         // Store client capabilities
         *self.client_capabilities.write().await = Some(params.capabilities.clone());
+        self.state
+            .set_progress_supported(self.supports_progress().await);
 
         // Parse initialization options
         if let Some(init_options) = params.initialization_options

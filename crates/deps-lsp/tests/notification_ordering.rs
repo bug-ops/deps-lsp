@@ -145,6 +145,52 @@ serde = "1.0.0"
     let _shutdown_response = client.shutdown();
 }
 
+/// Regression test for #290: the server must not send
+/// `window/workDoneProgress/create` requests to a client that explicitly
+/// declined `window.workDoneProgress` support during `initialize` — doing
+/// so unconditionally is an LSP 3.17 spec violation.
+#[cfg(feature = "cargo")]
+#[test]
+fn test_no_progress_create_without_client_capability() {
+    let mut client = LspClient::spawn();
+
+    let _init_response = client.initialize_with_progress_support(false);
+    client.clear_notifications();
+
+    let cargo_toml = r#"[package]
+name = "test-package"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0.0"
+"#;
+
+    client.did_open("file:///test/Cargo.toml", "toml", cargo_toml);
+
+    // Positive liveness proof: `publishDiagnostics` for this URI is only sent
+    // after the background registry fetch completes (see `lifecycle.rs`), so
+    // waiting for it proves the fetch actually ran to completion rather than
+    // the absence check below being vacuously true (e.g. because `did_open`
+    // became a no-op in the harness).
+    let _diagnostics = client
+        .wait_for_notification(20, |n| {
+            n.method == "textDocument/publishDiagnostics"
+                && n.params["uri"] == "file:///test/Cargo.toml"
+        })
+        .expect(
+            "Server should publish diagnostics for the opened document once the fetch completes",
+        );
+
+    assert_eq!(
+        client.progress_create_request_count(),
+        0,
+        "Server must not request a workDoneProgress token when the client didn't advertise support"
+    );
+
+    let _shutdown_response = client.shutdown();
+}
+
 /// Verifies notification capture works correctly.
 #[test]
 fn test_notification_capture_basic() {

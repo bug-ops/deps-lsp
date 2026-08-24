@@ -5,6 +5,7 @@ use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{EcosystemId, EcosystemRegistry, PackageName, PackageVersions, ParseResult};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tower_lsp_server::ls_types::Uri;
@@ -451,6 +452,11 @@ pub struct ServerState {
     pub cold_start_limiter: ColdStartLimiter,
     /// Background task handles
     tasks: tokio::sync::RwLock<HashMap<Uri, JoinHandle<()>>>,
+    /// Whether the client advertised `window.workDoneProgress` support during
+    /// `initialize`. Set once, read from spawned lifecycle tasks that have no
+    /// direct access to `ClientCapabilities` (see `RegistryProgress::start` call
+    /// sites in `document::lifecycle`).
+    progress_supported: AtomicBool,
 }
 
 impl ServerState {
@@ -475,7 +481,21 @@ impl ServerState {
             ecosystem_registry,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
+            progress_supported: AtomicBool::new(false),
         }
+    }
+
+    /// Returns whether the client supports LSP work done progress notifications.
+    pub fn supports_progress(&self) -> bool {
+        self.progress_supported.load(Ordering::Relaxed)
+    }
+
+    /// Records whether the client supports LSP work done progress notifications.
+    ///
+    /// Called once from `initialize` with the result of negotiating
+    /// `window.workDoneProgress` from `ClientCapabilities`.
+    pub fn set_progress_supported(&self, supported: bool) {
+        self.progress_supported.store(supported, Ordering::Relaxed);
     }
 
     /// Retrieves document state by URI.
