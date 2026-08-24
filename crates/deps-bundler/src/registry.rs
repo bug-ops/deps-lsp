@@ -23,6 +23,22 @@ pub fn gem_url(name: &str) -> String {
     format!("{RUBYGEMS_URL}/{}", urlencoding::encode(name))
 }
 
+/// Builds the rubygems.org API request URL for a gem's version list.
+fn versions_url(name: &str) -> String {
+    format!(
+        "{RUBYGEMS_API_BASE}/versions/{}.json",
+        urlencoding::encode(name)
+    )
+}
+
+/// Builds the rubygems.org API request URL for a gem's detailed info.
+fn gem_info_url(name: &str) -> String {
+    format!(
+        "{RUBYGEMS_API_BASE}/gems/{}.json",
+        urlencoding::encode(name)
+    )
+}
+
 /// Client for interacting with rubygems.org registry.
 #[derive(Clone)]
 pub struct RubyGemsRegistry {
@@ -37,7 +53,7 @@ impl RubyGemsRegistry {
 
     /// Fetches all versions for a gem.
     pub async fn get_versions(&self, name: &str) -> Result<Vec<BundlerVersion>> {
-        let url = format!("{}/versions/{}.json", RUBYGEMS_API_BASE, name);
+        let url = versions_url(name);
         let data = self.cache.get_cached(&url).await?;
         parse_versions_response(&data, name)
     }
@@ -68,7 +84,7 @@ impl RubyGemsRegistry {
 
     /// Gets detailed gem information.
     pub async fn get_gem_info(&self, name: &str) -> Result<GemInfo> {
-        let url = format!("{}/gems/{}.json", RUBYGEMS_API_BASE, name);
+        let url = gem_info_url(name);
         let data = self.cache.get_cached(&url).await?;
         parse_gem_info(&data)
     }
@@ -668,6 +684,41 @@ mod tests {
     async fn test_registry_creation() {
         let cache = Arc::new(HttpCache::new());
         let _registry = RubyGemsRegistry::new(cache);
+    }
+
+    /// #349: `foo?callback=evil` must not inject a query string into the
+    /// `versions.json` request URL — the raw `?` has to be percent-encoded, not left to
+    /// reach the request as a literal query separator. Asserted on the *parsed* URL
+    /// (`url::Url::parse`), not the raw format-string output: a `!url.contains('?')`
+    /// check alone would pass even while a decoded round trip still produced a real
+    /// query component at the transport layer.
+    #[test]
+    fn test_get_versions_url_encodes_query_injection() {
+        let name = "foo?callback=evil";
+        let url = versions_url(name);
+        let parsed = url::Url::parse(&url).unwrap();
+        assert!(parsed.query().is_none());
+        assert_eq!(parsed.path_segments().unwrap().count(), 4);
+        let last = parsed.path_segments().unwrap().next_back().unwrap();
+        assert_eq!(
+            urlencoding::decode(last.strip_suffix(".json").unwrap()).unwrap(),
+            name
+        );
+    }
+
+    /// #349: same query-injection guard for `get_gem_info`'s `gems/{name}.json` URL.
+    #[test]
+    fn test_get_gem_info_url_encodes_query_injection() {
+        let name = "foo?callback=evil";
+        let url = gem_info_url(name);
+        let parsed = url::Url::parse(&url).unwrap();
+        assert!(parsed.query().is_none());
+        assert_eq!(parsed.path_segments().unwrap().count(), 4);
+        let last = parsed.path_segments().unwrap().next_back().unwrap();
+        assert_eq!(
+            urlencoding::decode(last.strip_suffix(".json").unwrap()).unwrap(),
+            name
+        );
     }
 
     #[test]

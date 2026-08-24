@@ -27,6 +27,8 @@ yaml-rust2 = { workspace = true }
 deps-core = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true, features = ["html_reports"] }
 insta = { workspace = true, features = ["json"] }
+mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test = { workspace = true }
+url = { workspace = true }

@@ -8,7 +8,7 @@ use tower_lsp_server::ls_types::{
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_registry_url,
-    lsp_helpers::EcosystemFormatter,
+    lsp_helpers::{EcosystemFormatter, warn_rejected_value},
 };
 
 use crate::formatter::SwiftFormatter;
@@ -42,6 +42,7 @@ fn build_url_completion(
         .unwrap_or_else(|| format!("https://github.com/{}", package.name));
 
     if !is_safe_registry_url(&url) {
+        warn_rejected_value("is_safe_registry_url", "swift url completion", &url);
         return None;
     }
 

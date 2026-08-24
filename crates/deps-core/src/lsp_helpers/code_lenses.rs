@@ -6,7 +6,7 @@ use crate::PublishTime;
 
 use super::{
     EcosystemFormatter, LineOffsetTable, VersionData, is_safe_version_string, literal_span_matches,
-    slice_for_range, strip_whitespace,
+    slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
 /// Manifest edits bringing every safely-editable outdated dependency to `latest`.
@@ -137,6 +137,11 @@ pub fn collect_update_all_edits(
             continue;
         };
         if !is_safe_version_string(latest) {
+            warn_rejected_value(
+                "is_safe_version_string",
+                "update-all code lens edit",
+                latest,
+            );
             continue;
         }
 
