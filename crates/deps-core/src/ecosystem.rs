@@ -64,6 +64,8 @@ pub enum EcosystemId {
     Swift,
     /// .NET NuGet ecosystem (`.csproj`/`.fsproj`/`.vbproj`, `Directory.Packages.props`, `packages.config`).
     NuGet,
+    /// Deno ecosystem (`deno.json`/`deno.jsonc`), mixing `jsr:` and `npm:` specifiers.
+    Deno,
 }
 
 impl EcosystemId {
@@ -83,6 +85,7 @@ impl EcosystemId {
             Self::Gradle => "gradle",
             Self::Swift => "swift",
             Self::NuGet => "nuget",
+            Self::Deno => "deno",
         }
     }
 
@@ -107,7 +110,7 @@ impl EcosystemId {
     pub const fn osv_ecosystem(self) -> Option<&'static str> {
         Some(match self {
             Self::Cargo => "crates.io",
-            Self::Npm => "npm",
+            Self::Npm | Self::Deno => "npm",
             Self::Pypi => "PyPI",
             Self::Go => "Go",
             Self::Bundler => "RubyGems",
@@ -142,6 +145,7 @@ impl std::str::FromStr for EcosystemId {
             "gradle" => Ok(Self::Gradle),
             "swift" => Ok(Self::Swift),
             "nuget" => Ok(Self::NuGet),
+            "deno" => Ok(Self::Deno),
             _ => Err(crate::error::DepsError::UnsupportedEcosystem(s.to_string())),
         }
     }
@@ -562,6 +566,7 @@ mod tests {
             EcosystemId::Gradle,
             EcosystemId::Swift,
             EcosystemId::NuGet,
+            EcosystemId::Deno,
         ];
 
         for id in ALL {
@@ -585,6 +590,7 @@ mod tests {
             (EcosystemId::Gradle, "Maven"),
             (EcosystemId::Swift, "SwiftURL"),
             (EcosystemId::NuGet, "NuGet"),
+            (EcosystemId::Deno, "npm"),
         ];
 
         for (id, expected_str) in expected {

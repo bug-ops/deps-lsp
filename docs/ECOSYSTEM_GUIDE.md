@@ -4,7 +4,7 @@ This guide explains how to add support for a new package ecosystem (e.g., Go mod
 
 ## Supported Ecosystems
 
-deps-lsp provides comprehensive LSP support for 11 package ecosystems:
+deps-lsp provides comprehensive LSP support for 12 package ecosystems:
 
 | Ecosystem | Language | Manifest File(s) | Lock File(s) | Features |
 |-----------|----------|-----------------|--------------|----------|
@@ -19,6 +19,7 @@ deps-lsp provides comprehensive LSP support for 11 package ecosystems:
 | **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
 | **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, GitHub API support (code lens not covered — see below) |
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling |
+| **Deno** | JSR/npm | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
 
 ### Yanked-Version Diagnostics
 
@@ -49,6 +50,7 @@ section for how the two are deduplicated.
 | Swift | No | Swift package registries expose no per-tag yank signal |
 | NuGet | No | unlisted versions are not distinguishable from listed ones today |
 | Composer | No | Packagist's `abandoned` flag is package-level, not per-version — enabling it would fire on nearly every dependency of an abandoned package rather than the specific withdrawn release |
+| Deno | Yes | JSR `meta.json` per-version `yanked` (genuine) for `jsr:` specifiers; npm `deprecated` (same package-level caveat as the npm row above) for `npm:` specifiers |
 
 ### PyPI Environment Markers (PEP 508)
 
@@ -132,6 +134,16 @@ pays for the signal differently:
   `{version: date}` map derived from the full packument's `time` field instead. This is the
   one ecosystem in this project where `freshness.enabled: false` genuinely removes a whole
   request per hover/completion round, not just a conditional revalidation.
+
+### Deno Freshness
+
+`jsr:` specifiers get full freshness coverage at **zero extra request cost** — better than
+both NuGet and npm above. JSR's `meta.json` (the same response `JsrRegistry::get_versions`
+already fetches for the version list) carries a per-version `createdAt` timestamp, so
+`published_at` is populated unconditionally with no separate fetch and no TTL to tune.
+`npm:` specifiers in `deno.json` inherit npm's own freshness behavior exactly (see
+NuGet/npm Release-Freshness Coverage above), since `DenoRegistry` delegates them to the
+same `deps-npm` registry client `package.json` uses.
 
 ### CodeLens: "Update N Outdated Dependencies"
 
@@ -222,7 +234,7 @@ This is distinct from `Unknown package` (the package itself was not found) and f
 latest release). The two are mutually exclusive on the same dependency — a requirement is
 either up to date, outdated-but-satisfiable, or unsatisfiable, never more than one at once.
 
-The check is always on (no configuration flag) across all 11 ecosystems, and is
+The check is always on (no configuration flag) across all 12 ecosystems, and is
 deliberately conservative:
 
 - **Suppressed while versions are still loading**, or if the registry fetch failed — an
@@ -358,8 +370,9 @@ dependency, so only one yanked diagnostic is ever shown per dependency.
 | Gradle | No | reuses Maven Central's registry client, same hardcoded `false` |
 | NuGet | No | `NuGetVersion::is_yanked` is a hardcoded `false` constant |
 | Swift | No | `SwiftVersion.yanked` is a field that is always `false` for GitHub tags (no such concept in the source) |
+| Deno | Yes, exact pins only | JSR `meta.json` per-version `yanked` for `jsr:` specifiers; npm `deprecated` (see restriction above) for `npm:` specifiers |
 
-5 of 11 ecosystems can produce this diagnostic today; the other 6 have no real yanked signal
+6 of 12 ecosystems can produce this diagnostic today; the other 6 have no real yanked signal
 to source it from (three are architecturally impossible — no such registry concept exists —
 and Go's is a fixable but separate gap).
 
@@ -1086,6 +1099,7 @@ See existing implementations for reference:
 - `crates/deps-composer/` - PHP/composer.json with Packagist V2 API
 - `crates/deps-swift/` - Swift/Package.swift with GitHub API support
 - `crates/deps-nuget/` - C#/.NET/.csproj/packages.config with NuGet V3 registry (SemVer2 prerelease, central package management)
+- `crates/deps-deno/` - Deno/deno.json with the JSR API, delegating `npm:` specifiers to `deps-npm`'s registry client — the reference implementation for an ecosystem that dispatches across two registries from one manifest
 
 ## Key API Contracts
 

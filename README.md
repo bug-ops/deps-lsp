@@ -7,7 +7,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.91-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, and NuGet ecosystems.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, NuGet, and Deno ecosystems.
 
 ![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
 
@@ -39,6 +39,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | Swift | SPM | `Package.swift` | Supported |
 | PHP | Composer | `composer.json` | Supported |
 | C# | NuGet | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | Supported |
+| Deno | JSR/npm | `deno.json`, `deno.jsonc` | Supported |
 
 > [!NOTE]
 > **Ecosystem details:**
@@ -51,6 +52,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 > - **Swift** — all `.package()` forms (from, upToNextMajor/Minor, exact, range, branch, revision, path); versions via GitHub API tags
 > - **Composer** — `require`/`require-dev` sections, Packagist v2 API with metadata de-minification, Composer-specific tilde semantics (`~1.2` = `>=1.2.0 <2.0.0`)
 > - **NuGet** — `PackageReference` (attribute and child-element form), Central Package Management (`Directory.Packages.props`), legacy `packages.config`, `packages.lock.json`; NuGet V3 registry (service index, flat container, search)
+> - **Deno** — `imports` map only (`scopes`/`importMap` not yet supported); `jsr:` specifiers via the keyless JSR API, `npm:` specifiers reuse the existing npm registry client; no `deno.lock` support yet
 
 ## Installation
 
@@ -111,6 +113,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `swift` | Swift | Package.swift | Yes |
 | `composer` | PHP | composer.json | Yes |
 | `nuget` | C# | .csproj, Directory.Packages.props, packages.config | Yes |
+| `deno` | Deno (JSR/npm) | deno.json, deno.jsonc | Yes |
 
 ## Usage
 
@@ -342,6 +345,7 @@ deps-lsp/
 │   ├── deps-swift/     # Package.swift parser + GitHub API registry
 │   ├── deps-composer/  # composer.json parser + Packagist registry
 │   ├── deps-nuget/     # .csproj/packages.config parser + NuGet V3 registry
+│   ├── deps-deno/      # deno.json parser + JSR registry (npm: delegates to deps-npm)
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration

@@ -513,6 +513,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "deps-deno"
+version = "0.10.1"
+dependencies = [
+ "deps-core",
+ "deps-npm",
+ "jsonc-parser",
+ "mockito",
+ "node-semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tower-lsp-server",
+ "tracing",
+ "urlencoding",
+]
+
+[[package]]
 name = "deps-go"
 version = "0.10.1"
 dependencies = [
@@ -559,6 +577,7 @@ dependencies = [
  "deps-composer",
  "deps-core",
  "deps-dart",
+ "deps-deno",
  "deps-go",
  "deps-gradle",
  "deps-maven",
@@ -1312,6 +1331,12 @@ dependencies = [
  "futures-util",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "jsonc-parser"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0560e3f9a9a03ea6b6e90b41138c5db9e21526c99eb192c1a26c68176593285"
 
 [[package]]
 name = "lazy_static"

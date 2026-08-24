@@ -1085,6 +1085,7 @@ mod tests {
             ("gradle", EcosystemId::Gradle),
             ("swift", EcosystemId::Swift),
             ("nuget", EcosystemId::NuGet),
+            ("deno", EcosystemId::Deno),
         ] {
             let parsed: EcosystemId = id
                 .parse()
@@ -1271,6 +1272,25 @@ mod tests {
 
             assert_eq!(doc_state.ecosystem_id(), "npm");
             assert_eq!(doc_state.ecosystem, EcosystemId::Npm);
+            assert!(doc_state.parse_result.is_none());
+        }
+    }
+
+    // =========================================================================
+    // Deno ecosystem tests
+    // =========================================================================
+
+    #[cfg(feature = "deno")]
+    mod deno_tests {
+        use super::*;
+
+        #[test]
+        fn test_document_state_new_without_parse_result() {
+            let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0"}}"#.to_string();
+            let doc_state = DocumentState::new_without_parse_result(EcosystemId::Deno, content);
+
+            assert_eq!(doc_state.ecosystem_id(), "deno");
+            assert_eq!(doc_state.ecosystem, EcosystemId::Deno);
             assert!(doc_state.parse_result.is_none());
         }
     }

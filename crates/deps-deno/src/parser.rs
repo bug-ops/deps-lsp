@@ -1,0 +1,413 @@
+//! `deno.json` / `deno.jsonc` parser using `jsonc-parser`'s AST (D6).
+//!
+//! Plain JSON is a strict subset of JSONC, so both `deno.json` and `deno.jsonc` share this
+//! single code path. The AST (rather than `deps-npm`'s `serde_json` + text-search pattern)
+//! is required because Deno import maps routinely point several aliases at the identical
+//! specifier value — a find-first-occurrence text search would hand every such alias the
+//! same source position, corrupting hover/inlay-hint/code-action targeting.
+
+use crate::error::{DenoError, Result};
+use crate::specifier::parse_specifier;
+use crate::types::{DenoDependency, DenoDependencySection};
+use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::{PackageName, VersionReq};
+use jsonc_parser::ast::{Object, ObjectProp, StringLit, Value};
+use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
+use std::borrow::Cow;
+use std::collections::HashSet;
+use tower_lsp_server::ls_types::{Range, Uri};
+
+/// Result of parsing a `deno.json`/`deno.jsonc` file.
+#[derive(Debug)]
+pub struct DenoParseResult {
+    /// All dependencies found in the `imports` map.
+    pub dependencies: Vec<DenoDependency>,
+    /// Document URI.
+    pub uri: Uri,
+}
+
+deps_core::impl_parse_result!(
+    DenoParseResult,
+    DenoDependency {
+        dependencies: dependencies,
+        uri: uri,
+    }
+);
+
+/// Parses a `deno.json`/`deno.jsonc` file and extracts all `imports` entries with
+/// positions.
+///
+/// # Errors
+///
+/// Returns an error if the content is not valid JSON/JSONC (malformed syntax, unclosed
+/// block comment, stray brace) — the file is then not recognized as a Deno manifest and
+/// degrades gracefully (spec §6), matching every other ecosystem's parse-failure behavior.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_deno::parser::parse_deno_json;
+/// use tower_lsp_server::ls_types::Uri;
+///
+/// let json = r#"{
+///   "imports": {
+///     "@std/fs": "jsr:@std/fs@^1.0"
+///   }
+/// }"#;
+/// let uri = Uri::from_file_path("/project/deno.json").unwrap();
+///
+/// let result = parse_deno_json(json, &uri).unwrap();
+/// assert_eq!(result.dependencies.len(), 1);
+/// assert_eq!(result.dependencies[0].name, "jsr:@std/fs");
+/// ```
+pub fn parse_deno_json(content: &str, uri: &Uri) -> Result<DenoParseResult> {
+    let ast = parse_to_ast(
+        content,
+        &CollectOptions::default(),
+        &ParseOptions::default(),
+    )
+    .map_err(|e| DenoError::JsonParseError {
+        message: e.to_string(),
+    })?;
+
+    let line_table = LineOffsetTable::new(content);
+    let mut dependencies = Vec::new();
+
+    if let Some(Value::Object(root)) = ast.value
+        && let Some(imports_prop) = find_last_prop(&root, "imports")
+        && let Value::Object(imports) = &imports_prop.value
+    {
+        collect_imports(imports, content, &line_table, &mut dependencies);
+    }
+
+    Ok(DenoParseResult {
+        dependencies,
+        uri: uri.clone(),
+    })
+}
+
+/// Finds the property named `key` in `object`, taking the *last* one if `key` occurs more
+/// than once — JSON's last-key-wins semantics (spec §6), which `jsonc-parser`'s
+/// `Vec<ObjectProp>` does not enforce on its own (unlike `serde_json::Map`, which dedupes
+/// during parsing).
+fn find_last_prop<'a, 'b>(object: &'a Object<'b>, key: &str) -> Option<&'a ObjectProp<'b>> {
+    object
+        .properties
+        .iter()
+        .rev()
+        .find(|prop| prop.name.as_str() == key)
+}
+
+/// Builds a [`DenoDependency`] for every entry in the `imports` object, applying
+/// last-alias-wins deduplication (S6) so a manifest with two entries for the same import
+/// alias produces exactly one dependency — positioned at the *last* occurrence, matching
+/// where its value actually lives once JSON parsing collapses the duplicate.
+fn collect_imports(
+    imports: &Object,
+    content: &str,
+    line_table: &LineOffsetTable,
+    out: &mut Vec<DenoDependency>,
+) {
+    let mut seen_aliases = HashSet::new();
+    let mut collected = Vec::new();
+
+    // Walk in reverse (last occurrence first) so the first alias we see for a given key
+    // is the one that wins; earlier (source-order) duplicates are then skipped.
+    for prop in imports.properties.iter().rev() {
+        let alias = prop.name.as_str();
+        if !seen_aliases.insert(alias.to_string()) {
+            continue;
+        }
+        let Value::StringLit(value_lit) = &prop.value else {
+            continue;
+        };
+        if let Some(dep) = build_dependency(value_lit, content, line_table) {
+            collected.push(dep);
+        }
+    }
+
+    // Restore source order for the surviving (deduplicated) entries.
+    collected.reverse();
+    out.extend(collected);
+}
+
+/// Builds a [`DenoDependency`] from one `imports` value's string literal, or `None` if the
+/// value is not a recognized `jsr:`/`npm:` specifier (D7 — e.g. `http://`, `file:`, a bare
+/// alias — silently skipped, same as an unparseable entry in any other ecosystem).
+fn build_dependency(
+    value_lit: &StringLit,
+    content: &str,
+    line_table: &LineOffsetTable,
+) -> Option<DenoDependency> {
+    let parsed = parse_specifier(value_lit.value.as_ref())?;
+
+    // S5 escape guard: `value_lit.range` covers the whole literal *including* its
+    // surrounding quotes. Byte-arithmetic from that range into `parsed`'s offsets (which
+    // are relative to the *unescaped* value) is only sound when no unescaping happened —
+    // exactly when `value_lit.value` is `Cow::Borrowed` (a direct slice of the source).
+    // Deno specifiers never legitimately need escapes, so this is a correctness
+    // fail-safe, not a feature: fall back to the literal's inner span (excluding the
+    // quotes) as `name_range`, and no `version_range` — never the whole literal including
+    // quotes, which would let a later text-edit delete the quotes and corrupt the JSON.
+    let Cow::Borrowed(_) = &value_lit.value else {
+        tracing::debug!(
+            "deno.json: import value contains escape sequences, skipping precise position tracking"
+        );
+        let inner_start = value_lit.range.start + 1;
+        let inner_end = value_lit.range.end.saturating_sub(1);
+        return Some(DenoDependency {
+            name: PackageName::new(parsed.name),
+            name_range: byte_range_to_lsp(content, line_table, inner_start, inner_end),
+            version_req: parsed.version_req.map(VersionReq::new),
+            version_range: None,
+            section: DenoDependencySection::Imports,
+        });
+    };
+
+    // The literal's inner (unquoted) text starts right after its opening quote.
+    let value_start = value_lit.range.start + 1;
+
+    let name_range = byte_range_to_lsp(
+        content,
+        line_table,
+        value_start + parsed.name_range.start,
+        value_start + parsed.name_range.end,
+    );
+    let version_range = parsed.version_range.map(|r| {
+        byte_range_to_lsp(
+            content,
+            line_table,
+            value_start + r.start,
+            value_start + r.end,
+        )
+    });
+
+    Some(DenoDependency {
+        name: PackageName::new(parsed.name),
+        name_range,
+        version_req: parsed.version_req.map(VersionReq::new),
+        version_range,
+        section: DenoDependencySection::Imports,
+    })
+}
+
+/// Converts a `[start, end)` byte range in `content` to an LSP `Range`.
+fn byte_range_to_lsp(content: &str, table: &LineOffsetTable, start: usize, end: usize) -> Range {
+    Range::new(
+        table.byte_offset_to_position(content, start),
+        table.byte_offset_to_position(content, end),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_uri() -> Uri {
+        deps_core::test_util::test_uri("/test/deno.json")
+    }
+
+    #[test]
+    fn test_parse_simple_jsr_import() {
+        let json = r#"{
+  "imports": {
+    "@std/fs": "jsr:@std/fs@^1.0"
+  }
+}"#;
+
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "jsr:@std/fs");
+        assert_eq!(dep.version_req, Some("^1.0".into()));
+        assert!(matches!(dep.section, DenoDependencySection::Imports));
+    }
+
+    #[test]
+    fn test_parse_npm_import() {
+        let json = r#"{
+  "imports": {
+    "react": "npm:react@^18"
+  }
+}"#;
+
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "npm:react");
+        assert_eq!(result.dependencies[0].version_req, Some("^18".into()));
+    }
+
+    #[test]
+    fn test_parse_mixed_jsr_and_npm() {
+        let json = r#"{
+  "imports": {
+    "@std/fs": "jsr:@std/fs@^1.0",
+    "react": "npm:react@^18",
+    "preact": "npm:preact@^10"
+  }
+}"#;
+
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        assert!(result.dependencies.iter().any(|d| d.name == "jsr:@std/fs"));
+        assert!(result.dependencies.iter().any(|d| d.name == "npm:react"));
+        assert!(result.dependencies.iter().any(|d| d.name == "npm:preact"));
+    }
+
+    #[test]
+    fn test_parse_empty_imports() {
+        let json = r#"{"imports": {}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_parse_no_imports_key() {
+        let json = r#"{"name": "my-app"}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_parse_unsupported_specifier_silently_skipped() {
+        let json = r#"{
+  "imports": {
+    "@std/fs": "jsr:@std/fs@^1.0",
+    "legacy": "https://deno.land/x/legacy/mod.ts",
+    "local": "./local.ts"
+  }
+}"#;
+
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "jsr:@std/fs");
+    }
+
+    #[test]
+    fn test_parse_invalid_json_errors() {
+        let json = "{ imports: not valid json !!!";
+        let result = parse_deno_json(json, &test_uri());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_jsonc_comments_tolerated() {
+        let jsonc = r#"{
+  // line comment
+  "imports": {
+    /* block comment */
+    "@std/fs": "jsr:@std/fs@^1.0"
+  }
+}"#;
+
+        let result = parse_deno_json(jsonc, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "jsr:@std/fs");
+    }
+
+    #[test]
+    fn test_duplicate_alias_keys_last_wins() {
+        // S6: jsonc-parser's `Vec<ObjectProp>` does not dedupe like serde_json::Map does.
+        let json = r#"{
+  "imports": {
+    "@std/fs": "jsr:@std/fs@^1.0",
+    "@std/fs": "jsr:@std/fs@^2.0"
+  }
+}"#;
+
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].version_req, Some("^2.0".into()));
+        // The surviving dependency's position must be the *last* occurrence's line.
+        assert_eq!(result.dependencies[0].name_range.start.line, 3);
+    }
+
+    #[test]
+    fn test_two_aliases_same_specifier_get_distinct_positions() {
+        // The core reason D6 uses the AST rather than deps-npm's text-search pattern:
+        // two different aliases mapping to the identical specifier value must not collapse
+        // onto the same source position.
+        let json = r#"{
+  "imports": {
+    "@std/fs": "jsr:@std/fs@^1.0",
+    "@std/fs/": "jsr:@std/fs@^1.0"
+  }
+}"#;
+
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        let lines: Vec<u32> = result
+            .dependencies
+            .iter()
+            .map(|d| d.name_range.start.line)
+            .collect();
+        assert_ne!(lines[0], lines[1]);
+    }
+
+    #[test]
+    fn test_empty_version_after_at_produces_a_version_range() {
+        // S7, exercised through the full parser: the completion path relies on
+        // `version_range` being `Some` (an empty span) right after the user types '@'.
+        let json = r#"{"imports": {"@std/fs": "jsr:@std/fs@"}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.version_req, Some(String::new().into()));
+        let range = dep.version_range.expect("version_range must be Some");
+        assert_eq!(range.start, range.end);
+    }
+
+    #[test]
+    fn test_scoped_npm_import() {
+        let json = r#"{"imports": {"node-types": "npm:@types/node@^20"}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "npm:@types/node");
+        assert_eq!(result.dependencies[0].version_req, Some("^20".into()));
+    }
+
+    #[test]
+    fn test_escaped_specifier_falls_back_to_inner_span_with_no_version_range() {
+        // S5 escape-guard fail-safe: a JSON `\uXXXX` escape inside the value (unescaping
+        // to the character '1' here) means `value_lit.value` is `Cow::Owned`, so
+        // byte-offset arithmetic into the raw *source* text is unsound for anything
+        // narrower than the whole literal. `name`/`version_req` still come from the
+        // already-unescaped value (jsonc-parser did that work); only position tracking
+        // degrades to the inner-span fallback with no `version_range`.
+        let json_escape = "\\u0031"; // a JSON \uXXXX escape unescaping to the character '1'
+        let raw_value = format!("jsr:@std/fs@{json_escape}.0"); // raw source text, escape included
+        let json = format!(r#"{{"imports": {{"@std/fs": "{raw_value}"}}}}"#);
+        let result = parse_deno_json(&json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "jsr:@std/fs");
+        assert_eq!(dep.version_req, Some("1.0".into()));
+        assert!(dep.version_range.is_none());
+
+        // name_range widens to the raw literal's inner span (excluding quotes) — the
+        // whole escaped value text, not just the name portion, and never the whole
+        // literal *including* quotes (which would let a later edit delete them).
+        let value_start_byte = json.find(&format!("\"{raw_value}\"")).unwrap() + 1;
+        let value_end_byte = value_start_byte + raw_value.len();
+
+        assert_eq!(dep.name_range.start.line, 0);
+        assert_eq!(dep.name_range.start.character, value_start_byte as u32);
+        assert_eq!(dep.name_range.end.character, value_end_byte as u32);
+    }
+
+    #[test]
+    fn test_unclosed_block_comment_is_a_parse_error() {
+        // deps-lsp testing gap: the only prior invalid-JSONC test used generic garbage
+        // text, not the JSONC-specific failure mode the parser's own docs name.
+        let jsonc = r#"{
+  /* unclosed comment
+  "imports": {
+    "@std/fs": "jsr:@std/fs@^1.0"
+  }
+}"#;
+        let result = parse_deno_json(jsonc, &test_uri());
+        assert!(result.is_err());
+    }
+}

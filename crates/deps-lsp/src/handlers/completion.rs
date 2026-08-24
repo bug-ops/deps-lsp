@@ -243,7 +243,8 @@ const fn uses_xml_tag_values(ecosystem_kind: EcosystemId) -> bool {
         | EcosystemId::Gradle
         | EcosystemId::Swift
         | EcosystemId::NuGet
-        | EcosystemId::Bundler => false,
+        | EcosystemId::Bundler
+        | EcosystemId::Deno => false,
     }
 }
 
@@ -271,6 +272,23 @@ fn strip_leading_xml_tag(prefix: &str) -> &str {
 ///
 /// Exhaustively matched, like [`is_in_dependencies_section`], so a future JSON-manifest
 /// ecosystem forces a decision here instead of silently keeping a stray quote.
+///
+/// `Deno` is deliberately `false` despite `deno.json` being JSON, unlike npm/Composer:
+/// the npm analogy doesn't hold here because the completable text at a package-name
+/// position in `deno.json` is the JSON *value* (the `jsr:`/`npm:` specifier string), not
+/// the *key* (the import alias) — `extract_prefix`'s whole-line-to-cursor-then-trim
+/// approach only strips a stray quote correctly for a key-position completion, so
+/// applying it to Deno would leak the alias and colon into the fallback search query.
+///
+/// Fallback (raw-text) completion does still *run* for Deno — `is_in_dependencies_section`
+/// returns `true` inside `imports`, same as any other JSON ecosystem — but it is harmless:
+/// the raw line-start-to-cursor text `extract_prefix` produces is always preceded by the
+/// alias key, colon and opening quote in real JSON (`"@std/fs": "jsr:@std/f`), so it can
+/// never coincide with a bare `jsr:`/`npm:` prefix. `DenoRegistry::search` (`deps-deno`)
+/// therefore always takes its scheme-less `None => Ok(vec![])` arm for this path, so the
+/// fallback query is effectively a no-op rather than a source of garbage results — it is
+/// the primary `detect_completion_context`-based path
+/// (`DenoEcosystem::generate_completions`) that does the real work.
 const fn uses_json_quoted_keys(ecosystem_kind: EcosystemId) -> bool {
     match ecosystem_kind {
         EcosystemId::Npm | EcosystemId::Composer => true,
@@ -282,7 +300,8 @@ const fn uses_json_quoted_keys(ecosystem_kind: EcosystemId) -> bool {
         | EcosystemId::Gradle
         | EcosystemId::Swift
         | EcosystemId::NuGet
-        | EcosystemId::Bundler => false,
+        | EcosystemId::Bundler
+        | EcosystemId::Deno => false,
     }
 }
 
@@ -338,6 +357,7 @@ fn is_in_dependencies_section(
         // packages.config lists `<package>` elements directly under its root with no
         // such wrapper. See the Bundler arm above for why this is `false`.
         EcosystemId::NuGet => false,
+        EcosystemId::Deno => is_in_json_dependencies(content, line_number, &["imports"]),
     }
 }
 
@@ -624,6 +644,22 @@ fn create_package_completion_item(
             format!("<PackageReference Include=\"{name}\" Version=\"{latest}\" />")
         }
         EcosystemId::Bundler => format!("gem \"{name}\", \"~> {latest}\""),
+        EcosystemId::Deno => {
+            // D11: the alias key is conventionally the bare name (scheme stripped); the
+            // value is the full scheme-qualified specifier.
+            let bare = name
+                .as_str()
+                .split_once(':')
+                .map_or(name.as_str(), |(_, rest)| rest);
+            // N5: an empty `latest` (a JSR search hit with no `latestVersion`) must not
+            // insert a dangling `@^` with nothing after it — mirrors the Swift arm's
+            // `latest.is_empty()` guard above.
+            if latest.is_empty() {
+                format!("\"{bare}\": \"{name}\"")
+            } else {
+                format!("\"{bare}\": \"{name}@^{latest}\"")
+            }
+        }
     };
 
     // Build detail text
@@ -1107,6 +1143,18 @@ requests
     }
 
     #[test]
+    fn test_is_in_dependencies_section_deno() {
+        let content = r#"{
+  "name": "test",
+  "imports": {
+    "@std/fs": "jsr:@std/fs@^1.0"
+  }
+}"#;
+        assert!(is_in_dependencies_section(content, 3, EcosystemId::Deno));
+        assert!(!is_in_dependencies_section(content, 1, EcosystemId::Deno));
+    }
+
+    #[test]
     fn test_is_in_dependencies_section_no_raw_text_boundary_ecosystems() {
         // No existing raw-text section boundary: `false` preserves pre-fix behavior
         // (fallback completion disabled) rather than risking spurious registry
@@ -1342,6 +1390,52 @@ requests
                 ".package(url: \"https://github.com/apple/swift-nio\", from: \"2.62.0\")"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_deno_strips_scheme_for_alias_key() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("jsr:@std/fs"),
+            repository: None,
+            latest_version: "1.0.24",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Deno);
+
+        assert_eq!(
+            item.insert_text,
+            Some("\"@std/fs\": \"jsr:@std/fs@^1.0.24\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_deno_npm_scheme() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("npm:react"),
+            repository: None,
+            latest_version: "18.3.1",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Deno);
+
+        assert_eq!(
+            item.insert_text,
+            Some("\"react\": \"npm:react@^18.3.1\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_deno_empty_latest_omits_version_clause() {
+        // N5: a JSR search hit lacking `latestVersion` must not insert a dangling `@^`.
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("jsr:@std/fs"),
+            repository: None,
+            latest_version: "",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Deno);
+
+        assert_eq!(
+            item.insert_text,
+            Some("\"@std/fs\": \"jsr:@std/fs\"".to_string())
         );
     }
 

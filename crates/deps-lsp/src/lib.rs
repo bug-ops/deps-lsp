@@ -201,6 +201,24 @@ ecosystem!(
     ]
 );
 
+ecosystem!(
+    "deno",
+    deps_deno,
+    DenoEcosystem,
+    [
+        DenoDependency,
+        DenoDependencySection,
+        DenoFormatter,
+        DenoMetadata,
+        DenoParseResult,
+        DenoRegistry,
+        JsrPackage,
+        JsrRegistry,
+        JsrVersion,
+        parse_deno_json,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
     register!("cargo", CargoEcosystem, registry, &cache);
@@ -214,6 +232,7 @@ pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) 
     register!("swift", SwiftEcosystem, registry, &cache);
     register!("composer", ComposerEcosystem, registry, &cache);
     register!("nuget", NuGetEcosystem, registry, &cache);
+    register!("deno", DenoEcosystem, registry, &cache);
 }
 
 #[cfg(test)]
@@ -248,6 +267,8 @@ mod tests {
         assert!(registry.get("composer").is_some());
         #[cfg(feature = "nuget")]
         assert!(registry.get("nuget").is_some());
+        #[cfg(feature = "deno")]
+        assert!(registry.get("deno").is_some());
     }
 
     /// Regression guard for issue #118: `EcosystemId`'s string literals (`deps-core`)
@@ -296,5 +317,7 @@ mod tests {
         );
         #[cfg(feature = "nuget")]
         assert!(registry.get(deps_core::EcosystemId::NuGet.id()).is_some());
+        #[cfg(feature = "deno")]
+        assert!(registry.get(deps_core::EcosystemId::Deno.id()).is_some());
     }
 }
