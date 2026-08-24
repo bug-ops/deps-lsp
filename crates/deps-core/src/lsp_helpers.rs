@@ -14,6 +14,12 @@ use crate::{
     Registry, Version, VersionReq, format_relative_age,
 };
 
+/// Maximum number of recent versions hover's "Recent versions" section renders.
+///
+/// Also the walk target for registries (NuGet, npm) that must fetch publish times for
+/// only the versions actually rendered, rather than the entire version history.
+pub const HOVER_RECENT_VERSIONS: usize = 8;
+
 /// Registry version data for one package, fetched together in a single round trip.
 ///
 /// `latest` and `available` are deliberately asymmetric — this is load-bearing, not an
@@ -1196,7 +1202,11 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     if let Some(available_versions) = &available_versions {
         markdown.push_str("**Recent versions**:\n");
         let now = PublishTime::now();
-        for (i, version) in available_versions.iter().take(8).enumerate() {
+        for (i, version) in available_versions
+            .iter()
+            .take(HOVER_RECENT_VERSIONS)
+            .enumerate()
+        {
             let version_span = markdown_code_span(version.version_string());
             let age_suffix = if freshness.enabled {
                 version_age_suffix(version.as_ref(), now)

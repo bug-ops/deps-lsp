@@ -18,7 +18,7 @@ quick-xml = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "sync"] }
+tokio = { workspace = true, features = ["fs", "macros", "sync"] }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 urlencoding = { workspace = true }

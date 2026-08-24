@@ -7,13 +7,18 @@
 
 use crate::types::{NuGetVersion, PackageInfo};
 use crate::version::compare_versions;
-use deps_core::{HttpCache, Result};
+use deps_core::{HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result};
 use serde::Deserialize;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 const SERVICE_INDEX_URL: &str = "https://api.nuget.org/v3/index.json";
+
+/// Safety bound on external (non-inline) registration page fetches per `get_versions_with`
+/// call. Real packages need at most one (§1.1); this only guards a pathological feed.
+const MAX_EXTERNAL_PAGE_FETCHES: usize = 2;
 
 /// Display name for NuGet used in not-found and API-response error messages.
 pub const REGISTRY: &str = "NuGet";
@@ -38,6 +43,12 @@ struct ServiceIndex {
     package_base_address: String,
     /// `SearchQueryService/3.5.0` (preferred) or bare `SearchQueryService`.
     search_query_service: String,
+    /// `RegistrationsBaseUrl/3.6.0` (SemVer 2.0.0, preferred), falling back to `3.4.0`
+    /// (SemVer 1) or the bare, undated resource. `Option`, not error-gated: a private V3
+    /// feed (Azure Artifacts, BaGet, GitHub Packages) may omit this resource entirely, in
+    /// which case freshness degrades to `published_at == None` everywhere rather than
+    /// failing `get_versions` for that feed.
+    registrations_base_url: Option<String>,
 }
 
 fn pick_resource(resources: &[ServiceResource], type_preference: &[&str]) -> Option<String> {
@@ -68,12 +79,63 @@ impl ServiceIndex {
             file_type: "NuGet service index".into(),
             source: Box::new(std::io::Error::other("missing SearchQueryService resource")),
         })?;
+        let registrations_base_url = pick_resource(
+            &response.resources,
+            &[
+                "RegistrationsBaseUrl/3.6.0",
+                "RegistrationsBaseUrl/3.4.0",
+                "RegistrationsBaseUrl",
+            ],
+        );
 
         Ok(Self {
             package_base_address,
             search_query_service,
+            registrations_base_url,
         })
     }
+}
+
+/// Registration hive index (`RegistrationsBaseUrl/{id}/index.json`): a list of pages, each
+/// either inline (`items` present) or an external stub (`items` absent, fetched via `id`).
+#[derive(Debug, Deserialize)]
+struct RegistrationIndex {
+    #[serde(default)]
+    items: Vec<RegistrationPage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistrationPage {
+    #[serde(rename = "@id")]
+    id: String,
+    /// Present for an inline page; `None` for an externalized page, which must be fetched
+    /// separately at `id` to obtain the same shape as [`RegistrationPageBody`].
+    #[serde(default)]
+    items: Option<Vec<CatalogEntryWrapper>>,
+}
+
+/// Body of a fetched external registration page — structurally identical to a
+/// [`RegistrationPage`]'s inline `items`.
+#[derive(Debug, Deserialize)]
+struct RegistrationPageBody {
+    #[serde(default)]
+    items: Vec<CatalogEntryWrapper>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogEntryWrapper {
+    #[serde(rename = "catalogEntry")]
+    catalog_entry: CatalogEntry,
+}
+
+#[derive(Debug, Deserialize)]
+struct CatalogEntry {
+    version: String,
+    /// Absent/malformed degrades to no publish time for that version, not an error. The
+    /// unlisted sentinel (`1900-01-01T00:00:00+00:00`) parses successfully but is filtered
+    /// out by [`accumulate_catalog_entries`] rather than rendered as a bogus 126-year age.
+    #[serde(default)]
+    published: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,16 +207,128 @@ impl NuGetRegistry {
     /// Fetches all available versions for `name` from the flat-container endpoint,
     /// sorted newest-first.
     ///
+    /// Delegates to [`Self::get_versions_typed_with`] with freshness disabled so the two
+    /// paths cannot drift apart.
+    ///
     /// # Errors
     ///
     /// Returns an error if the service index cannot be resolved or the flat-container
     /// request fails.
     pub async fn get_versions_typed(&self, name: &str) -> Result<Vec<NuGetVersion>> {
-        let index = self.service_index().await?;
-        let url = flat_container_url(&index.package_base_address, name);
+        self.get_versions_typed_with(name, false).await
+    }
 
-        let data = self.cache.get_cached(&url).await?;
-        parse_flat_container(&data)
+    /// Same as [`Self::get_versions_typed`], but attaches [`NuGetVersion::published_at`]
+    /// from the registration hive when `freshness_enabled` and the feed exposes a
+    /// `RegistrationsBaseUrl` resource.
+    ///
+    /// The flat-container fetch (version list) and the registration-index fetch (for
+    /// publish times) are independent once the service index is resolved, so they run
+    /// concurrently via `tokio::join!` rather than sequentially — this matters because
+    /// `complete_versions_generic` is a per-keystroke completion path and `HttpCache` has
+    /// no TTL, so every call revalidates over the network.
+    ///
+    /// A registration-index fetch or parse failure degrades to no publish times, never to
+    /// an error: the version list itself must be unaffected by a listing problem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the service index cannot be resolved or the flat-container
+    /// request fails.
+    pub async fn get_versions_typed_with(
+        &self,
+        name: &str,
+        freshness_enabled: bool,
+    ) -> Result<Vec<NuGetVersion>> {
+        let index = self.service_index().await?;
+        let flat_url = flat_container_url(&index.package_base_address, name);
+        let registration_base = if freshness_enabled {
+            index.registrations_base_url.clone()
+        } else {
+            None
+        };
+
+        if let Some(base) = registration_base {
+            let registration_url = registration_index_url(&base, name);
+            let (flat_result, registration_result) = tokio::join!(
+                self.cache.get_cached(&flat_url),
+                self.cache.get_cached(&registration_url),
+            );
+            let mut versions = parse_flat_container(&flat_result?)?;
+            match registration_result {
+                Ok(registration_body) => {
+                    let times = self
+                        .publish_times_from_index(&registration_body, &base)
+                        .await;
+                    attach_publish_times(&mut versions, &times);
+                }
+                Err(e) => {
+                    tracing::debug!(package = %name, error = %e, "registration index fetch failed, publish times unavailable");
+                }
+            }
+            Ok(versions)
+        } else {
+            let data = self.cache.get_cached(&flat_url).await?;
+            parse_flat_container(&data)
+        }
+    }
+
+    /// Walks the registration hive backwards from the last page, collecting `published`
+    /// dates until at least [`HOVER_RECENT_VERSIONS`] entries have been examined.
+    ///
+    /// Pages are ordered ascending by version (mirroring the flat container's descending
+    /// order in reverse), so the tail of `index.items` holds the most recent versions —
+    /// exactly what hover renders. Terminates on whichever comes first: enough entries
+    /// collected, the index exhausted (packages with fewer total versions than the target),
+    /// or [`MAX_EXTERNAL_PAGE_FETCHES`] external pages fetched (a safety bound; real
+    /// packages need at most one, per the live measurements this plan is based on).
+    ///
+    /// Never fails the caller: a malformed index, an unreachable page, or a page `@id`
+    /// outside `base`'s origin all degrade to fewer (or zero) entries in the returned map.
+    async fn publish_times_from_index(
+        &self,
+        index_body: &[u8],
+        base: &str,
+    ) -> HashMap<String, PublishTime> {
+        let mut times = HashMap::new();
+        let Ok(index) = serde_json::from_slice::<RegistrationIndex>(index_body) else {
+            return times;
+        };
+
+        let mut collected = 0usize;
+        let mut external_fetches = 0usize;
+        let trusted_prefix = format!("{base}/");
+
+        for page in index.items.iter().rev() {
+            if collected >= HOVER_RECENT_VERSIONS {
+                break;
+            }
+
+            match &page.items {
+                Some(inline) => accumulate_catalog_entries(&mut times, &mut collected, inline),
+                None => {
+                    // A page `@id` outside the resolved registration base is skipped, not
+                    // trusted — the feed chooses `@id` values, and `ensure_https` blocks
+                    // non-HTTPS but not cross-origin redirection of our fetch (S2/M2).
+                    if !page.id.starts_with(&trusted_prefix) {
+                        continue;
+                    }
+                    if external_fetches >= MAX_EXTERNAL_PAGE_FETCHES {
+                        break;
+                    }
+                    external_fetches += 1;
+                    let Ok(body) = self.cache.get_cached(&page.id).await else {
+                        continue;
+                    };
+                    let Ok(parsed) = serde_json::from_slice::<RegistrationPageBody>(&body) else {
+                        continue;
+                    };
+                    accumulate_catalog_entries(&mut times, &mut collected, &parsed.items);
+                }
+            }
+        }
+
+        times
     }
 
     /// Finds the highest version of `name` matching `req` (exact pin, interval notation,
@@ -202,6 +376,47 @@ pub fn flat_container_url(base: &str, name: &str) -> String {
     format!("{base}/{}/index.json", urlencoding::encode(&lower))
 }
 
+/// Builds the registration-hive index URL for `name`. Same lowercasing/encoding rationale
+/// as [`flat_container_url`].
+pub fn registration_index_url(base: &str, name: &str) -> String {
+    let lower = name.to_lowercase();
+    format!("{base}/{}/index.json", urlencoding::encode(&lower))
+}
+
+/// Attaches `published_at` to each version whose string matches an entry in `times`.
+///
+/// A version present in `versions` but absent from `times` (or vice versa) is not an
+/// error: it simply keeps/never gets a `published_at`. Order is untouched.
+fn attach_publish_times(versions: &mut [NuGetVersion], times: &HashMap<String, PublishTime>) {
+    for v in versions {
+        v.published_at = times.get(&v.version).copied();
+    }
+}
+
+/// Extracts `(version, published)` pairs from a page's catalog entries into `times`,
+/// filtering the unlisted sentinel (`published <= epoch`) and any unparseable timestamp.
+/// Advances `collected` by the entry count regardless of whether a time was extracted, since
+/// the walk target in [`NuGetRegistry::publish_times_from_index`] is "entries examined", not
+/// "entries successfully timed".
+fn accumulate_catalog_entries(
+    times: &mut HashMap<String, PublishTime>,
+    collected: &mut usize,
+    entries: &[CatalogEntryWrapper],
+) {
+    for entry in entries {
+        let published = entry
+            .catalog_entry
+            .published
+            .as_deref()
+            .and_then(PublishTime::parse_rfc3339)
+            .filter(|t| t.as_unix_secs() > 0);
+        if let Some(published) = published {
+            times.insert(entry.catalog_entry.version.clone(), published);
+        }
+        *collected += 1;
+    }
+}
+
 /// Builds the `SearchQueryService` URL for `query`, limited to `limit` results.
 ///
 /// `semVerLevel=2.0.0` is mandatory (spec §1) — omitting it silently hides every package
@@ -225,7 +440,10 @@ pub fn parse_flat_container(data: &[u8]) -> Result<Vec<NuGetVersion>> {
 
     Ok(versions
         .into_iter()
-        .map(|version| NuGetVersion { version })
+        .map(|version| NuGetVersion {
+            version,
+            published_at: None,
+        })
         .collect())
 }
 
@@ -244,6 +462,7 @@ fn pick_latest_matching(versions: Vec<NuGetVersion>, req: &str) -> Option<NuGetV
         let strings: Vec<String> = versions.iter().map(|v| v.version.clone()).collect();
         return crate::version::resolve_float(&strings, req).map(|v| NuGetVersion {
             version: v.to_string(),
+            published_at: None,
         });
     }
 
@@ -283,6 +502,22 @@ impl deps_core::Registry for NuGetRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let versions = self.get_versions_typed(name.as_str()).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
+    }
+
+    fn get_versions_with<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        freshness: deps_core::FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let versions = self
+                .get_versions_typed_with(name.as_str(), freshness.enabled)
+                .await?;
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -371,6 +606,23 @@ mod tests {
                 "resources": [
                     {{"@id": "{package_base_address}", "@type": "PackageBaseAddress/3.0.0"}},
                     {{"@id": "{search_query_service}", "@type": "SearchQueryService/3.5.0"}}
+                ]
+            }}"#
+        )
+    }
+
+    fn service_index_body_with_registrations(
+        package_base_address: &str,
+        search_query_service: &str,
+        registrations_base_url: &str,
+    ) -> String {
+        format!(
+            r#"{{
+                "version": "3.0.0",
+                "resources": [
+                    {{"@id": "{package_base_address}", "@type": "PackageBaseAddress/3.0.0"}},
+                    {{"@id": "{search_query_service}", "@type": "SearchQueryService/3.5.0"}},
+                    {{"@id": "{registrations_base_url}", "@type": "RegistrationsBaseUrl/3.6.0"}}
                 ]
             }}"#
         )
@@ -558,6 +810,7 @@ mod tests {
     fn v(s: &str) -> NuGetVersion {
         NuGetVersion {
             version: s.to_string(),
+            published_at: None,
         }
     }
 
@@ -636,5 +889,584 @@ mod tests {
             vec![Box::new(v("1.1.0-rc.1")), Box::new(v("1.0.0"))];
         let req = VersionReq::new("*");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    // --- ServiceIndex::resolve: registrations_base_url preference (S2/rev2 OQ6) ---
+
+    #[test]
+    fn test_service_index_resolve_registrations_base_url_prefers_3_6_0() {
+        let response: ServiceIndexResponse = serde_json::from_str(
+            r#"{"version": "3.0.0", "resources": [
+                {"@id": "https://flat/", "@type": "PackageBaseAddress/3.0.0"},
+                {"@id": "https://search/", "@type": "SearchQueryService"},
+                {"@id": "https://reg-semver1/", "@type": "RegistrationsBaseUrl/3.4.0"},
+                {"@id": "https://reg-semver2/", "@type": "RegistrationsBaseUrl/3.6.0"}
+            ]}"#,
+        )
+        .unwrap();
+        let index = ServiceIndex::resolve(&response).unwrap();
+        assert_eq!(
+            index.registrations_base_url.as_deref(),
+            Some("https://reg-semver2")
+        );
+    }
+
+    #[test]
+    fn test_service_index_resolve_registrations_base_url_falls_back_to_3_4_0() {
+        let response: ServiceIndexResponse = serde_json::from_str(
+            r#"{"version": "3.0.0", "resources": [
+                {"@id": "https://flat/", "@type": "PackageBaseAddress/3.0.0"},
+                {"@id": "https://search/", "@type": "SearchQueryService"},
+                {"@id": "https://reg-semver1/", "@type": "RegistrationsBaseUrl/3.4.0"}
+            ]}"#,
+        )
+        .unwrap();
+        let index = ServiceIndex::resolve(&response).unwrap();
+        assert_eq!(
+            index.registrations_base_url.as_deref(),
+            Some("https://reg-semver1")
+        );
+    }
+
+    #[test]
+    fn test_service_index_resolve_registrations_base_url_absent_is_none() {
+        let response: ServiceIndexResponse =
+            serde_json::from_str(&service_index_body("https://flat/", "https://search/")).unwrap();
+        let index = ServiceIndex::resolve(&response).unwrap();
+        assert!(index.registrations_base_url.is_none());
+    }
+
+    #[test]
+    fn test_registration_index_url_lowercases_and_encodes() {
+        assert_eq!(
+            registration_index_url(
+                "https://api.nuget.org/v3/registration5-gz-semver2",
+                "Newtonsoft.Json"
+            ),
+            "https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json"
+        );
+    }
+
+    // --- attach_publish_times ---
+
+    #[test]
+    fn test_attach_publish_times_matches_by_version_string() {
+        let mut versions = vec![v("1.0.0"), v("2.0.0")];
+        let mut times = HashMap::new();
+        times.insert(
+            "1.0.0".to_string(),
+            PublishTime::parse_rfc3339("2020-01-01T00:00:00Z").unwrap(),
+        );
+        attach_publish_times(&mut versions, &times);
+        assert_eq!(
+            versions[0].published_at,
+            PublishTime::parse_rfc3339("2020-01-01T00:00:00Z")
+        );
+        assert_eq!(versions[1].published_at, None);
+    }
+
+    #[test]
+    fn test_attach_publish_times_empty_map_leaves_all_none() {
+        let mut versions = vec![v("1.0.0"), v("2.0.0")];
+        attach_publish_times(&mut versions, &HashMap::new());
+        assert!(versions.iter().all(|ver| ver.published_at.is_none()));
+    }
+
+    // --- publish_times_from_index: pure fixtures, no network for inline pages ---
+
+    fn inline_registration_index(base: &str, entries: &[(&str, Option<&str>)]) -> String {
+        let items: Vec<String> = entries
+            .iter()
+            .map(|(version, published)| match published {
+                Some(p) => {
+                    format!(r#"{{"catalogEntry": {{"version": "{version}", "published": "{p}"}}}}"#)
+                }
+                None => format!(r#"{{"catalogEntry": {{"version": "{version}"}}}}"#),
+            })
+            .collect();
+        format!(
+            r#"{{"count": 1, "items": [{{"@id": "{base}/pkg/page/0.json", "count": {n}, "items": [{items}]}}]}}"#,
+            n = entries.len(),
+            items = items.join(",")
+        )
+    }
+
+    #[tokio::test]
+    async fn test_publish_times_from_index_inline_happy_path() {
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let body = inline_registration_index(
+            "https://api.nuget.org/v3/reg",
+            &[
+                ("1.0.0", Some("2020-01-01T00:00:00Z")),
+                ("2.0.0", Some("2021-01-01T00:00:00Z")),
+            ],
+        );
+        let times = registry
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .await;
+        assert_eq!(
+            times.get("2.0.0").copied(),
+            PublishTime::parse_rfc3339("2021-01-01T00:00:00Z")
+        );
+        assert_eq!(times.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_publish_times_from_index_sentinel_filtered() {
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let body = inline_registration_index(
+            "https://api.nuget.org/v3/reg",
+            &[
+                ("1.0.0", Some("1900-01-01T00:00:00+00:00")),
+                ("2.0.0", Some("2021-01-01T00:00:00Z")),
+            ],
+        );
+        let times = registry
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .await;
+        assert!(!times.contains_key("1.0.0"));
+        assert!(times.contains_key("2.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_publish_times_from_index_missing_published_is_absent_rest_intact() {
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let body = inline_registration_index(
+            "https://api.nuget.org/v3/reg",
+            &[("1.0.0", None), ("2.0.0", Some("2021-01-01T00:00:00Z"))],
+        );
+        let times = registry
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .await;
+        assert!(!times.contains_key("1.0.0"));
+        assert!(times.contains_key("2.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_publish_times_from_index_malformed_json_returns_empty_map() {
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let times = registry
+            .publish_times_from_index(b"not json", "https://api.nuget.org/v3/reg")
+            .await;
+        assert!(times.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_publish_times_from_index_foreign_origin_page_skipped_no_request() {
+        // A page @id outside `base`'s origin must be skipped without ever being fetched —
+        // if the implementation issued a real request here, this test would hang/fail on
+        // network access rather than complete instantly.
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let body = r#"{"count": 1, "items": [
+            {"@id": "https://evil.example/pkg/page/0.json", "count": 1}
+        ]}"#;
+        let times = registry
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .await;
+        assert!(times.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_publish_times_from_index_lookalike_origin_page_skipped_no_request() {
+        // A prefix-lookalike host (`…nuget.org.evil.test`) must also be rejected — the
+        // trailing-slash check in the trust boundary is what catches this.
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let body = r#"{"count": 1, "items": [
+            {"@id": "https://api.nuget.org.evil.test/v3/reg/pkg/page/0.json", "count": 1}
+        ]}"#;
+        let times = registry
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .await;
+        assert!(times.is_empty());
+    }
+
+    // --- get_versions_typed_with: end-to-end gating and registration-hive walk (mockito) ---
+
+    #[tokio::test]
+    async fn test_get_versions_typed_with_disabled_issues_zero_registration_requests() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _service_index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body_with_registrations(
+                &format!("{base}/flatcontainer"),
+                &format!("{base}/query"),
+                &format!("{base}/registrations"),
+            ))
+            .create_async()
+            .await;
+        let _flat_mock = server
+            .mock("GET", "/flatcontainer/widget/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0", "2.0.0"]}"#)
+            .create_async()
+            .await;
+        // No mock registered for /registrations/* — a request there would fail the test.
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+
+        let versions = registry
+            .get_versions_typed_with("widget", false)
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(versions.iter().all(|v| v.published_at.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_typed_with_enabled_matches_disabled_set_and_order() {
+        // FR-006 regression guard: enabling freshness must not change the returned list's
+        // set or order, only populate `published_at`.
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _service_index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body_with_registrations(
+                &format!("{base}/flatcontainer"),
+                &format!("{base}/query"),
+                &format!("{base}/registrations"),
+            ))
+            .create_async()
+            .await;
+        let _flat_mock = server
+            .mock("GET", "/flatcontainer/widget/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0", "2.0.0"]}"#)
+            .create_async()
+            .await;
+        let registration_body = inline_registration_index(
+            &format!("{base}/registrations"),
+            &[
+                ("1.0.0", Some("2020-01-01T00:00:00Z")),
+                ("2.0.0", Some("2021-01-01T00:00:00Z")),
+            ],
+        );
+        let _reg_mock = server
+            .mock("GET", "/registrations/widget/index.json")
+            .with_status(200)
+            .with_body(registration_body)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+
+        let disabled = registry
+            .get_versions_typed_with("widget", false)
+            .await
+            .unwrap();
+        let enabled = registry
+            .get_versions_typed_with("widget", true)
+            .await
+            .unwrap();
+
+        let disabled_strings: Vec<&str> = disabled.iter().map(|v| v.version.as_str()).collect();
+        let enabled_strings: Vec<&str> = enabled.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(disabled_strings, enabled_strings);
+        assert!(enabled.iter().all(|v| v.published_at.is_some()));
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_typed_with_externalized_index_fetches_only_needed_pages() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let reg_base = format!("{base}/registrations");
+
+        let _service_index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body_with_registrations(
+                &format!("{base}/flatcontainer"),
+                &format!("{base}/query"),
+                &reg_base,
+            ))
+            .create_async()
+            .await;
+        let _flat_mock = server
+            .mock("GET", "/flatcontainer/widget/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["9.0.0", "8.0.0", "7.0.0"]}"#)
+            .create_async()
+            .await;
+
+        // Two external stub pages; only the last one (page 1) should ever be requested,
+        // since it alone already covers >= HOVER_RECENT_VERSIONS entries.
+        let index_body = format!(
+            r#"{{"count": 2, "items": [
+                {{"@id": "{reg_base}/widget/page/0.json", "count": 5}},
+                {{"@id": "{reg_base}/widget/page/1.json", "count": 5}}
+            ]}}"#
+        );
+        let _reg_mock = server
+            .mock("GET", "/registrations/widget/index.json")
+            .with_status(200)
+            .with_body(index_body)
+            .create_async()
+            .await;
+
+        // Page 1 alone carries HOVER_RECENT_VERSIONS (8) entries, so the walk must stop
+        // here and never touch page 0.
+        let page1_body = r#"{"items": [
+            {"catalogEntry": {"version": "2.0.0", "published": "2015-01-01T00:00:00Z"}},
+            {"catalogEntry": {"version": "3.0.0", "published": "2016-01-01T00:00:00Z"}},
+            {"catalogEntry": {"version": "4.0.0", "published": "2017-01-01T00:00:00Z"}},
+            {"catalogEntry": {"version": "5.0.0", "published": "2018-01-01T00:00:00Z"}},
+            {"catalogEntry": {"version": "6.0.0", "published": "2019-01-01T00:00:00Z"}},
+            {"catalogEntry": {"version": "7.0.0", "published": "2020-01-01T00:00:00Z"}},
+            {"catalogEntry": {"version": "8.0.0", "published": "2021-01-01T00:00:00Z"}},
+            {"catalogEntry": {"version": "9.0.0", "published": "2022-01-01T00:00:00Z"}}
+        ]}"#;
+        let page1_mock = server
+            .mock("GET", "/registrations/widget/page/1.json")
+            .with_status(200)
+            .with_body(page1_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let page0_mock = server
+            .mock("GET", "/registrations/widget/page/0.json")
+            .with_status(200)
+            .with_body(r#"{"items": []}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let versions = registry
+            .get_versions_typed_with("widget", true)
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 3);
+        assert!(versions.iter().all(|v| v.published_at.is_some()));
+        page1_mock.assert_async().await;
+        page0_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_typed_with_external_fetch_cap_stops_walk_at_two_pages() {
+        // Tester gap: MAX_EXTERNAL_PAGE_FETCHES = 2 was never actually hit by any prior
+        // test. Three external pages, each carrying too few entries to reach
+        // HOVER_RECENT_VERSIONS alone or even combined two-at-a-time, so the walk must stop
+        // after exactly 2 external fetches (pages 2 and 1) and never touch page 0 — proving
+        // the cap terminates the walk rather than the count or exhaustion terminators.
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let reg_base = format!("{base}/registrations");
+
+        let _service_index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body_with_registrations(
+                &format!("{base}/flatcontainer"),
+                &format!("{base}/query"),
+                &reg_base,
+            ))
+            .create_async()
+            .await;
+        let _flat_mock = server
+            .mock("GET", "/flatcontainer/widget/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["6.0.0", "5.0.0", "4.0.0", "3.0.0", "2.0.0", "1.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let index_body = format!(
+            r#"{{"count": 3, "items": [
+                {{"@id": "{reg_base}/widget/page/0.json", "count": 2}},
+                {{"@id": "{reg_base}/widget/page/1.json", "count": 2}},
+                {{"@id": "{reg_base}/widget/page/2.json", "count": 2}}
+            ]}}"#
+        );
+        let _reg_mock = server
+            .mock("GET", "/registrations/widget/index.json")
+            .with_status(200)
+            .with_body(index_body)
+            .create_async()
+            .await;
+
+        let page2_body = r#"{"items": [
+            {"catalogEntry": {"version": "5.0.0", "published": "2021-01-01T00:00:00Z"}},
+            {"catalogEntry": {"version": "6.0.0", "published": "2022-01-01T00:00:00Z"}}
+        ]}"#;
+        let page2_mock = server
+            .mock("GET", "/registrations/widget/page/2.json")
+            .with_status(200)
+            .with_body(page2_body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let page1_body = r#"{"items": [
+            {"catalogEntry": {"version": "3.0.0", "published": "2019-01-01T00:00:00Z"}},
+            {"catalogEntry": {"version": "4.0.0", "published": "2020-01-01T00:00:00Z"}}
+        ]}"#;
+        let page1_mock = server
+            .mock("GET", "/registrations/widget/page/1.json")
+            .with_status(200)
+            .with_body(page1_body)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Only 4 entries collected across the two allowed external fetches (< 8), so a
+        // buggy implementation would keep walking into page 0. This mock must see zero hits.
+        let page0_mock = server
+            .mock("GET", "/registrations/widget/page/0.json")
+            .with_status(200)
+            .with_body(
+                r#"{"items": [
+                {"catalogEntry": {"version": "1.0.0", "published": "2017-01-01T00:00:00Z"}},
+                {"catalogEntry": {"version": "2.0.0", "published": "2018-01-01T00:00:00Z"}}
+            ]}"#,
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let versions = registry
+            .get_versions_typed_with("widget", true)
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 6);
+        // Only the 4 versions covered by the two allowed external pages got a date.
+        for v in ["3.0.0", "4.0.0", "5.0.0", "6.0.0"] {
+            assert!(
+                versions
+                    .iter()
+                    .find(|ver| ver.version == v)
+                    .unwrap()
+                    .published_at
+                    .is_some(),
+                "{v} should have a published_at"
+            );
+        }
+        for v in ["1.0.0", "2.0.0"] {
+            assert!(
+                versions
+                    .iter()
+                    .find(|ver| ver.version == v)
+                    .unwrap()
+                    .published_at
+                    .is_none(),
+                "{v} is beyond the external-fetch cap and must have no published_at"
+            );
+        }
+        page2_mock.assert_async().await;
+        page1_mock.assert_async().await;
+        page0_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_typed_with_single_version_package_terminates() {
+        // S3 regression: a package with fewer total versions than HOVER_RECENT_VERSIONS
+        // must terminate via index exhaustion rather than hanging or looping.
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _service_index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body_with_registrations(
+                &format!("{base}/flatcontainer"),
+                &format!("{base}/query"),
+                &format!("{base}/registrations"),
+            ))
+            .create_async()
+            .await;
+        let _flat_mock = server
+            .mock("GET", "/flatcontainer/orchard.core/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0"]}"#)
+            .create_async()
+            .await;
+        let registration_body = inline_registration_index(
+            &format!("{base}/registrations"),
+            &[("1.0.0", Some("2020-01-01T00:00:00Z"))],
+        );
+        let _reg_mock = server
+            .mock("GET", "/registrations/orchard.core/index.json")
+            .with_status(200)
+            .with_body(registration_body)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let versions = registry
+            .get_versions_typed_with("orchard.core", true)
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].published_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_typed_with_no_registrations_base_url_degrades_gracefully() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _service_index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{base}/flatcontainer"),
+                &format!("{base}/query"),
+            ))
+            .create_async()
+            .await;
+        let _flat_mock = server
+            .mock("GET", "/flatcontainer/widget/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let versions = registry
+            .get_versions_typed_with("widget", true)
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].published_at.is_none());
+    }
+
+    // --- NFR-006 live verification (real network, run explicitly with `--ignored`) ---
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_nuget_attaches_publish_times() {
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let versions = registry
+            .get_versions_typed_with("Newtonsoft.Json", true)
+            .await
+            .unwrap();
+
+        assert!(!versions.is_empty());
+        assert!(versions.iter().take(5).any(|v| v.published_at.is_some()));
     }
 }

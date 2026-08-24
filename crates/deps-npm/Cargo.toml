@@ -13,6 +13,7 @@ publish = true
 workspace = true
 
 [dependencies]
+dashmap = { workspace = true }
 deps-core = { workspace = true }
 node-semver = { workspace = true }
 reqwest = { workspace = true }
@@ -28,6 +29,7 @@ urlencoding = { workspace = true }
 deps-core = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true, features = ["html_reports"] }
 insta = { workspace = true, features = ["json"] }
+mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
