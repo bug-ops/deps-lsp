@@ -13,9 +13,12 @@ use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_req
 /// a requirement is classified identically in both places.
 ///
 /// Returns `None` for `>`, `>=`, `!=`, and `*` — confirmed live against RubyGems (#332
-/// critique) that a malformed operand for these instead makes every candidate match, which
-/// never triggers the "no version satisfies requirement" false positive this gates, so they
-/// need no validation here.
+/// critique) that a malformed operand for these instead makes every candidate match except,
+/// for `!=` since #345's switch to canonical comparison, one candidate that happens to
+/// canonicalize identically to the operand's non-garbage prefix (e.g. `!= 1.0.0!!!` no longer
+/// matches `1.0.0` itself). Either way this never triggers the "no version satisfies
+/// requirement" false positive this gates — a single excluded candidate among the rest still
+/// leaves the requirement satisfiable — so none of these four need validation here.
 fn fail_closed_operand(requirement: &str) -> Option<&str> {
     let req = requirement.trim();
     if req == "*" || req.starts_with(">=") || req.starts_with('>') || req.starts_with("!=") {
@@ -90,16 +93,14 @@ fn exact_pin_version(requirement: &str) -> Option<&str> {
 /// left alone: they typically span many versions, so a match existing only among yanked ones
 /// is a rare edge case rather than the common one exact pins hit.
 ///
-/// Note on the boundary case (pin equal to the maximum): this gate compares numerically via
-/// [`compare_versions`], which zero-pads missing components, while the actual scan in
-/// [`RubygemsMatcher`] compares by string equality/prefix (see `version_matches_requirement`).
-/// The two can disagree at the boundary — a pin of `"1.6"` vs. a published `"1.6.0"` compares
-/// `Equal` here (numeric zero-padding) but would not string-match there. (A prerelease-tagged
-/// pin like `"2.0.0.rc1"` against a published `"2.0.0"` no longer reaches this path:
-/// `compare_versions` correctly orders it below the stable release instead of tying, since
-/// #323's fix.) That disagreement only ever makes this gate suppress a diagnostic the string
-/// matcher would otherwise have flagged — over-suppression, the safe direction — never the
-/// reverse.
+/// Note on the boundary case (pin equal to the maximum): this gate compares via
+/// [`compare_versions`], and since #345 the actual scan in [`RubygemsMatcher`]
+/// (`version_matches_requirement`) does too for both the explicit `=` and bare-pin forms —
+/// both now agree that a pin of `"1.6"` canonically equals a published `"1.6.0"`. (Before
+/// #345, the string/prefix matcher used there disagreed with this gate at that boundary; the
+/// two no longer can.) A prerelease-tagged pin like `"2.0.0.rc1"` against a published
+/// `"2.0.0"` does not reach this path either: `compare_versions` correctly orders it below
+/// the stable release instead of tying, since #323's fix.
 fn exact_pin_could_be_yanked(requirement: &str, available: &[String]) -> bool {
     let Some(pin) = exact_pin_version(requirement) else {
         return false;

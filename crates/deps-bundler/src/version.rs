@@ -283,16 +283,26 @@ pub fn version_matches_requirement(version: &str, requirement: &str) -> bool {
     // Not equal
     if req.starts_with("!=") {
         let req_ver = req.trim_start_matches("!=").trim();
-        return version != req_ver;
+        return compare_versions(version, req_ver) != Ordering::Equal;
     }
 
-    // Exact match
+    // Exact match. `compare_versions` tolerates and skips bytes outside its token alphabet
+    // (digits/letters), so a malformed operand like `= 1.0.0!!!` must be rejected explicitly
+    // via `is_valid_rubygems_version` first — otherwise it would silently compare as if the
+    // garbage suffix were absent and match `1.0.0`, where RubyGems itself raises
+    // `BadRequirementError` (#345 M1: this branch used to fail closed for free under raw
+    // string equality, which the switch to canonical comparison no longer does on its own).
     if let Some(req_ver) = req.strip_prefix('=') {
-        return version == req_ver.trim();
+        let req_ver = req_ver.trim();
+        return is_valid_rubygems_version(req_ver)
+            && compare_versions(version, req_ver) == Ordering::Equal;
     }
 
-    // Default: exact match or prefix match
-    version == req || version.starts_with(&format!("{req}."))
+    // Default (no operator): RubyGems compiles a bare version requirement to `=`
+    // (`Gem::Requirement.create("1.6.0")` -> `["=", ...]`), so it gets the same canonical
+    // equality and the same malformed-operand rejection as the explicit `=` branch above,
+    // not a raw string/prefix match (#345).
+    is_valid_rubygems_version(req) && compare_versions(version, req) == Ordering::Equal
 }
 
 /// Joins a token slice back into a dot-separated version string.
@@ -713,5 +723,59 @@ mod tests {
         assert!(version_matches_requirement("1.0.0", "*"));
         assert!(version_matches_requirement("0.0.1", "*"));
         assert!(version_matches_requirement("99.99.99", "*"));
+    }
+
+    #[test]
+    fn test_version_matches_requirement_canonical_equality() {
+        // Regression test for #345: `Gem::Requirement#satisfied_by?` compares `=`/`!=`
+        // operands via canonical `Gem::Version` equality, not raw string equality, so a
+        // trailing-zero segment must not defeat the match.
+        assert!(version_matches_requirement("1.6.0", "= 1.6"));
+        assert!(!version_matches_requirement("1.6.0", "!= 1.6"));
+
+        assert!(version_matches_requirement("1.6", "= 1.6.0"));
+        assert!(!version_matches_requirement("1.6", "!= 1.6.0"));
+
+        // Leading-zero digit run: RubyGems compares numeric segments by value, not by
+        // string, so "06" and "6" are the same segment (#331-era `cmp_digits`).
+        assert!(version_matches_requirement("1.6", "= 1.06"));
+        assert!(!version_matches_requirement("1.6", "!= 1.06"));
+
+        // Zero-padded prerelease tag run: "1.2.3-0.beta1" and "1.2.3-beta1" canonicalize
+        // identically (#331 `strip_padding_before_tag`).
+        assert!(version_matches_requirement(
+            "1.2.3-beta1",
+            "= 1.2.3-0.beta1"
+        ));
+        assert!(!version_matches_requirement(
+            "1.2.3-beta1",
+            "!= 1.2.3-0.beta1"
+        ));
+    }
+
+    #[test]
+    fn test_version_matches_requirement_bare_canonical_equality() {
+        // Regression test for #345: a bare (no-operator) requirement compiles to `=` in
+        // RubyGems (`Gem::Requirement.create("1.6.0")` -> `["=", ...]`), so it must use the
+        // same canonical equality as the explicit `=` branch, not a raw string/prefix match.
+        assert!(version_matches_requirement("1.6.0", "1.6"));
+        assert!(version_matches_requirement("1.6", "1.6.0"));
+        assert!(version_matches_requirement("1", "1.0"));
+
+        // A bare requirement is an exact pin, not a family prefix: a version that merely
+        // starts with the requirement's digits must not match unless canonically equal.
+        assert!(!version_matches_requirement("1.6.13", "1.6"));
+        assert!(!version_matches_requirement("1.60.0", "1.6"));
+    }
+
+    #[test]
+    fn test_version_matches_requirement_malformed_operand_fails_closed() {
+        // Regression test for #345 M1: `compare_versions` silently skips bytes outside its
+        // token alphabet, so without an explicit `is_valid_rubygems_version` gate a malformed
+        // `=`/bare operand would wrongly match by ignoring the garbage suffix — where RubyGems
+        // itself raises `BadRequirementError`. Both branches must fail closed (no match)
+        // instead, matching their pre-#345 raw-string-equality behavior.
+        assert!(!version_matches_requirement("1.0.0", "= 1.0.0!!!"));
+        assert!(!version_matches_requirement("1.0.0", "1.0.0!!!"));
     }
 }
