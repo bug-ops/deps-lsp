@@ -81,6 +81,30 @@ pub fn split_scoped(name: &str) -> Option<(&str, &str)> {
     Some((scope, pkg))
 }
 
+/// Returns `true` if `segment` starts with `.`.
+///
+/// Covers both `.` and `..`, which would otherwise let a JSR scope/package segment
+/// collapse a `jsr.io` URL's path away from the intended `/@scope/pkg` shape via
+/// dot-segment normalization. Shared by
+/// [`DenoFormatter::validate_package_name`](crate::formatter::DenoFormatter)'s diagnostic
+/// lint and [`JsrRegistry::get_versions`](crate::registry::JsrRegistry)'s URL-safety gate,
+/// so both stay in sync.
+///
+/// # Examples
+///
+/// ```
+/// use deps_deno::specifier::is_dot_prefixed;
+///
+/// assert!(is_dot_prefixed("."));
+/// assert!(is_dot_prefixed(".."));
+/// assert!(is_dot_prefixed(".hidden"));
+/// assert!(!is_dot_prefixed("std"));
+/// ```
+#[must_use]
+pub fn is_dot_prefixed(segment: &str) -> bool {
+    segment.starts_with('.')
+}
+
 /// A parsed Deno import specifier value, with byte ranges relative to the *value* string
 /// (excluding the surrounding JSON quotes).
 #[derive(Debug, Clone, PartialEq, Eq)]

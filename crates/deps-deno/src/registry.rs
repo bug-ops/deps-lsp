@@ -7,7 +7,7 @@
 //! scheme off the incoming (already scheme-qualified, per D2) [`PackageName`] and
 //! delegates to whichever half owns it.
 
-use crate::specifier::{Scheme, split_scheme, split_scoped};
+use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use crate::types::{DenoMetadata, JsrPackage, JsrVersion};
 use deps_core::{
     DepsError, FreshnessSettings, HttpCache, Metadata, PackageName, Registry, Result, Version,
@@ -178,7 +178,11 @@ impl JsrRegistry {
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails, the response is not valid UTF-8/JSON,
-    /// or the package does not exist (mapped to `DepsError::PackageNotFound`).
+    /// or the package does not exist (mapped to `DepsError::PackageNotFound`). Also
+    /// returns `DepsError::PackageNotFound` up front, before any request is made, if
+    /// `scope` or `name` starts with `.` (S-L1) — such a segment would otherwise let
+    /// `url::Url::parse` normalize the request path away from the intended
+    /// `/@scope/name/meta.json` shape.
     ///
     /// # Examples
     ///
@@ -196,8 +200,20 @@ impl JsrRegistry {
     /// # }
     /// ```
     pub async fn get_versions(&self, scope: &str, name: &str) -> Result<Vec<JsrVersion>> {
-        let url = meta_json_url(&self.base, scope, name);
         let full_name = format!("@{scope}/{name}");
+        // S-L1: a dot-prefixed segment must be rejected before it ever reaches
+        // `meta_json_url` — `url::Url::parse` decodes percent-encoding before dot-segment
+        // normalization, so encoding alone cannot prevent `..`/`.` from collapsing the
+        // path away from the intended `/@scope/name` shape. This is the single choke point
+        // for every `JsrRegistry::get_versions` caller (`DenoRegistry::get_versions`,
+        // `get_versions_with`, `get_latest_matching`).
+        if is_dot_prefixed(scope) || is_dot_prefixed(name) {
+            return Err(DepsError::PackageNotFound {
+                package: full_name,
+                registry: REGISTRY,
+            });
+        }
+        let url = meta_json_url(&self.base, scope, name);
         let data = self
             .cache
             .get_cached(&url)
@@ -544,10 +560,24 @@ mod tests {
 
     #[test]
     fn test_meta_json_url_encodes_malicious_segments() {
+        // S-L1 trap: the original version of this test asserted `!url.contains("/../")`
+        // on the *raw* string, which passed even while the bug was live, because
+        // `urlencoding::encode` never puts a literal `/../` into the raw string — the
+        // collapse happens later, inside `url::Url::parse`'s dot-segment normalization
+        // (which runs *after* percent-decoding). This test only exercises `meta_json_url`
+        // (unchanged by the S-L1 fix, which gates `JsrRegistry::get_versions` instead), so
+        // it does not itself prove the fix works — see
+        // `test_jsr_registry_get_versions_rejects_dot_prefixed_package_segment` and its
+        // siblings below for that. It still asserts on the parsed path, not the raw
+        // string, so it stays a meaningful check of `meta_json_url`'s own encoding.
         let url = meta_json_url(JSR_BASE, "evil/../secret?x=1#frag", "pkg");
-        assert!(!url.contains("/../"));
         assert!(!url.contains('?'));
         assert!(!url.contains('#'));
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.path(),
+            "/@evil%2F..%2Fsecret%3Fx%3D1%23frag/pkg/meta.json"
+        );
     }
 
     #[test]
@@ -768,6 +798,130 @@ mod tests {
 
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version_string(), "1.0.0");
+        mock.assert_async().await;
+    }
+
+    // --- S-L1: dot-prefixed JSR segment must be rejected before building the URL ---
+
+    /// `JsrRegistry` pointed at an address nothing listens on, so any request it actually
+    /// issues fails with a connection error rather than silently succeeding — proof that
+    /// the dot-prefix guard short-circuits before any network call.
+    fn unreachable_jsr(cache: Arc<HttpCache>) -> JsrRegistry {
+        JsrRegistry::with_bases(
+            cache,
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_jsr_registry_get_versions_rejects_dot_prefixed_package_segment() {
+        // The exploitable case: a `..`/`.` *package* segment would otherwise let
+        // `url::Url::parse` normalize the request path away from `/@scope/pkg/meta.json`
+        // to an unrelated URL (e.g. `/meta.json`). Must fail closed with `PackageNotFound`
+        // instead of reaching the network.
+        let registry = unreachable_jsr(Arc::new(HttpCache::new()));
+
+        let err = registry.get_versions("std", "..").await.unwrap_err();
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound {
+                registry: REGISTRY,
+                ..
+            }
+        ));
+
+        let err = registry.get_versions("std", ".").await.unwrap_err();
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound {
+                registry: REGISTRY,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_jsr_registry_get_versions_rejects_dot_prefixed_scope_segment() {
+        // Defense in depth: a dot-prefixed *scope* segment cannot actually collapse the
+        // URL (the literal `@` prefix makes it e.g. `@..`, not a dot-segment), but it is
+        // still rejected directly by the `is_dot_prefixed` gate on principle.
+        let registry = unreachable_jsr(Arc::new(HttpCache::new()));
+
+        let err = registry.get_versions("..", "pkg").await.unwrap_err();
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound {
+                registry: REGISTRY,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_deno_registry_get_versions_rejects_dot_prefixed_jsr_package_via_mock() {
+        // End-to-end through the `Registry` trait dispatch: `jsr:@scope/..` must return
+        // `PackageNotFound` without ever issuing the `meta.json` request.
+        let mut server = mockito::Server::new_async().await;
+        let cache = Arc::new(HttpCache::new());
+        let jsr = JsrRegistry::with_bases(Arc::clone(&cache), server.url(), server.url());
+        let registry = DenoRegistry {
+            jsr,
+            npm: NpmRegistry::new(cache),
+        };
+
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let Err(err) = Registry::get_versions(&registry, &PackageName::new("jsr:@std/..")).await
+        else {
+            panic!("expected an error for a dot-prefixed jsr: package segment");
+        };
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound {
+                registry: REGISTRY,
+                ..
+            }
+        ));
+
+        let Err(err) = Registry::get_versions_with(
+            &registry,
+            &PackageName::new("jsr:@std/.."),
+            FreshnessSettings::default(),
+        )
+        .await
+        else {
+            panic!("expected an error for a dot-prefixed jsr: package segment");
+        };
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound {
+                registry: REGISTRY,
+                ..
+            }
+        ));
+
+        let Err(err) = Registry::get_latest_matching(
+            &registry,
+            &PackageName::new("jsr:@std/.."),
+            &VersionReq::new("*"),
+        )
+        .await
+        else {
+            panic!("expected an error for a dot-prefixed jsr: package segment");
+        };
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound {
+                registry: REGISTRY,
+                ..
+            }
+        ));
+
         mock.assert_async().await;
     }
 

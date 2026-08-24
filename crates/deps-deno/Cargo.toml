@@ -30,3 +30,4 @@ deps-core = { workspace = true, features = ["test-util"] }
 deps-npm = { workspace = true, features = ["test-util"] }
 mockito = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+url = { workspace = true }
