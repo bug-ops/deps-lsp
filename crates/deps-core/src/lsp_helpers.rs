@@ -1320,16 +1320,29 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .unwrap();
     }
 
-    // The `**Latest**` line prefers the just-fetched Ch2 list (`available_versions`,
-    // whose index 0 is the same entry the "Recent versions" section below labels
-    // `*(latest)*`) over the Ch1 cache (`versions.cached`, populated by the lifecycle's
-    // background fetch) whenever a live fetch is available. Ch1 alone would let this
-    // line render a version older than the one the "Recent versions" list right below it
-    // shows as `*(latest)*` — a self-contradictory response when a new version is
-    // published between the last background fetch and this hover call, with the cooldown
-    // callout then decided off the stale operand too (issue #227 F5). Falls back to Ch1
-    // only when there is no live fetch to prefer (non-resolvable source).
-    let live_latest = available_versions.as_ref().and_then(|v| v.first());
+    // The `**Latest**` line prefers the just-fetched Ch2 list (`available_versions`) over
+    // the Ch1 cache (`versions.cached`, populated by the lifecycle's background fetch)
+    // whenever a live fetch is available. Ch1 alone would let this line render a version
+    // older than the one the "Recent versions" list right below it shows as `*(latest)*` —
+    // a self-contradictory response when a new version is published between the last
+    // background fetch and this hover call, with the cooldown callout then decided off the
+    // stale operand too (issue #227 F5). Falls back to Ch1 only when there is no live list
+    // at all (non-resolvable source) — NOT merely when the live list has no stable entry:
+    // a live list that's all pre-release still means a live fetch happened, and rendering
+    // a stale Ch1 version that may not even appear in the live "Recent versions" list below
+    // would be exactly the self-contradiction #227 F5 fixed, via a different path (#313).
+    //
+    // `live_latest_idx` (not raw index 0) picks the entry: `available_versions` is sorted
+    // purely by version number, so a pre-release with the highest number can sort to index 0
+    // even though it isn't the ecosystem's "latest stable" pick — mirroring this line to the
+    // raw top entry would tag a pre-release as `(latest)` below, contradicting the
+    // stable-only semantics of `versions.cached`'s `latest`. Recorded as an index (matching
+    // `find_latest_stable`'s exact `is_stable` predicate) rather than a version string so the
+    // "Recent versions" marker below can match by position instead of string equality, which
+    // could spuriously tag more than one entry if two ever shared a version string.
+    let live_latest_idx = available_versions
+        .as_ref()
+        .and_then(|v| v.iter().position(|ver| ver.is_stable()));
     let cached_latest = resolvable
         .then(|| {
             versions
@@ -1338,10 +1351,17 @@ pub async fn generate_hover<R: Registry + ?Sized>(
                 .or_else(|| versions.cached.get(dep.name()))
         })
         .flatten();
-    let latest_line: Option<(&str, Option<PublishTime>)> = if let Some(live) = live_latest {
-        Some((live.version_string(), live.published_at()))
-    } else {
-        cached_latest.map(|v| (v.latest.as_str(), v.published_at))
+    // A non-empty live list with no stable entry is deliberately treated differently from
+    // an empty (or absent) live list: the former still falls through to `None` below (no
+    // header at all, matching the empty "Recent versions" list right beneath it) rather than
+    // the Ch1 cache, since the cache's version wouldn't be part of what the live list just
+    // showed. An empty live list carries no such contradiction risk — it has nothing to
+    // contradict — so it keeps falling back to Ch1, same as when there's no live fetch.
+    let latest_line: Option<(&str, Option<PublishTime>)> = match &available_versions {
+        Some(v) if !v.is_empty() => live_latest_idx
+            .map(|idx| &v[idx])
+            .map(|live| (live.version_string(), live.published_at())),
+        _ => cached_latest.map(|v| (v.latest.as_str(), v.published_at)),
     };
     if let Some((latest_ver, raw_published_at)) = latest_line {
         let published_at = freshness.enabled.then_some(raw_published_at).flatten();
@@ -1376,6 +1396,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     push_vulnerability_hover_section(&mut markdown, vuln_outcome);
 
     if let Some(available_versions) = &available_versions {
+        // Matched by position against `live_latest_idx` (the header's stable-latest pick)
+        // rather than raw index 0 or string equality: `available_versions` is sorted purely
+        // by version number, so index 0 can be a pre-release the header itself doesn't call
+        // "latest" (issue #313), and matching by version string instead of index could tag
+        // more than one entry if two ever shared a version string. No match in the rendered
+        // top-N slice simply omits the marker.
         markdown.push_str("**Recent versions**:\n");
         for (i, version) in available_versions
             .iter()
@@ -1388,7 +1414,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             } else {
                 String::new()
             };
-            if i == 0 {
+            if Some(i) == live_latest_idx {
                 writeln!(&mut markdown, "- {version_span} *(latest)*{age_suffix}").unwrap();
             } else if version.is_yanked() {
                 writeln!(
@@ -4011,6 +4037,217 @@ mod tests {
         // Exactly the pre-feature line: no trailing age suffix.
         assert!(content.value.contains("- `1.2.3` *(latest)*\n"));
         assert!(!content.value.contains("ago"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_latest_marker_skips_prerelease_at_raw_top() {
+        use std::collections::HashMap;
+
+        // Raw registry order (newest by version number first): a pre-release sorts above
+        // the actual stable latest, mirroring NuGet's Newtonsoft.Json 13.0.5-beta1 vs
+        // 13.0.4 (#313).
+        let registry = MockRegistryWithVersions {
+            versions: vec![
+                MockVersionWithAge {
+                    version: "13.0.5-beta1".to_string(),
+                    yanked: false,
+                    published_at: None,
+                },
+                MockVersionWithAge {
+                    version: "13.0.4".to_string(),
+                    yanked: false,
+                    published_at: None,
+                },
+            ],
+        };
+        let parse_result = freshness_test_parse_result("Newtonsoft.Json");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Latest**: `13.0.4`"),
+            "got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("- `13.0.4` *(latest)*"),
+            "the stable version, not the raw-top pre-release, should carry the marker; got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("13.0.5-beta1` *(latest)*"),
+            "the pre-release must not be tagged latest; got: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_latest_marker_omitted_when_stable_outside_top_n() {
+        use std::collections::HashMap;
+
+        // Nine pre-releases followed by one stable version: the stable pick sits past
+        // `HOVER_RECENT_VERSIONS`, so it never appears in the rendered list.
+        let mut versions: Vec<MockVersionWithAge> = (0..=HOVER_RECENT_VERSIONS)
+            .map(|i| MockVersionWithAge {
+                version: format!("2.0.0-alpha{i}"),
+                yanked: false,
+                published_at: None,
+            })
+            .collect();
+        versions.push(MockVersionWithAge {
+            version: "1.9.0".to_string(),
+            yanked: false,
+            published_at: None,
+        });
+        let registry = MockRegistryWithVersions { versions };
+        let parse_result = freshness_test_parse_result("example");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Latest**: `1.9.0`"),
+            "got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("*(latest)*"),
+            "the stable latest isn't in the truncated top-N slice, so no entry should be marked; got: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_latest_marker_all_prerelease_degrades_gracefully() {
+        use std::collections::HashMap;
+
+        // No stable version exists anywhere in the list: `find_latest_stable` returns
+        // `None`, and there is no Ch1 cache to fall back to either (#313 edge case).
+        let registry = MockRegistryWithVersions {
+            versions: vec![
+                MockVersionWithAge {
+                    version: "2.0.0-beta2".to_string(),
+                    yanked: false,
+                    published_at: None,
+                },
+                MockVersionWithAge {
+                    version: "2.0.0-beta1".to_string(),
+                    yanked: false,
+                    published_at: None,
+                },
+                MockVersionWithAge {
+                    version: "1.9.0-alpha1".to_string(),
+                    yanked: false,
+                    published_at: None,
+                },
+            ],
+        };
+        let parse_result = freshness_test_parse_result("example");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor, not panic");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("**Latest**:"),
+            "no stable version exists, so the header should be omitted rather than picking a pre-release; got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("*(latest)*"),
+            "no stable version exists, so no entry in the list should be marked latest; got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("2.0.0-beta2"),
+            "the raw version list should still render even without a latest marker; got: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_latest_marker_all_prerelease_live_list_ignores_stale_cache() {
+        use std::collections::HashMap;
+
+        // A live fetch happened (so `available_versions` is `Some`), but every entry in it
+        // is a pre-release: `live_latest_idx` is `None`. A stale Ch1 cache is also present,
+        // recording a version that isn't part of the live list at all. Falling back to that
+        // stale cached value here would render a `**Latest**` line that contradicts the live
+        // "Recent versions" list right below it — exactly the self-contradiction #227 F5 was
+        // fixed to prevent, just reached through this all-prerelease path instead (#313 S2).
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "2.0.0-beta2".to_string(),
+                yanked: false,
+                published_at: None,
+            }],
+        };
+        let parse_result = freshness_test_parse_result("example");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("example".into(), PackageVersions::latest_only("1.5.0"));
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor, not panic");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("**Latest**:"),
+            "a live fetch with no stable entry must not fall back to a stale cached version \
+             that isn't in the live list; got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("1.5.0"),
+            "the stale cached version must not leak into the response at all; got: {}",
+            content.value
+        );
     }
 
     #[tokio::test]
