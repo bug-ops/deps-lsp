@@ -17,6 +17,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Lock file parsing** — Extract resolved versions from `Package.resolved`
 - **All version forms** — `from`, `upToNextMajor`, `upToNextMinor`, `exact`, half-open range, closed range, `branch`, `revision`, `path`
 - **GITHUB_TOKEN support** — Authenticated requests raise the rate limit from 60 to 5,000 requests/hour
+- **Release-freshness signal (partial)** — `SwiftRegistry::get_versions_with_release_dates`, invoked via `Registry::get_versions_with` when freshness rendering is enabled, attaches GitHub Release publish timestamps to tag-derived versions, memoized behind a TTL; requires `GITHUB_TOKEN` and covers only versions with a matching GitHub Release (see `ECOSYSTEM_GUIDE.md`)
 
 > [!TIP]
 > Set `GITHUB_TOKEN` in your environment to avoid GitHub API rate limits when working with many Swift dependencies.

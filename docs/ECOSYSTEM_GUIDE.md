@@ -300,6 +300,31 @@ When a dependency in `package.json` fails to resolve against the npm registry, t
 
 The check is deliberately permissive: uppercase names are still accepted (npm only warns on those for legacy packages, never rejects), and it accepts every character npm's own `encodeURIComponent(segment) === segment` predicate accepts, including `! ' ( ) * - . _ ~` — not just alphanumerics and hyphens.
 
+### Swift Release-Freshness Coverage
+
+Unlike the six ecosystems whose registry already carries a publish timestamp, Swift sources
+package versions from GitHub's `tags` API, which has no date field. `deps-swift` augments the
+tag-derived version list with publish times from GitHub's *releases* API (one extra request per
+package, memoized behind a TTL) — but this makes Swift's freshness signal **partial**, in four
+distinct ways:
+
+- **Requires `GITHUB_TOKEN`.** Without it, hover and completion render Swift versions exactly as
+  they did before this feature — no publish age shown, no error. A one-time `tracing::info!`
+  notes the skip on first use (`export GITHUB_TOKEN=$(gh auth token)` to enable it).
+- **Covers only versions with a matching GitHub Release.** A tag with no corresponding Release
+  shows no date. Coverage of the versions actually rendered is high but not universal even among
+  recent versions — one real-world counterexample (`SwiftyJSON/SwiftyJSON`) is missing dates for
+  two of its eight most recent tags.
+- **Reports Release *publish* time, not tag-creation time.** If a maintainer tags a commit and
+  only publishes the GitHub Release for it later, the date reflects the Release, which can read
+  as more recent than when the code was actually written. There is no cheap way to distinguish
+  this from a genuinely fresh release.
+- **Covers roughly the 100 newest releases only** (one unpaginated API page). Browsing completions
+  filtered to an older major version line can show no dates at all, even though the same package's
+  newest versions do — this is a known, accepted inconsistency within a single session.
+
+A miss in any of the above degrades to no date shown, never a wrong one.
+
 ## Architecture Overview
 
 Each ecosystem is implemented as a separate crate under `crates/deps-{ecosystem}/` with the following structure:

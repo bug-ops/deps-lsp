@@ -666,8 +666,10 @@ name = "deps-swift"
 version = "0.10.1"
 dependencies = [
  "bytes",
+ "dashmap",
  "deps-core",
  "insta",
+ "mockito",
  "regex",
  "reqwest",
  "semver",
