@@ -780,6 +780,50 @@ pub trait EcosystemFormatter: Send + Sync {
         None
     }
 
+    /// Whether this ecosystem's registry can silently omit a *published* version from
+    /// `available` in a way indistinguishable from "never published" — and, if so, whether
+    /// `requirement` names a version-space region that specific omission could explain, given
+    /// the versions actually observed in `available`.
+    ///
+    /// Called by [`requirement_is_unsatisfiable`] before compiling `requirement`; returning
+    /// `true` suppresses the "no published version satisfies this requirement" diagnostic for
+    /// this dependency, the same as [`Self::compile_requirement`] returning `None` — but,
+    /// unlike that method, this one sees `available` and can therefore narrow the suppression
+    /// instead of disabling it for every requirement of a given shape.
+    ///
+    /// Default `false` — no ecosystem has this problem unless it opts in. `deps-bundler`
+    /// overrides it (see `BundlerFormatter::requirement_is_undecidable_given_available` and
+    /// its helper for the RubyGems-specific rationale and heuristic).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    /// use deps_core::{PackageName, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert!(!DefaultFormatter.requirement_is_undecidable_given_available(
+    ///     &VersionReq::new("1.6.13"),
+    ///     &["1.6.9".to_string(), "1.6.14".to_string()],
+    /// ));
+    /// ```
+    fn requirement_is_undecidable_given_available(
+        &self,
+        _requirement: &VersionReq,
+        _available: &[String],
+    ) -> bool {
+        false
+    }
+
     /// Get package URL for hover markdown.
     fn package_url(&self, name: &PackageName) -> String;
 
@@ -1687,12 +1731,14 @@ const MAX_REQUIREMENT_LEN: usize = 256;
 ///    oversized requirement is treated the same as "unmodellable" (suppressed, not warned).
 /// 4. `!formatter.requirement_is_unresolved(requirement)` (FR-005) — an unresolved
 ///    placeholder requirement was never actually checked against anything.
-/// 5. `formatter.compile_requirement(requirement)` returns `Some(matcher)` — this
+/// 5. `!formatter.requirement_is_undecidable_given_available(requirement, available)` — this
+///    ecosystem's registry can hide a published version that would have decided the match.
+/// 6. `formatter.compile_requirement(requirement)` returns `Some(matcher)` — this
 ///    ecosystem opted in and the requirement string itself parses.
-/// 6. Scanning `available` with `matcher.matches`: **at least one** candidate returned
+/// 7. Scanning `available` with `matcher.matches`: **at least one** candidate returned
 ///    `Some(false)`, and **none** returned `Some(true)`. Candidates returning `None`
 ///    (unparseable candidate strings) are skipped and count toward neither side —
-///    condition 6's "at least one `Some(false)`" is load-bearing: if every candidate is
+///    condition 7's "at least one `Some(false)`" is load-bearing: if every candidate is
 ///    unparseable, nothing was decided, so the verdict is `false` (no diagnostic) rather
 ///    than a vacuous `true`.
 ///
@@ -1753,6 +1799,9 @@ pub fn requirement_is_unsatisfiable(
         return false;
     }
     if formatter.requirement_is_unresolved(requirement) {
+        return false;
+    }
+    if formatter.requirement_is_undecidable_given_available(requirement, available) {
         return false;
     }
     let Some(matcher) = formatter.compile_requirement(requirement) else {
