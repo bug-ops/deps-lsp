@@ -1197,6 +1197,55 @@ pub fn is_safe_registry_url(url: &str) -> bool {
         })
 }
 
+/// Whether `name` is safe to embed as a package name in a manifest [`TextEdit`] or
+/// completion item.
+///
+/// Guards every arm of `create_package_completion_item`
+/// (`crates/deps-lsp/src/handlers/completion.rs`) as a single upfront check, applied
+/// before the raw `name` reaches any ecosystem-specific snippet — including Maven and
+/// Swift, which additionally validate a *derived* value on top of this gate
+/// ([`is_safe_maven_coordinate_segment`] on each split coordinate segment,
+/// [`is_safe_registry_url`] on the constructed URL) because a value type distinct from
+/// the raw name needs its own allowlist — see [`is_safe_version_string`]'s doc comment
+/// for why version-derived and non-version-derived sinks each get their own allowlist.
+/// [`PackageName::new`](crate::PackageName::new) is documented as never validating or
+/// modifying its input, so this predicate is the first gate a registry-reported name
+/// passes through before reaching a manifest. Two sinks that key a bare TOML/YAML
+/// entry by `name` (Cargo/PyPI, Dart) additionally quote that key in the snippet, since
+/// `.` and `@` are legal here but would otherwise be read as TOML's dotted-key
+/// separator or break a YAML plain scalar.
+///
+/// An allowlist, not a denylist: `name` must be non-empty, at most 256 bytes, and
+/// contain only `[A-Za-z0-9._@:/~-]` — the character set real package names use across
+/// every ecosystem this predicate guards: Cargo/PyPI/Dart/NuGet/Bundler
+/// (alphanumeric, `-`, `_`, `.`), npm/Deno scoped names (`@scope/name`, adding `@` and
+/// `/`), Composer (`vendor/package`, `/`), Go module paths (domain-qualified paths like
+/// `github.com/org/repo`, `/`, `.`, and `~` — legal in a Go path element and already
+/// allowed by [`is_safe_version_string`]/[`is_safe_registry_url`]), and Gradle's
+/// colon-delimited `group:artifact` short form (`:`). A denylist here would need to
+/// anticipate every dangerous token a target manifest format (TOML/JSON/YAML/XML
+/// string literals, a live Kotlin/Groovy build-script DSL) could ever act on; failing
+/// closed on an unrecognized character — notably `"`, `'`, `<`, `>`, `` ` ``, and all
+/// control characters/newlines — is cheaper and safer.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::is_safe_package_name;
+///
+/// assert!(is_safe_package_name("serde"));
+/// assert!(is_safe_package_name("@scope/name"));
+/// assert!(is_safe_package_name("org.apache.commons:commons-lang3"));
+/// assert!(!is_safe_package_name("evil\"\nbackdoor = \"9.9.9"));
+/// ```
+pub fn is_safe_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | ':' | '/' | '-' | '~')
+        })
+}
+
 /// Builds a single-entry [`WorkspaceEdit::changes`] map replacing `range` in `uri`
 /// with `new_text`.
 ///
@@ -1643,6 +1692,78 @@ mod tests {
         let over_cap = format!("{at_cap}a");
         assert_eq!(over_cap.len(), 2049);
         assert!(!is_safe_registry_url(&over_cap));
+    }
+
+    #[test]
+    fn test_is_safe_package_name_accepts_real_names_across_ecosystems() {
+        for good in [
+            "serde",                            // Cargo
+            "requests",                         // PyPI
+            "@scope/name",                      // npm/Deno scoped
+            "monolog/monolog",                  // Composer vendor/package
+            "github.com/org/repo",              // Go module path
+            "path",                             // Dart
+            "org.apache.commons:commons-lang3", // Gradle group:artifact
+            "Newtonsoft.Json",                  // NuGet
+            "rails",                            // Bundler
+            "npm:react",                        // Deno npm-scheme specifier
+            "jsr:@std/fs",                      // Deno jsr-scheme specifier
+            "github.com/foo/bar~compat",        // Go path element with `~`
+        ] {
+            assert!(
+                is_safe_package_name(good),
+                "expected {good:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_package_name_rejects_empty() {
+        assert!(!is_safe_package_name(""));
+    }
+
+    #[test]
+    fn test_is_safe_package_name_rejects_non_ascii() {
+        // Deliberately excluded: the allowlist is ASCII-only, so a legacy non-ASCII
+        // npm package name (a handful exist, e.g. Unicode-normalized scopes) is
+        // rejected rather than risking homograph/normalization tricks in a manifest.
+        assert!(!is_safe_package_name("café"));
+        assert!(!is_safe_package_name("пакет"));
+    }
+
+    #[test]
+    fn test_is_safe_package_name_accepts_dot_dot_shapes() {
+        // `.`/`/` are individually legal (PyPI dotted names, npm/Composer scopes), so
+        // `..`/`../..` pass the charset too. This is not a path-traversal risk: every
+        // sink treats `name` as manifest text (a TOML/JSON/YAML/XML value or a
+        // string-literal argument), never as a filesystem path.
+        assert!(is_safe_package_name(".."));
+        assert!(is_safe_package_name("../.."));
+    }
+
+    #[test]
+    fn test_is_safe_package_name_rejects_structural_breakout_characters() {
+        for bad in [
+            "evil\"\nbackdoor = \"9.9.9",
+            "evil\", git = \"https://evil",
+            "evil\\",
+            "evil'",
+            "evil<script>",
+            "evil`echo`",
+            "evil\ninjected = true",
+            "evil\tname",
+        ] {
+            assert!(
+                !is_safe_package_name(bad),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_package_name_length_cap() {
+        assert!(is_safe_package_name(&"a".repeat(256)));
+        assert!(!is_safe_package_name(&"a".repeat(257)));
     }
 
     #[test]
