@@ -55,8 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-lsp**: `handle_inlay_hints` no longer awaits the config `RwLock` read while holding a `DashMap` document `Ref`, closing the reproducible liveness hazard from #317 (the residual `Ref`-across-`generate_*()` hold is tracked separately) (#318).
-- **deps-bundler**: hover's "Recent versions" list no longer repeats the same version once per RubyGems platform variant; entries are now deduplicated by version number (resolves #311).
-- **deps-core**: hover's `(latest)` marker in "Recent versions" now matches the `**Latest**` header's stable-version pick instead of the raw highest-numbered entry, which could be a pre-release (resolves #313).
+- **deps-bundler**: hover's "Recent versions" list no longer repeats the same version once per RubyGems platform variant; entries are now deduplicated by version number (resolves #311) (#321).
+- **deps-core**: hover's `(latest)` marker in "Recent versions" now matches the `**Latest**` header's stable-version pick instead of the raw highest-numbered entry, which could be a pre-release (resolves #313) (#321).
 - **deps-lsp**: `RegistryProgress::start` no longer sends `window/workDoneProgress/create` to a client that never advertised `window.workDoneProgress` support, an LSP 3.17 spec violation (resolves #290) (#296).
 - **deps-lsp** (tests): `LspClient::read_response`'s 10s hang-detection timeout is now covered by a fast unit test instead of being unexercised (resolves #291) (#296).
 - **deps-bundler**: fix Bundler yanked-diagnostic path incorrectly trusting missing RubyGems yank data (resolves #298) (#301).
