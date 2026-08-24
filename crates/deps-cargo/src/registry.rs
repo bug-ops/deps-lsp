@@ -50,20 +50,36 @@ pub fn crate_url(name: &str) -> String {
     format!("{CRATES_IO_URL}/{}", urlencoding::encode(name))
 }
 
-/// Whether `name` matches crates.io's actual crate-name charset (ASCII alphanumeric, `-`,
-/// `_`) — stricter than [`deps_core::is_safe_package_name`], which permits `/`, `@`, `.`,
-/// `:`, `~` to accommodate other ecosystems' scoped/namespaced names. `sparse_index_path`
-/// performs no per-character encoding at all before splicing `name` into the request URL
-/// (unlike every other ecosystem crate, which `urlencoding::encode`s each segment): a
-/// `name` containing `/` or `.` is used as-is to build directory components, so a crafted
-/// name like `../../etc/passwd` can inject arbitrary path segments, not just the narrower
-/// exact-`.`/`..` case #341/#349/#357/#361 covered (#365 S1).
-fn is_safe_crate_name(name: &str) -> bool {
+/// Whether `name`'s character set matches crates.io's crate-name charset (ASCII
+/// alphanumeric, `-`, `_`), non-empty — stricter than
+/// [`deps_core::is_safe_package_name`], which permits `/`, `@`, `.`, `:`, `~` to
+/// accommodate other ecosystems' scoped/namespaced names. Deliberately carries no
+/// length bound of its own: [`is_safe_crate_name`] layers this crate's 128-byte
+/// URL-safety cap on top, while `deps_cargo::formatter::CargoFormatter`'s
+/// `validate_package_name` layers its own, stricter, diagnostic-accuracy length
+/// check on top instead — bundling a length bound into this predicate would make
+/// the latter unable to distinguish "bad charset" from "too long" for a name that
+/// is both charset-valid and longer than crates.io's real limit (#382 follow-up).
+pub(crate) fn is_safe_crate_name_charset(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 128
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+/// Whether `name` is safe to splice into a crates.io sparse-index request URL:
+/// [`is_safe_crate_name_charset`] plus a 128-byte length bound. `sparse_index_path`
+/// performs no per-character encoding at all before splicing `name` into the request
+/// URL (unlike every other ecosystem crate, which `urlencoding::encode`s each
+/// segment): a `name` containing `/` or `.` is used as-is to build directory
+/// components, so a crafted name like `../../etc/passwd` can inject arbitrary path
+/// segments, not just the narrower exact-`.`/`..` case #341/#349/#357/#361 covered
+/// (#365 S1). The 128-byte bound exists only to keep a pathological request URL
+/// bounded — it is not crates.io's real publish-time length limit, so callers that
+/// need an accurate "too long" diagnostic (see `is_safe_crate_name_charset`'s docs)
+/// must not reuse this function for that purpose.
+pub(crate) fn is_safe_crate_name(name: &str) -> bool {
+    is_safe_crate_name_charset(name) && name.len() <= 128
 }
 
 /// Rejects a `name` outside crates.io's crate-name charset before it would reach

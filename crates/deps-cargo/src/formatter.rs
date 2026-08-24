@@ -1,5 +1,15 @@
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
-use deps_core::{PackageName, VersionReq};
+use deps_core::{InvalidPackageName, PackageName, VersionReq};
+
+/// Maximum crate name length this diagnostic accepts.
+///
+/// Deliberately stricter than `registry::is_safe_crate_name`'s 128-byte cap: that
+/// predicate only needs to guarantee a name is safe to splice into a sparse-index
+/// URL, while this constant approximates crates.io's actual publish-time limit for
+/// the "Invalid package name" diagnostic below — a name between 65 and 128 bytes
+/// passes the shared URL-safety check but still correctly fails this diagnostic's
+/// length check. Do not "fix" the two caps back into lockstep.
+const MAX_NAME_LENGTH: usize = 64;
 
 /// Precise semver `VersionReq` matcher, compiled once per dependency by
 /// [`CargoFormatter::compile_requirement`].
@@ -23,6 +33,63 @@ impl EcosystemFormatter for CargoFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::crate_url(name.as_str())
+    }
+
+    /// Validates a crate name against crates.io's naming rules.
+    ///
+    /// crates.io accepts only non-empty names starting with an ASCII letter or `_`,
+    /// followed by ASCII alphanumeric characters plus `-`/`_`, up to `MAX_NAME_LENGTH`
+    /// characters. The base charset+non-empty check reuses
+    /// `registry::is_safe_crate_name_charset` — the same predicate
+    /// `registry::is_safe_crate_name` builds on for the sparse-index URL-injection
+    /// gate — rather than duplicating it. This method deliberately calls the
+    /// charset-only variant, not `is_safe_crate_name` itself: that function also
+    /// bundles in a 128-byte URL-safety cap unrelated to crates.io's real naming
+    /// rules, which would make a charset-valid name over 128 bytes report the wrong
+    /// "invalid characters" reason instead of reaching this method's own
+    /// `MAX_NAME_LENGTH` check below. The leading-character rule and
+    /// `MAX_NAME_LENGTH` are layered on top here because they are specific to this
+    /// diagnostic-accuracy question, not to URL-splicing safety (see
+    /// `MAX_NAME_LENGTH`'s doc for why the two length caps intentionally differ). A
+    /// name that fails this can never resolve on crates.io, so this override lets
+    /// the "Invalid package name" diagnostic (deps-core's
+    /// `formatter.validate_package_name` gate) surface the accurate reason instead
+    /// of the generic "Unknown package" a registry-side lookup failure produces
+    /// (#382).
+    ///
+    /// The charset check (via `registry::is_safe_crate_name_charset`) and the
+    /// leading-character check both run before the length check, so a name that is
+    /// both non-ASCII and longer than `MAX_NAME_LENGTH` chars (e.g. a repeated CJK
+    /// name) reports the charset violation rather than a misleading "too long" —
+    /// the length in bytes of such a name can exceed the limit even when its
+    /// character count does not, and vice versa, so the length check counts
+    /// `chars()`, not bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] if `name` is empty, starts with a digit or
+    /// `-`, contains a character outside `[A-Za-z0-9_-]` (for example a non-ASCII
+    /// name like `"日本語"`), or exceeds `MAX_NAME_LENGTH` characters.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        if name.is_empty() {
+            return Err(InvalidPackageName::new("name cannot be empty"));
+        }
+        if !crate::registry::is_safe_crate_name_charset(name) {
+            return Err(InvalidPackageName::new(
+                "name must contain only ASCII letters, digits, '-', or '_'",
+            ));
+        }
+        if !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+            return Err(InvalidPackageName::new(
+                "name must start with an ASCII letter or '_'",
+            ));
+        }
+        if name.chars().count() > MAX_NAME_LENGTH {
+            return Err(InvalidPackageName::new(format!(
+                "name cannot exceed {MAX_NAME_LENGTH} characters"
+            )));
+        }
+        Ok(())
     }
 
     /// Compiles `requirement` via `semver::VersionReq`, the same crate `deps-cargo`'s
@@ -65,6 +132,114 @@ mod tests {
         assert_eq!(
             formatter.package_url(&PackageName::new("tokio-util")),
             "https://crates.io/crates/tokio-util"
+        );
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_valid_names() {
+        let formatter = CargoFormatter;
+        for name in [
+            "serde",
+            "tokio-util",
+            "my_crate",
+            "a",
+            "a".repeat(64).as_str(),
+        ] {
+            assert!(
+                formatter.validate_package_name(name).is_ok(),
+                "expected {name:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_empty() {
+        let formatter = CargoFormatter;
+        assert!(formatter.validate_package_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_too_long() {
+        let formatter = CargoFormatter;
+        let too_long = "a".repeat(65);
+        assert!(formatter.validate_package_name(&too_long).is_err());
+    }
+
+    /// #382 repro: a non-ASCII crate name must be reported as an invalid package
+    /// name, not silently forwarded to the registry as an "Unknown package".
+    #[test]
+    fn test_validate_package_name_rejects_non_ascii() {
+        let formatter = CargoFormatter;
+        assert!(formatter.validate_package_name("日本語").is_err());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_disallowed_punctuation() {
+        let formatter = CargoFormatter;
+        for name in ["serde.rs", "serde/util", "serde@1.0", "serde util"] {
+            assert!(
+                formatter.validate_package_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
+    }
+
+    /// crates.io's first-character rule: a digit or `-` can never lead a real
+    /// crate name — same "falls through to Unknown package" bug shape as #382,
+    /// on a different invalid-name form.
+    #[test]
+    fn test_validate_package_name_rejects_leading_digit_or_hyphen() {
+        let formatter = CargoFormatter;
+        for name in ["1abc", "9serde", "-abc"] {
+            assert!(
+                formatter.validate_package_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
+    }
+
+    /// A leading underscore is explicitly allowed, unlike a leading digit or `-`.
+    #[test]
+    fn test_validate_package_name_accepts_leading_underscore() {
+        let formatter = CargoFormatter;
+        assert!(formatter.validate_package_name("_private").is_ok());
+    }
+
+    /// The charset check must run before the length check: a non-ASCII name whose
+    /// *byte* length exceeds 64 (but character count does not) must report the
+    /// charset violation, not a misleading "too long" — and vice versa, the length
+    /// check must count `chars()`, not bytes, so it doesn't false-positive here.
+    #[test]
+    fn test_validate_package_name_long_non_ascii_reports_charset_error() {
+        let formatter = CargoFormatter;
+        let name = "日".repeat(30); // 30 chars, 90 bytes: over the byte cap, under the char cap
+        let err = formatter
+            .validate_package_name(&name)
+            .expect_err("non-ASCII name must be rejected");
+        assert!(
+            err.reason().contains("ASCII"),
+            "expected a charset error, got: {}",
+            err.reason()
+        );
+    }
+
+    /// Regression: `validate_package_name` must use `registry::is_safe_crate_name_charset`
+    /// (charset only), not `registry::is_safe_crate_name` (charset + a 128-byte
+    /// URL-safety cap unrelated to this diagnostic) — a charset-valid name over 128
+    /// bytes must reach this method's own `MAX_NAME_LENGTH` check and report "too
+    /// long", not the wrong "invalid characters" reason from the bundled-length
+    /// predicate.
+    #[test]
+    fn test_validate_package_name_over_128_bytes_reports_length_error_not_charset() {
+        let formatter = CargoFormatter;
+        let name = "a".repeat(130);
+        let err = formatter
+            .validate_package_name(&name)
+            .expect_err("over-length name must be rejected");
+        assert!(
+            err.reason().contains("exceed"),
+            "expected a length error, got: {}",
+            err.reason()
         );
     }
 

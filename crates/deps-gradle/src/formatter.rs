@@ -1,7 +1,7 @@
 //! Version formatting for Gradle ecosystem.
 
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
-use deps_core::{PackageName, VersionReq};
+use deps_core::{InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment};
 
 pub struct GradleFormatter;
 
@@ -169,6 +169,45 @@ impl EcosystemFormatter for GradleFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         deps_maven::registry::package_url(name.as_str())
+    }
+
+    /// Validates a Gradle coordinate's `group:artifact` shape and character set.
+    ///
+    /// Gradle resolves through `deps_maven::MavenCentralRegistry` and shares Maven's
+    /// `groupId:artifactId` coordinate shape (see `deps-gradle/src/ecosystem.rs`), so this
+    /// mirrors [`deps_maven`]'s `MavenFormatter::validate_package_name` exactly, reusing
+    /// [`is_safe_maven_coordinate_segment`] rather than duplicating it — letting the
+    /// "Invalid package name" diagnostic surface the accurate reason instead of the
+    /// generic "Unknown package" a registry-side rejection produces (#375).
+    ///
+    /// Unlike Maven's `${property}`-specific `is_unresolved`, this uses Gradle's own
+    /// `is_unresolved`, which also short-circuits on an unresolved `$var`/`${var}`
+    /// reference or Gradle-catalog-alias placeholder — valid Gradle syntax, not a
+    /// malformed coordinate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] if `name` has no `:` separator, or if either the
+    /// `group` or `artifact` segment fails [`is_safe_maven_coordinate_segment`] — but
+    /// never when `name` is unresolved per `is_unresolved`, which is accepted instead.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        if is_unresolved(name) {
+            return Ok(());
+        }
+        let Some((group_id, artifact_id)) = name.split_once(':') else {
+            return Err(InvalidPackageName::new(
+                "coordinate must be in 'group:artifact' form",
+            ));
+        };
+        if !is_safe_maven_coordinate_segment(group_id) {
+            return Err(InvalidPackageName::new("group contains invalid characters"));
+        }
+        if !is_safe_maven_coordinate_segment(artifact_id) {
+            return Err(InvalidPackageName::new(
+                "artifact contains invalid characters",
+            ));
+        }
+        Ok(())
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -413,6 +452,40 @@ mod tests {
     fn test_version_satisfies_unresolved_compound_variable() {
         let f = GradleFormatter;
         assert!(f.version_satisfies_requirement("3.14.0", "1.0.0-$suffix"));
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_valid_coordinate() {
+        let f = GradleFormatter;
+        assert!(f.validate_package_name("com.google.guava:guava").is_ok());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_missing_colon() {
+        let f = GradleFormatter;
+        assert!(f.validate_package_name("com.google.guava").is_err());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_invalid_group() {
+        let f = GradleFormatter;
+        assert!(f.validate_package_name("com</group>:guava").is_err());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_invalid_artifact() {
+        let f = GradleFormatter;
+        assert!(f.validate_package_name("com.google.guava:..").is_err());
+    }
+
+    /// Gradle's own `is_unresolved` (unresolved `$var`/`${var}` or catalog-alias
+    /// placeholder) is valid Gradle syntax, not a malformed coordinate — must be
+    /// accepted, mirroring Maven's `${property}` treatment.
+    #[test]
+    fn test_validate_package_name_accepts_unresolved_variable() {
+        let f = GradleFormatter;
+        assert!(f.validate_package_name("$group:guava").is_ok());
+        assert!(f.validate_package_name("com.google.guava:${name}").is_ok());
     }
 
     #[test]
