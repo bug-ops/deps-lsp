@@ -217,6 +217,27 @@ mod tests {
     }
 
     #[test]
+    fn test_version_is_prerelease() {
+        use deps_core::Version;
+
+        let stable = DartVersion {
+            version: "1.0.0".into(),
+            retracted: false,
+            published_at: None,
+        };
+        let prerelease = DartVersion {
+            version: "2.10.0-nullsafety.1".into(),
+            retracted: false,
+            published_at: None,
+        };
+
+        assert!(!stable.is_prerelease());
+        assert!(stable.is_stable());
+        assert!(prerelease.is_prerelease());
+        assert!(!prerelease.is_stable());
+    }
+
+    #[test]
     fn test_metadata_trait() {
         use deps_core::Metadata;
         let info = PackageInfo {

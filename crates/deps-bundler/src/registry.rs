@@ -105,9 +105,9 @@ fn parse_versions_response(data: &[u8], _gem_name: &str) -> Result<Vec<BundlerVe
     // the `ruby` platform entry when a duplicate exists since it's the generic variant.
     //
     // First-seen (JSON) order is preserved rather than collected via `HashMap::into_values`
-    // (whose iteration order is randomized per-process): `compare_versions` reduces
-    // same-numeric-prefix entries (e.g. `3.7.0`, `3.7.0.pre1`) to ties, so the later stable
-    // sort's tie-break depends on this order staying deterministic across hovers.
+    // (whose iteration order is randomized per-process): `compare_versions` can still tie two
+    // entries (e.g. `"1.0"` and `"1.0.0"`, zero-padded to equal), so the later stable sort's
+    // tie-break depends on this order staying deterministic across hovers.
     let mut versions: Vec<BundlerVersion> = Vec::with_capacity(entries.len());
     let mut index_by_number: HashMap<String, usize> = HashMap::with_capacity(entries.len());
     for e in entries {
@@ -512,27 +512,47 @@ mod tests {
 
     #[test]
     fn test_parse_versions_response_dedup_is_order_deterministic_across_runs() {
-        // `compare_versions` reduces same-numeric-prefix entries to ties (the trailing
-        // non-numeric segment of "3.7.0.pre1"/"3.7.0.pre2" parses to nothing and is
-        // dropped), mirroring real gems like mime-types. The dedup step must preserve
-        // first-seen (JSON) order for the later stable sort's tie-break to stay
-        // deterministic — collecting via `HashMap::into_values` would randomize it
-        // per-process instead. Run repeatedly to catch that regression, since a HashMap's
-        // random seed is fixed for the life of one process and a single run could pass by
-        // chance.
+        // `compare_versions` (#323) correctly orders "3.7.0" above its own "pre1"/"pre2"
+        // prereleases rather than tying them, so this input no longer exercises a tie. Use
+        // a shape that still ties post-#323 instead — "1.0" and "1.0.0" zero-pad to equal —
+        // to keep covering the dedup step's first-seen-order preservation, which the later
+        // stable sort's tie-break depends on staying deterministic across hovers.
+        // Collecting via `HashMap::into_values` would randomize that order per-process
+        // instead. Run repeatedly to catch that regression, since a HashMap's random seed
+        // is fixed for the life of one process and a single run could pass by chance.
+        let json = r#"[
+            {"number": "1.0", "prerelease": false, "yanked": false, "platform": "ruby"},
+            {"number": "2.0.0", "prerelease": false, "yanked": false, "platform": "ruby"},
+            {"number": "1.0.0", "prerelease": false, "yanked": false, "platform": "ruby"}
+        ]"#;
+
+        for _ in 0..20 {
+            let versions = parse_versions_response(json.as_bytes(), "mime-types").unwrap();
+            assert_eq!(versions.len(), 3);
+            assert_eq!(versions[0].number, "2.0.0");
+            assert_eq!(versions[1].number, "1.0");
+            assert_eq!(versions[2].number, "1.0.0");
+        }
+    }
+
+    #[test]
+    fn test_parse_versions_response_orders_dot_notation_prerelease_below_stable() {
+        // Regression test for #323, replacing this test's old expectation (kept as
+        // `..._dedup_is_order_deterministic_across_runs` above): before the fix, mime-types'
+        // real "3.7.0"/"3.7.0.pre1"/"3.7.0.pre2" tied under `compare_versions` and this sort
+        // only preserved JSON input order by accident. It must now sort by actual version
+        // precedence.
         let json = r#"[
             {"number": "3.7.0.pre2", "prerelease": true, "yanked": false, "platform": "ruby"},
             {"number": "3.7.0.pre1", "prerelease": true, "yanked": false, "platform": "ruby"},
             {"number": "3.7.0", "prerelease": false, "yanked": false, "platform": "ruby"}
         ]"#;
 
-        for _ in 0..20 {
-            let versions = parse_versions_response(json.as_bytes(), "mime-types").unwrap();
-            assert_eq!(versions.len(), 3);
-            assert_eq!(versions[0].number, "3.7.0.pre2");
-            assert_eq!(versions[1].number, "3.7.0.pre1");
-            assert_eq!(versions[2].number, "3.7.0");
-        }
+        let versions = parse_versions_response(json.as_bytes(), "mime-types").unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].number, "3.7.0");
+        assert_eq!(versions[1].number, "3.7.0.pre2");
+        assert_eq!(versions[2].number, "3.7.0.pre1");
     }
 
     #[test]

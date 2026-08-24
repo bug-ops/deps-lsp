@@ -92,6 +92,15 @@ macro_rules! impl_dependency {
 /// * `yanked` - Field name for yanked/deprecated status (`bool`)
 /// * `published_at` - Optional: field name for publish timestamp
 ///   (`Option<PublishTime>`), already parsed eagerly at construction
+/// * `prerelease` - Optional: expression evaluating to a closure
+///   `Fn(&$type) -> bool`, used when the ecosystem has its own reliable
+///   prerelease signal (e.g. a semver-parsed `pre` component) instead of
+///   falling back to the trait's default hyphen-substring heuristic.
+///   Omitting this arm silently installs the default heuristic, with no
+///   compile-time signal that it may be wrong for the ecosystem — only omit
+///   it when the default is provably correct for the registry's version
+///   format (as of #322, `deps-composer` is the sole deliberate holdout,
+///   since Packagist versions aren't strict semver).
 ///
 /// # Examples
 ///
@@ -124,6 +133,23 @@ macro_rules! impl_dependency {
 ///     version: version,
 ///     yanked: deprecated,
 ///     published_at: published_at,
+/// });
+/// ```
+///
+/// With a structured prerelease signal:
+///
+/// ```ignore
+/// use deps_core::impl_version;
+///
+/// pub struct MyVersion {
+///     pub version: String,
+///     pub deprecated: bool,
+/// }
+///
+/// impl_version!(MyVersion {
+///     version: version,
+///     yanked: deprecated,
+///     prerelease: |v: &MyVersion| v.version.contains("-pre"),
 /// });
 /// ```
 #[macro_export]
@@ -162,6 +188,57 @@ macro_rules! impl_version {
 
             fn published_at(&self) -> Option<$crate::freshness::PublishTime> {
                 self.$published_at
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
+    };
+    ($type:ty {
+        version: $version:ident,
+        yanked: $yanked:ident,
+        prerelease: $prerelease:expr $(,)?
+    }) => {
+        impl $crate::registry::Version for $type {
+            fn version_string(&self) -> &str {
+                &self.$version
+            }
+
+            fn is_yanked(&self) -> bool {
+                self.$yanked
+            }
+
+            fn is_prerelease(&self) -> bool {
+                ($prerelease)(self)
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
+    };
+    ($type:ty {
+        version: $version:ident,
+        yanked: $yanked:ident,
+        published_at: $published_at:ident,
+        prerelease: $prerelease:expr $(,)?
+    }) => {
+        impl $crate::registry::Version for $type {
+            fn version_string(&self) -> &str {
+                &self.$version
+            }
+
+            fn is_yanked(&self) -> bool {
+                self.$yanked
+            }
+
+            fn published_at(&self) -> Option<$crate::freshness::PublishTime> {
+                self.$published_at
+            }
+
+            fn is_prerelease(&self) -> bool {
+                ($prerelease)(self)
             }
 
             fn as_any(&self) -> &dyn ::std::any::Any {
@@ -354,6 +431,19 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
+    struct TestVersionWithPrerelease {
+        version: String,
+        yanked: bool,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestVersionWithPublishedAtAndPrerelease {
+        version: String,
+        yanked: bool,
+        published_at: Option<crate::freshness::PublishTime>,
+    }
+
+    #[derive(Debug, Clone)]
     struct TestPackage {
         name: crate::PackageName,
         description: Option<String>,
@@ -385,6 +475,19 @@ mod tests {
         version: version,
         yanked: yanked,
         published_at: published_at,
+    });
+
+    impl_version!(TestVersionWithPrerelease {
+        version: version,
+        yanked: yanked,
+        prerelease: |v: &TestVersionWithPrerelease| v.version.contains(".pre"),
+    });
+
+    impl_version!(TestVersionWithPublishedAtAndPrerelease {
+        version: version,
+        yanked: yanked,
+        published_at: published_at,
+        prerelease: |v: &TestVersionWithPublishedAtAndPrerelease| v.version.contains(".pre"),
     });
 
     impl_metadata!(TestPackage {
@@ -455,6 +558,43 @@ mod tests {
             Some(PublishTime::from_unix_secs(1_000))
         );
         assert!(version.as_any().is::<TestVersionWithPublishedAt>());
+    }
+
+    #[test]
+    fn test_impl_version_macro_with_prerelease() {
+        use crate::registry::Version;
+
+        let stable = TestVersionWithPrerelease {
+            version: "1.0.0".into(),
+            yanked: false,
+        };
+        let prerelease = TestVersionWithPrerelease {
+            version: "1.0.0.pre1".into(),
+            yanked: false,
+        };
+
+        assert!(!stable.is_prerelease());
+        assert!(prerelease.is_prerelease());
+        assert!(stable.is_stable());
+        assert!(!prerelease.is_stable());
+    }
+
+    #[test]
+    fn test_impl_version_macro_with_published_at_and_prerelease() {
+        use crate::freshness::PublishTime;
+        use crate::registry::Version;
+
+        let version = TestVersionWithPublishedAtAndPrerelease {
+            version: "2.0.0.pre1".into(),
+            yanked: false,
+            published_at: Some(PublishTime::from_unix_secs(2_000)),
+        };
+
+        assert!(version.is_prerelease());
+        assert_eq!(
+            version.published_at(),
+            Some(PublishTime::from_unix_secs(2_000))
+        );
     }
 
     #[test]

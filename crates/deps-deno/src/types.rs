@@ -86,10 +86,17 @@ pub struct JsrVersion {
     pub published_at: Option<deps_core::PublishTime>,
 }
 
+// JSR mandates strict semver, so `node_semver` reliably exposes the
+// prerelease identifiers instead of falling back to deps-core's default
+// hyphen-substring heuristic (#322). A parse failure here (treated as
+// not-prerelease) is practically unreachable given that enforcement.
 deps_core::impl_version!(JsrVersion {
     version: version,
     yanked: yanked,
     published_at: published_at,
+    prerelease: |v: &JsrVersion| {
+        node_semver::Version::parse(&v.version).is_ok_and(|parsed| parsed.is_prerelease())
+    },
 });
 
 /// A JSR package search result, from `https://api.jsr.io/packages?query=`.
@@ -213,6 +220,25 @@ mod tests {
 
         assert_eq!(version.version_string(), "1.0.24");
         assert!(version.is_yanked());
+    }
+
+    #[test]
+    fn test_jsr_version_is_prerelease() {
+        let stable = JsrVersion {
+            version: "1.0.24".into(),
+            yanked: false,
+            published_at: None,
+        };
+        let prerelease = JsrVersion {
+            version: "1.0.24-rc.1".into(),
+            yanked: false,
+            published_at: None,
+        };
+
+        assert!(!stable.is_prerelease());
+        assert!(stable.is_stable());
+        assert!(prerelease.is_prerelease());
+        assert!(!prerelease.is_stable());
     }
 
     #[test]

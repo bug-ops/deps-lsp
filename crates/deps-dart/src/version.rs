@@ -168,6 +168,17 @@ fn matches_caret(version: &str, requirement: &str) -> bool {
     }
 }
 
+/// Whether `version` has a semver 2.0.0 prerelease component.
+///
+/// Pub requires published versions to be strict semver, so any hyphen
+/// preceding optional `+build` metadata reliably marks a prerelease —
+/// unlike deps-core's default keyword-based heuristic, this also catches
+/// conventions not in its fixed list, e.g. Dart's `nullsafety` preview tag
+/// (`2.10.0-nullsafety.1`) (#322).
+pub fn is_prerelease(version: &str) -> bool {
+    version.split('+').next().unwrap_or(version).contains('-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +190,17 @@ mod tests {
         assert_eq!(compare_versions("1.0.0", "1.0.1"), Ordering::Less);
         assert_eq!(compare_versions("2.0.0", "1.9.9"), Ordering::Greater);
         assert_eq!(compare_versions("1.0.0", "1.0"), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_is_prerelease() {
+        assert!(!is_prerelease("1.0.0"));
+        assert!(!is_prerelease("1.0.0+build.1"));
+        assert!(is_prerelease("1.0.0-dev.1"));
+        // Not in deps-core's default keyword list, but still a valid semver
+        // prerelease tag.
+        assert!(is_prerelease("2.10.0-nullsafety.1"));
+        assert!(is_prerelease("1.0.0-nullsafety.1+build"));
     }
 
     #[test]

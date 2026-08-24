@@ -62,10 +62,13 @@ fn exact_pin_version(requirement: &str) -> Option<&str> {
 /// Note on the boundary case (pin equal to the maximum): this gate compares numerically via
 /// [`compare_versions`], which zero-pads missing components, while the actual scan in
 /// [`RubygemsMatcher`] compares by string equality/prefix (see `version_matches_requirement`).
-/// The two can disagree at the boundary — `"2.0.0.rc1"` vs. a published `"2.0.0"`, or a pin of
-/// `"1.6"` vs. a published `"1.6.0"`, compare `Equal` here but would not string-match there.
-/// That disagreement only ever makes this gate suppress a diagnostic the string matcher would
-/// otherwise have flagged — over-suppression, the safe direction — never the reverse.
+/// The two can disagree at the boundary — a pin of `"1.6"` vs. a published `"1.6.0"` compares
+/// `Equal` here (numeric zero-padding) but would not string-match there. (A prerelease-tagged
+/// pin like `"2.0.0.rc1"` against a published `"2.0.0"` no longer reaches this path:
+/// `compare_versions` correctly orders it below the stable release instead of tying, since
+/// #323's fix.) That disagreement only ever makes this gate suppress a diagnostic the string
+/// matcher would otherwise have flagged — over-suppression, the safe direction — never the
+/// reverse.
 fn exact_pin_could_be_yanked(requirement: &str, available: &[String]) -> bool {
     let Some(pin) = exact_pin_version(requirement) else {
         return false;

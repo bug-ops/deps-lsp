@@ -159,6 +159,11 @@ impl PypiVersion {
     /// assert!(beta.is_prerelease());
     /// assert!(rc.is_prerelease());
     /// ```
+    ///
+    /// Do not rename or remove this method without updating the
+    /// `prerelease:` closure in the `impl_version!` call below, which
+    /// delegates to it by name and relies on inherent-beats-trait method
+    /// resolution to reach it.
     pub fn is_prerelease(&self) -> bool {
         use pep440_rs::Version;
         use std::str::FromStr;
@@ -169,11 +174,23 @@ impl PypiVersion {
     }
 }
 
-// Use macro to implement VersionInfo and Version traits
+// Use macro to implement VersionInfo and Version traits. Without an explicit
+// `prerelease:` arm, `impl_version!` would fall back to the trait's default
+// hyphen-substring heuristic, which is unreachable-shadowing for `PypiVersion`
+// once boxed as `dyn deps_core::Version` — its inherent `is_prerelease` above
+// is PEP 440-aware and must be the one actually consulted.
+//
+// `v.is_prerelease()` below resolves to the inherent method (defined above,
+// on the concrete `PypiVersion` type) because inherent methods take priority
+// over trait methods for the same receiver — this is deliberate delegation,
+// not a mistake. If that inherent method is ever renamed or removed, this
+// call would silently rebind to the trait method being defined right here,
+// causing unbounded recursion; keep the two in sync.
 deps_core::impl_version!(PypiVersion {
     version: version,
     yanked: yanked,
     published_at: published_at,
+    prerelease: |v: &PypiVersion| v.is_prerelease(),
 });
 
 /// Package metadata from PyPI.
@@ -432,6 +449,28 @@ mod tests {
         assert!(alpha.is_prerelease());
         assert!(beta.is_prerelease());
         assert!(rc.is_prerelease());
+    }
+
+    #[test]
+    fn test_pypi_version_prerelease_detection_through_version_trait() {
+        // Regression test for #322: `impl_version!` must not shadow the
+        // PEP 440-aware inherent `is_prerelease` with the deps-core default
+        // hyphen-substring heuristic once boxed as `dyn deps_core::Version`.
+        let rc: Box<dyn Version> = Box::new(PypiVersion {
+            version: "1.0.0rc1".into(),
+            yanked: false,
+            published_at: None,
+        });
+        let stable: Box<dyn Version> = Box::new(PypiVersion {
+            version: "1.0.0".into(),
+            yanked: false,
+            published_at: None,
+        });
+
+        assert!(rc.is_prerelease());
+        assert!(!rc.is_stable());
+        assert!(!stable.is_prerelease());
+        assert!(stable.is_stable());
     }
 
     #[test]
