@@ -107,6 +107,32 @@ through:
 This is intentional graceful degradation (US-003), the same shape as Go's documented
 partial freshness coverage (`/@v/list` carries no per-version dates either) — not a bug.
 
+### NuGet/npm Release-Freshness Coverage
+
+Both are gated by `freshness.enabled` (default `true`) like every other ecosystem, but each
+pays for the signal differently:
+
+- **NuGet** ✅, **but only for the newest ~8 versions of a package** — for any feed that
+  exposes a `RegistrationsBaseUrl` resource in its service index (nuget.org always does),
+  ages come from walking the registration hive's pages backwards from the newest, stopping
+  once enough recent versions are covered. This is a deliberate MVP trade-off, not an
+  oversight: completion filters by the typed prefix *before* truncating to the versions it
+  renders, so a prefix that selects only older versions (e.g. typing `6.` against a package
+  whose newest release is `9.x`) renders those versions with no age at all, even though
+  hover on the same package shows ages normally (hover only ever renders the newest ~8
+  anyway). A private V3 feed (Azure Artifacts, BaGet, GitHub Packages) that omits
+  `RegistrationsBaseUrl` entirely degrades to `published_at: None` for every version, with
+  the version list itself unaffected. Unlisted versions (the registration hive's
+  `1900-01-01` sentinel date) never render a bogus age. Added cost is typically zero extra
+  round trips (the version list and the registration index are fetched concurrently), one
+  extra round trip when a package's registration hive externalizes its last page.
+- **npm** ✅, but enabling it issues an **entire additional full-packument fetch** per
+  package, not a marginal delta — the abbreviated packument `get_versions` already fetches
+  carries no publish dates, so freshness attaches a separately-fetched, TTL'd (1 hour)
+  `{version: date}` map derived from the full packument's `time` field instead. This is the
+  one ecosystem in this project where `freshness.enabled: false` genuinely removes a whole
+  request per hover/completion round, not just a conditional revalidation.
+
 ### CodeLens: "Update N Outdated Dependencies"
 
 An open manifest with at least one outdated, safely-editable dependency shows a code lens at

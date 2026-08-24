@@ -39,8 +39,8 @@ pub use lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,
 };
 pub use lsp_helpers::{
-    DiagnosticSeverities, EcosystemFormatter, LineOffsetTable, PackageVersions, RequirementMatcher,
-    RequirementStatus, VersionData, collect_update_all_edits,
+    DiagnosticSeverities, EcosystemFormatter, HOVER_RECENT_VERSIONS, LineOffsetTable,
+    PackageVersions, RequirementMatcher, RequirementStatus, VersionData, collect_update_all_edits,
     generate_code_actions as lsp_generate_code_actions,
     generate_code_lenses as lsp_generate_code_lenses,
     generate_diagnostics as lsp_generate_diagnostics, generate_hover as lsp_generate_hover,

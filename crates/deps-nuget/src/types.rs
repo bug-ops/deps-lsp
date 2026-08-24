@@ -53,6 +53,9 @@ deps_core::impl_parse_result!(
 #[derive(Debug, Clone)]
 pub struct NuGetVersion {
     pub version: String,
+    /// Publish timestamp, populated only when `Registry::get_versions_with` is called with
+    /// freshness enabled and the version was covered by the registration-hive walk.
+    pub published_at: Option<deps_core::PublishTime>,
 }
 
 impl deps_core::Version for NuGetVersion {
@@ -66,6 +69,10 @@ impl deps_core::Version for NuGetVersion {
 
     fn is_prerelease(&self) -> bool {
         crate::version::is_prerelease(&self.version)
+    }
+
+    fn published_at(&self) -> Option<deps_core::PublishTime> {
+        self.published_at
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -157,6 +164,7 @@ mod tests {
 
         let ver = NuGetVersion {
             version: "13.0.3".into(),
+            published_at: None,
         };
         assert_eq!(ver.version_string(), "13.0.3");
         assert!(!ver.is_yanked());
@@ -171,6 +179,7 @@ mod tests {
         // Real .NET label that the shared keyword-sniff default would misclassify as stable.
         let ver = NuGetVersion {
             version: "13.0.0-rtm".into(),
+            published_at: None,
         };
         assert!(ver.is_prerelease());
         assert!(!ver.is_stable());
@@ -182,6 +191,7 @@ mod tests {
 
         let ver = NuGetVersion {
             version: "1.0.0".into(),
+            published_at: None,
         };
         assert!(!ver.is_yanked());
     }

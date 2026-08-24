@@ -606,8 +606,10 @@ name = "deps-npm"
 version = "0.10.1"
 dependencies = [
  "criterion",
+ "dashmap",
  "deps-core",
  "insta",
+ "mockito",
  "node-semver",
  "reqwest",
  "serde",

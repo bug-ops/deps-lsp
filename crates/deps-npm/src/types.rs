@@ -81,6 +81,7 @@ pub enum NpmDependencySection {
 /// let version = NpmVersion {
 ///     version: "4.18.2".into(),
 ///     deprecated: false,
+///     published_at: None,
 /// };
 ///
 /// assert!(!version.deprecated);
@@ -89,12 +90,17 @@ pub enum NpmDependencySection {
 pub struct NpmVersion {
     pub version: String,
     pub deprecated: bool,
+    /// Publish timestamp, populated only when `Registry::get_versions_with` is called with
+    /// freshness enabled — derived from the full packument's `time` map, never the
+    /// abbreviated packument `get_versions` otherwise uses.
+    pub published_at: Option<deps_core::PublishTime>,
 }
 
 // Use macro to implement VersionInfo and Version traits
 deps_core::impl_version!(NpmVersion {
     version: version,
     yanked: deprecated,
+    published_at: published_at,
 });
 
 /// Package metadata from npm registry.
@@ -176,6 +182,7 @@ mod tests {
         let version = NpmVersion {
             version: "1.0.0".into(),
             deprecated: false,
+            published_at: None,
         };
 
         assert_eq!(version.version, "1.0.0");
@@ -187,6 +194,7 @@ mod tests {
         let version = NpmVersion {
             version: "2.0.0".into(),
             deprecated: true,
+            published_at: None,
         };
 
         assert_eq!(version.version_string(), "2.0.0");

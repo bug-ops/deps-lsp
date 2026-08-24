@@ -522,17 +522,35 @@ impl HttpCache {
     /// `DepsError::ResponseTooLarge` if the response body exceeds the
     /// configured size cap.
     pub async fn get_transport_only(&self, url: &str) -> Result<Bytes> {
+        self.get_transport_only_with_headers(url, &[]).await
+    }
+
+    /// Same as [`Self::get_transport_only`], but injects extra request headers (e.g. a
+    /// content-negotiating `Accept`) — mirrors how [`Self::get_cached_with_headers`] relates
+    /// to [`Self::get_cached`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `DepsError::HttpStatus` if the server returns a non-2xx
+    /// status, `DepsError::RegistryError` if the request fails, or
+    /// `DepsError::ResponseTooLarge` if the response body exceeds the
+    /// configured size cap.
+    pub async fn get_transport_only_with_headers(
+        &self,
+        url: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+    ) -> Result<Bytes> {
         ensure_https(url)?;
 
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| DepsError::RegistryError {
-                package: url.to_string(),
-                source: e,
-            })?;
+        let mut request = self.client.get(url);
+        for (name, value) in extra_headers {
+            request = request.header(name, *value);
+        }
+
+        let response = request.send().await.map_err(|e| DepsError::RegistryError {
+            package: url.to_string(),
+            source: e,
+        })?;
 
         if !response.status().is_success() {
             return Err(DepsError::HttpStatus {
@@ -1157,6 +1175,33 @@ mod tests {
         assert!(
             cache.is_empty(),
             "get_transport_only must not populate the entry-map cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_transport_only_with_headers_sends_extra_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/v1/vulns/RUSTSEC-2020-0071", server.url());
+
+        let _m = server
+            .mock("GET", "/v1/vulns/RUSTSEC-2020-0071")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_body(r#"{"id":"RUSTSEC-2020-0071"}"#)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let headers = [(header::ACCEPT, "application/json")];
+        let result: Bytes = cache
+            .get_transport_only_with_headers(&url, &headers)
+            .await
+            .unwrap();
+
+        assert_eq!(result.as_ref(), br#"{"id":"RUSTSEC-2020-0071"}"#);
+        assert!(
+            cache.is_empty(),
+            "get_transport_only_with_headers must not populate the entry-map cache"
         );
     }
 
