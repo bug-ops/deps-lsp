@@ -144,10 +144,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-maven, deps-swift, deps-lsp**: sanitize Maven groupId/artifactId and Swift registry URLs (and the fallback-search latest version) before they reach a completion TextEdit (resolves #314) (#320).
 - **deps-deno**: reject dot-prefixed JSR scope/package segments before building the registry metadata URL, closing a dot-segment URL-normalization gap (resolves #337) (#346).
 - **deps-core, deps-lsp**: sanitize registry-derived package names before they reach a completion TextEdit, across every ecosystem not already covered by #314 (Cargo, PyPI, npm, Composer, Go, Dart, Gradle, NuGet, Bundler, Deno); the Cargo/PyPI/Dart insert text now quotes the key to close a TOML dotted-key/YAML `@`-scalar edge case in the same fix (resolves #336) (#342).
-- **deps-bundler, deps-dart**: percent-encode registry-fetch URLs and reject a dot-segment (`.`/`..`) package name before building them, closing a path/query-injection gap (resolves #349) (#TBD).
-- **deps-maven**: reject an unsafe or dot-segment `groupId`/`artifactId` before building `metadata_urls`'s registry-fetch URL, closing the same #349 gap (#TBD).
-- **deps-npm, deps-deno**: reject a `.`/`..` scope or package segment as `PackageNotFound` before building the packument URL (resolves #341) (#TBD).
-- **deps-core**: `is_safe_*`/dot-segment predicate rejections now log a bounded `tracing::warn!` (value length only, never the raw value) instead of failing silently (resolves #344) (#TBD).
+- **deps-bundler, deps-dart**: percent-encode registry-fetch URLs and reject a dot-segment (`.`/`..`) package name before building them, closing a path/query-injection gap (resolves #349) (#355).
+- **deps-maven**: reject an unsafe or dot-segment `groupId`/`artifactId` before building `metadata_urls`'s registry-fetch URL, closing the same #349 gap (#355).
+- **deps-npm, deps-deno**: reject a `.`/`..` scope or package segment as `PackageNotFound` before building the packument URL (resolves #341) (#355).
+- **deps-core**: `is_safe_*`/dot-segment predicate rejections now log a bounded `tracing::warn!` (value length only, never the raw value) instead of failing silently (resolves #344) (#355).
 
 ### Changed
 - **Breaking (pre-1.0, internal API)**: `Ecosystem::{generate_hover, generate_diagnostics, generate_completions}` and `lsp_helpers::{generate_hover, generate_diagnostics_from_cache, generate_diagnostics}` now take an additional `deps_core::FreshnessSettings` parameter (issue #145, PR1 of 2). All call sites across the workspace pass it through. `generate_hover` and `generate_completions` (via `completion::{build_version_completion, complete_versions_generic}`) read `freshness.enabled` to gate the age-suffix rendering described above; the diagnostics functions still ignore the parameter — diagnostics carry no freshness-based rendering in this PR.
