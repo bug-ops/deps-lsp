@@ -44,8 +44,9 @@ pub use lsp_helpers::{
     VersionData, collect_update_all_edits, generate_code_actions as lsp_generate_code_actions,
     generate_code_lenses as lsp_generate_code_lenses,
     generate_diagnostics as lsp_generate_diagnostics, generate_hover as lsp_generate_hover,
-    generate_inlay_hints as lsp_generate_inlay_hints, is_safe_version_string, is_same_major_minor,
-    position_in_range, requirement_is_unsatisfiable,
+    generate_inlay_hints as lsp_generate_inlay_hints, is_safe_maven_coordinate_segment,
+    is_safe_registry_url, is_safe_version_string, is_same_major_minor, position_in_range,
+    requirement_is_unsatisfiable,
 };
 pub use package::{InvalidPackageName, PackageName, VersionReq};
 pub use parser::{

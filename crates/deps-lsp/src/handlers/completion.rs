@@ -6,6 +6,7 @@ use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
 use deps_core::completion::COMPLETION_SEARCH_TIMEOUT;
+use deps_core::{is_safe_maven_coordinate_segment, is_safe_registry_url, is_safe_version_string};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -601,7 +602,7 @@ async fn search_packages(
     // Convert search results to completion items
     results
         .iter()
-        .map(|metadata| create_package_completion_item(metadata.as_ref(), ecosystem_id))
+        .filter_map(|metadata| create_package_completion_item(metadata.as_ref(), ecosystem_id))
         .collect()
 }
 
@@ -610,30 +611,60 @@ async fn search_packages(
 /// The insert text mirrors each ecosystem's manifest syntax, exhaustively matched on
 /// [`EcosystemId`] so a new ecosystem must supply its own snippet instead of silently
 /// inheriting Cargo's `name = "version"` TOML syntax (see issue #118).
+///
+/// Returns `None` when a value this function interpolates into `insert_text` fails its
+/// allowlist — `latest` against [`is_safe_version_string`] (whenever non-empty; several
+/// arms legitimately omit the version clause when it's empty, so an empty `latest` is not
+/// itself unsafe), a Maven `groupId`/`artifactId` against
+/// [`is_safe_maven_coordinate_segment`], and a Swift repository URL against
+/// [`is_safe_registry_url`]. `metadata` comes straight from a registry search response, so
+/// a malicious/compromised registry must not be able to write structural
+/// characters into the manifest this text is inserted into.
 fn create_package_completion_item(
     metadata: &dyn deps_core::Metadata,
     ecosystem_id: EcosystemId,
-) -> CompletionItem {
+) -> Option<CompletionItem> {
     let name = metadata.name();
     let latest = metadata.latest_version();
     let description = metadata.description();
+
+    if !latest.is_empty() && !is_safe_version_string(latest) {
+        return None;
+    }
 
     let insert_text = match ecosystem_id {
         EcosystemId::Cargo | EcosystemId::Pypi => format!("{name} = \"{latest}\""),
         EcosystemId::Npm | EcosystemId::Composer => format!("\"{name}\": \"^{latest}\""),
         EcosystemId::Go => format!("{name} {latest}"),
         EcosystemId::Dart => format!("{name}: ^{latest}"),
-        EcosystemId::Maven => match name.as_str().split_once(':') {
-            Some((group_id, artifact_id)) => format!(
-                "<groupId>{group_id}</groupId><artifactId>{artifact_id}</artifactId><version>{latest}</version>"
-            ),
-            None => format!("<artifactId>{name}</artifactId><version>{latest}</version>"),
-        },
+        EcosystemId::Maven => {
+            // The predicate rejects `:` by design (see its doc comment), so it must
+            // validate each half of the coordinate after splitting, never the joined
+            // `name`.
+            let (group_id, artifact_id) = match name.as_str().split_once(':') {
+                Some((group_id, artifact_id)) => (Some(group_id), artifact_id),
+                None => (None, name.as_str()),
+            };
+            if !is_safe_maven_coordinate_segment(artifact_id)
+                || group_id.is_some_and(|g| !is_safe_maven_coordinate_segment(g))
+            {
+                return None;
+            }
+            group_id.map_or_else(
+                || format!("<artifactId>{artifact_id}</artifactId><version>{latest}</version>"),
+                |group_id| format!(
+                    "<groupId>{group_id}</groupId><artifactId>{artifact_id}</artifactId><version>{latest}</version>"
+                ),
+            )
+        }
         EcosystemId::Gradle => format!("implementation(\"{name}:{latest}\")"),
         EcosystemId::Swift => {
             let url = metadata
                 .repository()
                 .map_or_else(|| format!("https://github.com/{name}"), str::to_string);
+            if !is_safe_registry_url(&url) {
+                return None;
+            }
             if latest.is_empty() {
                 format!(".package(url: \"{url}\")")
             } else {
@@ -669,7 +700,7 @@ fn create_package_completion_item(
         Some(format!("Latest: {latest}"))
     };
 
-    CompletionItem {
+    Some(CompletionItem {
         label: name.to_string(),
         kind: Some(CompletionItemKind::MODULE),
         detail,
@@ -678,7 +709,7 @@ fn create_package_completion_item(
         insert_text: Some(insert_text),
         insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
         ..Default::default()
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1394,7 +1425,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("serde"),
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Cargo);
+        let item = create_package_completion_item(&meta, EcosystemId::Cargo).unwrap();
 
         assert_eq!(item.label, "serde");
         assert_eq!(item.kind, Some(CompletionItemKind::MODULE));
@@ -1432,7 +1463,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("express"),
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Npm);
+        let item = create_package_completion_item(&meta, EcosystemId::Npm).unwrap();
 
         assert_eq!(item.label, "express");
         assert_eq!(
@@ -1470,7 +1501,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("requests"),
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Pypi);
+        let item = create_package_completion_item(&meta, EcosystemId::Pypi).unwrap();
 
         assert_eq!(item.label, "requests");
         assert_eq!(item.insert_text, Some("requests = \"2.31.0\"".to_string()));
@@ -1509,7 +1540,7 @@ requests
             repository: None,
             latest_version: "3.14.0",
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Maven);
+        let item = create_package_completion_item(&meta, EcosystemId::Maven).unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -1528,12 +1559,64 @@ requests
             repository: None,
             latest_version: "3.14.0",
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Maven);
+        let item = create_package_completion_item(&meta, EcosystemId::Maven).unwrap();
 
         assert_eq!(
             item.insert_text,
             Some("<artifactId>commons-lang3</artifactId><version>3.14.0</version>".to_string())
         );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_maven_rejects_xml_breakout_artifact_id() {
+        // S1: the identical breakout `build_field_completion` (deps-maven) now guards
+        // against must also be rejected on this fallback-search path, not just the
+        // primary XML-context path.
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new(
+                "org.apache.commons:commons</artifactId><parent><groupId>evil",
+            ),
+            repository: None,
+            latest_version: "3.14.0",
+        };
+
+        assert!(create_package_completion_item(&meta, EcosystemId::Maven).is_none());
+    }
+
+    #[test]
+    fn test_create_package_completion_item_maven_rejects_xml_breakout_group_id() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("org.evil</groupId><parent>:commons-lang3"),
+            repository: None,
+            latest_version: "3.14.0",
+        };
+
+        assert!(create_package_completion_item(&meta, EcosystemId::Maven).is_none());
+    }
+
+    #[test]
+    fn test_create_package_completion_item_maven_no_colon_rejects_xml_breakout() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("commons</artifactId><parent>"),
+            repository: None,
+            latest_version: "3.14.0",
+        };
+
+        assert!(create_package_completion_item(&meta, EcosystemId::Maven).is_none());
+    }
+
+    #[test]
+    fn test_create_package_completion_item_rejects_unsafe_latest_version() {
+        // S2: `latest` is interpolated into every ecosystem's insert_text but was
+        // previously never validated on this path (unlike the other five `TextEdit`
+        // producers `is_safe_version_string` guards).
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("serde"),
+            repository: None,
+            latest_version: "1.0.0\", git = \"https://evil",
+        };
+
+        assert!(create_package_completion_item(&meta, EcosystemId::Cargo).is_none());
     }
 
     #[test]
@@ -1543,7 +1626,7 @@ requests
             repository: Some("https://github.com/apple/swift-nio"),
             latest_version: "2.62.0",
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Swift);
+        let item = create_package_completion_item(&meta, EcosystemId::Swift).unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -1561,7 +1644,7 @@ requests
             repository: Some("https://github.com/apple/swift-nio"),
             latest_version: "",
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Swift);
+        let item = create_package_completion_item(&meta, EcosystemId::Swift).unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -1576,7 +1659,7 @@ requests
             repository: None,
             latest_version: "2.62.0",
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Swift);
+        let item = create_package_completion_item(&meta, EcosystemId::Swift).unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -1588,13 +1671,39 @@ requests
     }
 
     #[test]
+    fn test_create_package_completion_item_swift_rejects_string_literal_breakout_repository() {
+        // S1: the identical breakout `build_url_completion` (deps-swift) now guards
+        // against must also be rejected on this fallback-search path.
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio"),
+            repository: Some(
+                "https://evil.example\", .exact(\"1.0.0\")), .package(url: \"https://real",
+            ),
+            latest_version: "2.62.0",
+        };
+
+        assert!(create_package_completion_item(&meta, EcosystemId::Swift).is_none());
+    }
+
+    #[test]
+    fn test_create_package_completion_item_swift_rejects_malicious_name_in_fallback_url() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio\", .exact(\"1\")) //"),
+            repository: None,
+            latest_version: "2.62.0",
+        };
+
+        assert!(create_package_completion_item(&meta, EcosystemId::Swift).is_none());
+    }
+
+    #[test]
     fn test_create_package_completion_item_deno_strips_scheme_for_alias_key() {
         let meta = MockMetadata {
             name: deps_core::PackageName::new("jsr:@std/fs"),
             repository: None,
             latest_version: "1.0.24",
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Deno);
+        let item = create_package_completion_item(&meta, EcosystemId::Deno).unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -1609,7 +1718,7 @@ requests
             repository: None,
             latest_version: "18.3.1",
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Deno);
+        let item = create_package_completion_item(&meta, EcosystemId::Deno).unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -1625,7 +1734,7 @@ requests
             repository: None,
             latest_version: "",
         };
-        let item = create_package_completion_item(&meta, EcosystemId::Deno);
+        let item = create_package_completion_item(&meta, EcosystemId::Deno).unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -2117,6 +2226,92 @@ serde
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "express");
+    }
+
+    #[tokio::test]
+    async fn test_search_packages_drops_maven_xml_breakout_keeps_safe_result() {
+        // S1: this is the fallback-search path a malicious/compromised Maven registry
+        // response can reach when `deps-maven`'s own XML-context completion produces no
+        // (safe) results — it must apply the same allowlist, not just the primary path.
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct MockMetadata {
+            name: deps_core::PackageName,
+        }
+        impl Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &'static str {
+                "3.14.0"
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MavenRegistry;
+        impl Registry for MavenRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![
+                        Box::new(MockMetadata {
+                            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
+                        }) as Box<dyn Metadata>,
+                        Box::new(MockMetadata {
+                            name: deps_core::PackageName::new(
+                                "org.evil:payload</artifactId><parent>",
+                            ),
+                        }) as Box<dyn Metadata>,
+                    ])
+                })
+            }
+
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let items = search_packages(&MavenRegistry, EcosystemId::Maven, "commons").await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "org.apache.commons:commons-lang3");
     }
 
     #[tokio::test(start_paused = true)]
