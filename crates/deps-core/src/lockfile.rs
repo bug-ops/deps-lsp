@@ -448,12 +448,18 @@ impl LockFileCache {
             return Ok(cached_packages);
         }
 
-        // Cache miss - parse and store
+        // Cache miss - parse and store.
+        //
+        // Stat the file *before* parsing and use that pre-parse mtime as the cache
+        // key's freshness marker. If we stat'd after `parse_lockfile` instead, a
+        // concurrent rewrite landing mid-parse would let us store content read from
+        // the old version of the file under the new version's mtime, making the
+        // entry look fresh when it is actually stale (#359).
         tracing::debug!("Lock file cache miss: {}", lockfile_path.display());
-        let packages = provider.parse_lockfile(lockfile_path).await?;
-
         let metadata = tokio::fs::metadata(lockfile_path).await?;
         let modified_at = metadata.modified()?;
+
+        let packages = provider.parse_lockfile(lockfile_path).await?;
 
         self.entries.insert(
             lockfile_path.to_path_buf(),
@@ -839,6 +845,198 @@ mod tests {
 
         assert!(located.is_some());
         assert_eq!(located.unwrap(), uv_lock);
+    }
+
+    /// Stub [`LockFileProvider`] that counts `parse_lockfile` invocations and returns
+    /// a package whose version is the lock file's trimmed content, so tests can
+    /// observe both call count and which content was actually parsed.
+    struct CountingLockFileProvider {
+        parse_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingLockFileProvider {
+        fn new() -> Self {
+            Self {
+                parse_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn parse_count(&self) -> usize {
+            self.parse_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl LockFileProvider for CountingLockFileProvider {
+        fn locate_lockfile(&self, _manifest_uri: &Uri) -> Option<PathBuf> {
+            None
+        }
+
+        fn parse_lockfile<'a>(
+            &'a self,
+            lockfile_path: &'a Path,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                self.parse_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let content = read_lockfile_content(lockfile_path, "test.lock").await?;
+
+                let mut packages = ResolvedPackages::new();
+                packages.insert(ResolvedPackage {
+                    name: "test-package".into(),
+                    version: content.trim().to_string(),
+                    source: ResolvedSource::Path { path: ".".into() },
+                    dependencies: vec![],
+                });
+                Ok(packages)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_or_parse_cache_hit_does_not_reparse() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("test.lock");
+        std::fs::write(&lock_path, "1.0.0").unwrap();
+
+        let provider = CountingLockFileProvider::new();
+        let cache = LockFileCache::new();
+
+        let first = cache.get_or_parse(&provider, &lock_path).await.unwrap();
+        let second = cache.get_or_parse(&provider, &lock_path).await.unwrap();
+
+        assert_eq!(provider.parse_count(), 1, "second call should hit cache");
+        assert_eq!(first.get_version("test-package"), Some("1.0.0"));
+        assert_eq!(second.get_version("test-package"), Some("1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_get_or_parse_reparses_when_mtime_advances() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("test.lock");
+        std::fs::write(&lock_path, "1.0.0").unwrap();
+
+        let provider = CountingLockFileProvider::new();
+        let cache = LockFileCache::new();
+
+        let first = cache.get_or_parse(&provider, &lock_path).await.unwrap();
+        assert_eq!(first.get_version("test-package"), Some("1.0.0"));
+
+        std::fs::write(&lock_path, "2.0.0").unwrap();
+        // Explicitly bump mtime into the future rather than relying on filesystem
+        // mtime resolution (coarse on some platforms) to observe the change.
+        let future_mtime = SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(future_mtime)
+            .unwrap();
+
+        let second = cache.get_or_parse(&provider, &lock_path).await.unwrap();
+
+        assert_eq!(
+            provider.parse_count(),
+            2,
+            "stale mtime should trigger reparse"
+        );
+        assert_eq!(second.get_version("test-package"), Some("2.0.0"));
+    }
+
+    /// Stub [`LockFileProvider`] that simulates a concurrent writer racing the parse:
+    /// each `parse_lockfile` call reads the file's *current* content first, then — as
+    /// a side effect before returning — rewrites the file to `"2.0.0"` and bumps its
+    /// mtime into the future, then returns packages parsed from the content it read
+    /// *before* that rewrite. This reproduces the only await point between the
+    /// `get_or_parse` stat and cache insert, entirely under test control.
+    struct RewritingDuringParseProvider {
+        parse_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RewritingDuringParseProvider {
+        fn new() -> Self {
+            Self {
+                parse_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn parse_count(&self) -> usize {
+            self.parse_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl LockFileProvider for RewritingDuringParseProvider {
+        fn locate_lockfile(&self, _manifest_uri: &Uri) -> Option<PathBuf> {
+            None
+        }
+
+        fn parse_lockfile<'a>(
+            &'a self,
+            lockfile_path: &'a Path,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                self.parse_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let content = read_lockfile_content(lockfile_path, "test.lock").await?;
+
+                // Simulate a writer rewriting the lock file mid-parse.
+                std::fs::write(lockfile_path, "2.0.0").unwrap();
+                let future_mtime = SystemTime::now() + std::time::Duration::from_secs(5);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(lockfile_path)
+                    .unwrap()
+                    .set_modified(future_mtime)
+                    .unwrap();
+
+                let mut packages = ResolvedPackages::new();
+                packages.insert(ResolvedPackage {
+                    name: "test-package".into(),
+                    version: content.trim().to_string(),
+                    source: ResolvedSource::Path { path: ".".into() },
+                    dependencies: vec![],
+                });
+                Ok(packages)
+            })
+        }
+    }
+
+    /// Regression test for #359: discriminates the stat-before-parse fix from the
+    /// original stat-after-parse ordering.
+    ///
+    /// With the fix, `get_or_parse` stats the file *before* calling `parse_lockfile`,
+    /// so the cached `modified_at` reflects the pre-rewrite mtime tied to the
+    /// `"1.0.0"` content actually parsed. A second call then sees the file's mtime is
+    /// newer than the cached one, so it re-parses and observes `"2.0.0"`.
+    ///
+    /// On the pre-fix ordering (stat after parse), the post-parse stat would pick up
+    /// the mtime bump this same call just made, storing the *new* mtime alongside the
+    /// *old* (`"1.0.0"`) content. The second call would then incorrectly hit cache and
+    /// return stale `"1.0.0"` content without re-parsing — exactly the bug #359
+    /// describes. This test would have failed on that code.
+    #[tokio::test]
+    async fn test_get_or_parse_detects_rewrite_during_parse() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lock_path = temp_dir.path().join("test.lock");
+        std::fs::write(&lock_path, "1.0.0").unwrap();
+
+        let provider = RewritingDuringParseProvider::new();
+        let cache = LockFileCache::new();
+
+        let first = cache.get_or_parse(&provider, &lock_path).await.unwrap();
+        assert_eq!(first.get_version("test-package"), Some("1.0.0"));
+
+        let second = cache.get_or_parse(&provider, &lock_path).await.unwrap();
+
+        assert_eq!(
+            provider.parse_count(),
+            2,
+            "rewrite during first parse must be detected and trigger a reparse"
+        );
+        assert_eq!(second.get_version("test-package"), Some("2.0.0"));
     }
 
     #[test]
