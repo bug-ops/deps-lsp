@@ -80,12 +80,16 @@ tokio = { version = "1.0", features = ["full"] }
 
 /// Verifies that progress notifications follow the expected lifecycle.
 ///
-/// Progress notifications should follow this order:
-/// 1. window/workDoneProgress/create
-/// 2. window/workDoneProgress/begin
-/// 3. window/workDoneProgress/end (or report)
-///
-/// This test verifies the progress notification sequence is correct IF sent.
+/// Per the LSP work-done-progress protocol, `window/workDoneProgress/create`
+/// is a *request* the server sends to the client (answered here by
+/// `LspClient::auto_respond`) to allocate a progress token; the lifecycle
+/// itself is reported via `$/progress` *notifications* whose `params.value.kind`
+/// is `"begin"`, then zero or more `"report"`, then `"end"` — there is no
+/// wire notification literally named `window/workDoneProgress/begin` or
+/// `.../end`. Without the auto-responder, the server's create request would
+/// never get a reply and the whole progress lifecycle would silently never
+/// fire — the assertions below (unconditional, not `if let`) are what catches
+/// that regression.
 #[cfg(feature = "cargo")]
 #[test]
 fn test_progress_notification_lifecycle() {
@@ -109,39 +113,33 @@ serde = "1.0.0"
 
     client.did_open("file:///test/Cargo.toml", "toml", cargo_toml);
 
-    // Flush notifications
-    for _ in 0..3 {
-        std::thread::sleep(Duration::from_millis(200));
-        client.flush_notifications();
-    }
+    // `begin` is sent right after the progress token is created, before any
+    // registry network call, so it should arrive quickly.
+    let begin = client
+        .wait_for_notification(20, |n| {
+            n.method == "$/progress" && n.params["value"]["kind"] == "begin"
+        })
+        .expect("Server should send a $/progress begin notification while fetching versions");
 
-    // Check for progress notifications
-    let create = client.find_notification("window/workDoneProgress/create");
-    let begin = client.find_notification("window/workDoneProgress/begin");
-    let end = client.find_notification("window/workDoneProgress/end");
+    // `end` is sent only after the registry fetch completes (or times out —
+    // `fetch_timeout_secs` defaults to 5s), so give it a much larger budget.
+    let end = client
+        .wait_for_notification(80, |n| {
+            n.method == "$/progress" && n.params["value"]["kind"] == "end"
+        })
+        .expect("Server should send a $/progress end notification once the fetch completes");
 
-    // If progress notifications are sent, they should follow the correct order
-    if let (Some(create), Some(begin)) = (&create, &begin) {
-        assert!(
-            create.sequence < begin.sequence,
-            "Expected window/workDoneProgress/create (seq={}) to come before window/workDoneProgress/begin (seq={})",
-            create.sequence,
-            begin.sequence
-        );
-    }
+    assert!(
+        client.progress_create_request_count() >= 1,
+        "Expected the server to request a workDoneProgress token before reporting progress"
+    );
 
-    if let (Some(begin), Some(end)) = (&begin, &end) {
-        assert!(
-            begin.sequence < end.sequence,
-            "Expected window/workDoneProgress/begin (seq={}) to come before window/workDoneProgress/end (seq={})",
-            begin.sequence,
-            end.sequence
-        );
-    }
-
-    // NOTE: These assertions are lenient because progress notifications may not
-    // be sent in the test environment. The important thing is that IF they are sent,
-    // they follow the correct order.
+    assert!(
+        begin.sequence < end.sequence,
+        "Expected $/progress begin (seq={}) to come before $/progress end (seq={})",
+        begin.sequence,
+        end.sequence
+    );
 
     // Shutdown cleanly
     let _shutdown_response = client.shutdown();

@@ -5,10 +5,93 @@
 
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, RwLock};
+use std::thread;
 use std::time::{Duration, Instant};
+
+/// Deadline for a single server message: the server must emit its next
+/// framed LSP message (response or notification) within this window.
+/// A stalled/deadlocked server never sends another message, so this bounds
+/// `read_response()` to a fast, clear failure instead of hanging until
+/// nextest's external slow-timeout kills the whole test binary.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A single framed message read off the server's stdout, or a terminal
+/// condition of the reader thread.
+enum ReaderMessage {
+    /// The raw JSON body of one Content-Length-framed LSP message.
+    Frame(Vec<u8>),
+    /// The server closed its stdout (process exited or pipe closed).
+    Eof,
+    /// The reader thread hit an I/O or framing error while parsing the stream.
+    Error(String),
+}
+
+/// Continuously read Content-Length-framed messages from `stdout` and push
+/// them to `tx`, decoupling the blocking read from the caller so it can be
+/// bounded with `Receiver::recv_timeout` instead of hanging indefinitely.
+fn spawn_reader_thread(stdout: ChildStdout, tx: mpsc::Sender<ReaderMessage>) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                let bytes_read = match reader.read_line(&mut line) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ =
+                            tx.send(ReaderMessage::Error(format!("failed to read header: {e}")));
+                        return;
+                    }
+                };
+
+                if bytes_read == 0 {
+                    let _ = tx.send(ReaderMessage::Eof);
+                    return;
+                }
+
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+
+                if line.to_lowercase().starts_with("content-length:") {
+                    content_length = match line
+                        .split(':')
+                        .nth(1)
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                    {
+                        Some(n) => n,
+                        None => {
+                            let _ = tx.send(ReaderMessage::Error(format!(
+                                "invalid content-length header: {line:?}"
+                            )));
+                            return;
+                        }
+                    };
+                }
+            }
+
+            if content_length == 0 {
+                continue;
+            }
+
+            let mut body = vec![0u8; content_length];
+            if let Err(e) = reader.read_exact(&mut body) {
+                let _ = tx.send(ReaderMessage::Error(format!("failed to read body: {e}")));
+                return;
+            }
+
+            if tx.send(ReaderMessage::Frame(body)).is_err() {
+                // Receiver dropped (client gone) — stop reading.
+                return;
+            }
+        }
+    });
+}
 
 /// A captured notification with timing and ordering information.
 #[derive(Debug, Clone)]
@@ -31,8 +114,14 @@ pub(crate) struct LspClient {
     notifications: Arc<RwLock<Vec<CapturedNotification>>>,
     /// Monotonic counter for notification ordering.
     notification_counter: Arc<AtomicU64>,
-    /// Buffered reader for stdout (wrapped in Option for initialization).
-    reader: Option<BufReader<std::process::ChildStdout>>,
+    /// Receives framed messages from the background stdout-reader thread,
+    /// bounding each wait with `READ_TIMEOUT` via `recv_timeout`.
+    message_rx: mpsc::Receiver<ReaderMessage>,
+    /// Count of `window/workDoneProgress/create` requests auto-answered.
+    /// Used by tests to prove the round trip actually happened, rather than
+    /// just observing a `$/progress` notification that could in principle
+    /// arrive some other way.
+    progress_create_requests: u64,
 }
 
 impl LspClient {
@@ -46,14 +135,22 @@ impl LspClient {
             .expect("Failed to spawn deps-lsp binary");
 
         let stdout = process.stdout.take().expect("Failed to capture stdout");
-        let reader = BufReader::new(stdout);
+        let (tx, rx) = mpsc::channel();
+        spawn_reader_thread(stdout, tx);
 
         Self {
             process,
             notifications: Arc::new(RwLock::new(Vec::new())),
             notification_counter: Arc::new(AtomicU64::new(0)),
-            reader: Some(reader),
+            message_rx: rx,
+            progress_create_requests: 0,
         }
+    }
+
+    /// Number of `window/workDoneProgress/create` requests auto-answered so far.
+    #[allow(dead_code)] // Used in notification_ordering tests
+    pub(crate) fn progress_create_request_count(&self) -> u64 {
+        self.progress_create_requests
     }
 
     /// Get all captured notifications.
@@ -95,8 +192,11 @@ impl LspClient {
     /// handled request can still reach the stdout sink after that round trip's
     /// response — a single flush is not guaranteed to have captured it. This
     /// retries the flush-and-search cycle, sleeping briefly between attempts, to
-    /// tolerate that without an unbounded wait. Measured against the real binary,
-    /// the relevant notification typically lands within 35-155ms of being sent;
+    /// tolerate that without an unbounded wait. The first attempt flushes
+    /// immediately with no preceding sleep, so a notification sent just before
+    /// this call is captured with minimal added latency instead of waiting out
+    /// a full 100ms for no reason. Measured against the real binary, the
+    /// relevant notification typically lands within 35-155ms of being sent;
     /// the default budget here (10 attempts, ~100ms apart) leaves ample headroom.
     /// Intended for positive waits only — a `None` result after exhausting
     /// `max_attempts` does not prove the notification will never arrive.
@@ -110,7 +210,7 @@ impl LspClient {
             if let Some(found) = self.get_notifications().into_iter().find(|n| predicate(n)) {
                 return Some(found);
             }
-            if attempt + 1 < max_attempts {
+            if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(100));
             }
             self.flush_notifications();
@@ -142,44 +242,35 @@ impl LspClient {
 
     /// Read a JSON-RPC response from the server.
     ///
-    /// Captures notifications and returns the first response with matching id,
-    /// or any response/error if no id filter is provided.
+    /// Captures notifications, transparently answers server-initiated requests
+    /// (see [`Self::auto_respond`]), and returns the first response with
+    /// matching id, or any response/error if no id filter is provided. The
+    /// *entire call* is bounded by `READ_TIMEOUT` from an absolute deadline
+    /// computed once up front — not reset by each incoming frame — so a
+    /// server that is alive but hung on the awaited response (deadlocked,
+    /// infinite loop) still fails fast even while it keeps emitting unrelated
+    /// traffic (e.g. `$/progress` reports, diagnostics) that would otherwise
+    /// keep resetting a per-message timeout indefinitely.
     pub(crate) fn read_response(&mut self, expected_id: Option<i64>) -> Value {
-        let reader = self.reader.as_mut().expect("reader not initialized");
-
+        let deadline = Instant::now() + READ_TIMEOUT;
         loop {
-            // Read headers
-            let mut content_length = 0;
-            loop {
-                let mut line = String::new();
-                let bytes_read = reader.read_line(&mut line).expect("Failed to read header");
-
-                // EOF - server closed connection
-                assert!(bytes_read != 0, "Server closed connection unexpectedly");
-
-                if line == "\r\n" || line == "\n" {
-                    break;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let msg = match self.message_rx.recv_timeout(remaining) {
+                Ok(msg) => msg,
+                Err(RecvTimeoutError::Timeout) => panic!(
+                    "Server did not respond within {}s (possible hang or deadlock)",
+                    READ_TIMEOUT.as_secs()
+                ),
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("Server closed connection unexpectedly")
                 }
+            };
 
-                if line.to_lowercase().starts_with("content-length:") {
-                    content_length = line
-                        .split(':')
-                        .nth(1)
-                        .unwrap()
-                        .trim()
-                        .parse()
-                        .expect("Invalid content length");
-                }
-            }
-
-            // Handle empty content (shouldn't happen in valid LSP)
-            if content_length == 0 {
-                continue;
-            }
-
-            // Read body
-            let mut body = vec![0u8; content_length];
-            reader.read_exact(&mut body).expect("Failed to read body");
+            let body = match msg {
+                ReaderMessage::Frame(body) => body,
+                ReaderMessage::Eof => panic!("Server closed connection unexpectedly"),
+                ReaderMessage::Error(e) => panic!("Failed to read from server: {e}"),
+            };
 
             let message: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
                 panic!("Invalid JSON: {e} in: {:?}", String::from_utf8_lossy(&body))
@@ -206,6 +297,16 @@ impl LspClient {
                 continue;
             }
 
+            // A message with both "id" and "method" is a server-initiated
+            // *request* (e.g. `window/workDoneProgress/create`), not a
+            // response to one of our own requests. The server blocks
+            // awaiting the reply, so the harness must answer it or requests
+            // like progress-token creation hang until their own timeout.
+            if let Some(method) = message.get("method").and_then(|m| m.as_str()) {
+                self.auto_respond(method, &message);
+                continue;
+            }
+
             // Check id if filter is specified
             if let Some(id) = expected_id {
                 if message.get("id") == Some(&json!(id)) {
@@ -219,6 +320,47 @@ impl LspClient {
         }
     }
 
+    /// Answer a server-initiated request so the server's awaiting future can
+    /// proceed. Dispatches per method rather than returning a blanket `null`
+    /// result for everything: `workspace/applyEdit`'s result type
+    /// (`ApplyWorkspaceEditResult { applied: bool, .. }`) is not nullable, so
+    /// a fabricated `null` would fail to deserialize server-side and the
+    /// server would read it as "client refused the edit" — a *new* silent
+    /// failure of exactly the kind #286 exists to eliminate. An unrecognized
+    /// method gets a JSON-RPC `MethodNotFound` error instead of a made-up
+    /// success, so an unhandled server request surfaces as a visible test
+    /// failure rather than a silently-accepted no-op.
+    fn auto_respond(&mut self, method: &str, message: &Value) {
+        let Some(id) = message.get("id").cloned() else {
+            return;
+        };
+
+        let response = match method {
+            "window/workDoneProgress/create" => {
+                self.progress_create_requests += 1;
+                json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
+            }
+            "workspace/inlayHint/refresh"
+            | "workspace/codeLens/refresh"
+            | "client/registerCapability" => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
+            }
+            "workspace/applyEdit" => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "applied": true } })
+            }
+            _ => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("MethodNotFound: unhandled server-initiated request {method:?}")
+                }
+            }),
+        };
+
+        self.send(&response);
+    }
+
     /// Initialize the LSP session.
     pub(crate) fn initialize(&mut self) -> Value {
         self.send(&json!({
@@ -228,6 +370,9 @@ impl LspClient {
             "params": {
                 "processId": null,
                 "capabilities": {
+                    "window": {
+                        "workDoneProgress": true
+                    },
                     "workspace": {
                         "inlayHint": {
                             "refreshSupport": true

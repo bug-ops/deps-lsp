@@ -153,7 +153,7 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - name: Run tests
-        run: cargo nextest run --workspace --all-features --no-fail-fast
+        run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
 
       - name: Run doctests
         run: cargo test --workspace --doc --all-features
@@ -218,7 +218,7 @@ jobs:
           tool: cargo-nextest, cargo-llvm-cov
 
       - name: Generate coverage
-        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest --profile coverage
 
       - name: Upload coverage
         uses: codecov/codecov-action@v5
