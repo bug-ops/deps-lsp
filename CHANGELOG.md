@@ -53,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-deno**: new Deno/JSR ecosystem — `deno.json`/`deno.jsonc` support, dispatching `jsr:` specifiers to a new JSR registry client and `npm:` specifiers to the existing `deps-npm` client (resolves #207)
 
 - **deps-core, deps-cargo, deps-npm, deps-swift**: unsatisfiable-requirement WARNING now mentions a matching pre-release when one exists for Cargo/npm/Swift's strict-SemVer requirements, follow-up to #206 (resolves #299) (#305)
-- **deps-core**: extract `Version::is_prerelease()`'s default heuristic into a reusable `has_default_prerelease_marker` function (resolves #327)
+- **deps-core**: extract `Version::is_prerelease()`'s default heuristic into a reusable `has_default_prerelease_marker` function (resolves #327) (#330)
 
 ### Fixed
 - **deps-lsp**: `handle_inlay_hints` no longer awaits the config `RwLock` read while holding a `DashMap` document `Ref`, closing the reproducible liveness hazard from #317 (the residual `Ref`-across-`generate_*()` hold is tracked separately) (#318).
@@ -61,10 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: hover's `(latest)` marker in "Recent versions" now matches the `**Latest**` header's stable-version pick instead of the raw highest-numbered entry, which could be a pre-release (resolves #313) (#321).
 - **deps-core, deps-pypi, deps-cargo, deps-dart, deps-swift, deps-npm, deps-deno**: `Version::is_prerelease()`'s default hyphen-substring heuristic missed non-hyphenated or incomplete prerelease conventions (PyPI's PEP 440 suffixes, Dart's `nullsafety` tag, and others) across 6 ecosystems relying on it unmodified; each now consults a reliable per-ecosystem signal instead (resolves #322).
 - **deps-bundler**: `compare_versions` silently dropped non-numeric version segments, causing a stable release to tie with its own prereleases (e.g. `3.7.0` == `3.7.0.pre1`, or a lexicographic mis-order like `beta10` < `beta2`); now tokenizes into alternating numeric/alpha runs and compares them run-wise (resolves #323).
-- **deps-bundler**: `compare_versions`/`canonical_segments` are now a direct, fuzz-verified port of `Gem::Version#<=>`/`#canonical_segments`, fixing several prerelease-ordering and hyphen-handling edge cases (resolves #327).
-- **deps-bundler**: `matches_pessimistic` (`~>` requirement matching) is now a direct port of `Gem::Version#release`/`#bump`, fixing several divergences from RubyGems' actual pessimistic-operator semantics (resolves #327).
-- **Breaking (pre-1.0, public API)**: `deps-swift`'s `SwiftVersion` gained a `prerelease: bool` field, set once during tag parsing instead of re-parsed on every `is_prerelease()` call (resolves #327).
-- **deps-composer**: `ComposerVersion::is_prerelease()` now recognizes short `-a`/`-b` stability aliases (resolves #327).
+- **deps-bundler**: `compare_versions`/`canonical_segments` are now a direct, fuzz-verified port of `Gem::Version#<=>`/`#canonical_segments`, fixing several prerelease-ordering and hyphen-handling edge cases (resolves #327) (#330).
+- **deps-bundler**: `matches_pessimistic` (`~>` requirement matching) is now a direct port of `Gem::Version#release`/`#bump`, fixing several divergences from RubyGems' actual pessimistic-operator semantics (resolves #327) (#330).
+- **Breaking (pre-1.0, public API)**: `deps-swift`'s `SwiftVersion` gained a `prerelease: bool` field, set once during tag parsing instead of re-parsed on every `is_prerelease()` call (resolves #327) (#330).
+- **deps-composer**: `ComposerVersion::is_prerelease()` now recognizes short `-a`/`-b` stability aliases (resolves #327) (#330).
 - **deps-lsp**: stop holding DashMap document `Ref` across registry-bound await in hover/completion/code_actions handlers (resolves #319).
 - **deps-lsp**: `RegistryProgress::start` no longer sends `window/workDoneProgress/create` to a client that never advertised `window.workDoneProgress` support, an LSP 3.17 spec violation (resolves #290) (#296).
 - **deps-lsp** (tests): `LspClient::read_response`'s 10s hang-detection timeout is now covered by a fast unit test instead of being unexercised (resolves #291) (#296).
