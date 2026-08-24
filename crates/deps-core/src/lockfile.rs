@@ -424,6 +424,10 @@ impl LockFileCache {
     /// # Errors
     ///
     /// Returns error if file cannot be read or parsed
+    // TODO(#350): `cached` (a DashMap shard `Ref`) is held across the
+    // `tokio::fs::metadata(...).await` below — same hazard class as #333, tracked
+    // separately and out of scope here.
+    #[allow(clippy::await_holding_invalid_type)]
     pub async fn get_or_parse(
         &self,
         provider: &dyn LockFileProvider,

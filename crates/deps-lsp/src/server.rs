@@ -687,6 +687,11 @@ impl Backend {
     /// the remaining race for clients that support it. Clients that don't advertise the
     /// capability get the plain `changes` map instead, which carries no version; for
     /// those, this recompute-at-click-time step is the only staleness mitigation.
+    // `doc` (a DashMap shard `Ref`) is dropped via an explicit `drop(doc)` before every
+    // `.await` reachable from this point (see below) — clippy's `await_holding_invalid_type`
+    // does not recognize a manual `drop()` in this control-flow shape and flags the
+    // binding regardless. Verified as a false positive, not a real hazard: nothing to fix.
+    #[allow(clippy::await_holding_invalid_type)]
     async fn execute_update_all_outdated(&self, uri: Uri) {
         let Some(doc) = self.state.get_document(&uri) else {
             self.warn_update_all_outdated_not_ready().await;

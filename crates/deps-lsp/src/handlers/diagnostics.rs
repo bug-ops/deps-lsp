@@ -38,45 +38,59 @@ pub(crate) async fn generate_diagnostics_internal(
     freshness: deps_core::FreshnessSettings,
     severities: deps_core::DiagnosticSeverities,
 ) -> Vec<Diagnostic> {
-    // Single document lookup: extract all needed data at once
-    let doc = match state.get_document(uri) {
-        Some(d) => d,
-        None => {
-            tracing::warn!("Document not found for diagnostics: {:?}", uri);
-            return vec![];
-        }
-    };
-
-    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id()) {
-        Some(e) => e,
-        None => {
+    // Own everything `generate_diagnostics` needs and release the DashMap shard `Ref`
+    // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
+    // `&DocumentState` synchronously, so the guard can't leak across the `.await` below.
+    let Some(extracted) = state.with_document(uri, |doc| {
+        let Some(ecosystem) = state.ecosystem_registry.get(doc.ecosystem_id()) else {
             tracing::warn!(
                 "Ecosystem not found for diagnostics: {}",
                 doc.ecosystem_id()
             );
-            return vec![];
+            return None;
+        };
+
+        // Skip diagnostics while versions are still loading to avoid
+        // false "Unknown package" warnings from empty cache
+        if doc.loading_state == deps_core::LoadingState::Loading {
+            return None;
         }
-    };
 
-    // Skip diagnostics while versions are still loading to avoid
-    // false "Unknown package" warnings from empty cache
-    if doc.loading_state == deps_core::LoadingState::Loading {
+        let parse_result = doc.parse_result_arc()?;
+        Some((
+            ecosystem,
+            parse_result,
+            doc.cached_versions.clone(),
+            doc.resolved_versions.clone(),
+            doc.vulnerabilities.clone(),
+            doc.yanked_versions.clone(),
+            doc.fetch_failed.clone(),
+        ))
+    }) else {
+        tracing::warn!("Document not found for diagnostics: {:?}", uri);
         return vec![];
-    }
-
-    let parse_result = match doc.parse_result() {
-        Some(p) => p,
-        None => return vec![],
     };
 
-    // Generate diagnostics while holding the lock
+    let Some((
+        ecosystem,
+        parse_result,
+        cached_versions,
+        resolved_versions,
+        vulnerabilities,
+        yanked_versions,
+        fetch_failed,
+    )) = extracted
+    else {
+        return vec![];
+    };
+
     ecosystem
         .generate_diagnostics(
-            parse_result,
-            VersionData::new(&doc.cached_versions, &doc.resolved_versions)
-                .with_vulnerabilities(&doc.vulnerabilities)
-                .with_yanked(&doc.yanked_versions)
-                .with_fetch_failed(&doc.fetch_failed),
+            parse_result.as_ref(),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulnerabilities)
+                .with_yanked(&yanked_versions)
+                .with_fetch_failed(&fetch_failed),
             uri,
             freshness,
             severities,
@@ -103,6 +117,81 @@ mod tests {
         let (client, full_config) = create_test_client_and_config();
         let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
         assert!(result.is_empty());
+    }
+
+    /// #333 liveness regression: `handle_diagnostics` must release the DashMap shard
+    /// `Ref` on the document *before* awaiting `Ecosystem::generate_diagnostics`, so a
+    /// concurrent `documents.get_mut` on the same URI (e.g. a `didChange`) is never
+    /// blocked behind an in-flight (or stuck) diagnostics generation.
+    ///
+    /// `BlockingEcosystem::generate_diagnostics` waits on a `Barrier` before blocking
+    /// forever (`std::future::pending`), standing in for an override that performs real
+    /// I/O — the worst case for a shard `Ref` held across the call. The test only
+    /// proceeds to race the writer once that future has demonstrably started executing
+    /// (via the barrier); a concurrent write racing here must complete almost
+    /// immediately, proving the `Ref` was already dropped before the call was awaited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_document_write_not_blocked_by_in_flight_diagnostics() {
+        use crate::document::DocumentState;
+        use crate::test_utils::blocking_ecosystem::{
+            BlockingEcosystem, BlockingHook, MockParseResult,
+        };
+        use deps_core::ParseResult;
+        use tokio::sync::Barrier;
+
+        let state = Arc::new(ServerState::new());
+        let started = Arc::new(Barrier::new(2));
+        state
+            .ecosystem_registry
+            .register(Arc::new(BlockingEcosystem {
+                started: Arc::clone(&started),
+                hook: BlockingHook::Diagnostics,
+            }));
+
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        state.update_document(uri.clone(), doc);
+
+        let config = DiagnosticsConfig::default();
+        let (client, full_config) = create_test_client_and_config();
+
+        let handler_task = tokio::spawn({
+            let state = Arc::clone(&state);
+            let uri = uri.clone();
+            async move { handle_diagnostics(state, &uri, &config, client, full_config).await }
+        });
+
+        // Block until `generate_diagnostics` has actually started executing — i.e.
+        // `handle_diagnostics` has reached (and is now inside) the await — before
+        // racing the writer below. Timeout-wrapped so a regression that makes the
+        // handler never reach the awaited call fails loudly instead of hanging forever.
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.wait())
+            .await
+            .expect("handle_diagnostics did not reach generate_diagnostics within 5s");
+
+        // Spawned onto its own task (rather than awaited inline) deliberately: see
+        // `completion.rs`'s equivalent #319 regression test for why `DashMap::get_mut`
+        // needs a real async yield point to race against `tokio::time::timeout`.
+        let write_task = tokio::spawn({
+            let state = Arc::clone(&state);
+            let uri = uri.clone();
+            async move {
+                state.documents.get_mut(&uri).unwrap().set_loading();
+            }
+        });
+        let write_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), write_task).await;
+
+        handler_task.abort();
+
+        assert!(
+            write_result.is_ok(),
+            "#333 regression: a concurrent documents.get_mut on the same URI must not \
+             block on an in-flight generate_diagnostics call — the DashMap shard Ref \
+             must be dropped before the call is awaited, not after it"
+        );
     }
 
     // Severity wiring tests (issue #224): confirm `DiagnosticsConfig`'s

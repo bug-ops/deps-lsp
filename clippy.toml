@@ -1,0 +1,18 @@
+# Backstops the DashMap Ref-across-await hazard (#333) at the lint level: holding any
+# of these guard types across an `.await` point blocks concurrent access to the same
+# shard for the duration of the await. Activates the already-enabled
+# `clippy::await_holding_invalid_type` lint (see `[workspace.lints.clippy]` in the
+# root `Cargo.toml`) for these types project-wide.
+await-holding-invalid-types = [
+    { path = "dashmap::mapref::one::Ref", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::mapref::one::RefMut", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::mapref::one::MappedRef", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::mapref::one::MappedRefMut", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::mapref::multiple::RefMulti", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::mapref::multiple::RefMutMulti", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::mapref::entry::Entry", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::mapref::entry::VacantEntry", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::mapref::entry::OccupiedEntry", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::iter::Iter", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+    { path = "dashmap::iter::IterMut", reason = "holds a DashMap shard lock; release it before awaiting (see `ServerState::with_document`)" },
+]

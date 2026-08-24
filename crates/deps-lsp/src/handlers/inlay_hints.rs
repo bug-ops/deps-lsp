@@ -37,26 +37,31 @@ pub async fn handle_inlay_hints(
     // Snapshot config before the document lookup (Copy value, no lock held across the call)
     let loading_config = { full_config.read().await.loading_indicator.clone() };
 
-    // Single document lookup: extract all needed data at once
-    let doc = match state.get_document(uri) {
-        Some(d) => d,
-        None => {
-            tracing::warn!("Document not found: {:?}", uri);
-            return vec![];
-        }
-    };
-
-    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id()) {
-        Some(e) => e,
-        None => {
+    // Own everything `generate_inlay_hints` needs and release the DashMap shard `Ref`
+    // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
+    // `&DocumentState` synchronously, so the guard can't leak across the `.await` below.
+    let Some(extracted) = state.with_document(uri, |doc| {
+        let Some(ecosystem) = state.ecosystem_registry.get(doc.ecosystem_id()) else {
             tracing::warn!("Ecosystem not found: {}", doc.ecosystem_id());
-            return vec![];
-        }
+            return None;
+        };
+        let parse_result = doc.parse_result_arc()?;
+        Some((
+            ecosystem,
+            parse_result,
+            doc.cached_versions.clone(),
+            doc.resolved_versions.clone(),
+            doc.loading_state,
+        ))
+    }) else {
+        tracing::warn!("Document not found: {:?}", uri);
+        return vec![];
     };
 
-    let parse_result = match doc.parse_result() {
-        Some(p) => p,
-        None => return vec![],
+    let Some((ecosystem, parse_result, cached_versions, resolved_versions, loading_state)) =
+        extracted
+    else {
+        return vec![];
     };
 
     let ecosystem_config = EcosystemConfig {
@@ -67,12 +72,11 @@ pub async fn handle_inlay_hints(
         show_loading_hints: loading_config.enabled && loading_config.fallback_to_hints,
     };
 
-    // Generate hints while holding the lock
     ecosystem
         .generate_inlay_hints(
-            parse_result,
-            VersionData::new(&doc.cached_versions, &doc.resolved_versions),
-            doc.loading_state,
+            parse_result.as_ref(),
+            VersionData::new(&cached_versions, &resolved_versions),
+            loading_state,
             &ecosystem_config,
         )
         .await
@@ -145,6 +149,98 @@ mod tests {
         let (client, full_config) = create_test_client_and_config();
         let result = handle_inlay_hints(state, params, &config, client, full_config).await;
         assert!(result.is_empty());
+    }
+
+    /// #333 liveness regression: `handle_inlay_hints` must release the DashMap shard
+    /// `Ref` on the document *before* awaiting `Ecosystem::generate_inlay_hints`, so a
+    /// concurrent `documents.get_mut` on the same URI (e.g. a `didChange`) is never
+    /// blocked behind an in-flight (or stuck) hint generation.
+    ///
+    /// `BlockingEcosystem::generate_inlay_hints` waits on a `Barrier` before blocking
+    /// forever (`std::future::pending`), standing in for an override that performs real
+    /// I/O — the worst case for a shard `Ref` held across the call. The test only
+    /// proceeds to race the writer once that future has demonstrably started executing
+    /// (via the barrier); a concurrent write racing here must complete almost
+    /// immediately, proving the `Ref` was already dropped before the call was awaited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_document_write_not_blocked_by_in_flight_inlay_hints() {
+        use crate::test_utils::blocking_ecosystem::{
+            BlockingEcosystem, BlockingHook, MockParseResult,
+        };
+        use deps_core::ParseResult;
+        use tokio::sync::Barrier;
+
+        let state = Arc::new(ServerState::new());
+        let started = Arc::new(Barrier::new(2));
+        state
+            .ecosystem_registry
+            .register(Arc::new(BlockingEcosystem {
+                started: Arc::clone(&started),
+                hook: BlockingHook::InlayHints,
+            }));
+
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let doc = crate::document::DocumentState::new_from_parse_result(
+            EcosystemId::Cargo,
+            content,
+            parse_result,
+        );
+        state.update_document(uri.clone(), doc);
+
+        let config = InlayHintsConfig {
+            enabled: true,
+            up_to_date_text: "up to date".to_string(),
+            needs_update_text: "outdated: {}".to_string(),
+        };
+        let (client, full_config) = create_test_client_and_config();
+
+        let handler_task = tokio::spawn({
+            let state = Arc::clone(&state);
+            let uri = uri.clone();
+            async move {
+                let params = InlayHintParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    work_done_progress_params: Default::default(),
+                    range: tower_lsp_server::ls_types::Range::new(
+                        tower_lsp_server::ls_types::Position::new(0, 0),
+                        tower_lsp_server::ls_types::Position::new(100, 0),
+                    ),
+                };
+                handle_inlay_hints(state, params, &config, client, full_config).await
+            }
+        });
+
+        // Block until `generate_inlay_hints` has actually started executing —
+        // i.e. `handle_inlay_hints` has reached (and is now inside) the await — before
+        // racing the writer below. Timeout-wrapped so a regression that makes the
+        // handler never reach the awaited call fails loudly instead of hanging forever.
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.wait())
+            .await
+            .expect("handle_inlay_hints did not reach generate_inlay_hints within 5s");
+
+        // Spawned onto its own task (rather than awaited inline) deliberately: see
+        // `completion.rs`'s equivalent #319 regression test for why `DashMap::get_mut`
+        // needs a real async yield point to race against `tokio::time::timeout`.
+        let write_task = tokio::spawn({
+            let state = Arc::clone(&state);
+            let uri = uri.clone();
+            async move {
+                state.documents.get_mut(&uri).unwrap().set_loading();
+            }
+        });
+        let write_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), write_task).await;
+
+        handler_task.abort();
+
+        assert!(
+            write_result.is_ok(),
+            "#333 regression: a concurrent documents.get_mut on the same URI must not \
+             block on an in-flight generate_inlay_hints call — the DashMap shard Ref \
+             must be dropped before the call is awaited, not after it"
+        );
     }
 
     // Cargo-specific tests
