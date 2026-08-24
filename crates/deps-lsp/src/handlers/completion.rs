@@ -6,7 +6,10 @@ use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
 use deps_core::completion::COMPLETION_SEARCH_TIMEOUT;
-use deps_core::{is_safe_maven_coordinate_segment, is_safe_registry_url, is_safe_version_string};
+use deps_core::{
+    is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,
+    is_safe_version_string,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -637,15 +640,26 @@ fn create_package_completion_item(
     let latest = metadata.latest_version();
     let description = metadata.description();
 
+    if !is_safe_package_name(name.as_str()) {
+        return None;
+    }
+
     if !latest.is_empty() && !is_safe_version_string(latest) {
         return None;
     }
 
     let insert_text = match ecosystem_id {
-        EcosystemId::Cargo | EcosystemId::Pypi => format!("{name} = \"{latest}\""),
+        // The key is quoted, not bare: a bare TOML key containing `.` (allowed by
+        // `is_safe_package_name` for PyPI names like `zope.interface`) expands into a
+        // nested table instead of a dependency entry — quoting closes that dotted-key
+        // injection and matches real names like `zope.interface` correctly either way.
+        EcosystemId::Cargo | EcosystemId::Pypi => format!("\"{name}\" = \"{latest}\""),
         EcosystemId::Npm | EcosystemId::Composer => format!("\"{name}\": \"^{latest}\""),
         EcosystemId::Go => format!("{name} {latest}"),
-        EcosystemId::Dart => format!("{name}: ^{latest}"),
+        // The key is quoted: an unquoted YAML plain scalar can't start with `@`
+        // (allowed by `is_safe_package_name` for npm/Deno-shaped names), which would
+        // otherwise emit invalid YAML instead of a dependency entry.
+        EcosystemId::Dart => format!("\"{name}\": ^{latest}"),
         EcosystemId::Maven => {
             // The predicate rejects `:` by design (see its doc comment), so it must
             // validate each half of the coordinate after splitting, never the joined
@@ -1633,7 +1647,10 @@ requests
         assert_eq!(item.label, "serde");
         assert_eq!(item.kind, Some(CompletionItemKind::MODULE));
         assert_eq!(item.detail, Some("Latest: 1.0.214".to_string()));
-        assert_eq!(item.insert_text, Some("serde = \"1.0.214\"".to_string()));
+        assert_eq!(
+            item.insert_text,
+            Some("\"serde\" = \"1.0.214\"".to_string())
+        );
         assert_eq!(item.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
     }
 
@@ -1707,7 +1724,10 @@ requests
         let item = create_package_completion_item(&meta, EcosystemId::Pypi).unwrap();
 
         assert_eq!(item.label, "requests");
-        assert_eq!(item.insert_text, Some("requests = \"2.31.0\"".to_string()));
+        assert_eq!(
+            item.insert_text,
+            Some("\"requests\" = \"2.31.0\"".to_string())
+        );
     }
 
     struct MockMetadata {
@@ -1734,6 +1754,26 @@ requests
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    #[test]
+    fn test_create_package_completion_item_pypi_dotted_name_quotes_toml_key() {
+        // S1: a bare TOML key containing `.` (legal here — real PyPI names like
+        // `zope.interface` use it) expands into a nested table instead of a
+        // dependency entry (`serde.path = "vendor"` parses as `serde = { path =
+        // "vendor" }`). Quoting the key keeps the dotted name a single dependency
+        // entry regardless of ecosystem-legit or attacker-supplied intent.
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("zope.interface"),
+            repository: None,
+            latest_version: "6.1",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Pypi).unwrap();
+
+        assert_eq!(
+            item.insert_text,
+            Some("\"zope.interface\" = \"6.1\"".to_string())
+        );
     }
 
     #[test]
@@ -1900,6 +1940,23 @@ requests
     }
 
     #[test]
+    fn test_create_package_completion_item_swift_rejects_malicious_name_even_with_repository() {
+        // M4: the upfront `is_safe_package_name` gate runs before the match arm, so it
+        // now also filters names that never reach `insert_text` on this path — when
+        // `repository` is provided, the name-derived fallback-URL branch doesn't run
+        // at all. Intentional: a registry response with a malicious name is
+        // untrustworthy as a whole, not just in the fields the formatter happens to
+        // interpolate.
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("apple/swift-nio\", .exact(\"1\")) //"),
+            repository: Some("https://github.com/apple/swift-nio"),
+            latest_version: "2.62.0",
+        };
+
+        assert!(create_package_completion_item(&meta, EcosystemId::Swift).is_none());
+    }
+
+    #[test]
     fn test_create_package_completion_item_deno_strips_scheme_for_alias_key() {
         let meta = MockMetadata {
             name: deps_core::PackageName::new("jsr:@std/fs"),
@@ -1943,6 +2000,123 @@ requests
             item.insert_text,
             Some("\"@std/fs\": \"jsr:@std/fs\"".to_string())
         );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_composer() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("monolog/monolog"),
+            repository: None,
+            latest_version: "3.5.0",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Composer).unwrap();
+
+        assert_eq!(
+            item.insert_text,
+            Some("\"monolog/monolog\": \"^3.5.0\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_go() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("github.com/stretchr/testify"),
+            repository: None,
+            latest_version: "v1.9.0",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Go).unwrap();
+
+        assert_eq!(
+            item.insert_text,
+            Some("github.com/stretchr/testify v1.9.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_dart() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("path"),
+            repository: None,
+            latest_version: "1.9.0",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Dart).unwrap();
+
+        assert_eq!(item.insert_text, Some("\"path\": ^1.9.0".to_string()));
+    }
+
+    #[test]
+    fn test_create_package_completion_item_gradle() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
+            repository: None,
+            latest_version: "3.14.0",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Gradle).unwrap();
+
+        assert_eq!(
+            item.insert_text,
+            Some("implementation(\"org.apache.commons:commons-lang3:3.14.0\")".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_nuget() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("Newtonsoft.Json"),
+            repository: None,
+            latest_version: "13.0.3",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::NuGet).unwrap();
+
+        assert_eq!(
+            item.insert_text,
+            Some("<PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" />".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_bundler() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("rails"),
+            repository: None,
+            latest_version: "7.1.3",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Bundler).unwrap();
+
+        assert_eq!(
+            item.insert_text,
+            Some("gem \"rails\", \"~> 7.1.3\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_rejects_malicious_name_toml_json_breakout() {
+        // Issue #336: a registry-reported name breaking out of a TOML/JSON/XML/YAML/
+        // Kotlin-Groovy-DSL/Ruby string literal must be rejected for every ecosystem
+        // that interpolates it raw, not just Maven/Swift.
+        let evil = deps_core::PackageName::new("evil\"\nbackdoor = \"9.9.9");
+        for ecosystem in [
+            EcosystemId::Cargo,
+            EcosystemId::Pypi,
+            EcosystemId::Npm,
+            EcosystemId::Composer,
+            EcosystemId::Go,
+            EcosystemId::Dart,
+            EcosystemId::Gradle,
+            EcosystemId::NuGet,
+            EcosystemId::Bundler,
+            EcosystemId::Deno,
+        ] {
+            let meta = MockMetadata {
+                name: evil.clone(),
+                repository: None,
+                latest_version: "9.9.9",
+            };
+            assert!(
+                create_package_completion_item(&meta, ecosystem).is_none(),
+                "expected {ecosystem:?} to reject the malicious name"
+            );
+        }
     }
 
     #[tokio::test]
