@@ -726,12 +726,18 @@ async fn fetch_latest_versions_parallel(
                             .collect();
                         // Retained alongside `available` so `generate_diagnostics_from_cache`
                         // can flag a requirement satisfiable only by a yanked version — see
-                        // `PackageVersions::yanked`.
-                        let yanked_list: Arc<[String]> = versions
-                            .iter()
-                            .filter(|v| v.is_yanked())
-                            .map(|v| v.version_string().to_string())
-                            .collect();
+                        // `PackageVersions::yanked`. Gated on `check_yanked`: a registry that
+                        // cannot answer `is_yanked()` (§#298) must not populate this list with
+                        // an untrustworthy always-false signal.
+                        let yanked_list: Arc<[String]> = if check_yanked {
+                            versions
+                                .iter()
+                                .filter(|v| v.is_yanked())
+                                .map(|v| v.version_string().to_string())
+                                .collect()
+                        } else {
+                            Arc::from([])
+                        };
                         // `.get(idx)` rather than `versions[idx]`: `select_latest_matching`
                         // is a public `Registry` trait method, so an out-of-tree
                         // implementation returning a stale index must not panic this task.
@@ -5441,6 +5447,16 @@ tokio = "1.0"
                 result.yanked_versions.is_empty(),
                 "a `reports_yanked() == false` registry's `is_yanked()` must never be trusted, \
                  even on the zero-cost row-1 path"
+            );
+            assert!(
+                result
+                    .versions
+                    .get(&PackageName::new("pkg"))
+                    .expect("pkg was fetched")
+                    .yanked
+                    .is_empty(),
+                "`PackageVersions::yanked` must stay empty for a `reports_yanked() == false` \
+                 registry, even though the fetched version is itself flagged `is_yanked`"
             );
         }
 
