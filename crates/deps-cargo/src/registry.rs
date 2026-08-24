@@ -347,6 +347,9 @@ impl deps_core::Registry for CratesIoRegistry {
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
+        if deps_core::is_existence_wildcard(req) {
+            return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
+        }
         let parsed_req: VersionReq = req.as_str().parse().ok()?;
         versions.iter().position(|v| {
             v.version_string().parse::<Version>().is_ok_and(|ver| {
@@ -681,5 +684,53 @@ mod tests {
         ];
         let req = VersionReq::new("*");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    #[test]
+    fn test_select_latest_matching_all_yanked_returns_newest_yanked() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = CratesIoRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(CargoVersion {
+                num: "2.0.0".into(),
+                yanked: true,
+                features: HashMap::new(),
+                published_at: None,
+            }),
+            Box::new(CargoVersion {
+                num: "1.0.0".into(),
+                yanked: true,
+                features: HashMap::new(),
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    #[test]
+    fn test_select_latest_matching_all_prerelease_returns_newest_prerelease() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = CratesIoRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(CargoVersion {
+                num: "2.0.0-beta.1".into(),
+                yanked: false,
+                features: HashMap::new(),
+                published_at: None,
+            }),
+            Box::new(CargoVersion {
+                num: "1.0.0-alpha.1".into(),
+                yanked: false,
+                features: HashMap::new(),
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
     }
 }

@@ -118,12 +118,11 @@ pub trait Registry: Send + Sync {
     /// [`RemovalStatus::is_flagged`]. An `AdvisoryDeprecated` version is fully
     /// installable — excluding it turns an existing package into a false
     /// "Unknown package" (#347). Under a wildcard/empty requirement
-    /// (`"*"`/`""`) this is an *existence* check ("does this package exist /
-    /// what is its newest version for display purposes"), not an upgrade
-    /// recommendation: an implementation may prefer a non-yanked version but
-    /// fall back to a yanked one rather than returning `None` when no
-    /// non-yanked version exists — a yanked package still exists. `deps-npm`
-    /// implements this fallback (mirrored by
+    /// (`"*"`/`""`, see [`is_existence_wildcard`]) this is an *existence* check ("does this
+    /// package exist / what is its newest version for display purposes"), not an upgrade
+    /// recommendation: an implementation may prefer a non-yanked version but fall back to a
+    /// yanked one rather than returning `None` when no non-yanked version exists — a yanked
+    /// package still exists. `deps-npm` implements this fallback (mirrored by
     /// [`select_latest_matching`](Self::select_latest_matching)'s wildcard branch on the
     /// same registry, which every caller reaching this trait method through the shared
     /// fetch loop actually goes through first); the exception never applies to a concrete
@@ -163,8 +162,10 @@ pub trait Registry: Send + Sync {
     /// Filter with [`RemovalStatus::blocks_resolution`], never with
     /// [`RemovalStatus::is_flagged`]. An `AdvisoryDeprecated` version is fully
     /// installable — excluding it turns an existing package into a false
-    /// "Unknown package" (#347). Under a wildcard/empty requirement this is
-    /// an *existence* check, not an upgrade recommendation.
+    /// "Unknown package" (#347). Under a wildcard/empty requirement (see
+    /// [`is_existence_wildcard`]) this is an *existence* check, not an upgrade
+    /// recommendation: Cargo, PyPI, Dart, npm, and Deno implement it by gating on
+    /// [`is_existence_wildcard`] and delegating to [`select_latest_for_existence`].
     ///
     /// `versions` must be a newest-first list as returned by this registry's
     /// [`get_versions`](Self::get_versions). Returns an index rather than a reference so
@@ -444,6 +445,127 @@ pub trait Version: Send + Sync {
 /// ```
 pub fn find_latest_stable(versions: &[Box<dyn Version>]) -> Option<&dyn Version> {
     versions.iter().find(|v| v.is_stable()).map(|v| v.as_ref())
+}
+
+/// Whether `req` is a wildcard/empty requirement (`""` or `"*"`, ignoring surrounding
+/// whitespace) rather than a concrete version constraint.
+///
+/// A wildcard requirement turns [`get_latest_matching`](Registry::get_latest_matching) and
+/// [`select_latest_matching`](Registry::select_latest_matching) into an *existence* check
+/// ("does this package exist / what is its newest version for display purposes") instead of
+/// an upgrade recommendation — see [`select_latest_for_existence`], which callers must gate
+/// on this function before use.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::{VersionReq, is_existence_wildcard};
+///
+/// assert!(is_existence_wildcard(&VersionReq::new("*")));
+/// assert!(is_existence_wildcard(&VersionReq::new("")));
+/// assert!(!is_existence_wildcard(&VersionReq::new("^1.2")));
+/// ```
+#[must_use]
+pub fn is_existence_wildcard(req: &crate::VersionReq) -> bool {
+    is_existence_wildcard_str(req.as_str())
+}
+
+/// [`is_existence_wildcard`] for a raw `&str`, without allocating a [`VersionReq`] wrapper.
+///
+/// Exists for callers that hold a version requirement as `&str` rather than a `VersionReq`
+/// (e.g. an inherent method taking `req_str: &str` for its own parsing needs) — going through
+/// [`is_existence_wildcard`] there would allocate a `String` via `VersionReq::new` on every
+/// call just to check it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::registry::is_existence_wildcard_str;
+///
+/// assert!(is_existence_wildcard_str("*"));
+/// assert!(is_existence_wildcard_str(""));
+/// assert!(!is_existence_wildcard_str("^1.2"));
+/// ```
+#[must_use]
+pub fn is_existence_wildcard_str(req: &str) -> bool {
+    matches!(req.trim(), "" | "*")
+}
+
+/// Index of the version an *existence* check should report as "latest", ignoring `req`
+/// entirely.
+///
+/// This is the shared 3-rung fallback ladder used under a wildcard/empty requirement, where
+/// every version satisfies by definition and the question is only which one to prefer for
+/// display:
+///
+/// 1. The newest version that is neither flagged
+///    ([`RemovalStatus::is_flagged`]) nor a pre-release ([`Version::is_prerelease`]).
+/// 2. Else, the newest version that does not block resolution
+///    ([`RemovalStatus::blocks_resolution`]) — an `AdvisoryDeprecated` version counts here.
+/// 3. Else, index `0` unconditionally — the newest version overall, however it is flagged.
+///    A yanked-or-prerelease-only package still exists; this rung is what turns that case
+///    into "here is its newest version" instead of a false "Unknown package" (#347, #364).
+///
+/// `versions` must be sorted newest-first, as returned by [`Registry::get_versions`]. Returns
+/// `None` only when `versions` is empty.
+///
+/// # Requirement-blindness is deliberate and dangerous
+///
+/// This function takes no `req` parameter and does not check whether the caller is under a
+/// wildcard requirement — it always returns rung 3 as a last resort, regardless of what a
+/// concrete requirement might demand. It is **only correct once the caller has already
+/// confirmed the requirement is a wildcard** via [`is_existence_wildcard`]. Calling it
+/// ungated — e.g. under a concrete `^1.2` requirement — can return a version that does not
+/// satisfy that requirement at all, silently corrupting upgrade resolution.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::registry::{RemovalStatus, Version, select_latest_for_existence};
+/// use std::any::Any;
+///
+/// struct MyVersion { version: String, status: RemovalStatus, prerelease: bool }
+///
+/// impl Version for MyVersion {
+///     fn version_string(&self) -> &str { &self.version }
+///     fn removal_status(&self) -> RemovalStatus { self.status }
+///     fn is_prerelease(&self) -> bool { self.prerelease }
+///     fn as_any(&self) -> &dyn Any { self }
+/// }
+///
+/// // Newest version is yanked; rung 3 still returns it rather than `None`.
+/// let versions = vec![
+///     MyVersion { version: "2.0.0".into(), status: RemovalStatus::Yanked, prerelease: false },
+///     MyVersion { version: "1.5.0".into(), status: RemovalStatus::Yanked, prerelease: false },
+/// ];
+///
+/// let idx = select_latest_for_existence(&versions, |v| v as &dyn Version);
+/// assert_eq!(idx, Some(0));
+///
+/// assert_eq!(select_latest_for_existence::<MyVersion>(&[], |v| v as &dyn Version), None);
+/// ```
+#[must_use]
+pub fn select_latest_for_existence<T>(
+    versions: &[T],
+    as_version: impl Fn(&T) -> &dyn Version,
+) -> Option<usize> {
+    if versions.is_empty() {
+        return None;
+    }
+    Some(
+        versions
+            .iter()
+            .position(|v| {
+                let v = as_version(v);
+                !v.removal_status().is_flagged() && !v.is_prerelease()
+            })
+            .or_else(|| {
+                versions
+                    .iter()
+                    .position(|v| !as_version(v).removal_status().blocks_resolution())
+            })
+            .unwrap_or(0),
+    )
 }
 
 /// Package metadata trait.

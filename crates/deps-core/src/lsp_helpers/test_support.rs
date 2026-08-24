@@ -462,12 +462,14 @@ impl crate::Version for MockVersionWithStatus {
     }
 }
 
-/// A registry whose `select_latest_matching` mirrors npm's #338 NFR-002 ranking
-/// preference — rung 1: newest entry that is neither flagged nor a prerelease; rung 2:
-/// newest entry that isn't hard-yanked — rather than `MockRegistryWithVersions`'s
-/// generic `is_stable()` scan. Exists for the hover/cache-agreement regression test
-/// (#347/#348 S1): hover must resolve "latest" through this same ranking, not an
-/// independent `is_stable()`-based pick that disagrees with it.
+/// A registry whose `select_latest_matching` mirrors the shared 3-rung existence
+/// ladder ([`crate::select_latest_for_existence`]) used by Cargo/PyPI/Dart/npm/Deno under
+/// a wildcard requirement, rather than `MockRegistryWithVersions`'s generic `is_stable()`
+/// scan. Exists for the hover/cache-agreement regression test (#347/#348 S1, #364): hover
+/// must resolve "latest" through this same ranking, not an independent `is_stable()`-based
+/// pick that disagrees with it — including rung 3 (newest overall, unconditionally), which
+/// is what lets an all-yanked/all-prerelease package still resolve a "latest" instead of
+/// `None`.
 pub(crate) struct MockRegistryPreferringUnflagged {
     pub(crate) versions: Vec<MockVersionWithStatus>,
 }
@@ -512,14 +514,7 @@ impl crate::Registry for MockRegistryPreferringUnflagged {
         versions: &[Box<dyn crate::Version>],
         _req: &crate::VersionReq,
     ) -> Option<usize> {
-        versions
-            .iter()
-            .position(|v| !v.removal_status().is_flagged() && !v.is_prerelease())
-            .or_else(|| {
-                versions
-                    .iter()
-                    .position(|v| !v.removal_status().blocks_resolution())
-            })
+        crate::select_latest_for_existence(versions, |v| v.as_ref())
     }
 
     fn as_any(&self) -> &dyn Any {
