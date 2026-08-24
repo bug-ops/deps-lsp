@@ -1048,6 +1048,50 @@ pub trait EcosystemFormatter: Send + Sync {
     }
 }
 
+/// Whether `version` is safe to embed in a manifest [`TextEdit`] or completion item.
+///
+/// Guards every call into
+/// [`EcosystemFormatter::format_version_replacing`]/[`EcosystemFormatter::format_version_for_text_edit`]
+/// and every completion item's `insert_text`/`text_edit`.
+///
+/// Must be applied to the raw version string *before* formatting, never to a
+/// formatter's output: some formatters legitimately produce structural
+/// characters in their output from an already-validated version plus fixed,
+/// trusted operators (e.g. PyPI's `>=1.2.3,<2`), so validating the output
+/// would wrongly reject those.
+///
+/// An allowlist, not a denylist: `version` must be non-empty, at most 64
+/// bytes, and contain only `[A-Za-z0-9.+_~:*^!-]` — the character set real
+/// version strings use across every ecosystem this workspace supports
+/// (SemVer, PEP 440 including epochs like `1!2.0`, Maven qualifiers, npm's
+/// `^`/`~`/`*` range tokens, Go's `+incompatible` suffix). A denylist here
+/// would need to anticipate every dangerous token a target manifest format
+/// (or a build tool evaluating it, e.g. Gradle's Kotlin/Groovy DSL
+/// interpolating `${...}` inside a version literal) could ever act on;
+/// failing closed on an unrecognized character is cheaper and safer.
+///
+/// This is the single validation chokepoint shared by every producer of a
+/// version-derived `TextEdit`/completion item in this workspace, including
+/// OSV advisory data (an `Advisory.fixed_versions` entry is exactly as
+/// untrusted as a registry-reported version).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::is_safe_version_string;
+///
+/// assert!(is_safe_version_string("1.2.3-alpha.1+build"));
+/// assert!(!is_safe_version_string("1.2.3\", git = \"https://evil"));
+/// ```
+pub fn is_safe_version_string(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '+' | '_' | '~' | ':' | '*' | '^' | '!' | '-')
+        })
+}
+
 pub fn generate_inlay_hints(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
@@ -1425,6 +1469,9 @@ fn build_vulnerability_fix_action(
     };
     let fix = dv.recommended_fix()?;
     let version_native = formatter.osv_version_to_native(&fix.version);
+    if !is_safe_version_string(&version_native) {
+        return None;
+    }
     // Computed before the N1 guard below against the *same* formatting the
     // plain "update version" action uses (`format_version_replacing`), not
     // the bare version: several ecosystems wrap or expand it (`deps-dart`'s
@@ -1567,6 +1614,9 @@ fn build_unsatisfiable_fix_action(
     }
 
     let latest = package_versions.latest.clone();
+    if !is_safe_version_string(&latest) {
+        return None;
+    }
     let new_text = formatter.format_version_replacing(&latest, version_req.as_str());
 
     if strip_whitespace(version_req.as_str()) == strip_whitespace(&new_text) {
@@ -1818,6 +1868,9 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     if let Some(registry_versions) = &registry_versions {
         let display_items = prepare_version_display_items(registry_versions, dep.name());
         for item in display_items {
+            if !is_safe_version_string(&item.version) {
+                continue;
+            }
             let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());
 
             if !emitted_texts.insert(strip_whitespace(&new_text)) {
@@ -2637,6 +2690,9 @@ pub fn collect_update_all_edits(
         else {
             continue;
         };
+        if !is_safe_version_string(latest) {
+            continue;
+        }
 
         let Some(version_req) = dep.version_requirement() else {
             continue;
@@ -3224,6 +3280,79 @@ mod tests {
         assert!(!is_same_major_minor("", ""));
         assert!(!is_same_major_minor("1.2.3", ""));
         assert!(!is_same_major_minor("", "1.2.3"));
+    }
+
+    #[test]
+    fn test_is_safe_version_string_accepts_ordinary_versions() {
+        assert!(is_safe_version_string("1.2.3"));
+        assert!(is_safe_version_string("1.2.3-beta.1+build"));
+        assert!(is_safe_version_string("v1.2.3"));
+    }
+
+    #[test]
+    fn test_is_safe_version_string_rejects_empty_or_whitespace() {
+        assert!(!is_safe_version_string(""));
+        assert!(!is_safe_version_string("   "));
+        assert!(!is_safe_version_string("\t\n"));
+    }
+
+    #[test]
+    fn test_is_safe_version_string_rejects_control_and_structural_characters() {
+        for bad in [
+            "1.2.3\n",
+            "1.2.3\t",
+            "1.2.3\"",
+            "1.2.3'",
+            "1.2.3<",
+            "1.2.3>",
+            "1.2.3&",
+            "1.2.3\\",
+            "1.0.0\", \"malicious\": \"true",
+        ] {
+            assert!(
+                !is_safe_version_string(bad),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_version_string_rejects_gradle_interpolation_payload() {
+        // Regression (critic S2): `$`/`{`/`}` are outside the allowlist, so a
+        // Gradle Kotlin/Groovy `${...}` interpolation payload written into
+        // build.gradle(.kts) can never reach a version literal via this gate.
+        for bad in ["1.0${System.getenv(\"X\")}", "1.0$var", "${evil}"] {
+            assert!(
+                !is_safe_version_string(bad),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_version_string_rejects_invisible_unicode() {
+        // Regression (critic M1): `char::is_control()` alone only covers
+        // category Cc — format/separator characters like the bidi override
+        // U+202E, zero-width space U+200B, and the JS/JSON5 line terminators
+        // U+2028/U+2029 must also be rejected by the allowlist.
+        for bad in ["1.2.3\u{202E}", "1.2.3\u{200B}", "1.2.3\u{2028}"] {
+            assert!(
+                !is_safe_version_string(bad),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_version_string_accepts_pep440_epoch() {
+        // PEP 440 epochs (`1!2.0`) are legitimate PyPI versions.
+        assert!(is_safe_version_string("1!2.0"));
+    }
+
+    #[test]
+    fn test_is_safe_version_string_length_cap() {
+        assert!(is_safe_version_string(&"1".repeat(64)));
+        assert!(!is_safe_version_string(&"1".repeat(65)));
     }
 
     #[test]
@@ -4908,6 +5037,100 @@ mod tests {
         assert!(
             refactor_titles(&actions).is_empty(),
             "a whitespace-only edit-text divergence must still be skipped as a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_refactor_loop_skips_unsafe_version_string() {
+        // Regression for #302: a registry version containing manifest-structural
+        // characters must never be offered as a REFACTOR quickfix, since its raw
+        // text would otherwise be written verbatim into the `TextEdit`.
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+        let registry = FixedVersionRegistry {
+            versions: vec![("1.1.0\", \"evil\": \"true", false), ("1.1.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &IdentityFormatter,
+        )
+        .await;
+
+        let titles = refactor_titles(&actions);
+        assert!(
+            !titles.iter().any(|t| t.contains("evil")),
+            "an unsafe version string must never be offered as an update: {titles:?}"
+        );
+        assert!(
+            titles.contains(&"1.1.0"),
+            "a safe version must still be offered: {titles:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_vulnerability_fix_action_skips_unsafe_fix_version() {
+        // Regression for #302: an OSV advisory's `fixed_versions` entry is
+        // external, untrusted data — a manifest-structural character in it must
+        // never reach a `TextEdit` via the vulnerability quickfix.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.2.0\", \"evil\": \"true".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &IdentityFormatter,
+        )
+        .await;
+
+        assert!(
+            quickfix_titles(&actions).is_empty(),
+            "an unsafe fix version must never produce a vulnerability-fix quickfix"
         );
     }
 
@@ -7394,6 +7617,69 @@ mod tests {
         }
 
         #[test]
+        fn test_empty_cached_latest_is_skipped() {
+            // Regression for #303: an empty cached `latest` must never produce an
+            // edit — the old no-op guard (comparing formatted text to the declared
+            // requirement) doesn't catch this because `"" != "1.0.0"`, so without an
+            // explicit guard the requirement gets erased instead of updated.
+            let content = "serde = \"1.0.0\"\n";
+            let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
+            let mut cached = HashMap::new();
+            cached.insert("serde".into(), PackageVersions::latest_only(""));
+            let resolved = HashMap::new();
+
+            let edits = collect_update_all_edits(
+                &pr,
+                content,
+                VersionData::new(&cached, &resolved),
+                &MockFormatter,
+            );
+            assert!(
+                edits.is_empty(),
+                "an empty cached latest must never produce a requirement-erasing edit"
+            );
+        }
+
+        #[test]
+        fn test_whitespace_only_cached_latest_is_skipped() {
+            let content = "serde = \"1.0.0\"\n";
+            let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
+            let mut cached = HashMap::new();
+            cached.insert("serde".into(), PackageVersions::latest_only("   "));
+            let resolved = HashMap::new();
+
+            let edits = collect_update_all_edits(
+                &pr,
+                content,
+                VersionData::new(&cached, &resolved),
+                &MockFormatter,
+            );
+            assert!(edits.is_empty());
+        }
+
+        #[test]
+        fn test_cached_latest_with_unsafe_characters_is_skipped() {
+            // Regression for #302: a registry-cached `latest` containing manifest-
+            // structural characters must never be written verbatim into a `TextEdit`.
+            let content = "serde = \"1.0.0\"\n";
+            let pr = parse_result(vec![dep("serde", Some("1.0.0"), Some(range(0, 9, 0, 14)))]);
+            let mut cached = HashMap::new();
+            cached.insert(
+                "serde".into(),
+                PackageVersions::latest_only("1.2.0\", \"evil\": \"true"),
+            );
+            let resolved = HashMap::new();
+
+            let edits = collect_update_all_edits(
+                &pr,
+                content,
+                VersionData::new(&cached, &resolved),
+                &MockFormatter,
+            );
+            assert!(edits.is_empty());
+        }
+
+        #[test]
         fn test_requirement_already_accepts_latest_is_not_counted() {
             // "^1.0" already accepts "1.2.0" per the default `is_requirement_up_to_date`,
             // so no edit is produced even though `latest` differs from the source text.
@@ -9002,6 +9288,41 @@ mod tests {
             .await;
 
             assert!(quickfix_titles(&actions).is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_absent_for_unsafe_or_empty_latest() {
+            // Regression for #302 (5th guarded call site, added alongside #304):
+            // `build_unsatisfiable_fix_action`'s cached `latest` is exactly as untrusted
+            // as `collect_update_all_edits`'s — a manifest-structural character or an
+            // empty string must never reach `format_version_replacing` here either.
+            for unsafe_latest in ["9.9.9\", \"evil\": \"true", "", "   "] {
+                let (dep, version_range, content) = vulnerable_dep("1.0.0");
+                let parse_result = MockParseResult {
+                    deps: vec![dep],
+                    uri: crate::test_util::test_uri("/test/Cargo.toml"),
+                };
+
+                let cached = cached_versions(unsafe_latest, &[unsafe_latest]);
+                let resolved = HashMap::new();
+                let versions = VersionData::new(&cached, &resolved);
+
+                let actions = generate_code_actions(
+                    &parse_result,
+                    version_range.start,
+                    parse_result.uri(),
+                    versions,
+                    &content,
+                    &MockRegistry,
+                    &ExactMatchFormatter,
+                )
+                .await;
+
+                assert!(
+                    quickfix_titles(&actions).is_empty(),
+                    "expected no unsatisfiable-fix quickfix for latest {unsafe_latest:?}"
+                );
+            }
         }
 
         #[tokio::test]

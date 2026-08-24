@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::lsp_helpers::is_safe_version_string;
+
 /// One dependency to query against OSV.
 ///
 /// Four distinct strings, deliberately: `key` is this project's internal
@@ -484,37 +486,13 @@ fn is_valid_osv_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// Returns `true` if `version` matches the character set real version
-/// strings use across every ecosystem this workspace supports
-/// (`[A-Za-z0-9.+_~:*^-]`, non-empty, capped at 64 bytes) — deliberately
-/// permissive (SemVer, PEP 440, Maven qualifiers, npm's `^`/`~`/`*` range
-/// tokens, and Go's `+incompatible` suffix all fit), but excludes quotes,
-/// commas, and newlines.
-///
-/// `Advisory::fixed_versions` is the only OSV-sourced field this workspace
-/// ever writes into a manifest `TextEdit`
-/// (`DependencyVulnerabilities::recommended_fix` ->
-/// `EcosystemFormatter::osv_version_to_native` ->
-/// `EcosystemFormatter::format_version_for_text_edit`), so an unvalidated
-/// `fixed` value from a compromised or malformed advisory record could
-/// inject arbitrary manifest syntax next to the version literal it is
-/// meant to replace. This is the parse-boundary chokepoint for that value,
-/// mirroring [`is_valid_osv_id`] for the id field.
-fn is_valid_osv_version(version: &str) -> bool {
-    !version.is_empty()
-        && version.len() <= 64
-        && version.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '_' | '~' | ':' | '*' | '^' | '-')
-        })
-}
-
 impl OsvVulnRecord {
     /// Converts a raw wire record into the `deps-lsp`-facing [`Advisory`],
     /// or `None` if the record's id fails [`is_valid_osv_id`] (dropped, same
     /// as a 404 on `/v1/vulns/{id}` — the dependency renders with whichever
     /// advisories did resolve, never a half-trusted one). Individual `fixed`
-    /// events failing [`is_valid_osv_version`] are dropped the same way, but
-    /// only that entry — the record as a whole still renders with its
+    /// events failing [`is_safe_version_string`] are dropped the same way,
+    /// but only that entry — the record as a whole still renders with its
     /// remaining, valid `fixed_versions`.
     ///
     /// `osv_name`/`osv_eco` are the package actually queried: a record can
@@ -566,7 +544,7 @@ impl OsvVulnRecord {
             .flat_map(|r| r.events.iter())
             .filter_map(|e| e.fixed.clone())
             .filter(|v| {
-                let valid = is_valid_osv_version(v);
+                let valid = is_safe_version_string(v);
                 if !valid {
                     tracing::warn!(
                         id = %self.id, version = %v,
@@ -824,14 +802,14 @@ mod osv_version_validation_tests {
             "1.2.3+incompatible",
             "1.2.3.post1",
         ] {
-            assert!(is_valid_osv_version(v), "expected {v:?} to be valid");
+            assert!(is_safe_version_string(v), "expected {v:?} to be valid");
         }
     }
 
     #[test]
     fn manifest_breakout_characters_are_rejected() {
         for v in ["1.0.0\", git = \"evil", "1.0.0,2.0.0", "1.0.0\nEvil", ""] {
-            assert!(!is_valid_osv_version(v), "expected {v:?} to be rejected");
+            assert!(!is_safe_version_string(v), "expected {v:?} to be rejected");
         }
     }
 }

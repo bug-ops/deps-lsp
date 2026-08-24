@@ -40,7 +40,7 @@
 //! }
 //! ```
 
-use crate::lsp_helpers::escape_markdown;
+use crate::lsp_helpers::{escape_markdown, is_safe_version_string};
 use crate::{
     FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
     format_relative_age,
@@ -846,6 +846,12 @@ pub async fn complete_versions_generic(
     let now = PublishTime::now();
     display_items
         .iter()
+        // A registry-reported version is exactly as untrusted as the one fed into
+        // `format_version_replacing`/`format_version_for_text_edit` (see
+        // `is_safe_version_string`'s doc comment) — a completion item's
+        // `insert_text`/`text_edit` is a manifest-write sink too, and fires on
+        // ordinary typing rather than a quickfix click.
+        .filter(|item| is_safe_version_string(&item.version))
         .map(|item| build_version_completion(item, None, now, freshness.enabled))
         .collect()
 }
@@ -2800,6 +2806,47 @@ mod tests {
 
         // Yanked version 1.0.1 should not be included
         assert!(!items.iter().any(|item| item.label == "1.0.1"));
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_filters_unsafe_version_string() {
+        // Regression (critic S3): `build_version_completion` writes `insert_text`/
+        // `text_edit.new_text` straight from a registry-reported version, the same
+        // untrusted data source as the REFACTOR code-action loop. An unsafe
+        // registry version must never surface as a completion item, while an
+        // ordinary safe version alongside it must still be offered.
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "1.0.0".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "1.0.1\", \"evil\": \"true".to_string(),
+                    yanked: false,
+                    prerelease: false,
+                },
+            ],
+        };
+
+        let items = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "1.0",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert!(
+            !items.iter().any(|item| item.label.contains("evil")),
+            "an unsafe version string must never be offered as a completion item: {items:?}"
+        );
+        assert!(
+            items.iter().any(|item| item.label.starts_with("1.0.0")),
+            "a safe version must still be offered: {items:?}"
+        );
     }
 
     #[tokio::test]
