@@ -14,7 +14,9 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 
 - **`Ecosystem` trait** — Unified interface for all package ecosystems (parse, registry, format)
 - **`EcosystemId` enum** — Exhaustive, typed identifier for every registered ecosystem, with `Display`/`FromStr` interop with `Ecosystem::id()`. Downstream code should match on this instead of the raw id string so a new ecosystem forces every relevant `match` to be updated at compile time
+- **`PackageName`/`VersionReq` newtypes** — Distinguish a manifest package name from a version requirement string at the type level, threaded through `Registry`, `Ecosystem`, and `EcosystemFormatter` so the two cannot be swapped at a call site
 - **`Registry` trait** — Abstraction over package registries with version lookup
+- **`freshness` module** — Release-freshness signal (`PublishTime`, `FreshnessSettings`, `is_within_cooldown`) flagging a "latest" version still inside its cooldown window, mirroring GitHub Dependabot's default 3-day package cooldown
 - **`LockFileProvider` trait** — Abstract lock file parsing for resolved versions
 - **Generic LSP handlers** — `generate_inlay_hints`, `generate_hover`, `generate_code_actions`, `generate_diagnostics`, `generate_code_lenses`, taking a bundled `VersionData` (cached + resolved version maps) to avoid swapping same-typed arguments at call sites
 - **`collect_update_all_edits`** — batch `TextEdit`s bringing every safely-editable outdated dependency to latest, shared across all ecosystems; guards against rewriting a `version_range` that isn't actually the version literal (property references, DSL variables, catalog aliases, synthesized range bounds)
@@ -30,7 +32,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 
 ```toml
 [dependencies]
-deps-core = "0.10"
+deps-core = "0.11"
 ```
 
 > [!IMPORTANT]

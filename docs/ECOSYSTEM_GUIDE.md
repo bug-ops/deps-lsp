@@ -19,7 +19,7 @@ deps-lsp provides comprehensive LSP support for 12 package ecosystems:
 | **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
 | **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, code lens (range-form dependencies not covered — see below), GitHub API support |
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling |
-| **Deno** | JSR/npm | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
+| **Deno** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
 
 ### Yanked-Version Diagnostics
 

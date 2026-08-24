@@ -17,10 +17,11 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Version hints** — Inlay hints showing latest available versions
 - **Loading indicators** — Visual feedback during registry fetches with LSP progress support
 - **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved, composer.lock
-- **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
+- **Diagnostics** — Warnings for outdated, unknown, yanked, or unsatisfiable-requirement dependencies
 - **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
+- **Release-freshness signal** — Flags a "latest" version still within a cooldown window in hover and completion, mirroring GitHub Dependabot's default 3-day package cooldown
 - **Hover information** — Package descriptions with resolved version from lock file
-- **Code actions** — Quick fixes to update dependencies
+- **Code actions** — Quick fixes to update dependencies, resolve unsatisfiable version requirements, and upgrade to a patched version for known vulnerabilities
 - **Code lens** — "Update N outdated dependencies" batch update on every open manifest
 - **High performance** — Parallel fetching with per-dependency timeouts, optimized caching
 
@@ -30,6 +31,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | ---------- | ----------- | --------------- | -------- |
 | Rust | Cargo | `Cargo.toml` | Supported |
 | JavaScript | npm | `package.json` | Supported |
+| JavaScript/TypeScript | Deno (JSR/npm) | `deno.json`, `deno.jsonc` | Supported |
 | Python | PyPI | `pyproject.toml`, `requirements.txt`, `constraints.txt` | Supported |
 | Go | Go Modules | `go.mod` | Supported |
 | Ruby | Bundler | `Gemfile` | Supported |
@@ -39,7 +41,6 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | Swift | SPM | `Package.swift` | Supported |
 | PHP | Composer | `composer.json` | Supported |
 | C# | NuGet | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | Supported |
-| Deno | JSR/npm | `deno.json`, `deno.jsonc` | Supported |
 
 > [!NOTE]
 > **Ecosystem details:**
@@ -104,6 +105,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | --------- | ---------- | ----------- | ------- |
 | `cargo` | Rust | Cargo.toml | Yes |
 | `npm` | JavaScript | package.json | Yes |
+| `deno` | JavaScript/TypeScript (Deno) | deno.json, deno.jsonc | Yes |
 | `pypi` | Python | pyproject.toml, requirements.txt, constraints.txt | Yes |
 | `go` | Go | go.mod | Yes |
 | `bundler` | Ruby | Gemfile | Yes |
@@ -113,7 +115,6 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `swift` | Swift | Package.swift | Yes |
 | `composer` | PHP | composer.json | Yes |
 | `nuget` | C# | .csproj, Directory.Packages.props, packages.config | Yes |
-| `deno` | Deno (JSR/npm) | deno.json, deno.jsonc | Yes |
 
 ## Usage
 
@@ -129,21 +130,29 @@ deps-lsp --stdio
 ## Editor setup
 
 > [!IMPORTANT]
-> Inlay hints must be enabled in your editor to see version indicators. See configuration for each editor below.
+> Inlay hints, code lens, and (in some editors) inline diagnostics are off by default at the *editor* level, independent of `deps-lsp`'s own [`initialization_options`](#configuration). The server always advertises support for all three — each section below covers the editor-side toggle needed to actually see them.
 
 ### Zed
 
 Install the **Deps** extension from Zed Extensions marketplace. Ruby support is enabled for Gemfile files.
 
-Enable inlay hints in Zed settings:
+Enable inlay hints, code lens, and (optionally) inline diagnostics in Zed settings:
 
 ```json
 {
   "inlay_hints": {
     "enabled": true
+  },
+  "code_lens": "on",
+  "diagnostics": {
+    "inline": {
+      "enabled": true
+    }
   }
 }
 ```
+
+`code_lens` accepts `"on"`, `"off"` (default), or `"menu"`, and is required for the "Update N outdated dependencies" lens to appear. `diagnostics.inline` is optional — diagnostics already show in the gutter and Problems panel without it; this additionally renders `deps-lsp`'s short one-line messages inline next to each dependency.
 
 ### Neovim
 
@@ -158,6 +167,28 @@ vim.lsp.inlay_hint.enable(true)
 ```
 
 For older Neovim versions, use [nvim-lsp-inlayhints](https://github.com/lvimuser/lsp-inlayhints.nvim).
+
+**Code lens** is not refreshed or rendered automatically by Neovim's built-in client — wire it up via an `LspAttach` autocommand:
+
+```lua
+vim.api.nvim_create_autocmd("LspAttach", {
+  callback = function(args)
+    local client = vim.lsp.get_client_by_id(args.data.client_id)
+    if client and client:supports_method("textDocument/codeLens") then
+      vim.lsp.codelens.refresh({ bufnr = args.buf })
+      vim.api.nvim_create_autocmd({ "BufEnter", "CursorHold", "InsertLeave" }, {
+        buffer = args.buf,
+        callback = function() vim.lsp.codelens.refresh({ bufnr = args.buf }) end,
+      })
+    end
+  end,
+})
+
+vim.keymap.set("n", "<leader>cl", vim.lsp.codelens.run, { desc = "Run code lens" })
+```
+
+> [!WARNING]
+> Neovim 0.11 changed diagnostic virtual text (inline diagnostics) from opt-out to opt-in. On 0.11+, run `vim.diagnostic.config({ virtual_text = true })` if `deps-lsp`'s warnings aren't appearing inline — on 0.10 and earlier this was already the default.
 
 ### Helix
 
@@ -184,6 +215,11 @@ Enable inlay hints in Helix config:
 display-inlay-hints = true
 ```
 
+Diagnostics render inline by default with no configuration needed.
+
+> [!NOTE]
+> Helix does not implement `textDocument/codeLens` — the "Update N outdated dependencies" batch action is unavailable there; use the per-dependency code action (`Cmd+.`/`Ctrl+.` equivalent) instead.
+
 ### VS Code
 
 Install an LSP client extension and configure deps-lsp. Enable inlay hints:
@@ -193,6 +229,8 @@ Install an LSP client extension and configure deps-lsp. Enable inlay hints:
   "editor.inlayHints.enabled": "on"
 }
 ```
+
+`editor.codeLens` is `true` by default in VS Code itself, so `deps-lsp`'s code lens should appear automatically — provided your chosen generic LSP client extension forwards the `codeLens` capability (most do; check its documentation if the lens doesn't show up). Diagnostics render as squiggles plus entries in the Problems panel by default; for an always-visible inline message next to each dependency, install the third-party [Error Lens](https://marketplace.visualstudio.com/items?itemName=usernamehw.errorlens) extension.
 
 ## Configuration
 
@@ -211,6 +249,10 @@ Configure via LSP initialization options:
     "yanked_severity": "warning",
     "unsatisfiable_severity": "warning",
     "vulnerabilities_enabled": true
+  },
+  "freshness": {
+    "enabled": true,
+    "cooldown_secs": 259200
   },
   "cache": {
     "enabled": true,
@@ -246,6 +288,11 @@ Configure via LSP initialization options:
 | `loading_indicator` | `fallback_to_hints` | `true` | Show loading in inlay hints if LSP progress unsupported |
 | `loading_indicator` | `loading_text` | `"..."` | Text shown during loading (max 100 chars) |
 | `code_lens` | `enabled` | `true` | Show the "Update N outdated dependencies" code lens |
+| `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
+| `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
+
+> [!NOTE]
+> The release-freshness signal applies uniformly across all ecosystems — there is no per-ecosystem override. Coverage depth varies with what each registry exposes (e.g. Deno's `jsr:` specifiers get full coverage at no extra request cost; Swift and Maven/Gradle have partial coverage since their APIs don't expose per-version publish dates directly). See [Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#mavengradle-release-freshness-coverage) for per-ecosystem details.
 
 > [!TIP]
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.

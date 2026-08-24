@@ -15,10 +15,13 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Multi-ecosystem** — Cargo.toml, package.json, pyproject.toml, go.mod, Gemfile, pubspec.yaml, pom.xml, libs.versions.toml, Package.swift, composer.json, .csproj/.fsproj/.vbproj, deno.json/deno.jsonc
 - **Inlay hints** — Show latest versions inline with loading indicators
 - **Hover info** — Package descriptions with resolved version from lock file
-- **Code actions** — Quick fixes to update dependencies
+- **Diagnostics** — Warnings for outdated, unknown, yanked, or unsatisfiable-requirement dependencies
+- **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
+- **Release-freshness signal** — Flags a "latest" version still within a cooldown window in hover and completion, mirroring GitHub Dependabot's default 3-day package cooldown
+- **Code actions** — Quick fixes to update dependencies, resolve unsatisfiable version requirements, and upgrade to a patched version for known vulnerabilities
 - **Code lens** — "Update N outdated dependencies" batch update on every open manifest
-- **Diagnostics** — Warnings for outdated, yanked, or unknown packages
 - **Lock file support** — Reads resolved versions without network requests
+- **Live config reload** — Configuration changes apply without restarting the server
 
 ## Installation
 
@@ -41,7 +44,7 @@ All ecosystems are enabled by default. Disable unused ones to reduce binary size
 
 ```toml
 [dependencies]
-deps-lsp = { version = "0.10", default-features = false, features = ["cargo", "npm"] }
+deps-lsp = { version = "0.11", default-features = false, features = ["cargo", "npm"] }
 ```
 
 | Feature | Ecosystem | Default |

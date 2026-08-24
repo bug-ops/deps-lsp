@@ -24,7 +24,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-go = "0.10"
+deps-go = "0.11"
 ```
 
 > [!IMPORTANT]

@@ -18,6 +18,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Multi-registry** — Resolves from Maven Central, Google Maven, and Gradle Plugin Portal
 - **Maven version comparison** — Full qualifier-aware comparison (`alpha`, `beta`, `RC`, `SNAPSHOT`)
 - **Configuration awareness** — Recognises `implementation`, `api`, `testImplementation`, and other Gradle configurations
+- **Release-freshness signal (partial)** — Per-version ages in hover/completion for Maven Central-resolved dependencies; unavailable for Google Maven and Gradle Plugin Portal artifacts, which have no date column (see `ECOSYSTEM_GUIDE.md`)
 
 > [!NOTE]
 > Registry integration reuses `deps_maven::MavenCentralRegistry`. Gradle dependencies use the `groupId:artifactId` identifier format.
@@ -26,7 +27,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-gradle = "0.10"
+deps-gradle = "0.11"
 ```
 
 > [!IMPORTANT]

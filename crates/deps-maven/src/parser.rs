@@ -65,7 +65,7 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
 
         match event {
             Event::Start(ref e) => {
-                let tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                let tag = e.local_name().as_ref().to_string();
                 let ctx = context_stack.last().cloned().unwrap_or(ParseContext::Root);
 
                 match (ctx, tag.as_str()) {
@@ -113,15 +113,12 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
             }
             Event::Text(ref e) => {
                 let text_start = pos;
-                let text = match e.decode() {
-                    Ok(cow) => {
-                        let s = cow.trim().to_string();
-                        // Unescape XML entities
-                        quick_xml::escape::unescape(&s)
-                            .map(|c| c.into_owned())
-                            .unwrap_or(s)
-                    }
-                    Err(_) => String::from_utf8_lossy(e.as_ref()).trim().to_string(),
+                let text = {
+                    let s = e.trim().to_string();
+                    // Unescape XML entities
+                    quick_xml::escape::unescape(&s)
+                        .map(|c| c.into_owned())
+                        .unwrap_or(s)
                 };
                 let text_end = reader.buffer_position();
 
@@ -163,7 +160,7 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
                 }
             }
             Event::End(ref e) => {
-                let tag = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                let tag = e.local_name().as_ref().to_string();
                 let ctx = context_stack.last().cloned().unwrap_or(ParseContext::Root);
 
                 match (ctx, tag.as_str()) {
