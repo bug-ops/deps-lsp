@@ -11,7 +11,7 @@ use tower_lsp_server::ls_types::{
 use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome, VulnerabilityMap, diagnostic_severity_for};
 use crate::{
     Dependency, EcosystemConfig, InvalidPackageName, PackageName, ParseResult, PublishTime,
-    Registry, Version, VersionReq, format_relative_age,
+    Registry, Version, VersionReq, format_relative_age, is_within_cooldown,
 };
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
@@ -50,6 +50,17 @@ pub struct PackageVersions {
     pub available: Arc<[String]>,
     /// Subset of `available` reported as yanked/deprecated by the registry.
     pub yanked: Arc<[String]>,
+    /// When `latest` was published, if the registry exposes it. `None` when
+    /// the ecosystem doesn't wire [`Version::published_at`] or the fetch
+    /// never ran.
+    ///
+    /// Deliberately a field on this single per-package struct rather than a
+    /// second parallel map keyed alongside `latest` — the earlier two-map
+    /// design (issue #227 critique C3) let `latest` and its age drift apart
+    /// silently whenever one map was updated (e.g. lockfile-resolved
+    /// overwrite) without the other. Bundling them here makes that
+    /// desync impossible: whoever sets `latest` sets `published_at` too.
+    pub published_at: Option<crate::freshness::PublishTime>,
 }
 
 impl PackageVersions {
@@ -83,6 +94,7 @@ impl PackageVersions {
             latest,
             available,
             yanked: Arc::from(Vec::new()),
+            published_at: None,
         }
     }
 
@@ -106,6 +118,7 @@ impl PackageVersions {
             latest: latest.into(),
             available: Arc::from(Vec::new()),
             yanked: Arc::from(Vec::new()),
+            published_at: None,
         }
     }
 }
@@ -1181,6 +1194,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     registry: &R,
     formatter: &dyn EcosystemFormatter,
     freshness: crate::freshness::FreshnessSettings,
+    now: PublishTime,
 ) -> Option<Hover> {
     use std::fmt::Write;
 
@@ -1198,6 +1212,11 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // must skip the registry lookup and every section built from it entirely.
     let resolvable = dep.source().is_version_resolvable();
 
+    // `now` is a caller-supplied parameter (issue #227 M4) rather than computed
+    // internally via `PublishTime::now()` — this is what lets tests pin an exact
+    // cooldown-boundary instant deterministically, and guarantees every age rendered
+    // in this single hover response (the `**Latest**` line and the "Recent versions"
+    // list below) is aged against the same instant.
     let available_versions = if resolvable {
         Some(
             registry
@@ -1257,22 +1276,53 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .unwrap();
     }
 
-    let latest = resolvable
+    // The `**Latest**` line prefers the just-fetched Ch2 list (`available_versions`,
+    // whose index 0 is the same entry the "Recent versions" section below labels
+    // `*(latest)*`) over the Ch1 cache (`versions.cached`, populated by the lifecycle's
+    // background fetch) whenever a live fetch is available. Ch1 alone would let this
+    // line render a version older than the one the "Recent versions" list right below it
+    // shows as `*(latest)*` — a self-contradictory response when a new version is
+    // published between the last background fetch and this hover call, with the cooldown
+    // callout then decided off the stale operand too (issue #227 F5). Falls back to Ch1
+    // only when there is no live fetch to prefer (non-resolvable source).
+    let live_latest = available_versions.as_ref().and_then(|v| v.first());
+    let cached_latest = resolvable
         .then(|| {
             versions
                 .cached
                 .get(normalized_name.as_str())
                 .or_else(|| versions.cached.get(dep.name()))
-                .map(|v| v.latest.as_str())
         })
         .flatten();
-    if let Some(latest_ver) = latest {
+    let latest_line: Option<(&str, Option<PublishTime>)> = if let Some(live) = live_latest {
+        Some((live.version_string(), live.published_at()))
+    } else {
+        cached_latest.map(|v| (v.latest.as_str(), v.published_at))
+    };
+    if let Some((latest_ver, raw_published_at)) = latest_line {
+        let published_at = freshness.enabled.then_some(raw_published_at).flatten();
+        let age_secs = published_at.map(|p| p.age_secs_from(now));
         write!(
             &mut markdown,
-            "**Latest**: {}\n\n",
+            "**Latest**: {}",
             markdown_code_span(latest_ver)
         )
         .unwrap();
+        if let Some(age_secs) = age_secs {
+            write!(
+                &mut markdown,
+                " *(published {})*",
+                format_relative_age(age_secs)
+            )
+            .unwrap();
+        }
+        markdown.push_str("\n\n");
+        if age_secs.is_some_and(|age| is_within_cooldown(age, freshness.cooldown_secs)) {
+            markdown.push_str(
+                "> ⏳ **Recently published** — this release is still within the cooldown window.\n\
+                 > It may still be yanked or superseded; consider verifying before upgrading.\n\n",
+            );
+        }
     }
 
     let vuln_outcome = versions.vulnerabilities.and_then(|m| {
@@ -1283,7 +1333,6 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     if let Some(available_versions) = &available_versions {
         markdown.push_str("**Recent versions**:\n");
-        let now = PublishTime::now();
         for (i, version) in available_versions
             .iter()
             .take(HOVER_RECENT_VERSIONS)
@@ -2162,13 +2211,21 @@ fn requirement_matches_only_yanked(
 /// * `parse_result` - Parsed dependencies from manifest
 /// * `versions` - Latest (registry) and resolved (lock file) version maps, keyed by package name
 /// * `formatter` - Ecosystem-specific formatting and comparison logic
+/// * `freshness` - Whether to differentiate an "outdated" diagnostic still within the
+///   release cooldown window (severity is unaffected either way — see the "Newer version
+///   available" message below)
 /// * `severities` - Configured severity for each diagnostic category
+/// * `now` - The instant every publish age in this call is computed against. Taken as a
+///   parameter rather than read internally via `PublishTime::now()` (issue #227 M4) so
+///   callers can pin an exact cooldown-boundary instant deterministically in tests, and
+///   so every dependency in one document is aged against the same instant.
 pub fn generate_diagnostics_from_cache(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
-    _freshness: crate::freshness::FreshnessSettings,
+    freshness: crate::freshness::FreshnessSettings,
     severities: DiagnosticSeverities,
+    now: PublishTime,
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
@@ -2368,10 +2425,32 @@ pub fn generate_diagnostics_from_cache(
         };
 
         if status == RequirementStatus::Outdated {
+            // Message-only differentiation: severity stays `severities.outdated` in both
+            // cases (already the floor — see the module docs). A within-cooldown release
+            // still deserves the recommendation, just with the extra context that it may
+            // yet be yanked or superseded (issue #227 §4.3).
+            let published_at = freshness
+                .enabled
+                .then_some(package_versions.published_at)
+                .flatten();
+            let message = match published_at {
+                Some(published_at)
+                    if is_within_cooldown(
+                        published_at.age_secs_from(now),
+                        freshness.cooldown_secs,
+                    ) =>
+                {
+                    format!(
+                        "Newer version available: {latest} (published {} — still within the release cooldown window)",
+                        format_relative_age(published_at.age_secs_from(now))
+                    )
+                }
+                _ => format!("Newer version available: {latest}"),
+            };
             diagnostics.push(Diagnostic {
                 range: version_range,
                 severity: Some(severities.outdated),
-                message: format!("Newer version available: {}", latest),
+                message,
                 source: Some("deps-lsp".into()),
                 ..Default::default()
             });
@@ -3757,6 +3836,7 @@ mod tests {
             &registry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -3791,6 +3871,7 @@ mod tests {
             &registry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -3832,6 +3913,7 @@ mod tests {
             &MockRegistry,
             &MockGoFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -3876,6 +3958,7 @@ mod tests {
             &MockRegistry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -3924,6 +4007,7 @@ mod tests {
             &registry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -3965,6 +4049,7 @@ mod tests {
                 enabled: false,
                 cooldown_secs: crate::freshness::DEFAULT_COOLDOWN_SECS,
             },
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -3974,6 +4059,365 @@ mod tests {
         };
         assert!(content.value.contains("- `1.2.3` *(latest)*\n"));
         assert!(!content.value.contains("ago"));
+    }
+
+    /// Issue #227 §4.2a: the `**Latest**` line gets a publish-age suffix and, within the
+    /// cooldown window, the "Recently published" callout.
+    #[tokio::test]
+    async fn test_generate_hover_latest_line_shows_age_and_cooldown_callout_when_within_cooldown() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                // 1 hour ago — well within the default 3-day cooldown.
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("**Latest**: `2.0.0` *(published 1 hour ago)*"),
+            "got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains(
+                "> ⏳ **Recently published** — this release is still within the cooldown window."
+            ),
+            "got: {}",
+            content.value
+        );
+    }
+
+    /// Same setup, but `latest` was published well outside the cooldown window — the age
+    /// suffix still renders, but the callout must not.
+    #[tokio::test]
+    async fn test_generate_hover_latest_line_no_callout_when_outside_cooldown() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                // 10 days ago — outside the default 3-day cooldown.
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 10 * 24 * 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("**Latest**: `2.0.0` *(published 1 week ago)*"),
+            "got: {}",
+            content.value
+        );
+        assert!(!content.value.contains("Recently published"));
+    }
+
+    /// A `latest` with no known publish time renders exactly the pre-feature line — no age
+    /// suffix, no callout.
+    #[tokio::test]
+    async fn test_generate_hover_latest_line_omits_age_when_published_at_unknown() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("**Latest**: `2.0.0`\n\n"));
+        assert!(!content.value.contains("published"));
+        assert!(!content.value.contains("Recently published"));
+    }
+
+    /// `freshness.enabled: false` suppresses both the age suffix and the cooldown callout
+    /// on the `**Latest**` line, even when the publish time would otherwise qualify.
+    #[tokio::test]
+    async fn test_generate_hover_latest_line_respects_freshness_disabled() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings {
+                enabled: false,
+                cooldown_secs: crate::freshness::DEFAULT_COOLDOWN_SECS,
+            },
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("**Latest**: `2.0.0`\n\n"));
+        assert!(!content.value.contains("published"));
+        assert!(!content.value.contains("Recently published"));
+    }
+
+    /// Deterministic boundary test (issue #227 M4): `now` is threaded in as a parameter
+    /// rather than read internally, so `published_at`/`now`/`cooldown_secs` can be pinned
+    /// to fixed absolute values with no wall-clock dependency. `age == cooldown_secs`
+    /// exactly must NOT be within cooldown — the bound is exclusive (`age < cooldown`).
+    #[tokio::test]
+    async fn test_generate_hover_latest_line_cooldown_boundary_is_exclusive() {
+        use std::collections::HashMap;
+
+        const COOLDOWN_SECS: u64 = 100;
+        let now = PublishTime::from_unix_secs(10_000);
+        let published_at_at_boundary =
+            PublishTime::from_unix_secs(10_000 - COOLDOWN_SECS.cast_signed());
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: Some(published_at_at_boundary),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: COOLDOWN_SECS,
+            },
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("Recently published"),
+            "age exactly equal to cooldown_secs must not be within cooldown, got: {}",
+            content.value
+        );
+    }
+
+    /// Same fixture, one second younger — must flip to within cooldown.
+    #[tokio::test]
+    async fn test_generate_hover_latest_line_cooldown_boundary_one_second_inside_shows_callout() {
+        use std::collections::HashMap;
+
+        const COOLDOWN_SECS: u64 = 100;
+        let now = PublishTime::from_unix_secs(10_000);
+        let published_at_just_inside =
+            PublishTime::from_unix_secs(10_000 - (COOLDOWN_SECS.cast_signed() - 1));
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: Some(published_at_just_inside),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: COOLDOWN_SECS,
+            },
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("Recently published"),
+            "age == cooldown_secs - 1 must be within cooldown, got: {}",
+            content.value
+        );
+    }
+
+    /// Issue #227 F5: the Ch1 cache (`versions.cached`, populated by the lifecycle's
+    /// background fetch) can go stale relative to the live Ch2 fetch this same hover call
+    /// just made (`registry.get_versions_with`) — e.g. a new version published between the
+    /// last background fetch and now. Before this fix, the `**Latest**` line and cooldown
+    /// callout read Ch1 alone, so hover could render a self-contradictory response: an
+    /// older `**Latest**` line sitting above a "Recent versions" list whose own `*(latest)*`
+    /// entry is a newer version. The line must prefer the live entry instead.
+    #[tokio::test]
+    async fn test_generate_hover_latest_line_prefers_live_fetch_over_stale_ch1_cache() {
+        use std::collections::HashMap;
+
+        let now = PublishTime::now();
+        let live_latest_published = PublishTime::from_unix_secs(now.as_unix_secs() - 60 * 60);
+        let registry = MockRegistryWithVersions {
+            versions: vec![
+                MockVersionWithAge {
+                    version: "1.0.214".to_string(),
+                    yanked: false,
+                    published_at: Some(live_latest_published),
+                },
+                MockVersionWithAge {
+                    version: "1.0.213".to_string(),
+                    yanked: false,
+                    published_at: Some(PublishTime::from_unix_secs(
+                        now.as_unix_secs() - 30 * 24 * 60 * 60,
+                    )),
+                },
+            ],
+        };
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        // Stale Ch1 entry: an older version, with an even older publish time, standing in
+        // for a background fetch that ran before 1.0.214 was published.
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "1.0.213".to_string(),
+                available: Arc::from(vec!["1.0.213".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: Some(PublishTime::from_unix_secs(
+                    now.as_unix_secs() - 90 * 24 * 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("**Latest**: `1.0.214` *(published 1 hour ago)*"),
+            "Latest line must reflect the live Ch2 fetch, not the stale Ch1 cache entry \
+             `1.0.213`, got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("**Latest**: `1.0.213`"),
+            "must not render the stale Ch1 version, got: {}",
+            content.value
+        );
+        assert!(
+            content
+                .value
+                .contains("- `1.0.214` *(latest)* — 1 hour ago"),
+            "the Recent versions list's own *(latest)* entry must agree with the Latest \
+             line above it, got: {}",
+            content.value
+        );
     }
 
     /// A formatter whose `format_version_for_text_edit` is the identity —
@@ -4968,6 +5412,7 @@ mod tests {
             &MockRegistry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -5003,6 +5448,7 @@ mod tests {
             &MockRegistry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -5040,6 +5486,7 @@ mod tests {
             &MockRegistry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -5097,6 +5544,7 @@ mod tests {
             &MockRegistry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -5149,6 +5597,7 @@ mod tests {
             &MockRegistry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated for a dependency at the cursor");
@@ -5582,6 +6031,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -5621,6 +6071,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -5659,6 +6110,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -5694,6 +6146,7 @@ mod tests {
             &formatter,
             crate::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -5875,12 +6328,273 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
         assert!(diagnostics[0].message.contains("Newer version available"));
         assert!(diagnostics[0].message.contains("2.0.0"));
+    }
+
+    /// Issue #227 §4.3: an outdated dependency whose `latest` was published within the
+    /// configured cooldown window gets the extra context appended, severity unchanged.
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_within_cooldown_appends_context() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                // 1 hour ago — well within the default 3-day cooldown.
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(
+            diagnostics[0].message,
+            "Newer version available: 2.0.0 (published 1 hour ago — still within the release cooldown window)"
+        );
+        // Guards against reintroducing the "ago ago" duplication bug found while
+        // writing this test — `format_relative_age` already appends "ago".
+        assert!(!diagnostics[0].message.contains("ago ago"));
+    }
+
+    /// Same setup, but `latest` was published well outside the cooldown window — the
+    /// message must stay exactly the pre-feature text.
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_outside_cooldown_plain_message() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                // 10 days ago — outside the default 3-day cooldown.
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 10 * 24 * 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "Newer version available: 2.0.0");
+    }
+
+    /// `freshness.enabled: false` suppresses the cooldown differentiation even when the
+    /// publish age would otherwise qualify.
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_freshness_disabled_plain_message() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            crate::freshness::FreshnessSettings {
+                enabled: false,
+                ..crate::freshness::FreshnessSettings::default()
+            },
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "Newer version available: 2.0.0");
+    }
+
+    /// Deterministic boundary test (issue #227 M4): `now` is threaded in as a parameter
+    /// rather than read internally, so `published_at`/`now`/`cooldown_secs` can be pinned
+    /// to fixed absolute values with no wall-clock dependency. `age == cooldown_secs`
+    /// exactly must NOT be within cooldown — the bound is exclusive (`age < cooldown`).
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_cooldown_boundary_is_exclusive() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        const COOLDOWN_SECS: u64 = 100;
+        let now = PublishTime::from_unix_secs(10_000);
+        let published_at_at_boundary =
+            PublishTime::from_unix_secs(10_000 - COOLDOWN_SECS.cast_signed());
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: Some(published_at_at_boundary),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            crate::freshness::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: COOLDOWN_SECS,
+            },
+            DiagnosticSeverities::default(),
+            now,
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message, "Newer version available: 2.0.0",
+            "age exactly equal to cooldown_secs must not be within cooldown"
+        );
+    }
+
+    /// Same fixture, one second younger — must flip to the within-cooldown message.
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_cooldown_boundary_one_second_inside() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        const COOLDOWN_SECS: u64 = 100;
+        let now = PublishTime::from_unix_secs(10_000);
+        let published_at_just_inside =
+            PublishTime::from_unix_secs(10_000 - (COOLDOWN_SECS.cast_signed() - 1));
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".to_string(),
+                available: Arc::from(vec!["2.0.0".to_string()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: Some(published_at_just_inside),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            crate::freshness::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: COOLDOWN_SECS,
+            },
+            DiagnosticSeverities::default(),
+            now,
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message,
+            "Newer version available: 2.0.0 (published 1 minute ago — still within the release cooldown window)",
+            "age == cooldown_secs - 1 must be within cooldown"
+        );
     }
 
     #[test]
@@ -5911,6 +6625,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert!(
@@ -5962,6 +6677,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert_eq!(diagnostics.len(), 2);
@@ -6111,6 +6827,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert!(
@@ -6152,6 +6869,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             severities,
+            PublishTime::now(),
         );
 
         let yanked_diag = diagnostics
@@ -6190,6 +6908,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         let yanked_diag = diagnostics
@@ -6229,6 +6948,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert!(
@@ -6271,6 +6991,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert_eq!(
@@ -6318,6 +7039,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         let yanked_diag = diagnostics
@@ -6371,6 +7093,7 @@ mod tests {
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert!(
@@ -6978,6 +7701,7 @@ mod tests {
                 &MockFormatter,
                 crate::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
+                PublishTime::now(),
             );
             let newer_version_diagnostics = diagnostics
                 .iter()
@@ -7163,6 +7887,7 @@ mod tests {
                         "1.4.0".to_string(),
                     ]),
                     yanked: Arc::from(Vec::<String>::new()),
+                    published_at: None,
                 },
             );
             m
@@ -7182,6 +7907,7 @@ mod tests {
             &StrictSemverFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         let message = diagnostics
@@ -7205,6 +7931,7 @@ mod tests {
                     latest: "1.5.0".to_string(),
                     available: Arc::from(vec!["1.5.0".to_string(), "1.4.0".to_string()]),
                     yanked: Arc::from(Vec::<String>::new()),
+                    published_at: None,
                 },
             );
             m
@@ -7224,6 +7951,7 @@ mod tests {
             &StrictSemverFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         let message = diagnostics
@@ -7280,6 +8008,7 @@ mod tests {
                 &ExactMatchFormatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
+                PublishTime::now(),
             );
             assert!(
                 diagnostics
@@ -7302,6 +8031,7 @@ mod tests {
             &ExactMatchFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
         assert!(
             diagnostics
@@ -7336,6 +8066,7 @@ mod tests {
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
         assert!(
             diagnostics
@@ -7356,6 +8087,7 @@ mod tests {
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
         assert!(
             diagnostics
@@ -7391,6 +8123,7 @@ mod tests {
             &RejectingFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.starts_with("Invalid package name"));
@@ -7426,6 +8159,7 @@ mod tests {
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
         assert!(
             diagnostics
@@ -7446,6 +8180,7 @@ mod tests {
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
         assert!(
             diagnostics
@@ -7491,6 +8226,7 @@ mod tests {
             &registry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should still be generated for a non-resolvable-source dependency");
@@ -7515,6 +8251,7 @@ mod tests {
             &registry,
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated");
@@ -7559,6 +8296,7 @@ mod tests {
             &formatter,
             crate::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         let vuln_diag = diagnostics
@@ -7606,6 +8344,7 @@ mod tests {
             &formatter,
             crate::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         let more_diag = diagnostics
@@ -7644,6 +8383,7 @@ mod tests {
             &formatter,
             crate::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
+            PublishTime::now(),
         );
 
         assert!(
@@ -7673,6 +8413,7 @@ mod tests {
             &MockRegistry,
             &MockFormatter,
             crate::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated");
@@ -7707,6 +8448,7 @@ mod tests {
             &MockRegistry,
             &MockFormatter,
             crate::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated");
@@ -7751,6 +8493,7 @@ mod tests {
             &MockRegistry,
             &MockFormatter,
             crate::FreshnessSettings::default(),
+            PublishTime::now(),
         )
         .await
         .expect("hover should be generated");
@@ -8192,6 +8935,7 @@ mod tests {
                         available.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                     ),
                     yanked: Arc::from(Vec::new()),
+                    published_at: None,
                 },
             );
             m
@@ -9292,6 +10036,7 @@ mod tests {
                     latest: "2.0.0".to_string(),
                     available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
                     yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    published_at: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9302,6 +10047,7 @@ mod tests {
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
+                PublishTime::now(),
             );
 
             assert_eq!(diagnostics.len(), 1, "expected exactly one diagnostic");
@@ -9338,6 +10084,7 @@ mod tests {
                     latest: "2.0.0".to_string(),
                     available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
                     yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    published_at: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9350,6 +10097,7 @@ mod tests {
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
+                PublishTime::now(),
             );
 
             // Two diagnostics are expected, not one: the in-use-version check (#263) has
@@ -9411,6 +10159,7 @@ mod tests {
                     latest: "1.2.1".to_string(),
                     available: Arc::from(vec!["1.2.1".to_string()]),
                     yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    published_at: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9426,6 +10175,7 @@ mod tests {
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 severities,
+                PublishTime::now(),
             );
 
             assert_eq!(diagnostics.len(), 1);
@@ -9460,6 +10210,7 @@ mod tests {
                         "1.0.0".to_string(),
                     ]),
                     yanked: Arc::from(vec!["1.0.0".to_string()]),
+                    published_at: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9470,6 +10221,7 @@ mod tests {
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
+                PublishTime::now(),
             );
 
             assert!(
@@ -9545,6 +10297,7 @@ mod tests {
                     latest: "2.0.0".to_string(),
                     available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
                     yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    published_at: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9571,6 +10324,7 @@ mod tests {
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
+                PublishTime::now(),
             );
 
             assert!(
@@ -9605,6 +10359,7 @@ mod tests {
                     latest: "2.0.0".to_string(),
                     available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
                     yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    published_at: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9615,6 +10370,7 @@ mod tests {
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
+                PublishTime::now(),
             );
 
             assert!(

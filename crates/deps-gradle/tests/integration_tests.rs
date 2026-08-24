@@ -229,6 +229,7 @@ spring-boot = { module = "org.springframework.boot:spring-boot-starter", version
         &formatter,
         deps_core::FreshnessSettings::default(),
         deps_core::DiagnosticSeverities::default(),
+        deps_core::PublishTime::now(),
     );
     assert!(
         diagnostics.is_empty(),

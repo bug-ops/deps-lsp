@@ -22,7 +22,16 @@ use tower_lsp_server::ls_types::DiagnosticSeverity;
 /// let config: DepsConfig = serde_json::from_str(json).unwrap();
 /// assert!(config.inlay_hints.enabled);
 /// ```
+/// `deny_unknown_fields` on this top-level struct only (never on the section structs
+/// below, to preserve forward-compat for keys added inside a known section): any key that
+/// isn't one of `DepsConfig`'s own fields makes the whole payload fail to parse, so
+/// `parse_config` (`server.rs`) can react by keeping the previous configuration rather
+/// than silently substituting an all-defaults one. Without this, a single recognized key
+/// in an otherwise-unrelated blob (e.g. a client that flattens its whole settings tree)
+/// would deserialize successfully and reset every unrecognized section to its default —
+/// issue #227 C2.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DepsConfig {
     #[serde(default)]
     pub inlay_hints: InlayHintsConfig,

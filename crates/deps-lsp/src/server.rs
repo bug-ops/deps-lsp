@@ -10,14 +10,15 @@ use tower_lsp_server::ls_types::{
     CodeActionOptions, CodeActionParams, CodeActionProviderCapability, CodeLens, CodeLensOptions,
     CodeLensParams, CompletionOptions, CompletionOptionsCompletionItem, CompletionParams,
     CompletionResponse, DiagnosticOptions, DiagnosticServerCapabilities,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentChanges, DocumentDiagnosticParams, DocumentDiagnosticReport,
-    DocumentDiagnosticReportResult, ExecuteCommandOptions, ExecuteCommandParams,
-    FullDocumentDiagnosticReport, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, InlayHint, InlayHintParams, MessageType, OneOf,
-    OptionalVersionedTextDocumentIdentifier, Range, RelatedFullDocumentDiagnosticReport,
-    ServerCapabilities, ServerInfo, TextDocumentEdit, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
+    DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentChanges,
+    DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
+    ExecuteCommandOptions, ExecuteCommandParams, FullDocumentDiagnosticReport, Hover, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, InlayHint,
+    InlayHintParams, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Range,
+    Registration, RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo,
+    TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
+    WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
 
@@ -28,6 +29,34 @@ mod commands {
     /// Command to update every outdated dependency in a document, bound to the code
     /// lens produced by `handlers::code_lens`.
     pub(super) const UPDATE_ALL_OUTDATED: &str = crate::handlers::code_lens::COMMAND_ID;
+}
+
+/// Parses a [`DepsConfig`] from a raw JSON settings payload (client
+/// `initializationOptions` or `workspace/didChangeConfiguration` settings), warning and
+/// returning `None` on any failure rather than silently substituting a default-valued
+/// config for the caller to store.
+///
+/// `DepsConfig` carries `#[serde(deny_unknown_fields)]`, so any key that isn't one of its
+/// own top-level fields fails deserialization here rather than being silently ignored —
+/// this is what makes the "keep previous configuration" behavior below actually meaningful
+/// (issue #227 C2). A weaker "at least one recognized key" check was tried first and
+/// rejected: a client that flattens its whole settings tree (e.g. `{"editor": ...,
+/// "diagnostics": ..., "python": ...}`) would still pass that check on the one generic key
+/// it happens to share with `DepsConfig`, then silently reset every *other* section
+/// (`freshness`, `inlay_hints`, ...) to its default — the same silent-wipe bug through a
+/// different door. `deny_unknown_fields` closes it structurally: every unrecognized key,
+/// anywhere in the payload, is a hard rejection. An empty object `{}` still parses fine —
+/// it legitimately means "use every default" for every section.
+fn parse_config(value: serde_json::Value) -> Option<DepsConfig> {
+    match serde_json::from_value::<DepsConfig>(value) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            tracing::warn!(
+                "failed to parse deps-lsp configuration: {e} (keeping previous configuration)"
+            );
+            None
+        }
+    }
 }
 
 pub struct Backend {
@@ -228,6 +257,30 @@ impl Backend {
             .unwrap_or(false)
     }
 
+    /// Whether the client requires dynamic registration before it will send
+    /// `workspace/didChangeConfiguration` notifications (M3): without this, some clients
+    /// never send the notification at all, making live-reload unverifiable.
+    async fn did_change_configuration_dynamic_registration_supported(&self) -> bool {
+        let caps = self.client_capabilities.read().await;
+        caps.as_ref()
+            .and_then(|c| c.workspace.as_ref())
+            .and_then(|w| w.did_change_configuration.as_ref())
+            .and_then(|d| d.dynamic_registration)
+            .unwrap_or(false)
+    }
+
+    /// Whether the client implements `workspace/diagnostic/refresh`, the notification
+    /// used to nudge a pull-diagnostics client to re-request diagnostics after a
+    /// configuration change (§2.1). Push-only clients are a known v1 gap (M2).
+    async fn diagnostic_refresh_supported(&self) -> bool {
+        let caps = self.client_capabilities.read().await;
+        caps.as_ref()
+            .and_then(|c| c.workspace.as_ref())
+            .and_then(|w| w.diagnostics.as_ref())
+            .and_then(|d| d.refresh_support)
+            .unwrap_or(false)
+    }
+
     fn server_capabilities() -> ServerCapabilities {
         ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -280,7 +333,7 @@ impl LanguageServer for Backend {
 
         // Parse initialization options
         if let Some(init_options) = params.initialization_options
-            && let Ok(config) = serde_json::from_value::<DepsConfig>(init_options)
+            && let Some(config) = parse_config(init_options)
         {
             tracing::debug!("loaded configuration: {:?}", config);
             *self.config.write().await = config;
@@ -319,6 +372,23 @@ impl LanguageServer for Backend {
                 .await;
         }
 
+        // Dynamically register for `workspace/didChangeConfiguration` so clients that
+        // gate the notification on this (M3) actually send it — without it, a changed
+        // `freshness.cooldown_secs` would never reach `did_change_configuration`.
+        if self
+            .did_change_configuration_dynamic_registration_supported()
+            .await
+        {
+            let registration = Registration {
+                id: "deps-lsp-did-change-configuration".to_string(),
+                method: "workspace/didChangeConfiguration".to_string(),
+                register_options: None,
+            };
+            if let Err(e) = self.client.register_capability(vec![registration]).await {
+                tracing::warn!("Failed to register didChangeConfiguration: {}", e);
+            }
+        }
+
         // Spawn background cleanup task for cold start rate limiter
         let state_clone = Arc::clone(&self.state);
         tokio::spawn(async move {
@@ -331,6 +401,44 @@ impl LanguageServer for Backend {
                 tracing::trace!("Cleaned up old cold start rate limit entries");
             }
         });
+    }
+
+    /// Handles `workspace/didChangeConfiguration`, applying a live-reloaded
+    /// [`DepsConfig`] without requiring an editor restart (issue #227 §2.1).
+    ///
+    /// Replace-whole-config semantics, matching [`Self::initialize`]. `null`/absent
+    /// settings mean the client expects the pull form (`workspace/configuration`)
+    /// instead, which is not implemented in v1 — logged at `debug` and otherwise a
+    /// no-op. A payload that fails to parse (or has no keys `DepsConfig` recognizes,
+    /// C2) keeps the previously stored configuration rather than silently resetting it
+    /// to defaults.
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        if params.settings.is_null() {
+            tracing::debug!(
+                "workspace/didChangeConfiguration received null settings; the \
+                 workspace/configuration pull form is not implemented, ignoring"
+            );
+            return;
+        }
+
+        let Some(config) = parse_config(params.settings) else {
+            return;
+        };
+
+        tracing::info!("configuration updated via workspace/didChangeConfiguration");
+        *self.config.write().await = config;
+
+        // Hover/completion/code actions are computed on demand and pick up the new
+        // config for free. Diagnostics are pull-based, so a pull-capable client must be
+        // told to re-request them (push-only clients are a known v1 gap, M2).
+        if self.diagnostic_refresh_supported().await
+            && let Err(e) = self.client.workspace_diagnostic_refresh().await
+        {
+            tracing::debug!(
+                "workspace/diagnostic/refresh failed or unsupported: {:?}",
+                e
+            );
+        }
     }
 
     fn shutdown(&self) -> impl std::future::Future<Output = Result<()>> + Send {
@@ -949,6 +1057,365 @@ mod tests {
         assert!(edit.document_changes.is_none());
         let changes = edit.changes.expect("changes present");
         assert_eq!(changes.get(&uri).map(Vec::len), Some(1));
+    }
+
+    // =========================================================================
+    // Issue #227: `parse_config` (C2) and `did_change_configuration` live-reload
+    // =========================================================================
+
+    mod parse_config_tests {
+        use super::*;
+
+        #[test]
+        fn test_parse_config_accepts_empty_object() {
+            let config = parse_config(serde_json::json!({})).expect("empty object is valid");
+            assert!(config.freshness.enabled);
+        }
+
+        #[test]
+        fn test_parse_config_accepts_recognized_keys() {
+            let config = parse_config(serde_json::json!({
+                "freshness": { "cooldown_secs": 60 }
+            }))
+            .expect("payload with a recognized key is valid");
+            assert_eq!(config.freshness.cooldown_secs, 60);
+        }
+
+        /// C2 regression: a section-wrapped payload (a real shape some clients send)
+        /// has none of `DepsConfig`'s own keys, so it would otherwise deserialize
+        /// silently into an all-defaults config, discarding the user's settings.
+        /// `deny_unknown_fields` rejects it as `deps-lsp` not being a `DepsConfig` field.
+        #[test]
+        fn test_parse_config_rejects_section_wrapped_payload() {
+            let result = parse_config(serde_json::json!({
+                "deps-lsp": { "freshness": { "cooldown_secs": 60 } }
+            }));
+            assert!(
+                result.is_none(),
+                "a payload with no recognized top-level key must be rejected, not \
+                 silently accepted as all-defaults"
+            );
+        }
+
+        /// Security audit regression: the *previous* "at least one recognized key"
+        /// positive-signal check would have accepted this payload outright (it does
+        /// contain a real `diagnostics` key) and then silently reset `freshness` and
+        /// every other unmentioned section to its default — the same C2 silent-wipe
+        /// through a different door. `deny_unknown_fields` closes it: any unrecognized
+        /// sibling key anywhere in the payload rejects the whole thing.
+        #[test]
+        fn test_parse_config_rejects_mixed_blob_with_one_recognized_key_and_unknown_siblings() {
+            let result = parse_config(serde_json::json!({
+                "diagnostics": { "outdated_severity": 1 },
+                "editor": { "fontSize": 14 },
+                "python": { "linting": true }
+            }));
+            assert!(
+                result.is_none(),
+                "a payload with unrecognized sibling keys must be rejected wholesale, \
+                 not accepted because one key happens to match"
+            );
+        }
+
+        #[test]
+        fn test_parse_config_rejects_malformed_field_value() {
+            let result = parse_config(serde_json::json!({ "freshness": "not an object" }));
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_parse_config_rejects_non_object_payload() {
+            let result = parse_config(serde_json::json!(["not", "an", "object"]));
+            assert!(result.is_none());
+        }
+    }
+
+    /// Tester gap: only the `false`/absent branch of these two capability checks was
+    /// incidentally covered (every other test builds a `Backend` that never sets
+    /// `client_capabilities`). These pin the `true` branch directly.
+    mod capability_support_tests {
+        use super::*;
+        use tower_lsp_server::ls_types::{
+            ClientCapabilities, DiagnosticWorkspaceClientCapabilities,
+            DynamicRegistrationClientCapabilities, WorkspaceClientCapabilities,
+        };
+
+        #[tokio::test]
+        async fn test_did_change_configuration_dynamic_registration_supported_true_branch() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            *backend.client_capabilities.write().await = Some(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    did_change_configuration: Some(DynamicRegistrationClientCapabilities {
+                        dynamic_registration: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+
+            assert!(
+                backend
+                    .did_change_configuration_dynamic_registration_supported()
+                    .await
+            );
+        }
+
+        #[tokio::test]
+        async fn test_diagnostic_refresh_supported_true_branch() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            *backend.client_capabilities.write().await = Some(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+
+            assert!(backend.diagnostic_refresh_supported().await);
+        }
+    }
+
+    mod initialize_tests {
+        use super::*;
+
+        /// Tester gap: `initialize` shares `parse_config` with `did_change_configuration`
+        /// (only the latter had end-to-end coverage), so this exercises the same
+        /// `deny_unknown_fields` positive-signal path through `Backend::initialize` itself
+        /// — a section-wrapped `initializationOptions` payload must not silently reset the
+        /// user's config to defaults.
+        #[tokio::test]
+        async fn test_initialize_applies_valid_initialization_options() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            let result = backend
+                .initialize(InitializeParams {
+                    initialization_options: Some(
+                        serde_json::json!({ "freshness": { "cooldown_secs": 60 } }),
+                    ),
+                    ..Default::default()
+                })
+                .await;
+
+            assert!(result.is_ok());
+            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+        }
+
+        /// C2 through `initialize`: a section-wrapped payload (`deny_unknown_fields`
+        /// rejects `deps-lsp` as an unrecognized top-level key) must leave the
+        /// already-`Default`-constructed config untouched, not reset it to some other
+        /// all-defaults value silently.
+        #[tokio::test]
+        async fn test_initialize_keeps_default_config_on_malformed_initialization_options() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            let result = backend
+                .initialize(InitializeParams {
+                    initialization_options: Some(
+                        serde_json::json!({ "deps-lsp": { "freshness": { "cooldown_secs": 60 } } }),
+                    ),
+                    ..Default::default()
+                })
+                .await;
+
+            assert!(result.is_ok());
+            assert_eq!(
+                backend.config.read().await.freshness.cooldown_secs,
+                deps_core::DEFAULT_COOLDOWN_SECS,
+                "malformed initializationOptions must not silently change the config"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_initialize_without_initialization_options_keeps_defaults() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            let result = backend.initialize(InitializeParams::default()).await;
+
+            assert!(result.is_ok());
+            assert!(backend.config.read().await.freshness.enabled);
+        }
+    }
+
+    mod did_change_configuration_tests {
+        use super::*;
+        use tower_lsp_server::ls_types::DidChangeConfigurationParams;
+
+        #[tokio::test]
+        async fn test_did_change_configuration_applies_valid_payload() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "freshness": { "cooldown_secs": 60 } }),
+                })
+                .await;
+
+            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+        }
+
+        /// C2 end-to-end: a section-wrapped payload must never wipe the previously
+        /// stored configuration back to defaults.
+        #[tokio::test]
+        async fn test_did_change_configuration_keeps_previous_on_malformed_payload() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "freshness": { "cooldown_secs": 60 } }),
+                })
+                .await;
+            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "deps-lsp": { "freshness": { "cooldown_secs": 999 } } }),
+                })
+                .await;
+
+            assert_eq!(
+                backend.config.read().await.freshness.cooldown_secs,
+                60,
+                "a malformed/unrecognized payload must not overwrite the previous configuration"
+            );
+        }
+
+        /// §2.1 point 4: `null` settings mean the client expects the pull form
+        /// (`workspace/configuration`), which v1 does not implement — must be a no-op,
+        /// not a reset to defaults.
+        #[tokio::test]
+        async fn test_did_change_configuration_null_settings_is_noop() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "freshness": { "cooldown_secs": 60 } }),
+                })
+                .await;
+            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::Value::Null,
+                })
+                .await;
+
+            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+        }
+
+        /// C1 regression: `did_change_configuration` makes a concurrent `config.write()`
+        /// reachable for the first time. Every handler that nested-reads `config` inside
+        /// `ensure_document_loaded` must drop its own outer guard first — otherwise a
+        /// writer queued in between permanently blocks the nested read (tokio's `RwLock`
+        /// is write-preferring).
+        ///
+        /// An earlier version of this test used an unseeded `test_uri`, so both handlers
+        /// bailed out of `ensure_document_loaded` on ENOENT *before* ever reaching their
+        /// own config snapshot — it passed in 0.01s regardless of whether the deadlock
+        /// existed. Fixed here by seeding the document directly (so the fast path in
+        /// `ensure_document_loaded` returns without touching `config` at all, and both
+        /// handlers reach their real snapshot reads), running on a multi-threaded runtime
+        /// (genuine OS-thread concurrency, not `current_thread`'s single deterministic
+        /// poll order), and lining hover/diagnostics/the config write up on a `Barrier` so
+        /// all three contend for the lock at essentially the same instant every run.
+        #[cfg(feature = "cargo")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn test_no_deadlock_between_config_write_and_concurrent_hover_and_diagnostics() {
+            use crate::document::DocumentState;
+            use crate::handlers::{diagnostics, hover};
+            use deps_core::EcosystemId;
+            use tokio::sync::Barrier;
+            use tower_lsp_server::ls_types::{
+                HoverParams, Position, TextDocumentIdentifier, TextDocumentPositionParams,
+            };
+
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            // Seed the document so `ensure_document_loaded`'s fast path (already loaded)
+            // returns immediately, letting both handlers reach their own config reads.
+            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            backend.state.update_document(uri.clone(), doc_state);
+
+            let barrier = Arc::new(Barrier::new(3));
+
+            let hover_task = tokio::spawn({
+                let state = Arc::clone(&backend.state);
+                let config = Arc::clone(&backend.config);
+                let client = backend.client.clone();
+                let uri = uri.clone();
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    barrier.wait().await;
+                    // Cursor position outside any dependency's span — `generate_hover`
+                    // returns immediately without a registry round trip, so this stays
+                    // offline and fast while still exercising hover's own config read.
+                    let params = HoverParams {
+                        text_document_position_params: TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier { uri },
+                            position: Position::new(99, 0),
+                        },
+                        work_done_progress_params: Default::default(),
+                    };
+                    hover::handle_hover(state, params, client, config).await
+                }
+            });
+
+            let diagnostics_config_snapshot = { backend.config.read().await.diagnostics.clone() };
+            let diagnostics_task = tokio::spawn({
+                let state = Arc::clone(&backend.state);
+                let config = Arc::clone(&backend.config);
+                let client = backend.client.clone();
+                let uri = uri.clone();
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    barrier.wait().await;
+                    diagnostics::handle_diagnostics(
+                        state,
+                        &uri,
+                        &diagnostics_config_snapshot,
+                        client,
+                        config,
+                    )
+                    .await
+                }
+            });
+
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                barrier.wait().await;
+                backend
+                    .did_change_configuration(DidChangeConfigurationParams {
+                        settings: serde_json::json!({ "freshness": { "cooldown_secs": 42 } }),
+                    })
+                    .await;
+                tokio::join!(hover_task, diagnostics_task)
+            })
+            .await
+            .expect(
+                "hover/diagnostics must not deadlock against a concurrent \
+                 did_change_configuration write (issue #227 C1)",
+            );
+
+            outcome.0.expect("hover task panicked");
+            outcome.1.expect("diagnostics task panicked");
+            assert_eq!(backend.config.read().await.freshness.cooldown_secs, 42);
+        }
     }
 
     #[cfg(feature = "cargo")]

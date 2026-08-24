@@ -204,6 +204,7 @@ serde = "1.0.0"
                     latest: "2.0.0".to_string(),
                     available: std::sync::Arc::from(vec!["2.0.0".to_string(), "1.0.0".to_string()]),
                     yanked: std::sync::Arc::from(Vec::new()),
+                    published_at: None,
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -244,6 +245,7 @@ serde = "1.0.0"
                     latest: "2.0.0".to_string(),
                     available: std::sync::Arc::from(vec!["2.0.0".to_string(), "1.0.0".to_string()]),
                     yanked: std::sync::Arc::from(Vec::new()),
+                    published_at: None,
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -284,6 +286,7 @@ serde = "1.0.0"
                         "1.0.213".to_string(),
                     ]),
                     yanked: std::sync::Arc::from(Vec::new()),
+                    published_at: None,
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -374,6 +377,7 @@ serde = "1.0.0"
                         "1.0.213".to_string(),
                     ]),
                     yanked: std::sync::Arc::from(Vec::new()),
+                    published_at: None,
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -457,6 +461,7 @@ serde = "1.0.0"
                     latest: "1.0.214".to_string(),
                     available: std::sync::Arc::from(vec!["1.0.214".to_string()]),
                     yanked: std::sync::Arc::from(Vec::new()),
+                    published_at: None,
                 },
             );
             cached.insert(
@@ -469,6 +474,7 @@ serde = "1.0.0"
                     // that latest doesn't itself satisfy look unsatisfiable.
                     available: std::sync::Arc::from(vec!["2.0.0".to_string(), "1.5.0".to_string()]),
                     yanked: std::sync::Arc::from(Vec::new()),
+                    published_at: None,
                 },
             );
             doc_state.update_cached_versions(cached);
@@ -521,6 +527,7 @@ serde = "1.0.0"
                         "1.0.213".to_string(),
                     ]),
                     yanked: std::sync::Arc::from(vec!["1.0.213".to_string()]),
+                    published_at: None,
                 },
             );
             doc_state.update_cached_versions(cached);

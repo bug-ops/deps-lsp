@@ -751,7 +751,7 @@ async fn fetch_latest_versions_parallel(
                         {
                             let latest = v.version_string().to_string();
                             tracing::debug!(package = %name, version = %latest, "fetched");
-                            Some((latest, v.is_yanked()))
+                            Some((latest, v.is_yanked(), v.published_at()))
                         } else {
                             // The pure list-based pick found nothing — for most
                             // ecosystems this genuinely means "no version found", but
@@ -777,7 +777,7 @@ async fn fetch_latest_versions_parallel(
                                         version = %latest,
                                         "fetched via get_latest_matching fallback"
                                     );
-                                    Some((latest, v.is_yanked()))
+                                    Some((latest, v.is_yanked(), v.published_at()))
                                 }
                                 Ok(Ok(None)) => {
                                     tracing::debug!(package = %name, "no version found");
@@ -825,7 +825,7 @@ async fn fetch_latest_versions_parallel(
                             // registry under today's hardcoded wildcard (one
                             // never returns a yanked version for `*`), but
                             // stays correct as a defense-in-depth check.
-                            if let Some((latest, true)) = &resolved {
+                            if let Some((latest, true, _)) = &resolved {
                                 yanked = Some((name.clone(), latest.clone()));
                             }
 
@@ -849,13 +849,14 @@ async fn fetch_latest_versions_parallel(
                             }
                         }
 
-                        resolved.map(|(latest, _)| {
+                        resolved.map(|(latest, _, published_at)| {
                             (
                                 name.clone(),
                                 PackageVersions {
                                     latest,
                                     available,
                                     yanked: yanked_list,
+                                    published_at,
                                 },
                             )
                         })
@@ -1801,9 +1802,15 @@ mod tests {
             "lock-file-populated entries must have an empty available list, got: {:?}",
             serde.available
         );
+        // Issue #227 C3: a locked/pinned version's age is not actionable, so this
+        // instant-display path must never attach a stale `published_at` — there is no
+        // second parallel map here that could drift out of sync with `latest`, since
+        // both live on the same `PackageVersions` entry.
+        assert_eq!(serde.published_at, None);
         let tokio = cached.get(&PackageName::new("tokio")).unwrap();
         assert_eq!(tokio.latest, "1.35.0");
         assert!(tokio.available.is_empty());
+        assert_eq!(tokio.published_at, None);
     }
 
     #[test]
@@ -2360,6 +2367,119 @@ mod tests {
             &*serde.yanked,
             &["1.0.213".to_string()],
             "yanked must carry only the entries reported as yanked"
+        );
+    }
+
+    /// Issue #227 C3: `PackageVersions.published_at` must be the publish time of
+    /// `latest` specifically, not of some other entry in `available` — a risk the old
+    /// two-parallel-map design (a separate `HashMap<String, PublishTime>` alongside the
+    /// version map) could not structurally rule out. Bundling `published_at` onto the
+    /// same struct as `latest`/`available`/`yanked` makes that desync impossible: both
+    /// are set from the same `Box<dyn Version>` in the same match arm.
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_carries_published_at_for_latest_only() {
+        use deps_core::freshness::PublishTime;
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        #[derive(Debug)]
+        struct MockVersion {
+            version: String,
+            yanked: bool,
+            published_at: Option<PublishTime>,
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &str {
+                &self.version
+            }
+            fn is_yanked(&self) -> bool {
+                self.yanked
+            }
+            fn published_at(&self) -> Option<PublishTime> {
+                self.published_at
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct DatedRegistry;
+
+        impl Registry for DatedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![
+                        Box::new(MockVersion {
+                            version: "1.0.214".to_string(),
+                            yanked: false,
+                            published_at: Some(PublishTime::from_unix_secs(2_000)),
+                        }) as Box<dyn Version>,
+                        Box::new(MockVersion {
+                            version: "1.0.213".to_string(),
+                            yanked: true,
+                            // Deliberately a different timestamp — proves the fetch loop
+                            // never accidentally attaches this entry's age to `latest`.
+                            published_at: Some(PublishTime::from_unix_secs(1_000)),
+                        }) as Box<dyn Version>,
+                    ])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{}", name)
+            }
+
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &deps_core::VersionReq,
+            ) -> Option<usize> {
+                versions.iter().position(|v| !v.is_yanked())
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(DatedRegistry);
+        let packages = vec![PackageName::new("serde")];
+
+        let result =
+            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 10, 10).await;
+
+        let serde = result
+            .versions
+            .get("serde")
+            .expect("serde should be fetched");
+        assert_eq!(serde.latest, "1.0.214");
+        assert_eq!(
+            serde.published_at,
+            Some(PublishTime::from_unix_secs(2_000)),
+            "published_at must be 1.0.214's own timestamp, not the yanked 1.0.213 entry's"
         );
     }
 
@@ -3437,6 +3557,7 @@ dependencies = ["requests>=2.0.0"]
                 formatter,
                 deps_core::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
+                deps_core::PublishTime::now(),
             );
 
             (diagnostics, yanked_versions)
