@@ -115,8 +115,18 @@ pub trait Registry: Send + Sync {
 
     /// Finds the latest version matching a version requirement.
     ///
-    /// Only returns stable (non-yanked, non-deprecated) versions unless
-    /// explicitly requested in the version requirement.
+    /// Only returns stable (non-yanked, non-deprecated) versions unless explicitly
+    /// requested in the version requirement, with one documented exception: under a
+    /// wildcard/empty requirement (`"*"`/`""`), an implementation may treat this as an
+    /// *existence* check ("does this package exist / what is its newest version for
+    /// display purposes") rather than an upgrade recommendation, preferring a stable
+    /// version but falling back to a yanked/deprecated one rather than returning `None`
+    /// when no stable version exists — a yanked/deprecated package still exists. `deps-npm`
+    /// implements this fallback (mirrored by
+    /// [`select_latest_matching`](Self::select_latest_matching)'s wildcard branch on the
+    /// same registry, which every caller reaching this trait method through the shared
+    /// fetch loop actually goes through first); the exception never applies to a concrete
+    /// requirement.
     ///
     /// # Arguments
     ///

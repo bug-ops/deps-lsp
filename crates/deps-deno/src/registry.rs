@@ -514,7 +514,11 @@ impl Registry for DenoRegistry {
     ) -> Option<usize> {
         // Name-free and pure `node_semver`: correct for both JSR (which mandates semver)
         // and npm version strings, so npm's implementation covers both without a
-        // downcast.
+        // downcast. This deliberately includes npm's #338 wildcard fallback: an
+        // all-yanked JSR package (like an all-deprecated npm package) resolves to its
+        // newest yanked version rather than `None`/"Unknown package" — not a bug to
+        // "fix" by special-casing JSR here, since the alternative reintroduces #338
+        // for JSR specifically.
         self.npm.select_latest_matching(versions, req)
     }
 
