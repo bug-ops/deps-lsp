@@ -12,6 +12,14 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Exposes `NpmRegistry::with_registry_base` to other workspace crates' own test builds
+# (M7/#312) — `cfg(test)` alone would not apply there, since deps-npm is a normal, non-dev
+# dependency of e.g. deps-deno. Mirrors deps-core's own `test-util` feature (see its
+# Cargo.toml). Only ever enabled from a `[dev-dependencies]` entry, so Cargo's feature
+# unification keeps it out of non-test builds of downstream crates.
+test-util = []
+
 [dependencies]
 dashmap = { workspace = true }
 deps-core = { workspace = true }

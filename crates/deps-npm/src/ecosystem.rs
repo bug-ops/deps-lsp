@@ -31,8 +31,19 @@ pub struct NpmEcosystem {
 impl NpmEcosystem {
     /// Creates a new npm ecosystem with the given HTTP cache.
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
+        Self::with_registry(Arc::new(NpmRegistry::new(cache)))
+    }
+
+    /// Creates a new npm ecosystem around an existing [`NpmRegistry`] instance (#312).
+    ///
+    /// Used by `deps-lsp`'s ecosystem registration to share one `NpmRegistry` — and thus
+    /// one freshness-path publish-time cache — between this ecosystem and `deps-deno`'s
+    /// `DenoEcosystem` (via its `DenoRegistry::with_npm`), instead of each constructing
+    /// its own.
+    #[must_use]
+    pub fn with_registry(registry: Arc<NpmRegistry>) -> Self {
         Self {
-            registry: Arc::new(NpmRegistry::new(cache)),
+            registry,
             formatter: NpmFormatter,
         }
     }

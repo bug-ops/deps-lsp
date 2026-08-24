@@ -1,11 +1,15 @@
 //! Deno import specifier grammar: `scheme:name[@version-req][/subpath]`.
 //!
-//! Two entry points:
+//! Three entry points:
 //! - [`split_scheme`] splits an already-parsed, scheme-qualified [`deps_core::PackageName`]
 //!   (e.g. `"jsr:@std/fs"`, no version/subpath) so a registry facade can dispatch it.
 //! - [`parse_specifier`] runs the full grammar over a raw manifest value
 //!   (`"jsr:@std/fs@1.2/base64"`) to extract the name/version byte ranges the manifest
 //!   parser needs.
+//! - [`partial_name_range`] detects a syntactically incomplete, still-being-typed name
+//!   (`"jsr:"`, `"jsr:@"`, `"jsr:@std"`, `"jsr:@std/"`) that `parse_specifier` correctly
+//!   rejects, so the manifest parser can still surface a completion-eligible `Dependency`
+//!   while the user is mid-keystroke (#310).
 
 use std::ops::Range;
 
@@ -190,6 +194,73 @@ pub fn parse_specifier(value: &str) -> Option<ParsedSpecifier> {
     })
 }
 
+/// Detects a syntactically incomplete, still-being-typed `jsr:`/`npm:` name.
+///
+/// [`parse_specifier`] correctly rejects such values; this returns the byte range (always
+/// `0..value.len()`) that should be treated as the in-progress package name for completion
+/// purposes instead.
+///
+/// This is deliberately a *separate* function rather than a relaxation of
+/// `parse_specifier` itself: `parse_specifier`'s rejections (`"jsr:@std"`, `"jsr:@std/"`,
+/// ...) are load-bearing invariants for every other caller (registry routing, version
+/// compilation) and must not change. `partial_name_range` only distinguishes, among values
+/// `parse_specifier` already rejects, the subset that is *mid-typing toward a valid name*
+/// (nothing after the scheme yet, an unfinished scope, or a scope with no package segment
+/// yet) from the subset that is permanently malformed (an empty scope, e.g. `"jsr:@/pkg"`)
+/// or simply not one of `jsr:`/`npm:` at all — both of which return `None` here exactly as
+/// they do from `parse_specifier`.
+///
+/// Returns `None` if `value` already parses completely (not partial), has no recognized
+/// scheme prefix, or is permanently malformed rather than in-progress.
+///
+/// # Examples
+///
+/// ```
+/// use deps_deno::specifier::partial_name_range;
+///
+/// assert_eq!(partial_name_range("jsr:"), Some(0..4));
+/// assert_eq!(partial_name_range("jsr:@"), Some(0..5));
+/// assert_eq!(partial_name_range("jsr:@std"), Some(0..8));
+/// assert_eq!(partial_name_range("jsr:@std/"), Some(0..9));
+///
+/// // Already complete: not this function's job.
+/// assert_eq!(partial_name_range("jsr:@std/fs"), None);
+/// // Permanently malformed (empty scope), not in-progress.
+/// assert_eq!(partial_name_range("jsr:@/fs"), None);
+/// // No recognized scheme at all.
+/// assert_eq!(partial_name_range("https://example.com"), None);
+/// ```
+#[must_use]
+pub fn partial_name_range(value: &str) -> Option<Range<usize>> {
+    if parse_specifier(value).is_some() {
+        return None;
+    }
+    let (_, rest) = split_scheme(value)?;
+
+    if rest.is_empty() {
+        return Some(0..value.len()); // "jsr:"
+    }
+
+    let after_at = rest.strip_prefix('@')?; // unscoped in-progress names already parse above
+
+    match after_at.find('/') {
+        None => Some(0..value.len()), // "jsr:@" or "jsr:@std" -- scope still being typed
+        Some(slash_rel) => {
+            let scope = &after_at[..slash_rel];
+            if scope.is_empty() {
+                return None; // "jsr:@/pkg" -- permanently malformed, not in-progress
+            }
+            let pkg = &after_at[slash_rel + 1..];
+            let pkg_end_rel = pkg.find(['@', '/']).unwrap_or(pkg.len());
+            if pkg_end_rel == 0 {
+                Some(0..value.len()) // "jsr:@std/" -- package segment still empty
+            } else {
+                None // non-empty pkg: parse_specifier should already have succeeded above
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +392,61 @@ mod tests {
         assert_eq!(split_scoped("@std"), None);
         assert_eq!(split_scoped("@/fs"), None);
         assert_eq!(split_scoped("@std/"), None);
+    }
+
+    // --- #310: partial_name_range ---
+
+    #[test]
+    fn partial_name_range_bare_scheme() {
+        assert_eq!(partial_name_range("jsr:"), Some(0..4));
+        assert_eq!(partial_name_range("npm:"), Some(0..4));
+    }
+
+    #[test]
+    fn partial_name_range_scope_started() {
+        assert_eq!(partial_name_range("jsr:@"), Some(0..5));
+        assert_eq!(partial_name_range("npm:@"), Some(0..5));
+    }
+
+    #[test]
+    fn partial_name_range_scope_in_progress_no_slash() {
+        assert_eq!(partial_name_range("jsr:@std"), Some(0..8));
+        assert_eq!(partial_name_range("npm:@types"), Some(0..10));
+    }
+
+    #[test]
+    fn partial_name_range_scope_complete_pkg_empty() {
+        assert_eq!(partial_name_range("jsr:@std/"), Some(0..9));
+        assert_eq!(partial_name_range("npm:@types/"), Some(0..11));
+    }
+
+    #[test]
+    fn partial_name_range_none_for_already_complete_specifier() {
+        assert_eq!(partial_name_range("jsr:@std/fs"), None);
+        assert_eq!(partial_name_range("npm:react"), None);
+        assert_eq!(partial_name_range("npm:@types/node"), None);
+    }
+
+    #[test]
+    fn partial_name_range_none_for_unrecognized_scheme() {
+        assert_eq!(partial_name_range("https://example.com"), None);
+        assert_eq!(partial_name_range("./relative.ts"), None);
+        assert_eq!(partial_name_range(""), None);
+    }
+
+    #[test]
+    fn partial_name_range_none_for_permanently_malformed_empty_scope() {
+        // "jsr:@/pkg" is not mid-typing toward a valid name -- there is no scope prefix
+        // to search on, unlike the genuine partial states above.
+        assert_eq!(partial_name_range("jsr:@/pkg"), None);
+        assert_eq!(partial_name_range("jsr:@/"), None);
+    }
+
+    #[test]
+    fn partial_name_range_scope_in_progress_with_version_prefix_not_confused() {
+        // A version requirement typed before the scope is finished must not be mistaken
+        // for a completed package name -- `@` immediately after the scope segment (no
+        // '/pkg' yet) still counts as "scope in progress", matching the no-slash case.
+        assert_eq!(partial_name_range("jsr:@std@1"), Some(0..10));
     }
 }

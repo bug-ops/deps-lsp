@@ -15,6 +15,7 @@ use deps_core::{
 
 use crate::formatter::DenoFormatter;
 use crate::registry::DenoRegistry;
+use deps_npm::NpmRegistry;
 
 /// Deno ecosystem implementation.
 ///
@@ -40,10 +41,26 @@ impl DenoEcosystem {
     /// does not extend to npm's separate freshness-path packument fetch, which bypasses
     /// `HttpCache` and is memoized per `NpmRegistry` instance — see
     /// [`DenoRegistry::new`](crate::registry::DenoRegistry::new)'s docs for the full
-    /// caveat (N4).
+    /// caveat (N4). Use [`Self::with_npm`] to avoid it.
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
         Self {
             registry: Arc::new(DenoRegistry::new(cache)),
+            formatter: DenoFormatter,
+        }
+    }
+
+    /// Creates a new Deno ecosystem sharing an existing [`NpmRegistry`] instance for its
+    /// `npm:`-scheme half, instead of building a private one (N4/#312).
+    ///
+    /// `deps-lsp`'s ecosystem registration uses this when both the `npm` and `deno`
+    /// features are enabled, so a package appearing in both `package.json` and
+    /// `deno.json` shares one freshness-path publish-time cache. See
+    /// [`DenoRegistry::with_npm`](crate::registry::DenoRegistry::with_npm) for what this
+    /// dedupes.
+    #[must_use]
+    pub fn with_npm(cache: Arc<deps_core::HttpCache>, npm: NpmRegistry) -> Self {
+        Self {
+            registry: Arc::new(DenoRegistry::with_npm(cache, npm)),
             formatter: DenoFormatter,
         }
     }

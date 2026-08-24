@@ -144,10 +144,26 @@ pub struct NpmRegistry {
 impl NpmRegistry {
     /// Creates a new npm registry client with the given HTTP cache.
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        Self::with_registry_base(cache, REGISTRY_BASE.to_string())
+        Self::build(cache, REGISTRY_BASE.to_string())
     }
 
-    fn with_registry_base(cache: Arc<HttpCache>, registry_base: String) -> Self {
+    /// Creates a new npm registry client pointed at a custom registry base URL, for
+    /// pointing at a mockito server in tests.
+    ///
+    /// `pub` but gated behind `cfg(test)`/the `test-util` feature (M7/#312) rather than
+    /// unconditionally public API: it exists purely so other workspace crates' own test
+    /// builds can construct a mockable [`NpmRegistry`] (`cfg(test)` alone would not apply
+    /// there, since deps-npm is a normal, non-dev dependency for e.g. `deps-deno`) —
+    /// enabled via `deps-npm = { workspace = true, features = ["test-util"] }` under
+    /// `[dev-dependencies]`, mirroring `deps-core`'s own `test-util` feature. Never
+    /// reachable from a non-test build of a downstream crate.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_registry_base(cache: Arc<HttpCache>, registry_base: String) -> Self {
+        Self::build(cache, registry_base)
+    }
+
+    fn build(cache: Arc<HttpCache>, registry_base: String) -> Self {
         Self {
             cache,
             registry_base,
@@ -1409,6 +1425,55 @@ mod tests {
             .find(|v| v.version_string() == "1.0.0")
             .unwrap();
         assert!(outside_top8.published_at().is_some());
+
+        abbrev_mock.assert_async().await;
+        full_mock.assert_async().await;
+    }
+
+    // --- #312: NpmRegistry::clone shares the publish_times cache and HttpCache, the
+    // mechanism DenoRegistry::with_npm relies on to dedupe the freshness-path
+    // full-packument fetch for a package appearing in both package.json and deno.json ---
+
+    #[tokio::test]
+    async fn test_clone_shares_publish_times_cache_avoiding_duplicate_full_packument_fetch() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+        let shared = registry.clone();
+
+        let abbrev_mock = server
+            .mock("GET", "/widget")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let full_mock = server
+            .mock("GET", "/widget")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_body(r#"{"time": {"1.0.0": "2020-01-01T00:00:00Z"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        use deps_core::{FreshnessSettings, PackageName, Registry};
+
+        let first = registry
+            .get_versions_with(&PackageName::new("widget"), FreshnessSettings::default())
+            .await
+            .unwrap();
+        assert!(first[0].published_at().is_some());
+
+        // A clone — standing in for a second ecosystem instance (e.g. DenoRegistry::npm)
+        // sharing this NpmRegistry — must reuse the cached publish-time map rather than
+        // refetching the full packument.
+        let second = shared
+            .get_versions_with(&PackageName::new("widget"), FreshnessSettings::default())
+            .await
+            .unwrap();
+        assert!(second[0].published_at().is_some());
 
         abbrev_mock.assert_async().await;
         full_mock.assert_async().await;
