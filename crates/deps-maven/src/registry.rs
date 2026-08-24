@@ -284,7 +284,7 @@ impl MavenCentralRegistry {
         &self,
         name: &str,
     ) -> Result<(Vec<MavenVersion>, Option<String>, Option<String>)> {
-        let urls = metadata_urls(name);
+        let urls = metadata_urls(name)?;
         if urls.is_empty() {
             tracing::debug!(package = %name, "skipping: invalid groupId:artifactId format");
             return Ok((vec![], None, None));
@@ -553,15 +553,20 @@ where
 /// Non-Google packages get two URLs: Maven Central (primary) and Gradle Plugin Portal (fallback).
 /// Google-hosted packages get only the Google Maven URL — they are not mirrored elsewhere.
 ///
-/// Returns an empty list (treated by [`MavenCentralRegistry::get_metadata`] the same as a
-/// malformed `groupId:artifactId` pair, i.e. no versions found) when either coordinate
-/// segment fails [`is_safe_maven_coordinate_segment`] — a `groupId`/`artifactId` containing
-/// `../` (or other path-breakout characters) must never reach the `.`→`/` replace and URL
-/// construction below, since `group_path`/`artifact_id` are interpolated into the request
-/// URL unescaped (#349).
-fn metadata_urls(name: &str) -> Vec<String> {
+/// Returns `Ok(vec![])` (treated by [`MavenCentralRegistry::get_metadata`] as "no versions
+/// found") only for a malformed `groupId:artifactId` pair with no `:` separator.
+///
+/// Returns `Err(DepsError::PackageNotFound)` — mirroring `deps-dart`'s `reject_dot_segment`
+/// (#349) — when either coordinate segment fails [`is_safe_maven_coordinate_segment`]: a
+/// `groupId`/`artifactId` containing `../` (or other path-breakout characters) must never
+/// reach the `.`→`/` replace and URL construction below, since `group_path`/`artifact_id`
+/// are interpolated into the request URL unescaped. Propagating this as an error (rather
+/// than folding it into the empty-URL-list case) keeps it distinguishable from a genuine
+/// 404, so hover correctly renders nothing for a rejected coordinate instead of a broken
+/// "package not found" section (#366).
+fn metadata_urls(name: &str) -> Result<Vec<String>> {
     let Some((group_id, artifact_id)) = name.split_once(':') else {
-        return vec![];
+        return Ok(vec![]);
     };
     if !is_safe_maven_coordinate_segment(group_id) {
         warn_rejected_value(
@@ -569,7 +574,10 @@ fn metadata_urls(name: &str) -> Vec<String> {
             "maven metadata URL groupId",
             group_id,
         );
-        return vec![];
+        return Err(DepsError::PackageNotFound {
+            package: name.to_string(),
+            registry: REGISTRY,
+        });
     }
     if !is_safe_maven_coordinate_segment(artifact_id) {
         warn_rejected_value(
@@ -577,20 +585,23 @@ fn metadata_urls(name: &str) -> Vec<String> {
             "maven metadata URL artifactId",
             artifact_id,
         );
-        return vec![];
+        return Err(DepsError::PackageNotFound {
+            package: name.to_string(),
+            registry: REGISTRY,
+        });
     }
     let group_path = group_id.replace('.', "/");
     let primary_base = repo_base_for_group(group_id);
     let primary = format!("{primary_base}/{group_path}/{artifact_id}/maven-metadata.xml");
 
-    if is_google_group(group_id) {
+    Ok(if is_google_group(group_id) {
         vec![primary]
     } else {
         vec![
             primary,
             format!("{GRADLE_PLUGIN_PORTAL_BASE}/{group_path}/{artifact_id}/maven-metadata.xml"),
         ]
-    }
+    })
 }
 
 /// Parses maven-metadata.xml to extract version list and the authoritative release version.
@@ -1003,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_metadata_urls_central_has_two_urls() {
-        let urls = metadata_urls("org.apache.commons:commons-lang3");
+        let urls = metadata_urls("org.apache.commons:commons-lang3").unwrap();
         assert_eq!(urls.len(), 2);
         assert_eq!(
             urls[0],
@@ -1017,14 +1028,14 @@ mod tests {
 
     #[test]
     fn test_metadata_urls_google_has_one_url() {
-        let urls = metadata_urls("androidx.core:core-ktx");
+        let urls = metadata_urls("androidx.core:core-ktx").unwrap();
         assert_eq!(urls.len(), 1);
         assert_eq!(
             urls[0],
             "https://dl.google.com/dl/android/maven2/androidx/core/core-ktx/maven-metadata.xml"
         );
 
-        let urls = metadata_urls("com.google.firebase.crashlytics:firebase-crashlytics");
+        let urls = metadata_urls("com.google.firebase.crashlytics:firebase-crashlytics").unwrap();
         assert_eq!(urls.len(), 1);
         assert_eq!(
             urls[0],
@@ -1034,7 +1045,22 @@ mod tests {
 
     #[test]
     fn test_metadata_urls_no_colon() {
-        assert!(metadata_urls("bad").is_empty());
+        assert!(metadata_urls("bad").unwrap().is_empty());
+    }
+
+    /// #366: a rejected coordinate must surface specifically as `PackageNotFound`, not
+    /// merely *some* error — `DepsError::is_not_found()` (checked by
+    /// `deps-lsp/src/document/lifecycle.rs`) is what keeps the diagnostic classified as
+    /// "Unknown package" rather than "Registry lookup failed", and is also what makes
+    /// `generate_hover`'s `.ok()?` chain return `None` the same way it already does for a
+    /// genuine 404.
+    fn assert_rejected_as_not_found(result: Result<Vec<String>>) {
+        let err = result.expect_err("rejected coordinate must be Err");
+        assert!(
+            matches!(err, DepsError::PackageNotFound { .. }),
+            "expected PackageNotFound, got {err:?}"
+        );
+        assert!(err.is_not_found());
     }
 
     /// #349: `com.example:../../../admin` (confirmed live) must not escape the `maven2`
@@ -1043,15 +1069,19 @@ mod tests {
     /// escape/percent-encode it, so the correct regression assertion is that *no* metadata
     /// URL is built at all — there is structurally nothing left for a
     /// `url::Url::parse` check to validate once the request itself is suppressed.
+    ///
+    /// #366: the rejection is a distinct error (`PackageNotFound`), not the same empty-list
+    /// case as a malformed `groupId:artifactId` pair — this is what lets hover distinguish
+    /// "not found" from a security-gated coordinate and return `None` for both.
     #[test]
     fn test_metadata_urls_rejects_path_traversal_artifact_id() {
-        assert!(metadata_urls("com.example:../../../admin").is_empty());
+        assert_rejected_as_not_found(metadata_urls("com.example:../../../admin"));
     }
 
     /// #349: same guard, but the traversal sits in the groupId segment instead.
     #[test]
     fn test_metadata_urls_rejects_path_traversal_group_id() {
-        assert!(metadata_urls("../../../admin:artifact").is_empty());
+        assert_rejected_as_not_found(metadata_urls("../../../admin:artifact"));
     }
 
     /// M1 (impl-critic): a literal `..` artifactId is made only of otherwise-allowed
@@ -1063,15 +1093,15 @@ mod tests {
     /// be rejected outright like any other dot-segment gate in this PR.
     #[test]
     fn test_metadata_urls_rejects_literal_dot_dot_artifact_id() {
-        assert!(metadata_urls("com.example:..").is_empty());
-        assert!(metadata_urls("a:..").is_empty());
+        assert_rejected_as_not_found(metadata_urls("com.example:.."));
+        assert_rejected_as_not_found(metadata_urls("a:.."));
     }
 
     /// M1: same guard for a literal `.` artifactId/groupId.
     #[test]
     fn test_metadata_urls_rejects_literal_dot_segment() {
-        assert!(metadata_urls("com.example:.").is_empty());
-        assert!(metadata_urls(".:artifact").is_empty());
+        assert_rejected_as_not_found(metadata_urls("com.example:."));
+        assert_rejected_as_not_found(metadata_urls(".:artifact"));
     }
 
     /// #349: a legitimate coordinate must still resolve to a URL confined to the
@@ -1081,7 +1111,7 @@ mod tests {
     /// tests would still be caught here.
     #[test]
     fn test_metadata_urls_parsed_url_stays_within_maven2_prefix() {
-        let urls = metadata_urls("org.apache.commons:commons-lang3");
+        let urls = metadata_urls("org.apache.commons:commons-lang3").unwrap();
         let parsed = url::Url::parse(&urls[0]).unwrap();
         let segments: Vec<&str> = parsed.path_segments().unwrap().collect();
         assert_eq!(
@@ -2163,6 +2193,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// #366: unlike the malformed-pair case above, a coordinate rejected by
+    /// `is_safe_maven_coordinate_segment` must surface as `Err`, not `Ok(vec![])` — this is
+    /// what lets hover (`registry.get_versions_with(...).ok()?`) return `None` for a
+    /// rejected coordinate instead of a broken "package not found" hover section.
+    #[tokio::test]
+    async fn test_get_versions_typed_dot_segment_artifact_id_returns_err() {
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry
+            .get_versions_typed("com.example:..")
+            .await
+            .expect_err("dot-segment artifactId must be rejected");
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert!(err.is_not_found());
     }
 
     // --- NFR-006 live verification (real network, run explicitly with `--ignored`) ---

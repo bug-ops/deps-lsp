@@ -1701,4 +1701,32 @@ mod tests {
         assert!(content.value.contains("+2 more advisories"));
         assert!(content.value.contains("also affected"));
     }
+
+    /// #366: a registry error classified as `PackageNotFound` (e.g. `deps-maven`'s
+    /// `metadata_urls` rejecting a dot-segment coordinate like `com.example:..`, mirrored
+    /// here by [`NotFoundRegistry`]) must make hover return `None` via this function's own
+    /// `get_versions_with(...).await.ok()?` chain, exactly like it already does for a
+    /// genuine 404 — not a broken hover section built from an empty version list.
+    #[tokio::test]
+    async fn test_generate_hover_none_when_registry_reports_not_found() {
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("com.example:..")],
+            uri: crate::test_util::test_uri("/test/pom.xml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &NotFoundRegistry,
+            &MockFormatter,
+            crate::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await;
+
+        assert!(hover.is_none());
+    }
 }
