@@ -41,9 +41,14 @@ enum MavenNameField {
 /// document if used as-is.
 ///
 /// Returns `None` when the requested field's value doesn't pass
-/// [`is_safe_maven_coordinate_segment`] — a malicious/compromised search result must not
+/// [`is_safe_maven_coordinate_segment`], or when the base builder itself rejects the
+/// combined `groupId:artifactId` name — a malicious/compromised search result must not
 /// reach the manifest as an unsanitized `TextEdit`, so the item is dropped rather than
-/// built with unsafe text.
+/// built with unsafe text. A known, benign edge case: two maximal-length segments
+/// (128 bytes each, [`is_safe_maven_coordinate_segment`]'s own cap) joined by `:` is
+/// 257 bytes, one over [`deps_core::is_safe_package_name`]'s 256-byte cap — an
+/// implausibly long but fully legitimate coordinate would be dropped here too,
+/// failing closed rather than insecurely.
 fn build_field_completion(
     artifact: &ArtifactInfo,
     field: MavenNameField,
@@ -58,7 +63,7 @@ fn build_field_completion(
         return None;
     }
 
-    let mut item = deps_core::completion::build_package_completion(artifact, LspRange::default());
+    let mut item = deps_core::completion::build_package_completion(artifact, LspRange::default())?;
 
     item.insert_text = Some(value.clone());
     item.filter_text = Some(value.clone());
@@ -675,6 +680,29 @@ mod tests {
         artifact.group_id = "org.apache\ncommons".to_string();
         let range = test_range();
 
+        assert!(build_field_completion(&artifact, MavenNameField::GroupId, range).is_none());
+    }
+
+    #[test]
+    fn test_build_field_completion_rejects_when_base_builder_rejects_name() {
+        // `build_field_completion` only validates the *requested* field via
+        // `is_safe_maven_coordinate_segment` — the other half of the coordinate is
+        // left unvalidated by that check alone. Here `group_id` (the requested
+        // field) is safe on its own, but `artifact_id` contains a space, which is
+        // outside `is_safe_package_name`'s allowlist (though it would also fail
+        // `is_safe_maven_coordinate_segment`, that check never runs against the
+        // non-requested field). Realistically the registry always sets `name` to
+        // the joined `group_id:artifact_id` (see `crates/deps-maven/src/registry.rs`),
+        // so the base builder's `is_safe_package_name` gate on the combined name is
+        // what closes this — and that rejection must propagate through
+        // `build_field_completion`'s `?`, poisoning `label` otherwise (never
+        // overridden by this function).
+        let mut artifact = test_artifact();
+        artifact.artifact_id = "commons lang3".to_string();
+        artifact.name = format!("{}:{}", artifact.group_id, artifact.artifact_id).into();
+        let range = test_range();
+
+        assert!(is_safe_maven_coordinate_segment(&artifact.group_id));
         assert!(build_field_completion(&artifact, MavenNameField::GroupId, range).is_none());
     }
 
