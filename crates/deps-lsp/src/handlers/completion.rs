@@ -922,9 +922,6 @@ mod tests {
             {
                 Box::pin(async move { Ok(vec![]) })
             }
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
-            }
             fn as_any(&self) -> &dyn Any {
                 self
             }
