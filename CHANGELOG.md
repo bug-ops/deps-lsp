@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: `Version::is_yanked() -> bool` replaced by `Version::removal_status() -> RemovalStatus` (`Available`/`AdvisoryDeprecated`/`Yanked`) (resolves #348) (#363)
 
 ### Fixed
+- **docs**: documented each editor's own toggle for inlay hints, code lens, and inline diagnostics (all off by default in Zed and Neovim, code lens unsupported in Helix), since `deps-lsp`'s `initialization_options` alone don't make these features visible
 - **deps-maven, deps-cargo, deps-gradle**: `MavenFormatter`/`CargoFormatter`/`GradleFormatter` now override `validate_package_name`, surfacing "Invalid package name" instead of "Unknown package" for a structurally invalid coordinate/name (resolves #369, #382, #375) (#374, #387)
 - **deps-cargo, deps-go, deps-nuget, deps-composer, deps-swift, deps-deno, deps-core**: closed remaining gaps in the dot-segment/unvalidated-URL-sink regression sweep — non-ASCII/empty-name panics, missing per-character name encoding, unvalidated `.`/`..` identifiers reaching a registry-fetch URL builder, and silent (non-warning) rejection paths across package/version/URL builders (resolves #357, #361, #371, #376, #377, #378, #379, #380) (#374, #384, #386)
 - **deps-core**: closed the DashMap `Ref`-held-across-await family of liveness hazards across hover/completion/code_actions, inlay hints, config reload, and `LockFileCache` (resolves #317, #319, #333, #334, #350) (#318, #325, #354, #358)

@@ -130,21 +130,29 @@ deps-lsp --stdio
 ## Editor setup
 
 > [!IMPORTANT]
-> Inlay hints must be enabled in your editor to see version indicators. See configuration for each editor below.
+> Inlay hints, code lens, and (in some editors) inline diagnostics are off by default at the *editor* level, independent of `deps-lsp`'s own [`initialization_options`](#configuration). The server always advertises support for all three — each section below covers the editor-side toggle needed to actually see them.
 
 ### Zed
 
 Install the **Deps** extension from Zed Extensions marketplace. Ruby support is enabled for Gemfile files.
 
-Enable inlay hints in Zed settings:
+Enable inlay hints, code lens, and (optionally) inline diagnostics in Zed settings:
 
 ```json
 {
   "inlay_hints": {
     "enabled": true
+  },
+  "code_lens": "on",
+  "diagnostics": {
+    "inline": {
+      "enabled": true
+    }
   }
 }
 ```
+
+`code_lens` accepts `"on"`, `"off"` (default), or `"menu"`, and is required for the "Update N outdated dependencies" lens to appear. `diagnostics.inline` is optional — diagnostics already show in the gutter and Problems panel without it; this additionally renders `deps-lsp`'s short one-line messages inline next to each dependency.
 
 ### Neovim
 
@@ -159,6 +167,28 @@ vim.lsp.inlay_hint.enable(true)
 ```
 
 For older Neovim versions, use [nvim-lsp-inlayhints](https://github.com/lvimuser/lsp-inlayhints.nvim).
+
+**Code lens** is not refreshed or rendered automatically by Neovim's built-in client — wire it up via an `LspAttach` autocommand:
+
+```lua
+vim.api.nvim_create_autocmd("LspAttach", {
+  callback = function(args)
+    local client = vim.lsp.get_client_by_id(args.data.client_id)
+    if client and client:supports_method("textDocument/codeLens") then
+      vim.lsp.codelens.refresh({ bufnr = args.buf })
+      vim.api.nvim_create_autocmd({ "BufEnter", "CursorHold", "InsertLeave" }, {
+        buffer = args.buf,
+        callback = function() vim.lsp.codelens.refresh({ bufnr = args.buf }) end,
+      })
+    end
+  end,
+})
+
+vim.keymap.set("n", "<leader>cl", vim.lsp.codelens.run, { desc = "Run code lens" })
+```
+
+> [!WARNING]
+> Neovim 0.11 changed diagnostic virtual text (inline diagnostics) from opt-out to opt-in. On 0.11+, run `vim.diagnostic.config({ virtual_text = true })` if `deps-lsp`'s warnings aren't appearing inline — on 0.10 and earlier this was already the default.
 
 ### Helix
 
@@ -185,6 +215,11 @@ Enable inlay hints in Helix config:
 display-inlay-hints = true
 ```
 
+Diagnostics render inline by default with no configuration needed.
+
+> [!NOTE]
+> Helix does not implement `textDocument/codeLens` — the "Update N outdated dependencies" batch action is unavailable there; use the per-dependency code action (`Cmd+.`/`Ctrl+.` equivalent) instead.
+
 ### VS Code
 
 Install an LSP client extension and configure deps-lsp. Enable inlay hints:
@@ -194,6 +229,8 @@ Install an LSP client extension and configure deps-lsp. Enable inlay hints:
   "editor.inlayHints.enabled": "on"
 }
 ```
+
+`editor.codeLens` is `true` by default in VS Code itself, so `deps-lsp`'s code lens should appear automatically — provided your chosen generic LSP client extension forwards the `codeLens` capability (most do; check its documentation if the lens doesn't show up). Diagnostics render as squiggles plus entries in the Problems panel by default; for an always-visible inline message next to each dependency, install the third-party [Error Lens](https://marketplace.visualstudio.com/items?itemName=usernamehw.errorlens) extension.
 
 ## Configuration
 
