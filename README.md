@@ -17,10 +17,11 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Version hints** — Inlay hints showing latest available versions
 - **Loading indicators** — Visual feedback during registry fetches with LSP progress support
 - **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved, composer.lock
-- **Diagnostics** — Warnings for outdated, unknown, or yanked dependencies
+- **Diagnostics** — Warnings for outdated, unknown, yanked, or unsatisfiable-requirement dependencies
 - **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
+- **Release-freshness signal** — Flags a "latest" version still within a cooldown window in hover and completion, mirroring GitHub Dependabot's default 3-day package cooldown
 - **Hover information** — Package descriptions with resolved version from lock file
-- **Code actions** — Quick fixes to update dependencies
+- **Code actions** — Quick fixes to update dependencies, resolve unsatisfiable version requirements, and upgrade to a patched version for known vulnerabilities
 - **Code lens** — "Update N outdated dependencies" batch update on every open manifest
 - **High performance** — Parallel fetching with per-dependency timeouts, optimized caching
 
@@ -30,6 +31,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | ---------- | ----------- | --------------- | -------- |
 | Rust | Cargo | `Cargo.toml` | Supported |
 | JavaScript | npm | `package.json` | Supported |
+| JavaScript/TypeScript | Deno (JSR/npm) | `deno.json`, `deno.jsonc` | Supported |
 | Python | PyPI | `pyproject.toml`, `requirements.txt`, `constraints.txt` | Supported |
 | Go | Go Modules | `go.mod` | Supported |
 | Ruby | Bundler | `Gemfile` | Supported |
@@ -39,7 +41,6 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | Swift | SPM | `Package.swift` | Supported |
 | PHP | Composer | `composer.json` | Supported |
 | C# | NuGet | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | Supported |
-| Deno | JSR/npm | `deno.json`, `deno.jsonc` | Supported |
 
 > [!NOTE]
 > **Ecosystem details:**
@@ -104,6 +105,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | --------- | ---------- | ----------- | ------- |
 | `cargo` | Rust | Cargo.toml | Yes |
 | `npm` | JavaScript | package.json | Yes |
+| `deno` | JavaScript/TypeScript (Deno) | deno.json, deno.jsonc | Yes |
 | `pypi` | Python | pyproject.toml, requirements.txt, constraints.txt | Yes |
 | `go` | Go | go.mod | Yes |
 | `bundler` | Ruby | Gemfile | Yes |
@@ -113,7 +115,6 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `swift` | Swift | Package.swift | Yes |
 | `composer` | PHP | composer.json | Yes |
 | `nuget` | C# | .csproj, Directory.Packages.props, packages.config | Yes |
-| `deno` | Deno (JSR/npm) | deno.json, deno.jsonc | Yes |
 
 ## Usage
 
@@ -212,6 +213,10 @@ Configure via LSP initialization options:
     "unsatisfiable_severity": "warning",
     "vulnerabilities_enabled": true
   },
+  "freshness": {
+    "enabled": true,
+    "cooldown_secs": 259200
+  },
   "cache": {
     "enabled": true,
     "refresh_interval_secs": 300,
@@ -246,6 +251,11 @@ Configure via LSP initialization options:
 | `loading_indicator` | `fallback_to_hints` | `true` | Show loading in inlay hints if LSP progress unsupported |
 | `loading_indicator` | `loading_text` | `"..."` | Text shown during loading (max 100 chars) |
 | `code_lens` | `enabled` | `true` | Show the "Update N outdated dependencies" code lens |
+| `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
+| `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
+
+> [!NOTE]
+> The release-freshness signal applies uniformly across all ecosystems — there is no per-ecosystem override. Coverage depth varies with what each registry exposes (e.g. Deno's `jsr:` specifiers get full coverage at no extra request cost; Swift and Maven/Gradle have partial coverage since their APIs don't expose per-version publish dates directly). See [Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#mavengradle-release-freshness-coverage) for per-ecosystem details.
 
 > [!TIP]
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.

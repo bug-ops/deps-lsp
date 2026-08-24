@@ -7,7 +7,7 @@
 //! `quick-xml`'s `Attribute` exposes no span API. This module uses the borrowed-slice
 //! offset instead of a text scan: `Reader::from_str(content)` + `reader.read_event()`
 //! (mirroring `deps-maven`'s reader setup exactly, `crates/deps-maven/src/parser.rs:51,62`)
-//! yields `Event<'a>` borrowed from `content` itself, so an attribute's raw `Cow<'a, [u8]>`
+//! yields `Event<'a>` borrowed from `content` itself, so an attribute's raw `Cow<'a, str>`
 //! value is `Cow::Borrowed` pointing directly into `content`'s bytes. The byte offset is then
 //! simple pointer arithmetic:
 //!
@@ -67,7 +67,7 @@ pub fn parse_packages_config(content: &str, doc_uri: &Uri) -> Result<NuGetParseR
         })?;
 
         match event {
-            Event::Empty(ref e) | Event::Start(ref e) if e.local_name().as_ref() == b"package" => {
+            Event::Empty(ref e) | Event::Start(ref e) if e.local_name().as_ref() == "package" => {
                 if let Some(dep) = parse_package_element(content, &line_table, e) {
                     dependencies.push(dep);
                 }
@@ -95,11 +95,11 @@ fn parse_package_element(
 
     for attr in e.attributes().flatten() {
         match attr.key.local_name().as_ref() {
-            b"id" => {
+            "id" => {
                 name_span = attribute_byte_range(content, &attr.value);
                 name = Some(decode_attr_value(&attr.value));
             }
-            b"version" => {
+            "version" => {
                 version_span = attribute_byte_range(content, &attr.value);
                 version = Some(decode_attr_value(&attr.value));
             }
@@ -160,7 +160,7 @@ fn parse_reference_elements(
 
         match event {
             Event::Empty(ref e) => {
-                if e.local_name().as_ref() == tag_name.as_bytes()
+                if e.local_name().as_ref() == tag_name
                     && let Some(dep) =
                         finalize_dep(content, &line_table, accum_from_attrs(content, e))
                 {
@@ -168,9 +168,9 @@ fn parse_reference_elements(
                 }
             }
             Event::Start(ref e) => {
-                if e.local_name().as_ref() == tag_name.as_bytes() {
+                if e.local_name().as_ref() == tag_name {
                     current = Some(accum_from_attrs(content, e));
-                } else if current.is_some() && e.local_name().as_ref() == b"Version" {
+                } else if current.is_some() && e.local_name().as_ref() == "Version" {
                     in_version_child = true;
                 }
             }
@@ -183,9 +183,9 @@ fn parse_reference_elements(
             }
             Event::End(ref e) => {
                 let local = e.local_name();
-                if local.as_ref() == b"Version" && in_version_child {
+                if local.as_ref() == "Version" && in_version_child {
                     in_version_child = false;
-                } else if local.as_ref() == tag_name.as_bytes()
+                } else if local.as_ref() == tag_name
                     && let Some(accum) = current.take()
                     && let Some(dep) = finalize_dep(content, &line_table, accum)
                 {
@@ -207,11 +207,11 @@ fn accum_from_attrs(content: &str, e: &BytesStart<'_>) -> DepAccum {
     let mut accum = DepAccum::default();
     for attr in e.attributes().flatten() {
         match attr.key.local_name().as_ref() {
-            b"Include" => {
+            "Include" => {
                 accum.name_span = attribute_byte_range(content, &attr.value);
                 accum.name = Some(decode_attr_value(&attr.value));
             }
-            b"Version" => {
+            "Version" => {
                 accum.version_span = attribute_byte_range(content, &attr.value);
                 accum.version = Some(decode_attr_value(&attr.value));
             }
@@ -267,7 +267,7 @@ fn resolve_version_field(
 /// builds have no overflow checks, so an unchecked subtraction would wrap silently into a
 /// garbage offset instead of failing loudly — falling back to an empty `(0, 0)` range is
 /// safe (worst case, a wrong/empty LSP range) where a wrapped `usize` is not.
-fn attribute_byte_range(content: &str, raw: &[u8]) -> (usize, usize) {
+fn attribute_byte_range(content: &str, raw: &str) -> (usize, usize) {
     let Some(offset) = (raw.as_ptr() as usize).checked_sub(content.as_ptr() as usize) else {
         return (0, 0);
     };
@@ -281,24 +281,17 @@ fn span_to_range(content: &str, line_table: &LineOffsetTable, span: (usize, usiz
     )
 }
 
-fn decode_attr_value(raw: &[u8]) -> String {
-    std::str::from_utf8(raw)
-        .ok()
-        .and_then(|s| quick_xml::escape::unescape(s).ok())
+fn decode_attr_value(raw: &str) -> String {
+    quick_xml::escape::unescape(raw)
         .map(|c| c.into_owned())
-        .unwrap_or_else(|| String::from_utf8_lossy(raw).into_owned())
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 fn decode_text(e: &BytesText<'_>) -> String {
-    match e.decode() {
-        Ok(cow) => {
-            let s = cow.trim().to_string();
-            quick_xml::escape::unescape(&s)
-                .map(|c| c.into_owned())
-                .unwrap_or(s)
-        }
-        Err(_) => String::from_utf8_lossy(e.as_ref()).trim().to_string(),
-    }
+    let s = e.trim().to_string();
+    quick_xml::escape::unescape(&s)
+        .map(|c| c.into_owned())
+        .unwrap_or(s)
 }
 
 #[cfg(test)]
@@ -460,9 +453,9 @@ mod tests {
         };
         let mut checked = false;
         for attr in e.attributes().flatten() {
-            if attr.key.local_name().as_ref() == b"Version" {
+            if attr.key.local_name().as_ref() == "Version" {
                 let (start, end) = attribute_byte_range(xml, &attr.value);
-                assert_eq!(&xml.as_bytes()[start..end], attr.value.as_ref());
+                assert_eq!(&xml[start..end], attr.value.as_ref());
                 assert_eq!(&xml[start..end], "1.2.3");
                 checked = true;
             }
@@ -481,7 +474,7 @@ mod tests {
         // of wrapping.
         let buffer = "0123456789";
         let content = &buffer[5..];
-        let raw = &buffer.as_bytes()[0..3];
+        let raw = &buffer[0..3];
         assert_eq!(attribute_byte_range(content, raw), (0, 0));
     }
 

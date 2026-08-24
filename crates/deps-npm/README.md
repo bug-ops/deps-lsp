@@ -17,12 +17,13 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **npm registry** — Client for npm registry API with metadata caching
 - **Node semver resolution** — Full `^`, `~`, `>=`, `<`, range, and tag specifier support
 - **Scoped packages** — Support for `@scope/package` format
+- **Release-freshness signal** — Per-version ages in hover/completion, derived from a separately fetched, TTL'd full packument (the abbreviated packument used for the version list carries no publish dates)
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-npm = "0.10"
+deps-npm = "0.11"
 ```
 
 > [!IMPORTANT]

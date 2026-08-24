@@ -22,7 +22,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-deno = "0.10"
+deps-deno = "0.11"
 ```
 
 > [!IMPORTANT]

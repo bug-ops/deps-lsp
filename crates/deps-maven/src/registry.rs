@@ -635,23 +635,19 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.name().as_ref() {
-                b"versions" => in_versions = true,
-                b"version" if in_versions => in_version = true,
-                b"release" if !in_versions => in_release = true,
+                "versions" => in_versions = true,
+                "version" if in_versions => in_version = true,
+                "release" if !in_versions => in_release = true,
                 _ => {}
             },
             Ok(Event::End(e)) => match e.name().as_ref() {
-                b"versions" => in_versions = false,
-                b"version" => in_version = false,
-                b"release" => in_release = false,
+                "versions" => in_versions = false,
+                "version" => in_version = false,
+                "release" => in_release = false,
                 _ => {}
             },
             Ok(Event::Text(e)) => {
-                let Ok(decoded) = e.decode() else {
-                    buf.clear();
-                    continue;
-                };
-                let text = quick_xml::escape::unescape(&decoded).unwrap_or_default();
+                let text = quick_xml::escape::unescape(&e).unwrap_or_default();
                 let s = text.trim().to_string();
                 if s.is_empty() {
                     buf.clear();

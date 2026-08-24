@@ -17,6 +17,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Version comparison** — 4-component NuGet versioning (`Major.Minor.Patch.Revision`), structural prerelease detection, interval range notation (`[1.0,2.0)`), and floating versions (`1.1.*`)
 - **Central Package Management** — `Directory.Packages.props`-managed dependencies parse with no inline version, so hover/completion on the package name still work
 - **Lock file support** — `packages.lock.json`, merged across target framework monikers
+- **Release-freshness signal** — Per-version ages in hover/completion from the V3 registration hive, covering the newest ~8 versions of a package (see `ECOSYSTEM_GUIDE.md`)
 
 > [!IMPORTANT]
 > Requires Rust 1.91 or later.
@@ -25,7 +26,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-nuget = "0.10"
+deps-nuget = "0.11"
 ```
 
 ## Usage

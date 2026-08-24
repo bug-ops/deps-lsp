@@ -18,12 +18,13 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Version comparison** — Maven version qualifier support (`alpha`, `beta`, `RC`, `SNAPSHOT`, `GA`)
 - **Property resolution** — Resolve `${property}` placeholders defined in `<properties>`
 - **Scope handling** — Recognise `compile`, `test`, `provided`, `runtime`, and `import` scopes
+- **Release-freshness signal (partial)** — Per-version ages in hover/completion from Maven Central's directory listing; unavailable for Google Maven and Gradle Plugin Portal artifacts, which have no date column (see `ECOSYSTEM_GUIDE.md`)
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-maven = "0.10"
+deps-maven = "0.11"
 ```
 
 > [!IMPORTANT]
