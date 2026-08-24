@@ -259,6 +259,19 @@ deliberately conservative:
   positives if reused here (e.g. Cargo's `~1.0.999` reads as "up to date" against a latest
   of `1.0.214` under the loose same-major-minor heuristic, despite patch `999` never having
   been published).
+- **Cargo, npm, and Swift additionally name a matching pre-release, if one exists.** These
+  three ecosystems use a strict SemVer-style matcher that excludes prereleases unless the
+  requirement itself names one — so a requirement like `^2.0.0` reads as fully unsatisfiable
+  even when a `2.0.0-rc.1` has been published. The WARNING then appends a clause naming it:
+  ```
+  No published version satisfies requirement '^2.0.0'; latest is 1.5.0 (a pre-release,
+  2.0.0-rc.1, is excluded by SemVer's default pre-release-matching rules; require it
+  explicitly to use it)
+  ```
+  The hint is skipped when the requirement itself already names a pre-release (the real
+  blocker there is version ordering, not pre-release exclusion) and when the only matching
+  pre-release has been yanked. Maven/NuGet/Composer/Gradle's range-parsing model already
+  admits prerelease qualifiers within a range and is unaffected.
 
 **Not yet implemented:** a separate informational diagnostic for a requirement that only
 matches prerelease versions.

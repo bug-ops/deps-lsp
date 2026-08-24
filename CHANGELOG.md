@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **deps-core, deps-swift**: release-freshness signal for Swift via the GitHub releases API, memoized and best-effort (#293)
 
-- **deps-core, deps-cargo, deps-npm, deps-swift**: unsatisfiable-requirement WARNING now mentions a matching pre-release when one exists for Cargo/npm/Swift's strict-SemVer requirements, follow-up to #206 (resolves #299)
+- **deps-core, deps-cargo, deps-npm, deps-swift**: unsatisfiable-requirement WARNING now mentions a matching pre-release when one exists for Cargo/npm/Swift's strict-SemVer requirements, follow-up to #206 (resolves #299) (#305)
 
 ### Fixed
 - **deps-lsp**: `RegistryProgress::start` no longer sends `window/workDoneProgress/create` to a client that never advertised `window.workDoneProgress` support, an LSP 3.17 spec violation (resolves #290) (#296).
