@@ -522,6 +522,82 @@ impl crate::Registry for MockRegistryPreferringUnflagged {
     }
 }
 
+/// A registry whose `select_latest_matching` always returns `None` — mirroring Go's
+/// list-based ladder, which is deliberately excluded from the shared 3-rung existence
+/// ladder (#364/#372) since `/@v/list` has no real per-version retraction data — paired
+/// with a `get_latest_matching` that DOES resolve, mirroring Go's `/@latest` endpoint
+/// answering from a more complete source than the list. Exists for the hover
+/// list-based-pick-failed fallback regression test (#373). `get_latest_matching_calls`
+/// counts invocations so a test can assert the fallback is NOT reached on the happy
+/// path (a list-based pick that already succeeds), guarding against a future regression
+/// that would make every hover pay for a second network round trip.
+pub(crate) struct MockRegistryListFailsLatestFallbackSucceeds {
+    pub(crate) versions: Vec<MockVersionWithAge>,
+    pub(crate) fallback_latest: MockVersionWithAge,
+    /// `select_latest_matching`'s return value — `None` reproduces the Go
+    /// list-based-pick-failure this mock exists for; `Some(idx)` lets a test exercise the
+    /// happy path (list pick succeeds) through this same mock, to assert the fallback is
+    /// NOT reached.
+    pub(crate) list_pick_index: Option<usize>,
+    pub(crate) get_latest_matching_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::Registry for MockRegistryListFailsLatestFallbackSucceeds {
+    fn get_versions<'a>(
+        &'a self,
+        _name: &'a crate::PackageName,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
+        let versions = self
+            .versions
+            .iter()
+            .map(|v| {
+                Box::new(MockVersionWithAge {
+                    version: v.version.clone(),
+                    yanked: v.yanked,
+                    published_at: v.published_at,
+                }) as Box<dyn crate::Version>
+            })
+            .collect();
+        Box::pin(async move { Ok(versions) })
+    }
+
+    fn get_latest_matching<'a>(
+        &'a self,
+        _name: &'a crate::PackageName,
+        _req: &'a crate::VersionReq,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+    {
+        self.get_latest_matching_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fallback = MockVersionWithAge {
+            version: self.fallback_latest.version.clone(),
+            yanked: self.fallback_latest.yanked,
+            published_at: self.fallback_latest.published_at,
+        };
+        Box::pin(async move { Ok(Some(Box::new(fallback) as Box<dyn crate::Version>)) })
+    }
+
+    fn search<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: usize,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn select_latest_matching(
+        &self,
+        _versions: &[Box<dyn crate::Version>],
+        _req: &crate::VersionReq,
+    ) -> Option<usize> {
+        self.list_pick_index
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// A registry returning a fixed, caller-supplied version list — used to
 /// exercise the yank check and display-item dedup in
 /// [`generate_code_actions`].

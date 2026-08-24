@@ -26,6 +26,17 @@ fn version_age_suffix(version: &dyn Version, now: PublishTime) -> String {
         .unwrap_or_default()
 }
 
+/// Bounds the `Registry::get_latest_matching` fallback (#373) hover fires when the
+/// list-based `**Latest**` pick fails on a non-empty live list. Hover responses must
+/// return quickly (`.claude/rules/rust-code.md`), and without this the fallback would
+/// stack on top of `get_versions_with`'s own up-to-30s `reqwest` client timeout
+/// (`HttpCache`), doubling worst-case hover latency to ~60s. `generate_hover` has no
+/// `timeout_secs` config threaded in the way `lifecycle.rs`'s background fetch does, so
+/// this is a fixed local bound rather than a configurable one — a few seconds is enough
+/// slack for the already-rare "list-based pick failed" path without meaningfully
+/// delaying the common case, which never reaches this fallback at all.
+const HOVER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub async fn generate_hover<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
@@ -127,6 +138,15 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // a stale Ch1 version that may not even appear in the live "Recent versions" list below
     // would be exactly the self-contradiction #227 F5 fixed, via a different path (#313).
     //
+    // Exception (#373): when the list-based pick fails on a non-empty list, `latest_line`
+    // can render a version sourced from `list_fallback_latest` — `Registry::get_latest_matching`
+    // instead of the list — which the "Recent versions" list below is built from `available_versions`
+    // alone and so may not contain (Go's `/@latest` can answer with a pseudo-version `/@v/list`
+    // never enumerates). No entry is marked `*(latest)*` in that case, since `live_latest_idx`
+    // is `None`. This is an accepted, narrower trade-off than the contradiction #227 F5/#313
+    // guard against: rendering *a* correct latest version, even one absent from or unmarked in
+    // the list below, beats rendering no `**Latest**` line at all.
+    //
     // `live_latest_idx` (not raw index 0) picks the entry: `available_versions` is sorted
     // purely by version number, so a pre-release with the highest number can sort to index 0
     // even though it isn't the ecosystem's "latest stable" pick — mirroring this line to the
@@ -146,6 +166,48 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let live_latest_idx = available_versions
         .as_ref()
         .and_then(|v| registry.select_latest_matching(v, &wildcard_req));
+    // #373: `live_latest_idx` can be `None` even though a live fetch DID happen and the
+    // list is non-empty — e.g. Go's `/@v/list` never enumerates pseudo-versions, so an
+    // untagged module whose whole tagged history is pre-release fails the list-based pick
+    // entirely. This must not fall straight to the Ch1 cache (see the comment on
+    // `latest_line` below) — instead mirror the exact fallback `lifecycle.rs`'s background
+    // fetch already uses for this same case: a second call to `Registry::get_latest_matching`,
+    // which some registries (Go's `/@latest`) answer from a source more complete than the
+    // list endpoint. Only attempted for a non-empty live list with no list-based pick; an
+    // empty or absent live list keeps falling back to Ch1 untouched. Bounded by
+    // `HOVER_FALLBACK_TIMEOUT` and logged like `lifecycle.rs`'s own fallback — a failure,
+    // timeout, or `None` here degrades gracefully to no `**Latest**` line, same as today:
+    // `available_versions` already succeeded, so this fallback's own error must not abort
+    // the rest of the hover.
+    let list_fallback_latest = if available_versions.as_ref().is_some_and(|v| !v.is_empty())
+        && live_latest_idx.is_none()
+    {
+        match tokio::time::timeout(
+            HOVER_FALLBACK_TIMEOUT,
+            registry.get_latest_matching(dep.name(), &wildcard_req),
+        )
+        .await
+        {
+            Ok(Ok(found)) => {
+                tracing::debug!(package = %dep.name(), found = found.is_some(), "hover latest fallback (get_latest_matching) resolved");
+                found
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(package = %dep.name(), %error, "hover latest fallback (get_latest_matching) failed");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    package = %dep.name(),
+                    timeout_secs = HOVER_FALLBACK_TIMEOUT.as_secs(),
+                    "hover latest fallback (get_latest_matching) timed out"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let cached_latest = resolvable
         .then(|| {
             versions
@@ -155,15 +217,23 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         })
         .flatten();
     // A non-empty live list with no stable entry is deliberately treated differently from
-    // an empty (or absent) live list: the former still falls through to `None` below (no
-    // header at all, matching the empty "Recent versions" list right beneath it) rather than
-    // the Ch1 cache, since the cache's version wouldn't be part of what the live list just
-    // showed. An empty live list carries no such contradiction risk — it has nothing to
-    // contradict — so it keeps falling back to Ch1, same as when there's no live fetch.
+    // an empty (or absent) live list: the former tries `list_fallback_latest` (#373) first —
+    // a second registry call for the rare "list-based pick failed but a live fetch happened"
+    // case — before giving up, rather than falling back to the Ch1 cache, since the cache's
+    // version wouldn't be part of what the live list just showed. Only once that fallback
+    // also yields nothing does the line render nothing at all (no header, matching the empty
+    // "Recent versions" list right beneath it). An empty live list carries no such
+    // contradiction risk — it has nothing to contradict — so it keeps falling back to Ch1,
+    // same as when there's no live fetch.
     let latest_line: Option<(&str, Option<PublishTime>)> = match &available_versions {
         Some(v) if !v.is_empty() => live_latest_idx
             .map(|idx| &v[idx])
-            .map(|live| (live.version_string(), live.published_at())),
+            .map(|live| (live.version_string(), live.published_at()))
+            .or_else(|| {
+                list_fallback_latest
+                    .as_deref()
+                    .map(|live| (live.version_string(), live.published_at()))
+            }),
         _ => cached_latest.map(|v| (v.latest.as_str(), v.published_at)),
     };
     if let Some((latest_ver, raw_published_at)) = latest_line {
@@ -635,6 +705,107 @@ mod tests {
             !content.value.contains("1.5.0"),
             "the stale cached version must not leak into the response at all; got: {}",
             content.value
+        );
+    }
+
+    /// #373: Go's `/@v/list` never enumerates pseudo-versions, so an untagged module whose
+    /// entire tagged history is pre-release fails `select_latest_matching`'s list-based pick
+    /// even though the live fetch succeeded and returned a non-empty list. Hover must fall
+    /// back to `Registry::get_latest_matching` (mirroring `lifecycle.rs`'s background-fetch
+    /// fallback, which answers this from Go's `/@latest` endpoint) instead of rendering no
+    /// `**Latest**` line at all.
+    #[tokio::test]
+    async fn test_generate_hover_latest_falls_back_to_get_latest_matching_when_list_pick_fails() {
+        use std::collections::HashMap;
+
+        let registry = MockRegistryListFailsLatestFallbackSucceeds {
+            versions: vec![MockVersionWithAge {
+                version: "v0.0.0-20230101000000-abcdef123456".to_string(),
+                yanked: false,
+                published_at: None,
+            }],
+            fallback_latest: MockVersionWithAge {
+                version: "v1.2.3".to_string(),
+                yanked: false,
+                published_at: None,
+            },
+            list_pick_index: None,
+            get_latest_matching_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let parse_result = freshness_test_parse_result("example.com/mod");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Latest**: `v1.2.3`"),
+            "the list-based pick failed, so hover must fall back to get_latest_matching's \
+             result instead of omitting the Latest line; got: {}",
+            content.value
+        );
+    }
+
+    /// #373 M4: the fallback must not fire on the common "list-based pick already
+    /// succeeded" path — asserted via a call counter on the mock, guarding against a
+    /// future regression that would make every hover pay for a second registry round
+    /// trip regardless of whether the list-based pick worked.
+    #[tokio::test]
+    async fn test_generate_hover_does_not_call_fallback_when_list_pick_succeeds() {
+        use std::collections::HashMap;
+        use std::sync::atomic::Ordering;
+
+        let registry = MockRegistryListFailsLatestFallbackSucceeds {
+            versions: vec![MockVersionWithAge {
+                version: "v1.2.3".to_string(),
+                yanked: false,
+                published_at: None,
+            }],
+            fallback_latest: MockVersionWithAge {
+                version: "v9.9.9".to_string(),
+                yanked: false,
+                published_at: None,
+            },
+            list_pick_index: Some(0),
+            get_latest_matching_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let parse_result = freshness_test_parse_result("example.com/mod");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Latest**: `v1.2.3`"),
+            "expected the list-based pick's own version, not the fallback's; got: {}",
+            content.value
+        );
+        assert_eq!(
+            registry.get_latest_matching_calls.load(Ordering::Relaxed),
+            0,
+            "get_latest_matching must not be called when the list-based pick already succeeded"
         );
     }
 
