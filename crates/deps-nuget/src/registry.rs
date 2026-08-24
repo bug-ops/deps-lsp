@@ -162,6 +162,11 @@ struct SearchResultDoc {
 }
 
 /// Returns the nuget.org package page URL for `name`.
+///
+/// Display link only, never fetched by this process — unlike [`flat_container_url`]/
+/// [`registration_index_url`] (fetch sinks), so it is deliberately not gated against a
+/// `.`/`..` name (see [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link
+/// scope split, #379).
 pub fn package_url(name: &str) -> String {
     format!(
         "https://www.nuget.org/packages/{}",
@@ -1047,6 +1052,22 @@ mod tests {
                 "Newtonsoft.Json"
             ),
             "https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json"
+        );
+    }
+
+    /// #365 regression sweep: exercises the real production `reject_dot_segment` gate and
+    /// `registration_index_url` sink together against the shared adversarial input set,
+    /// mirroring `test_flat_container_url_dot_segment_sweep` for the sibling sink (#380).
+    #[test]
+    fn test_registration_index_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| {
+                reject_dot_segment(seg).ok().map(|()| {
+                    registration_index_url("https://api.nuget.org/v3/registration5-gz-semver2", seg)
+                })
+            },
+            "api.nuget.org",
+            "/v3/registration5-gz-semver2/",
         );
     }
 

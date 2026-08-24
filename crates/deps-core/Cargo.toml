@@ -23,7 +23,7 @@ workspace = true
 # enablable by any downstream Cargo.toml (this crate has `publish = true`),
 # so it must never be enabled in a shipped/release build — see
 # `cache::ensure_https` for the full contract.
-test-util = ["dep:url", "dep:urlencoding"]
+test-util = ["dep:tracing-subscriber", "dep:url", "dep:urlencoding"]
 
 [dependencies]
 bytes = { workspace = true }
@@ -38,6 +38,7 @@ time = { workspace = true, features = ["std", "parsing"] }
 tokio = { workspace = true, features = ["sync", "time", "fs"] }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 urlencoding = { workspace = true, optional = true }
 yaml-rust2 = { workspace = true }

@@ -121,6 +121,13 @@ fn repo_base_for_group(group_id: &str) -> &'static str {
     }
 }
 
+/// Returns the URL for a coordinate's page on Maven Central (or maven.google.com for a
+/// Google-group coordinate), falling back to a Central search query when `name` is not a
+/// `groupId:artifactId` pair.
+///
+/// Display link only, never fetched by this process — unlike `metadata_urls` (a fetch
+/// sink), so it is deliberately not gated against a `.`/`..` segment (see
+/// [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link scope split, #379).
 pub fn package_url(name: &str) -> String {
     let parts: Vec<&str> = name.splitn(2, ':').collect();
     if parts.len() == 2 {

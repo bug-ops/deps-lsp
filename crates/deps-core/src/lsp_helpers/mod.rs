@@ -1071,6 +1071,15 @@ pub trait EcosystemFormatter: Send + Sync {
 /// Shared by `deps-npm`'s scope/package segment guard and `deps-dart`'s package-name
 /// guard — both ecosystems' registry APIs key a fetch on a bare, suffix-less path segment.
 ///
+/// **Scope**: this predicate (and the `#365` regression sweep built around it) guards
+/// registry-*fetch* URL builders — the sink is a request this process actually
+/// dereferences, so a retargeted URL can make it fetch attacker-chosen data. It
+/// deliberately does *not* extend to a "docs link"/`package_url`-style builder (the
+/// per-ecosystem hover/display link, e.g. `deps_cargo::crate_url`, `deps_go::package_url`):
+/// those interpolate the name into a link rendered in hover text and never fetched by
+/// this process, so an unrejected `.`/`..` name there produces at worst a misleading
+/// same-host link (the registry's package-listing root), not a traversal off-host (#379).
+///
 /// # Examples
 ///
 /// ```

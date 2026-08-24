@@ -845,62 +845,10 @@ mod tests {
         assert!(!page_has_more(0));
     }
 
-    #[derive(Clone, Default)]
-    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capturing_subscriber() -> (CapturingWriter, impl tracing::Subscriber) {
-        let writer = CapturingWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer.clone())
-            // INFO (not WARN) so the release-dates token-gate skip (`tracing::info!`)
-            // is captured too, alongside the WARN-level pagination-truncation tests
-            // that already use this helper.
-            .with_max_level(tracing::Level::INFO)
-            .without_time()
-            .with_target(false)
-            .finish();
-        (writer, subscriber)
-    }
-
-    /// Captures `tracing` output emitted during `f` into a `String`, so
-    /// pagination-truncation warnings can be asserted on without a real
-    /// GitHub server (the tags endpoint's base URL isn't test-injectable).
-    fn capture_tracing_output(f: impl FnOnce()) -> String {
-        let (writer, subscriber) = capturing_subscriber();
-        tracing::subscriber::with_default(subscriber, f);
-        String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
-    }
-
-    /// Async counterpart of [`capture_tracing_output`]: sets the capturing
-    /// subscriber as the thread-local default for the duration of `fut`.
-    /// Relies on the `#[tokio::test]` current-thread runtime polling `fut`
-    /// on the same thread that installed the default.
-    async fn capture_tracing_output_async(fut: impl std::future::Future<Output = ()>) -> String {
-        let (writer, subscriber) = capturing_subscriber();
-        let guard = tracing::subscriber::set_default(subscriber);
-        fut.await;
-        drop(guard);
-        String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
-    }
+    // `capture_tracing_output`/`capture_tracing_output_async` (originally added here for
+    // #357) now live in `deps_core::test_util`, shared with every other crate's
+    // `warn_rejected_value`-firing tests (#380 review).
+    use deps_core::test_util::{capture_tracing_output, capture_tracing_output_async};
 
     #[test]
     fn test_pagination_warns_when_truncated_at_cap() {

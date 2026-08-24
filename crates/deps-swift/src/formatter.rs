@@ -3,7 +3,7 @@
 use deps_core::Dependency;
 use deps_core::PackageName;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, warn_rejected_value};
 
 /// Precise semver `VersionReq` matcher, compiled once per dependency by
 /// [`SwiftFormatter::compile_requirement`] — the same crate `version_satisfies_requirement`
@@ -41,6 +41,11 @@ impl EcosystemFormatter for SwiftFormatter {
         if is_valid_owner_repo(name.as_str()) {
             format!("https://github.com/{name}")
         } else {
+            warn_rejected_value(
+                "is_valid_owner_repo",
+                "swift package display formatting",
+                name.as_str(),
+            );
             String::new()
         }
     }
@@ -107,6 +112,8 @@ impl EcosystemFormatter for SwiftFormatter {
 mod tests {
     use super::*;
 
+    use deps_core::test_util::capture_tracing_output;
+
     #[test]
     fn test_format_version() {
         let fmt = SwiftFormatter;
@@ -128,6 +135,37 @@ mod tests {
         assert_eq!(fmt.package_url(&PackageName::new("../../etc/passwd")), "");
         assert_eq!(fmt.package_url(&PackageName::new("no-slash")), "");
         assert_eq!(fmt.package_url(&PackageName::new("owner/repo/extra")), "");
+    }
+
+    #[test]
+    fn test_package_url_rejection_logs_warn_rejected_value() {
+        // #380 B3: the fallback-return-value tests above don't prove `warn_rejected_value`
+        // actually fires — a refactor could delete the warn call and they would stay green.
+        let fmt = SwiftFormatter;
+        let output = capture_tracing_output(|| {
+            let _ = fmt.package_url(&PackageName::new("../../etc/passwd"));
+        });
+        assert!(
+            output.contains("is_valid_owner_repo"),
+            "output was: {output}"
+        );
+        assert!(
+            output.contains("swift package display formatting"),
+            "output was: {output}"
+        );
+        assert!(
+            !output.contains("etc/passwd"),
+            "raw rejected value must not be logged: {output}"
+        );
+    }
+
+    #[test]
+    fn test_package_url_accepted_logs_no_warn() {
+        let fmt = SwiftFormatter;
+        let output = capture_tracing_output(|| {
+            let _ = fmt.package_url(&PackageName::new("apple/swift-nio"));
+        });
+        assert!(output.is_empty(), "output was: {output}");
     }
 
     #[test]

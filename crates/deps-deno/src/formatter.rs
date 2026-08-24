@@ -8,7 +8,7 @@
 //! `deps-npm`'s wording outright (yanked messages, S2).
 
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, warn_rejected_value};
 use deps_core::{Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Precise `node-semver` range matcher, compiled once per dependency by
@@ -62,11 +62,26 @@ impl EcosystemFormatter for DenoFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         match split_scheme(name.as_str()) {
-            Some((Scheme::Jsr, rest)) => split_scoped(rest)
-                .map(|(scope, pkg)| crate::registry::jsr_package_url(scope, pkg))
-                .unwrap_or_default(),
+            Some((Scheme::Jsr, rest)) => match split_scoped(rest) {
+                Some((scope, pkg)) => crate::registry::jsr_package_url(scope, pkg),
+                None => {
+                    warn_rejected_value(
+                        "split_scoped",
+                        "deno jsr package display formatting",
+                        name.as_str(),
+                    );
+                    String::new()
+                }
+            },
             Some((Scheme::Npm, rest)) => deps_npm::package_url(rest),
-            None => String::new(),
+            None => {
+                warn_rejected_value(
+                    "split_scheme",
+                    "deno package display formatting",
+                    name.as_str(),
+                );
+                String::new()
+            }
         }
     }
 
@@ -142,6 +157,8 @@ impl EcosystemFormatter for DenoFormatter {
 mod tests {
     use super::*;
 
+    use deps_core::test_util::capture_tracing_output;
+
     #[test]
     fn test_package_url_jsr() {
         let formatter = DenoFormatter;
@@ -173,6 +190,50 @@ mod tests {
     fn test_package_url_unroutable_scheme_is_empty() {
         let formatter = DenoFormatter;
         assert_eq!(formatter.package_url(&PackageName::new("unknown:x")), "");
+    }
+
+    #[test]
+    fn test_package_url_jsr_unscoped_is_empty() {
+        // `split_scoped` fails for a `jsr:` specifier missing the `@scope/` prefix.
+        let formatter = DenoFormatter;
+        assert_eq!(formatter.package_url(&PackageName::new("jsr:std")), "");
+    }
+
+    #[test]
+    fn test_package_url_jsr_unscoped_logs_warn_rejected_value() {
+        // #380 B2/B3: `split_scoped` failure (missing `@scope/`) must warn, not silently
+        // drop the value.
+        let formatter = DenoFormatter;
+        let output = capture_tracing_output(|| {
+            let _ = formatter.package_url(&PackageName::new("jsr:std"));
+        });
+        assert!(output.contains("split_scoped"), "output was: {output}");
+        assert!(
+            output.contains("deno jsr package display formatting"),
+            "output was: {output}"
+        );
+    }
+
+    #[test]
+    fn test_package_url_unroutable_scheme_logs_warn_rejected_value() {
+        let formatter = DenoFormatter;
+        let output = capture_tracing_output(|| {
+            let _ = formatter.package_url(&PackageName::new("unknown:x"));
+        });
+        assert!(output.contains("split_scheme"), "output was: {output}");
+        assert!(
+            output.contains("deno package display formatting"),
+            "output was: {output}"
+        );
+    }
+
+    #[test]
+    fn test_package_url_jsr_accepted_logs_no_warn() {
+        let formatter = DenoFormatter;
+        let output = capture_tracing_output(|| {
+            let _ = formatter.package_url(&PackageName::new("jsr:@std/fs"));
+        });
+        assert!(output.is_empty(), "output was: {output}");
     }
 
     #[test]
