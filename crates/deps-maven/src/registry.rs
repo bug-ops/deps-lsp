@@ -6,6 +6,7 @@
 use crate::types::{ArtifactInfo, MavenVersion};
 use crate::version::compare_versions;
 use bytes::Bytes;
+use dashmap::DashMap;
 use deps_core::{DepsError, HttpCache, PublishTime, Result};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -60,6 +61,42 @@ const SEARCH_ATTEMPT_TIMEOUTS: [Duration; 2] =
 
 /// Delay between `search_typed` retry attempts.
 const SEARCH_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// `rows` value used for every `solrsearch` request, regardless of the caller's
+/// requested `limit` (#282 gap 2).
+///
+/// `search_typed`'s caller-facing result count is still capped at `limit` by
+/// `parse_search_response`'s `.take(limit)` — this only fixes the *request URL*,
+/// which doubles as `HttpCache`'s cache key. `deps-lsp`'s completion handler calls
+/// `search_typed` with `limit=20` for its primary (typed-field) search and `limit=50`
+/// for its fallback search; before this constant, those two calls built different
+/// URLs (`rows=20` vs `rows=50`) and so never shared a cache entry, making
+/// `HttpCache::peek_cached`'s stale-fallback (see `search_with_retry`) always miss on
+/// the fallback path even when a same-query result was already cached moments earlier
+/// by the primary path. Set to the largest `limit` any caller passes, so a smaller
+/// request is always answerable from the same cache entry as a larger one.
+const SEARCH_CACHE_ROWS: usize = 50;
+
+/// TTL for `MavenCentralRegistry::recent_search_failures` (#282 gap 1).
+///
+/// A completion request's own fallback search (`deps-lsp`'s `completion.rs`, once its
+/// extracted query matches the primary path's — see `extract_prefix`'s XML-tag
+/// stripping) issues a second `search_typed` call for the same query within the same
+/// request, well inside `COMPLETION_SEARCH_TIMEOUT`, whenever the first call fails
+/// *fast* (DNS failure, connection refused) rather than hanging —
+/// `SEARCH_ATTEMPT_TIMEOUTS`'s hang-mode guarantee (see its doc) only protects against
+/// the hang case, not this one. Reusing `COMPLETION_SEARCH_TIMEOUT` as the TTL is sized
+/// to comfortably span that in-request duplicate-call window without also suppressing a
+/// legitimate retry on a later, unrelated completion request for the same prefix.
+///
+/// By design, this memo is never populated for the hang failure mode itself: a hang
+/// exhausts `SEARCH_ATTEMPT_TIMEOUTS`' full budget, which `deps-lsp`'s own outer
+/// `COMPLETION_SEARCH_TIMEOUT` deadline always wins against first (see that constant's
+/// doc) — the whole `search_typed` future, including the code that would record a
+/// failure here, is cancelled before it can run. That's fine: the hang case is already
+/// handled by the caller's existing skip-fallback path, so no second call happens for
+/// this memo to prevent.
+const RECENT_FAILURE_TTL: Duration = deps_core::completion::COMPLETION_SEARCH_TIMEOUT;
 
 const GOOGLE_PREFIXES: &[&str] = &[
     "androidx.",
@@ -201,11 +238,24 @@ fn attach_publish_times(versions: &mut [MavenVersion], times: &HashMap<String, P
 #[derive(Clone)]
 pub struct MavenCentralRegistry {
     cache: Arc<HttpCache>,
+    /// Query -> instant of its last unrecoverable live search failure (#282 gap 1).
+    ///
+    /// Checked at the top of `search_typed`: a repeat call for the same query within
+    /// `RECENT_FAILURE_TTL` returns immediately without a network attempt. A `DashMap`
+    /// (like `HttpCache::entries`) rather than a `Mutex<HashMap<_>>`, so concurrent
+    /// completion requests for different queries don't contend on one lock and a panic
+    /// while holding a shard can't poison the whole map. Wrapped in `Arc` (`DashMap`
+    /// itself clones its contents, not a shared handle) so every `Clone` of this
+    /// registry shares one map, matching `cache`'s sharing semantics.
+    recent_search_failures: Arc<DashMap<String, tokio::time::Instant>>,
 }
 
 impl MavenCentralRegistry {
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            recent_search_failures: Arc::new(DashMap::new()),
+        }
     }
 
     /// Fetches and parses `maven-metadata.xml`, also returning the directory URL of
@@ -310,23 +360,102 @@ impl MavenCentralRegistry {
     /// unreliability (#274) without exceeding the caller's own completion deadline. See
     /// `SEARCH_ATTEMPT_TIMEOUTS` and `search_with_retry` for the retry/fallback policy.
     ///
+    /// A query that failed live within the last `RECENT_FAILURE_TTL` short-circuits to
+    /// the same error with no network attempt at all (#282 gap 1) — this is what keeps
+    /// a completion request's own fallback search (`deps-lsp`'s `completion.rs`) from
+    /// doubling live request volume against an endpoint that is already fast-failing
+    /// for this query, since a fast failure (unlike a hang) returns well inside the
+    /// caller's own deadline and so does not get skipped by that deadline alone.
+    ///
+    /// The request always asks `solrsearch` for `SEARCH_CACHE_ROWS` rows regardless of
+    /// `limit` (#282 gap 2), so that calls with different `limit`s for the same `query`
+    /// share one `HttpCache` entry — `limit` only trims the parsed result afterward via
+    /// `parse_search_response`.
+    ///
     /// # Errors
     ///
     /// Returns the last error (an HTTP/network error, or a synthesized timeout error)
     /// if every attempt fails and no cached result is available to fall back to.
     pub async fn search_typed(&self, query: &str, limit: usize) -> Result<Vec<ArtifactInfo>> {
-        let url = format!(
-            "{MAVEN_SEARCH_BASE}?q={q}&rows={limit}&wt=json",
-            q = urlencoding::encode(query),
+        debug_assert!(
+            limit <= SEARCH_CACHE_ROWS,
+            "search_typed's limit ({limit}) exceeds SEARCH_CACHE_ROWS ({SEARCH_CACHE_ROWS}); \
+             raise SEARCH_CACHE_ROWS to cover every caller's requested limit"
         );
 
+        if is_recently_failed(&self.recent_search_failures, query) {
+            return Err(DepsError::CacheError(format!(
+                "solrsearch recently failed for query {query:?}, \
+                 skipping duplicate live attempt"
+            )));
+        }
+
+        let url = search_url(query);
         let data = search_with_retry(
             || self.cache.get_cached(&url),
             || self.cache.peek_cached(&url),
         )
-        .await?;
-        parse_search_response(&data, limit)
+        .await;
+
+        let data = match data {
+            Ok(data) => data,
+            Err(e) => {
+                record_search_failure(&self.recent_search_failures, query);
+                return Err(e);
+            }
+        };
+
+        // Only clear the failure memo once the body is confirmed parseable: an HTTP 200
+        // with a zero-byte/garbage body is `solrsearch`'s documented failure signature
+        // (#274), and `search_with_retry` reports that as `Ok`. Clearing on fetch alone
+        // would erase a real failure record without recording the parse failure that
+        // follows.
+        match parse_search_response(&data, limit) {
+            Ok(results) => {
+                record_search_success(&self.recent_search_failures, query);
+                Ok(results)
+            }
+            Err(e) => {
+                record_search_failure(&self.recent_search_failures, query);
+                Err(e)
+            }
+        }
     }
+}
+
+/// Builds the `solrsearch` request URL for `query`.
+///
+/// Deliberately takes no `limit`: the URL doubles as `HttpCache`'s cache key, and
+/// always requesting [`SEARCH_CACHE_ROWS`] rows keeps that key identical across calls
+/// for the same `query` regardless of the caller's requested `limit` (#282 gap 2).
+fn search_url(query: &str) -> String {
+    format!(
+        "{MAVEN_SEARCH_BASE}?q={q}&rows={SEARCH_CACHE_ROWS}&wt=json",
+        q = urlencoding::encode(query),
+    )
+}
+
+/// Whether `query` failed live within [`RECENT_FAILURE_TTL`], per `failures`.
+fn is_recently_failed(failures: &DashMap<String, tokio::time::Instant>, query: &str) -> bool {
+    failures
+        .get(query)
+        .is_some_and(|failed_at| failed_at.elapsed() < RECENT_FAILURE_TTL)
+}
+
+/// Records `query`'s live search failure, pruning already-expired entries first so
+/// `failures` doesn't grow unbounded over the server's lifetime. Pruning only happens
+/// here (on a new failure), not on every lookup, so `failures` can transiently hold
+/// entries older than `RECENT_FAILURE_TTL` between failures — harmless, since
+/// `is_recently_failed` still checks each entry's age itself before trusting it.
+fn record_search_failure(failures: &DashMap<String, tokio::time::Instant>, query: &str) {
+    failures.retain(|_, failed_at| failed_at.elapsed() < RECENT_FAILURE_TTL);
+    failures.insert(query.to_string(), tokio::time::Instant::now());
+}
+
+/// Clears `query`'s failure record, if any, after a fully successful (fetched and
+/// parsed) `search_typed` call.
+fn record_search_success(failures: &DashMap<String, tokio::time::Instant>, query: &str) {
+    failures.remove(query);
 }
 
 /// Whether a failed search attempt is worth retrying live (#274).
@@ -1036,6 +1165,112 @@ mod tests {
              timeout does (#274/S1), elapsed={:?}",
             start.elapsed()
         );
+    }
+
+    /// #282 gap 2: the request URL (which doubles as `HttpCache`'s cache key) must not
+    /// vary with the caller's requested `limit`, so a `limit=50` fallback search can
+    /// reuse a `limit=20` primary search's cached/stale result for the same query.
+    #[test]
+    fn test_search_url_is_limit_independent() {
+        assert_eq!(
+            search_url("commons-lang3"),
+            "https://search.maven.org/solrsearch/select?q=commons-lang3&rows=50&wt=json"
+        );
+    }
+
+    #[test]
+    fn test_is_recently_failed_true_within_ttl() {
+        let failures = DashMap::new();
+        failures.insert("guava".to_string(), tokio::time::Instant::now());
+        assert!(is_recently_failed(&failures, "guava"));
+    }
+
+    #[test]
+    fn test_is_recently_failed_false_for_unknown_query() {
+        let failures = DashMap::new();
+        assert!(!is_recently_failed(&failures, "guava"));
+    }
+
+    /// #282 gap 1: an expired entry must not keep suppressing live attempts forever —
+    /// once `RECENT_FAILURE_TTL` has passed, a legitimate retry is allowed again.
+    #[tokio::test(start_paused = true)]
+    async fn test_is_recently_failed_false_after_ttl_expires() {
+        let failures = DashMap::new();
+        failures.insert("guava".to_string(), tokio::time::Instant::now());
+
+        tokio::time::advance(RECENT_FAILURE_TTL + Duration::from_millis(1)).await;
+
+        assert!(!is_recently_failed(&failures, "guava"));
+    }
+
+    /// #282 gap 1: `record_search_failure` must not let `failures` grow unbounded —
+    /// already-expired entries for other queries are pruned on every new failure.
+    #[tokio::test(start_paused = true)]
+    async fn test_record_search_failure_prunes_expired_entries() {
+        let failures = DashMap::new();
+        record_search_failure(&failures, "old-query");
+        assert_eq!(failures.len(), 1);
+
+        tokio::time::advance(RECENT_FAILURE_TTL + Duration::from_millis(1)).await;
+        record_search_failure(&failures, "new-query");
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures.contains_key("new-query"));
+        assert!(!failures.contains_key("old-query"));
+    }
+
+    #[test]
+    fn test_record_search_success_clears_failure() {
+        let failures = DashMap::new();
+        failures.insert("guava".to_string(), tokio::time::Instant::now());
+
+        record_search_success(&failures, "guava");
+
+        assert!(!failures.contains_key("guava"));
+    }
+
+    #[test]
+    fn test_record_search_success_on_unknown_query_is_a_no_op() {
+        let failures = DashMap::new();
+        record_search_success(&failures, "guava");
+        assert!(failures.is_empty());
+    }
+
+    /// #282 gap 1: a query that just failed live short-circuits the next `search_typed`
+    /// call for the same query with no network attempt — the returned error names the
+    /// suppression explicitly, distinguishing it from a real HTTP/timeout failure.
+    #[tokio::test]
+    async fn test_search_typed_short_circuits_on_recent_failure() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = MavenCentralRegistry::new(cache);
+        registry
+            .recent_search_failures
+            .insert("guava".to_string(), tokio::time::Instant::now());
+
+        let err = registry.search_typed("guava", 20).await.unwrap_err();
+
+        assert!(err.to_string().contains("skipping duplicate live attempt"));
+    }
+
+    /// #282 S1: `parse_search_response` is the sole trim mechanism now that the request
+    /// URL always asks for `SEARCH_CACHE_ROWS` regardless of the caller's `limit` — a
+    /// caller asking for fewer results than the response contains must still get back
+    /// only what it asked for.
+    #[test]
+    fn test_parse_search_response_trims_to_limit() {
+        let json = r#"{
+            "response": {
+                "numFound": 2,
+                "docs": [
+                    {"g": "org.apache.commons", "a": "commons-lang3", "latestVersion": "3.14.0"},
+                    {"g": "org.apache.commons", "a": "commons-math3", "latestVersion": "3.6.1"}
+                ]
+            }
+        }"#;
+
+        let results = parse_search_response(json.as_bytes(), 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "org.apache.commons:commons-lang3");
     }
 
     #[tokio::test(start_paused = true)]
