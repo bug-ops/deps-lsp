@@ -190,6 +190,37 @@ pub trait Registry: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Whether `version` contains one of the common pre-release substrings
+/// (`-alpha`, `-beta`, `-rc`, `-dev`, `-pre`, `-snapshot`, `-canary`,
+/// `-nightly`), case-insensitively.
+///
+/// This is [`Version::is_prerelease`]'s default heuristic, extracted so an
+/// ecosystem that overrides `is_prerelease` to cover format-specific gaps
+/// (e.g. Composer's `dev-` branch-alias prefix) can extend this baseline
+/// instead of copy-pasting the substring list out of sync with it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::has_default_prerelease_marker;
+///
+/// assert!(has_default_prerelease_marker("1.0.0-beta"));
+/// assert!(has_default_prerelease_marker("1.0.0-RC1"));
+/// assert!(!has_default_prerelease_marker("1.0.0"));
+/// ```
+#[must_use]
+pub fn has_default_prerelease_marker(version: &str) -> bool {
+    let v = version.to_lowercase();
+    v.contains("-alpha")
+        || v.contains("-beta")
+        || v.contains("-rc")
+        || v.contains("-dev")
+        || v.contains("-pre")
+        || v.contains("-snapshot")
+        || v.contains("-canary")
+        || v.contains("-nightly")
+}
+
 /// Version information trait.
 ///
 /// All version types must implement this to work with generic handlers.
@@ -202,17 +233,10 @@ pub trait Version: Send + Sync {
 
     /// Whether this version is a pre-release (alpha, beta, rc, etc.).
     ///
-    /// Default implementation checks for common pre-release patterns.
+    /// Default implementation checks for common pre-release patterns via
+    /// [`has_default_prerelease_marker`].
     fn is_prerelease(&self) -> bool {
-        let v = self.version_string().to_lowercase();
-        v.contains("-alpha")
-            || v.contains("-beta")
-            || v.contains("-rc")
-            || v.contains("-dev")
-            || v.contains("-pre")
-            || v.contains("-snapshot")
-            || v.contains("-canary")
-            || v.contains("-nightly")
+        has_default_prerelease_marker(self.version_string())
     }
 
     /// Available feature flags (empty if not supported by ecosystem).

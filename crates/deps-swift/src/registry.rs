@@ -436,11 +436,13 @@ fn tags_to_versions(tags: Vec<GithubTag>) -> Vec<SwiftVersion> {
         .filter_map(|tag| {
             let name = normalize_tag(&tag.name).to_string();
             let parsed = semver::Version::parse(&name).ok()?;
+            let prerelease = !parsed.pre.is_empty();
             Some((
                 SwiftVersion {
                     version: name,
                     yanked: false,
                     published_at: None,
+                    prerelease,
                 },
                 parsed,
             ))
@@ -1025,11 +1027,13 @@ mod tests {
                 version: "2.0.0".into(),
                 yanked: false,
                 published_at: None,
+                prerelease: false,
             }),
             Box::new(SwiftVersion {
                 version: "1.0.0".into(),
                 yanked: false,
                 published_at: None,
+                prerelease: false,
             }),
         ];
         let req = VersionReq::new("^1.0.0");
@@ -1182,6 +1186,7 @@ mod tests {
             version: "1.0.0".into(),
             yanked: false,
             published_at: None,
+            prerelease: false,
         }];
         let published = PublishTime::parse_rfc3339("2026-01-02T08:56:05Z").unwrap();
         let dates = HashMap::from([("1.0.0".to_string(), published)]);
@@ -1195,6 +1200,7 @@ mod tests {
             version: "1.0.0".into(),
             yanked: false,
             published_at: None,
+            prerelease: false,
         }];
         let dates = HashMap::new();
         attach_publish_times(&mut versions, &dates);
@@ -1209,6 +1215,7 @@ mod tests {
             version: "1.0".into(),
             yanked: false,
             published_at: None,
+            prerelease: false,
         }];
         let published = PublishTime::parse_rfc3339("2026-01-02T08:56:05Z").unwrap();
         let dates = HashMap::from([("1.0.0".to_string(), published)]);
