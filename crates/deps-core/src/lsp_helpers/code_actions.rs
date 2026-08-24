@@ -7,7 +7,7 @@ use crate::{Dependency, ParseResult, Registry, VersionReq};
 use super::{
     EcosystemFormatter, LineOffsetTable, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData,
     is_safe_version_string, literal_span_matches, requirement_is_unsatisfiable, single_file_edit,
-    slice_for_range, strip_whitespace,
+    slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
@@ -55,6 +55,11 @@ fn build_vulnerability_fix_action(
     let fix = dv.recommended_fix()?;
     let version_native = formatter.osv_version_to_native(&fix.version);
     if !is_safe_version_string(&version_native) {
+        warn_rejected_value(
+            "is_safe_version_string",
+            "vulnerability fix code action",
+            &version_native,
+        );
         return None;
     }
     // Computed before the N1 guard below against the *same* formatting the
@@ -193,6 +198,11 @@ fn build_unsatisfiable_fix_action(
 
     let latest = package_versions.latest.clone();
     if !is_safe_version_string(&latest) {
+        warn_rejected_value(
+            "is_safe_version_string",
+            "unsatisfiable-requirement fix code action",
+            &latest,
+        );
         return None;
     }
     let new_text = formatter.format_version_replacing(&latest, version_req.as_str());
@@ -440,6 +450,11 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         let display_items = prepare_version_display_items(registry_versions, dep.name());
         for item in display_items {
             if !is_safe_version_string(&item.version) {
+                warn_rejected_value(
+                    "is_safe_version_string",
+                    "update-to-version refactor code action",
+                    &item.version,
+                );
                 continue;
             }
             let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());

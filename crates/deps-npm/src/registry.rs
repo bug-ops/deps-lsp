@@ -8,7 +8,10 @@
 
 use crate::types::{NpmPackage, NpmVersion};
 use dashmap::DashMap;
-use deps_core::{DepsError, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result};
+use deps_core::{
+    DepsError, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, is_dot_segment,
+    lsp_helpers::warn_rejected_value,
+};
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
@@ -88,6 +91,19 @@ pub fn package_url(name: &str) -> String {
         );
     }
     format!("{}/{}", NPMJS_URL, urlencoding::encode(name))
+}
+
+/// Whether `name` (a bare package name, or `@scope/pkg` scoped form) has a path segment
+/// that is exactly `.` or `..` once split the same way [`versions_url`] splits it. See
+/// [`deps_core::lsp_helpers::is_dot_segment`]'s doc for why this must be rejected rather
+/// than encoded (#341).
+fn has_dot_segment(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix('@')
+        && let Some((scope, pkg)) = rest.split_once('/')
+    {
+        return is_dot_segment(scope) || is_dot_segment(pkg);
+    }
+    is_dot_segment(name)
 }
 
 /// Builds the npm registry request URL for a package's version metadata.
@@ -212,6 +228,10 @@ impl NpmRegistry {
     /// - Response body is invalid UTF-8
     /// - JSON parsing fails
     /// - Package does not exist
+    /// - `name`'s scope or package segment is exactly `.` or `..` (#341) — rejected as
+    ///   [`DepsError::PackageNotFound`] rather than encoded, since percent-encoding alone
+    ///   does not stop the URL parser's dot-segment normalization from retargeting the
+    ///   request
     ///
     /// # Examples
     ///
@@ -229,6 +249,14 @@ impl NpmRegistry {
     /// # }
     /// ```
     pub async fn get_versions(&self, name: &str) -> Result<Vec<NpmVersion>> {
+        if has_dot_segment(name) {
+            warn_rejected_value("npm_dot_segment_guard", "npm packument request URL", name);
+            return Err(DepsError::PackageNotFound {
+                package: name.to_string(),
+                registry: REGISTRY,
+            });
+        }
+
         let url = versions_url(&self.registry_base, name);
         let data = self
             .cache
@@ -806,6 +834,71 @@ mod tests {
         assert!(!url.contains("/../"));
         assert!(!url.contains('?'));
         assert!(!url.contains('#'));
+    }
+
+    // --- #341: `.`/`..` path segments survive percent-encoding and are collapsed by the
+    // URL parser's own dot-segment normalization, which a raw `!url.contains(...)` check
+    // (as used by the tests above) cannot detect. These assert on the *parsed* URL.
+
+    /// Demonstrates the vulnerability `has_dot_segment` exists to prevent: `versions_url`
+    /// alone (with no caller-side guard) builds a URL that, once parsed, has already lost
+    /// the package segment — `@a/..` normalizes away to the registry root instead of a
+    /// 404 for a literal package named `..`.
+    #[test]
+    fn test_versions_url_scoped_dot_dot_segment_normalizes_to_registry_root() {
+        let url = versions_url(REGISTRY_BASE, "@a/..");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.path(), "/", "parsed path: {}", parsed.path());
+    }
+
+    #[test]
+    fn test_versions_url_bare_dot_dot_normalizes_to_registry_root() {
+        let url = versions_url(REGISTRY_BASE, "..");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.path(), "/", "parsed path: {}", parsed.path());
+    }
+
+    #[test]
+    fn test_has_dot_segment_rejects_scoped_dot_dot_package() {
+        assert!(has_dot_segment("@a/.."));
+    }
+
+    #[test]
+    fn test_has_dot_segment_rejects_scoped_dot_package() {
+        assert!(has_dot_segment("@a/."));
+    }
+
+    #[test]
+    fn test_has_dot_segment_rejects_bare_dot_dot() {
+        assert!(has_dot_segment(".."));
+    }
+
+    #[test]
+    fn test_has_dot_segment_accepts_normal_names() {
+        assert!(!has_dot_segment("express"));
+        assert!(!has_dot_segment("@types/node"));
+        assert!(!has_dot_segment("left-pad"));
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_rejects_bare_dot_dot_as_not_found() {
+        let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry.get_versions("..").await.unwrap_err();
+        assert!(err.is_not_found());
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_rejects_scoped_dot_dot_package_as_not_found() {
+        let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry.get_versions("@a/..").await.unwrap_err();
+        assert!(err.is_not_found());
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_rejects_scoped_dot_package_as_not_found() {
+        let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry.get_versions("@a/.").await.unwrap_err();
+        assert!(err.is_not_found());
     }
 
     #[test]

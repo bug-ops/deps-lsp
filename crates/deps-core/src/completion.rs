@@ -40,7 +40,7 @@
 //! }
 //! ```
 
-use crate::lsp_helpers::{escape_markdown, is_safe_version_string};
+use crate::lsp_helpers::{escape_markdown, is_safe_version_string, warn_rejected_value};
 use crate::{
     FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
     format_relative_age,
@@ -864,7 +864,17 @@ pub async fn complete_versions_generic(
         // `is_safe_version_string`'s doc comment) — a completion item's
         // `insert_text`/`text_edit` is a manifest-write sink too, and fires on
         // ordinary typing rather than a quickfix click.
-        .filter(|item| is_safe_version_string(&item.version))
+        .filter(|item| {
+            let safe = is_safe_version_string(&item.version);
+            if !safe {
+                warn_rejected_value(
+                    "is_safe_version_string",
+                    "version completion item",
+                    &item.version,
+                );
+            }
+            safe
+        })
         .map(|item| build_version_completion(item, None, now, freshness.enabled))
         .collect()
 }

@@ -1058,6 +1058,32 @@ pub trait EcosystemFormatter: Send + Sync {
     }
 }
 
+/// Whether `segment` is exactly `.` or `..`.
+///
+/// Unlike ordinary path characters, a literal `.`/`..` segment is not neutralized by
+/// percent-encoding: `.` is an unreserved character (RFC 3986), so `urlencoding::encode`
+/// leaves it untouched, and the URL parser's dot-segment removal (RFC 3986 §5.2.4) still
+/// collapses it after encoding — `%2E` decodes back to `.` before that normalization runs.
+/// A registry-fetch URL built as `{base}/{prefix}/{name}` (no fixed suffix after `name`)
+/// must reject a `name`/path segment satisfying this predicate rather than encode it,
+/// since encoding alone does not stop the collapse (#341, #349).
+///
+/// Shared by `deps-npm`'s scope/package segment guard and `deps-dart`'s package-name
+/// guard — both ecosystems' registry APIs key a fetch on a bare, suffix-less path segment.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::is_dot_segment;
+///
+/// assert!(is_dot_segment(".."));
+/// assert!(is_dot_segment("."));
+/// assert!(!is_dot_segment("left-pad"));
+/// ```
+pub fn is_dot_segment(segment: &str) -> bool {
+    segment == "." || segment == ".."
+}
+
 /// Whether `version` is safe to embed in a manifest [`TextEdit`] or completion item.
 ///
 /// Guards every call into
@@ -1110,14 +1136,18 @@ pub fn is_safe_version_string(version: &str) -> bool {
 /// type distinct from a version string (see [`is_safe_version_string`]'s doc comment for
 /// why version-derived and non-version-derived sinks each get their own allowlist).
 ///
-/// An allowlist, not a denylist: `segment` must be non-empty, at most 128 bytes, and
-/// contain only `[A-Za-z0-9._-]` — the character set real Maven Central group ids
-/// (reverse-DNS style, e.g. `org.apache.commons`) and artifact ids (hyphen/underscore
-/// separated, e.g. `commons-lang3`) use. Deliberately excludes `:` — the
-/// `groupId:artifactId` separator — because this validates one already-split coordinate
-/// field at a time, never the joined pair. Failing closed on an unrecognized character
-/// (e.g. `<`, `"`, a newline) keeps a malicious/compromised search result from
-/// restructuring the pom.xml it's inserted into.
+/// An allowlist, not a denylist: `segment` must be non-empty, at most 128 bytes, not
+/// exactly `.`/`..` (see [`is_dot_segment`]), and contain only `[A-Za-z0-9._-]` — the
+/// character set real Maven Central group ids (reverse-DNS style, e.g.
+/// `org.apache.commons`) and artifact ids (hyphen/underscore separated, e.g.
+/// `commons-lang3`) use. Deliberately excludes `:` — the `groupId:artifactId` separator —
+/// because this validates one already-split coordinate field at a time, never the joined
+/// pair. Failing closed on an unrecognized character (e.g. `<`, `"`, a newline) keeps a
+/// malicious/compromised search result from restructuring the pom.xml it's inserted into;
+/// the dedicated `.`/`..` rejection closes the same dot-segment URL-normalization gap
+/// [`is_dot_segment`] guards elsewhere (`artifactId` reaches a registry-fetch URL as a bare
+/// path segment in `deps-maven::registry::metadata_urls`, unlike `groupId`, whose `.`→`/`
+/// expansion can never itself produce a literal `..` component).
 ///
 /// # Examples
 ///
@@ -1127,10 +1157,12 @@ pub fn is_safe_version_string(version: &str) -> bool {
 /// assert!(is_safe_maven_coordinate_segment("org.apache.commons"));
 /// assert!(is_safe_maven_coordinate_segment("commons-lang3"));
 /// assert!(!is_safe_maven_coordinate_segment("commons</artifactId><parent>"));
+/// assert!(!is_safe_maven_coordinate_segment(".."));
 /// ```
 pub fn is_safe_maven_coordinate_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= 128
+        && !is_dot_segment(segment)
         && segment
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
@@ -1244,6 +1276,40 @@ pub fn is_safe_package_name(name: &str) -> bool {
         && name.chars().all(|c| {
             c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | ':' | '/' | '-' | '~')
         })
+}
+
+/// Logs a `tracing::warn!` for a value rejected by an `is_safe_*` predicate (or an
+/// equivalent value-rejecting gate) before it reaches a manifest edit or registry URL.
+///
+/// Deliberately logs only `value`'s byte length, never its content: `value` is
+/// registry-controlled and, by construction, already failed an allowlist — logging it
+/// verbatim at `warn` would let a malicious/compromised registry response inject arbitrary
+/// content into this project's own log stream (a second-order log-injection concern),
+/// mirroring why `deps-pypi`'s `truncate_for_log` bounds a logged excerpt instead of
+/// logging a value verbatim. This is this helper's own contract, not a claim that every
+/// `tracing` call site in the workspace avoids logging a raw value — e.g. `deps-lsp`'s
+/// `deps-lsp.updateVersion` handler and an OSV malformed-`fixed`-version warning predate
+/// this helper and log their rejected value directly; they are unrelated call sites, not a
+/// place this helper is used.
+///
+/// `gate` names the predicate/guard that rejected `value` (e.g.
+/// `"is_safe_maven_coordinate_segment"`); `context` is a short description of the call site
+/// (e.g. `"maven groupId completion"`).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::warn_rejected_value;
+///
+/// warn_rejected_value("is_safe_version_string", "code lens latest version", "1.0.0\"; evil");
+/// ```
+pub fn warn_rejected_value(gate: &str, context: &str, value: &str) {
+    tracing::warn!(
+        gate,
+        context,
+        len = value.len(),
+        "rejected unsafe value before manifest/registry sink"
+    );
 }
 
 /// Builds a single-entry [`WorkspaceEdit::changes`] map replacing `range` in `uri`

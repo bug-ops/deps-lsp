@@ -8,7 +8,7 @@ use deps_core::EcosystemId;
 use deps_core::completion::COMPLETION_SEARCH_TIMEOUT;
 use deps_core::{
     is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,
-    is_safe_version_string,
+    is_safe_version_string, lsp_helpers::warn_rejected_value,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -641,10 +641,20 @@ fn create_package_completion_item(
     let description = metadata.description();
 
     if !is_safe_package_name(name.as_str()) {
+        warn_rejected_value(
+            "is_safe_package_name",
+            "package name completion item",
+            name.as_str(),
+        );
         return None;
     }
 
     if !latest.is_empty() && !is_safe_version_string(latest) {
+        warn_rejected_value(
+            "is_safe_version_string",
+            "package name completion item",
+            latest,
+        );
         return None;
     }
 
@@ -668,9 +678,22 @@ fn create_package_completion_item(
                 Some((group_id, artifact_id)) => (Some(group_id), artifact_id),
                 None => (None, name.as_str()),
             };
-            if !is_safe_maven_coordinate_segment(artifact_id)
-                || group_id.is_some_and(|g| !is_safe_maven_coordinate_segment(g))
+            if !is_safe_maven_coordinate_segment(artifact_id) {
+                warn_rejected_value(
+                    "is_safe_maven_coordinate_segment",
+                    "maven package name completion item",
+                    artifact_id,
+                );
+                return None;
+            }
+            if let Some(g) = group_id
+                && !is_safe_maven_coordinate_segment(g)
             {
+                warn_rejected_value(
+                    "is_safe_maven_coordinate_segment",
+                    "maven package name completion item",
+                    g,
+                );
                 return None;
             }
             group_id.map_or_else(
@@ -686,6 +709,11 @@ fn create_package_completion_item(
                 .repository()
                 .map_or_else(|| format!("https://github.com/{name}"), str::to_string);
             if !is_safe_registry_url(&url) {
+                warn_rejected_value(
+                    "is_safe_registry_url",
+                    "swift package name completion item",
+                    &url,
+                );
                 return None;
             }
             if latest.is_empty() {

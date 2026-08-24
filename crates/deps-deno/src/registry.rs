@@ -779,6 +779,23 @@ mod tests {
         ));
     }
 
+    /// #341: the `npm:` arm forwards the bare name straight to `NpmRegistry::get_versions`
+    /// via `Registry::get_versions` (UFCS), so npm's own dot-segment guard is reached
+    /// without any deno-side change — `unreachable_npm` proves this by construction: a
+    /// dot-segment name must fail before any network call, not merely fail eventually.
+    #[tokio::test]
+    async fn test_deno_registry_get_versions_rejects_dot_segment_npm_package() {
+        let cache = Arc::new(HttpCache::new());
+        let npm = unreachable_npm(Arc::clone(&cache));
+        let registry = DenoRegistry::with_npm(cache, npm);
+
+        let Err(err) = Registry::get_versions(&registry, &PackageName::new("npm:@a/..")).await
+        else {
+            panic!("expected an error for a dot-segment npm: package name");
+        };
+        assert!(err.is_not_found());
+    }
+
     #[tokio::test]
     async fn test_deno_registry_get_versions_dispatches_jsr_via_mock() {
         let mut server = mockito::Server::new_async().await;

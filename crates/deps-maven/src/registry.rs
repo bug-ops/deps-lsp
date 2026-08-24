@@ -7,7 +7,10 @@ use crate::types::{ArtifactInfo, MavenVersion};
 use crate::version::compare_versions;
 use bytes::Bytes;
 use dashmap::DashMap;
-use deps_core::{DepsError, HttpCache, PublishTime, Result};
+use deps_core::{
+    DepsError, HttpCache, PublishTime, Result, is_safe_maven_coordinate_segment,
+    lsp_helpers::warn_rejected_value,
+};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use serde::Deserialize;
@@ -549,10 +552,33 @@ where
 ///
 /// Non-Google packages get two URLs: Maven Central (primary) and Gradle Plugin Portal (fallback).
 /// Google-hosted packages get only the Google Maven URL — they are not mirrored elsewhere.
+///
+/// Returns an empty list (treated by [`MavenCentralRegistry::get_metadata`] the same as a
+/// malformed `groupId:artifactId` pair, i.e. no versions found) when either coordinate
+/// segment fails [`is_safe_maven_coordinate_segment`] — a `groupId`/`artifactId` containing
+/// `../` (or other path-breakout characters) must never reach the `.`→`/` replace and URL
+/// construction below, since `group_path`/`artifact_id` are interpolated into the request
+/// URL unescaped (#349).
 fn metadata_urls(name: &str) -> Vec<String> {
     let Some((group_id, artifact_id)) = name.split_once(':') else {
         return vec![];
     };
+    if !is_safe_maven_coordinate_segment(group_id) {
+        warn_rejected_value(
+            "is_safe_maven_coordinate_segment",
+            "maven metadata URL groupId",
+            group_id,
+        );
+        return vec![];
+    }
+    if !is_safe_maven_coordinate_segment(artifact_id) {
+        warn_rejected_value(
+            "is_safe_maven_coordinate_segment",
+            "maven metadata URL artifactId",
+            artifact_id,
+        );
+        return vec![];
+    }
     let group_path = group_id.replace('.', "/");
     let primary_base = repo_base_for_group(group_id);
     let primary = format!("{primary_base}/{group_path}/{artifact_id}/maven-metadata.xml");
@@ -1009,6 +1035,66 @@ mod tests {
     #[test]
     fn test_metadata_urls_no_colon() {
         assert!(metadata_urls("bad").is_empty());
+    }
+
+    /// #349: `com.example:../../../admin` (confirmed live) must not escape the `maven2`
+    /// prefix via the artifact_id segment. The fix rejects the coordinate outright
+    /// (`is_safe_maven_coordinate_segment` gate) rather than attempting to
+    /// escape/percent-encode it, so the correct regression assertion is that *no* metadata
+    /// URL is built at all — there is structurally nothing left for a
+    /// `url::Url::parse` check to validate once the request itself is suppressed.
+    #[test]
+    fn test_metadata_urls_rejects_path_traversal_artifact_id() {
+        assert!(metadata_urls("com.example:../../../admin").is_empty());
+    }
+
+    /// #349: same guard, but the traversal sits in the groupId segment instead.
+    #[test]
+    fn test_metadata_urls_rejects_path_traversal_group_id() {
+        assert!(metadata_urls("../../../admin:artifact").is_empty());
+    }
+
+    /// M1 (impl-critic): a literal `..` artifactId is made only of otherwise-allowed
+    /// characters (`is_safe_maven_coordinate_segment`'s charset permits `.`), so it used to
+    /// slip past the gate even though it is not a real Maven coordinate segment —
+    /// `metadata_urls("com.example:..")` collapsed to `/maven2/com/maven-metadata.xml`,
+    /// dropping the `example`/artifactId path components via dot-segment normalization.
+    /// Confined to the `maven2` prefix (not a breakout, per the critique), but must still
+    /// be rejected outright like any other dot-segment gate in this PR.
+    #[test]
+    fn test_metadata_urls_rejects_literal_dot_dot_artifact_id() {
+        assert!(metadata_urls("com.example:..").is_empty());
+        assert!(metadata_urls("a:..").is_empty());
+    }
+
+    /// M1: same guard for a literal `.` artifactId/groupId.
+    #[test]
+    fn test_metadata_urls_rejects_literal_dot_segment() {
+        assert!(metadata_urls("com.example:.").is_empty());
+        assert!(metadata_urls(".:artifact").is_empty());
+    }
+
+    /// #349: a legitimate coordinate must still resolve to a URL confined to the
+    /// `maven2` (or Gradle Plugin Portal) prefix — verified structurally via
+    /// `url::Url::parse`, not a raw-string `contains` check, so a future regression that
+    /// reintroduces unescaped interpolation without breaking the existing exact-string
+    /// tests would still be caught here.
+    #[test]
+    fn test_metadata_urls_parsed_url_stays_within_maven2_prefix() {
+        let urls = metadata_urls("org.apache.commons:commons-lang3");
+        let parsed = url::Url::parse(&urls[0]).unwrap();
+        let segments: Vec<&str> = parsed.path_segments().unwrap().collect();
+        assert_eq!(
+            segments,
+            vec![
+                "maven2",
+                "org",
+                "apache",
+                "commons",
+                "commons-lang3",
+                "maven-metadata.xml"
+            ]
+        );
     }
 
     #[test]

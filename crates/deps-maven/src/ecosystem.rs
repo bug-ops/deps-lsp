@@ -8,7 +8,8 @@ use tower_lsp_server::ls_types::{
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_maven_coordinate_segment,
-    lsp_helpers::EcosystemFormatter, position_in_range,
+    lsp_helpers::{EcosystemFormatter, warn_rejected_value},
+    position_in_range,
 };
 
 use crate::formatter::MavenFormatter;
@@ -60,6 +61,11 @@ fn build_field_completion(
     };
 
     if !is_safe_maven_coordinate_segment(&value) {
+        warn_rejected_value(
+            "is_safe_maven_coordinate_segment",
+            "maven coordinate field completion",
+            &value,
+        );
         return None;
     }
 
