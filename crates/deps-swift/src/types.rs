@@ -17,6 +17,12 @@ pub struct SwiftDependency {
     pub version_req: Option<deps_core::VersionReq>,
     /// LSP range of the version string content (excluding quotes), None for non-registry deps
     pub version_range: Option<Range>,
+    /// The bare literal text `version_range` spans (e.g. `"4.50.0"`), when it differs from
+    /// `version_req` — every registry-form syntax synthesizes a comparator requirement
+    /// (`.exact("4.50.0")` -> `"=4.50.0"`, `.upToNextMajor(from: "4.77.0")` ->
+    /// `">=4.77.0, <5.0.0"`) that never matches the bare literal text at `version_range`.
+    /// `None` for branch/revision/path deps, which have no `version_range` to guard.
+    pub version_literal: Option<String>,
     /// Original Git URL from Package.swift
     pub url: String,
     /// Dependency source (registry, git, or path)
@@ -42,6 +48,10 @@ impl deps_core::ecosystem::Dependency for SwiftDependency {
 
     fn source(&self) -> DependencySource {
         self.source.clone()
+    }
+
+    fn version_literal(&self) -> Option<&str> {
+        self.version_literal.as_deref()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -142,6 +152,7 @@ mod tests {
             name_range: Range::new(Position::new(0, 0), Position::new(0, 15)),
             version_req: Some(">=2.0.0, <3.0.0".into()),
             version_range: Some(Range::new(Position::new(0, 20), Position::new(0, 27))),
+            version_literal: Some("2.0.0".into()),
             url: "https://github.com/apple/swift-nio.git".into(),
             source: DependencySource::Registry,
         };

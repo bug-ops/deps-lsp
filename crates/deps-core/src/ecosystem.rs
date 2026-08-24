@@ -211,6 +211,38 @@ pub trait Dependency: Send + Sync {
         None
     }
 
+    /// The raw manifest text spanned by [`version_range`](Dependency::version_range),
+    /// when it differs from [`version_requirement`](Dependency::version_requirement).
+    ///
+    /// Most ecosystems' `version_requirement()` is (up to whitespace) exactly the text at
+    /// `version_range()`, so the default `None` — telling callers to fall back to
+    /// `version_requirement()` — is correct for them. An ecosystem whose parser synthesizes
+    /// a comparator string from a bare literal (e.g. `deps-swift`'s `.exact("4.50.0")`
+    /// becoming requirement `"=4.50.0"` while `version_range()` still spans only `4.50.0`)
+    /// overrides this to return that literal, so `lsp_helpers`' literal-span guard
+    /// (`literal_span_matches`, used by both `generate_code_actions` and
+    /// `collect_update_all_edits`) compares `version_range`'s slice against the text it was
+    /// actually derived from instead of the synthesized comparator, which would otherwise
+    /// never match and silently suppress every fix action for that dependency.
+    ///
+    /// A sibling mechanism already exists for the same underlying problem: `deps-nuget`
+    /// wraps a bare source version as requirement `[1.0.0]`, and `literal_span_matches`
+    /// special-cases that bracket wrapping inline rather than going through this hook. This
+    /// method exists for the general case — an ecosystem whose synthesized requirement is
+    /// not a simple wrap (`deps-swift`'s comparator range is not recoverable from
+    /// `version_requirement()` by stripping fixed characters) needs its own literal, not a
+    /// transform `literal_span_matches` could hard-code.
+    ///
+    /// **Must not** be set when `version_range()` spans only part of a multi-literal
+    /// requirement whose other part(s) are not being rewritten — e.g. a `"lower"..<"upper"`
+    /// range, where `version_range()` covers only `lower`. Reporting `lower` as the literal
+    /// would let the guard pass and an edit rewrite `lower` alone, corrupting the
+    /// requirement (`deps-swift` leaves this `None` for both its range-literal forms for
+    /// exactly this reason — see `crates/deps-swift/src/parser.rs`'s range-form comments).
+    fn version_literal(&self) -> Option<&str> {
+        None
+    }
+
     /// Downcast to concrete type
     fn as_any(&self) -> &dyn Any;
 }

@@ -6,7 +6,9 @@
 use crate::types::{SwiftPackage, SwiftVersion};
 use bytes::Bytes;
 use dashmap::DashMap;
-use deps_core::{DepsError, HttpCache, PublishTime, Result};
+use deps_core::{
+    DepsError, HttpCache, PublishTime, Result, is_dot_segment, lsp_helpers::warn_rejected_value,
+};
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
@@ -77,19 +79,30 @@ const MAX_MEMO_ENTRIES: usize = 256;
 
 /// Validates that `name` is a valid `owner/repo` GitHub identifier.
 ///
-/// Accepts characters `[a-zA-Z0-9._-]` in both owner and repo segments.
+/// Accepts characters `[a-zA-Z0-9._-]` in both owner and repo segments, and additionally
+/// rejects a segment that is exactly `.` or `..` (see [`is_dot_segment`]): both characters
+/// are allowed by the charset regex alone, but a segment of exactly `.`/`..` is not
+/// neutralized by URL construction the way other charset-allowed characters are — `name`
+/// reaches `get_versions`'s tags fetch and `release_dates`'s releases fetch
+/// (`{api_base}/repos/{name}/...`) as a bare path segment, so a repo half of `..` retargets
+/// the request one path segment up (#357), mirroring the same class of gap `deps-npm` and
+/// `deps-dart` already close for their own bare-segment registry fetches.
+///
+/// Delegates the shape check to [`crate::is_valid_github_identity`], shared with
+/// `formatter::is_valid_owner_repo`'s display-URL gate, so the two can't drift apart on
+/// what counts as valid.
 fn validate_owner_repo(name: &str) -> Result<()> {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$").expect("hardcoded regex is valid")
-    });
-    if re.is_match(name) {
-        Ok(())
-    } else {
-        Err(DepsError::InvalidUri(format!(
-            "invalid owner/repo format: '{name}'"
-        )))
+    if crate::is_valid_github_identity(name) {
+        return Ok(());
     }
+    if let Some((owner, repo)) = name.split_once('/')
+        && (is_dot_segment(owner) || is_dot_segment(repo))
+    {
+        warn_rejected_value("is_dot_segment", "GitHub owner/repo request URL", name);
+    }
+    Err(DepsError::InvalidUri(format!(
+        "invalid owner/repo format: '{name}'"
+    )))
 }
 
 /// One memoized `/releases` lookup for a single package.
@@ -795,6 +808,21 @@ mod tests {
         assert!(validate_owner_repo("owner/repo/extra").is_err());
         assert!(validate_owner_repo("owner/ repo").is_err());
         assert!(validate_owner_repo("").is_err());
+    }
+
+    #[test]
+    fn test_validate_owner_repo_rejects_dot_segment_repo() {
+        // Regression for #357: the charset regex alone allows `.`, so a repo half of
+        // exactly `..` previously passed — retargeting the tags/releases fetch one path
+        // segment up (`{api_base}/repos/{owner}/../releases` -> `{api_base}/repos/releases`).
+        assert!(validate_owner_repo("owner/..").is_err());
+        assert!(validate_owner_repo("owner/.").is_err());
+    }
+
+    #[test]
+    fn test_validate_owner_repo_rejects_dot_segment_owner() {
+        assert!(validate_owner_repo("../repo").is_err());
+        assert!(validate_owner_repo("./repo").is_err());
     }
 
     #[tokio::test]

@@ -76,8 +76,14 @@ fn build_vulnerability_fix_action(
     // `version_req` can be a normalized requirement string with spacing the
     // declared text and the freshly-formatted text don't agree on (e.g.
     // pep508's `>=1.7, <2.0` vs. a formatter's `>=1.7,<2.0`), which would
-    // otherwise let a whitespace-only edit slip past this guard.
-    if strip_whitespace(version_req) == strip_whitespace(&new_text) {
+    // otherwise let a whitespace-only edit slip past this guard. Compares
+    // against `dep.version_literal()` rather than `version_req` when the
+    // ecosystem provides one, mirroring `generate_code_actions`'s literal-span
+    // guard — for `deps-swift`, `version_req` is a synthesized comparator
+    // (`"=2.61.0"`) that never equals the bare-literal formatted text
+    // (`"2.61.0"`) even when the edit genuinely is a no-op.
+    let literal_target = dep.version_literal().unwrap_or(version_req);
+    if strip_whitespace(literal_target) == strip_whitespace(&new_text) {
         return None;
     }
 
@@ -207,7 +213,11 @@ fn build_unsatisfiable_fix_action(
     }
     let new_text = formatter.format_version_replacing(&latest, version_req.as_str());
 
-    if strip_whitespace(version_req.as_str()) == strip_whitespace(&new_text) {
+    // Mirrors `build_vulnerability_fix_action`'s N1 guard: compares against
+    // `dep.version_literal()` rather than `version_req` when the ecosystem provides one,
+    // so a synthesized comparator requirement doesn't mask a genuine no-op edit.
+    let literal_target = dep.version_literal().unwrap_or(version_req.as_str());
+    if strip_whitespace(literal_target) == strip_whitespace(&new_text) {
         return None;
     }
 
@@ -248,12 +258,14 @@ fn build_unsatisfiable_fix_action(
 /// immediately if no dependency is at `position`, it has no `version_range`
 /// to edit, it has no declared (or an empty) `version_requirement`, or the
 /// **literal-span guard** rejects it — `content` sliced over `version_range`
-/// no longer holds the literal requirement text (see `literal_span_matches`,
-/// e.g. a Maven `${property}` reference, a Gradle DSL variable/alias, or a
-/// synthesized comparator's lower bound). Writing a `TextEdit` at that range
-/// would corrupt the manifest instead of fixing it, so this mirrors the
-/// guard `collect_update_all_edits` already applies on the bulk-edit path,
-/// and gates every kind of action below since any of them could write there.
+/// no longer holds the literal text (see `literal_span_matches`, compared
+/// against [`Dependency::version_literal`] when the ecosystem provides one,
+/// falling back to `version_requirement` otherwise — e.g. a Maven
+/// `${property}` reference or a Gradle DSL variable/alias). Writing a
+/// `TextEdit` at that range would corrupt the manifest instead of fixing it,
+/// so this mirrors the guard `collect_update_all_edits` already applies on
+/// the bulk-edit path, and gates every kind of action below since any of
+/// them could write there.
 ///
 /// Otherwise returns up to three kinds of action, in this order:
 ///
@@ -359,12 +371,18 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 
     let line_offsets = LineOffsetTable::new(content);
     let slice = slice_for_range(content, &line_offsets, version_range);
-    if !literal_span_matches(slice, version_req.as_str()) {
-        // `version_range` no longer slices to the declared requirement text
-        // (e.g. a Maven `${property}`, a Gradle DSL variable/alias, or a
-        // synthesized comparator's lower bound) — writing a TextEdit there
-        // would corrupt the manifest instead of fixing it. Mirrors the guard
-        // `collect_update_all_edits` already applies on the bulk-edit path.
+    let literal_target = dep
+        .version_literal()
+        .unwrap_or_else(|| version_req.as_str());
+    if !literal_span_matches(slice, literal_target) {
+        // `version_range` no longer slices to the declared literal text (e.g. a Maven
+        // `${property}` or a Gradle DSL variable/alias) — writing a TextEdit there would
+        // corrupt the manifest instead of fixing it. Mirrors the guard
+        // `collect_update_all_edits` already applies on the bulk-edit path. Compares
+        // against `dep.version_literal()` rather than `version_req` when the ecosystem
+        // provides one (see that method's doc) — an ecosystem that synthesizes its
+        // requirement from a bare literal (e.g. `deps-swift`) would otherwise always fail
+        // this guard even though `version_range` correctly spans the literal.
         return actions;
     }
 
@@ -428,16 +446,21 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     }
 
     // De-duplicates every REFACTOR action's formatted edit text against the declared
-    // requirement, both fix actions' edits (if present), and every REFACTOR action already
+    // literal text, both fix actions' edits (if present), and every REFACTOR action already
     // emitted below, so no two actions in the response — nor a REFACTOR action and a fix
     // action above — ever carry a byte-identical `WorkspaceEdit`. Seeding with the
-    // declared requirement subsumes the former N1 guard (an item whose formatted text
+    // declared literal text subsumes the former N1 guard (an item whose formatted text
     // equals the declared text is a no-op); checking formatted text rather than raw
     // version also subsumes the former `item.version == fix_version_native` check, since
     // `format_version_replacing` is deterministic in its inputs. Whitespace-insensitive,
-    // matching every other no-op guard in this crate (see `strip_whitespace`).
+    // matching every other no-op guard in this crate (see `strip_whitespace`). Seeded with
+    // `literal_target` (not `version_req`) for the same reason the guard above compares
+    // against it: for an ecosystem synthesizing its requirement from a bare literal (e.g.
+    // `deps-swift`), `version_req` never equals the formatted edit text even when the edit
+    // genuinely is a no-op (`.exact("2.61.0")` declares `version_req` `"=2.61.0"`, but the
+    // manifest text — and any freshly-formatted "update to 2.61.0" text — is `"2.61.0"`).
     let mut emitted_texts: HashSet<String> = HashSet::new();
-    emitted_texts.insert(strip_whitespace(version_req.as_str()));
+    emitted_texts.insert(strip_whitespace(literal_target));
     if let Some(fix_text) = fix_new_text {
         emitted_texts.insert(fix_text);
     }
@@ -1491,6 +1514,62 @@ mod tests {
             }
         }
 
+        /// Mirrors `deps-swift`'s `SwiftDependency`: `version_req` is a synthesized
+        /// comparator string, `version_range` spans only the bare literal it was
+        /// synthesized from, and `version_literal` (unlike [`CaDep`], which relies on
+        /// the trait's default `None`) carries that literal so the guard compares
+        /// against it instead of `version_req` (#367).
+        struct CaLiteralDep {
+            name: PackageName,
+            version_req: Option<VersionReq>,
+            version_range: Option<Range>,
+            version_literal: Option<String>,
+        }
+
+        impl Dependency for CaLiteralDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::default()
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                self.version_req.as_ref()
+            }
+            fn version_range(&self) -> Option<Range> {
+                self.version_range
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn version_literal(&self) -> Option<&str> {
+                self.version_literal.as_deref()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct CaLiteralParseResult {
+            deps: Vec<CaLiteralDep>,
+            uri: Uri,
+        }
+
+        impl ParseResult for CaLiteralParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
         struct CaVersion {
             version: String,
             yanked: bool,
@@ -1707,6 +1786,80 @@ mod tests {
             .await;
 
             assert!(actions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_guard_rejects_synthesized_requirement_with_no_literal_override() {
+            // Reproduces #367: a synthesized comparator requirement (mirroring
+            // `deps-swift`'s `.upToNextMajor(from: "4.77.0")` -> `">=4.77.0, <5.0.0"`)
+            // whose `version_range` spans only the bare literal `4.77.0`. Without a
+            // `version_literal` override the guard compares the slice against the full
+            // comparator string and can never match, so no action is ever produced —
+            // the exact bug this issue reports.
+            let content = "4.77.0";
+            let dep = CaDep {
+                name: pkg("vapor"),
+                version_req: Some(VersionReq::new(">=4.77.0, <5.0.0")),
+                version_range: Some(range(0, 0, 0, 6)),
+            };
+            let pr = CaParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Package.swift"),
+            };
+            let position = Position::new(0, 0);
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                versions,
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(actions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_guard_accepts_synthesized_requirement_via_version_literal_override() {
+            // Fix for #367: same synthesized-requirement / bare-literal shape as
+            // `test_guard_rejects_synthesized_requirement_with_no_literal_override`, but
+            // `version_literal` now carries the bare literal the requirement was
+            // synthesized from — the guard must compare against that instead of
+            // `version_req` and accept the span.
+            let content = "4.77.0";
+            let dep = CaLiteralDep {
+                name: pkg("vapor"),
+                version_req: Some(VersionReq::new(">=4.77.0, <5.0.0")),
+                version_range: Some(range(0, 0, 0, 6)),
+                version_literal: Some("4.77.0".to_string()),
+            };
+            let pr = CaLiteralParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Package.swift"),
+            };
+            let position = Position::new(0, 0);
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &pr,
+                position,
+                pr.uri(),
+                versions,
+                content,
+                &CaRegistry,
+                &MockFormatter,
+            )
+            .await;
+
+            assert!(!actions.is_empty());
         }
     }
 
