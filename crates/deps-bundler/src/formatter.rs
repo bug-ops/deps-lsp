@@ -1,9 +1,40 @@
 //! Version formatting for Bundler ecosystem.
 
-use crate::version::{compare_versions, version_matches_requirement};
+use crate::version::{compare_versions, is_valid_rubygems_version, version_matches_requirement};
 use deps_core::PackageName;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
+
+/// Extracts the version operand of `requirement` for the operators whose
+/// [`version_matches_requirement`] branch evaluates `false` against every candidate on a
+/// malformed operand ("fails closed") rather than `true` against every candidate ("fails
+/// open"): `~>`, `<`, `<=`, `=`, and the bare/no-operator pin. Mirrors
+/// `version_matches_requirement`'s own operator dispatch order (`<=` checked before `<`) so
+/// a requirement is classified identically in both places.
+///
+/// Returns `None` for `>`, `>=`, `!=`, and `*` — confirmed live against RubyGems (#332
+/// critique) that a malformed operand for these instead makes every candidate match, which
+/// never triggers the "no version satisfies requirement" false positive this gates, so they
+/// need no validation here.
+fn fail_closed_operand(requirement: &str) -> Option<&str> {
+    let req = requirement.trim();
+    if req == "*" || req.starts_with(">=") || req.starts_with('>') || req.starts_with("!=") {
+        return None;
+    }
+    if let Some(rest) = req.strip_prefix("~>") {
+        return Some(rest.trim());
+    }
+    if let Some(rest) = req.strip_prefix("<=") {
+        return Some(rest.trim());
+    }
+    if let Some(rest) = req.strip_prefix('<') {
+        return Some(rest.trim());
+    }
+    if let Some(rest) = req.strip_prefix('=') {
+        return Some(rest.trim());
+    }
+    Some(req)
+}
 
 /// Rubygems requirement matcher, compiled once per dependency by
 /// [`BundlerFormatter::compile_requirement`]. `version_matches_requirement` is a hand-rolled
@@ -98,13 +129,24 @@ impl EcosystemFormatter for BundlerFormatter {
     /// Compiles `requirement` into a `RubygemsMatcher` using the same
     /// `version_matches_requirement` comparator as `version_satisfies_requirement` — Bundler
     /// requirements have no separate "loose" vs. "precise" form to distinguish, and
-    /// `version_matches_requirement` never fails to parse, so this always decides (`Some`).
-    /// The "could this requirement be satisfied by a version RubyGems hid" ambiguity is
-    /// handled separately in [`Self::requirement_is_undecidable_given_available`], which sees
-    /// `available` and can therefore decide it precisely instead of this method having to
-    /// guess from `requirement` alone.
+    /// `version_matches_requirement` never fails to parse, so this always decides (`Some`),
+    /// except when `fail_closed_operand` identifies `requirement` as one of the operator
+    /// shapes (`~>`, `<`, `<=`, `=`, bare) whose malformed-operand behavior fails closed
+    /// (matches no candidate) rather than open: with no up-front validation, that would
+    /// produce a misleading "no version satisfies requirement" diagnostic instead of
+    /// flagging the requirement itself as invalid, so this returns `None` for it instead,
+    /// matching the `is_valid_range`/`is_valid_requirement` precedent in Maven/Gradle/NuGet's
+    /// `compile_requirement` (#332). The "could this requirement be satisfied by a version
+    /// RubyGems hid" ambiguity is handled separately in
+    /// [`Self::requirement_is_undecidable_given_available`], which sees `available` and can
+    /// therefore decide it precisely instead of this method having to guess from
+    /// `requirement` alone.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        Some(Box::new(RubygemsMatcher(requirement.as_str().to_string())))
+        compile_requirement_unless(
+            requirement.as_str(),
+            |r| fail_closed_operand(r).is_some_and(|operand| !is_valid_rubygems_version(operand)),
+            RubygemsMatcher,
+        )
     }
 
     /// See `exact_pin_could_be_yanked` for the RubyGems-specific rationale and heuristic.
@@ -241,6 +283,81 @@ mod tests {
         assert!(
             formatter
                 .compile_requirement(&VersionReq::new("*"))
+                .is_some()
+        );
+    }
+
+    /// #332 regression: a syntactically malformed `~>` requirement must not compile into a
+    /// matcher — that would compare `false` against every candidate version and trigger a
+    /// misleading "no version satisfies requirement" diagnostic instead of one flagging the
+    /// requirement itself as invalid.
+    #[test]
+    fn test_compile_requirement_malformed_pessimistic_suppressed() {
+        let formatter = BundlerFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("~> abc"))
+                .is_none()
+        );
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("~>"))
+                .is_none()
+        );
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("~> "))
+                .is_none()
+        );
+    }
+
+    /// #332/S2 regression: `<`, `<=`, `=`, and a bare (no-operator) pin fail closed on a
+    /// malformed operand identically to `~>` — confirmed live against RubyGems (critic
+    /// finding S2), so the same suppression must apply to all four, not just `~>`.
+    #[test]
+    fn test_compile_requirement_malformed_other_fail_closed_operators_suppressed() {
+        let formatter = BundlerFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("< abc"))
+                .is_none()
+        );
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("<= abc"))
+                .is_none()
+        );
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("= abc"))
+                .is_none()
+        );
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("abc"))
+                .is_none()
+        );
+    }
+
+    /// #332/S2: `>`, `>=`, and `!=` fail *open* on a malformed operand (every candidate
+    /// matches), which never triggers the unsatisfiable false positive #332 exists to
+    /// prevent — so these must still compile, unlike the fail-closed operators above.
+    #[test]
+    fn test_compile_requirement_malformed_fail_open_operators_still_compile() {
+        let formatter = BundlerFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("> abc"))
+                .is_some()
+        );
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new(">= abc"))
+                .is_some()
+        );
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("!= abc"))
                 .is_some()
         );
     }
