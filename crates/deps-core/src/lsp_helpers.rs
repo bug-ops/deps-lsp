@@ -1285,6 +1285,15 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     })
 }
 
+/// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
+///
+/// Set by `generate_diagnostics_from_cache`, so `build_unsatisfiable_fix_action`'s
+/// stashed `CodeAction::data` can name it and the `deps-lsp` handler's diagnostic-binding
+/// step can match on it — the same mechanism `build_vulnerability_fix_action` uses with an
+/// advisory id, generalized to a constant since this diagnostic has no per-instance
+/// identifier.
+pub const UNSATISFIABLE_DIAGNOSTIC_CODE: &str = "unsatisfiable-requirement";
+
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
 /// bundled with the native-namespace version it targets so callers can dedup
 /// display items and check the registry's yank flag against it without
@@ -1393,13 +1402,122 @@ fn build_vulnerability_fix_action(
                 changes: Some(edits),
                 ..Default::default()
             }),
-            is_preferred: Some(true),
-            // Stashes the resolved advisory ids so the `deps-lsp` handler can
-            // bind this action to the matching client-supplied diagnostics
-            // (`CodeActionContext::diagnostics`) without deps-core needing to
-            // know about LSP request context — cleared by the handler once
-            // consumed.
-            data: Some(serde_json::json!({ "advisory_ids": fix.advisory_ids })),
+            is_preferred: None,
+            // Stashes the resolved advisory ids, plus this action's own edit range, so the
+            // `deps-lsp` handler can bind this action to the matching client-supplied
+            // diagnostics (`CodeActionContext::diagnostics`) without deps-core needing to
+            // know about LSP request context — cleared by the handler once consumed. Shape
+            // shared with `build_unsatisfiable_fix_action`'s stashed payload: `bind_diagnostics`
+            // matches on `diagnostic_codes` regardless of which producer built the action.
+            data: Some(serde_json::json!({
+                "diagnostic_codes": fix.advisory_ids,
+                "diagnostic_range": version_range,
+            })),
+            ..Default::default()
+        },
+    })
+}
+
+/// The unsatisfiable-requirement quickfix built by [`build_unsatisfiable_fix_action`],
+/// bundled with the native-namespace target version it carries so callers can dedup
+/// display items and check the registry's yank flag against it, mirroring
+/// [`VulnerabilityFixAction`]'s shape.
+struct UnsatisfiableFixAction {
+    /// The cached `latest` version this action targets (see the function doc for why
+    /// this is the cached rather than the live value).
+    version_native: String,
+    /// The formatted edit text this action's own `TextEdit` writes, kept alongside it
+    /// for the same reason [`VulnerabilityFixAction::new_text`] is.
+    new_text: String,
+    action: CodeAction,
+}
+
+/// Builds the "fix unsatisfiable requirement" quickfix for `dep`, if its declared
+/// requirement currently matches no published version.
+///
+/// Mirrors [`build_vulnerability_fix_action`]'s shape: computed entirely from the cached
+/// `versions` snapshot and the dependency's declared requirement, before any registry
+/// fetch, so a registry outage never hides it (the same FR-007 rationale). Gated by
+/// [`requirement_is_unsatisfiable`] evaluated against the identical inputs
+/// [`generate_diagnostics_from_cache`] uses, so this action can never appear without —
+/// or be missing despite — the diagnostic it resolves.
+///
+/// Targets `versions.cached[..].latest`, the **cached** value, not a freshly fetched one:
+/// that is the exact value the diagnostic's "latest is X" message names, so the action's
+/// title and the diagnostic text agree on what "the latest" is. A display item further
+/// down in [`generate_code_actions`] built from the same call's *live* registry response
+/// can disagree with a stale cache, and that is accepted deliberately — see that
+/// function's doc comment.
+///
+/// The rewritten requirement is re-checked with the same predicate before the action is
+/// returned (`format_version_replacing` is overridden by `deps-pypi` and `deps-gradle` to
+/// preserve operator style, which can leave a rewritten range still unsatisfiable). This
+/// is best-effort, not a proof: [`requirement_is_unsatisfiable`] also returns `false` for
+/// a rewrite this ecosystem's matcher cannot evaluate at all (uncompilable or unresolved),
+/// so an unverifiable rewrite passes through unrejected. That is the safe direction — a
+/// rewrite this scan cannot judge is not evidence it is bad — but it means the guard holds
+/// only "for every rewrite the ecosystem can evaluate", not unconditionally.
+fn build_unsatisfiable_fix_action(
+    dep: &dyn Dependency,
+    uri: &Uri,
+    version_range: Range,
+    versions: VersionData<'_>,
+    version_req: &VersionReq,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<UnsatisfiableFixAction> {
+    if !dep.source().is_version_resolvable() {
+        return None;
+    }
+
+    let normalized_name = formatter.normalize_package_name(dep.name());
+    let package_versions = versions
+        .cached
+        .get(normalized_name.as_str())
+        .or_else(|| versions.cached.get(dep.name()))?;
+
+    if !requirement_is_unsatisfiable(formatter, version_req, &package_versions.available) {
+        return None;
+    }
+
+    let latest = package_versions.latest.clone();
+    let new_text = formatter.format_version_replacing(&latest, version_req.as_str());
+
+    if strip_whitespace(version_req.as_str()) == strip_whitespace(&new_text) {
+        return None;
+    }
+
+    let verification_req = VersionReq::new(new_text.clone());
+    if requirement_is_unsatisfiable(formatter, &verification_req, &package_versions.available) {
+        return None;
+    }
+
+    let mut edits = HashMap::new();
+    edits.insert(
+        uri.clone(),
+        vec![TextEdit {
+            range: version_range,
+            new_text: new_text.clone(),
+        }],
+    );
+
+    Some(UnsatisfiableFixAction {
+        version_native: latest.clone(),
+        new_text,
+        action: CodeAction {
+            title: format!("Fix unsatisfiable requirement: update to {latest}"),
+            kind: Some(CodeActionKind::QUICKFIX),
+            edit: Some(WorkspaceEdit {
+                changes: Some(edits),
+                ..Default::default()
+            }),
+            is_preferred: None,
+            // Same payload shape `build_vulnerability_fix_action` stashes — see that
+            // function's doc comment. This diagnostic has no per-instance id, so
+            // `diagnostic_codes` names the shared constant instead.
+            data: Some(serde_json::json!({
+                "diagnostic_codes": [UNSATISFIABLE_DIAGNOSTIC_CODE],
+                "diagnostic_range": version_range,
+            })),
             ..Default::default()
         },
     })
@@ -1417,9 +1535,9 @@ fn build_vulnerability_fix_action(
 /// synthesized comparator's lower bound). Writing a `TextEdit` at that range
 /// would corrupt the manifest instead of fixing it, so this mirrors the
 /// guard `collect_update_all_edits` already applies on the bulk-edit path,
-/// and gates *both* kinds of action below since either could write there.
+/// and gates every kind of action below since any of them could write there.
 ///
-/// Otherwise returns up to two kinds of action, in this order:
+/// Otherwise returns up to three kinds of action, in this order:
 ///
 /// 1. At most one `QUICKFIX` "fix vulnerability" action, if `versions`
 ///    carries an OSV scan result flagging this dependency and
@@ -1433,17 +1551,20 @@ fn build_vulnerability_fix_action(
 ///    the registry fetch that produces the plain list below fails. When the
 ///    fetch does succeed, a fix target the registry reports as yanked is
 ///    dropped rather than offered.
-/// 2. Up to five plain `REFACTOR` "update to `<version>`" actions, one per
+/// 2. At most one `QUICKFIX` "fix unsatisfiable requirement" action, computed the same
+///    registry-independent way (see the private `build_unsatisfiable_fix_action` helper
+///    just above) for the same FR-007 reason. If its rewritten text collides with the
+///    vulnerability fix's (both yank-filtered first), it is dropped in favor of the
+///    vulnerability fix, whose title is the more informative of the two.
+/// 3. Up to five plain `REFACTOR` "update to `<version>`" actions, one per
 ///    non-yanked version [`crate::completion::prepare_version_display_items`]
-///    selects from the registry response, and demoting `is_preferred` to
-///    `None` on all of them when a fix action is present, since only one
-///    preferred action is meaningful per response. Each action's edit text
+///    selects from the registry response. Each action's edit text
 ///    comes from [`EcosystemFormatter::format_version_replacing`], which
 ///    preserves the manifest's existing pin/operator style where an
 ///    ecosystem overrides it (e.g. PyPI's `==1.0.1` stays `==1.0.2` rather
 ///    than expanding to a `>=,<` range). Every entry's formatted edit text is
 ///    checked against a running set seeded with the declared requirement and
-///    the fix action's own formatted text (whitespace-insensitive); an entry
+///    the two fix actions' own formatted text (whitespace-insensitive); an entry
 ///    is skipped, and never added to the set, when its text is already
 ///    present. This is the common case, not a rare edge case:
 ///    [`crate::completion::prepare_version_display_items`] lists the top 5
@@ -1453,7 +1574,7 @@ fn build_vulnerability_fix_action(
 ///    catches two display items whose formatted text coincides — e.g. an
 ///    ecosystem formatter that truncates precision (PyPI's
 ///    `truncate_release_to_match`) can map several distinct registry
-///    versions to the same rewritten text — and a display item matching the
+///    versions to the same rewritten text — and a display item matching a
 ///    fix action's target even when their *raw* versions differ (formatting
 ///    can normalize two distinct inputs to the same text). Textual (not
 ///    semantic) equality is deliberate: `formatter.is_requirement_up_to_date`
@@ -1463,15 +1584,27 @@ fn build_vulnerability_fix_action(
 ///    requirement; it also can't detect a pinned no-op like `==1.0.0` ->
 ///    `==1.0.0`, since it never compares the formatted edit text at all.
 ///
-/// Returns an empty `Vec` also when (no fix action applies and) the registry
-/// fetch fails.
+/// Every action above is built with `is_preferred: None`; exactly one is promoted to
+/// `Some(true)` in a single post-pass once all three kinds have been considered, in
+/// priority order: the vulnerability fix, then the unsatisfiable fix, then the REFACTOR
+/// item whose `item.is_latest` is set. LSP's `isPreferred` is a flat per-response boolean
+/// with no per-diagnostic scoping, so "at most one preferred action" must hold across all
+/// producers, not per producer — building every action with `None` and resolving the flag
+/// once here, rather than at each construction site, is what keeps that invariant
+/// structural (checkable with one `filter().count() <= 1` assertion) instead of something
+/// every future producer has to remember to uphold by hand. A vulnerability is silent and
+/// security-relevant; an unsatisfiable requirement is loud (the package manager already
+/// fails the build) but merely inconvenient; both outrank a routine "update to latest".
+/// This resolution runs on every return path below that can carry a fix action, including
+/// the registry-outage path, so an outage never silently drops `isPreferred` from an
+/// already-built fix.
+///
+/// Returns an empty `Vec` also when no fix action applies and the registry fetch fails.
 ///
 /// No `# Examples` here: exercising this meaningfully needs a `Registry`
 /// impl plus `ParseResult`/`Dependency` mocks, which live as private test
 /// fixtures in this module's own `#[cfg(test)]` block rather than as public
 /// API — see the `generate_code_actions_*` tests there for realistic calls.
-// TODO(#206-followup): unsatisfiable quick-fix needs context.diagnostics + latest
-// threaded into generate_code_actions.
 pub async fn generate_code_actions<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
@@ -1517,8 +1650,8 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         return actions;
     }
 
-    // Built before the registry fetch below so a registry outage never
-    // suppresses an OSV-derived fix (FR-007).
+    // Both fix actions are built before the registry fetch below so a registry outage
+    // never suppresses an OSV-derived fix (FR-007) or a known-unsatisfiable one.
     let fix = build_vulnerability_fix_action(
         dep,
         uri,
@@ -1527,39 +1660,59 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         version_req.as_str(),
         formatter,
     );
+    let unsat_fix =
+        build_unsatisfiable_fix_action(dep, uri, version_range, versions, version_req, formatter);
 
-    let Ok(registry_versions) = registry.get_versions(dep.name()).await else {
-        if let Some(fix) = fix {
-            actions.push(fix.action);
-        }
-        return actions;
+    let registry_versions = registry.get_versions(dep.name()).await.ok();
+
+    // A fix target that the registry reports as yanked is dropped entirely rather than
+    // offered — the surviving diagnostics carry the finding either way, and there is no
+    // comparator here to bound a search for an alternative target. On a registry outage
+    // (`registry_versions` is `None`) there is nothing to check a yank flag against, so
+    // both actions pass through unfiltered — the pre-existing vuln-fix behavior, now
+    // shared by the unsat fix too.
+    let is_yanked_target = |version_native: &str| {
+        registry_versions.as_ref().is_some_and(|versions_list| {
+            versions_list
+                .iter()
+                .find(|v| v.version_string() == version_native)
+                .is_some_and(|v| v.is_yanked())
+        })
     };
+    let fix = fix.filter(|f| !is_yanked_target(&f.version_native));
+    let unsat_fix = unsat_fix.filter(|f| !is_yanked_target(&f.version_native));
 
-    // S4: a fix target that the registry reports as yanked is dropped
-    // entirely rather than offered — the surviving diagnostics carry the
-    // finding either way, and there is no comparator here to bound a search
-    // for an alternative target.
-    let fix = fix.filter(|f| {
-        !registry_versions
-            .iter()
-            .find(|v| v.version_string() == f.version_native)
-            .is_some_and(|v| v.is_yanked())
+    // Yank-filtering both actions before this collision check (not after) matters: PyPI's
+    // `truncate_release_to_match` can map a yanked version and a live one to identical
+    // rewritten text, and checking collision first would drop the unsat action for a text
+    // match against a vuln fix that the yank filter above was about to drop anyway,
+    // leaving neither action behind.
+    let unsat_fix = unsat_fix.filter(|u| {
+        fix.as_ref()
+            .is_none_or(|f| strip_whitespace(&f.new_text) != strip_whitespace(&u.new_text))
     });
 
-    let fix_version_native = fix.as_ref().map(|f| f.version_native.clone());
-    // Captured before `fix.action` moves into `actions` below, so the dedup seeding
-    // reads back the exact text the fix action's own `TextEdit` already carries
-    // instead of recomputing it (see `VulnerabilityFixAction::new_text`'s doc comment).
+    // Captured before each action's `.action` moves into `actions` below, so the dedup
+    // seeding and the `is_preferred` post-pass read back the exact text/index without
+    // recomputing or re-deriving them (see `VulnerabilityFixAction::new_text`'s doc comment).
     let fix_new_text = fix.as_ref().map(|f| strip_whitespace(&f.new_text));
+    let unsat_new_text = unsat_fix.as_ref().map(|f| strip_whitespace(&f.new_text));
+
+    let mut vuln_idx = None;
     if let Some(fix) = fix {
+        vuln_idx = Some(actions.len());
         actions.push(fix.action);
     }
+    let mut unsat_idx = None;
+    if let Some(unsat_fix) = unsat_fix {
+        unsat_idx = Some(actions.len());
+        actions.push(unsat_fix.action);
+    }
 
-    let display_items = prepare_version_display_items(&registry_versions, dep.name());
     // De-duplicates every REFACTOR action's formatted edit text against the declared
-    // requirement, the fix action's edit (if any), and every REFACTOR action already
-    // emitted below, so no two actions in the response — nor a REFACTOR action and the
-    // fix action above — ever carry a byte-identical `WorkspaceEdit`. Seeding with the
+    // requirement, both fix actions' edits (if present), and every REFACTOR action already
+    // emitted below, so no two actions in the response — nor a REFACTOR action and a fix
+    // action above — ever carry a byte-identical `WorkspaceEdit`. Seeding with the
     // declared requirement subsumes the former N1 guard (an item whose formatted text
     // equals the declared text is a no-op); checking formatted text rather than raw
     // version also subsumes the former `item.version == fix_version_native` check, since
@@ -1570,35 +1723,53 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     if let Some(fix_text) = fix_new_text {
         emitted_texts.insert(fix_text);
     }
+    if let Some(unsat_text) = unsat_new_text {
+        emitted_texts.insert(unsat_text);
+    }
 
-    for item in display_items {
-        let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());
+    let mut latest_refactor_idx = None;
+    if let Some(registry_versions) = &registry_versions {
+        let display_items = prepare_version_display_items(registry_versions, dep.name());
+        for item in display_items {
+            let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());
 
-        if !emitted_texts.insert(strip_whitespace(&new_text)) {
-            continue;
-        }
+            if !emitted_texts.insert(strip_whitespace(&new_text)) {
+                continue;
+            }
 
-        let mut edits = HashMap::new();
-        edits.insert(
-            uri.clone(),
-            vec![TextEdit {
-                range: version_range,
-                new_text,
-            }],
-        );
+            let mut edits = HashMap::new();
+            edits.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: version_range,
+                    new_text,
+                }],
+            );
 
-        actions.push(CodeAction {
-            title: item.label,
-            kind: Some(CodeActionKind::REFACTOR),
-            edit: Some(WorkspaceEdit {
-                changes: Some(edits),
+            if item.is_latest {
+                latest_refactor_idx = Some(actions.len());
+            }
+            actions.push(CodeAction {
+                title: item.label,
+                kind: Some(CodeActionKind::REFACTOR),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(edits),
+                    ..Default::default()
+                }),
+                // Resolved once below, for every producer at once.
+                is_preferred: None,
                 ..Default::default()
-            }),
-            // Only one preferred action is meaningful; the fix action above
-            // takes that role when present.
-            is_preferred: (fix_version_native.is_none()).then_some(item.is_latest),
-            ..Default::default()
-        });
+            });
+        }
+    }
+
+    // Single post-pass resolving `isPreferred`: exactly one action, in priority order
+    // vuln fix -> unsat fix -> latest REFACTOR item. Runs unconditionally on every path
+    // through this function that can reach here, including the registry-outage path
+    // (`registry_versions.is_none()`), so an outage never drops `isPreferred` from an
+    // already-built fix action.
+    if let Some(i) = vuln_idx.or(unsat_idx).or(latest_refactor_idx) {
+        actions[i].is_preferred = Some(true);
     }
 
     actions
@@ -2029,6 +2200,7 @@ pub fn generate_diagnostics_from_cache(
                     "No published version satisfies requirement '{req_str}'; latest is {latest}"
                 ),
                 source: Some("deps-lsp".into()),
+                code: Some(NumberOrString::String(UNSATISFIABLE_DIAGNOSTIC_CODE.into())),
                 ..Default::default()
             });
             continue;
@@ -3858,7 +4030,10 @@ mod tests {
         // binding, even though the title only names the first one.
         assert_eq!(
             actions[0].data,
-            Some(serde_json::json!({ "advisory_ids": ["A2", "A1"] }))
+            Some(serde_json::json!({
+                "diagnostic_codes": ["A2", "A1"],
+                "diagnostic_range": version_range,
+            }))
         );
     }
 
@@ -4432,6 +4607,9 @@ mod tests {
         // No plain "update to X" items either, since the registry fetch that
         // would produce them failed.
         assert_eq!(actions.len(), 1);
+        // S1: the single-exit restructure must not drop `isPreferred` from an
+        // already-built fix action on the registry-outage path.
+        assert_eq!(actions[0].is_preferred, Some(true));
     }
 
     #[tokio::test]
@@ -4508,6 +4686,71 @@ mod tests {
                 .filter(|a| a.kind == Some(CodeActionKind::REFACTOR))
                 .all(|a| a.is_preferred.is_none()),
             "only the fix action may be preferred once it exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_latest_refactor_is_preferred_when_no_fix_exists() {
+        // Critic C1 / review "Important": the most common production path — no
+        // vulnerability, no unsatisfiable requirement, just a satisfiable
+        // dependency with newer versions available — must still mark the
+        // `item.is_latest` REFACTOR action as the editor's preferred quickfix.
+        // This moved from a construction-site expression to the shared
+        // `is_preferred` post-pass indexed by `latest_refactor_idx`; a wrong
+        // index or a broken `.or()` chain would silently strip `isPreferred`
+        // from every ordinary "update to latest" action across all 11
+        // ecosystems with a fully green suite otherwise.
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+        let registry = FixedVersionRegistry {
+            versions: vec![("2.0.0", false), ("1.5.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MockFormatter,
+        )
+        .await;
+
+        assert!(
+            quickfix_titles(&actions).is_empty(),
+            "no vuln/unsat fix should exist: {actions:?}"
+        );
+        let refactor_titles = refactor_titles(&actions);
+        assert_eq!(refactor_titles.len(), 2, "{refactor_titles:?}");
+
+        let preferred: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.is_preferred == Some(true))
+            .map(|a| a.title.as_str())
+            .collect();
+        assert_eq!(
+            preferred.len(),
+            1,
+            "exactly one action must be preferred: {actions:?}"
+        );
+        assert!(
+            preferred[0].starts_with("2.0.0"),
+            "the newest (item.is_latest) REFACTOR action must be preferred: {preferred:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .filter(|a| !a.title.starts_with("2.0.0"))
+                .all(|a| a.is_preferred.is_none()),
+            "every other action must be None, not Some(false): {actions:?}"
         );
     }
 
@@ -7557,6 +7800,643 @@ mod tests {
             .await;
 
             assert!(actions.is_empty());
+        }
+    }
+
+    /// Coverage for [`build_unsatisfiable_fix_action`] and its wiring into
+    /// `generate_code_actions` (plan §1.2-§1.4): each guard, the yank filter, the
+    /// vuln/unsat collision drop, and the `is_preferred` post-pass across producers.
+    mod unsatisfiable_fix_action_tests {
+        use super::*;
+        use std::collections::HashMap;
+
+        /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`], but
+        /// `format_version_replacing` always returns a fixed text that stays
+        /// unsatisfiable against any `available` list not literally containing it —
+        /// simulating a pypi/gradle-style override that preserves operator style
+        /// into a still-broken range (plan §1.2.5 / critic M4).
+        struct NonFixingFormatter;
+
+        impl EcosystemFormatter for NonFixingFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn format_version_replacing(&self, _version: &str, _current: &str) -> String {
+                "still-bad".to_string()
+            }
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
+            }
+        }
+
+        /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`], but
+        /// `format_version_replacing` always returns the same fixed text regardless of
+        /// its input — mirroring PyPI's `truncate_release_to_match`, which can map
+        /// distinct registry versions to byte-identical rewritten text (M7 / plan
+        /// §1.4). Used to construct a vuln-fix target and an unsat-fix target that are
+        /// two different, independently-yankable versions whose formatted edits
+        /// nonetheless collide.
+        struct CollidingTextFormatter;
+
+        impl EcosystemFormatter for CollidingTextFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn format_version_replacing(&self, _version: &str, _current: &str) -> String {
+                "9.9.9".to_string()
+            }
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
+            }
+        }
+
+        /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`], but with a
+        /// non-identity `normalize_package_name`, for the M1 lookup-fallback test.
+        struct NormalizingExactFormatter;
+
+        impl EcosystemFormatter for NormalizingExactFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn normalize_package_name(&self, name: &PackageName) -> String {
+                format!("normalized-{name}")
+            }
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
+            }
+        }
+
+        struct UnsatDep {
+            name: PackageName,
+            version_req: VersionReq,
+            version_range: Range,
+            source: crate::parser::DependencySource,
+        }
+
+        impl Dependency for UnsatDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::default()
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                Some(&self.version_req)
+            }
+            fn version_range(&self) -> Option<Range> {
+                Some(self.version_range)
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                self.source.clone()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// `MockParseResult` only stores `MockDep`s; wraps a single `UnsatDep` instead.
+        struct UnsatParseResult {
+            dep: UnsatDep,
+            uri: Uri,
+        }
+
+        impl ParseResult for UnsatParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![&self.dep]
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        fn cached_versions_keyed(
+            key: &str,
+            latest: &str,
+            available: &[&str],
+        ) -> HashMap<PackageName, PackageVersions> {
+            let mut m = HashMap::new();
+            m.insert(
+                pkg(key),
+                PackageVersions {
+                    latest: latest.to_string(),
+                    available: Arc::from(
+                        available.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    ),
+                    yanked: Arc::from(Vec::new()),
+                },
+            );
+            m
+        }
+
+        fn cached_versions(
+            latest: &str,
+            available: &[&str],
+        ) -> HashMap<PackageName, PackageVersions> {
+            cached_versions_keyed("pkg", latest, available)
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_emitted_for_unsatisfiable_requirement() {
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &MockRegistry,
+                &ExactMatchFormatter,
+            )
+            .await;
+
+            assert_eq!(
+                quickfix_titles(&actions),
+                vec!["Fix unsatisfiable requirement: update to 9.9.9"]
+            );
+            assert_eq!(actions[0].is_preferred, Some(true));
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_absent_when_requirement_is_satisfied() {
+            let (dep, version_range, content) = vulnerable_dep("9.9.9");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &MockRegistry,
+                &ExactMatchFormatter,
+            )
+            .await;
+
+            assert!(quickfix_titles(&actions).is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_absent_for_non_resolvable_source() {
+            // Mirrors the diagnostic's own `is_version_resolvable` call-site guard
+            // (#248): a path/git/SDK/workspace dependency's cache entry may be
+            // coincidental, so no fix action should be offered for it either.
+            let content = "1.0.0";
+            let dep = UnsatDep {
+                name: pkg("pkg"),
+                version_req: VersionReq::new("1.0.0"),
+                version_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                source: crate::parser::DependencySource::Path {
+                    path: "../local".into(),
+                },
+            };
+            let pr = UnsatParseResult {
+                dep,
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &pr,
+                Position::new(0, 0),
+                pr.uri(),
+                versions,
+                content,
+                &MockRegistry,
+                &ExactMatchFormatter,
+            )
+            .await;
+
+            assert!(quickfix_titles(&actions).is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_no_op_guard_skips_when_rewrite_equals_declared_text() {
+            // `latest` already equals the declared requirement text (whitespace
+            // aside) — nothing for the action to fix.
+            let (dep, version_range, content) = vulnerable_dep("9.9.9");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            // Requirement "9.9.9" itself is unsatisfiable only if it isn't in
+            // `available`; make it unsatisfiable via a *different* available set
+            // but formatted rewrite identical to the declared text.
+            let cached = cached_versions("9.9.9", &["1.0.0"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &MockRegistry,
+                &ExactMatchFormatter,
+            )
+            .await;
+
+            // "9.9.9" -> "9.9.9" is a no-op rewrite, so the action must be skipped
+            // even though the requirement is genuinely unsatisfiable.
+            assert!(quickfix_titles(&actions).is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_verification_guard_rejects_rewrite_that_stays_unsatisfiable() {
+            // Critic M4: `format_version_replacing` can preserve operator style into
+            // a rewrite that is itself still unsatisfiable (pypi/gradle-style). The
+            // action must not be offered in that case.
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &MockRegistry,
+                &NonFixingFormatter,
+            )
+            .await;
+
+            assert!(quickfix_titles(&actions).is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_resolves_cache_entry_via_raw_name_fallback() {
+            // Critic M1: mirrors the diagnostic's `.get(normalized).or_else(|| .get(raw))`
+            // lookup — an ecosystem whose `normalize_package_name` is not the identity
+            // must still resolve a cache entry keyed by the raw declared name.
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            // Keyed by the raw name "pkg", not "normalized-pkg".
+            let cached = cached_versions_keyed("pkg", "9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &MockRegistry,
+                &NormalizingExactFormatter,
+            )
+            .await;
+
+            assert_eq!(
+                quickfix_titles(&actions),
+                vec!["Fix unsatisfiable requirement: update to 9.9.9"]
+            );
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_dropped_when_target_is_yanked() {
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+            let registry = FixedVersionRegistry {
+                versions: vec![("9.9.9", true)],
+            };
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &registry,
+                &ExactMatchFormatter,
+            )
+            .await;
+
+            assert!(quickfix_titles(&actions).is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_survives_registry_outage_and_is_preferred() {
+            // S1: the single-exit restructure must not drop `isPreferred` on the
+            // outage path when only the unsat fix (no vuln fix) is present.
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &ErrorRegistry,
+                &ExactMatchFormatter,
+            )
+            .await;
+
+            assert_eq!(
+                quickfix_titles(&actions),
+                vec!["Fix unsatisfiable requirement: update to 9.9.9"]
+            );
+            assert_eq!(actions[0].is_preferred, Some(true));
+        }
+
+        #[tokio::test]
+        async fn test_vuln_and_unsat_fix_coexist_with_vuln_preferred() {
+            use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+            vulnerabilities.insert(
+                "pkg".to_string(),
+                ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    advisories: vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["5.5.5".to_string()],
+                        url: String::new(),
+                    })],
+                    total_known: 1,
+                    upgrade_status: UpgradeStatus::NotChecked,
+                }),
+            );
+            // "9.9.9" (unsat target) differs from "5.5.5" (vuln target), so both
+            // survive the text-collision drop.
+            let cached = cached_versions("9.9.9", &["9.9.9", "5.5.5"]);
+            let resolved = HashMap::new();
+            let versions =
+                VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &MockRegistry,
+                &ExactMatchFormatter,
+            )
+            .await;
+
+            let titles = quickfix_titles(&actions);
+            assert_eq!(titles.len(), 2, "expected both fixes: {titles:?}");
+            assert!(titles.iter().any(|t| t.starts_with("Update to 5.5.5")));
+            assert!(
+                titles
+                    .iter()
+                    .any(|t| t.starts_with("Fix unsatisfiable requirement"))
+            );
+
+            let vuln_action = actions
+                .iter()
+                .find(|a| a.title.starts_with("Update to 5.5.5"))
+                .unwrap();
+            let unsat_action = actions
+                .iter()
+                .find(|a| a.title.starts_with("Fix unsatisfiable"))
+                .unwrap();
+            assert_eq!(vuln_action.is_preferred, Some(true));
+            assert_eq!(unsat_action.is_preferred, None);
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| a.is_preferred == Some(true))
+                    .count(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_dropped_when_it_collides_with_vuln_fix_text() {
+            // Plan §1.4: when both fixes would write byte-identical text, the vuln
+            // fix (richer title) wins and the unsat fix is dropped.
+            use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+            vulnerabilities.insert(
+                "pkg".to_string(),
+                ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    advisories: vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        // Same target as the unsat fix's cached `latest` below.
+                        fixed_versions: vec!["9.9.9".to_string()],
+                        url: String::new(),
+                    })],
+                    total_known: 1,
+                    upgrade_status: UpgradeStatus::NotChecked,
+                }),
+            );
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions =
+                VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &MockRegistry,
+                &ExactMatchFormatter,
+            )
+            .await;
+
+            let titles = quickfix_titles(&actions);
+            assert_eq!(titles.len(), 1, "unsat fix must be dropped: {titles:?}");
+            assert!(titles[0].starts_with("Update to 9.9.9"));
+        }
+
+        #[tokio::test]
+        async fn test_yank_filter_runs_before_collision_check_so_neither_fix_is_lost() {
+            // Critic M7: the vuln fix targets a *yanked* version and the unsat fix
+            // targets a *different, live* version, but both format to identical
+            // text (mirroring PyPI's `truncate_release_to_match`). Yank-filtering
+            // both actions before the collision check must run first: it drops the
+            // yanked vuln fix and leaves the live unsat fix as the sole survivor.
+            // The wrong order (collision-first) would drop the unsat action for
+            // "colliding" with a vuln fix that the yank filter was about to drop
+            // anyway, leaving the user with neither action.
+            use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+            vulnerabilities.insert(
+                "pkg".to_string(),
+                ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    advisories: vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        // Different raw version than the unsat fix's cached
+                        // `latest` ("9.9.9") below, but `CollidingTextFormatter`
+                        // rewrites both to the same "9.9.9" text.
+                        fixed_versions: vec!["9.9.5".to_string()],
+                        url: String::new(),
+                    })],
+                    total_known: 1,
+                    upgrade_status: UpgradeStatus::NotChecked,
+                }),
+            );
+            // Unsat fix's own gate/verification data (distinct from the registry
+            // below): unsatisfiable against "9.9.9", and the rewritten "9.9.9"
+            // re-verifies as satisfiable since it's literally in `available`.
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions =
+                VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+            // Registry-reported yank status: the vuln fix's target is yanked, the
+            // unsat fix's target is live.
+            let registry = FixedVersionRegistry {
+                versions: vec![("9.9.5", true), ("9.9.9", false)],
+            };
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &registry,
+                &CollidingTextFormatter,
+            )
+            .await;
+
+            let titles = quickfix_titles(&actions);
+            assert_eq!(
+                titles,
+                vec!["Fix unsatisfiable requirement: update to 9.9.9"],
+                "vuln fix must be dropped for being yanked, unsat fix must survive: {titles:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_unsat_fix_dedups_refactor_item_writing_the_same_text() {
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+            // The registry's own "9.9.9" entry would otherwise become a REFACTOR
+            // "update to 9.9.9" display item, byte-identical to the unsat fix's edit.
+            let registry = FixedVersionRegistry {
+                versions: vec![("9.9.9", false)],
+            };
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &registry,
+                &ExactMatchFormatter,
+            )
+            .await;
+
+            assert_eq!(quickfix_titles(&actions).len(), 1);
+            assert!(
+                refactor_titles(&actions).is_empty(),
+                "the duplicate REFACTOR item must be suppressed by the dedup set: {actions:?}"
+            );
         }
     }
 

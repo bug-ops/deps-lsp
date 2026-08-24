@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, Diagnostic, NumberOrString,
+    Range,
 };
 
 /// Handles code action requests using trait-based delegation.
@@ -54,7 +55,7 @@ pub async fn handle_code_actions(
         )
         .await;
 
-    attach_vulnerability_diagnostics(&mut actions, &params.context.diagnostics);
+    bind_diagnostics(&mut actions, &params.context.diagnostics);
 
     let actions = match params.context.only.as_deref() {
         Some(only) if !only.is_empty() => filter_by_requested_kinds(actions, only),
@@ -67,45 +68,95 @@ pub async fn handle_code_actions(
         .collect()
 }
 
-/// Binds a vulnerability-fix action to the client-supplied diagnostics it
-/// resolves, so editors can surface it from the advisory's own
-/// lightbulb/quickfix affordance.
+/// Binds a code action to the client-supplied diagnostics it resolves, so editors can
+/// surface it from the diagnostic's own lightbulb/quickfix affordance.
 ///
-/// `deps-core` has no LSP request context, so [`deps_core::lsp_helpers::generate_code_actions`]
-/// stashes the resolved advisory ids in `CodeAction::data` instead
-/// (`{"advisory_ids": [...]}`). This matches those ids against `diagnostics`
-/// — the same set the client already sent in `CodeActionParams.context`,
-/// filtered to entries this server emitted (`source == "deps-lsp"`) whose
-/// `code` names one of the ids — and moves the matches into
-/// `CodeAction::diagnostics`. `data` is cleared afterward regardless of
-/// whether a match was found, so a stale payload can never be mistaken for a
-/// still-resolvable action.
-fn attach_vulnerability_diagnostics(actions: &mut [CodeAction], diagnostics: &[Diagnostic]) {
+/// `deps-core` has no LSP request context, so a code-action producer in
+/// [`deps_core::lsp_helpers::generate_code_actions`] (the vulnerability fix, or the
+/// unsatisfiable-requirement fix) stashes `{"diagnostic_codes": [...], "diagnostic_range":
+/// <Range>}` in `CodeAction::data` instead. This matches against `diagnostics` — the set
+/// the client already sent in `CodeActionParams.context` — in three steps:
+///
+/// 1. Filter to entries this server emitted (`source == "deps-lsp"`) whose `code` names
+///    one of `diagnostic_codes`.
+/// 2. If at most one candidate remains, bind it with no further check. This is the common
+///    case — every vulnerability fix (a unique advisory id) and every single-unsatisfiable
+///    -dependency document — and matches today's behavior exactly, deliberately with no
+///    range check: `context.diagnostics` are the diagnostics the *client* holds from its
+///    last `publishDiagnostics`, which shift as the user types, while `diagnostic_range`
+///    is recomputed from the freshly re-parsed buffer. Requiring equality here would make
+///    an in-flight edit break a binding that works today.
+/// 3. Only when two or more candidates remain — reachable because
+///    `UNSATISFIABLE_DIAGNOSTIC_CODE` is a constant shared by every unsatisfiable
+///    dependency in a document, unlike a unique advisory id — narrow to the candidates
+///    whose range *overlaps* `diagnostic_range`, so one action does not claim every
+///    unsatisfiable dependency in the document. Overlap, not equality, so a range shifted
+///    by an in-flight edit still matches. If the narrowing leaves nothing, fall back to
+///    the full code-matched set rather than binding nothing.
+///
+/// `data` is cleared afterward regardless of whether a match was found, so a stale payload
+/// can never be mistaken for a still-resolvable action.
+///
+/// Accepted tradeoff: because `UNSATISFIABLE_DIAGNOSTIC_CODE` is a constant, if the client's
+/// diagnostic list happens to contain exactly one unsatisfiable diagnostic and it belongs to
+/// a *different* dependency than the one this action targets, step 2 still binds it (no range
+/// check on a single candidate). This is cosmetic mis-attribution of the editor's "fix this
+/// problem" affordance only — the `TextEdit` itself always comes from this action's own
+/// `dep.version_range()`, so no incorrect edit is possible.
+fn bind_diagnostics(actions: &mut [CodeAction], diagnostics: &[Diagnostic]) {
     for action in actions {
         let Some(data) = action.data.take() else {
             continue;
         };
-        let Some(advisory_ids) = data
-            .get("advisory_ids")
+        let Some(codes) = data
+            .get("diagnostic_codes")
             .and_then(serde_json::Value::as_array)
         else {
             continue;
         };
-        let ids: Vec<&str> = advisory_ids.iter().filter_map(|v| v.as_str()).collect();
+        let codes: Vec<&str> = codes.iter().filter_map(serde_json::Value::as_str).collect();
 
-        let matches: Vec<Diagnostic> = diagnostics
+        let candidates: Vec<&Diagnostic> = diagnostics
             .iter()
             .filter(|d| {
                 d.source.as_deref() == Some("deps-lsp")
-                    && matches!(&d.code, Some(NumberOrString::String(code)) if ids.contains(&code.as_str()))
+                    && matches!(&d.code, Some(NumberOrString::String(code)) if codes.contains(&code.as_str()))
             })
-            .cloned()
             .collect();
+
+        let matches: Vec<Diagnostic> = if candidates.len() <= 1 {
+            candidates.into_iter().cloned().collect()
+        } else {
+            let diagnostic_range = data
+                .get("diagnostic_range")
+                .and_then(|v| serde_json::from_value::<Range>(v.clone()).ok());
+
+            let overlapping: Vec<Diagnostic> = diagnostic_range
+                .map(|range| {
+                    candidates
+                        .iter()
+                        .filter(|d| ranges_overlap(&d.range, &range))
+                        .map(|d| (**d).clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if overlapping.is_empty() {
+                candidates.into_iter().cloned().collect()
+            } else {
+                overlapping
+            }
+        };
 
         if !matches.is_empty() {
             action.diagnostics = Some(matches);
         }
     }
+}
+
+/// Whether `a` and `b` overlap, under LSP `Position`'s line-then-character ordering.
+fn ranges_overlap(a: &Range, b: &Range) -> bool {
+    a.start <= b.end && b.start <= a.end
 }
 
 /// Filters `actions` down to those matching one of the client-requested
@@ -218,12 +269,33 @@ mod tests {
         }
     }
 
+    fn ranged_diagnostic(source: &str, code: &str, range: Range) -> Diagnostic {
+        Diagnostic {
+            source: Some(source.to_string()),
+            code: Some(NumberOrString::String(code.to_string())),
+            range,
+            ..Default::default()
+        }
+    }
+
+    fn action_with_data(codes: &[&str], range: Range) -> CodeAction {
+        CodeAction {
+            title: "fix".to_string(),
+            kind: Some(CodeActionKind::QUICKFIX),
+            data: Some(serde_json::json!({
+                "diagnostic_codes": codes,
+                "diagnostic_range": range,
+            })),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn test_attach_vulnerability_diagnostics_matches_by_source_and_code() {
+    fn test_bind_diagnostics_matches_by_source_and_code() {
         let mut actions = vec![CodeAction {
             title: "fix".to_string(),
             kind: Some(CodeActionKind::QUICKFIX),
-            data: Some(serde_json::json!({ "advisory_ids": ["RUSTSEC-1", "RUSTSEC-2"] })),
+            data: Some(serde_json::json!({ "diagnostic_codes": ["RUSTSEC-1", "RUSTSEC-2"] })),
             ..Default::default()
         }];
         let diagnostics = vec![
@@ -235,7 +307,7 @@ mod tests {
             vuln_diagnostic(Some("deps-lsp"), Some("RUSTSEC-999")),
         ];
 
-        attach_vulnerability_diagnostics(&mut actions, &diagnostics);
+        bind_diagnostics(&mut actions, &diagnostics);
 
         let attached = actions[0].diagnostics.as_ref().expect("expected matches");
         assert_eq!(attached.len(), 2);
@@ -244,29 +316,113 @@ mod tests {
     }
 
     #[test]
-    fn test_attach_vulnerability_diagnostics_no_match_clears_data_without_setting_diagnostics() {
+    fn test_bind_diagnostics_no_match_clears_data_without_setting_diagnostics() {
         let mut actions = vec![CodeAction {
             title: "fix".to_string(),
             kind: Some(CodeActionKind::QUICKFIX),
-            data: Some(serde_json::json!({ "advisory_ids": ["RUSTSEC-1"] })),
+            data: Some(serde_json::json!({ "diagnostic_codes": ["RUSTSEC-1"] })),
             ..Default::default()
         }];
         let diagnostics = vec![vuln_diagnostic(Some("deps-lsp"), Some("RUSTSEC-999"))];
 
-        attach_vulnerability_diagnostics(&mut actions, &diagnostics);
+        bind_diagnostics(&mut actions, &diagnostics);
 
         assert!(actions[0].diagnostics.is_none());
         assert!(actions[0].data.is_none());
     }
 
     #[test]
-    fn test_attach_vulnerability_diagnostics_action_without_data_is_untouched() {
+    fn test_bind_diagnostics_action_without_data_is_untouched() {
         let mut actions = vec![action(CodeActionKind::REFACTOR)];
         let diagnostics = vec![vuln_diagnostic(Some("deps-lsp"), Some("RUSTSEC-1"))];
 
-        attach_vulnerability_diagnostics(&mut actions, &diagnostics);
+        bind_diagnostics(&mut actions, &diagnostics);
 
         assert!(actions[0].diagnostics.is_none());
+    }
+
+    #[test]
+    fn test_bind_diagnostics_single_candidate_binds_despite_shifted_range() {
+        // Today's behavior, must not regress (critic S2): a single code-matched candidate
+        // binds with no range check at all, even when the client-held diagnostic's range
+        // has drifted from the action's freshly-recomputed `diagnostic_range` (an in-flight
+        // edit above the dependency line shifts the client's held range but not the range
+        // recomputed from the current buffer).
+        let action_range = Range::new(Position::new(5, 0), Position::new(5, 10));
+        let shifted_range = Range::new(Position::new(9, 0), Position::new(9, 10));
+        let mut actions = vec![action_with_data(
+            &["unsatisfiable-requirement"],
+            action_range,
+        )];
+        let diagnostics = vec![ranged_diagnostic(
+            "deps-lsp",
+            "unsatisfiable-requirement",
+            shifted_range,
+        )];
+
+        bind_diagnostics(&mut actions, &diagnostics);
+
+        assert_eq!(
+            actions[0]
+                .diagnostics
+                .as_ref()
+                .expect("single candidate must bind with no range check")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_bind_diagnostics_two_candidates_narrow_to_overlapping_one() {
+        // The anti-fan-out property `UNSATISFIABLE_DIAGNOSTIC_CODE` (a constant shared by
+        // every unsatisfiable dependency in a document) needs: with two code-matched
+        // diagnostics, only the one overlapping this action's own range binds.
+        let action_range = Range::new(Position::new(5, 0), Position::new(5, 10));
+        let overlapping = Range::new(Position::new(5, 2), Position::new(5, 8));
+        let elsewhere = Range::new(Position::new(20, 0), Position::new(20, 10));
+        let mut actions = vec![action_with_data(
+            &["unsatisfiable-requirement"],
+            action_range,
+        )];
+        let diagnostics = vec![
+            ranged_diagnostic("deps-lsp", "unsatisfiable-requirement", overlapping),
+            ranged_diagnostic("deps-lsp", "unsatisfiable-requirement", elsewhere),
+        ];
+
+        bind_diagnostics(&mut actions, &diagnostics);
+
+        let attached = actions[0].diagnostics.as_ref().expect("expected a match");
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].range, overlapping);
+    }
+
+    #[test]
+    fn test_bind_diagnostics_two_candidates_no_overlap_falls_back_to_full_set() {
+        // If narrowing by range leaves nothing (both client-held ranges have drifted off
+        // the freshly-recomputed range), fall back to binding the full code-matched set
+        // rather than binding nothing.
+        let action_range = Range::new(Position::new(5, 0), Position::new(5, 10));
+        let first = Range::new(Position::new(20, 0), Position::new(20, 10));
+        let second = Range::new(Position::new(30, 0), Position::new(30, 10));
+        let mut actions = vec![action_with_data(
+            &["unsatisfiable-requirement"],
+            action_range,
+        )];
+        let diagnostics = vec![
+            ranged_diagnostic("deps-lsp", "unsatisfiable-requirement", first),
+            ranged_diagnostic("deps-lsp", "unsatisfiable-requirement", second),
+        ];
+
+        bind_diagnostics(&mut actions, &diagnostics);
+
+        assert_eq!(
+            actions[0]
+                .diagnostics
+                .as_ref()
+                .expect("expected the fallback full set")
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

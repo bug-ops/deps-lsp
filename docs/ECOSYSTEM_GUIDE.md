@@ -260,9 +260,38 @@ deliberately conservative:
   of `1.0.214` under the loose same-major-minor heuristic, despite patch `999` never having
   been published).
 
-**Not yet implemented:** a quick-fix code action that rewrites the requirement to the
-latest version (tracked as a follow-up), and a separate informational diagnostic for a
-requirement that only matches prerelease versions.
+**Not yet implemented:** a separate informational diagnostic for a requirement that only
+matches prerelease versions.
+
+### Code Action: Fix Unsatisfiable Requirement
+
+A dependency flagged by the diagnostic above gets a `QUICKFIX` titled `Fix unsatisfiable
+requirement: update to <version>`, targeting the same cached `latest` value the diagnostic
+message names, so the action's title and the diagnostic text always agree on what "the
+latest" is. The action is gated by the identical unsatisfiability check the diagnostic uses,
+so the action never appears without the diagnostic — though, as described below, several
+further guards (a yanked target, a no-op or still-unsatisfiable rewrite, a text collision
+with the vulnerability fix) can independently suppress the action while the diagnostic
+itself stays up.
+
+Like the vulnerability fix above, this action is computed before the registry fetch that
+produces the plain update list, so a registry outage never hides it. When the fetch does
+succeed, a target the registry reports as yanked is dropped rather than offered. The
+rewritten text is re-checked against the same unsatisfiability predicate before the action
+is returned, since an ecosystem that preserves operator style when rewriting a requirement
+(PyPI, Gradle) can otherwise produce another still-unsatisfiable range; this re-check cannot
+prove a rewrite it cannot evaluate is correct, so it holds for every rewrite the ecosystem's
+own comparator can judge, not unconditionally.
+
+If both this action and the vulnerability fix apply to the same dependency and would write
+byte-identical text, the vulnerability fix (the more informative title) is kept and this one
+is dropped. At most one action across the whole response is ever marked as the editor's
+preferred quickfix, in priority order: vulnerability fix, then unsatisfiable-requirement fix,
+then the REFACTOR item pointing at the newest available version.
+
+Editors that support diagnostic-bound quickfixes get this automatically, the same way as the
+vulnerability fix: the action binds to any matching diagnostic the client already reported
+for an overlapping range.
 
 ### Yanked Version Diagnostic
 

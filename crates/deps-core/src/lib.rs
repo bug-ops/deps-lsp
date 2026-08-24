@@ -40,7 +40,8 @@ pub use lockfile::{
 };
 pub use lsp_helpers::{
     DiagnosticSeverities, EcosystemFormatter, HOVER_RECENT_VERSIONS, LineOffsetTable,
-    PackageVersions, RequirementMatcher, RequirementStatus, VersionData, collect_update_all_edits,
+    PackageVersions, RequirementMatcher, RequirementStatus, UNSATISFIABLE_DIAGNOSTIC_CODE,
+    VersionData, collect_update_all_edits,
     generate_code_actions as lsp_generate_code_actions,
     generate_code_lenses as lsp_generate_code_lenses,
     generate_diagnostics as lsp_generate_diagnostics, generate_hover as lsp_generate_hover,
