@@ -72,38 +72,47 @@ pub async fn handle_completion(
         }
     }
 
-    // Get document and extract needed data
-    let doc = match state.get_document(uri) {
-        Some(d) => d,
-        None => {
-            tracing::warn!("completion: document not found: {:?}", uri);
-            return None;
-        }
+    // Own everything needed from the document in a single shard acquisition, then
+    // release the `Ref` immediately: two separate acquisitions (one for `content`, a
+    // later one for `parse_result`) would let a concurrent `didChange` land in
+    // between, pairing a `parse_result` with `content` from a different document
+    // revision — `generate_completions` correlates the two (e.g. `extract_prefix`
+    // slicing `content` at a range taken from `parse_result`), so a torn pair risks
+    // wrong or out-of-bounds-guarded-empty completions (#319 review).
+    let (ecosystem_id, ecosystem_kind, content, parse_result) = {
+        let doc = match state.get_document(uri) {
+            Some(d) => d,
+            None => {
+                tracing::warn!("completion: document not found: {:?}", uri);
+                return None;
+            }
+        };
+        (
+            doc.ecosystem_id(),
+            doc.ecosystem,
+            doc.content.clone(),
+            doc.parse_result_arc(),
+        )
     };
-    let ecosystem_id = doc.ecosystem_id();
-    let ecosystem_kind = doc.ecosystem;
-    let content = doc.content.clone();
-    let has_parse_result = doc.parse_result().is_some();
-    drop(doc);
 
     tracing::info!(
         "completion: ecosystem={}, has_parse_result={}",
         ecosystem_id,
-        has_parse_result
+        parse_result.is_some()
     );
 
     // Try parse_result first, fallback to text-based detection
-    let items = if has_parse_result {
-        // Re-acquire document to get parse_result
-        let doc = state.get_document(uri)?;
-        let parse_result = doc.parse_result()?;
+    let items = if let Some(parse_result) = parse_result {
         let ecosystem = state.ecosystem_registry.get(ecosystem_id)?;
+        // The DashMap shard `Ref` was already dropped above, before this
+        // timeout-bound await: the search can run for up to
+        // `COMPLETION_SEARCH_TIMEOUT`, and holding the guard that long would block a
+        // concurrent `documents.get_mut` on the same shard for the duration (#319).
         let completion_result = tokio::time::timeout(
             COMPLETION_SEARCH_TIMEOUT,
-            ecosystem.generate_completions(parse_result, position, &content, freshness),
+            ecosystem.generate_completions(parse_result.as_ref(), position, &content, freshness),
         )
         .await;
-        drop(doc);
 
         match completion_result {
             // Ecosystem returned no completions: try fallback, since this handles the
@@ -859,6 +868,206 @@ mod tests {
         let (client, config) = create_test_client_and_config();
         let _result = handle_completion(state, params, client, config).await;
         // Just verify it doesn't panic - actual completion logic is in ecosystem
+    }
+
+    /// #319 liveness regression: `handle_completion` must release the DashMap shard
+    /// `Ref` on the document *before* entering the `COMPLETION_SEARCH_TIMEOUT`-bounded
+    /// await, so a concurrent `documents.get_mut` on the same URI (e.g. a `didChange`)
+    /// is never blocked behind an in-flight (or stuck) registry-backed search.
+    ///
+    /// `BlockingEcosystem::generate_completions` waits on a `Barrier` before blocking
+    /// forever (`std::future::pending`), standing in for a registry call that never
+    /// returns — the worst case for a shard `Ref` held across the search. The test
+    /// only proceeds to race the writer once that future has demonstrably started
+    /// executing (via the barrier), which — pre-fix — would still be *after* the old
+    /// code's `let doc = state.get_document(uri)?;` acquisition but *before* its
+    /// `drop(doc)`, since that drop ran only once the whole timeout resolved. A
+    /// concurrent write racing here would previously deadlock against the `parking_lot`
+    /// shard guard for the life of the (never-resolving) search; post-fix it must
+    /// complete almost immediately, since the `Ref` was already dropped before the
+    /// search was ever awaited.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_document_write_not_blocked_by_in_flight_completion_search() {
+        use deps_core::ecosystem::private::Sealed;
+        use deps_core::{
+            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
+        };
+        use std::any::Any;
+        use std::path::Path;
+        use tokio::sync::Barrier;
+        use tower_lsp_server::ls_types::Uri;
+
+        struct NoopRegistry;
+        impl Registry for NoopRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct NoopFormatter;
+        impl EcosystemFormatter for NoopFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+
+        struct BlockingEcosystem {
+            started: Arc<Barrier>,
+        }
+        impl Sealed for BlockingEcosystem {}
+        impl Ecosystem for BlockingEcosystem {
+            fn id(&self) -> &'static str {
+                "cargo"
+            }
+            fn display_name(&self) -> &'static str {
+                "cargo"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &["Cargo.toml"]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a Uri,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
+            {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn registry(&self) -> Arc<dyn Registry> {
+                Arc::new(NoopRegistry)
+            }
+            fn formatter(&self) -> &dyn EcosystemFormatter {
+                &NoopFormatter
+            }
+            fn generate_completions<'a>(
+                &'a self,
+                _parse_result: &'a dyn ParseResult,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+                Box::pin(async move {
+                    self.started.wait().await;
+                    std::future::pending::<()>().await;
+                    unreachable!("test aborts the completion task before this future resolves")
+                })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult {
+            uri: Uri,
+        }
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![]
+            }
+            fn workspace_root(&self) -> Option<&Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = Arc::new(ServerState::new());
+        let started = Arc::new(Barrier::new(2));
+        state
+            .ecosystem_registry
+            .register(Arc::new(BlockingEcosystem {
+                started: Arc::clone(&started),
+            }));
+
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        state.update_document(uri.clone(), doc);
+
+        let (client, config) = create_test_client_and_config();
+
+        let completion_task = tokio::spawn({
+            let state = Arc::clone(&state);
+            let uri = uri.clone();
+            async move {
+                let params = CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri },
+                        position: Position::new(1, 9),
+                    },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                    context: None,
+                };
+                handle_completion(state, params, client, config).await
+            }
+        });
+
+        // Block until `generate_completions` has actually started executing — i.e.
+        // `handle_completion` has reached (and is now inside) the
+        // `COMPLETION_SEARCH_TIMEOUT`-bounded await — before racing the writer below.
+        started.wait().await;
+
+        // Spawned onto its own task (rather than awaited inline) deliberately:
+        // `DashMap::get_mut` blocks the OS thread synchronously on a `parking_lot`
+        // lock, with no `.await` point of its own. Wrapping that blocking call
+        // directly in `tokio::time::timeout` would not work — a `Future::poll` that
+        // never returns can't be preempted by a sibling timer that only fires between
+        // polls. Spawning it gives the *join* a real async yield point, so the
+        // `timeout` below can race against it and fire even while the spawned task
+        // sits blocked on the shard lock.
+        let write_task = tokio::spawn({
+            let state = Arc::clone(&state);
+            let uri = uri.clone();
+            async move {
+                state.documents.get_mut(&uri).unwrap().set_loading();
+            }
+        });
+        let write_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), write_task).await;
+
+        completion_task.abort();
+
+        assert!(
+            write_result.is_ok(),
+            "#319 regression: a concurrent documents.get_mut on the same URI must not \
+             block on an in-flight completion search — the DashMap shard Ref must be \
+             dropped before the COMPLETION_SEARCH_TIMEOUT-bounded await, not after it"
+        );
     }
 
     /// Issue #227 tester gap: `build_version_completion`'s `label_details`

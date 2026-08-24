@@ -39,10 +39,11 @@ pub struct DocumentState {
     pub ecosystem: EcosystemId,
     /// Original document content
     pub content: String,
-    /// Parsed result as trait object (new architecture)
-    /// Note: This is not cloned when DocumentState is cloned
-    #[allow(dead_code)]
-    parse_result: Option<Box<dyn ParseResult>>,
+    /// Parsed result as trait object, wrapped in `Arc` (rather than `Box`) so
+    /// [`Self::parse_result_arc`] can hand a caller a cheap owned clone — letting it
+    /// release the DashMap shard `Ref` before an `.await` on a registry-bound
+    /// `generate_*` call without deep-cloning ecosystem-specific parse data (#319).
+    parse_result: Option<Arc<dyn ParseResult>>,
     /// Latest known version and full version list per package, fetched together in a
     /// single registry round trip (see [`PackageVersions`]).
     pub cached_versions: HashMap<PackageName, PackageVersions>,
@@ -90,7 +91,8 @@ impl Clone for DocumentState {
         Self {
             ecosystem: self.ecosystem,
             content: self.content.clone(),
-            parse_result: None, // Don't clone trait object
+            // Cheap: `Arc::clone`, not a deep copy of the parse result.
+            parse_result: self.parse_result.clone(),
             cached_versions: self.cached_versions.clone(),
             resolved_versions: self.resolved_versions.clone(),
             vulnerabilities: self.vulnerabilities.clone(),
@@ -216,7 +218,7 @@ impl DocumentState {
         Self {
             ecosystem,
             content,
-            parse_result: Some(parse_result),
+            parse_result: Some(Arc::from(parse_result)),
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
@@ -259,7 +261,17 @@ impl DocumentState {
 
     /// Gets a reference to the parse result if available.
     pub fn parse_result(&self) -> Option<&dyn ParseResult> {
-        self.parse_result.as_ref().map(std::convert::AsRef::as_ref)
+        self.parse_result.as_deref()
+    }
+
+    /// Returns a cheap `Arc` clone of the parse result, if available.
+    ///
+    /// Lets a caller (e.g. a `handlers::{hover,completion,code_actions}` handler) own
+    /// the parse result and release the DashMap shard `Ref` before awaiting a
+    /// registry-bound `Ecosystem::generate_*` call, without deep-cloning
+    /// ecosystem-specific parse data on every request (#319).
+    pub fn parse_result_arc(&self) -> Option<Arc<dyn ParseResult>> {
+        self.parse_result.clone()
     }
 
     /// Updates the cached registry version data (new architecture).
@@ -519,9 +531,9 @@ impl ServerState {
     ///
     /// # Performance
     ///
-    /// Cloning `DocumentState` is relatively cheap as it only clones
-    /// `String` and `HashMap` metadata, not the underlying parse result
-    /// trait object.
+    /// Cloning `DocumentState` is relatively cheap: `String`/`HashMap` metadata is
+    /// deep-cloned, but the parse result is an `Arc` clone (a refcount bump), not a
+    /// deep copy of the underlying ecosystem-specific parse data.
     ///
     /// # Examples
     ///
@@ -1247,6 +1259,33 @@ mod tests {
             assert_eq!(cloned.ecosystem, state.ecosystem);
             assert_eq!(cloned.content, state.content);
             assert!(cloned.parse_result.is_none());
+        }
+
+        /// `parse_result` is stored as `Arc<dyn ParseResult>` (#319), so — unlike the
+        /// old `Box`-backed field, which `Clone` had to silently drop — a clone now
+        /// carries a cheap `Arc` clone of the *same* parse result rather than losing it.
+        #[test]
+        fn test_document_state_clone_preserves_parse_result() {
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let ecosystem = ServerState::new().ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+            let parse_result = tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(ecosystem.parse_manifest(&content, &uri))
+                .unwrap();
+
+            let state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            let cloned = state.clone();
+
+            assert!(
+                cloned.parse_result_arc().is_some(),
+                "clone must still carry the parse result"
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                &state.parse_result_arc().unwrap(),
+                &cloned.parse_result_arc().unwrap()
+            ));
         }
 
         #[test]

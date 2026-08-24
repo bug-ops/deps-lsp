@@ -27,31 +27,42 @@ pub async fn handle_code_actions(
         return vec![];
     }
 
-    // Single document lookup: extract all needed data at once
-    let doc = match state.get_document(uri) {
-        Some(d) => d,
-        None => return vec![],
+    // Own everything `generate_code_actions` needs and release the DashMap shard
+    // `Ref` before awaiting it: the default impl awaits a real registry fetch, so
+    // holding the guard across that await would block a concurrent
+    // `documents.get_mut` on the same shard for the duration (#319).
+    let (ecosystem, parse_result, cached_versions, resolved_versions, vulnerabilities, content) = {
+        let doc = match state.get_document(uri) {
+            Some(d) => d,
+            None => return vec![],
+        };
+
+        let Some(ecosystem) = state.ecosystem_registry.get(doc.ecosystem_id()) else {
+            return vec![];
+        };
+
+        let Some(parse_result) = doc.parse_result_arc() else {
+            return vec![];
+        };
+
+        (
+            ecosystem,
+            parse_result,
+            doc.cached_versions.clone(),
+            doc.resolved_versions.clone(),
+            doc.vulnerabilities.clone(),
+            doc.content.clone(),
+        )
     };
 
-    let ecosystem = match state.ecosystem_registry.get(doc.ecosystem_id()) {
-        Some(e) => e,
-        None => return vec![],
-    };
-
-    let parse_result = match doc.parse_result() {
-        Some(p) => p,
-        None => return vec![],
-    };
-
-    // Generate code actions while holding the lock
     let mut actions = ecosystem
         .generate_code_actions(
-            parse_result,
+            parse_result.as_ref(),
             position,
             uri,
-            VersionData::new(&doc.cached_versions, &doc.resolved_versions)
-                .with_vulnerabilities(&doc.vulnerabilities),
-            &doc.content,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulnerabilities),
+            &content,
         )
         .await;
 
