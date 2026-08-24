@@ -7,6 +7,7 @@ use crate::version::{compare_versions, version_matches_requirement};
 use deps_core::{HttpCache, Result};
 use serde::Deserialize;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const RUBYGEMS_API_BASE: &str = "https://rubygems.org/api/v1";
@@ -98,9 +99,19 @@ fn default_platform() -> String {
 fn parse_versions_response(data: &[u8], _gem_name: &str) -> Result<Vec<BundlerVersion>> {
     let entries: Vec<VersionEntry> = serde_json::from_slice(data)?;
 
-    let mut versions: Vec<BundlerVersion> = entries
-        .into_iter()
-        .map(|e| BundlerVersion {
+    // RubyGems' `versions.json` returns one entry per (version, platform) pair, so a gem
+    // shipping platform-specific prebuilt gems (nokogiri, ffi, sassc, ...) has multiple
+    // entries sharing the same `number` across platforms. Dedup by version number, keeping
+    // the `ruby` platform entry when a duplicate exists since it's the generic variant.
+    //
+    // First-seen (JSON) order is preserved rather than collected via `HashMap::into_values`
+    // (whose iteration order is randomized per-process): `compare_versions` reduces
+    // same-numeric-prefix entries (e.g. `3.7.0`, `3.7.0.pre1`) to ties, so the later stable
+    // sort's tie-break depends on this order staying deterministic across hovers.
+    let mut versions: Vec<BundlerVersion> = Vec::with_capacity(entries.len());
+    let mut index_by_number: HashMap<String, usize> = HashMap::with_capacity(entries.len());
+    for e in entries {
+        let version = BundlerVersion {
             number: e.number,
             prerelease: e.prerelease,
             yanked: e.yanked,
@@ -109,8 +120,16 @@ fn parse_versions_response(data: &[u8], _gem_name: &str) -> Result<Vec<BundlerVe
                 .as_deref()
                 .and_then(deps_core::PublishTime::parse_rfc3339),
             platform: e.platform,
-        })
-        .collect();
+        };
+        if let Some(&idx) = index_by_number.get(&version.number) {
+            if version.platform == "ruby" && versions[idx].platform != "ruby" {
+                versions[idx] = version;
+            }
+        } else {
+            index_by_number.insert(version.number.clone(), versions.len());
+            versions.push(version);
+        }
+    }
 
     // Sort by version descending (newest first)
     versions.sort_by(|a, b| compare_versions(&b.number, &a.number));
@@ -184,6 +203,14 @@ impl deps_core::Version for BundlerVersion {
 
     fn is_yanked(&self) -> bool {
         self.yanked
+    }
+
+    // RubyGems flags prereleases with dot notation (`7.1.0.beta1`, `7.1.0.rc1`), not the
+    // hyphenated style (`-beta`, `-rc`) `Version::is_prerelease`'s default heuristic checks
+    // for, so the default would misclassify a real Bundler prerelease as stable. `prerelease`
+    // is the registry's own flag for this version — trust it instead (#313).
+    fn is_prerelease(&self) -> bool {
+        self.prerelease
     }
 
     fn published_at(&self) -> Option<deps_core::PublishTime> {
@@ -430,6 +457,85 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_versions_response_dedups_platform_duplicates() {
+        let json = r#"[
+            {"number": "1.19.4", "prerelease": false, "yanked": false, "platform": "x86_64-linux"},
+            {"number": "1.19.4", "prerelease": false, "yanked": false, "platform": "ruby"},
+            {"number": "1.19.4", "prerelease": false, "yanked": false, "platform": "x64-mingw32"},
+            {"number": "1.19.3", "prerelease": false, "yanked": false, "platform": "java"}
+        ]"#;
+
+        let versions = parse_versions_response(json.as_bytes(), "nokogiri").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].number, "1.19.4");
+        assert_eq!(
+            versions[0].platform, "ruby",
+            "dedup should prefer the ruby platform entry"
+        );
+        assert_eq!(versions[1].number, "1.19.3");
+        assert_eq!(versions[1].platform, "java");
+    }
+
+    #[test]
+    fn test_parse_versions_response_dedup_without_ruby_platform() {
+        let json = r#"[
+            {"number": "2.0.0", "prerelease": false, "yanked": false, "platform": "x86-mswin32"},
+            {"number": "2.0.0", "prerelease": false, "yanked": false, "platform": "java"}
+        ]"#;
+
+        let versions = parse_versions_response(json.as_bytes(), "grpc").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].number, "2.0.0");
+    }
+
+    #[test]
+    fn test_parse_versions_response_single_version_across_all_platforms() {
+        // A gem with exactly one released version, shipped as prebuilt gems for every
+        // supported platform plus the generic `ruby` variant: dedup must collapse all
+        // of these down to the single distinct version, not zero or several.
+        let json = r#"[
+            {"number": "1.0.0", "prerelease": false, "yanked": false, "platform": "x86_64-linux"},
+            {"number": "1.0.0", "prerelease": false, "yanked": false, "platform": "x86_64-darwin"},
+            {"number": "1.0.0", "prerelease": false, "yanked": false, "platform": "x64-mingw32"},
+            {"number": "1.0.0", "prerelease": false, "yanked": false, "platform": "java"},
+            {"number": "1.0.0", "prerelease": false, "yanked": false, "platform": "ruby"}
+        ]"#;
+
+        let versions = parse_versions_response(json.as_bytes(), "grpc").unwrap();
+        assert_eq!(
+            versions.len(),
+            1,
+            "five platform entries for one version number must dedup to one distinct version"
+        );
+        assert_eq!(versions[0].platform, "ruby");
+    }
+
+    #[test]
+    fn test_parse_versions_response_dedup_is_order_deterministic_across_runs() {
+        // `compare_versions` reduces same-numeric-prefix entries to ties (the trailing
+        // non-numeric segment of "3.7.0.pre1"/"3.7.0.pre2" parses to nothing and is
+        // dropped), mirroring real gems like mime-types. The dedup step must preserve
+        // first-seen (JSON) order for the later stable sort's tie-break to stay
+        // deterministic — collecting via `HashMap::into_values` would randomize it
+        // per-process instead. Run repeatedly to catch that regression, since a HashMap's
+        // random seed is fixed for the life of one process and a single run could pass by
+        // chance.
+        let json = r#"[
+            {"number": "3.7.0.pre2", "prerelease": true, "yanked": false, "platform": "ruby"},
+            {"number": "3.7.0.pre1", "prerelease": true, "yanked": false, "platform": "ruby"},
+            {"number": "3.7.0", "prerelease": false, "yanked": false, "platform": "ruby"}
+        ]"#;
+
+        for _ in 0..20 {
+            let versions = parse_versions_response(json.as_bytes(), "mime-types").unwrap();
+            assert_eq!(versions.len(), 3);
+            assert_eq!(versions[0].number, "3.7.0.pre2");
+            assert_eq!(versions[1].number, "3.7.0.pre1");
+            assert_eq!(versions[2].number, "3.7.0");
+        }
+    }
+
+    #[test]
     fn test_parse_versions_response_empty() {
         let json = r"[]";
         let versions = parse_versions_response(json.as_bytes(), "test").unwrap();
@@ -563,6 +669,63 @@ mod tests {
         assert_eq!(version.version_string(), "1.0.0");
         assert!(version.is_yanked());
         assert!(version.features().is_empty());
+    }
+
+    #[test]
+    fn test_version_trait_is_prerelease_uses_registry_flag_not_hyphen_heuristic() {
+        use deps_core::Version;
+
+        // RubyGems flags prereleases with dot notation, not deps-core's default
+        // hyphen-based heuristic (`-beta`, `-rc`, ...).
+        let prerelease = BundlerVersion {
+            number: "7.1.0.beta1".into(),
+            prerelease: true,
+            yanked: false,
+            published_at: None,
+            platform: "ruby".into(),
+        };
+        assert!(
+            prerelease.is_prerelease(),
+            "the registry's own prerelease flag must be trusted, not the hyphen heuristic"
+        );
+
+        let stable = BundlerVersion {
+            number: "7.1.0".into(),
+            prerelease: false,
+            yanked: false,
+            published_at: None,
+            platform: "ruby".into(),
+        };
+        assert!(!stable.is_prerelease());
+    }
+
+    #[test]
+    fn test_find_latest_stable_skips_dot_notation_bundler_prerelease() {
+        use deps_core::{Version, find_latest_stable};
+
+        let versions: Vec<Box<dyn Version>> = vec![
+            Box::new(BundlerVersion {
+                number: "7.1.0.beta1".into(),
+                prerelease: true,
+                yanked: false,
+                published_at: None,
+                platform: "ruby".into(),
+            }),
+            Box::new(BundlerVersion {
+                number: "7.0.8".into(),
+                prerelease: false,
+                yanked: false,
+                published_at: None,
+                platform: "ruby".into(),
+            }),
+        ];
+
+        let latest = find_latest_stable(&versions);
+        assert_eq!(
+            latest.map(deps_core::Version::version_string),
+            Some("7.0.8"),
+            "find_latest_stable (which #313's hover fix depends on) must skip the dot-notation prerelease"
+        );
     }
 
     #[test]
