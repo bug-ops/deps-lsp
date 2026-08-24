@@ -201,15 +201,69 @@ async fn fallback_completion(
 /// key, or a trailing `"` when the cursor sits right after a closing quote (e.g. an
 /// editor auto-closed it, or the user retyped it). Either would otherwise reach the
 /// registry as part of the search query and suppress exact matches.
+///
+/// For XML manifests (`pom.xml`) an opening tag survives on the left instead (cursor
+/// inside `<artifactId>gua`) — stripped so the extracted text matches what the
+/// ecosystem's own primary completion path (e.g. `MavenEcosystem::detect_xml_context`)
+/// searches for at the same cursor position. Without this, the raw-text fallback path
+/// searches the registry for markup-polluted text instead of the real prefix, and (#282
+/// C1) a per-query dedup/cache mechanism keyed on the search string never recognizes
+/// the fallback's call as a repeat of the primary path's call for the same prefix.
 fn extract_prefix(line: &str, character: u32, ecosystem_kind: EcosystemId) -> &str {
     let prefix_end =
         deps_core::completion::utf16_to_byte_offset(line, character).unwrap_or(line.len());
     let prefix = line[..prefix_end].trim();
     if uses_json_quoted_keys(ecosystem_kind) {
         prefix.trim_matches('"')
+    } else if uses_xml_tag_values(ecosystem_kind) {
+        strip_leading_xml_tag(prefix)
     } else {
         prefix
     }
+}
+
+/// Whether `ecosystem_kind`'s manifest wraps a completable value in an XML open tag on
+/// the same line (`<artifactId>gua`), so [`extract_prefix`] must strip that tag.
+///
+/// Exhaustively matched, like [`uses_json_quoted_keys`], so a future XML-manifest
+/// ecosystem forces a decision here instead of silently leaking tag markup into a
+/// registry search query. NuGet is XML too but correctly `false`: its dependencies are
+/// attribute-valued (`<PackageReference Include="..." Version="..." />`), not tag-value
+/// wrapped like Maven's, and its `is_in_dependencies_section` arm is already `false`
+/// (see that function's doc), so it never reaches `extract_prefix` regardless.
+const fn uses_xml_tag_values(ecosystem_kind: EcosystemId) -> bool {
+    match ecosystem_kind {
+        EcosystemId::Maven => true,
+        EcosystemId::Npm
+        | EcosystemId::Composer
+        | EcosystemId::Cargo
+        | EcosystemId::Pypi
+        | EcosystemId::Go
+        | EcosystemId::Dart
+        | EcosystemId::Gradle
+        | EcosystemId::Swift
+        | EcosystemId::NuGet
+        | EcosystemId::Bundler => false,
+    }
+}
+
+/// Strips everything up to and including the *last* `>` in `prefix` (`<artifactId>gua`
+/// -> `gua`); returns `prefix` unchanged if it contains no `>` at all (e.g. the tag is
+/// not yet closed, as when the user is still typing the tag name itself).
+///
+/// Scans for the last `>`, not the first, to mirror `MavenEcosystem::
+/// detect_xml_context`'s own `rfind`-based tag lookup (`crates/deps-maven/src/
+/// ecosystem.rs`): that function locates the closest opening tag *before the cursor*,
+/// which is the last one on the line, not the first. A first-`>` version of this
+/// function diverges from it whenever more than one tag precedes the cursor on a line
+/// (`<groupId>com.google.guava</groupId><artifactId>gua` — the first `>` sits inside
+/// `<groupId>`, well short of the real value), or when the cursor sits right after a
+/// closing tag (`<artifactId>guava</artifactId>` with the cursor at the end: the last
+/// `>` is the line's very last character, correctly yielding an empty string — matching
+/// `detect_xml_context`'s own "no context" outcome for that position, since its
+/// `between.contains("</")` guard rejects it too).
+fn strip_leading_xml_tag(prefix: &str) -> &str {
+    prefix.rfind('>').map_or(prefix, |gt| &prefix[gt + 1..])
 }
 
 /// Whether `ecosystem_kind`'s manifest keys are typed as JSON string literals
@@ -600,10 +654,14 @@ mod tests {
         Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
 
-    /// Builds a `ServerState` whose `"cargo"` ecosystem entry is overridden to route
-    /// registry search through `registry`, so `fallback_completion` tests can observe
-    /// (or forbid) a search call without hitting the network.
-    fn mock_cargo_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
+    /// Builds a `ServerState` whose `id`/`manifest_filename` ecosystem entry is
+    /// overridden to route registry search through `registry`, so `fallback_completion`
+    /// tests can observe (or forbid) a search call without hitting the network.
+    fn mock_ecosystem_state(
+        id: &'static str,
+        manifest_filename: &'static str,
+        registry: Arc<dyn deps_core::Registry>,
+    ) -> ServerState {
         use deps_core::{Ecosystem, EcosystemFormatter, ParseResult};
         use std::any::Any;
         use tower_lsp_server::ls_types::Uri;
@@ -619,18 +677,20 @@ mod tests {
         }
 
         struct MockEcosystem {
+            id: &'static str,
+            manifest_filename: &'static str,
             registry: Arc<dyn deps_core::Registry>,
         }
         impl deps_core::ecosystem::private::Sealed for MockEcosystem {}
         impl Ecosystem for MockEcosystem {
             fn id(&self) -> &'static str {
-                "cargo"
+                self.id
             }
             fn display_name(&self) -> &'static str {
-                "Cargo (mock)"
+                self.id
             }
             fn manifest_filenames(&self) -> &[&'static str] {
-                &["Cargo.toml"]
+                std::slice::from_ref(&self.manifest_filename)
             }
             fn parse_manifest<'a>(
                 &'a self,
@@ -661,10 +721,24 @@ mod tests {
         }
 
         let state = ServerState::new();
+        state.ecosystem_registry.register(Arc::new(MockEcosystem {
+            id,
+            manifest_filename,
+            registry,
+        }));
         state
-            .ecosystem_registry
-            .register(Arc::new(MockEcosystem { registry }));
-        state
+    }
+
+    /// Builds a `ServerState` whose `"cargo"` ecosystem entry is overridden to route
+    /// registry search through `registry`, so `fallback_completion` tests can observe
+    /// (or forbid) a search call without hitting the network.
+    fn mock_cargo_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
+        mock_ecosystem_state("cargo", "Cargo.toml", registry)
+    }
+
+    /// Same as [`mock_cargo_state`], but for the `"maven"` ecosystem.
+    fn mock_maven_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
+        mock_ecosystem_state("maven", "pom.xml", registry)
     }
 
     #[tokio::test]
@@ -1459,6 +1533,117 @@ s
         .await;
         assert_eq!(ascii_items.len(), 1);
         assert_eq!(ascii_items[0].label, "serde");
+    }
+
+    #[test]
+    fn test_extract_prefix_strips_leading_xml_tag_for_maven() {
+        // Cursor right after "gua" in `<artifactId>gua`.
+        assert_eq!(
+            extract_prefix("  <artifactId>gua", 17, EcosystemId::Maven),
+            "gua"
+        );
+    }
+
+    #[test]
+    fn test_extract_prefix_maven_unclosed_tag_is_unchanged() {
+        // Cursor mid-tag-name, before `>` exists yet: nothing to strip.
+        assert_eq!(
+            extract_prefix("  <artifactId", 13, EcosystemId::Maven),
+            "<artifactId"
+        );
+    }
+
+    /// #282 S1 (second critic round): a first-`>`-based strip diverges from
+    /// `MavenEcosystem::detect_xml_context`'s own `rfind`-based (last-tag) lookup
+    /// whenever more than one tag precedes the cursor on a line — the first `>` here
+    /// sits inside `<groupId>`, well short of the real value. Mirrored by
+    /// `deps-maven`'s `test_detect_xml_context_compact_multi_tag_line_matches_completion_extractor`
+    /// using the identical line/cursor position.
+    #[test]
+    fn test_extract_prefix_maven_strips_last_tag_not_first() {
+        let line = "    <dependency><groupId>com.google.guava</groupId><artifactId>gua";
+        assert_eq!(extract_prefix(line, 66, EcosystemId::Maven), "gua");
+    }
+
+    /// #282 S1 (second critic round): cursor right after a fully closed tag must yield
+    /// an empty prefix (rejected by `fallback_completion`'s existing empty-prefix
+    /// guard), matching `detect_xml_context`'s own "no context" outcome for the same
+    /// position (its `between.contains("</")` guard rejects it too) instead of sending
+    /// `solrsearch` a markup-polluted live query for an ordinary explicit-invoke
+    /// position. Mirrored by `deps-maven`'s
+    /// `test_detect_xml_context_after_closed_tag_yields_no_context` using the identical
+    /// line/cursor position.
+    #[test]
+    fn test_extract_prefix_maven_after_closed_tag_is_empty() {
+        let line = "    <artifactId>guava</artifactId>";
+        assert_eq!(extract_prefix(line, 34, EcosystemId::Maven), "");
+    }
+
+    /// #282 C1 regression guard: the primary completion path (`MavenEcosystem::
+    /// detect_xml_context`) searches the registry for the bare tag value (`"gua"` for
+    /// `<artifactId>gua`), not the raw line text. Before this fix, `fallback_completion`
+    /// searched for `"<artifactId>gua"` instead — a different query string that broke
+    /// both search relevance and any per-query dedup/cache mechanism (the fast-failure
+    /// amplification fix in `deps-maven`) keyed on the query matching across the
+    /// primary and fallback paths for the same cursor position.
+    #[tokio::test]
+    async fn test_fallback_completion_maven_query_matches_tag_value() {
+        use deps_core::{Metadata, Registry};
+        use std::any::Any;
+        use std::sync::Mutex;
+
+        struct CapturingRegistry {
+            captured_query: Mutex<Option<String>>,
+        }
+        impl Registry for CapturingRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::Result<Vec<Box<dyn deps_core::Version>>>,
+            > {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::Result<Option<Box<dyn deps_core::Version>>>,
+            > {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                *self.captured_query.lock().unwrap() = Some(query.to_string());
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry = Arc::new(CapturingRegistry {
+            captured_query: Mutex::new(None),
+        });
+        let state = mock_maven_state(Arc::clone(&registry) as Arc<dyn Registry>);
+
+        let content = "<dependencies>\n  <dependency>\n    <artifactId>gua\n";
+        fallback_completion(&state, EcosystemId::Maven, Position::new(2, 19), content).await;
+
+        assert_eq!(
+            registry.captured_query.lock().unwrap().as_deref(),
+            Some("gua")
+        );
     }
 
     #[test]

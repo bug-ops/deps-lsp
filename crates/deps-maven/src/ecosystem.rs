@@ -422,6 +422,37 @@ mod tests {
         assert_eq!(v, "jun");
     }
 
+    /// #282 S1 (second critic round) parity guard: `deps-lsp`'s `completion.rs`
+    /// (`extract_prefix`/`strip_leading_xml_tag`) must extract the identical query
+    /// string for the identical cursor position, since it's a raw-text approximation of
+    /// this function's own tag-aware extraction, and both feed the same registry
+    /// dedup/cache-key mechanism (`MavenCentralRegistry::search_typed`). This line and
+    /// cursor position are kept intentionally identical to `deps-lsp`'s
+    /// `test_fallback_completion_maven_query_matches_tag_value` — if either extractor's
+    /// logic changes, update both tests and confirm they still agree.
+    #[test]
+    fn test_detect_xml_context_compact_multi_tag_line_matches_completion_extractor() {
+        // <dependency><groupId>com.google.guava</groupId><artifactId>gua| — cursor
+        // right after "gua", with an earlier `<groupId>...</groupId>` on the same line.
+        let line = "<dependency><groupId>com.google.guava</groupId><artifactId>gua";
+        let (t, v) = xml_context(line, u32::try_from(line.len()).unwrap());
+        assert_eq!(t, "artifactId");
+        assert_eq!(v, "gua");
+    }
+
+    /// #282 S1 (second critic round) parity guard: cursor right after a fully closed
+    /// tag (`<artifactId>guava</artifactId>|`) yields no completion context at all —
+    /// `between.contains("</")` rejects it. `deps-lsp`'s `strip_leading_xml_tag` must
+    /// agree by yielding an empty string for the same position (which `fallback_completion`'s
+    /// existing empty-prefix guard then rejects), not a markup-polluted search query.
+    #[test]
+    fn test_detect_xml_context_after_closed_tag_yields_no_context() {
+        let line = "<artifactId>guava</artifactId>";
+        let (t, v) = xml_context(line, u32::try_from(line.len()).unwrap());
+        assert_eq!(t, "");
+        assert_eq!(v, "");
+    }
+
     #[test]
     fn test_detect_xml_context_artifact_id_range_spans_full_value() {
         // <artifactId>jun|it</artifactId> — indented by 4 spaces in xml_context_with_range
