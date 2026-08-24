@@ -54,7 +54,9 @@ pub use parser::{
     MAX_YAML_NESTING_DEPTH, check_toml_nesting_depth, check_yaml_expansion,
     check_yaml_nesting_depth,
 };
-pub use registry::{Metadata, Registry, Version, find_latest_stable};
+pub use registry::{
+    Metadata, Registry, Version, find_latest_stable, has_default_prerelease_marker,
+};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
     normalize_and_parse_version, normalize_operator_spacing,

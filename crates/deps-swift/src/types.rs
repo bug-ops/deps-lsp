@@ -60,21 +60,22 @@ pub struct SwiftVersion {
     /// among the newest ~100 (see `SwiftRegistry::release_dates`). `None` for a
     /// tag-only version or one outside that window — never a wrong date (#223).
     pub published_at: Option<deps_core::PublishTime>,
+    /// Whether the tag's semver `pre` component is non-empty, computed once
+    /// from the `semver::Version` already parsed by `tags_to_versions` (#327 M5).
+    pub prerelease: bool,
 }
 
-// GitHub release tags are parsed as strict semver (the `v` prefix already
-// stripped), so `semver::Version::parse` gives a reliable `pre` component
-// instead of falling back to deps-core's default hyphen-substring
-// heuristic (#322). `tags_to_versions` already filters non-semver tags
-// before this runs, so a parse failure here (treated as not-prerelease) is
-// practically unreachable.
+// `prerelease` is threaded from the single semver parse `tags_to_versions`
+// already performs and discards, instead of re-parsing `version` on every
+// `is_prerelease()` call (#327 M5). GitHub release tags are parsed as strict
+// semver (the `v` prefix already stripped) there, so this reflects a
+// reliable `pre` component instead of falling back to deps-core's default
+// hyphen-substring heuristic (#322).
 deps_core::impl_version!(SwiftVersion {
     version: version,
     yanked: yanked,
     published_at: published_at,
-    prerelease: |v: &SwiftVersion| {
-        semver::Version::parse(&v.version).is_ok_and(|parsed| !parsed.pre.is_empty())
-    },
+    prerelease: |v: &SwiftVersion| v.prerelease,
 });
 
 /// Package metadata from GitHub API.
@@ -159,6 +160,7 @@ mod tests {
             version: "2.40.0".into(),
             yanked: false,
             published_at: None,
+            prerelease: false,
         };
         assert_eq!(ver.version_string(), "2.40.0");
         assert!(!ver.is_yanked());
@@ -170,11 +172,13 @@ mod tests {
             version: "2.40.0".into(),
             yanked: false,
             published_at: None,
+            prerelease: false,
         };
         let prerelease = SwiftVersion {
             version: "2.40.0-beta.1".into(),
             yanked: false,
             published_at: None,
+            prerelease: true,
         };
 
         assert!(!stable.is_prerelease());
