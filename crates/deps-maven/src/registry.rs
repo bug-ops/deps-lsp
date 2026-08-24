@@ -1104,6 +1104,31 @@ mod tests {
         assert_rejected_as_not_found(metadata_urls(".:artifact"));
     }
 
+    /// #365 regression sweep: exercises the real production, self-gating `metadata_urls`
+    /// sink against the shared adversarial input set (varying artifactId, then groupId),
+    /// guarding against a 6th recurrence of #349's defect class.
+    #[test]
+    fn test_metadata_urls_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| {
+                metadata_urls(&format!("com.example:{seg}"))
+                    .ok()
+                    .and_then(|urls| urls.into_iter().next())
+            },
+            "repo1.maven.org",
+            "/maven2/",
+        );
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| {
+                metadata_urls(&format!("{seg}:artifact"))
+                    .ok()
+                    .and_then(|urls| urls.into_iter().next())
+            },
+            "repo1.maven.org",
+            "/maven2/",
+        );
+    }
+
     /// #349: a legitimate coordinate must still resolve to a URL confined to the
     /// `maven2` (or Gradle Plugin Portal) prefix — verified structurally via
     /// `url::Url::parse`, not a raw-string `contains` check, so a future regression that

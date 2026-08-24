@@ -24,7 +24,7 @@
 //! ```
 
 use crate::types::{CargoVersion, CrateInfo};
-use deps_core::{DepsError, HttpCache, Result};
+use deps_core::{DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use std::any::Any;
@@ -43,6 +43,39 @@ pub const CRATES_IO_URL: &str = "https://crates.io/crates";
 /// Returns the URL for a crate's page on crates.io.
 pub fn crate_url(name: &str) -> String {
     format!("{CRATES_IO_URL}/{}", urlencoding::encode(name))
+}
+
+/// Whether `name` matches crates.io's actual crate-name charset (ASCII alphanumeric, `-`,
+/// `_`) — stricter than [`deps_core::is_safe_package_name`], which permits `/`, `@`, `.`,
+/// `:`, `~` to accommodate other ecosystems' scoped/namespaced names. `sparse_index_path`
+/// performs no per-character encoding at all before splicing `name` into the request URL
+/// (unlike every other ecosystem crate, which `urlencoding::encode`s each segment): a
+/// `name` containing `/` or `.` is used as-is to build directory components, so a crafted
+/// name like `../../etc/passwd` can inject arbitrary path segments, not just the narrower
+/// exact-`.`/`..` case #341/#349/#357/#361 covered (#365 S1).
+fn is_safe_crate_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+/// Rejects a `name` outside crates.io's crate-name charset before it would reach
+/// [`sparse_index_path`], as `DepsError::PackageNotFound`.
+fn reject_unsafe_crate_name(name: &str) -> Result<()> {
+    if !is_safe_crate_name(name) {
+        warn_rejected_value(
+            "is_safe_crate_name",
+            "crates.io sparse index request URL",
+            name,
+        );
+        return Err(DepsError::PackageNotFound {
+            package: name.to_string(),
+            registry: REGISTRY,
+        });
+    }
+    Ok(())
 }
 
 /// Client for interacting with crates.io registry.
@@ -87,13 +120,8 @@ impl CratesIoRegistry {
     /// # }
     /// ```
     pub async fn get_versions(&self, name: &str) -> Result<Vec<CargoVersion>> {
-        let path = sparse_index_path(name);
-        // Pre-allocate: SPARSE_INDEX_BASE (25 chars) + "/" + path
-        let mut url = String::with_capacity(SPARSE_INDEX_BASE.len() + 1 + path.len());
-        url.push_str(SPARSE_INDEX_BASE);
-        url.push('/');
-        url.push_str(&path);
-
+        reject_unsafe_crate_name(name)?;
+        let url = sparse_index_url(name);
         let data = self.cache.get_cached(&url).await?;
 
         parse_index_json(&data, name)
@@ -191,6 +219,12 @@ impl CratesIoRegistry {
 /// positions, not byte length/offsets — crate names may contain multi-byte
 /// UTF-8 characters, and byte-index slicing could land mid-character and panic.
 /// An empty name has no length-based segment and returns the empty string.
+///
+/// Callers must additionally run [`reject_unsafe_crate_name`] first: this function performs
+/// no charset/encoding validation of `name` at all, so an unchecked `name` (any character,
+/// including `.`/`..` or an embedded `/`) reaches this unfiltered and can inject arbitrary
+/// path segments once spliced into the request URL (#365 S1) — the char-safe indexing above
+/// only prevents a panic (#376), it does not validate `name`.
 fn sparse_index_path(name: &str) -> String {
     let name_lower = name.to_lowercase();
     let chars: Vec<char> = name_lower.chars().collect();
@@ -227,6 +261,20 @@ fn sparse_index_path(name: &str) -> String {
             path
         }
     }
+}
+
+/// Builds the sparse index request URL for a crate's version metadata. Callers must run
+/// [`reject_unsafe_crate_name`] first — `sparse_index_path` performs no encoding or
+/// rejection of `name` at all, so an unchecked `name` (any character, including `.`/`..`
+/// or an embedded `/`) reaches this unfiltered.
+fn sparse_index_url(name: &str) -> String {
+    let path = sparse_index_path(name);
+    // Pre-allocate: SPARSE_INDEX_BASE (25 chars) + "/" + path
+    let mut url = String::with_capacity(SPARSE_INDEX_BASE.len() + 1 + path.len());
+    url.push_str(SPARSE_INDEX_BASE);
+    url.push('/');
+    url.push_str(&path);
+    url
 }
 
 /// Entry in the sparse index (one line of newline-delimited JSON).
@@ -395,6 +443,86 @@ mod tests {
     #[test]
     fn test_sparse_index_path_uppercase() {
         assert_eq!(sparse_index_path("SERDE"), "se/rd/serde");
+    }
+
+    #[test]
+    fn test_reject_unsafe_crate_name_rejects_bare_dot_dot() {
+        assert!(reject_unsafe_crate_name("..").is_err());
+    }
+
+    #[test]
+    fn test_reject_unsafe_crate_name_rejects_bare_dot() {
+        assert!(reject_unsafe_crate_name(".").is_err());
+    }
+
+    #[test]
+    fn test_reject_unsafe_crate_name_rejects_embedded_slash() {
+        // S1 (impl-critic): `sparse_index_path` performs no per-character encoding, so a
+        // `/` anywhere in `name` (not just a bare `.`/`..`) can inject path segments once
+        // spliced into the request URL.
+        assert!(reject_unsafe_crate_name("../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_reject_unsafe_crate_name_accepts_normal_names() {
+        assert!(reject_unsafe_crate_name("serde").is_ok());
+        assert!(reject_unsafe_crate_name("serde_derive").is_ok());
+        assert!(reject_unsafe_crate_name("actix-web").is_ok());
+    }
+
+    /// #376: `sparse_index_path`'s byte-index slicing (`name_lower[0..2]` etc.) panics on a
+    /// non-ASCII crate name, since those indices can land mid-codepoint. `is_safe_crate_name`'s
+    /// ASCII-alphanumeric-only allowlist blocks any non-ASCII input before it reaches that
+    /// code, closing the panic as a side effect of the charset check — asserted directly here
+    /// so a future narrowing of the allowlist's *intent* (without touching this exact
+    /// assertion) can't silently reopen the panic with nothing to catch it.
+    #[test]
+    fn test_reject_unsafe_crate_name_rejects_non_ascii() {
+        assert!(reject_unsafe_crate_name("日本").is_err());
+    }
+
+    /// Demonstrates the vulnerability `reject_unsafe_crate_name` exists to prevent:
+    /// `sparse_index_url` alone (with no caller-side guard) builds a URL that, once parsed,
+    /// has escaped the sparse index root entirely.
+    #[test]
+    fn test_sparse_index_url_bare_dot_dot_normalizes_above_root() {
+        let url = sparse_index_url("..");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.path(), "/", "parsed path: {}", parsed.path());
+    }
+
+    /// Demonstrates the broader S1 vulnerability: an embedded `/` (not just a bare
+    /// `.`/`..`) lets `sparse_index_url` alone build a URL whose path escapes to an
+    /// attacker-influenced location, since no character in `name` is encoded.
+    #[test]
+    fn test_sparse_index_url_embedded_slash_escapes_root() {
+        let url = sparse_index_url("../../etc/passwd");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.path(),
+            "/etc/passwd",
+            "parsed path: {}",
+            parsed.path()
+        );
+    }
+
+    /// #365 regression sweep: exercises the real production `reject_unsafe_crate_name`
+    /// gate and `sparse_index_url` sink together against the shared adversarial input set.
+    /// Every entry is rejected by the charset-only gate before reaching the sink (none of
+    /// `ADVERSARIAL_URL_SEGMENTS` is pure ASCII-alphanumeric/`-`/`_`), so this is a vacuous
+    /// but still forward-looking regression guard: it would start exercising the
+    /// host/prefix/survival assertions the moment the gate's charset is ever loosened.
+    #[test]
+    fn test_sparse_index_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| {
+                reject_unsafe_crate_name(seg)
+                    .ok()
+                    .map(|()| sparse_index_url(seg))
+            },
+            "index.crates.io",
+            "/",
+        );
     }
 
     #[test]
@@ -687,6 +815,30 @@ mod tests {
     async fn test_registry_creation() {
         let cache = Arc::new(HttpCache::new());
         let _registry = CratesIoRegistry::new(cache);
+    }
+
+    /// #365 end-to-end coverage (critic S2): exercises the real production
+    /// `get_versions` — not a reimplemented gate+sink pair — proving the gate is actually
+    /// wired into the call path a real completion/hover/diagnostic request would take. No
+    /// mock is needed: the gate must reject before any network request is issued.
+    ///
+    /// Asserts the exact `PackageNotFound` variant (gate rejected before any request), not
+    /// the broader `is_not_found()` (also true for a live 404 `HttpStatus`) — critic R1: a
+    /// deleted gate here would still hit `index.crates.io` and get back a real (non-404)
+    /// response that fails to parse as sparse-index JSON, so `is_not_found()` alone would
+    /// not reliably catch the regression.
+    #[tokio::test]
+    async fn test_get_versions_rejects_bare_dot_dot_as_not_found() {
+        let registry = CratesIoRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry.get_versions("..").await.unwrap_err();
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_rejects_embedded_slash_as_not_found() {
+        let registry = CratesIoRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry.get_versions("../../etc/passwd").await.unwrap_err();
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
     }
 
     #[tokio::test]

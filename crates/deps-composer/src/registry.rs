@@ -9,7 +9,7 @@
 //! by inheriting from the previous complete entry.
 
 use crate::types::{ComposerPackage, ComposerVersion};
-use deps_core::{DepsError, HttpCache, Result};
+use deps_core::{DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value};
 use serde::Deserialize;
 use std::any::Any;
 use std::sync::Arc;
@@ -37,6 +37,51 @@ pub fn package_url(name: &str) -> String {
 
 /// Display name for Packagist used in not-found and API-response error messages.
 pub const REGISTRY: &str = "Packagist";
+
+/// Builds the Packagist v2 API request URL for `name`'s version metadata.
+///
+/// Packagist names are `vendor/package`; each segment is percent-encoded individually.
+/// Callers must run [`reject_dot_segment`] first — a `vendor` of exactly `.`/`..` survives
+/// encoding unchanged (`.` is an RFC 3986 unreserved character) and sits between two real
+/// `/` separators here (`{base}/p2/{vendor}/{package}.json`), so it forms an exact
+/// dot-segment that a URL parser's dot-segment normalization collapses, escaping the `/p2/`
+/// prefix (#365). The unscoped `package` segment is glued directly onto `.json` with no
+/// separator and cannot form an exact dot-segment this way, but is still gated for
+/// consistency with every other ecosystem's blanket per-segment check.
+fn p2_url(base: &str, name: &str) -> String {
+    if let Some((vendor, package)) = name.split_once('/') {
+        format!(
+            "{base}/p2/{}/{}.json",
+            urlencoding::encode(vendor),
+            urlencoding::encode(package)
+        )
+    } else {
+        format!("{base}/p2/{}.json", urlencoding::encode(name))
+    }
+}
+
+/// Whether `name` (a bare package name, or `vendor/package` form) has a path segment that
+/// is exactly `.`/`..`, mirroring `deps-npm`'s identical `has_dot_segment` for the same
+/// vulnerability class.
+fn has_dot_segment(name: &str) -> bool {
+    if let Some((vendor, package)) = name.split_once('/') {
+        return is_dot_segment(vendor) || is_dot_segment(package);
+    }
+    is_dot_segment(name)
+}
+
+/// Rejects a dot-segment `name` before it would reach [`p2_url`], as
+/// `DepsError::PackageNotFound`.
+fn reject_dot_segment(name: &str) -> Result<()> {
+    if has_dot_segment(name) {
+        warn_rejected_value("is_dot_segment", "Packagist p2 metadata request URL", name);
+        return Err(DepsError::PackageNotFound {
+            package: name.to_string(),
+            registry: REGISTRY,
+        });
+    }
+    Ok(())
+}
 
 /// Client for interacting with the Packagist registry.
 ///
@@ -69,17 +114,8 @@ impl PackagistRegistry {
     ///
     /// Returns an error if the HTTP request or JSON parsing fails.
     pub async fn get_versions(&self, name: &str) -> Result<Vec<ComposerVersion>> {
-        // Packagist names are vendor/package; encode each segment separately
-        let base = &self.base;
-        let url = if let Some((vendor, package)) = name.split_once('/') {
-            format!(
-                "{base}/p2/{}/{}.json",
-                urlencoding::encode(vendor),
-                urlencoding::encode(package)
-            )
-        } else {
-            format!("{base}/p2/{}.json", urlencoding::encode(name))
-        };
+        reject_dot_segment(name)?;
+        let url = p2_url(&self.base, name);
         let data = self.cache.get_cached(&url).await?;
         parse_package_metadata(name, &data)
     }
@@ -361,6 +397,86 @@ mod tests {
     #[test]
     fn test_package_url_empty_name() {
         assert_eq!(package_url(""), "https://packagist.org/packages/");
+    }
+
+    #[test]
+    fn test_reject_dot_segment_rejects_bare_dot_dot() {
+        assert!(reject_dot_segment("..").is_err());
+    }
+
+    #[test]
+    fn test_reject_dot_segment_rejects_vendor_dot_dot() {
+        assert!(reject_dot_segment("../evil").is_err());
+    }
+
+    #[test]
+    fn test_reject_dot_segment_rejects_package_dot_dot() {
+        assert!(reject_dot_segment("vendor/..").is_err());
+    }
+
+    #[test]
+    fn test_reject_dot_segment_accepts_normal_names() {
+        assert!(reject_dot_segment("monolog/monolog").is_ok());
+        assert!(reject_dot_segment("symfony").is_ok());
+    }
+
+    /// Demonstrates the vulnerability `reject_dot_segment` exists to prevent: `p2_url`
+    /// alone (with no caller-side guard) builds a URL that, once parsed, has already lost
+    /// the `p2` path component for a `vendor` of exactly `..`.
+    #[test]
+    fn test_p2_url_bare_dot_dot_vendor_normalizes_above_p2_prefix() {
+        let url = p2_url("https://repo.packagist.org", "../evil");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.path(),
+            "/evil.json",
+            "parsed path: {}",
+            parsed.path()
+        );
+    }
+
+    /// #365 regression sweep: exercises the real production `reject_dot_segment` gate and
+    /// `p2_url` sink together against the shared adversarial input set (varying vendor,
+    /// then package), guarding against a 6th recurrence of the dot-segment defect class in
+    /// this crate.
+    #[test]
+    fn test_p2_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| {
+                let name = format!("{seg}/package");
+                reject_dot_segment(&name)
+                    .ok()
+                    .map(|()| p2_url("https://repo.packagist.org", &name))
+            },
+            "repo.packagist.org",
+            "/p2/",
+        );
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| {
+                let name = format!("vendor/{seg}");
+                reject_dot_segment(&name)
+                    .ok()
+                    .map(|()| p2_url("https://repo.packagist.org", &name))
+            },
+            "repo.packagist.org",
+            "/p2/",
+        );
+    }
+
+    /// #365 end-to-end coverage (critic S2): exercises the real production
+    /// `get_versions` — not a reimplemented gate+sink pair — proving the gate is actually
+    /// wired into the call path a real completion/hover/diagnostic request would take. No
+    /// mock is needed: the gate must reject before any network request is issued.
+    ///
+    /// Asserts the exact `PackageNotFound` variant (gate rejected before any request), not
+    /// the broader `is_not_found()` (also true for a live 404 `HttpStatus`) — critic R1:
+    /// `repo.packagist.org` 404ing for this path today would make a deleted gate go
+    /// undetected by this test.
+    #[tokio::test]
+    async fn test_get_versions_rejects_vendor_dot_dot_as_not_found() {
+        let registry = PackagistRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry.get_versions("../evil").await.unwrap_err();
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
     }
 
     #[test]

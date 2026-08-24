@@ -169,6 +169,28 @@ pub fn package_url(name: &str) -> String {
     )
 }
 
+/// Rejects a dot-segment `name` before it would reach [`flat_container_url`]/
+/// [`registration_index_url`], as `DepsError::PackageNotFound` — mirroring `deps-npm`'s/
+/// `deps-dart`'s identical guard for the same vulnerability class (#341/#349/#365): a `name`
+/// of exactly `.`/`..`, once lowercased and percent-encoded, is followed by a real `/`
+/// separator before `index.json`, so it forms an exact dot-segment that a URL parser's
+/// dot-segment normalization collapses, escaping the intended `PackageBaseAddress`/
+/// `RegistrationsBaseUrl` prefix.
+fn reject_dot_segment(name: &str) -> Result<()> {
+    if deps_core::is_dot_segment(name) {
+        deps_core::lsp_helpers::warn_rejected_value(
+            "is_dot_segment",
+            "NuGet flat-container/registration request URL",
+            name,
+        );
+        return Err(deps_core::DepsError::PackageNotFound {
+            package: name.to_string(),
+            registry: REGISTRY,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct NuGetRegistry {
     cache: Arc<HttpCache>,
@@ -233,10 +255,14 @@ impl NuGetRegistry {
     ///
     /// Both fetches go through `HttpCache::get_cached_trusted_origin`, scoped to the
     /// resolved `PackageBaseAddress`/`RegistrationsBaseUrl` respectively — not just the
-    /// external registration pages `publish_times_from_index` walks. Every URL this method
-    /// ever contacts (index, flat container, registration index, and — down in
-    /// `publish_times_from_index` — the page `@id`s the index itself supplies) is checked
-    /// against its trusted prefix on every redirect hop, not only its initial request.
+    /// external registration pages `publish_times_from_index` walks. Every *redirect* this
+    /// method's requests can follow (index, flat container, registration index, and — down
+    /// in `publish_times_from_index` — the page `@id`s the index itself supplies) is
+    /// checked against its trusted prefix, since `get_cached_trusted_origin` selects a
+    /// redirect-policy-scoped client — it does not itself validate the *initial* request
+    /// URL. That initial URL's safety instead comes from `reject_dot_segment`, which gates
+    /// `name` before `flat_container_url`/`registration_index_url` are ever called (#365
+    /// M5).
     ///
     /// # Errors
     ///
@@ -247,6 +273,7 @@ impl NuGetRegistry {
         name: &str,
         freshness_enabled: bool,
     ) -> Result<Vec<NuGetVersion>> {
+        reject_dot_segment(name)?;
         let index = self.service_index().await?;
         let flat_url = flat_container_url(&index.package_base_address, name);
         let flat_trusted_prefix = format!("{}/", index.package_base_address);
@@ -723,6 +750,52 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_dot_segment_rejects_bare_dot_dot() {
+        assert!(reject_dot_segment("..").is_err());
+    }
+
+    #[test]
+    fn test_reject_dot_segment_rejects_bare_dot() {
+        assert!(reject_dot_segment(".").is_err());
+    }
+
+    #[test]
+    fn test_reject_dot_segment_accepts_normal_names() {
+        assert!(reject_dot_segment("Newtonsoft.Json").is_ok());
+    }
+
+    /// Demonstrates the vulnerability `reject_dot_segment` exists to prevent:
+    /// `flat_container_url` alone (with no caller-side guard) builds a URL that, once
+    /// parsed, has already lost the `v3-flatcontainer` path component.
+    #[test]
+    fn test_flat_container_url_bare_dot_dot_normalizes_above_base_prefix() {
+        let url = flat_container_url("https://api.nuget.org/v3-flatcontainer", "..");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.path(),
+            "/index.json",
+            "parsed path: {}",
+            parsed.path()
+        );
+    }
+
+    /// #365 regression sweep: exercises the real production `reject_dot_segment` gate and
+    /// `flat_container_url` sink together against the shared adversarial input set,
+    /// guarding against a 6th recurrence of the dot-segment defect class in this crate.
+    #[test]
+    fn test_flat_container_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| {
+                reject_dot_segment(seg)
+                    .ok()
+                    .map(|()| flat_container_url("https://api.nuget.org/v3-flatcontainer", seg))
+            },
+            "api.nuget.org",
+            "/v3-flatcontainer/",
+        );
+    }
+
+    #[test]
     fn test_search_url_includes_mandatory_semver_level_and_prerelease_false() {
         let url = search_url("https://azuresearch-usnc.nuget.org/query", "json", 10);
         assert_eq!(
@@ -880,6 +953,26 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = NuGetRegistry::new(cache);
         assert!(registry.as_any().is::<NuGetRegistry>());
+    }
+
+    /// #365 end-to-end coverage (critic S2): exercises the real production
+    /// `get_versions_typed_with` — not a reimplemented gate+sink pair — proving the gate is
+    /// actually wired into the call path a real completion/hover/diagnostic request would
+    /// take. No mock is needed: `reject_dot_segment` runs before `service_index()`, so the
+    /// gate must reject before any network request is issued.
+    ///
+    /// Asserts the exact `PackageNotFound` variant (gate rejected before any request), not
+    /// the broader `is_not_found()` (also true for a live 404 `HttpStatus`) — critic R1:
+    /// `api.nuget.org` 404ing for this path today would make a deleted gate go undetected
+    /// by this test.
+    #[tokio::test]
+    async fn test_get_versions_typed_with_rejects_bare_dot_dot_as_not_found() {
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry
+            .get_versions_typed_with("..", false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, deps_core::DepsError::PackageNotFound { .. }));
     }
 
     #[test]

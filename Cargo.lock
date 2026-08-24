@@ -453,6 +453,7 @@ dependencies = [
  "toml-span",
  "tower-lsp-server",
  "tracing",
+ "url",
  "urlencoding",
 ]
 
@@ -469,6 +470,7 @@ dependencies = [
  "tokio",
  "tower-lsp-server",
  "tracing",
+ "url",
  "urlencoding",
 ]
 
@@ -492,6 +494,8 @@ dependencies = [
  "tokio-test",
  "tower-lsp-server",
  "tracing",
+ "url",
+ "urlencoding",
  "yaml-rust2",
 ]
 
@@ -551,6 +555,7 @@ dependencies = [
  "tokio-test",
  "tower-lsp-server",
  "tracing",
+ "url",
  "urlencoding",
 ]
 
@@ -665,6 +670,7 @@ dependencies = [
  "tokio-test",
  "tower-lsp-server",
  "tracing",
+ "url",
  "urlencoding",
 ]
 
