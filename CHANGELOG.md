@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: `Version::is_yanked() -> bool` is replaced by `Version::removal_status() -> RemovalStatus` (a new `Available`/`AdvisoryDeprecated`/`Yanked` enum, re-exported from `deps-core`), so a call site must now state whether it means "blocks resolution" or "is flagged at all" instead of conflating the two (resolves #348) (#363)
 
 ### Fixed
+- **deps-maven**: hover no longer renders a broken "package not found" section for a `groupId`/`artifactId` rejected by the dot-segment/path-traversal guard (e.g. a literal `..`) — `metadata_urls` now returns `PackageNotFound` for a rejected coordinate instead of the same empty-URL-list path used by a malformed pair, so hover returns `None` like it already does for a genuine 404 (resolves #366)
 - **deps-core**: `LockFileCache::get_or_parse` now stats the lock file's mtime before parsing rather than after, closing a TOCTOU window where a concurrent rewrite mid-parse could cache stale content under a fresh mtime (resolves #359, #360) (#362)
 - **deps-core**: `LockFileCache::get_or_parse` no longer holds a `DashMap` `Ref` across the `tokio::fs::metadata` staleness-check await, closing the last known hazard in this class after #333/#334 (resolves #350)
 - **deps-composer**: an abandoned Packagist package's still-installable versions are no longer excluded from resolution, which previously misreported every version of an abandoned package as "Unknown package" (resolves #347) (#363)
