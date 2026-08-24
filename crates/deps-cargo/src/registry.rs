@@ -349,9 +349,9 @@ impl deps_core::Registry for CratesIoRegistry {
     ) -> Option<usize> {
         let parsed_req: VersionReq = req.as_str().parse().ok()?;
         versions.iter().position(|v| {
-            v.version_string()
-                .parse::<Version>()
-                .is_ok_and(|ver| parsed_req.matches(&ver) && !v.is_yanked())
+            v.version_string().parse::<Version>().is_ok_and(|ver| {
+                parsed_req.matches(&ver) && !v.removal_status().blocks_resolution()
+            })
         })
     }
 

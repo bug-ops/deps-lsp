@@ -597,9 +597,9 @@ impl deps_core::Registry for NuGetRegistry {
         })
     }
 
-    // `Version::is_yanked` is hardcoded `false` (`types.rs:63`) — the flat
-    // versions container `get_versions` reads has no `listed` flag (see the
-    // TODO above at `registry.rs:274`) (#233).
+    // `Version::removal_status` uses the trait's default `Available` (no override
+    // in `types.rs`) — the flat versions container `get_versions` reads has no
+    // `listed` flag (see the TODO above at `registry.rs:274`) (#233).
     fn reports_yanked(&self) -> bool {
         false
     }

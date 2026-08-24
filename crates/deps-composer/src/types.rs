@@ -128,7 +128,7 @@ fn has_short_stability_alias(s: &str) -> bool {
 // that case never reaches `is_prerelease()` (#327 M1).
 deps_core::impl_version!(ComposerVersion {
     version: version,
-    yanked: abandoned,
+    status: |v: &ComposerVersion| deps_core::RemovalStatus::from_advisory(v.abandoned),
     published_at: published_at,
     prerelease: |v: &ComposerVersion| {
         deps_core::has_default_prerelease_marker(&v.version)
@@ -214,7 +214,11 @@ mod tests {
         };
 
         assert_eq!(version.version_string(), "2.0.0");
-        assert!(version.is_yanked());
+        assert_eq!(
+            version.removal_status(),
+            deps_core::RemovalStatus::AdvisoryDeprecated
+        );
+        assert!(!version.removal_status().blocks_resolution());
     }
 
     #[test]

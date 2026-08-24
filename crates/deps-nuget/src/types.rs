@@ -40,9 +40,10 @@ deps_core::impl_parse_result!(
 
 /// A single version of a package, as returned by the NuGet flat-container endpoint.
 ///
-/// Deliberately a single field. `is_yanked` always reports `false` because the flat
-/// container carries no `listed` flag — unlisted detection requires the registration
-/// hive and is deferred (spec §1, follow-up D1) to hover-only enrichment.
+/// Deliberately a single field. `removal_status` always reports `Available` (the
+/// trait default, no override here) because the flat container carries no `listed`
+/// flag — unlisted detection requires the registration hive and is deferred (spec
+/// §1, follow-up D1) to hover-only enrichment.
 ///
 /// Hand-writes `deps_core::Version` instead of using `impl_version!` because the macro's
 /// `is_prerelease` cannot be overridden and the shared default (a keyword sniff for
@@ -61,10 +62,6 @@ pub struct NuGetVersion {
 impl deps_core::Version for NuGetVersion {
     fn version_string(&self) -> &str {
         &self.version
-    }
-
-    fn is_yanked(&self) -> bool {
-        false
     }
 
     fn is_prerelease(&self) -> bool {
@@ -167,7 +164,7 @@ mod tests {
             published_at: None,
         };
         assert_eq!(ver.version_string(), "13.0.3");
-        assert!(!ver.is_yanked());
+        assert!(!ver.removal_status().blocks_resolution());
         assert!(!ver.is_prerelease());
         assert!(ver.as_any().is::<NuGetVersion>());
     }
@@ -193,7 +190,7 @@ mod tests {
             version: "1.0.0".into(),
             published_at: None,
         };
-        assert!(!ver.is_yanked());
+        assert!(!ver.removal_status().blocks_resolution());
     }
 
     #[test]

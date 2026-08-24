@@ -456,10 +456,10 @@ impl deps_core::Registry for GoRegistry {
         // fallback — Go module requirements are exact pins/MVS, not ranges.
         versions
             .iter()
-            .position(|v| !v.is_prerelease() && !v.is_yanked())
+            .position(|v| !v.is_prerelease() && !v.removal_status().blocks_resolution())
     }
 
-    // `Version::is_yanked` is hardcoded to `false` (`registry.rs:354`, `:401`) —
+    // `Version::removal_status` is hardcoded to `Available` (`registry.rs:354`, `:401`) —
     // the proxy's `/@v/list` fast path never surfaces `retract` data, so a
     // yanked-check probe here would always come back empty (#233).
     fn reports_yanked(&self) -> bool {

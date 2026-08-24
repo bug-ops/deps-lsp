@@ -461,6 +461,7 @@ name = "deps-composer"
 version = "0.10.1"
 dependencies = [
  "deps-core",
+ "mockito",
  "serde",
  "serde_json",
  "tempfile",

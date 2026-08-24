@@ -130,14 +130,22 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // `live_latest_idx` (not raw index 0) picks the entry: `available_versions` is sorted
     // purely by version number, so a pre-release with the highest number can sort to index 0
     // even though it isn't the ecosystem's "latest stable" pick — mirroring this line to the
-    // raw top entry would tag a pre-release as `(latest)` below, contradicting the
-    // stable-only semantics of `versions.cached`'s `latest`. Recorded as an index (matching
-    // `find_latest_stable`'s exact `is_stable` predicate) rather than a version string so the
+    // raw top entry would tag a pre-release as `(latest)` below. The pick is delegated to
+    // `Registry::select_latest_matching` — the exact same call `lifecycle.rs`'s background
+    // fetch uses to populate `versions.cached`'s `latest` and every cache-backed diagnostic —
+    // rather than re-derived here with a generic `is_stable()` scan. The two must never
+    // disagree about what "latest" is: an ecosystem whose `select_latest_matching` applies a
+    // ranking preference beyond plain resolvability (e.g. npm's #338 NFR-002, which prefers a
+    // non-deprecated version over a newer deprecated one) gets that same preference reflected
+    // in this hover response instead of hover independently picking a different version and
+    // silently dropping that version's `*(deprecated)*`/`*(yanked)*` label because it thinks
+    // it's `(latest)` (#347/#348 S1). Recorded as an index rather than a version string so the
     // "Recent versions" marker below can match by position instead of string equality, which
     // could spuriously tag more than one entry if two ever shared a version string.
+    let wildcard_req = VersionReq::new("*");
     let live_latest_idx = available_versions
         .as_ref()
-        .and_then(|v| v.iter().position(|ver| ver.is_stable()));
+        .and_then(|v| registry.select_latest_matching(v, &wildcard_req));
     let cached_latest = resolvable
         .then(|| {
             versions
@@ -210,8 +218,21 @@ pub async fn generate_hover<R: Registry + ?Sized>(
                 String::new()
             };
             if Some(i) == live_latest_idx {
-                writeln!(&mut markdown, "- {version_span} *(latest)*{age_suffix}").unwrap();
-            } else if version.is_yanked() {
+                if version.removal_status().is_flagged() {
+                    // The resolved "latest" can itself be flagged (e.g. npm's ranking
+                    // preference falls through to a deprecated version when no clean one
+                    // exists) — the deprecation/yank warning must not silently vanish just
+                    // because this entry also carries the `(latest)` marker (#347/#348 S1).
+                    writeln!(
+                        &mut markdown,
+                        "- {version_span} *(latest)* {}{age_suffix}",
+                        formatter.yanked_label()
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(&mut markdown, "- {version_span} *(latest)*{age_suffix}").unwrap();
+                }
+            } else if version.removal_status().is_flagged() {
                 writeln!(
                     &mut markdown,
                     "- {} {}{}",
@@ -328,6 +349,7 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RemovalStatus;
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::*;
 
@@ -1148,6 +1170,121 @@ mod tests {
                 .contains("- `1.0.214` *(latest)* — 1 hour ago"),
             "the Recent versions list's own *(latest)* entry must agree with the Latest \
              line above it, got: {}",
+            content.value
+        );
+    }
+
+    /// #347/#348 S1: npm-shaped package `[2.0.0 AdvisoryDeprecated, 1.9.0 Available]`.
+    /// `is_stable()` accepts `AdvisoryDeprecated`, so a naive `is_stable()`-based scan for
+    /// "latest" picks `2.0.0` — disagreeing with npm's own `select_latest_matching`, which
+    /// deliberately ranks a non-deprecated version ahead of a deprecated one (#338 NFR-002)
+    /// and would resolve `1.9.0` instead (this is exactly what `lifecycle.rs` caches and
+    /// diagnostics read). Hover must delegate to the registry's `select_latest_matching`
+    /// instead of re-deriving the pick, so it agrees with that cached value, and the
+    /// resolved `2.0.0`-would-be-latest case below must still carry its deprecated label
+    /// when a deprecated version *is* the resolved latest.
+    #[tokio::test]
+    async fn test_generate_hover_latest_agrees_with_npm_shaped_deprecated_ranking() {
+        use std::collections::HashMap;
+
+        let now = PublishTime::now();
+        let registry = MockRegistryPreferringUnflagged {
+            versions: vec![
+                MockVersionWithStatus {
+                    version: "2.0.0".to_string(),
+                    status: RemovalStatus::AdvisoryDeprecated,
+                },
+                MockVersionWithStatus {
+                    version: "1.9.0".to_string(),
+                    status: RemovalStatus::Available,
+                },
+            ],
+        };
+
+        let parse_result = freshness_test_parse_result("pkg");
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Latest**: `1.9.0`"),
+            "hover must agree with select_latest_matching's non-deprecated-preferred pick \
+             (1.9.0), not a naive is_stable() scan that would pick the newer but deprecated \
+             2.0.0, got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("- `1.9.0` *(latest)*"),
+            "the Recent versions list's own *(latest)* marker must agree with the Latest \
+             line above it, got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("- `2.0.0` *(yanked)*"),
+            "2.0.0 must keep its flagged label even though it isn't the resolved latest, \
+             got: {}",
+            content.value
+        );
+    }
+
+    /// #347/#348 S1: when every version is flagged, the registry's own ranking (rung 2 of
+    /// `MockRegistryPreferringUnflagged`) can still resolve a flagged version as "latest" —
+    /// hover must keep that entry's deprecated/yanked label instead of letting `*(latest)*`
+    /// silently replace it (issue #227-F5/#313's self-contradiction class).
+    #[tokio::test]
+    async fn test_generate_hover_latest_keeps_flagged_label_when_resolved_version_is_flagged() {
+        use std::collections::HashMap;
+
+        let now = PublishTime::now();
+        let registry = MockRegistryPreferringUnflagged {
+            versions: vec![MockVersionWithStatus {
+                version: "2.0.0".to_string(),
+                status: RemovalStatus::AdvisoryDeprecated,
+            }],
+        };
+
+        let parse_result = freshness_test_parse_result("pkg");
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Latest**: `2.0.0`"),
+            "the only version resolves as latest even though it's flagged, got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("- `2.0.0` *(latest)* *(yanked)*"),
+            "the resolved latest must keep its flagged label instead of the warning \
+             silently vanishing behind *(latest)*, got: {}",
             content.value
         );
     }

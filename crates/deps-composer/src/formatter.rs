@@ -189,12 +189,13 @@ impl EcosystemFormatter for ComposerFormatter {
 
     /// Restricts the yanked-only-match diagnostic to an exact-pin requirement.
     ///
-    /// Composer's `Version::is_yanked()` is sourced from `abandoned`
-    /// (`ComposerVersion::abandoned`), a package-level flag Packagist replicates onto every
-    /// version entry of an abandoned package — not a true per-version yank. Evaluating a
-    /// range requirement (`^1.0`, `~2.3`) against it would flag every dependency on such a
-    /// package with this diagnostic's "yanked" wording, conflating it with package-level
-    /// abandonment, which is a distinct, separately-planned diagnostic (issue #205).
+    /// Composer's `Version::removal_status()` reports `AdvisoryDeprecated`, sourced from
+    /// `abandoned` (`ComposerVersion::abandoned`), a package-level flag Packagist replicates
+    /// onto every version entry of an abandoned package — not a true per-version yank.
+    /// Evaluating a range requirement (`^1.0`, `~2.3`) against it would flag every dependency
+    /// on such a package with this diagnostic's "yanked" wording, conflating it with
+    /// package-level abandonment, which is a distinct, separately-planned diagnostic
+    /// (issue #205).
     fn yanked_diagnostic_applies_to(&self, requirement: &VersionReq) -> bool {
         is_exact_pin(requirement.as_str())
     }
@@ -592,9 +593,9 @@ mod tests {
     }
 
     /// S1 regression: `yanked_diagnostic_applies_to` must reject a range requirement, since
-    /// Composer's `is_yanked()` is sourced from `abandoned`, a package-level flag replicated
-    /// onto every version — a range requirement would flag every dependency on an abandoned
-    /// package, conflating this diagnostic with package-level abandonment (issue #205).
+    /// Composer's `removal_status()` is sourced from `abandoned`, a package-level flag
+    /// replicated onto every version — a range requirement would flag every dependency on an
+    /// abandoned package, conflating this diagnostic with package-level abandonment (issue #205).
     #[test]
     fn test_yanked_diagnostic_applies_to_matches_is_exact_pin() {
         let f = ComposerFormatter;

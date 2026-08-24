@@ -45,12 +45,19 @@ pub const REGISTRY: &str = "Packagist";
 #[derive(Clone)]
 pub struct PackagistRegistry {
     cache: Arc<HttpCache>,
+    base: String,
 }
 
 impl PackagistRegistry {
     /// Creates a new Packagist registry client with the given HTTP cache.
-    pub const fn new(cache: Arc<HttpCache>) -> Self {
-        Self { cache }
+    pub fn new(cache: Arc<HttpCache>) -> Self {
+        Self::with_registry_base(cache, PACKAGIST_BASE.to_string())
+    }
+
+    /// Registry base URL — `PACKAGIST_BASE` in production, overridden to a mockito
+    /// server URL in tests (mirrors `deps-npm`'s `with_registry_base`).
+    fn with_registry_base(cache: Arc<HttpCache>, base: String) -> Self {
+        Self { cache, base }
     }
 
     /// Fetches all versions for a package from the Packagist v2 API.
@@ -63,14 +70,15 @@ impl PackagistRegistry {
     /// Returns an error if the HTTP request or JSON parsing fails.
     pub async fn get_versions(&self, name: &str) -> Result<Vec<ComposerVersion>> {
         // Packagist names are vendor/package; encode each segment separately
+        let base = &self.base;
         let url = if let Some((vendor, package)) = name.split_once('/') {
             format!(
-                "{PACKAGIST_BASE}/p2/{}/{}.json",
+                "{base}/p2/{}/{}.json",
                 urlencoding::encode(vendor),
                 urlencoding::encode(package)
             )
         } else {
-            format!("{PACKAGIST_BASE}/p2/{}.json", urlencoding::encode(name))
+            format!("{base}/p2/{}.json", urlencoding::encode(name))
         };
         let data = self.cache.get_cached(&url).await?;
         parse_package_metadata(name, &data)
@@ -92,7 +100,7 @@ impl PackagistRegistry {
 
         Ok(versions
             .into_iter()
-            .find(|v| !v.abandoned && formatter.version_satisfies_requirement(&v.version, req_str)))
+            .find(|v| formatter.version_satisfies_requirement(&v.version, req_str)))
     }
 
     /// Searches for packages by name/keywords.
@@ -299,15 +307,18 @@ impl deps_core::Registry for PackagistRegistry {
         use deps_core::lsp_helpers::EcosystemFormatter;
 
         versions.iter().position(|v| {
-            !v.is_yanked()
+            // Always true for Composer (`abandoned` maps to `AdvisoryDeprecated`, which
+            // never blocks resolution) — kept to document the contract (#347).
+            !v.removal_status().blocks_resolution()
                 && formatter.version_satisfies_requirement(v.version_string(), req.as_str())
         })
     }
 
-    // Packagist's `abandoned` is package-level, not per-version: `is_yanked`
-    // means "this package is abandoned", inherited by every version via the
-    // p2 minified-inheritance loop. Enabling the yanked check here would fire
-    // on nearly every dependency of an abandoned package (#233 R2).
+    // Packagist's `abandoned` is package-level, not per-version: `removal_status`
+    // reports `AdvisoryDeprecated` for "this package is abandoned", inherited by
+    // every version via the p2 minified-inheritance loop. Enabling the yanked
+    // diagnostic here would fire on nearly every version of an abandoned package
+    // (#233 R2, #205).
     fn reports_yanked(&self) -> bool {
         false
     }
@@ -568,6 +579,11 @@ mod tests {
 
     #[test]
     fn test_select_latest_matching_not_default_none() {
+        // Regression for #347's mixed case: the newest version is abandoned, an older
+        // version is clean. Composer has no npm-style ranking preference for a
+        // non-abandoned version over a newer abandoned one (unlike deps-npm's #338
+        // NFR-002) — `abandoned` is advisory, not a hard removal from resolution, so
+        // the newest version resolves as latest regardless of its abandoned flag.
         use deps_core::{Registry, VersionReq};
 
         let cache = Arc::new(HttpCache::new());
@@ -587,7 +603,67 @@ mod tests {
             }),
         ];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    #[test]
+    fn test_select_latest_matching_all_abandoned_still_resolves() {
+        // Regression test for #347: an abandoned package's versions must
+        // still resolve under a wildcard requirement — `abandoned` is
+        // advisory, not a hard removal from resolution.
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0".into(),
+                version_normalized: "2.0.0.0".into(),
+                abandoned: true,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.0.0".into(),
+                version_normalized: "1.0.0.0".into(),
+                abandoned: true,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// Regression for #347's other half (S2): the inherent `get_latest_matching` —
+    /// the fetch loop's fallback when the pure list-based `select_latest_matching`
+    /// pick finds nothing, and the path `diagnostics.rs`'s live-lookup exercises
+    /// directly — must also resolve an all-abandoned package instead of treating it
+    /// as non-existent. Mirrors `deps-npm`'s
+    /// `test_get_latest_matching_wildcard_all_deprecated_returns_newest` shape.
+    #[tokio::test]
+    async fn test_get_latest_matching_wildcard_all_abandoned_still_resolves() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/p2/vendor/abandoned-pkg.json")
+            .with_status(200)
+            .with_body(
+                r#"{"packages": {"vendor/abandoned-pkg": [
+                    {"version": "2.0.0", "version_normalized": "2.0.0.0", "abandoned": true},
+                    {"version": "1.0.0", "version_normalized": "1.0.0.0", "abandoned": true}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = registry
+            .get_latest_matching("vendor/abandoned-pkg", "*")
+            .await
+            .unwrap();
+
+        let version = latest.expect("an all-abandoned package still exists and resolves");
+        assert_eq!(version.version, "2.0.0");
     }
 
     #[tokio::test]

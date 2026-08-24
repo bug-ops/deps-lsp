@@ -344,4 +344,84 @@ mod tests {
         #[cfg(feature = "deno")]
         assert!(registry.get(deps_core::EcosystemId::Deno.id()).is_some());
     }
+
+    /// #348 regression: `select_latest_matching` must resolve an all-`AdvisoryDeprecated`
+    /// version list under a wildcard requirement for every registered ecosystem — an
+    /// advisory-only flag (npm `deprecated`, Composer `abandoned`, ...) must never make an
+    /// existing package look unresolvable (#347). Iterates every id `register_ecosystems`
+    /// wires up via `EcosystemRegistry::ecosystem_ids`, so a 12th ecosystem is covered
+    /// automatically without a new test. The paired `Available` control guards against a
+    /// `None` result that has nothing to do with the advisory flag (e.g. the fixture
+    /// version strings not fitting this ecosystem's matcher).
+    ///
+    /// This assertion is only genuinely discriminating for an ecosystem whose
+    /// `select_latest_matching` actually consults `removal_status()` when filtering under
+    /// a wildcard requirement (currently Composer, npm, and Deno-via-npm) — for an
+    /// ecosystem that doesn't filter on it at all, or that only maps a real per-version
+    /// yank (not the advisory case), `subject.is_some()` is trivially true regardless of
+    /// whether the ecosystem maps its advisory flag correctly.
+    #[test]
+    fn test_select_latest_matching_resolves_advisory_deprecated_for_every_ecosystem() {
+        use deps_core::{RemovalStatus, Version, VersionReq};
+        use std::any::Any;
+
+        struct StatusVersion {
+            version: &'static str,
+            status: RemovalStatus,
+        }
+
+        impl Version for StatusVersion {
+            fn version_string(&self) -> &str {
+                self.version
+            }
+
+            fn removal_status(&self) -> RemovalStatus {
+                self.status
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        fn fixture(status: RemovalStatus) -> Vec<Box<dyn Version>> {
+            vec![
+                Box::new(StatusVersion {
+                    version: "2.0.0",
+                    status,
+                }),
+                Box::new(StatusVersion {
+                    version: "1.2.3",
+                    status,
+                }),
+            ]
+        }
+
+        let registry = Arc::new(EcosystemRegistry::new());
+        let cache = Arc::new(HttpCache::new());
+        register_ecosystems(&registry, Arc::clone(&cache));
+
+        let req = VersionReq::new("*");
+        for id in registry.ecosystem_ids() {
+            let ecosystem = registry.get(id).expect("id came from ecosystem_ids()");
+            let ecosystem_registry = ecosystem.registry();
+
+            let control =
+                ecosystem_registry.select_latest_matching(&fixture(RemovalStatus::Available), &req);
+            assert!(
+                control.is_some(),
+                "{id}: control fixture (all Available) must resolve under a wildcard \
+                 requirement — a `None` here means the fixture itself doesn't fit this \
+                 ecosystem's matcher, not that the advisory flag broke anything"
+            );
+
+            let subject = ecosystem_registry
+                .select_latest_matching(&fixture(RemovalStatus::AdvisoryDeprecated), &req);
+            assert!(
+                subject.is_some(),
+                "{id}: an advisory-only flag must not hide an existing package under a \
+                 wildcard requirement (#347)"
+            );
+        }
+    }
 }

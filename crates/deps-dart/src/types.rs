@@ -200,7 +200,7 @@ mod tests {
             published_at: Some(deps_core::PublishTime::from_unix_secs(1_704_067_200)),
         };
         assert_eq!(ver.version_string(), "1.0.0");
-        assert!(!ver.is_yanked());
+        assert!(!ver.removal_status().blocks_resolution());
         assert!(ver.features().is_empty());
         assert!(ver.as_any().is::<DartVersion>());
     }
@@ -213,7 +213,7 @@ mod tests {
             retracted: true,
             published_at: None,
         };
-        assert!(ver.is_yanked());
+        assert!(ver.removal_status().blocks_resolution());
     }
 
     #[test]

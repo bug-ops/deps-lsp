@@ -377,15 +377,15 @@ impl NpmRegistry {
     /// `1.0.0-beta.2`), with one exception: under a wildcard/empty requirement
     /// (`"*"`/`""`), which answers "does this package exist / what is its newest version"
     /// for existence checks rather than "what should I recommend installing". That call
-    /// prefers the newest stable version, falls back to the newest non-deprecated version
-    /// (possibly a prerelease — including when every version is a prerelease and none is
-    /// deprecated, which resolves to that newest prerelease rather than `None`; hover's
-    /// separate `is_stable()`-based pick shows no `**Latest**` line in that case, so
-    /// diagnostics and hover intentionally diverge here) when no stable version exists, and
-    /// finally to the newest version overall when every version is deprecated (#338) — a
-    /// deprecated package still exists. Mirrors
+    /// prefers the newest non-deprecated, non-prerelease version; if none exists it falls
+    /// straight through to the newest version overall — deprecated, a prerelease, or both
+    /// (#338 NFR-001) — rather than reporting "no version found" for a package that
+    /// genuinely exists. Mirrors
     /// [`Registry::select_latest_matching`](deps_core::Registry::select_latest_matching)'s
-    /// wildcard branch exactly, so the two never disagree on the same input.
+    /// wildcard branch exactly, so the two never disagree on the same input; hover
+    /// (`generate_hover`) resolves "latest" through that same method rather than
+    /// re-deriving it, so hover, diagnostics, and this fallback can never disagree either
+    /// (#347/#348 S1).
     ///
     /// # Errors
     ///
@@ -420,10 +420,18 @@ impl NpmRegistry {
                 return Ok(None);
             }
             use deps_core::Version as _;
+            // Rung 1 deliberately does not use the generic `is_stable()` (which now also
+            // accepts `AdvisoryDeprecated`, #347/#348): npm's own #338 NFR-002 wants a
+            // non-deprecated version preferred over a deprecated one whenever both exist,
+            // which is a ranking preference, not a resolvability question.
             let idx = versions
                 .iter()
-                .position(|v| v.is_stable())
-                .or_else(|| versions.iter().position(|v| !v.deprecated))
+                .position(|v| !v.removal_status().is_flagged() && !v.is_prerelease())
+                .or_else(|| {
+                    versions
+                        .iter()
+                        .position(|v| !v.removal_status().blocks_resolution())
+                })
                 .unwrap_or(0);
             return Ok(versions.into_iter().nth(idx));
         }
@@ -709,33 +717,43 @@ impl deps_core::Registry for NpmRegistry {
                 return None;
             }
             // Existence/latest-for-display resolution (#338): prefer the newest
-            // stable (non-yanked, non-prerelease) version — matching
-            // `Version::is_stable()`, mirroring `get_latest_matching`'s identical
-            // wildcard branch above so the two never disagree — falling back to the
-            // newest non-yanked version (possibly a prerelease) when no stable
-            // version exists, and finally to the newest version overall when every
-            // version is yanked. A yanked/deprecated-but-existing package must never
-            // resolve to "no version found", but that must not surface an
-            // unrequested prerelease as "the latest" ahead of a stable release.
-            // Deliberate divergence from hover (W1): a package whose every version
-            // is a prerelease, with none deprecated, resolves here to that newest
-            // prerelease (diagnostics can say "Newer version available:
-            // 0.1.0-alpha.2"), while hover's separate `is_stable()`-based pick shows
-            // no `**Latest**` line at all for the same package — this is accepted as
-            // consistent with #338's own principle of not reporting "Unknown
-            // package"/"no latest" for a package that genuinely exists and resolves.
+            // non-flagged, non-prerelease version. Rung 2 (`!blocks_resolution()`) is where
+            // this ladder actually lands when rung 1 finds nothing: npm never produces
+            // `RemovalStatus::Yanked` (`types.rs` only maps `deprecated` via
+            // `from_advisory`, never a real yank), so `blocks_resolution()` is always
+            // `false` here and rung 2 always matches the very first (newest) entry. In
+            // practice this means: prefer the newest clean stable release; otherwise fall
+            // straight through to the newest release overall — deprecated, a prerelease, or
+            // both — rather than reporting "no version found" for a package that genuinely
+            // exists (#338 NFR-001). The trailing `.unwrap_or(0)` is unreachable for that
+            // same reason (rung 2 cannot return `None` once `versions` is non-empty) but is
+            // kept as a defensive fallback rather than an `.unwrap()`.
+            // Rung 1 deliberately does not use the generic `Version::is_stable()`
+            // (which now also accepts `AdvisoryDeprecated`, #347/#348): npm's own
+            // #338 NFR-002 wants a non-deprecated version preferred over a
+            // deprecated one whenever both exist, which is a ranking preference,
+            // not a resolvability question — mirrored by `get_latest_matching`'s
+            // identical wildcard branch above so the two never disagree. Hover
+            // (`deps-core`'s `generate_hover`) resolves "latest" through this exact method
+            // rather than re-deriving it with a different predicate, so hover and this
+            // ranking preference can never disagree either (#347/#348 S1).
             return Some(
                 versions
                     .iter()
-                    .position(|v| v.is_stable())
-                    .or_else(|| versions.iter().position(|v| !v.is_yanked()))
+                    .position(|v| !v.removal_status().is_flagged() && !v.is_prerelease())
+                    .or_else(|| {
+                        versions
+                            .iter()
+                            .position(|v| !v.removal_status().blocks_resolution())
+                    })
                     .unwrap_or(0),
             );
         }
         let parsed_req = node_semver::Range::parse(req_str).ok()?;
         versions.iter().position(|v| {
-            node_semver::Version::parse(v.version_string())
-                .is_ok_and(|ver| parsed_req.satisfies(&ver) && !v.is_yanked())
+            node_semver::Version::parse(v.version_string()).is_ok_and(|ver| {
+                parsed_req.satisfies(&ver) && !v.removal_status().blocks_resolution()
+            })
         })
     }
 
@@ -1269,10 +1287,12 @@ mod tests {
     /// the same version data, mirroring `deps-maven`'s S8 helper pattern. `entries` must
     /// already be newest-first (matching `parse_package_metadata`'s sort), since that's
     /// what both the mocked packument response and the directly-built `Vec` assume.
+    /// Returns the agreed-upon version string so a caller can additionally assert on
+    /// exactly which version was picked, not just that the two methods agree.
     async fn assert_get_latest_matching_agrees_with_select_latest_matching(
         name: &str,
         entries: &[(&str, bool)],
-    ) {
+    ) -> String {
         use deps_core::{Registry, VersionReq};
 
         let mut server = mockito::Server::new_async().await;
@@ -1321,6 +1341,7 @@ mod tests {
             .expect("fixture always has a pick");
 
         assert_eq!(via_get_latest.version, boxed[idx].version_string());
+        via_get_latest.version
     }
 
     #[tokio::test]
@@ -1348,6 +1369,23 @@ mod tests {
             &[("2.0.0-alpha", false), ("1.0.0-beta", false)],
         )
         .await;
+    }
+
+    /// #347/#348 S3: rung 2 of the wildcard ladder (`!blocks_resolution()`) is always
+    /// `true` for npm (it never produces `RemovalStatus::Yanked`), so it collapses
+    /// straight to the newest entry overall rather than preferring an older *clean*
+    /// entry over a newer *deprecated* one. Pre-refactor (when rung 2 excluded
+    /// deprecated versions) this same input returned `1.0.0-beta`; it now returns
+    /// `2.0.0` — a real, intentional behavior change this test pins down so it stays
+    /// verified going forward instead of silently drifting.
+    #[tokio::test]
+    async fn test_wildcard_agreement_newest_deprecated_beats_older_clean_prerelease() {
+        let picked = assert_get_latest_matching_agrees_with_select_latest_matching(
+            "newest-deprecated-beats-older-clean-prerelease",
+            &[("2.0.0", true), ("1.0.0-beta", false)],
+        )
+        .await;
+        assert_eq!(picked, "2.0.0");
     }
 
     /// N4 (tier 2): `get_latest_matching`'s all-prerelease/none-deprecated case (W1) —

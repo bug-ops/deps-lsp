@@ -24,5 +24,6 @@ urlencoding = { workspace = true }
 
 [dev-dependencies]
 deps-core = { workspace = true, features = ["test-util"] }
+mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
