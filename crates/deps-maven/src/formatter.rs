@@ -1,7 +1,7 @@
 //! Version formatting for Maven ecosystem.
 
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
-use deps_core::{PackageName, VersionReq};
+use deps_core::{InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment};
 
 pub struct MavenFormatter;
 
@@ -98,6 +98,53 @@ impl EcosystemFormatter for MavenFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
+    }
+
+    /// Validates a Maven coordinate's `groupId:artifactId` shape and character set.
+    ///
+    /// Mirrors the gate `crate::registry::metadata_urls` applies before building a
+    /// registry request URL ([`is_safe_maven_coordinate_segment`] on each split
+    /// coordinate segment), so a coordinate rejected here would also be rejected there —
+    /// letting the "Invalid package name" diagnostic (deps-core's
+    /// `formatter.validate_package_name` gate) surface the accurate reason instead of the
+    /// generic "Unknown package" a registry-side rejection produces (#369).
+    ///
+    /// An unresolved `${property}` groupId/artifactId (e.g. a multi-module POM's
+    /// `<groupId>${project.groupId}</groupId>`, see `is_unresolved`) is valid Maven,
+    /// not a malformed coordinate — checked first and always accepted, the same
+    /// undecidable treatment `is_unresolved` already gets in
+    /// [`version_satisfies_requirement`](Self::version_satisfies_requirement) and
+    /// [`compile_requirement`](Self::compile_requirement).
+    ///
+    /// The missing-`:` branch is defensive: `crate::parser` always builds a
+    /// dependency's name as `format!("{group_id}:{artifact_id}")`, so a real coordinate
+    /// reaching this method already contains exactly one `:`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] if `name` has no `:` separator, or if either the
+    /// `groupId` or `artifactId` segment fails [`is_safe_maven_coordinate_segment`] — but
+    /// never when `name` contains an unresolved `${property}`, which is accepted instead.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        if is_unresolved(name) {
+            return Ok(());
+        }
+        let Some((group_id, artifact_id)) = name.split_once(':') else {
+            return Err(InvalidPackageName::new(
+                "coordinate must be in 'groupId:artifactId' form",
+            ));
+        };
+        if !is_safe_maven_coordinate_segment(group_id) {
+            return Err(InvalidPackageName::new(
+                "groupId contains invalid characters",
+            ));
+        }
+        if !is_safe_maven_coordinate_segment(artifact_id) {
+            return Err(InvalidPackageName::new(
+                "artifactId contains invalid characters",
+            ));
+        }
+        Ok(())
     }
 
     // #249 review (M4): this branch order (unresolved → range → exact) is a separate copy
@@ -204,6 +251,52 @@ mod tests {
         assert!(f.version_satisfies_requirement("7.1.1", "${woodstoxVersion}"));
         assert!(f.version_satisfies_requirement("2.0.17", "${slf4j.version}"));
         assert!(f.version_satisfies_requirement("1.0.0", "${project.version}"));
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_valid_coordinate() {
+        let f = MavenFormatter;
+        assert!(
+            f.validate_package_name("org.apache.commons:commons-lang3")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_invalid_group_id() {
+        let f = MavenFormatter;
+        assert!(
+            f.validate_package_name("commons</artifactId><parent>:commons-lang3")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_invalid_artifact_id() {
+        let f = MavenFormatter;
+        assert!(f.validate_package_name("org.apache.commons:..").is_err());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_missing_colon() {
+        let f = MavenFormatter;
+        assert!(f.validate_package_name("org.apache.commons").is_err());
+    }
+
+    /// Impl-critic S2: an unresolved `${property}` groupId/artifactId (e.g. a
+    /// multi-module POM's `<groupId>${project.groupId}</groupId>`) is valid Maven, not a
+    /// malformed coordinate — must be treated as undecidable (`Ok`), not rejected.
+    #[test]
+    fn test_validate_package_name_accepts_unresolved_property() {
+        let f = MavenFormatter;
+        assert!(
+            f.validate_package_name("${project.groupId}:my-module")
+                .is_ok()
+        );
+        assert!(
+            f.validate_package_name("org.example:${artifact.name}")
+                .is_ok()
+        );
     }
 
     #[test]
