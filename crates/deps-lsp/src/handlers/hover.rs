@@ -28,17 +28,29 @@ pub async fn handle_hover(
     // acquires the config RwLock before the DashMap shard guard, never the reverse.
     let freshness = { config.read().await.freshness.to_settings() };
 
-    // Single document lookup: extract all needed data at once
-    let doc = state.get_document(uri)?;
-    let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
-    let parse_result = doc.parse_result()?;
+    // Own everything `generate_hover` needs and release the DashMap shard `Ref`
+    // before awaiting it: the default impl awaits a real registry fetch
+    // (`Registry::get_versions_with`), so holding the guard across that await would
+    // block a concurrent `documents.get_mut` on the same shard for the duration (#319).
+    let (ecosystem, parse_result, cached_versions, resolved_versions, vulnerabilities) = {
+        let doc = state.get_document(uri)?;
+        let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
+        let parse_result = doc.parse_result_arc()?;
+        (
+            ecosystem,
+            parse_result,
+            doc.cached_versions.clone(),
+            doc.resolved_versions.clone(),
+            doc.vulnerabilities.clone(),
+        )
+    };
 
     ecosystem
         .generate_hover(
-            parse_result,
+            parse_result.as_ref(),
             position,
-            VersionData::new(&doc.cached_versions, &doc.resolved_versions)
-                .with_vulnerabilities(&doc.vulnerabilities),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulnerabilities),
             freshness,
         )
         .await
