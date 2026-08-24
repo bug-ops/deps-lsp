@@ -83,9 +83,13 @@ fn not_found_or(err: DepsError, full_name: &str) -> DepsError {
 }
 
 /// Builds the error for a scheme-qualified name that could not be routed: an unknown or
-/// missing scheme reaching a fetch method. In practice the manifest parser never emits
-/// such a dependency (D7 only produces `jsr:`/`npm:`-qualified names), so this is a
-/// defensive arm only — never a silent fetch against the wrong registry.
+/// missing scheme reaching a fetch method, or a scheme-qualified name with nothing after
+/// it (`"npm:"`) — the latter is not merely defensive:
+/// [`partial_name_range`](crate::specifier::partial_name_range) (#310) deliberately treats
+/// a bare `"npm:"`/`"jsr:"` as a completion-eligible in-progress
+/// dependency name while the user is mid-keystroke, so `rest.is_empty()` reaches this
+/// facade's `npm:` arm in normal use (M2) and must be rejected here rather than turned
+/// into a GET against the bare npm registry base URL.
 fn unroutable(name: &PackageName) -> DepsError {
     DepsError::PackageNotFound {
         package: name.to_string(),
@@ -338,21 +342,37 @@ pub struct DenoRegistry {
 
 impl DenoRegistry {
     /// Creates a new Deno registry facade, building both halves from the same
-    /// `Arc<HttpCache>` (M1). This dedupes plain cached GETs — the abbreviated packument
-    /// `get_versions` fetches, and the JSR endpoints — between `package.json` and
-    /// `deno.json` for the same npm package. It does **not** dedupe the *separate*
-    /// full-packument fetch npm's own freshness path (`fetch_publish_times`) issues when
-    /// `freshness.enabled`: that path deliberately bypasses `HttpCache`'s entry map
-    /// (`deps-npm/src/registry.rs`) and is memoized in a per-`NpmRegistry`-instance
-    /// `DashMap`, and this facade constructs its own `NpmRegistry` instance rather than
-    /// sharing `NpmEcosystem`'s — so with freshness on, that one extra request *is* still
-    /// duplicated for a package appearing in both manifests (N4, tracked as a follow-up:
-    /// sharing one `NpmRegistry` instance across ecosystem registration).
+    /// `Arc<HttpCache>` (M1) and a private `NpmRegistry` instance.
+    ///
+    /// This dedupes plain cached GETs — the abbreviated packument `get_versions` fetches,
+    /// and the JSR endpoints — between `package.json` and `deno.json` for the same npm
+    /// package. It does **not** dedupe the *separate* full-packument fetch npm's own
+    /// freshness path (`fetch_publish_times`) issues when `freshness.enabled`: that path
+    /// deliberately bypasses `HttpCache`'s entry map (`deps-npm/src/registry.rs`) and is
+    /// memoized in a per-`NpmRegistry`-instance `DashMap`, and this constructor builds its
+    /// own private `NpmRegistry` rather than sharing `NpmEcosystem`'s — so with freshness
+    /// on, that one extra request is still duplicated for a package appearing in both
+    /// manifests. Use [`Self::with_npm`] instead to avoid this (N4/#312).
     #[must_use]
     pub fn new(cache: Arc<HttpCache>) -> Self {
+        Self::with_npm(Arc::clone(&cache), NpmRegistry::new(cache))
+    }
+
+    /// Creates a new Deno registry facade sharing an existing [`NpmRegistry`] instance for
+    /// its `npm:`-scheme half, instead of building a private one (N4/#312).
+    ///
+    /// `NpmRegistry` is cheaply `Clone` (its `HttpCache` and freshness-path publish-time
+    /// map are both `Arc`-wrapped internally), so passing a clone of the same instance
+    /// registered for the standalone npm ecosystem shares not just plain cached GETs
+    /// (already covered by `cache`) but also the freshness path's full-packument fetch and
+    /// its publish-time cache, for a package appearing in both `package.json` and
+    /// `deno.json` (an `npm:`-specifier dependency). This is what `deps-lsp`'s ecosystem
+    /// registration does when both the `npm` and `deno` features are enabled.
+    #[must_use]
+    pub fn with_npm(cache: Arc<HttpCache>, npm: NpmRegistry) -> Self {
         Self {
-            jsr: JsrRegistry::new(Arc::clone(&cache)),
-            npm: NpmRegistry::new(cache),
+            jsr: JsrRegistry::new(cache),
+            npm,
         }
     }
 }
@@ -373,6 +393,9 @@ impl Registry for DenoRegistry {
                         .collect())
                 }
                 Some((Scheme::Npm, rest)) => {
+                    if rest.is_empty() {
+                        return Err(unroutable(name));
+                    }
                     let bare = PackageName::new(rest);
                     // S3: `NpmRegistry` has an *inherent* `get_versions` that shadows the
                     // trait method and silently drops `get_versions_with`'s freshness
@@ -393,6 +416,9 @@ impl Registry for DenoRegistry {
         Box::pin(async move {
             match split_scheme(name.as_str()) {
                 Some((Scheme::Npm, rest)) => {
+                    if rest.is_empty() {
+                        return Err(unroutable(name));
+                    }
                     let bare = PackageName::new(rest);
                     Registry::get_versions_with(&self.npm, &bare, freshness).await
                 }
@@ -424,6 +450,9 @@ impl Registry for DenoRegistry {
                         .map(|v| Box::new(v) as Box<dyn Version>))
                 }
                 Some((Scheme::Npm, rest)) => {
+                    if rest.is_empty() {
+                        return Err(unroutable(name));
+                    }
                     let bare = PackageName::new(rest);
                     Registry::get_latest_matching(&self.npm, &bare, req).await
                 }
@@ -650,6 +679,82 @@ mod tests {
         assert!(matches!(result, DepsError::HttpStatus { status: 500, .. }));
     }
 
+    // --- M2/#312: "npm:" alone (partial_name_range's in-progress name, #310) must not
+    // become a GET against the bare npm registry base URL ---
+
+    /// An `NpmRegistry` pointed at an address nothing listens on, so any request it
+    /// actually issues fails with a connection error rather than silently succeeding —
+    /// proof that the empty-name guard short-circuits before any network call.
+    fn unreachable_npm(cache: Arc<HttpCache>) -> NpmRegistry {
+        NpmRegistry::with_registry_base(cache, "http://127.0.0.1:1".to_string())
+    }
+
+    #[tokio::test]
+    async fn test_deno_registry_get_versions_rejects_empty_npm_name() {
+        let cache = Arc::new(HttpCache::new());
+        let npm = unreachable_npm(Arc::clone(&cache));
+        let registry = DenoRegistry::with_npm(cache, npm);
+
+        let Err(err) = Registry::get_versions(&registry, &PackageName::new("npm:")).await else {
+            panic!("expected an error for an empty npm: name");
+        };
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound {
+                registry: "deno",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_deno_registry_get_versions_with_rejects_empty_npm_name() {
+        let cache = Arc::new(HttpCache::new());
+        let npm = unreachable_npm(Arc::clone(&cache));
+        let registry = DenoRegistry::with_npm(cache, npm);
+
+        let Err(err) = Registry::get_versions_with(
+            &registry,
+            &PackageName::new("npm:"),
+            FreshnessSettings::default(),
+        )
+        .await
+        else {
+            panic!("expected an error for an empty npm: name");
+        };
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound {
+                registry: "deno",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_deno_registry_get_latest_matching_rejects_empty_npm_name() {
+        let cache = Arc::new(HttpCache::new());
+        let npm = unreachable_npm(Arc::clone(&cache));
+        let registry = DenoRegistry::with_npm(cache, npm);
+
+        let Err(err) = Registry::get_latest_matching(
+            &registry,
+            &PackageName::new("npm:"),
+            &VersionReq::new("*"),
+        )
+        .await
+        else {
+            panic!("expected an error for an empty npm: name");
+        };
+        assert!(matches!(
+            err,
+            DepsError::PackageNotFound {
+                registry: "deno",
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn test_deno_registry_get_versions_dispatches_jsr_via_mock() {
         let mut server = mockito::Server::new_async().await;
@@ -799,11 +904,68 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires network access; deps-npm has no public mockable base URL
+    async fn test_deno_registry_with_npm_shares_freshness_cache_across_instances() {
+        // #312: DenoRegistry::with_npm must hold the caller-supplied NpmRegistry rather
+        // than building its own, so a package appearing in both package.json (the
+        // standalone npm ecosystem) and deno.json (an `npm:`-specifier dependency) shares
+        // one freshness-path publish-time cache instead of refetching the full packument
+        // per ecosystem instance.
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let http_cache = Arc::new(HttpCache::new());
+        let shared_npm = NpmRegistry::with_registry_base(Arc::clone(&http_cache), base);
+
+        let abbrev_mock = server
+            .mock("GET", "/widget")
+            .match_header("accept", "application/vnd.npm.install-v1+json")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let full_mock = server
+            .mock("GET", "/widget")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_body(r#"{"time": {"1.0.0": "2020-01-01T00:00:00Z"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        // Simulates package.json's standalone npm ecosystem instance.
+        let npm_side = shared_npm.clone();
+        let from_npm = Registry::get_versions_with(
+            &npm_side,
+            &PackageName::new("widget"),
+            FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert!(from_npm[0].published_at().is_some());
+
+        // Simulates deno.json's `npm:widget` dependency, sharing the SAME NpmRegistry
+        // instance via `with_npm` — the full-packument fetch above must not repeat.
+        let deno_registry = DenoRegistry::with_npm(Arc::clone(&http_cache), shared_npm);
+        let from_deno = Registry::get_versions_with(
+            &deno_registry,
+            &PackageName::new("npm:widget"),
+            FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert!(from_deno[0].published_at().is_some());
+
+        abbrev_mock.assert_async().await;
+        full_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    #[ignore] // requires network access
     async fn test_deno_registry_get_versions_dispatches_npm_live() {
-        // `NpmRegistry`'s mockable base-URL constructor is private to `deps_npm`, so the
-        // npm arm's dispatch (as opposed to its routing, covered by the package_url tests
-        // below) can only be exercised end-to-end against the real registry here.
+        // Exercises the npm arm's dispatch through `DenoRegistry::new`'s private
+        // `NpmRegistry` end-to-end against the real registry; routing itself is covered by
+        // the package_url tests below, and mockable dispatch via a shared instance by
+        // `test_deno_registry_with_npm_shares_freshness_cache_across_instances` above.
         let cache = Arc::new(HttpCache::new());
         let registry = DenoRegistry::new(cache);
         let versions = Registry::get_versions(&registry, &PackageName::new("npm:react"))

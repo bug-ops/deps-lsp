@@ -220,9 +220,34 @@ ecosystem!(
 );
 
 /// Registers all enabled ecosystems.
+///
+/// `npm` and `deno` are special-cased (#312): when both features are enabled, they share
+/// one `NpmRegistry` instance — built once here and handed to both `NpmEcosystem` and
+/// `DenoEcosystem`'s `npm:`-scheme half via `with_registry`/`with_npm` — instead of each
+/// constructing its own. `NpmRegistry` is cheaply `Clone` (its `HttpCache` and
+/// freshness-path publish-time map are both `Arc`-wrapped internally), so this dedupes the
+/// freshness path's full-packument fetch and its publish-time cache for a package
+/// appearing in both `package.json` and a `deno.json` `npm:`-specifier dependency, on top
+/// of the plain cached GETs the shared `cache` already dedupes.
 pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
     register!("cargo", CargoEcosystem, registry, &cache);
+
+    #[cfg(all(feature = "npm", feature = "deno"))]
+    {
+        let npm_registry = Arc::new(NpmRegistry::new(Arc::clone(&cache)));
+        registry.register(Arc::new(NpmEcosystem::with_registry(Arc::clone(
+            &npm_registry,
+        ))));
+        registry.register(Arc::new(DenoEcosystem::with_npm(
+            Arc::clone(&cache),
+            npm_registry.as_ref().clone(),
+        )));
+    }
+    #[cfg(all(feature = "npm", not(feature = "deno")))]
     register!("npm", NpmEcosystem, registry, &cache);
+    #[cfg(all(feature = "deno", not(feature = "npm")))]
+    register!("deno", DenoEcosystem, registry, &cache);
+
     register!("pypi", PypiEcosystem, registry, &cache);
     register!("go", GoEcosystem, registry, &cache);
     register!("bundler", BundlerEcosystem, registry, &cache);
@@ -232,7 +257,6 @@ pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) 
     register!("swift", SwiftEcosystem, registry, &cache);
     register!("composer", ComposerEcosystem, registry, &cache);
     register!("nuget", NuGetEcosystem, registry, &cache);
-    register!("deno", DenoEcosystem, registry, &cache);
 }
 
 #[cfg(test)]

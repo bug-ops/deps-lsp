@@ -132,24 +132,26 @@ fn collect_imports(
 }
 
 /// Builds a [`DenoDependency`] from one `imports` value's string literal, or `None` if the
-/// value is not a recognized `jsr:`/`npm:` specifier (D7 — e.g. `http://`, `file:`, a bare
-/// alias — silently skipped, same as an unparseable entry in any other ecosystem).
+/// value is neither a recognized `jsr:`/`npm:` specifier nor a syntactically incomplete,
+/// still-being-typed one (D7 — e.g. `http://`, `file:`, a bare alias — silently skipped,
+/// same as an unparseable entry in any other ecosystem).
 fn build_dependency(
     value_lit: &StringLit,
     content: &str,
     line_table: &LineOffsetTable,
 ) -> Option<DenoDependency> {
-    let parsed = parse_specifier(value_lit.value.as_ref())?;
+    let raw_value = value_lit.value.as_ref();
 
     // S5 escape guard: `value_lit.range` covers the whole literal *including* its
-    // surrounding quotes. Byte-arithmetic from that range into `parsed`'s offsets (which
-    // are relative to the *unescaped* value) is only sound when no unescaping happened —
-    // exactly when `value_lit.value` is `Cow::Borrowed` (a direct slice of the source).
-    // Deno specifiers never legitimately need escapes, so this is a correctness
-    // fail-safe, not a feature: fall back to the literal's inner span (excluding the
-    // quotes) as `name_range`, and no `version_range` — never the whole literal including
-    // quotes, which would let a later text-edit delete the quotes and corrupt the JSON.
-    let Cow::Borrowed(_) = &value_lit.value else {
+    // surrounding quotes. Byte-arithmetic from that range into offsets relative to the
+    // *unescaped* value is only sound when no unescaping happened — exactly when
+    // `value_lit.value` is `Cow::Borrowed` (a direct slice of the source). Deno specifiers
+    // never legitimately need escapes, so this is a correctness fail-safe: an escaped
+    // value only degrades to the inner-span fallback (no `version_range`) when it fully
+    // parses; a partial/in-progress escaped value (#310) is skipped entirely rather than
+    // guessing at an unsound byte range for it.
+    if let Cow::Owned(_) = &value_lit.value {
+        let parsed = parse_specifier(raw_value)?;
         tracing::debug!(
             "deno.json: import value contains escape sequences, skipping precise position tracking"
         );
@@ -162,31 +164,57 @@ fn build_dependency(
             version_range: None,
             section: DenoDependencySection::Imports,
         });
-    };
+    }
 
     // The literal's inner (unquoted) text starts right after its opening quote.
     let value_start = value_lit.range.start + 1;
 
+    if let Some(parsed) = parse_specifier(raw_value) {
+        let name_range = byte_range_to_lsp(
+            content,
+            line_table,
+            value_start + parsed.name_range.start,
+            value_start + parsed.name_range.end,
+        );
+        let version_range = parsed.version_range.map(|r| {
+            byte_range_to_lsp(
+                content,
+                line_table,
+                value_start + r.start,
+                value_start + r.end,
+            )
+        });
+
+        return Some(DenoDependency {
+            name: PackageName::new(parsed.name),
+            name_range,
+            version_req: parsed.version_req.map(VersionReq::new),
+            version_range,
+            section: DenoDependencySection::Imports,
+        });
+    }
+
+    // #310: a syntactically incomplete but still in-progress jsr:/npm: specifier ("jsr:",
+    // "jsr:@", "jsr:@std", "jsr:@std/", ...) — `parse_specifier` correctly rejects these
+    // (not yet a valid, routable name), but a `Dependency` must still exist here for
+    // `detect_completion_context` to have a range to fire `PackageName` completion
+    // against. This mirrors `deps-npm`'s parser, which always builds a `Dependency` from a
+    // `dependencies` object key regardless of scope completeness (`deps-npm/src/parser.rs`)
+    // — validity is deferred to `DenoFormatter::validate_package_name`'s diagnostic, not
+    // gated at parse time.
+    let partial_range = crate::specifier::partial_name_range(raw_value)?;
     let name_range = byte_range_to_lsp(
         content,
         line_table,
-        value_start + parsed.name_range.start,
-        value_start + parsed.name_range.end,
+        value_start + partial_range.start,
+        value_start + partial_range.end,
     );
-    let version_range = parsed.version_range.map(|r| {
-        byte_range_to_lsp(
-            content,
-            line_table,
-            value_start + r.start,
-            value_start + r.end,
-        )
-    });
 
     Some(DenoDependency {
-        name: PackageName::new(parsed.name),
+        name: PackageName::new(&raw_value[partial_range]),
         name_range,
-        version_req: parsed.version_req.map(VersionReq::new),
-        version_range,
+        version_req: None,
+        version_range: None,
         section: DenoDependencySection::Imports,
     })
 }
@@ -395,6 +423,96 @@ mod tests {
         assert_eq!(dep.name_range.start.line, 0);
         assert_eq!(dep.name_range.start.character, value_start_byte as u32);
         assert_eq!(dep.name_range.end.character, value_end_byte as u32);
+    }
+
+    // --- #310: partial jsr:/npm: specifiers still produce a completion-eligible Dependency ---
+
+    #[test]
+    fn test_partial_jsr_bare_scheme_produces_dependency_with_no_version() {
+        let json = r#"{"imports": {"@std/fs": "jsr:"}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "jsr:");
+        assert_eq!(dep.version_req, None);
+        assert_eq!(dep.version_range, None);
+    }
+
+    #[test]
+    fn test_partial_jsr_scope_started_produces_dependency() {
+        let json = r#"{"imports": {"@std/fs": "jsr:@"}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "jsr:@");
+    }
+
+    #[test]
+    fn test_partial_jsr_scope_in_progress_produces_dependency() {
+        let json = r#"{"imports": {"@std/fs": "jsr:@std"}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "jsr:@std");
+    }
+
+    #[test]
+    fn test_partial_jsr_trailing_slash_produces_dependency() {
+        let json = r#"{"imports": {"@std/fs": "jsr:@std/"}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "jsr:@std/");
+    }
+
+    #[test]
+    fn test_partial_specifier_name_range_covers_the_typed_text() {
+        // The completion path relies on `name_range` spanning exactly the typed text (no
+        // quotes) so `detect_completion_context` can extract the right prefix.
+        let json = r#"{"imports": {"@std/fs": "jsr:@std/"}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        let value_start = json.find(r#""jsr:@std/""#).unwrap() + 1;
+        assert_eq!(dep.name_range.start.character, value_start as u32);
+        assert_eq!(
+            dep.name_range.end.character,
+            (value_start + "jsr:@std/".len()) as u32
+        );
+    }
+
+    #[test]
+    fn test_permanently_malformed_empty_scope_still_skipped() {
+        // "jsr:@/pkg" is not a partial state (no scope prefix to complete against) --
+        // must remain silently skipped, same as before #310.
+        let json = r#"{"imports": {"@std/fs": "jsr:@/pkg"}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_unsupported_scheme_still_skipped_not_treated_as_partial() {
+        let json = r#"{"imports": {"legacy": "https://deno.land/x/legacy/mod.ts"}}"#;
+        let result = parse_deno_json(json, &test_uri()).unwrap();
+        assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_partial_specifier_end_to_end_completion_context_fires() {
+        use deps_core::completion::{CompletionContext, detect_completion_context};
+
+        for value in ["jsr:", "jsr:@", "jsr:@std", "jsr:@std/"] {
+            let content = format!(r#"{{"imports": {{"@std/fs": "{value}"}}}}"#);
+            let result = parse_deno_json(&content, &test_uri()).unwrap();
+            assert_eq!(result.dependencies.len(), 1, "value: {value}");
+
+            let name_range = result.dependencies[0].name_range;
+            let cursor = name_range.end; // cursor right after the last typed character
+            let context = detect_completion_context(&result, cursor, &content);
+
+            match context {
+                CompletionContext::PackageName { prefix, .. } => {
+                    assert_eq!(prefix, value, "value: {value}");
+                }
+                other => panic!("value {value}: expected PackageName context, got {other:?}"),
+            }
+        }
     }
 
     #[test]

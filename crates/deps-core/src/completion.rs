@@ -1412,6 +1412,52 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_package_name_context_fires_for_ecosystem_supplied_partial_name() {
+        // #310 (deps-deno): a scheme-prefixed but structurally incomplete specifier value
+        // ("jsr:", "jsr:@", "jsr:@std", "jsr:@std/") has no complete name to parse, yet
+        // completion must still fire while the user is mid-keystroke. This is deliberately
+        // NOT solved by adding jsr:/npm:-specific logic here — `detect_completion_context`
+        // stays ecosystem-agnostic. Instead, `deps-deno`'s parser (mirroring `deps-npm`,
+        // which always builds a `Dependency` from a `dependencies` object key regardless of
+        // scope completeness) supplies a `Dependency` whose `name`/`name_range` cover the
+        // partial text directly; the existing range-containment check below requires no
+        // change to handle it. This test documents and locks in that consistency.
+        let parse_result = MockParseResult {
+            dependencies: vec![MockDependency {
+                name: "jsr:@std/".into(),
+                name_range: Range {
+                    start: Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 0,
+                        character: 9,
+                    },
+                },
+                version_range: None,
+                features_range: None,
+            }],
+        };
+
+        let content = "jsr:@std/";
+        let position = Position {
+            line: 0,
+            character: 9,
+        };
+
+        let context = detect_completion_context(&parse_result, position, content);
+
+        match context {
+            CompletionContext::PackageName { prefix, range } => {
+                assert_eq!(prefix, "jsr:@std/");
+                assert_eq!(range, parse_result.dependencies[0].name_range);
+            }
+            other => panic!("Expected PackageName context, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_detect_version_context() {
         let parse_result = MockParseResult {
             dependencies: vec![MockDependency {
