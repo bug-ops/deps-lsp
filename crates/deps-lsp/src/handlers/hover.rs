@@ -32,18 +32,20 @@ pub async fn handle_hover(
     // before awaiting it: the default impl awaits a real registry fetch
     // (`Registry::get_versions_with`), so holding the guard across that await would
     // block a concurrent `documents.get_mut` on the same shard for the duration (#319).
-    let (ecosystem, parse_result, cached_versions, resolved_versions, vulnerabilities) = {
-        let doc = state.get_document(uri)?;
-        let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
-        let parse_result = doc.parse_result_arc()?;
-        (
-            ecosystem,
-            parse_result,
-            doc.cached_versions.clone(),
-            doc.resolved_versions.clone(),
-            doc.vulnerabilities.clone(),
-        )
-    };
+    // `with_document` makes this structural rather than a convention to remember (#333).
+    let (ecosystem, parse_result, cached_versions, resolved_versions, vulnerabilities) = state
+        .with_document(uri, |doc| {
+            let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
+            let parse_result = doc.parse_result_arc()?;
+            Some((
+                ecosystem,
+                parse_result,
+                doc.cached_versions.clone(),
+                doc.resolved_versions.clone(),
+                doc.vulnerabilities.clone(),
+            ))
+        })
+        .flatten()?;
 
     ecosystem
         .generate_hover(

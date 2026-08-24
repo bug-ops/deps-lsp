@@ -82,20 +82,20 @@ pub async fn handle_completion(
     // revision — `generate_completions` correlates the two (e.g. `extract_prefix`
     // slicing `content` at a range taken from `parse_result`), so a torn pair risks
     // wrong or out-of-bounds-guarded-empty completions (#319 review).
-    let (ecosystem_id, ecosystem_kind, content, parse_result) = {
-        let doc = match state.get_document(uri) {
-            Some(d) => d,
-            None => {
-                tracing::warn!("completion: document not found: {:?}", uri);
-                return None;
-            }
-        };
-        (
-            doc.ecosystem_id(),
-            doc.ecosystem,
-            doc.content.clone(),
-            doc.parse_result_arc(),
-        )
+    // `with_document` makes releasing the guard structural rather than a convention
+    // to remember (#333).
+    let Some((ecosystem_id, ecosystem_kind, content, parse_result)) =
+        state.with_document(uri, |doc| {
+            (
+                doc.ecosystem_id(),
+                doc.ecosystem,
+                doc.content.clone(),
+                doc.parse_result_arc(),
+            )
+        })
+    else {
+        tracing::warn!("completion: document not found: {:?}", uri);
+        return None;
     };
 
     tracing::info!(
@@ -902,118 +902,11 @@ mod tests {
     /// search was ever awaited.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_document_write_not_blocked_by_in_flight_completion_search() {
-        use deps_core::ecosystem::private::Sealed;
-        use deps_core::{
-            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
+        use crate::test_utils::blocking_ecosystem::{
+            BlockingEcosystem, BlockingHook, MockParseResult,
         };
-        use std::any::Any;
-        use std::path::Path;
+        use deps_core::ParseResult;
         use tokio::sync::Barrier;
-        use tower_lsp_server::ls_types::Uri;
-
-        struct NoopRegistry;
-        impl Registry for NoopRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct NoopFormatter;
-        impl EcosystemFormatter for NoopFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
-                version.to_string()
-            }
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
-            }
-        }
-
-        struct BlockingEcosystem {
-            started: Arc<Barrier>,
-        }
-        impl Sealed for BlockingEcosystem {}
-        impl Ecosystem for BlockingEcosystem {
-            fn id(&self) -> &'static str {
-                "cargo"
-            }
-            fn display_name(&self) -> &'static str {
-                "cargo"
-            }
-            fn manifest_filenames(&self) -> &[&'static str] {
-                &["Cargo.toml"]
-            }
-            fn parse_manifest<'a>(
-                &'a self,
-                _content: &'a str,
-                _uri: &'a Uri,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
-            {
-                Box::pin(async move { unimplemented!() })
-            }
-            fn registry(&self) -> Arc<dyn Registry> {
-                Arc::new(NoopRegistry)
-            }
-            fn formatter(&self) -> &dyn EcosystemFormatter {
-                &NoopFormatter
-            }
-            fn generate_completions<'a>(
-                &'a self,
-                _parse_result: &'a dyn ParseResult,
-                _position: tower_lsp_server::ls_types::Position,
-                _content: &'a str,
-                _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
-                Box::pin(async move {
-                    self.started.wait().await;
-                    std::future::pending::<()>().await;
-                    unreachable!("test aborts the completion task before this future resolves")
-                })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockParseResult {
-            uri: Uri,
-        }
-        impl ParseResult for MockParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                vec![]
-            }
-            fn workspace_root(&self) -> Option<&Path> {
-                None
-            }
-            fn uri(&self) -> &Uri {
-                &self.uri
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         let state = Arc::new(ServerState::new());
         let started = Arc::new(Barrier::new(2));
@@ -1021,6 +914,7 @@ mod tests {
             .ecosystem_registry
             .register(Arc::new(BlockingEcosystem {
                 started: Arc::clone(&started),
+                hook: BlockingHook::Completions,
             }));
 
         let uri = deps_core::test_util::test_uri("/test/Cargo.toml");

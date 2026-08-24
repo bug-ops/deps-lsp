@@ -514,12 +514,45 @@ impl ServerState {
     ///
     /// Returns a read-only reference to the document state if it exists.
     /// The reference holds a lock on the internal map, so it should be
-    /// dropped as soon as possible.
+    /// dropped as soon as possible. Prefer [`Self::with_document`] when the
+    /// caller needs to `.await` anything afterward — it makes dropping the
+    /// guard before the `.await` structural rather than a convention to remember.
     pub fn get_document(
         &self,
         uri: &Uri,
     ) -> Option<dashmap::mapref::one::Ref<'_, Uri, DocumentState>> {
         self.documents.get(uri)
+    }
+
+    /// Extracts owned data from a document without exposing the DashMap shard `Ref`
+    /// to the caller.
+    ///
+    /// `extract` runs synchronously while the shard lock is held and must return only
+    /// owned or `Arc`-cloned data (e.g. via [`DocumentState::parse_result_arc`]); the
+    /// `Ref` this method acquires is dropped before the call returns, so *that*
+    /// particular guard can never leak across an `.await` through `T`. This does not by
+    /// itself prevent `extract` from independently capturing and returning some other,
+    /// unrelated `Ref` (e.g. from a second `get_document` call on `state`) — `extract`'s
+    /// closure environment is not restricted to this method's own guard. The
+    /// project-wide backstop against the DashMap Ref-across-await hazard (#333) in
+    /// general is the `await-holding-invalid-types` lint configured in the workspace
+    /// `clippy.toml` (#334), not this method's type signature alone.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use deps_lsp::document::ServerState;
+    /// # use tower_lsp_server::ls_types::Uri;
+    /// # async fn example(state: &ServerState, uri: &Uri) {
+    /// let content_len = state.with_document(uri, |doc| doc.content.len());
+    /// # }
+    /// ```
+    pub fn with_document<T>(
+        &self,
+        uri: &Uri,
+        extract: impl FnOnce(&DocumentState) -> T,
+    ) -> Option<T> {
+        self.documents.get(uri).map(|doc| extract(&doc))
     }
 
     /// Retrieves a cloned copy of document state by URI.

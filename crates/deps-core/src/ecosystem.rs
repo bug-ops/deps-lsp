@@ -403,15 +403,6 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// Default implementation delegates to `lsp_helpers::generate_inlay_hints`
     /// using `self.formatter()`. Override only if custom behavior is needed.
-    // TODO: `handlers::inlay_hints` holds a DashMap shard `Ref` across this future.
-    // An override must never start awaiting real I/O here — it is safe today only
-    // because the default impl (a sync fn wrapped in `Box::pin(async move {...})`)
-    // never actually yields. #319 fixed the identical hazard in
-    // generate_hover/generate_completions/generate_code_actions by having the caller
-    // own the parse result (`DocumentState::parse_result_arc`) and drop the `Ref`
-    // before awaiting; inlay_hints/diagnostics/code_lenses were deliberately left
-    // holding the `Ref` because their defaults never yield, not because the hazard
-    // doesn't apply — apply the same fix pattern here if that ever changes.
     fn generate_inlay_hints<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -493,9 +484,6 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// Default implementation delegates to `lsp_helpers::generate_diagnostics_from_cache`
     /// using `self.formatter()`.
-    // TODO: `handlers::diagnostics` holds a DashMap shard `Ref` across this future —
-    // same caveat as `generate_inlay_hints` above: an override must never start
-    // awaiting real I/O here, safe today only because the default never yields.
     fn generate_diagnostics<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -520,9 +508,6 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// Default implementation delegates to `lsp_helpers::generate_code_lenses` using
     /// `self.formatter()`. Override only if custom behavior is needed.
-    // TODO: `handlers::code_lens` holds a DashMap shard `Ref` across this future —
-    // same caveat as `generate_inlay_hints` above: an override must never start
-    // awaiting real I/O here, safe today only because the default never yields.
     fn generate_code_lenses<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
