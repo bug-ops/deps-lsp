@@ -186,40 +186,42 @@ impl CratesIoRegistry {
 /// - 2 chars: "2/{name}"
 /// - 3 chars: "3/{first_char}/{name}"
 /// - 4+ chars: "{first_2}/{next_2}/{name}"
+///
+/// Path segments are computed from the crate name's **character** count and
+/// positions, not byte length/offsets — crate names may contain multi-byte
+/// UTF-8 characters, and byte-index slicing could land mid-character and panic.
+/// An empty name has no length-based segment and returns the empty string.
 fn sparse_index_path(name: &str) -> String {
     let name_lower = name.to_lowercase();
-    let len = name_lower.len();
+    let chars: Vec<char> = name_lower.chars().collect();
 
-    match len {
+    match chars.len() {
+        0 => name_lower,
         1 => {
-            // "1/" + name = 2 + 1 = 3 chars
-            let mut path = String::with_capacity(3);
+            let mut path = String::with_capacity(2 + name_lower.len());
             path.push_str("1/");
             path.push_str(&name_lower);
             path
         }
         2 => {
-            // "2/" + name = 2 + 2 = 4 chars
-            let mut path = String::with_capacity(4);
+            let mut path = String::with_capacity(2 + name_lower.len());
             path.push_str("2/");
             path.push_str(&name_lower);
             path
         }
         3 => {
-            // "3/" + first_char + "/" + name = 2 + 1 + 1 + 3 = 7 chars
-            let mut path = String::with_capacity(7);
+            let mut path = String::with_capacity(4 + name_lower.len());
             path.push_str("3/");
-            path.push_str(&name_lower[0..1]);
+            path.push(chars[0]);
             path.push('/');
             path.push_str(&name_lower);
             path
         }
         _ => {
-            // first_2 + "/" + next_2 + "/" + name = 2 + 1 + 2 + 1 + len
-            let mut path = String::with_capacity(6 + len);
-            path.push_str(&name_lower[0..2]);
+            let mut path = String::with_capacity(6 + name_lower.len());
+            path.extend(chars[0..2].iter());
             path.push('/');
-            path.push_str(&name_lower[2..4]);
+            path.extend(chars[2..4].iter());
             path.push('/');
             path.push_str(&name_lower);
             path
@@ -610,6 +612,38 @@ mod tests {
     fn test_sparse_index_path_mixed_case() {
         assert_eq!(sparse_index_path("MyPackage"), "my/pa/mypackage");
         assert_eq!(sparse_index_path("UPPERCASE"), "up/pe/uppercase");
+    }
+
+    #[test]
+    fn test_sparse_index_path_multibyte_one_char() {
+        // "本" is 1 char / 3 bytes: byte-index slicing would panic here.
+        assert_eq!(sparse_index_path("本"), "1/本");
+    }
+
+    #[test]
+    fn test_sparse_index_path_multibyte_two_chars() {
+        // "日本" is 2 chars / 6 bytes.
+        assert_eq!(sparse_index_path("日本"), "2/日本");
+    }
+
+    #[test]
+    fn test_sparse_index_path_multibyte_three_chars() {
+        // "日本語" is 3 chars / 9 bytes. The old byte-length-keyed match would
+        // have routed this to the 4+ arm's `name_lower[0..2]`, panicking at
+        // byte index 2 (mid-character), not the 3-char arm.
+        assert_eq!(sparse_index_path("日本語"), "3/日/日本語");
+    }
+
+    #[test]
+    fn test_sparse_index_path_multibyte_four_plus_chars() {
+        // "日本ab" is 4 chars with multi-byte characters in the first two.
+        assert_eq!(sparse_index_path("日本ab"), "日本/ab/日本ab");
+    }
+
+    #[test]
+    fn test_sparse_index_path_empty_name() {
+        // 0 chars falls into the "4+" arm's slicing range; must not panic.
+        assert_eq!(sparse_index_path(""), "");
     }
 
     #[test]
