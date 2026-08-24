@@ -21,7 +21,7 @@ name = "deps_lsp"
 path = "src/lib.rs"
 
 [features]
-default = ["cargo", "npm", "pypi", "go", "bundler", "dart", "maven", "gradle", "swift", "composer", "nuget"]
+default = ["cargo", "npm", "pypi", "go", "bundler", "dart", "maven", "gradle", "swift", "composer", "nuget", "deno"]
 cargo = ["dep:deps-cargo"]
 npm = ["dep:deps-npm"]
 pypi = ["dep:deps-pypi"]
@@ -33,12 +33,16 @@ gradle = ["dep:deps-gradle"]
 swift = ["dep:deps-swift"]
 composer = ["dep:deps-composer"]
 nuget = ["dep:deps-nuget"]
+# Pulls in deps-npm transitively (DenoRegistry delegates npm: specifiers to it, D3) even
+# when the "npm" feature itself is disabled.
+deno = ["dep:deps-deno"]
 
 [dependencies]
 # Internal crates
 deps-core = { workspace = true }
 deps-cargo = { workspace = true, optional = true }
 deps-composer = { workspace = true, optional = true }
+deps-deno = { workspace = true, optional = true }
 deps-npm = { workspace = true, optional = true }
 deps-pypi = { workspace = true, optional = true }
 deps-go = { workspace = true, optional = true }

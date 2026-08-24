@@ -1,0 +1,31 @@
+[package]
+name = "deps-deno"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deno/JSR ecosystem support for deps-lsp"
+publish = true
+
+[lints]
+workspace = true
+
+[dependencies]
+deps-core = { workspace = true }
+deps-npm = { workspace = true }
+jsonc-parser = { workspace = true }
+node-semver = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tower-lsp-server = { workspace = true }
+tracing = { workspace = true }
+urlencoding = { workspace = true }
+
+[dev-dependencies]
+deps-core = { workspace = true, features = ["test-util"] }
+mockito = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

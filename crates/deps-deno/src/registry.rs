@@ -1,0 +1,899 @@
+//! JSR registry client and the scheme-dispatching Deno registry facade (D3).
+//!
+//! A Deno `imports` map mixes two registries in one file: `jsr:` specifiers resolve
+//! against the JSR API (this module's [`JsrRegistry`]), and `npm:` specifiers reuse the
+//! existing [`deps_npm::NpmRegistry`] unchanged. [`DenoRegistry`] is the single
+//! `deps_core::Registry` implementation the ecosystem exposes; every method splits the
+//! scheme off the incoming (already scheme-qualified, per D2) [`PackageName`] and
+//! delegates to whichever half owns it.
+
+use crate::specifier::{Scheme, split_scheme, split_scoped};
+use crate::types::{DenoMetadata, JsrPackage, JsrVersion};
+use deps_core::{
+    DepsError, FreshnessSettings, HttpCache, Metadata, PackageName, Registry, Result, Version,
+    VersionReq,
+};
+use deps_npm::NpmRegistry;
+use serde::Deserialize;
+use std::any::Any;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+const JSR_BASE: &str = "https://jsr.io";
+const JSR_API_BASE: &str = "https://api.jsr.io";
+
+/// Display name for the JSR registry used in not-found error messages.
+pub const REGISTRY: &str = "jsr";
+
+/// Returns the URL for a JSR package's page on jsr.io.
+#[must_use]
+pub fn jsr_package_url(scope: &str, name: &str) -> String {
+    format!(
+        "{JSR_BASE}/@{}/{}",
+        urlencoding::encode(scope),
+        urlencoding::encode(name)
+    )
+}
+
+fn meta_json_url(base: &str, scope: &str, name: &str) -> String {
+    format!(
+        "{base}/@{}/{}/meta.json",
+        urlencoding::encode(scope),
+        urlencoding::encode(name)
+    )
+}
+
+/// Upper bound on how many results [`JsrRegistry::search`] fetches from the wire before
+/// reordering/truncating to the caller's requested `limit`, for a scope-qualified query
+/// (N1). Bounds the request even if `limit` itself is large; JSR's search API returns
+/// `total` (well beyond this) but a scope-qualified completion query never needs more than
+/// a small over-fetch to find the exact-scope match within.
+const MAX_SCOPE_SEARCH_OVERFETCH: usize = 40;
+
+/// Splits a scope-qualified search query (`"@scope/pkg-prefix"`) into `(scope,
+/// pkg_prefix)`. `pkg_prefix` may be empty if the caller hasn't typed a package-name
+/// character yet (`"@std/"`). Returns `None` for an unscoped query (no leading `@`) or one
+/// with no `/` yet (`"@std"` — still typing the scope, nothing to split on).
+fn split_scope_query(query: &str) -> Option<(&str, &str)> {
+    let after_at = query.strip_prefix('@')?;
+    after_at.split_once('/')
+}
+
+/// Extracts the scope portion of a [`JsrPackage`]'s already scheme-qualified `name`
+/// (`"jsr:@scope/pkg"`), or `""` if the name is unexpectedly not in that shape.
+fn package_scope(pkg: &JsrPackage) -> &str {
+    pkg.name
+        .as_str()
+        .strip_prefix("jsr:@")
+        .and_then(|s| s.split_once('/'))
+        .map_or("", |(scope, _)| scope)
+}
+
+/// Converts a 404 response into `DepsError::PackageNotFound`, passing through any other
+/// error unchanged. Mirrors `deps-npm`'s `not_found_or` (`deps-npm/src/registry.rs`).
+fn not_found_or(err: DepsError, full_name: &str) -> DepsError {
+    if matches!(err, DepsError::HttpStatus { status: 404, .. }) {
+        DepsError::PackageNotFound {
+            package: full_name.to_string(),
+            registry: REGISTRY,
+        }
+    } else {
+        err
+    }
+}
+
+/// Builds the error for a scheme-qualified name that could not be routed: an unknown or
+/// missing scheme reaching a fetch method. In practice the manifest parser never emits
+/// such a dependency (D7 only produces `jsr:`/`npm:`-qualified names), so this is a
+/// defensive arm only — never a silent fetch against the wrong registry.
+fn unroutable(name: &PackageName) -> DepsError {
+    DepsError::PackageNotFound {
+        package: name.to_string(),
+        registry: "deno",
+    }
+}
+
+/// One JSR package version entry inside `meta.json`'s `versions` object.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MetaVersionEntry {
+    #[serde(default)]
+    yanked: bool,
+    #[serde(default)]
+    created_at: Option<String>,
+}
+
+/// The subset of `https://jsr.io/@{scope}/{pkg}/meta.json` this client needs.
+#[derive(Deserialize)]
+struct MetaJson {
+    versions: HashMap<String, MetaVersionEntry>,
+}
+
+/// One search result inside `https://api.jsr.io/packages?query=`'s `items` array.
+#[derive(Deserialize)]
+struct SearchItem {
+    scope: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(rename = "latestVersion", default)]
+    latest_version: Option<String>,
+    #[serde(rename = "githubRepository", default)]
+    github_repository: Option<GithubRepository>,
+}
+
+#[derive(Deserialize)]
+struct GithubRepository {
+    owner: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    items: Vec<SearchItem>,
+}
+
+/// Client for the JSR registry (`jsr.io` for package metadata, `api.jsr.io` for search).
+///
+/// Both endpoints are keyless (live-verified 2026-08-24) and are fetched through the
+/// shared `HttpCache`, so no TTL tuning is needed (NFR-001): JSR sends a strong `ETag`,
+/// and `HttpCache` revalidates via `If-None-Match` on every call regardless of the
+/// `Cache-Control: no-cache, no-store` header JSR also sends.
+#[derive(Clone)]
+pub struct JsrRegistry {
+    cache: Arc<HttpCache>,
+    base: String,
+    api_base: String,
+}
+
+impl JsrRegistry {
+    /// Creates a new JSR registry client with the given HTTP cache.
+    #[must_use]
+    pub fn new(cache: Arc<HttpCache>) -> Self {
+        Self::with_bases(cache, JSR_BASE.to_string(), JSR_API_BASE.to_string())
+    }
+
+    fn with_bases(cache: Arc<HttpCache>, base: String, api_base: String) -> Self {
+        Self {
+            cache,
+            base,
+            api_base,
+        }
+    }
+
+    /// Fetches all versions of `@{scope}/{name}` from `meta.json`.
+    ///
+    /// Returns versions sorted newest-first (per `Registry::get_versions`' contract) —
+    /// `meta.json`'s `versions` is a JSON *object*, and `serde_json` does not preserve
+    /// insertion order here (`preserve_order` is enabled only for `deps-composer`), so an
+    /// explicit semver-descending sort is required (C2).
+    ///
+    /// `published_at` is populated directly from this same response's per-version
+    /// `createdAt` field — no extra request, unlike npm (D10).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails, the response is not valid UTF-8/JSON,
+    /// or the package does not exist (mapped to `DepsError::PackageNotFound`).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use deps_deno::registry::JsrRegistry;
+    /// # use deps_core::HttpCache;
+    /// # use std::sync::Arc;
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let cache = Arc::new(HttpCache::new());
+    /// let registry = JsrRegistry::new(cache);
+    ///
+    /// let versions = registry.get_versions("std", "fs").await.unwrap();
+    /// assert!(!versions.is_empty());
+    /// # }
+    /// ```
+    pub async fn get_versions(&self, scope: &str, name: &str) -> Result<Vec<JsrVersion>> {
+        let url = meta_json_url(&self.base, scope, name);
+        let full_name = format!("@{scope}/{name}");
+        let data = self
+            .cache
+            .get_cached(&url)
+            .await
+            .map_err(|e| not_found_or(e, &full_name))?;
+        parse_meta_json(&data)
+    }
+
+    /// Searches JSR for packages matching `query`.
+    ///
+    /// If `query` is scope-qualified (`"@scope/pkg-prefix"`), the scope is split off
+    /// *before* hitting the wire and only the package-name portion is sent as the search
+    /// text (N1): JSR's search API ranks purely by text relevance and ignores the scope
+    /// portion of a scoped query entirely — live-verified 2026-08-24, `query=@std/fs`
+    /// buries the exact `std/fs` match 17th of 20 results, and a `scope=` query parameter
+    /// is accepted but has no effect on ranking. Results are then reordered so an exact
+    /// scope match sorts first (a stable sort, so JSR's own relevance ranking is preserved
+    /// within each group), restoring the ordering a caller completing a scoped specifier —
+    /// the common case for JSR — actually needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response is not valid JSON.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use deps_deno::registry::JsrRegistry;
+    /// # use deps_core::HttpCache;
+    /// # use std::sync::Arc;
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let cache = Arc::new(HttpCache::new());
+    /// let registry = JsrRegistry::new(cache);
+    ///
+    /// let results = registry.search("fs", 10).await.unwrap();
+    /// assert!(!results.is_empty());
+    /// # }
+    /// ```
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<JsrPackage>> {
+        let Some((scope, pkg_prefix)) = split_scope_query(query) else {
+            return self.fetch_search(query, limit).await;
+        };
+
+        // No package-name text typed yet (`"@std/"`): search on the scope itself instead
+        // of an empty string.
+        let text_query = if pkg_prefix.is_empty() {
+            scope
+        } else {
+            pkg_prefix
+        };
+        // R1: `usize::clamp(min, max)` panics if `min > max`, which a plain
+        // `.clamp(limit, MAX_SCOPE_SEARCH_OVERFETCH)` would do for any `limit` above the
+        // cap. `.min(MAX_SCOPE_SEARCH_OVERFETCH.max(limit))` can never invert: the upper
+        // bound passed to `min` is itself widened to `limit` whenever `limit` exceeds the
+        // cap, so this degrades to "no overfetch, just use `limit`" instead of panicking.
+        let fetch_limit = limit
+            .saturating_mul(4)
+            .min(MAX_SCOPE_SEARCH_OVERFETCH.max(limit));
+
+        let mut results = self.fetch_search(text_query, fetch_limit).await?;
+        results.sort_by_key(|p| !package_scope(p).eq_ignore_ascii_case(scope));
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    /// Issues the raw `api.jsr.io/packages?query=` request with no scope-aware
+    /// post-processing. Used directly for an unscoped query, and as the underlying fetch
+    /// for [`Self::search`]'s scope-qualified path.
+    async fn fetch_search(&self, query: &str, limit: usize) -> Result<Vec<JsrPackage>> {
+        let url = format!(
+            "{}/packages?query={}&limit={}",
+            self.api_base,
+            urlencoding::encode(query),
+            limit
+        );
+        let data = self.cache.get_cached(&url).await?;
+        parse_search_response(&data)
+    }
+}
+
+/// Parses `meta.json`'s `versions` object into a newest-first `Vec<JsrVersion>` (C2).
+fn parse_meta_json(data: &[u8]) -> Result<Vec<JsrVersion>> {
+    let meta: MetaJson = serde_json::from_slice(data)?;
+
+    let mut versions_with_parsed: Vec<(JsrVersion, node_semver::Version)> = meta
+        .versions
+        .into_iter()
+        .filter_map(|(version, entry)| {
+            let parsed = node_semver::Version::parse(&version).ok()?;
+            let published_at = entry
+                .created_at
+                .as_deref()
+                .and_then(deps_core::PublishTime::parse_rfc3339);
+            Some((
+                JsrVersion {
+                    version,
+                    yanked: entry.yanked,
+                    published_at,
+                },
+                parsed,
+            ))
+        })
+        .collect();
+
+    versions_with_parsed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    Ok(versions_with_parsed.into_iter().map(|(v, _)| v).collect())
+}
+
+/// Parses `api.jsr.io/packages`'s search response into `JsrPackage`s, each already
+/// scheme-qualified as `"jsr:@scope/name"` (D3).
+fn parse_search_response(data: &[u8]) -> Result<Vec<JsrPackage>> {
+    let response: SearchResponse = serde_json::from_slice(data)?;
+
+    Ok(response
+        .items
+        .into_iter()
+        .map(|item| {
+            let repository = item
+                .github_repository
+                .map(|repo| format!("https://github.com/{}/{}", repo.owner, repo.name));
+            let description = item.description.filter(|d| !d.is_empty());
+            JsrPackage {
+                name: PackageName::new(format!("jsr:@{}/{}", item.scope, item.name)),
+                description,
+                repository,
+                documentation: None,
+                latest_version: item.latest_version.unwrap_or_default(),
+            }
+        })
+        .collect())
+}
+
+/// The `deps_core::Registry` implementation for Deno manifests (D3).
+///
+/// A dispatching facade holding a [`JsrRegistry`] plus a [`deps_npm::NpmRegistry`],
+/// routed by the scheme carried inside every incoming [`PackageName`].
+pub struct DenoRegistry {
+    jsr: JsrRegistry,
+    npm: NpmRegistry,
+}
+
+impl DenoRegistry {
+    /// Creates a new Deno registry facade, building both halves from the same
+    /// `Arc<HttpCache>` (M1). This dedupes plain cached GETs — the abbreviated packument
+    /// `get_versions` fetches, and the JSR endpoints — between `package.json` and
+    /// `deno.json` for the same npm package. It does **not** dedupe the *separate*
+    /// full-packument fetch npm's own freshness path (`fetch_publish_times`) issues when
+    /// `freshness.enabled`: that path deliberately bypasses `HttpCache`'s entry map
+    /// (`deps-npm/src/registry.rs`) and is memoized in a per-`NpmRegistry`-instance
+    /// `DashMap`, and this facade constructs its own `NpmRegistry` instance rather than
+    /// sharing `NpmEcosystem`'s — so with freshness on, that one extra request *is* still
+    /// duplicated for a package appearing in both manifests (N4, tracked as a follow-up:
+    /// sharing one `NpmRegistry` instance across ecosystem registration).
+    #[must_use]
+    pub fn new(cache: Arc<HttpCache>) -> Self {
+        Self {
+            jsr: JsrRegistry::new(Arc::clone(&cache)),
+            npm: NpmRegistry::new(cache),
+        }
+    }
+}
+
+impl Registry for DenoRegistry {
+    fn get_versions<'a>(
+        &'a self,
+        name: &'a PackageName,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
+        Box::pin(async move {
+            match split_scheme(name.as_str()) {
+                Some((Scheme::Jsr, rest)) => {
+                    let (scope, pkg) = split_scoped(rest).ok_or_else(|| unroutable(name))?;
+                    let versions = self.jsr.get_versions(scope, pkg).await?;
+                    Ok(versions
+                        .into_iter()
+                        .map(|v| Box::new(v) as Box<dyn Version>)
+                        .collect())
+                }
+                Some((Scheme::Npm, rest)) => {
+                    let bare = PackageName::new(rest);
+                    // S3: `NpmRegistry` has an *inherent* `get_versions` that shadows the
+                    // trait method and silently drops `get_versions_with`'s freshness
+                    // semantics if called via plain method syntax — UFCS forces the trait
+                    // method.
+                    Registry::get_versions(&self.npm, &bare).await
+                }
+                None => Err(unroutable(name)),
+            }
+        })
+    }
+
+    fn get_versions_with<'a>(
+        &'a self,
+        name: &'a PackageName,
+        freshness: FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
+        Box::pin(async move {
+            match split_scheme(name.as_str()) {
+                Some((Scheme::Npm, rest)) => {
+                    let bare = PackageName::new(rest);
+                    Registry::get_versions_with(&self.npm, &bare, freshness).await
+                }
+                // JSR's `meta.json` already carries `createdAt` in the same response
+                // `get_versions` fetches (D10) — no separate freshness request needed.
+                _ => self.get_versions(name).await,
+            }
+        })
+    }
+
+    fn get_latest_matching<'a>(
+        &'a self,
+        name: &'a PackageName,
+        req: &'a VersionReq,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
+        Box::pin(async move {
+            match split_scheme(name.as_str()) {
+                Some((Scheme::Jsr, rest)) => {
+                    let (scope, pkg) = split_scoped(rest).ok_or_else(|| unroutable(name))?;
+                    let versions = self.jsr.get_versions(scope, pkg).await?;
+                    let parsed_req = node_semver::Range::parse(req.as_str())
+                        .map_err(|e| DepsError::InvalidVersionReq(e.to_string()))?;
+                    Ok(versions
+                        .into_iter()
+                        .find(|v| {
+                            node_semver::Version::parse(&v.version)
+                                .is_ok_and(|ver| parsed_req.satisfies(&ver) && !v.yanked)
+                        })
+                        .map(|v| Box::new(v) as Box<dyn Version>))
+                }
+                Some((Scheme::Npm, rest)) => {
+                    let bare = PackageName::new(rest);
+                    Registry::get_latest_matching(&self.npm, &bare, req).await
+                }
+                None => Err(unroutable(name)),
+            }
+        })
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn Metadata>>>> {
+        Box::pin(async move {
+            match split_scheme(query) {
+                Some((Scheme::Jsr, rest)) => {
+                    let packages = self.jsr.search(rest, limit).await?;
+                    Ok(packages
+                        .into_iter()
+                        .map(|p| Box::new(p) as Box<dyn Metadata>)
+                        .collect())
+                }
+                Some((Scheme::Npm, rest)) => {
+                    let results = Registry::search(&self.npm, rest, limit).await?;
+                    Ok(results
+                        .into_iter()
+                        .map(|m| {
+                            let prefixed = PackageName::new(format!("npm:{}", m.name()));
+                            Box::new(DenoMetadata::new(prefixed, m)) as Box<dyn Metadata>
+                        })
+                        .collect())
+                }
+                // No scheme prefix on the query: never guess which registry to search.
+                None => Ok(vec![]),
+            }
+        })
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        match split_scheme(name.as_str()) {
+            Some((Scheme::Jsr, rest)) => split_scoped(rest)
+                .map(|(scope, pkg)| jsr_package_url(scope, pkg))
+                .unwrap_or_default(),
+            Some((Scheme::Npm, rest)) => self.npm.package_url(&PackageName::new(rest)),
+            None => String::new(),
+        }
+    }
+
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn Version>],
+        req: &VersionReq,
+    ) -> Option<usize> {
+        // Name-free and pure `node_semver`: correct for both JSR (which mandates semver)
+        // and npm version strings, so npm's implementation covers both without a
+        // downcast.
+        self.npm.select_latest_matching(versions, req)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_jsr_package_url() {
+        assert_eq!(jsr_package_url("std", "fs"), "https://jsr.io/@std/fs");
+    }
+
+    // --- S-L2: URL-encoding regressions, mirroring deps-npm's package_url/versions_url tests ---
+
+    #[test]
+    fn test_jsr_package_url_encodes_malicious_scope() {
+        let url = jsr_package_url("evil)[pkg](https://evil.example", "x");
+        assert!(!url.contains(')'));
+        assert!(!url.contains('('));
+        assert!(!url.contains('['));
+        assert!(!url.contains(']'));
+    }
+
+    #[test]
+    fn test_jsr_package_url_encodes_malicious_name_segment() {
+        let url = jsr_package_url("std", "evil)[pkg](https://evil.example");
+        assert!(!url.contains(')'));
+        assert!(!url.contains('('));
+    }
+
+    #[test]
+    fn test_jsr_package_url_encodes_newline_and_percent() {
+        let url = jsr_package_url("evil\n<%", "pkg");
+        assert!(!url.contains('\n'));
+        assert!(!url.contains('<'));
+        assert!(url.contains("%25"));
+    }
+
+    #[test]
+    fn test_meta_json_url_encodes_malicious_segments() {
+        let url = meta_json_url(JSR_BASE, "evil/../secret?x=1#frag", "pkg");
+        assert!(!url.contains("/../"));
+        assert!(!url.contains('?'));
+        assert!(!url.contains('#'));
+    }
+
+    #[test]
+    fn test_parse_meta_json_sorts_newest_first() {
+        // C2: the raw object order below is deliberately NOT sorted, mirroring the live
+        // `meta.json` shape (verified 2026-08-24) where `1.0.19` precedes `0.200.0`.
+        let json = r#"{
+  "versions": {
+    "1.0.19": {"createdAt": "2025-07-01T07:43:44Z"},
+    "0.200.0": {"createdAt": "2024-04-24T06:44:45Z"},
+    "1.0.24": {"createdAt": "2026-05-26T09:57:22Z"},
+    "0.229.0": {"yanked": true, "createdAt": "2024-04-29T17:22:46Z"},
+    "1.0.9": {"createdAt": "2025-01-10T08:22:54Z"}
+  }
+}"#;
+
+        let versions = parse_meta_json(json.as_bytes()).unwrap();
+        let strings: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(
+            strings,
+            vec!["1.0.24", "1.0.19", "1.0.9", "0.229.0", "0.200.0"]
+        );
+    }
+
+    #[test]
+    fn test_parse_meta_json_yanked_and_published_at() {
+        let json = r#"{
+  "versions": {
+    "1.0.0": {"createdAt": "2024-01-01T00:00:00Z"},
+    "0.9.0": {"yanked": true, "createdAt": "2023-01-01T00:00:00Z"}
+  }
+}"#;
+
+        let versions = parse_meta_json(json.as_bytes()).unwrap();
+        let v1 = versions.iter().find(|v| v.version == "1.0.0").unwrap();
+        assert!(!v1.yanked);
+        assert!(v1.published_at.is_some());
+
+        let v09 = versions.iter().find(|v| v.version == "0.9.0").unwrap();
+        assert!(v09.yanked);
+    }
+
+    #[test]
+    fn test_parse_meta_json_skips_non_semver_keys() {
+        let json = r#"{
+  "versions": {
+    "1.0.0": {"createdAt": "2024-01-01T00:00:00Z"},
+    "not-a-version": {"createdAt": "2024-01-01T00:00:00Z"}
+  }
+}"#;
+
+        let versions = parse_meta_json(json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_search_response_prefixes_name_with_scheme_and_maps_github_repo() {
+        let json = r#"{
+  "items": [
+    {
+      "scope": "std",
+      "name": "fs",
+      "description": "File system utilities",
+      "latestVersion": "1.0.24",
+      "githubRepository": {"owner": "denoland", "name": "std"}
+    }
+  ]
+}"#;
+
+        let packages = parse_search_response(json.as_bytes()).unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "jsr:@std/fs");
+        assert_eq!(
+            packages[0].description,
+            Some("File system utilities".to_string())
+        );
+        assert_eq!(
+            packages[0].repository,
+            Some("https://github.com/denoland/std".to_string())
+        );
+        assert_eq!(packages[0].latest_version, "1.0.24");
+    }
+
+    #[test]
+    fn test_parse_search_response_empty_description_becomes_none() {
+        let json = r#"{
+  "items": [
+    {"scope": "anabranch", "name": "fs", "description": "", "latestVersion": "0.3.1"}
+  ]
+}"#;
+
+        let packages = parse_search_response(json.as_bytes()).unwrap();
+        assert_eq!(packages[0].description, None);
+        assert_eq!(packages[0].repository, None);
+    }
+
+    #[test]
+    fn test_not_found_or_maps_404() {
+        let err = DepsError::HttpStatus {
+            url: "https://jsr.io/@std/fs/meta.json".into(),
+            status: 404,
+        };
+        let result = not_found_or(err, "@std/fs");
+        assert!(matches!(
+            result,
+            DepsError::PackageNotFound { package, registry }
+                if package == "@std/fs" && registry == REGISTRY
+        ));
+    }
+
+    #[test]
+    fn test_not_found_or_passes_through_non_404() {
+        let err = DepsError::HttpStatus {
+            url: "https://jsr.io/@std/fs/meta.json".into(),
+            status: 500,
+        };
+        let result = not_found_or(err, "@std/fs");
+        assert!(matches!(result, DepsError::HttpStatus { status: 500, .. }));
+    }
+
+    #[tokio::test]
+    async fn test_deno_registry_get_versions_dispatches_jsr_via_mock() {
+        let mut server = mockito::Server::new_async().await;
+        let cache = Arc::new(HttpCache::new());
+        let jsr = JsrRegistry::with_bases(Arc::clone(&cache), server.url(), server.url());
+        let registry = DenoRegistry {
+            jsr,
+            npm: NpmRegistry::new(cache),
+        };
+
+        let mock = server
+            .mock("GET", "/@std/fs/meta.json")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {"createdAt": "2024-01-01T00:00:00Z"}}}"#)
+            .create_async()
+            .await;
+
+        let versions = Registry::get_versions(&registry, &PackageName::new("jsr:@std/fs"))
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_string(), "1.0.0");
+        mock.assert_async().await;
+    }
+
+    // --- N1: scope-aware JSR search ---
+
+    #[test]
+    fn test_split_scope_query() {
+        assert_eq!(split_scope_query("@std/fs"), Some(("std", "fs")));
+        assert_eq!(split_scope_query("@std/f"), Some(("std", "f")));
+        assert_eq!(split_scope_query("@std/"), Some(("std", "")));
+        assert_eq!(split_scope_query("@std"), None);
+        assert_eq!(split_scope_query("fs"), None);
+    }
+
+    #[test]
+    fn test_package_scope_extracts_from_prefixed_name() {
+        let pkg = JsrPackage {
+            name: PackageName::new("jsr:@std/fs"),
+            description: None,
+            repository: None,
+            documentation: None,
+            latest_version: String::new(),
+        };
+        assert_eq!(package_scope(&pkg), "std");
+    }
+
+    #[tokio::test]
+    async fn test_jsr_registry_search_scoped_query_sends_only_package_name_segment() {
+        // N1: JSR's search API ranks purely by text relevance and ignores the scope
+        // portion of a scoped query, so the scope must never reach `query=` on the wire.
+        let mut server = mockito::Server::new_async().await;
+        let registry =
+            JsrRegistry::with_bases(Arc::new(HttpCache::new()), server.url(), server.url());
+
+        let mock = server
+            .mock("GET", "/packages")
+            .match_query(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "query".into(),
+                "fs".into(),
+            )]))
+            .with_status(200)
+            .with_body(r#"{"items": [{"scope": "std", "name": "fs", "latestVersion": "1.0.24"}]}"#)
+            .create_async()
+            .await;
+
+        let results = registry.search("@std/fs", 5).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "jsr:@std/fs");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_jsr_registry_search_scoped_query_reorders_exact_scope_match_first() {
+        // N1: the common case (`jsr:@std/fs`) must surface the exact-scope match first,
+        // not buried behind unrelated packages that merely share the text query.
+        let mut server = mockito::Server::new_async().await;
+        let registry =
+            JsrRegistry::with_bases(Arc::new(HttpCache::new()), server.url(), server.url());
+
+        let body = r#"{"items": [
+            {"scope": "other", "name": "fs", "latestVersion": "1.0.0"},
+            {"scope": "another", "name": "fs-utils", "latestVersion": "3.0.0"},
+            {"scope": "std", "name": "fs", "latestVersion": "2.0.0"}
+        ]}"#;
+        let mock = server
+            .mock("GET", "/packages")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let results = registry.search("@std/fs", 2).await.unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "jsr:@std/fs");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_jsr_registry_search_unscoped_query_unaffected() {
+        let mut server = mockito::Server::new_async().await;
+        let registry =
+            JsrRegistry::with_bases(Arc::new(HttpCache::new()), server.url(), server.url());
+
+        let mock = server
+            .mock("GET", "/packages")
+            .match_query(mockito::Matcher::UrlEncoded("query".into(), "fs".into()))
+            .with_status(200)
+            .with_body(r#"{"items": [{"scope": "std", "name": "fs", "latestVersion": "1.0.24"}]}"#)
+            .create_async()
+            .await;
+
+        let results = registry.search("fs", 5).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_jsr_registry_search_scoped_query_limit_above_overfetch_cap_does_not_panic() {
+        // R1: `limit > MAX_SCOPE_SEARCH_OVERFETCH` used to invert a `usize::clamp`'s
+        // min/max and panic. Must degrade to using `limit` directly instead.
+        let mut server = mockito::Server::new_async().await;
+        let registry =
+            JsrRegistry::with_bases(Arc::new(HttpCache::new()), server.url(), server.url());
+
+        let mock = server
+            .mock("GET", "/packages")
+            .match_query(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+                "limit".into(),
+                "50".into(),
+            )]))
+            .with_status(200)
+            .with_body(r#"{"items": [{"scope": "std", "name": "fs", "latestVersion": "1.0.24"}]}"#)
+            .create_async()
+            .await;
+
+        let results = registry.search("@std/fs", 50).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    #[ignore] // requires network access; deps-npm has no public mockable base URL
+    async fn test_deno_registry_get_versions_dispatches_npm_live() {
+        // `NpmRegistry`'s mockable base-URL constructor is private to `deps_npm`, so the
+        // npm arm's dispatch (as opposed to its routing, covered by the package_url tests
+        // below) can only be exercised end-to-end against the real registry here.
+        let cache = Arc::new(HttpCache::new());
+        let registry = DenoRegistry::new(cache);
+        let versions = Registry::get_versions(&registry, &PackageName::new("npm:react"))
+            .await
+            .unwrap();
+        assert!(!versions.is_empty());
+    }
+
+    #[test]
+    fn test_deno_registry_package_url_dispatches_jsr() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = DenoRegistry::new(cache);
+        assert_eq!(
+            registry.package_url(&PackageName::new("jsr:@std/fs")),
+            "https://jsr.io/@std/fs"
+        );
+    }
+
+    #[test]
+    fn test_deno_registry_package_url_dispatches_npm() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = DenoRegistry::new(cache);
+        assert_eq!(
+            registry.package_url(&PackageName::new("npm:react")),
+            "https://www.npmjs.com/package/react"
+        );
+    }
+
+    #[test]
+    fn test_deno_registry_package_url_unroutable_scheme_is_empty() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = DenoRegistry::new(cache);
+        assert_eq!(registry.package_url(&PackageName::new("unknown:x")), "");
+    }
+
+    // --- Live registry verification (real network, run explicitly with `--ignored`) ---
+    // Per `.claude/rules/continuous-improvement.md`'s Registry Integration Gate: confirms
+    // this crate's parsing matches the actual live JSR response shape, not just the JSON
+    // samples quoted in the architecture plan.
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_jsr_get_versions_std_fs() {
+        let registry = JsrRegistry::new(Arc::new(HttpCache::new()));
+        let versions = registry.get_versions("std", "fs").await.unwrap();
+
+        assert!(!versions.is_empty());
+        // 1.0.24 is JSR's `@std/fs` latest as of 2026-08-24; live registry only ever adds
+        // new versions above it, so a look-up here is a floor, not a fixed hit.
+        assert!(versions.iter().any(|v| v.version == "1.0.24"));
+        // At least one known-yanked version (0.229.0) must round-trip its yanked flag.
+        assert!(versions.iter().any(|v| v.version == "0.229.0" && v.yanked));
+        // Sorted newest-first (C2).
+        let parsed: Vec<node_semver::Version> = versions
+            .iter()
+            .map(|v| node_semver::Version::parse(&v.version).unwrap())
+            .collect();
+        assert!(parsed.windows(2).all(|w| w[0] >= w[1]));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_jsr_search_fs() {
+        let registry = JsrRegistry::new(Arc::new(HttpCache::new()));
+        let results = registry.search("fs", 5).await.unwrap();
+
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|p| p.name.as_str().starts_with("jsr:@")));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_jsr_search_scoped_query_ranks_exact_scope_first() {
+        // N1: live-verified 2026-08-24 that an unfixed scoped query buries `@std/fs`
+        // ~17th of 20 results; this must now come back first.
+        let registry = JsrRegistry::new(Arc::new(HttpCache::new()));
+        let results = registry.search("@std/fs", 5).await.unwrap();
+
+        assert!(!results.is_empty());
+        assert_eq!(results[0].name, "jsr:@std/fs");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_jsr_get_versions_missing_package_is_not_found() {
+        let registry = JsrRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry
+            .get_versions("this-scope-does-not-exist-12345", "nope")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+    }
+}

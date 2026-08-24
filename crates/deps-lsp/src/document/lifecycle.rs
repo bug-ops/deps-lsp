@@ -110,6 +110,10 @@ const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
 /// requirement as concrete; a bare `"1.2.3"` alone is not enough evidence
 /// (critique C2).
 ///
+/// Deno reuses npm's exact grammar for both its `jsr:` and `npm:` specifiers
+/// (`DenoFormatter::compile_requirement` compiles both through the same
+/// `node_semver::Range` npm itself uses), so it gets the same treatment here.
+///
 /// Gradle is deliberately excluded: a bare Gradle coordinate version (e.g.
 /// `"2.14.1"`) is an exact match under `GradleFormatter`'s own
 /// `version_satisfies_requirement` unless it uses the `+` dynamic-version
@@ -119,7 +123,7 @@ const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
 const fn bare_version_is_a_range(ecosystem: EcosystemId) -> bool {
     matches!(
         ecosystem,
-        EcosystemId::Cargo | EcosystemId::Npm | EcosystemId::Composer
+        EcosystemId::Cargo | EcosystemId::Npm | EcosystemId::Composer | EcosystemId::Deno
     )
 }
 
@@ -4471,8 +4475,15 @@ tokio = "1.0"
         fn is_concrete_version_bare_digit_rejected_for_range_default_ecosystems() {
             // Critique C2: Cargo's bare "1.2.3" is a caret range under
             // Cargo's own default operator, not a pin — same for npm and
-            // Composer's implicit range notations.
-            for eco in [EcosystemId::Cargo, EcosystemId::Npm, EcosystemId::Composer] {
+            // Composer's implicit range notations. Deno reuses npm's exact
+            // grammar for both `jsr:` and `npm:` requirements, so it gets the
+            // same treatment (`bare_version_is_a_range`'s doc comment).
+            for eco in [
+                EcosystemId::Cargo,
+                EcosystemId::Npm,
+                EcosystemId::Composer,
+                EcosystemId::Deno,
+            ] {
                 assert!(!is_concrete_version("1.2.3", eco), "{eco:?}");
                 // ...but an explicit pin is still accepted.
                 assert!(is_concrete_version("=1.2.3", eco), "{eco:?}");
