@@ -91,6 +91,23 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+      - name: Guard against test-util leaking into the release dependency tree
+        # deps-core's `test-util` feature (see crates/deps-core/Cargo.toml) relaxes
+        # ensure_https's HTTPS enforcement for loopback hosts and must never reach
+        # deps-lsp's shipped binary. `-e features,no-dev` mirrors a release build:
+        # it excludes dev-dependencies, so this fails if test-util is ever pulled
+        # in through deps-lsp's normal (non-dev) dependency graph.
+        #
+        # The `ctl` self-check (test-util IS expected with dev-deps included) guards
+        # against a `cargo tree` failure or output-format drift silently no-op'ing
+        # this step: without it, an empty `tree` on either branch would pass.
+        run: |
+          tree=$(cargo tree -p deps-lsp -e features,no-dev)
+          ctl=$(cargo tree -p deps-lsp -e features)
+          grep -q 'feature "test-util"' <<<"$ctl" || { echo "::error::guard self-check failed"; exit 1; }
+          grep -q 'feature "test-util"' <<<"$tree" && { echo "::error::deps-core's test-util feature is reachable from deps-lsp's non-dev dependency tree"; exit 1; }
+          exit 0
+
   security:
     name: Security Audit
     needs: changes
@@ -301,7 +318,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build release
-        run: cargo build --workspace --release --all-features
+        # Deliberately not --all-features: this must mirror the shipped binary's
+        # configuration (default features), otherwise it would enable deps-core's
+        # test-util feature (see crates/deps-core/Cargo.toml) in a release build.
+        run: cargo build --workspace --release
 
       - name: Check binary size
         run: |

@@ -695,6 +695,32 @@ impl Default for HttpCache {
 mod tests {
     use super::*;
 
+    // Guards the non-loopback path of `ensure_https`: every other test in this
+    // module reaches it only through loopback `mockito` URLs, so without this
+    // test the "reject any other HTTP host" branch would never run.
+    #[test]
+    fn test_ensure_https_rejects_non_loopback_http() {
+        assert!(ensure_https("http://example.com").is_err());
+    }
+
+    // `http://example.com` alone would still pass under a regressed, substring-based
+    // `is_loopback_host` (e.g. `url.contains("localhost")`) — these hosts embed a
+    // loopback token without actually being loopback, and must still be rejected.
+    #[test]
+    fn test_ensure_https_rejects_hosts_resembling_loopback() {
+        assert!(ensure_https("http://localhost.evil.com/").is_err());
+        assert!(ensure_https("http://127.0.0.1.evil.com/").is_err());
+        assert!(ensure_https("http://evil.com/?cb=127.0.0.1").is_err());
+    }
+
+    // The sole exerciser of `is_loopback_host`'s bracketed-IPv6 branch
+    // (`strip_prefix('[')`/`split(']')`) — every other test/mockito URL in this
+    // module uses `127.0.0.1`.
+    #[test]
+    fn test_ensure_https_accepts_bracketed_ipv6_loopback() {
+        assert!(ensure_https("http://[::1]:1234/x").is_ok());
+    }
+
     #[test]
     fn test_cache_creation() {
         let cache = HttpCache::new();

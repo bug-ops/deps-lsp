@@ -16,6 +16,13 @@ workspace = true
 # Exposes `test_util` to other workspace crates' own test builds, where
 # `cfg(test)` alone would not apply (deps-core is a normal, non-dev
 # dependency there).
+#
+# Security note: enabling this feature also relaxes `cache::ensure_https`
+# to allow plain HTTP for loopback hosts (`127.0.0.1`/`localhost`/`::1`),
+# needed for cross-crate `mockito` tests. This feature is publicly
+# enablable by any downstream Cargo.toml (this crate has `publish = true`),
+# so it must never be enabled in a shipped/release build — see
+# `cache::ensure_https` for the full contract.
 test-util = []
 
 [dependencies]
