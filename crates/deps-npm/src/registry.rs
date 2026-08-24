@@ -32,9 +32,11 @@ const PUBLISH_TIMES_TTL: Duration = Duration::from_hours(1);
 
 /// Cap on the number of packages [`NpmRegistry::publish_times`] retains derived maps for.
 /// Not a copy of `HttpCache::evict_entries`'s byte-budget eviction — [`parse_package_times`]
-/// retains only entries within the top-8 version set (security S-2), so every entry here is
-/// at most `HOVER_RECENT_VERSIONS` small `(String, PublishTime)` pairs, and a plain
-/// count-based cap is sufficient.
+/// retains only entries whose version is in the package's actual published-version list
+/// (security S-2), which bounds each entry's map to the registry-authoritative version count
+/// for that package (not an attacker-controlled `time` object), so a plain count-based cap on
+/// the number of packages is sufficient even though an individual package's map is no longer
+/// a small constant size.
 const PUBLISH_TIMES_MAX_ENTRIES: usize = 256;
 
 /// Display name for the npm registry used in not-found and API-response
@@ -200,12 +202,20 @@ impl NpmRegistry {
     /// full packument only when the cached entry is TTL-expired or `current_top8` differs
     /// from the top-8 set it was last built against (see [`CachedTimes`]).
     ///
+    /// `all_versions` is the package's full, registry-authoritative version list (from the
+    /// abbreviated packument already fetched via [`Self::get_versions`]) — it bounds what
+    /// [`Self::fetch_publish_times`] retains from the `time` field (security S-2), so npm
+    /// coverage is not limited to the top-8 window the way `current_top8`-based invalidation
+    /// is. `current_top8` is used *only* for the TTL-invalidation predicate and `top_seen`,
+    /// never for retention.
+    ///
     /// Never fails the caller: a fetch or parse error degrades to an empty map, logged at
     /// `debug` — ages vanish, the version list (already fetched via [`Self::get_versions`])
     /// does not.
     async fn publish_times(
         &self,
         name: &str,
+        all_versions: &[String],
         current_top8: &[String],
     ) -> Arc<HashMap<String, PublishTime>> {
         if let Some(cached) = self.publish_times.get(name)
@@ -218,7 +228,7 @@ impl NpmRegistry {
             self.evict_publish_times();
         }
 
-        let times = Arc::new(self.fetch_publish_times(name, current_top8).await);
+        let times = Arc::new(self.fetch_publish_times(name, all_versions).await);
         self.publish_times.insert(
             name.to_string(),
             CachedTimes {
@@ -235,13 +245,14 @@ impl NpmRegistry {
     /// shared cache budget) and derives a `{version -> PublishTime}` map from its `time`
     /// field, retaining only entries whose version is in `known_versions`.
     ///
-    /// The `known_versions` filter (security S-2) bounds the retained map to a small,
-    /// constant-size set regardless of how many keys a pathological or malicious `time`
-    /// object carries — without it, a crafted full packument could retain up to
-    /// `MAX_RESPONSE_BYTES` (32 MiB) worth of entries per package across
+    /// The `known_versions` filter (security S-2) bounds the retained map to the package's
+    /// actual published-version count regardless of how many keys a pathological or
+    /// malicious `time` object carries — without it, a crafted full packument could retain up
+    /// to `MAX_RESPONSE_BYTES` (32 MiB) worth of entries per package across
     /// `PUBLISH_TIMES_MAX_ENTRIES` cached packages. It also drops the `created`/`modified`
     /// pseudo-entries, which are never queried (lookups are always by a real version
-    /// string), for free.
+    /// string), for free. Callers pass the package's full version list here, not just the
+    /// top-8 window, so npm's coverage has no NuGet-style tail gap.
     async fn fetch_publish_times(
         &self,
         name: &str,
@@ -459,8 +470,13 @@ fn publish_times_stale(cached: &CachedTimes, now: Instant, current_top8: &[Strin
 
 /// Parses a full packument's `time` field into a `{version -> PublishTime}` map, retaining
 /// only entries whose version string is in `known_versions` (security S-2: bounds the
-/// retained map to a small, constant-size set regardless of how many keys the source `time`
-/// object carries — see [`NpmRegistry::fetch_publish_times`]).
+/// retained map to the package's actual published-version count regardless of how many keys
+/// the source `time` object carries — see [`NpmRegistry::fetch_publish_times`]).
+///
+/// `known_versions` is looked up via a `HashSet` built once up front rather than
+/// `Vec::contains`: callers now pass a package's full version list (some npm packages carry
+/// several thousand versions), and a per-entry linear scan over that list inside the `time`
+/// object's filter would be O(n²).
 ///
 /// # Errors
 ///
@@ -471,10 +487,12 @@ fn parse_package_times(
     known_versions: &[String],
 ) -> Result<HashMap<String, PublishTime>> {
     let parsed: PackageTimes = serde_json::from_slice(data)?;
+    let known: std::collections::HashSet<&str> =
+        known_versions.iter().map(String::as_str).collect();
     Ok(parsed
         .time
         .into_iter()
-        .filter(|(version, _)| known_versions.contains(version))
+        .filter(|(version, _)| known.contains(version.as_str()))
         .filter_map(|(version, value)| {
             let published = PublishTime::parse_rfc3339(value.as_str()?)?;
             Some((version, published))
@@ -535,8 +553,12 @@ impl deps_core::Registry for NpmRegistry {
         Box::pin(async move {
             let mut versions = self.get_versions(name.as_str()).await?;
             if freshness.enabled {
+                let all_versions: Vec<String> =
+                    versions.iter().map(|v| v.version.clone()).collect();
                 let top8 = top_n(&versions, HOVER_RECENT_VERSIONS);
-                let times = self.publish_times(name.as_str(), &top8).await;
+                let times = self
+                    .publish_times(name.as_str(), &all_versions, &top8)
+                    .await;
                 attach_publish_times(&mut versions, &times);
             }
             Ok(versions
@@ -1171,7 +1193,9 @@ mod tests {
         );
 
         let current_top8 = vec!["1.0.0".to_string()];
-        let result = registry.publish_times("widget", &current_top8).await;
+        let result = registry
+            .publish_times("widget", &current_top8, &current_top8)
+            .await;
 
         assert!(Arc::ptr_eq(&result, &times));
     }
@@ -1217,7 +1241,7 @@ mod tests {
         ];
 
         for _ in 0..10 {
-            let times = registry.publish_times("widget", &top8).await;
+            let times = registry.publish_times("widget", &top8, &top8).await;
             assert!(!times.contains_key("3.0.0-missing"));
             assert!(times.contains_key("2.0.0"));
         }
@@ -1258,12 +1282,12 @@ mod tests {
 
         let new_top8 = vec!["2.0.0".to_string(), "1.0.0".to_string()];
 
-        let first = registry.publish_times("widget", &new_top8).await;
+        let first = registry.publish_times("widget", &new_top8, &new_top8).await;
         assert!(first.contains_key("2.0.0"));
 
         // Repeated calls with the now-current top8: no further refetch.
         for _ in 0..5 {
-            registry.publish_times("widget", &new_top8).await;
+            registry.publish_times("widget", &new_top8, &new_top8).await;
         }
 
         mock.assert_async().await;
@@ -1336,6 +1360,60 @@ mod tests {
         full_mock.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn test_get_versions_with_covers_version_outside_top8_window() {
+        // Regression guard: the retention filter passed to `fetch_publish_times` /
+        // `parse_package_times` must be the package's full version list, not just the
+        // top-8 slice used for TTL invalidation — otherwise npm silently regains the
+        // NuGet-style "only the newest ~8 versions get an age" tail gap.
+        use deps_core::{FreshnessSettings, PackageName, Registry};
+
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        let abbrev_versions: String = (1..=10)
+            .map(|n| format!(r#""{n}.0.0": {{}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let abbrev_mock = server
+            .mock("GET", "/widget")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(format!(r#"{{"versions": {{{abbrev_versions}}}}}"#))
+            .create_async()
+            .await;
+
+        let time_entries: String = (1..=10)
+            .map(|n| format!(r#""{n}.0.0": "20{n:02}-01-01T00:00:00Z""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let full_mock = server
+            .mock("GET", "/widget")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_body(format!(r#"{{"time": {{{time_entries}}}}}"#))
+            .create_async()
+            .await;
+
+        let versions = registry
+            .get_versions_with(&PackageName::new("widget"), FreshnessSettings::default())
+            .await
+            .unwrap();
+
+        // 10 versions sorted newest-first (10.0.0 .. 1.0.0); the top-8 window is
+        // 10.0.0..=3.0.0, so 2.0.0 and 1.0.0 fall outside it.
+        assert_eq!(versions.len(), 10);
+        let outside_top8 = versions
+            .iter()
+            .find(|v| v.version_string() == "1.0.0")
+            .unwrap();
+        assert!(outside_top8.published_at().is_some());
+
+        abbrev_mock.assert_async().await;
+        full_mock.assert_async().await;
+    }
+
     // --- NFR-006 live verification (real network, run explicitly with `--ignored`) ---
 
     #[tokio::test]
@@ -1359,11 +1437,11 @@ mod tests {
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
         let top8 = vec!["4.18.2".to_string()];
 
-        let first = registry.publish_times("express", &top8).await;
+        let first = registry.publish_times("express", &top8, &top8).await;
         assert!(!first.is_empty());
 
         // Within TTL and unchanged top-8: must return the identical Arc, not refetch.
-        let second = registry.publish_times("express", &top8).await;
+        let second = registry.publish_times("express", &top8, &top8).await;
         assert!(Arc::ptr_eq(&first, &second));
     }
 }
