@@ -2,7 +2,7 @@ use crate::config::DepsConfig;
 use crate::document::{ServerState, handle_document_change, handle_document_open};
 use crate::file_watcher;
 use crate::handlers::{code_actions, code_lens, completion, diagnostics, hover, inlay_hints};
-use deps_core::PackageName;
+use deps_core::{PackageName, is_safe_version_string};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -631,21 +631,9 @@ impl LanguageServer for Backend {
             && let Some(args) = params.arguments.first()
             && let Ok(update_args) = serde_json::from_value::<UpdateVersionArgs>(args.clone())
         {
-            let mut edits = HashMap::new();
-            edits.insert(
-                update_args.uri.clone(),
-                vec![TextEdit {
-                    range: update_args.range,
-                    new_text: format!("\"{}\"", update_args.version),
-                }],
-            );
-
-            let edit = WorkspaceEdit {
-                changes: Some(edits),
-                ..Default::default()
-            };
-
-            if let Err(e) = self.client.apply_edit(edit).await {
+            if let Some(edit) = build_update_version_edit(&update_args)
+                && let Err(e) = self.client.apply_edit(edit).await
+            {
                 tracing::error!("Failed to apply edit: {:?}", e);
             }
         } else if params.command == commands::UPDATE_ALL_OUTDATED
@@ -793,6 +781,34 @@ struct UpdateVersionArgs {
     uri: Uri,
     range: Range,
     version: String,
+}
+
+/// Builds the `WorkspaceEdit` for `deps-lsp.updateVersion`, or `None` if `args.version`
+/// fails [`is_safe_version_string`] — this command builds its `TextEdit` directly from a
+/// client-supplied argument, bypassing `EcosystemFormatter` entirely, so the same
+/// manifest-injection risk `is_safe_version_string` guards elsewhere applies here too.
+fn build_update_version_edit(args: &UpdateVersionArgs) -> Option<WorkspaceEdit> {
+    if !is_safe_version_string(&args.version) {
+        tracing::error!(
+            version = %args.version,
+            "deps-lsp.updateVersion: rejecting unsafe version string"
+        );
+        return None;
+    }
+
+    let mut edits = HashMap::new();
+    edits.insert(
+        args.uri.clone(),
+        vec![TextEdit {
+            range: args.range,
+            new_text: format!("\"{}\"", args.version),
+        }],
+    );
+
+    Some(WorkspaceEdit {
+        changes: Some(edits),
+        ..Default::default()
+    })
 }
 
 /// Arguments for `deps-lsp.updateAllOutdated` — the URI only. Ranges are recomputed at
@@ -986,6 +1002,63 @@ mod tests {
         assert_eq!(args.version, "1.0.0");
         assert_eq!(args.range.start.line, 5);
         assert_eq!(args.range.start.character, 10);
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_update_version_with_unsafe_version_does_not_panic() {
+        // Smoke test only: `execute_command` returns `Ok(None)` on this uninitialized-
+        // backend harness whether `build_update_version_edit`'s guard fires or not
+        // (`apply_edit` itself errors out on an uninitialized client, per
+        // `test_execute_command_update_all_outdated_apply_edit_failure_does_not_panic`'s
+        // own comment) — it cannot distinguish "guard fired" from "guard absent". The
+        // actual regression coverage for the guard lives on `build_update_version_edit`
+        // directly, below.
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        let params = ExecuteCommandParams {
+            command: commands::UPDATE_VERSION.to_string(),
+            arguments: vec![serde_json::json!({
+                "uri": "file:///test/Cargo.toml",
+                "range": {
+                    "start": {"line": 0, "character": 9},
+                    "end": {"line": 0, "character": 14}
+                },
+                "version": "1.2.0\", \"evil\": \"true"
+            })],
+            work_done_progress_params: Default::default(),
+        };
+
+        let result = backend.execute_command(params).await;
+        assert!(result.is_ok());
+    }
+
+    fn update_version_args(version: &str) -> UpdateVersionArgs {
+        UpdateVersionArgs {
+            uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+            range: Range::default(),
+            version: version.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_build_update_version_edit_rejects_unsafe_version() {
+        // Regression for #302: an unsafe client-supplied version must never reach a
+        // `TextEdit` via `deps-lsp.updateVersion`.
+        let args = update_version_args("1.2.0\", \"evil\": \"true");
+        assert!(build_update_version_edit(&args).is_none());
+    }
+
+    #[test]
+    fn test_build_update_version_edit_accepts_safe_version() {
+        let args = update_version_args("1.2.0");
+        let edit = build_update_version_edit(&args).expect("a safe version must produce an edit");
+
+        let changes = edit.changes.expect("changes present");
+        let edits = changes.get(&args.uri).expect("edit for the given uri");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range, args.range);
+        assert_eq!(edits[0].new_text, "\"1.2.0\"");
     }
 
     #[test]
