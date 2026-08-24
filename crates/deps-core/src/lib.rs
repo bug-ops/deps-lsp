@@ -57,5 +57,5 @@ pub use parser::{
 pub use registry::{Metadata, Registry, Version, find_latest_stable};
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
-    normalize_and_parse_version,
+    normalize_and_parse_version, normalize_operator_spacing,
 };

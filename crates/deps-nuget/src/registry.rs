@@ -570,10 +570,6 @@ impl deps_core::Registry for NuGetRegistry {
         })
     }
 
-    fn package_url(&self, name: &deps_core::PackageName) -> String {
-        package_url(name.as_str())
-    }
-
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn deps_core::Version>],
@@ -883,10 +879,6 @@ mod tests {
         use deps_core::Registry;
         let cache = Arc::new(HttpCache::new());
         let registry = NuGetRegistry::new(cache);
-        assert_eq!(
-            registry.package_url(&deps_core::PackageName::new("Newtonsoft.Json")),
-            "https://www.nuget.org/packages/Newtonsoft.Json"
-        );
         assert!(registry.as_any().is::<NuGetRegistry>());
     }
 

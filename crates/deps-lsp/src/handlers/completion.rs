@@ -1113,9 +1113,6 @@ mod tests {
             {
                 Box::pin(async move { Ok(vec![]) })
             }
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
-            }
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -2032,9 +2029,6 @@ s
             {
                 panic!("guard must short-circuit before reaching registry search");
             }
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
-            }
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -2105,9 +2099,6 @@ s
                         name: deps_core::PackageName::new("serde"),
                     }) as Box<dyn Metadata>])
                 })
-            }
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -2229,9 +2220,6 @@ s
             {
                 *self.captured_query.lock().unwrap() = Some(query.to_string());
                 Box::pin(async move { Ok(vec![]) })
-            }
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -2422,10 +2410,6 @@ serde
                 })
             }
 
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
-            }
-
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -2508,10 +2492,6 @@ serde
                 })
             }
 
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
-            }
-
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -2560,10 +2540,6 @@ serde
                     tokio::time::sleep(Duration::from_mins(1)).await;
                     Ok(vec![])
                 })
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
             }
 
             fn as_any(&self) -> &dyn Any {

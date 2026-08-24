@@ -242,10 +242,6 @@ impl deps_core::Registry for PubDevRegistry {
         })
     }
 
-    fn package_url(&self, name: &deps_core::PackageName) -> String {
-        package_url(name.as_str())
-    }
-
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn deps_core::Version>],
@@ -466,17 +462,6 @@ mod tests {
         assert_eq!(info.description(), Some("A test package"));
         assert_eq!(info.repository(), Some("https://github.com/test/test"));
         assert!(info.documentation().is_none());
-    }
-
-    #[test]
-    fn test_registry_package_url_trait() {
-        use deps_core::Registry;
-        let cache = Arc::new(HttpCache::new());
-        let registry = PubDevRegistry::new(cache);
-        assert_eq!(
-            registry.package_url(&deps_core::PackageName::new("http")),
-            "https://pub.dev/packages/http"
-        );
     }
 
     #[test]

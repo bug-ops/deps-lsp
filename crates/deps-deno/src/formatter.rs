@@ -170,6 +170,12 @@ mod tests {
     }
 
     #[test]
+    fn test_package_url_unroutable_scheme_is_empty() {
+        let formatter = DenoFormatter;
+        assert_eq!(formatter.package_url(&PackageName::new("unknown:x")), "");
+    }
+
+    #[test]
     fn test_yanked_wording_matches_npm() {
         let formatter = DenoFormatter;
         assert_eq!(formatter.yanked_message(), "This version is deprecated");

@@ -119,10 +119,6 @@ impl deps_core::Registry for {ECOSYSTEM_PASCAL}Registry {
         })
     }
 
-    fn package_url(&self, name: &str) -> String {
-        format!("{}/{}", REGISTRY_URL, urlencoding::encode(name))
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -131,14 +127,6 @@ impl deps_core::Registry for {ECOSYSTEM_PASCAL}Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_package_url() {
-        let cache = Arc::new(HttpCache::new());
-        let registry = {ECOSYSTEM_PASCAL}Registry::new(cache);
-        let url = registry.package_url("my-package");
-        assert!(url.contains("my-package"));
-    }
 
     #[tokio::test]
     #[ignore] // Requires network
