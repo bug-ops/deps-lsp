@@ -56,11 +56,16 @@ pub struct SwiftVersion {
     pub version: String,
     /// Always false for GitHub tags
     pub yanked: bool,
+    /// GitHub Release publish time for this tag, if a matching Release exists
+    /// among the newest ~100 (see `SwiftRegistry::release_dates`). `None` for a
+    /// tag-only version or one outside that window — never a wrong date (#223).
+    pub published_at: Option<deps_core::PublishTime>,
 }
 
 deps_core::impl_version!(SwiftVersion {
     version: version,
     yanked: yanked,
+    published_at: published_at,
 });
 
 /// Package metadata from GitHub API.
@@ -144,6 +149,7 @@ mod tests {
         let ver = SwiftVersion {
             version: "2.40.0".into(),
             yanked: false,
+            published_at: None,
         };
         assert_eq!(ver.version_string(), "2.40.0");
         assert!(!ver.is_yanked());
