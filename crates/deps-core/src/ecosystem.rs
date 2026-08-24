@@ -403,7 +403,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// Default implementation delegates to `lsp_helpers::generate_inlay_hints`
     /// using `self.formatter()`. Override only if custom behavior is needed.
-    // TODO(#317-followup): callers hold a DashMap Ref across this future — overrides must not await I/O until the Ref-across-generate follow-up lands.
+    // TODO(#319): callers hold a DashMap Ref across this future — overrides must not await I/O until #319 lands.
     fn generate_inlay_hints<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
@@ -485,7 +485,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     ///
     /// Default implementation delegates to `lsp_helpers::generate_diagnostics_from_cache`
     /// using `self.formatter()`.
-    // TODO(#317-followup): callers hold a DashMap Ref across this future — overrides must not await I/O until the Ref-across-generate follow-up lands.
+    // TODO(#319): callers hold a DashMap Ref across this future — overrides must not await I/O until #319 lands.
     fn generate_diagnostics<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
