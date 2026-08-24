@@ -290,10 +290,6 @@ impl deps_core::Registry for RubyGemsRegistry {
         })
     }
 
-    fn package_url(&self, name: &deps_core::PackageName) -> String {
-        gem_url(name.as_str())
-    }
-
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn deps_core::Version>],
@@ -790,19 +786,6 @@ mod tests {
         assert!(gem.description().is_none());
         assert!(gem.repository().is_none());
         assert!(gem.documentation().is_none());
-    }
-
-    #[test]
-    fn test_registry_package_url() {
-        use deps_core::Registry;
-
-        let cache = Arc::new(HttpCache::new());
-        let registry = RubyGemsRegistry::new(cache);
-
-        assert_eq!(
-            registry.package_url(&deps_core::PackageName::new("rails")),
-            "https://rubygems.org/gems/rails"
-        );
     }
 
     #[test]

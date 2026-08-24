@@ -67,10 +67,6 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///         Box::pin(async move { Ok(vec![]) })
 ///     }
 ///
-///     fn package_url(&self, name: &PackageName) -> String {
-///         format!("https://example.com/packages/{}", name)
-///     }
-///
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
 /// ```
@@ -150,11 +146,6 @@ pub trait Registry: Send + Sync {
         query: &'a str,
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn Metadata>>>>;
-
-    /// Package URL for ecosystem (e.g., <https://crates.io/crates/serde>)
-    ///
-    /// Returns a URL that links to the package page on the registry website.
-    fn package_url(&self, name: &PackageName) -> String;
 
     /// Index of the latest version in `versions` satisfying `req`, with no I/O.
     ///

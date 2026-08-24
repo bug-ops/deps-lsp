@@ -1,9 +1,8 @@
-use std::borrow::Cow;
-
 use deps_core::Dependency;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
+use deps_core::normalize_operator_spacing;
 
 /// Composer requirement matcher, compiled once per dependency by
 /// [`ComposerFormatter::compile_requirement`]. Shares `version_satisfies_requirement`'s
@@ -266,55 +265,6 @@ fn satisfies_tilde_composer(version: &str, req: &str) -> bool {
         // ~X: >=X.0.0 <(X+1).0.0 — same as caret for single segment
         req_parts.first() == ver_parts.first()
     }
-}
-
-/// Collapses whitespace between a range operator (`>=`, `<=`, `>`, `<`) and its version
-/// number, e.g. `">= 1.0 < 2.0"` becomes `">=1.0 <2.0"`. Both forms are valid Composer
-/// constraint syntax, but leaving the space in place would make the whitespace-based AND
-/// split below treat the operator and its version as separate clauses.
-///
-/// Borrows `requirement` unchanged when there is no spaced operator to collapse (the
-/// common case) instead of always allocating — `ComposerMatcher::matches` calls this once
-/// per candidate version, and `version_satisfies_requirement` recurses through it again
-/// per `||`/AND clause, so an unconditional allocation here is O(candidates * clauses).
-fn normalize_operator_spacing(requirement: &str) -> Cow<'_, str> {
-    if !has_spaced_operator(requirement) {
-        return Cow::Borrowed(requirement);
-    }
-
-    let mut result = String::with_capacity(requirement.len());
-    let mut chars = requirement.chars().peekable();
-    while let Some(c) = chars.next() {
-        result.push(c);
-        if c == '>' || c == '<' {
-            if chars.peek() == Some(&'=') {
-                result.push('=');
-                chars.next();
-            }
-            while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
-                chars.next();
-            }
-        }
-    }
-    Cow::Owned(result)
-}
-
-/// Reports whether `requirement` contains a `>`/`<`/`>=`/`<=` operator immediately
-/// followed by whitespace, i.e. whether [`normalize_operator_spacing`] would need to
-/// allocate. Pure scan, no allocation, so the common no-op case stays cheap.
-fn has_spaced_operator(requirement: &str) -> bool {
-    let mut chars = requirement.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '>' || c == '<' {
-            if chars.peek() == Some(&'=') {
-                chars.next();
-            }
-            if chars.peek().is_some_and(|ws| ws.is_whitespace()) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Caret operator — same as default EcosystemFormatter but inlined for clarity.

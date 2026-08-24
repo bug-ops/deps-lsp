@@ -369,10 +369,6 @@ impl deps_core::Registry for CratesIoRegistry {
         })
     }
 
-    fn package_url(&self, name: &deps_core::PackageName) -> String {
-        crate_url(name.as_str())
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }

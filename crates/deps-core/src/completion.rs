@@ -1060,10 +1060,6 @@ mod tests {
             Box::pin(async move { Ok(vec![]) })
         }
 
-        fn package_url(&self, _name: &crate::PackageName) -> String {
-            String::new()
-        }
-
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -1107,10 +1103,6 @@ mod tests {
                 .map(|m| Box::new(m) as Box<dyn crate::Metadata>)
                 .collect();
             Box::pin(async move { Ok(results) })
-        }
-
-        fn package_url(&self, _name: &crate::PackageName) -> String {
-            String::new()
         }
 
         fn as_any(&self) -> &dyn Any {

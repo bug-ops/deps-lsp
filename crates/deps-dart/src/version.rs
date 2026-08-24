@@ -1,6 +1,6 @@
 //! Version comparison and constraint matching for Dart packages.
 
-use std::borrow::Cow;
+use deps_core::normalize_operator_spacing;
 use std::cmp::Ordering;
 
 pub fn compare_versions(a: &str, b: &str) -> Ordering {
@@ -53,54 +53,6 @@ pub(crate) fn version_matches_normalized_constraint(version: &str, constraint: &
     }
 
     match_single_constraint(version, constraint)
-}
-
-/// Collapses whitespace between a range operator (`>=`, `<=`, `>`, `<`) and its version
-/// number, e.g. `">= 1.15.0 < 2.0.0"` becomes `">=1.15.0 <2.0.0"`. Both forms are valid
-/// pubspec constraint syntax, but leaving the space in place would make the later
-/// whitespace-based AND split treat the operator and its version as separate clauses.
-///
-/// Borrows `constraint` unchanged when there is no spaced operator to collapse (the
-/// common case) instead of always allocating — [`version_matches_constraint`] (the
-/// uncompiled/loose matching path) calls this once per candidate version.
-pub(crate) fn normalize_operator_spacing(constraint: &str) -> Cow<'_, str> {
-    if !has_spaced_operator(constraint) {
-        return Cow::Borrowed(constraint);
-    }
-
-    let mut result = String::with_capacity(constraint.len());
-    let mut chars = constraint.chars().peekable();
-    while let Some(c) = chars.next() {
-        result.push(c);
-        if c == '>' || c == '<' {
-            if chars.peek() == Some(&'=') {
-                result.push('=');
-                chars.next();
-            }
-            while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
-                chars.next();
-            }
-        }
-    }
-    Cow::Owned(result)
-}
-
-/// Reports whether `constraint` contains a `>`/`<`/`>=`/`<=` operator immediately
-/// followed by whitespace, i.e. whether [`normalize_operator_spacing`] would need to
-/// allocate. Pure scan, no allocation, so the common no-op case stays cheap.
-fn has_spaced_operator(constraint: &str) -> bool {
-    let mut chars = constraint.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '>' || c == '<' {
-            if chars.peek() == Some(&'=') {
-                chars.next();
-            }
-            if chars.peek().is_some_and(|ws| ws.is_whitespace()) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn match_single_constraint(version: &str, constraint: &str) -> bool {

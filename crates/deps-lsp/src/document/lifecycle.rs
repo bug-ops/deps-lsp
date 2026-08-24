@@ -1892,10 +1892,6 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
-            }
-
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -1968,10 +1964,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
             }
 
             fn as_any(&self) -> &dyn Any {
@@ -2074,10 +2066,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
             }
 
             fn as_any(&self) -> &dyn Any {
@@ -2207,10 +2195,6 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
-            }
-
             fn select_latest_matching(
                 &self,
                 versions: &[Box<dyn Version>],
@@ -2330,10 +2314,6 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
-            }
-
             fn select_latest_matching(
                 &self,
                 versions: &[Box<dyn Version>],
@@ -2448,10 +2428,6 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
-            }
-
             fn select_latest_matching(
                 &self,
                 versions: &[Box<dyn Version>],
@@ -2548,10 +2524,6 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
-            }
-
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -2616,10 +2588,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
             }
 
             fn as_any(&self) -> &dyn Any {
@@ -2712,10 +2680,6 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
-            }
-
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -2782,10 +2746,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
             }
 
             fn as_any(&self) -> &dyn Any {
@@ -2858,10 +2818,6 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
-            }
-
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -2925,10 +2881,6 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name)
             }
 
             fn as_any(&self) -> &dyn Any {
@@ -3461,10 +3413,6 @@ dependencies = ["requests>=2.0.0"]
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://pypi.org/project/{name}")
             }
 
             fn as_any(&self) -> &dyn Any {
@@ -5282,10 +5230,6 @@ tokio = "1.0"
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
             {
                 Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
             }
 
             fn reports_yanked(&self) -> bool {

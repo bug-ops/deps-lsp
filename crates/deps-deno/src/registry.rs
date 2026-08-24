@@ -491,16 +491,6 @@ impl Registry for DenoRegistry {
         })
     }
 
-    fn package_url(&self, name: &PackageName) -> String {
-        match split_scheme(name.as_str()) {
-            Some((Scheme::Jsr, rest)) => split_scoped(rest)
-                .map(|(scope, pkg)| jsr_package_url(scope, pkg))
-                .unwrap_or_default(),
-            Some((Scheme::Npm, rest)) => self.npm.package_url(&PackageName::new(rest)),
-            None => String::new(),
-        }
-    }
-
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn Version>],
@@ -963,8 +953,8 @@ mod tests {
     #[ignore] // requires network access
     async fn test_deno_registry_get_versions_dispatches_npm_live() {
         // Exercises the npm arm's dispatch through `DenoRegistry::new`'s private
-        // `NpmRegistry` end-to-end against the real registry; routing itself is covered by
-        // the package_url tests below, and mockable dispatch via a shared instance by
+        // `NpmRegistry` end-to-end against the real registry; mockable dispatch via a
+        // shared instance is covered by
         // `test_deno_registry_with_npm_shares_freshness_cache_across_instances` above.
         let cache = Arc::new(HttpCache::new());
         let registry = DenoRegistry::new(cache);
@@ -972,33 +962,6 @@ mod tests {
             .await
             .unwrap();
         assert!(!versions.is_empty());
-    }
-
-    #[test]
-    fn test_deno_registry_package_url_dispatches_jsr() {
-        let cache = Arc::new(HttpCache::new());
-        let registry = DenoRegistry::new(cache);
-        assert_eq!(
-            registry.package_url(&PackageName::new("jsr:@std/fs")),
-            "https://jsr.io/@std/fs"
-        );
-    }
-
-    #[test]
-    fn test_deno_registry_package_url_dispatches_npm() {
-        let cache = Arc::new(HttpCache::new());
-        let registry = DenoRegistry::new(cache);
-        assert_eq!(
-            registry.package_url(&PackageName::new("npm:react")),
-            "https://www.npmjs.com/package/react"
-        );
-    }
-
-    #[test]
-    fn test_deno_registry_package_url_unroutable_scheme_is_empty() {
-        let cache = Arc::new(HttpCache::new());
-        let registry = DenoRegistry::new(cache);
-        assert_eq!(registry.package_url(&PackageName::new("unknown:x")), "");
     }
 
     // --- Live registry verification (real network, run explicitly with `--ignored`) ---

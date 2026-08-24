@@ -1,11 +1,10 @@
 //! Version formatting for Dart ecosystem.
 
-use crate::version::{
-    normalize_operator_spacing, version_matches_constraint, version_matches_normalized_constraint,
-};
+use crate::version::{version_matches_constraint, version_matches_normalized_constraint};
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::normalize_operator_spacing;
 
 /// pub.dev constraint matcher, compiled once per dependency by
 /// [`DartFormatter::compile_requirement`]. Holds the requirement already run through

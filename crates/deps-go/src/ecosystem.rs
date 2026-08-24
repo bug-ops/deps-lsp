@@ -748,10 +748,7 @@ require github.com/gin-gonic/gin v1.9.1
         let ecosystem = GoEcosystem::new(cache);
 
         let registry = ecosystem.registry();
-        assert_eq!(
-            registry.package_url(&deps_core::PackageName::new("github.com/gin-gonic/gin")),
-            "https://pkg.go.dev/github.com/gin-gonic/gin"
-        );
+        assert!(registry.as_any().is::<GoRegistry>());
     }
 
     #[test]

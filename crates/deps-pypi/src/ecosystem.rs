@@ -826,10 +826,6 @@ dependencies = []
                 Box::pin(async move { Ok(Vec::new()) })
             }
 
-            fn package_url(&self, _name: &PackageName) -> String {
-                String::new()
-            }
-
             fn as_any(&self) -> &dyn std::any::Any {
                 self
             }

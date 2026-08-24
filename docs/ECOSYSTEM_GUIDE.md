@@ -780,10 +780,6 @@ impl deps_core::Registry for {Ecosystem}Registry {
         Box::pin(async move { Ok(vec![]) })
     }
 
-    fn package_url(&self, name: &deps_core::PackageName) -> String {
-        format!("{}/{}", REGISTRY_URL, urlencoding::encode(name.as_str()))
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
     }

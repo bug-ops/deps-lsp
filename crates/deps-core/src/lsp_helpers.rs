@@ -3834,10 +3834,6 @@ mod tests {
             Box::pin(async move { Ok(Vec::new()) })
         }
 
-        fn package_url(&self, _name: &PackageName) -> String {
-            String::new()
-        }
-
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -3876,10 +3872,6 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
         {
             Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn package_url(&self, _name: &PackageName) -> String {
-            String::new()
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -3923,10 +3915,6 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
         {
             Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn package_url(&self, _name: &PackageName) -> String {
-            String::new()
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -3976,10 +3964,6 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
         {
             Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn package_url(&self, _name: &PackageName) -> String {
-            String::new()
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -4077,10 +4061,6 @@ mod tests {
             Box::pin(async move { Ok(Vec::new()) })
         }
 
-        fn package_url(&self, _name: &crate::PackageName) -> String {
-            String::new()
-        }
-
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -4128,10 +4108,6 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
         {
             Box::pin(async move { Ok(Vec::new()) })
-        }
-
-        fn package_url(&self, _name: &PackageName) -> String {
-            String::new()
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -9320,10 +9296,6 @@ mod tests {
             ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
             {
                 Box::pin(async move { Ok(Vec::new()) })
-            }
-
-            fn package_url(&self, _name: &PackageName) -> String {
-                String::new()
             }
 
             fn as_any(&self) -> &dyn Any {

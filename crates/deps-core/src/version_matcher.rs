@@ -4,6 +4,7 @@
 //! across different package ecosystems (semver, PEP 440, etc.).
 
 use semver::Version;
+use std::borrow::Cow;
 
 /// Generic version requirement matcher.
 ///
@@ -170,6 +171,66 @@ pub fn extract_pypi_min_version(version_req: &str) -> Option<String> {
     None
 }
 
+/// Collapses whitespace between a range operator (`>=`, `<=`, `>`, `<`) and its version
+/// number, e.g. `">= 1.0 < 2.0"` becomes `">=1.0 <2.0"`.
+///
+/// Several ecosystem requirement grammars (Dart's pubspec constraints, Composer's version
+/// constraints) accept a space after a range operator, but the ecosystem's own AND-splitting
+/// logic (splitting a requirement on whitespace to get individual clauses) would otherwise
+/// treat the operator and its version as separate clauses.
+///
+/// Borrows `requirement` unchanged when there is no spaced operator to collapse (the common
+/// case) instead of always allocating — callers that check many candidate versions against
+/// the same requirement should normalize once and reuse the result rather than re-normalizing
+/// per candidate.
+///
+/// # Examples
+///
+/// ```
+/// # use deps_core::version_matcher::normalize_operator_spacing;
+/// assert_eq!(normalize_operator_spacing(">= 1.0 < 2.0"), ">=1.0 <2.0");
+/// assert_eq!(normalize_operator_spacing(">=1.0 <2.0"), ">=1.0 <2.0");
+/// ```
+pub fn normalize_operator_spacing(requirement: &str) -> Cow<'_, str> {
+    if !has_spaced_operator(requirement) {
+        return Cow::Borrowed(requirement);
+    }
+
+    let mut result = String::with_capacity(requirement.len());
+    let mut chars = requirement.chars().peekable();
+    while let Some(c) = chars.next() {
+        result.push(c);
+        if c == '>' || c == '<' {
+            if chars.peek() == Some(&'=') {
+                result.push('=');
+                chars.next();
+            }
+            while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                chars.next();
+            }
+        }
+    }
+    Cow::Owned(result)
+}
+
+/// Reports whether `requirement` contains a `>`/`<`/`>=`/`<=` operator immediately followed
+/// by whitespace, i.e. whether [`normalize_operator_spacing`] would need to allocate. Pure
+/// scan, no allocation, so the common no-op case stays cheap.
+fn has_spaced_operator(requirement: &str) -> bool {
+    let mut chars = requirement.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '>' || c == '<' {
+            if chars.peek() == Some(&'=') {
+                chars.next();
+            }
+            if chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +306,22 @@ mod tests {
         );
         assert_eq!(extract_pypi_min_version("^1.0"), Some("1.0".to_string())); // Poetry style
         assert_eq!(extract_pypi_min_version(">1.0"), Some("1.0".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_operator_spacing_collapses_spaced_operators() {
+        assert_eq!(normalize_operator_spacing(">= 1.0 < 2.0"), ">=1.0 <2.0");
+        assert_eq!(normalize_operator_spacing("> 1.0"), ">1.0");
+        assert_eq!(normalize_operator_spacing("<= 1.0"), "<=1.0");
+    }
+
+    #[test]
+    fn test_normalize_operator_spacing_borrows_when_no_spaced_operator() {
+        let input = ">=1.0 <2.0";
+        assert!(matches!(
+            normalize_operator_spacing(input),
+            Cow::Borrowed(s) if s == input
+        ));
     }
 
     #[test]

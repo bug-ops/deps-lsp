@@ -611,10 +611,6 @@ impl deps_core::Registry for NpmRegistry {
         })
     }
 
-    fn package_url(&self, name: &deps_core::PackageName) -> String {
-        package_url(name.as_str())
-    }
-
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn deps_core::Version>],

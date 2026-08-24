@@ -626,15 +626,6 @@ impl deps_core::Registry for SwiftRegistry {
         })
     }
 
-    fn package_url(&self, name: &deps_core::PackageName) -> String {
-        let name = name.as_str();
-        if validate_owner_repo(name).is_ok() {
-            format!("https://github.com/{name}")
-        } else {
-            String::new()
-        }
-    }
-
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn deps_core::Version>],
@@ -1024,17 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_package_url_valid() {
-        use deps_core::{PackageName, Registry};
-        let cache = Arc::new(HttpCache::new());
-        let registry = SwiftRegistry::new(cache);
-        assert_eq!(
-            registry.package_url(&PackageName::new("apple/swift-nio")),
-            "https://github.com/apple/swift-nio"
-        );
-    }
-
-    #[test]
     fn test_select_latest_matching_not_default_none() {
         use deps_core::{Registry, VersionReq};
 
@@ -1054,22 +1034,6 @@ mod tests {
         ];
         let req = VersionReq::new("^1.0.0");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
-    }
-
-    #[test]
-    fn test_registry_package_url_invalid_returns_empty() {
-        use deps_core::{PackageName, Registry};
-        let cache = Arc::new(HttpCache::new());
-        let registry = SwiftRegistry::new(cache);
-        assert_eq!(
-            registry.package_url(&PackageName::new("../../etc/passwd")),
-            ""
-        );
-        assert_eq!(registry.package_url(&PackageName::new("no-slash")), "");
-        assert_eq!(
-            registry.package_url(&PackageName::new("owner/repo/extra")),
-            ""
-        );
     }
 
     // --- normalize_tag ---
