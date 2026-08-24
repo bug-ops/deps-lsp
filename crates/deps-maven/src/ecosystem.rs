@@ -7,8 +7,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-    position_in_range,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_maven_coordinate_segment,
+    lsp_helpers::EcosystemFormatter, position_in_range,
 };
 
 use crate::formatter::MavenFormatter;
@@ -39,17 +39,26 @@ enum MavenNameField {
 /// [`MavenEcosystem::detect_xml_context`]) — the base builder's own range is a placeholder
 /// `(0,0)-(0,0)` that does not contain the real cursor position and would corrupt the
 /// document if used as-is.
+///
+/// Returns `None` when the requested field's value doesn't pass
+/// [`is_safe_maven_coordinate_segment`] — a malicious/compromised search result must not
+/// reach the manifest as an unsanitized `TextEdit`, so the item is dropped rather than
+/// built with unsafe text.
 fn build_field_completion(
     artifact: &ArtifactInfo,
     field: MavenNameField,
     replace_range: LspRange,
-) -> CompletionItem {
-    let mut item = deps_core::completion::build_package_completion(artifact, LspRange::default());
-
+) -> Option<CompletionItem> {
     let value = match field {
         MavenNameField::GroupId => artifact.group_id.clone(),
         MavenNameField::ArtifactId => artifact.artifact_id.clone(),
     };
+
+    if !is_safe_maven_coordinate_segment(&value) {
+        return None;
+    }
+
+    let mut item = deps_core::completion::build_package_completion(artifact, LspRange::default());
 
     item.insert_text = Some(value.clone());
     item.filter_text = Some(value.clone());
@@ -59,7 +68,7 @@ fn build_field_completion(
         new_text: value,
     }));
 
-    item
+    Some(item)
 }
 
 /// Builds completion items for one field of a Maven coordinate, deduped by that field's value.
@@ -83,7 +92,7 @@ fn build_deduped_field_completions(
             };
             seen.insert(value.clone())
         })
-        .map(|artifact| build_field_completion(artifact, field, replace_range))
+        .filter_map(|artifact| build_field_completion(artifact, field, replace_range))
         .collect()
 }
 
@@ -617,7 +626,7 @@ mod tests {
     fn test_build_field_completion_artifact_id() {
         let artifact = test_artifact();
         let range = test_range();
-        let item = build_field_completion(&artifact, MavenNameField::ArtifactId, range);
+        let item = build_field_completion(&artifact, MavenNameField::ArtifactId, range).unwrap();
 
         assert_eq!(item.insert_text, Some("commons-lang3".to_string()));
         assert_eq!(item.filter_text, Some("commons-lang3".to_string()));
@@ -637,7 +646,7 @@ mod tests {
     fn test_build_field_completion_group_id() {
         let artifact = test_artifact();
         let range = test_range();
-        let item = build_field_completion(&artifact, MavenNameField::GroupId, range);
+        let item = build_field_completion(&artifact, MavenNameField::GroupId, range).unwrap();
 
         assert_eq!(item.insert_text, Some("org.apache.commons".to_string()));
         assert_eq!(item.filter_text, Some("org.apache.commons".to_string()));
@@ -649,6 +658,52 @@ mod tests {
                 new_text: "org.apache.commons".to_string(),
             }))
         );
+    }
+
+    #[test]
+    fn test_build_field_completion_rejects_xml_breakout_artifact_id() {
+        let mut artifact = test_artifact();
+        artifact.artifact_id = "commons</artifactId><parent><groupId>evil".to_string();
+        let range = test_range();
+
+        assert!(build_field_completion(&artifact, MavenNameField::ArtifactId, range).is_none());
+    }
+
+    #[test]
+    fn test_build_field_completion_rejects_control_character_group_id() {
+        let mut artifact = test_artifact();
+        artifact.group_id = "org.apache\ncommons".to_string();
+        let range = test_range();
+
+        assert!(build_field_completion(&artifact, MavenNameField::GroupId, range).is_none());
+    }
+
+    #[test]
+    fn test_build_deduped_field_completions_drops_unsafe_results() {
+        let results = vec![
+            ArtifactInfo {
+                group_id: "org.apache.commons".to_string(),
+                artifact_id: "commons-lang3".to_string(),
+                name: "org.apache.commons:commons-lang3".to_string().into(),
+                description: None,
+                latest_version: "3.14.0".to_string(),
+                repository: None,
+            },
+            ArtifactInfo {
+                group_id: "org.evil</groupId><parent>".to_string(),
+                artifact_id: "payload".to_string(),
+                name: "org.evil:payload".to_string().into(),
+                description: None,
+                latest_version: "1.0.0".to_string(),
+                repository: None,
+            },
+        ];
+
+        let items =
+            build_deduped_field_completions(&results, MavenNameField::GroupId, test_range());
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].insert_text, Some("org.apache.commons".to_string()));
     }
 
     #[test]
