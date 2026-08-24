@@ -234,6 +234,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
+            version_literal: Some(ver_str.to_string()),
             url: url_str.to_string(),
             source: DependencySource::Registry,
         });
@@ -267,6 +268,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
+            version_literal: Some(ver_str.to_string()),
             url: url_str.to_string(),
             source: DependencySource::Registry,
         });
@@ -297,6 +299,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
+            version_literal: Some(ver_str.to_string()),
             url: url_str.to_string(),
             source: DependencySource::Registry,
         });
@@ -329,6 +332,13 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
+            // Deliberately `None`, unlike every other registry form: `version_range` spans
+            // only the lower bound of a two-literal range, so reporting it as the literal
+            // would let the guard pass and the edit rewrite the lower bound alone,
+            // inverting the range (e.g. `"1.0.0"..<"2.0.0"` -> `"3.5.0"..<"2.0.0"`) — SwiftPM
+            // traps on `lowerBound > upperBound`, corrupting the whole manifest (#367 C1).
+            // `None` keeps this form fail-closed, matching pre-fix behavior.
+            version_literal: None,
             url: url_str.to_string(),
             source: DependencySource::Registry,
         });
@@ -361,6 +371,10 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(lower.start(), lower.end())),
+            // See the half-open range form above (#367 C1): `version_range` spans only
+            // the lower bound, so reporting it as the literal would let the guard rewrite
+            // the lower bound alone and invert the range.
+            version_literal: None,
             url: url_str.to_string(),
             source: DependencySource::Registry,
         });
@@ -391,6 +405,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             name_range: make_range(url.start(), url.end()),
             version_req: Some(version_req.into()),
             version_range: Some(make_range(ver.start(), ver.end())),
+            version_literal: Some(ver_str.to_string()),
             url: url_str.to_string(),
             source: DependencySource::Registry,
         });
@@ -416,6 +431,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             name_range: make_range(url.start(), url.end()),
             version_req: None,
             version_range: None,
+            version_literal: None,
             url: url_str.to_string(),
             source: DependencySource::Git {
                 url: url_str.to_string(),
@@ -444,6 +460,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             name_range: make_range(url.start(), url.end()),
             version_req: None,
             version_range: None,
+            version_literal: None,
             url: url_str.to_string(),
             source: DependencySource::Git {
                 url: url_str.to_string(),
@@ -473,6 +490,7 @@ pub fn parse_package_swift(content: &str, uri: &Uri) -> Result<SwiftParseResult>
             name_range: make_range(path.start(), path.end()),
             version_req: None,
             version_range: None,
+            version_literal: None,
             url: String::new(),
             source: DependencySource::Path {
                 path: path_str.to_string(),
@@ -911,5 +929,113 @@ let package = Package(
         let content = r#".package(path: "../MyLib")"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
         assert!(result.dependencies[0].version_range().is_none());
+    }
+
+    // --- version_literal / literal-span guard (#367) ---
+
+    /// Slices `content` over a single-line LSP `Range` — mirrors
+    /// `deps_core::lsp_helpers`'s private `slice_for_range`, reimplemented here since
+    /// that helper isn't public. Every fixture below is single-line ASCII, so character
+    /// offsets equal byte offsets.
+    fn slice(content: &str, range: Range) -> &str {
+        assert_eq!(
+            range.start.line, range.end.line,
+            "fixture must be single-line"
+        );
+        let line = content.lines().nth(range.start.line as usize).unwrap();
+        &line[range.start.character as usize..range.end.character as usize]
+    }
+
+    /// Regression for #367: `deps-swift`'s registry-form dependencies all synthesize a
+    /// `version_req` comparator string that never equals the bare literal `version_range`
+    /// spans (e.g. `.exact("4.50.0")` -> requirement `"=4.50.0"`, range `"4.50.0"`). The
+    /// literal-span guard in `generate_code_actions`/`collect_update_all_edits` must
+    /// instead compare against `version_literal()`, which this test proves equals exactly
+    /// what `version_range()` slices to, for every **single-literal** registry-form
+    /// syntax (`.upToNextMajor`, `.upToNextMinor`, `.exact`, `from:`). The two-literal
+    /// range forms (`..<`/`...`) are deliberately excluded — see
+    /// `test_version_literal_is_none_for_range_forms` below (#367 C1).
+    #[test]
+    fn test_version_literal_matches_version_range_slice_for_every_registry_syntax() {
+        let cases: &[(&str, &str)] = &[
+            (
+                r#".package(url: "https://github.com/apple/swift-log", .upToNextMajor(from: "1.5.0"))"#,
+                "1.5.0",
+            ),
+            (
+                r#".package(url: "https://github.com/apple/swift-metrics", .upToNextMinor(from: "2.3.0"))"#,
+                "2.3.0",
+            ),
+            (
+                r#".package(url: "https://github.com/apple/swift-crypto", .exact("3.0.0"))"#,
+                "3.0.0",
+            ),
+            (
+                r#".package(url: "https://github.com/apple/swift-nio.git", from: "2.40.0")"#,
+                "2.40.0",
+            ),
+        ];
+
+        for (content, expected_literal) in cases {
+            let result = parse_package_swift(content, &test_uri()).unwrap();
+            assert_eq!(result.dependencies.len(), 1, "fixture: {content}");
+            let dep = &result.dependencies[0];
+
+            assert_eq!(
+                dep.version_literal(),
+                Some(*expected_literal),
+                "fixture: {content}"
+            );
+
+            let version_range = dep
+                .version_range()
+                .expect("registry dep has a version_range");
+            let slice = slice(content, version_range);
+            assert_eq!(
+                slice,
+                dep.version_literal().unwrap(),
+                "version_range must slice to exactly version_literal: {content}"
+            );
+            assert_ne!(
+                slice,
+                dep.version_requirement().unwrap().as_str(),
+                "the synthesized version_req must diverge from the bare literal, or this \
+                 fixture no longer exercises the bug #367 fixed: {content}"
+            );
+        }
+    }
+
+    /// Regression for #367 critic finding C1: `version_range` for a `..<`/`...` range
+    /// dependency spans only the *lower* bound literal — reporting that as
+    /// `version_literal` would let the literal-span guard pass and rewrite the lower
+    /// bound alone, inverting the range (e.g. `"1.0.0"..<"2.0.0"` ->
+    /// `"3.5.0"..<"2.0.0"`), which traps SwiftPM. `version_literal` must stay `None` for
+    /// both range forms so the guard keeps failing closed, exactly as it did before
+    /// `version_literal` existed.
+    #[test]
+    fn test_version_literal_is_none_for_range_forms() {
+        for content in [
+            r#".package(url: "https://github.com/foo/bar", "1.0.0"..<"2.0.0")"#,
+            r#".package(url: "https://github.com/baz/qux", "1.0.0"..."1.9.9")"#,
+        ] {
+            let result = parse_package_swift(content, &test_uri()).unwrap();
+            let dep = &result.dependencies[0];
+            assert_eq!(dep.version_literal(), None, "{content}");
+            // Still a registry dep with a version_range to (safely) decline to edit.
+            assert!(dep.version_range().is_some(), "{content}");
+            assert!(dep.version_requirement().is_some(), "{content}");
+        }
+    }
+
+    #[test]
+    fn test_version_literal_absent_for_branch_revision_path_deps() {
+        for content in [
+            r#".package(url: "https://github.com/dev/tool", .branch("main"))"#,
+            r#".package(url: "https://github.com/dev/debug", .revision("abc123"))"#,
+            r#".package(path: "../MyLib")"#,
+        ] {
+            let result = parse_package_swift(content, &test_uri()).unwrap();
+            assert_eq!(result.dependencies[0].version_literal(), None, "{content}");
+        }
     }
 }

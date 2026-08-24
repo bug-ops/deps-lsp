@@ -21,12 +21,12 @@ impl RequirementMatcher for SemverMatcher {
 use crate::types::SwiftDependency;
 
 /// Returns `true` if `name` matches the `owner/repo` GitHub identifier pattern.
+///
+/// Delegates to [`crate::is_valid_github_identity`], shared with `registry`'s
+/// credential-bearing fetch-URL gate, so a `.`/`..` segment is rejected here too (#357 M1) —
+/// otherwise this display-URL gate could still render `https://github.com/apple/..`.
 fn is_valid_owner_repo(name: &str) -> bool {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$").expect("hardcoded regex is valid")
-    });
-    re.is_match(name)
+    crate::is_valid_github_identity(name)
 }
 
 /// Formatter for Swift/SPM ecosystem LSP responses.
@@ -131,6 +131,18 @@ mod tests {
     }
 
     #[test]
+    fn test_package_url_rejects_dot_segment() {
+        // Regression for #357 M1: `is_valid_owner_repo` now shares
+        // `crate::is_valid_github_identity` with `registry::validate_owner_repo`, so a
+        // `..`/`.` repo or owner segment is rejected here too, not just on the
+        // credential-bearing fetch path.
+        let fmt = SwiftFormatter;
+        assert_eq!(fmt.package_url(&PackageName::new("apple/..")), "");
+        assert_eq!(fmt.package_url(&PackageName::new("apple/.")), "");
+        assert_eq!(fmt.package_url(&PackageName::new("../repo")), "");
+    }
+
+    #[test]
     fn test_normalize_package_name() {
         let fmt = SwiftFormatter;
         assert_eq!(
@@ -203,6 +215,7 @@ mod tests {
             name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
             version_req: Some(">=1.0.0".into()),
             version_range: None,
+            version_literal: None,
             url: url.to_string(),
             source: DependencySource::Registry,
         }

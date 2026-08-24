@@ -21,12 +21,14 @@ use super::{
 ///   `generate_diagnostics_from_cache` "Newer version available" diagnostics;
 /// - the **literal-span guard** (`literal_span_matches`): `content` sliced over
 ///   `version_range` must still be (up to whitespace and NuGet's bracket wrap) the
-///   declared requirement text. Several ecosystems point `version_range` at something
-///   that is not a version literal — a Maven `${property}` reference, a Gradle DSL
-///   variable or version-catalog alias, or (for every Swift dependency form) the
-///   lower-bound literal of a synthesized comparator range — and rewriting those spans
-///   would corrupt the manifest instead of fixing it. A dependency that fails the guard
-///   is skipped entirely: neither counted nor edited.
+///   literal text — [`Dependency::version_literal`](crate::Dependency::version_literal)
+///   when the ecosystem provides one (e.g. `deps-swift`, whose synthesized comparator
+///   requirement string diverges from the bare literal `version_range` spans), falling
+///   back to the declared requirement text otherwise. Some ecosystems point
+///   `version_range` at something that is not a version literal at all — a Maven
+///   `${property}` reference or a Gradle DSL variable/version-catalog alias — and
+///   rewriting those spans would corrupt the manifest instead of fixing it. A dependency
+///   that fails the guard is skipped entirely: neither counted nor edited.
 ///
 /// Accepted edits are sorted by start position; a later edit whose start falls before the
 /// previous edit's end (an overlap — a `WorkspaceEdit` protocol violation) is dropped with
@@ -160,7 +162,10 @@ pub fn collect_update_all_edits(
         }
 
         let slice = slice_for_range(content, &line_offsets, version_range);
-        if !literal_span_matches(slice, version_req.as_str()) {
+        let literal_target = dep
+            .version_literal()
+            .unwrap_or_else(|| version_req.as_str());
+        if !literal_span_matches(slice, literal_target) {
             continue;
         }
 
@@ -172,8 +177,11 @@ pub fn collect_update_all_edits(
         // destructive or misleading edit) and return it unchanged. Without this
         // check, such a dependency would still count toward — and appear fixed
         // by — the "Update N outdated dependencies" lens while its click applies
-        // nothing.
-        if strip_whitespace(&new_text) == strip_whitespace(version_req.as_str()) {
+        // nothing. Compares against `literal_target` (not `version_req`) for the same
+        // reason the literal-span guard above does: for `deps-swift`, `version_req` is a
+        // synthesized comparator that never equals the bare-literal formatted text even
+        // when the edit genuinely is a no-op.
+        if strip_whitespace(&new_text) == strip_whitespace(literal_target) {
             continue;
         }
 

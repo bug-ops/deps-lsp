@@ -675,7 +675,12 @@ mod tests {
 
         #[cfg(feature = "swift")]
         #[tokio::test]
-        async fn test_swift_from_form_is_skipped() {
+        async fn test_swift_from_form_is_edited() {
+            // Regression for #367: `version_literal` now lets the literal-span guard
+            // match a Swift dependency's synthesized comparator requirement against the
+            // bare literal `version_range` spans, so this case — previously always
+            // skipped regardless of ecosystem-independent test naming — now produces an
+            // edit like every other registry-form dependency.
             let state = ServerState::new();
             let ecosystem = state.ecosystem_registry.get("swift").unwrap();
             let uri = deps_core::test_util::test_uri("/test/Package.swift");
@@ -692,7 +697,40 @@ let package = Package(
                 PackageVersions::latest_only("3.0.0"),
             );
 
-            assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
+            assert_single_edit_produces_valid_declaration(
+                ecosystem.as_ref(),
+                &uri,
+                content,
+                cached,
+                "3.0.0",
+            )
+            .await;
+        }
+
+        #[cfg(feature = "swift")]
+        #[tokio::test]
+        async fn test_swift_range_forms_are_still_skipped() {
+            // Regression for #367 critic finding C1: `version_range` for a `..<`/`...`
+            // dependency spans only the lower-bound literal. If the guard were fooled
+            // into accepting that as `version_literal`, the edit would rewrite the lower
+            // bound alone and invert the range — SwiftPM traps on `lowerBound >
+            // upperBound`. `version_literal` stays `None` for both range forms, so this
+            // must keep producing zero edits, matching the pre-#367-fix behavior for
+            // every other unsupported-literal case (Maven `${property}`, Gradle DSL var).
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("swift").unwrap();
+            let uri = deps_core::test_util::test_uri("/test/Package.swift");
+
+            for content in [
+                r#".package(url: "https://github.com/foo/bar", "1.0.0"..<"2.0.0")"#,
+                r#".package(url: "https://github.com/baz/qux", "1.0.0"..."1.9.9")"#,
+            ] {
+                let mut cached = HashMap::new();
+                cached.insert("foo/bar".into(), PackageVersions::latest_only("3.5.0"));
+                cached.insert("baz/qux".into(), PackageVersions::latest_only("3.5.0"));
+
+                assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
+            }
         }
     }
 }

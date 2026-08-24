@@ -17,7 +17,7 @@ deps-lsp provides comprehensive LSP support for 12 package ecosystems:
 | **Maven** | Java | `pom.xml` | `maven-metadata.xml` (CDN) | Hover with corrected version ordering (numeric segments outrank qualifiers, prereleases sort below base release), inlay hints, completion, code actions, diagnostics, code lens (property-versioned dependencies not covered — see below) |
 | **Gradle** | Kotlin/Groovy | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | — | Hover with corrected version ordering (same as Maven), inlay hints, completion, code actions, diagnostics, code lens (variable/catalog-versioned dependencies not covered — see below), variable resolution (`gradle.properties`) |
 | **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
-| **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, GitHub API support (code lens not covered — see below) |
+| **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, code lens (range-form dependencies not covered — see below), GitHub API support |
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling |
 | **Deno** | JSR/npm | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
 
@@ -160,20 +160,29 @@ ecosystems point the tracked span at something else instead:
 
 - **`pom.xml`** dependencies versioned through a `<properties>` placeholder (`<version>${my.version}</version>`) are skipped — the span covers the placeholder, not a literal.
 - **Gradle** dependencies versioned through a DSL variable (`"...:$myVersion"`, resolved from `gradle.properties`) or a `libs.versions.toml` version-catalog alias (`version.ref = "spring"`) are skipped for the same reason.
-- **`Package.swift`** dependencies are always skipped, for every declaration form (`from:`, `.upToNextMajor`, `.exact`, a `..<`/`...` range, `.branch`, `.revision`) — the tracked span is only ever the lower-bound literal of a synthesized comparator range, never the full requirement.
+- **`Package.swift`** dependencies declared with a two-literal range (`"1.0.0"..<"2.0.0"` or `"1.0.0"..."1.9.9"`) are skipped — the tracked span covers only the range's lower-bound literal, and rewriting that literal alone would invert the range (SwiftPM traps on `lowerBound > upperBound`, corrupting the whole manifest) rather than leave a merely-stale-but-valid declaration.
 
 For these, no lens appears even when the dependency is genuinely outdated — this is the
 correct, conservative behavior (silently declining to edit is far better than corrupting a
-build file), not a bug.
+build file), not a bug. The per-line "Update to latest version" code action shares the exact
+same guard, so it declines the same way rather than corrupting these declarations.
 
-> [!WARNING]
-> The per-line "Update to latest version" code action does **not** have this guard yet —
-> for these same declarations, it currently applies the edit anyway, which corrupts the
-> property reference, DSL variable, catalog alias, or Swift comparator range it targets.
-> Until that is fixed, edit these specific declarations by hand rather than through the
-> code action. Lifting the restriction requires moving the same check into each
-> affected parser, which fixes both surfaces at once and is tracked as a follow-up, out
-> of scope for the initial CodeLens implementation.
+`Package.swift`'s other declaration forms (`from:`, `.upToNextMajor`, `.upToNextMinor`,
+`.exact`) were affected by this same guard through #367: each synthesizes a comparator
+requirement (e.g. `.exact("4.50.0")` -> `=4.50.0`) that never textually matched the bare
+version literal the tracked span actually points at, so the guard rejected every one of
+them and both the lens and the code action silently did nothing. Fixed by having
+`deps-swift` additionally report the bare literal (`Dependency::version_literal()`) the
+guard should compare against; these four forms now get a lens and code actions like any
+other registry-form dependency (`.branch`/`.revision`/`.package(path:)` dependencies still
+have no version to update, same as any other ecosystem's git/path dependency, and the two
+range forms above remain guard-skipped by design).
+
+Only the six documented `.package(...)` spellings above are parsed at all — a handful of
+other valid SwiftPM argument-label combinations (`.package(url:exact:)`, `.package(url:
+branch:)`/`(url:revision:)`, `.package(id:...)`, the legacy `.package(name:url:...)`, or any
+of the above with a trailing comma) currently parse to zero dependencies rather than a
+skipped one; extending parser coverage to them is tracked separately, out of scope here.
 
 **Known divergence from inlay hints (accepted, documented).** Inlay hints use a
 lock-file-aware "outdated" check (resolved version vs. latest), while the lens and

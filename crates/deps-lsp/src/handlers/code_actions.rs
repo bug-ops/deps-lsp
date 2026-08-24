@@ -644,4 +644,104 @@ serde = "1.0.0"
             // Test passes if no panic occurs
         }
     }
+
+    // Swift-specific tests
+    #[cfg(feature = "swift")]
+    mod swift_tests {
+        use super::*;
+        use crate::document::DocumentState;
+
+        #[tokio::test]
+        async fn test_handle_code_actions_exact_form_produces_vulnerability_fix() {
+            // Regression for #367, real end-to-end (`handle_code_actions` ->
+            // `SwiftEcosystem::generate_code_actions` -> the shared
+            // `deps_core::lsp_helpers::generate_code_actions`), not just the synthetic
+            // `CaLiteralDep` fixture `deps-core`'s own tests use. Reproduces the exact
+            // issue scenario: `.package(url: ..., .exact("4.50.0"))`. Uses OSV
+            // vulnerability data (registry-independent per FR-007) rather than a live
+            // registry fetch, so the assertion is deterministic and network-free —
+            // `context.only: [QUICKFIX]` additionally drops any REFACTOR items a live
+            // fetch might otherwise have produced.
+            use deps_core::osv::{
+                Advisory, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+                VulnerabilityMap,
+            };
+            use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
+
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Package.swift");
+
+            let ecosystem = state.ecosystem_registry.get("swift").unwrap();
+            let content =
+                r#".package(url: "https://github.com/vapor/vapor", .exact("4.50.0"))"#.to_string();
+            let version_col = content.find("4.50.0").unwrap() as u32;
+
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Swift, content, parse_result);
+
+            // Keyed by `SwiftFormatter::normalize_package_name` (lowercased `owner/repo`),
+            // the lookup `build_vulnerability_fix_action` actually uses — not
+            // `osv_package_name`'s `github.com/{owner}/{repo}` (a distinct mapping, used
+            // only for the wire request OSV itself receives).
+            let mut vulnerabilities = VulnerabilityMap::new();
+            vulnerabilities.insert(
+                "vapor/vapor".to_string(),
+                ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                    advisories: vec![Arc::new(Advisory {
+                        id: "GHSA-test-0001".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["4.50.1".to_string()],
+                        url: String::new(),
+                    })],
+                    total_known: 1,
+                    upgrade_status: UpgradeStatus::NotChecked,
+                }),
+            );
+            doc_state.vulnerabilities = vulnerabilities;
+            state.update_document(uri.clone(), doc_state);
+
+            let params = CodeActionParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range::new(
+                    Position::new(0, version_col),
+                    Position::new(0, version_col + "4.50.0".len() as u32),
+                ),
+                context: CodeActionContext {
+                    diagnostics: vec![Diagnostic {
+                        source: Some("deps-lsp".to_string()),
+                        code: Some(NumberOrString::String("GHSA-test-0001".to_string())),
+                        ..Default::default()
+                    }],
+                    only: Some(vec![CodeActionKind::QUICKFIX]),
+                    ..Default::default()
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+
+            let (client, config) = create_test_client_and_config();
+            let result = handle_code_actions(state, params, client, config).await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "the literal-span guard must accept the .exact(...) form and produce the \
+                 vulnerability-fix quickfix, the exact bug #367 reported: {result:?}"
+            );
+            let CodeActionOrCommand::CodeAction(action) = &result[0] else {
+                panic!("expected a CodeAction, got {:?}", result[0]);
+            };
+            assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+            assert!(action.title.starts_with("Update to 4.50.1"));
+        }
+    }
 }
