@@ -244,9 +244,13 @@ deliberately conservative:
 - **Suppressed for requirement forms naming a version outside the fetched candidate list by
   construction**, not just failing to match one present in it — Go pseudo-versions and
   `dev-*`/`*-dev`/`@dev` Composer branches (never enumerable from the registry list at all),
-  RubyGems exact pins (yanked versions are omitted from the list with no flag to detect
-  them by), and Maven/Gradle `-SNAPSHOT`/`LATEST`/`RELEASE` (resolved via a different
-  repository/side channel this registry never queries).
+  and Maven/Gradle `-SNAPSHOT`/`LATEST`/`RELEASE` (resolved via a different repository/side
+  channel this registry never queries).
+- **RubyGems exact pins are suppressed only when the pin does not exceed the highest
+  published version.** RubyGems' `versions.json` omits yanked versions from the list with no
+  flag to detect them, so a pin that could plausibly name a hidden yanked version is not
+  flagged. A pin above every published version — a mistyped or genuinely unpublished version,
+  e.g. `gem "foo", "99.0.0"` when `foo` tops out at `2.0` — is still flagged as unsatisfiable.
 - Each ecosystem opts in by implementing a precise per-version-format comparator (the same
   crate its registry client already depends on: `semver` for Cargo/Swift, `node-semver` for
   npm, `pep440_rs` for PyPI, bracket-interval range parsers for Maven/Gradle/NuGet, and
