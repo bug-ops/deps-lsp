@@ -454,6 +454,13 @@ impl deps_core::Registry for GoRegistry {
         // above (the `/@latest` fast path isn't reachable here: this method is a pure,
         // no-I/O pick over an already-fetched list). `req` is ignored, matching that
         // fallback — Go module requirements are exact pins/MVS, not ranges.
+        //
+        // Go deliberately opts out of the shared existence-check ladder
+        // (`deps_core::select_latest_for_existence`, see #364): Go has no real per-version
+        // retraction (`retracted` is hardcoded `false`, see `reports_yanked` below), so the
+        // ladder's rung 3 would return `Some(0)` unconditionally on an all-prerelease `/@v/
+        // list` and short-circuit the `/@latest` fallback in `lifecycle.rs`, which resolves
+        // pseudo-versions `/@v/list` never enumerates.
         versions
             .iter()
             .position(|v| !v.is_prerelease() && !v.removal_status().blocks_resolution())
@@ -867,5 +874,41 @@ mod tests {
         ];
         let req = VersionReq::new("*");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    /// #364 regression guard: Go deliberately does NOT adopt the shared existence-check
+    /// ladder's rung 3 (`deps_core::select_latest_for_existence`'s unconditional "newest
+    /// overall" fallback). A non-empty but all-pseudo-version `/@v/list` (every entry
+    /// `is_prerelease()`) must still yield `None` here so the fetch loop's `/@latest`
+    /// fallback in `lifecycle.rs` keeps firing — adopting rung 3 would return `Some(0)`
+    /// unconditionally and short-circuit that fallback, silently returning a pseudo-version
+    /// instead of resolving through the more complete `/@latest` endpoint.
+    #[test]
+    fn test_select_latest_matching_all_prerelease_stays_none_go_opts_out_of_ladder() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = GoRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(GoVersion {
+                version: "v0.0.0-20191109021931-daa7c04131f5".to_string(),
+                published_at: None,
+                is_pseudo: true,
+                retracted: false,
+            }),
+            Box::new(GoVersion {
+                version: "v1.0.0-beta.1".to_string(),
+                published_at: None,
+                is_pseudo: false,
+                retracted: false,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req),
+            None,
+            "Go must not fall through to rung 3; a non-empty all-prerelease list must \
+             still yield None so the /@latest fallback fires"
+        );
     }
 }

@@ -1289,6 +1289,61 @@ mod tests {
         );
     }
 
+    /// #364 rung 3: an *all-yanked* package (Cargo/PyPI/Dart-shaped —
+    /// `RemovalStatus::Yanked` blocks resolution, unlike npm's `AdvisoryDeprecated`) must
+    /// still resolve a "latest" via [`crate::select_latest_for_existence`]'s unconditional
+    /// last rung, instead of hover rendering no `**Latest**` line at all (the pre-#364
+    /// `None` behavior that read as a false "Unknown package").
+    #[tokio::test]
+    async fn test_generate_hover_latest_resolves_when_all_versions_yanked() {
+        use std::collections::HashMap;
+
+        let now = PublishTime::now();
+        let registry = MockRegistryPreferringUnflagged {
+            versions: vec![
+                MockVersionWithStatus {
+                    version: "2.0.0".to_string(),
+                    status: RemovalStatus::Yanked,
+                },
+                MockVersionWithStatus {
+                    version: "1.9.0".to_string(),
+                    status: RemovalStatus::Yanked,
+                },
+            ],
+        };
+
+        let parse_result = freshness_test_parse_result("pkg");
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Latest**: `2.0.0`"),
+            "an all-yanked package still exists: hover must resolve the newest yanked \
+             version as latest rather than showing no Latest line, got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("- `2.0.0` *(latest)* *(yanked)*"),
+            "the resolved latest must keep its yanked label, got: {}",
+            content.value
+        );
+    }
+
     #[tokio::test]
     async fn test_generate_hover_surfaces_markers() {
         use std::collections::HashMap;

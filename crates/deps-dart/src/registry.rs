@@ -302,6 +302,9 @@ impl deps_core::Registry for PubDevRegistry {
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
+        if deps_core::is_existence_wildcard(req) {
+            return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
+        }
         versions.iter().position(|v| {
             crate::version::version_matches_constraint(v.version_string(), req.as_str())
                 && !v.removal_status().blocks_resolution()
@@ -677,5 +680,49 @@ mod tests {
         ];
         let req = VersionReq::new("*");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    #[test]
+    fn test_select_latest_matching_all_retracted_returns_newest_retracted() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PubDevRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(DartVersion {
+                version: "2.0.0".into(),
+                retracted: true,
+                published_at: None,
+            }),
+            Box::new(DartVersion {
+                version: "1.0.0".into(),
+                retracted: true,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    #[test]
+    fn test_select_latest_matching_all_prerelease_returns_newest_prerelease() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PubDevRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(DartVersion {
+                version: "2.0.0-beta.1".into(),
+                retracted: false,
+                published_at: None,
+            }),
+            Box::new(DartVersion {
+                version: "1.0.0-alpha.1".into(),
+                retracted: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
     }
 }

@@ -321,11 +321,12 @@ impl deps_core::Registry for PypiRegistry {
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
-        // PEP 440 uses empty string for "any version"; mirrors the inherent
-        // `get_latest_matching` above.
-        let req_str = req.as_str();
-        let normalized_req = if req_str == "*" { "" } else { req_str };
-        let specs = VersionSpecifiers::from_str(normalized_req).ok()?;
+        if deps_core::is_existence_wildcard(req) {
+            return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
+        }
+        // The wildcard gate above already consumed `""`/`"*"`, so `req_str` here is always a
+        // concrete PEP 440 specifier — no "any version" normalization needed.
+        let specs = VersionSpecifiers::from_str(req.as_str()).ok()?;
 
         versions.iter().position(|v| {
             // Parsed directly via `pep440_rs` rather than the trait's default
@@ -1242,5 +1243,49 @@ mod tests {
         ];
         let req = VersionReq::new("*");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    #[test]
+    fn test_select_latest_matching_all_yanked_returns_newest_yanked() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PypiRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(PypiVersion {
+                version: "2.0.0".into(),
+                yanked: true,
+                published_at: None,
+            }),
+            Box::new(PypiVersion {
+                version: "1.0.0".into(),
+                yanked: true,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    #[test]
+    fn test_select_latest_matching_all_prerelease_returns_newest_prerelease() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PypiRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(PypiVersion {
+                version: "2.0.0rc1".into(),
+                yanked: false,
+                published_at: None,
+            }),
+            Box::new(PypiVersion {
+                version: "1.0.0rc1".into(),
+                yanked: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
     }
 }

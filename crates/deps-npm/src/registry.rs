@@ -415,25 +415,14 @@ impl NpmRegistry {
     ) -> Result<Option<NpmVersion>> {
         let versions = self.get_versions(name).await?;
 
-        if req_str.is_empty() || req_str == "*" {
-            if versions.is_empty() {
-                return Ok(None);
-            }
-            use deps_core::Version as _;
+        if deps_core::is_existence_wildcard_str(req_str) {
             // Rung 1 deliberately does not use the generic `is_stable()` (which now also
             // accepts `AdvisoryDeprecated`, #347/#348): npm's own #338 NFR-002 wants a
             // non-deprecated version preferred over a deprecated one whenever both exist,
             // which is a ranking preference, not a resolvability question.
-            let idx = versions
-                .iter()
-                .position(|v| !v.removal_status().is_flagged() && !v.is_prerelease())
-                .or_else(|| {
-                    versions
-                        .iter()
-                        .position(|v| !v.removal_status().blocks_resolution())
-                })
-                .unwrap_or(0);
-            return Ok(versions.into_iter().nth(idx));
+            let idx =
+                deps_core::select_latest_for_existence(&versions, |v| v as &dyn deps_core::Version);
+            return Ok(idx.and_then(|idx| versions.into_iter().nth(idx)));
         }
 
         // Parse npm semver requirement
@@ -711,11 +700,7 @@ impl deps_core::Registry for NpmRegistry {
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
-        let req_str = req.as_str();
-        if req_str.is_empty() || req_str == "*" {
-            if versions.is_empty() {
-                return None;
-            }
+        if deps_core::is_existence_wildcard(req) {
             // Existence/latest-for-display resolution (#338): prefer the newest
             // non-flagged, non-prerelease version. Rung 2 (`!blocks_resolution()`) is where
             // this ladder actually lands when rung 1 finds nothing: npm never produces
@@ -725,30 +710,14 @@ impl deps_core::Registry for NpmRegistry {
             // practice this means: prefer the newest clean stable release; otherwise fall
             // straight through to the newest release overall — deprecated, a prerelease, or
             // both — rather than reporting "no version found" for a package that genuinely
-            // exists (#338 NFR-001). The trailing `.unwrap_or(0)` is unreachable for that
-            // same reason (rung 2 cannot return `None` once `versions` is non-empty) but is
-            // kept as a defensive fallback rather than an `.unwrap()`.
-            // Rung 1 deliberately does not use the generic `Version::is_stable()`
-            // (which now also accepts `AdvisoryDeprecated`, #347/#348): npm's own
-            // #338 NFR-002 wants a non-deprecated version preferred over a
-            // deprecated one whenever both exist, which is a ranking preference,
-            // not a resolvability question — mirrored by `get_latest_matching`'s
-            // identical wildcard branch above so the two never disagree. Hover
-            // (`deps-core`'s `generate_hover`) resolves "latest" through this exact method
-            // rather than re-deriving it with a different predicate, so hover and this
-            // ranking preference can never disagree either (#347/#348 S1).
-            return Some(
-                versions
-                    .iter()
-                    .position(|v| !v.removal_status().is_flagged() && !v.is_prerelease())
-                    .or_else(|| {
-                        versions
-                            .iter()
-                            .position(|v| !v.removal_status().blocks_resolution())
-                    })
-                    .unwrap_or(0),
-            );
+            // exists (#338 NFR-001). Mirrored by `get_latest_matching`'s identical wildcard
+            // branch above so the two never disagree. Hover (`deps-core`'s `generate_hover`)
+            // resolves "latest" through this exact method rather than re-deriving it with a
+            // different predicate, so hover and this ranking preference can never disagree
+            // either (#347/#348 S1).
+            return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
         }
+        let req_str = req.as_str();
         let parsed_req = node_semver::Range::parse(req_str).ok()?;
         versions.iter().position(|v| {
             node_semver::Version::parse(v.version_string()).is_ok_and(|ver| {
