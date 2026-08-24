@@ -830,6 +830,200 @@ mod tests {
         // Just verify it doesn't panic - actual completion logic is in ecosystem
     }
 
+    /// Issue #227 tester gap: `build_version_completion`'s `label_details`
+    /// present/absent-when-`freshness.enabled`-toggles behavior is already unit-tested
+    /// directly in `deps_core::completion` — this test covers the piece that isn't: that
+    /// `handle_completion` (`completion.rs:47`) re-reads `config.freshness` on *every*
+    /// call, so a `workspace/didChangeConfiguration`-driven config update (simulated here
+    /// by writing directly to the shared `Arc<RwLock<DepsConfig>>`, exactly what
+    /// `Backend::did_change_configuration` does) changes completion's age-suffix presence
+    /// on the very next request, with no server restart and no re-opening the document.
+    #[tokio::test]
+    async fn test_completion_freshness_enabled_live_reload_changes_label_details_on_next_request() {
+        use deps_core::ecosystem::private::Sealed;
+        use deps_core::{
+            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
+        };
+        use std::any::Any;
+        use std::path::Path;
+        use tower_lsp_server::ls_types::{CompletionItemLabelDetails, Uri};
+
+        struct NoopRegistry;
+        impl Registry for NoopRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct NoopFormatter;
+        impl EcosystemFormatter for NoopFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+
+        /// Stands in for a real ecosystem's `generate_completions`, echoing whatever
+        /// `freshness.enabled` it was called with into `label_details` — exactly the
+        /// signal real ecosystems derive from `build_version_completion`, without
+        /// needing a real registry fetch or parsed manifest.
+        struct FreshnessEchoEcosystem;
+        impl Sealed for FreshnessEchoEcosystem {}
+        impl Ecosystem for FreshnessEchoEcosystem {
+            fn id(&self) -> &'static str {
+                "cargo"
+            }
+            fn display_name(&self) -> &'static str {
+                "cargo"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &["Cargo.toml"]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a Uri,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
+            {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn registry(&self) -> Arc<dyn Registry> {
+                Arc::new(NoopRegistry)
+            }
+            fn formatter(&self) -> &dyn EcosystemFormatter {
+                &NoopFormatter
+            }
+            fn generate_completions<'a>(
+                &'a self,
+                _parse_result: &'a dyn ParseResult,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+                Box::pin(async move {
+                    vec![CompletionItem {
+                        label: "1.0.0".to_string(),
+                        kind: Some(CompletionItemKind::VALUE),
+                        label_details: freshness.enabled.then(|| CompletionItemLabelDetails {
+                            detail: Some("  1 hour ago".to_string()),
+                            description: None,
+                        }),
+                        ..Default::default()
+                    }]
+                })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult {
+            uri: Uri,
+        }
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![]
+            }
+            fn workspace_root(&self) -> Option<&Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = Arc::new(ServerState::new());
+        // Overwrites the real Cargo ecosystem for this state instance only.
+        state
+            .ecosystem_registry
+            .register(Arc::new(FreshnessEchoEcosystem));
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+        let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+        let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        state.update_document(uri.clone(), doc);
+
+        let params = || CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position::new(0, 0),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+
+        let (client, config) = create_test_client_and_config();
+        assert!(
+            config.read().await.freshness.enabled,
+            "default config ships freshness enabled"
+        );
+
+        let before = handle_completion(
+            Arc::clone(&state),
+            params(),
+            client.clone(),
+            Arc::clone(&config),
+        )
+        .await
+        .expect("completion response");
+        let CompletionResponse::Array(items) = before else {
+            panic!("expected an array response");
+        };
+        assert!(
+            items[0].label_details.is_some(),
+            "freshness enabled by default: label_details must be present"
+        );
+
+        // Exactly what `Backend::did_change_configuration` does to the stored config —
+        // no document reload, no server restart.
+        config.write().await.freshness.enabled = false;
+
+        let after = handle_completion(state, params(), client, config)
+            .await
+            .expect("completion response");
+        let CompletionResponse::Array(items) = after else {
+            panic!("expected an array response");
+        };
+        assert!(
+            items[0].label_details.is_none(),
+            "freshness disabled via live-reload: label_details must disappear on the very \
+             next completion request"
+        );
+    }
+
     #[test]
     fn test_is_in_toml_dependencies_basic() {
         let content = r#"

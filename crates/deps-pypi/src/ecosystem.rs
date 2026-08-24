@@ -880,6 +880,7 @@ dependencies = []
                 &EmptyOkRegistry,
                 &formatter,
                 deps_core::FreshnessSettings::default(),
+                deps_core::PublishTime::now(),
             )
             .await
             .expect("hover should be produced for a dependency at its name position");
@@ -899,6 +900,7 @@ dependencies = []
                 &formatter,
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
+                deps_core::PublishTime::now(),
             );
             assert!(
                 diagnostics

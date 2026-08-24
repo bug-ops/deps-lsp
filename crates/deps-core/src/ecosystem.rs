@@ -441,6 +441,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 registry.as_ref(),
                 self.formatter(),
                 freshness,
+                crate::freshness::PublishTime::now(),
             )
             .await
         })
@@ -498,6 +499,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 self.formatter(),
                 freshness,
                 severities,
+                crate::freshness::PublishTime::now(),
             )
         })
     }
