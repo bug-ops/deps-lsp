@@ -36,6 +36,12 @@ impl EcosystemFormatter for CargoFormatter {
             .ok()
             .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
+
+    /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins
+    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
+    fn strict_semver_prerelease_exclusion(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -824,6 +824,44 @@ pub trait EcosystemFormatter: Send + Sync {
         false
     }
 
+    /// Whether this ecosystem's requirement/version syntax follows strict SemVer 2.0.0
+    /// pre-release semantics: a pre-release version (`X.Y.Z-pre`) is excluded from matching
+    /// `requirement` unless `requirement` itself pins to the same `X.Y.Z` tuple with a
+    /// pre-release tag — the rule Cargo's `semver` crate and npm's `node-semver` both
+    /// implement, and that `compile_requirement`'s matcher inherits from its underlying
+    /// comparator.
+    ///
+    /// Used by [`requirement_is_unsatisfiable`]'s caller in `generate_diagnostics_from_cache`
+    /// to decide whether the unsatisfiable-requirement WARNING should be enriched with a
+    /// mention of a published pre-release that would satisfy `requirement` if pre-release
+    /// exclusion were relaxed (#299). Maven/NuGet/Composer/Gradle use non-strict,
+    /// ecosystem-specific range models where this premise does not hold — they must not
+    /// override this.
+    ///
+    /// Default `false`. `deps-cargo`, `deps-npm`, and `deps-swift` override this to `true`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    /// use deps_core::PackageName;
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert!(!DefaultFormatter.strict_semver_prerelease_exclusion());
+    /// ```
+    fn strict_semver_prerelease_exclusion(&self) -> bool {
+        false
+    }
+
     /// Get package URL for hover markdown.
     fn package_url(&self, name: &PackageName) -> String;
 
@@ -1990,6 +2028,72 @@ pub fn requirement_is_unsatisfiable(
     saw_decided_false
 }
 
+/// Splits a strict-SemVer version string's stable `X.Y.Z` core from its pre-release
+/// identifier, if `version` carries one — e.g. `"2.0.0-rc.1"` -> `Some("2.0.0")`,
+/// `"2.0.0-rc.1+build.5"` -> `Some("2.0.0")`, `"2.0.0"` -> `None`.
+///
+/// `None` means `version` is already a stable release, not that it failed to parse — this
+/// is a textual SemVer split, not a validating parse. Callers only rely on it for
+/// strict-SemVer ecosystems (see
+/// [`EcosystemFormatter::strict_semver_prerelease_exclusion`]), whose registries only
+/// publish spec-conformant version strings.
+fn semver_prerelease_base(version: &str) -> Option<&str> {
+    let core = version.split('+').next().unwrap_or(version);
+    core.find('-').map(|dash| &core[..dash])
+}
+
+/// Reports whether `requirement` itself already names a pre-release tag — a `-` embedded
+/// directly in a version token (no surrounding whitespace), as opposed to a whitespace-padded
+/// hyphen range operator (npm's `"1.2.3 - 2.3.4"`).
+///
+/// Guards [`matching_prerelease_would_satisfy`] (#299 S1): when the requirement already pins
+/// to a pre-release tuple (e.g. `^2.0.0-rc.5`), a published pre-release that fails to match is
+/// rejected by ordinary version *ordering* against that explicit floor, not by SemVer's
+/// default pre-release exclusion — enriching the message in that case would misattribute the
+/// cause.
+fn requirement_names_prerelease(requirement: &str) -> bool {
+    let bytes = requirement.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'-'
+            && i > 0
+            && i + 1 < bytes.len()
+            && !bytes[i - 1].is_ascii_whitespace()
+            && !bytes[i + 1].is_ascii_whitespace()
+    })
+}
+
+/// For strict-SemVer ecosystems (see
+/// [`EcosystemFormatter::strict_semver_prerelease_exclusion`]), finds the newest published,
+/// non-yanked pre-release in `available` whose stable core would satisfy `requirement` —
+/// evidence that `requirement` reads as unsatisfiable only because SemVer's default comparator
+/// excludes pre-releases, not because no compatible version was ever published (#299).
+///
+/// Returns `None` when the ecosystem hasn't opted in, `requirement` itself already names a
+/// pre-release (see [`requirement_names_prerelease`] — in that shape a non-matching candidate
+/// is rejected by ordering against the requirement's own explicit floor, not by pre-release
+/// exclusion), `requirement` doesn't compile, or no such pre-release exists. `available` is
+/// assumed newest-first (see [`PackageVersions::available`]), so the first match found is the
+/// newest.
+fn matching_prerelease_would_satisfy(
+    formatter: &dyn EcosystemFormatter,
+    requirement: &VersionReq,
+    available: &[String],
+    yanked: &[String],
+) -> Option<String> {
+    if !formatter.strict_semver_prerelease_exclusion() {
+        return None;
+    }
+    if requirement_names_prerelease(requirement.as_str()) {
+        return None;
+    }
+    let matcher = formatter.compile_requirement(requirement)?;
+    available.iter().find_map(|candidate| {
+        let base = semver_prerelease_base(candidate)?;
+        (!yanked.iter().any(|y| y == candidate) && matcher.matches(base) == Some(true))
+            .then(|| candidate.clone())
+    })
+}
+
 /// Returns `true` when `requirement` is satisfied by at least one entry in `available`, but
 /// every matching entry is yanked — i.e. the dependency is currently satisfiable only by a
 /// yanked/deprecated version.
@@ -2193,12 +2297,28 @@ pub fn generate_diagnostics_from_cache(
 
         if unsatisfiable {
             let req_str = dep.version_requirement().map_or("", |r| r.as_str());
+            let mut message = format!(
+                "No published version satisfies requirement '{req_str}'; latest is {latest}"
+            );
+            if let Some(prerelease) = dep.version_requirement().and_then(|version_req| {
+                matching_prerelease_would_satisfy(
+                    formatter,
+                    version_req,
+                    &package_versions.available,
+                    &package_versions.yanked,
+                )
+            }) {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    message,
+                    " (a pre-release, {prerelease}, is excluded by SemVer's default \
+                     pre-release-matching rules; require it explicitly to use it)"
+                );
+            }
             diagnostics.push(Diagnostic {
                 range: version_range,
                 severity: Some(severities.unsatisfiable),
-                message: format!(
-                    "No published version satisfies requirement '{req_str}'; latest is {latest}"
-                ),
+                message,
                 source: Some("deps-lsp".into()),
                 code: Some(NumberOrString::String(UNSATISFIABLE_DIAGNOSTIC_CODE.into())),
                 ..Default::default()
@@ -6992,6 +7112,131 @@ mod tests {
         }
     }
 
+    struct RealSemverMatcher(semver::VersionReq);
+    impl RequirementMatcher for RealSemverMatcher {
+        fn matches(&self, version: &str) -> Option<bool> {
+            version
+                .parse::<semver::Version>()
+                .ok()
+                .map(|v| self.0.matches(&v))
+        }
+    }
+
+    /// Mirrors `deps-cargo`/`deps-swift`'s real formatter shape (`semver::VersionReq`
+    /// compilation, opted into `strict_semver_prerelease_exclusion`) without depending on
+    /// those crates. Shared by `matching_prerelease_would_satisfy_tests` and the
+    /// `generate_diagnostics_from_cache` end-to-end coverage below (#299).
+    struct StrictSemverFormatter;
+    impl EcosystemFormatter for StrictSemverFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.to_string()
+        }
+        fn compile_requirement(
+            &self,
+            requirement: &VersionReq,
+        ) -> Option<Box<dyn RequirementMatcher>> {
+            requirement
+                .as_str()
+                .parse::<semver::VersionReq>()
+                .ok()
+                .map(|req| Box::new(RealSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+        }
+        fn strict_semver_prerelease_exclusion(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_generate_diagnostics_unsatisfiable_enriched_with_matching_prerelease() {
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert(
+                "dep".into(),
+                PackageVersions {
+                    latest: "1.5.0".to_string(),
+                    available: Arc::from(vec![
+                        "2.0.0-rc.1".to_string(),
+                        "1.5.0".to_string(),
+                        "1.4.0".to_string(),
+                    ]),
+                    yanked: Arc::from(Vec::<String>::new()),
+                },
+            );
+            m
+        };
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/Cargo.toml");
+        let mut dependency = dep_at("dep");
+        dependency.version_req = VersionReq::new("^2.0.0");
+        let parse_result = SingleDepParseResult {
+            dep: dependency,
+            uri,
+        };
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &StrictSemverFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+
+        let message = diagnostics
+            .iter()
+            .find(|d| d.message.contains("No published version satisfies"))
+            .map(|d| d.message.as_str())
+            .expect("unsatisfiable WARNING must fire");
+        assert!(
+            message.contains("2.0.0-rc.1") && message.contains("pre-release"),
+            "message must mention the matching pre-release, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_unsatisfiable_no_enrichment_without_matching_prerelease() {
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert(
+                "dep".into(),
+                PackageVersions {
+                    latest: "1.5.0".to_string(),
+                    available: Arc::from(vec!["1.5.0".to_string(), "1.4.0".to_string()]),
+                    yanked: Arc::from(Vec::<String>::new()),
+                },
+            );
+            m
+        };
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/Cargo.toml");
+        let mut dependency = dep_at("dep");
+        dependency.version_req = VersionReq::new("^2.0.0");
+        let parse_result = SingleDepParseResult {
+            dep: dependency,
+            uri,
+        };
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &StrictSemverFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+        );
+
+        let message = diagnostics
+            .iter()
+            .find(|d| d.message.contains("No published version satisfies"))
+            .map(|d| d.message.as_str())
+            .expect("unsatisfiable WARNING must fire");
+        assert!(
+            !message.contains("pre-release"),
+            "message must not mention a pre-release when none satisfies, got: {message}"
+        );
+    }
+
     #[test]
     fn test_generate_diagnostics_unsatisfiable_skipped_for_non_registry_sources() {
         use crate::parser::DependencySource;
@@ -8641,6 +8886,229 @@ mod tests {
                 calls.load(std::sync::atomic::Ordering::SeqCst),
                 1,
                 "must stop scanning at the first Some(true)"
+            );
+        }
+    }
+
+    /// Coverage for `matching_prerelease_would_satisfy` and `semver_prerelease_base` (#299):
+    /// enriching the unsatisfiable-requirement WARNING for strict-SemVer ecosystems with a
+    /// mention of a published pre-release that would satisfy the requirement's stable core.
+    mod matching_prerelease_would_satisfy_tests {
+        use super::*;
+
+        /// Same matcher as `StrictSemverFormatter` (defined in the parent `tests` module and
+        /// shared with the `generate_diagnostics_from_cache` end-to-end coverage), but not
+        /// opted into `strict_semver_prerelease_exclusion` — mirrors Maven/NuGet/Composer/
+        /// Gradle, which must never get the enrichment.
+        struct NonStrictFormatter;
+        impl EcosystemFormatter for NonStrictFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.to_string()
+            }
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                requirement
+                    .as_str()
+                    .parse::<semver::VersionReq>()
+                    .ok()
+                    .map(|req| Box::new(RealSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+            }
+        }
+
+        fn versions(strs: &[&str]) -> Vec<String> {
+            strs.iter().map(|s| (*s).to_string()).collect()
+        }
+
+        #[test]
+        fn test_semver_prerelease_base() {
+            assert_eq!(semver_prerelease_base("2.0.0-rc.1"), Some("2.0.0"));
+            assert_eq!(semver_prerelease_base("2.0.0-rc.1+build.5"), Some("2.0.0"));
+            assert_eq!(semver_prerelease_base("2.0.0"), None);
+            assert_eq!(semver_prerelease_base("2.0.0+build.5"), None);
+        }
+
+        #[test]
+        fn test_requirement_names_prerelease() {
+            assert!(requirement_names_prerelease("2.0.0-rc.5"));
+            assert!(requirement_names_prerelease("^2.0.0-rc.5"));
+            assert!(requirement_names_prerelease("~2.0.0-rc.5"));
+            assert!(requirement_names_prerelease(">=2.0.0-rc.5"));
+            assert!(requirement_names_prerelease("=2.0.0-rc.5"));
+            assert!(!requirement_names_prerelease("^2.0.0"));
+            assert!(!requirement_names_prerelease(">=1.0.0, <2.0.0"));
+            // npm's whitespace-padded hyphen range operator must not be mistaken for an
+            // embedded pre-release tag.
+            assert!(!requirement_names_prerelease("1.2.3 - 2.3.4"));
+        }
+
+        /// (a) No pre-release exists among `available` — no enrichment.
+        #[test]
+        fn test_no_prerelease_available_returns_none() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new("^2.0.0"),
+                    &versions(&["1.5.0", "1.4.0"]),
+                    &[],
+                ),
+                None
+            );
+        }
+
+        /// (b) A pre-release exists that would satisfy the requirement's stable core — the
+        /// scenario from the issue's example (`^2.0.0` vs. published `2.0.0-rc.1`).
+        #[test]
+        fn test_matching_prerelease_is_found() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new("^2.0.0"),
+                    &versions(&["2.0.0-rc.1", "1.5.0"]),
+                    &[],
+                ),
+                Some("2.0.0-rc.1".to_string())
+            );
+        }
+
+        /// The newest matching pre-release wins when several are published (`available` is
+        /// newest-first).
+        #[test]
+        fn test_returns_newest_matching_prerelease_first() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new("^2.0.0"),
+                    &versions(&["2.0.0-rc.2", "2.0.0-rc.1", "1.5.0"]),
+                    &[],
+                ),
+                Some("2.0.0-rc.2".to_string())
+            );
+        }
+
+        /// A published pre-release whose stable core still fails the requirement (wrong
+        /// major version) must not be surfaced.
+        #[test]
+        fn test_non_matching_prerelease_returns_none() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new("^2.0.0"),
+                    &versions(&["3.0.0-rc.1", "1.5.0"]),
+                    &[],
+                ),
+                None
+            );
+        }
+
+        /// (c) The requirement is itself an exact pin to a nonexistent pre-release
+        /// (`=2.0.0-rc.5`) — existing #206 behavior. A published pre-release with a
+        /// different tag must not be surfaced, since the requirement already names a
+        /// pre-release tag (`requirement_names_prerelease` bails before even compiling).
+        #[test]
+        fn test_exact_prerelease_pin_does_not_misfire_on_unrelated_prerelease() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new("=2.0.0-rc.5"),
+                    &versions(&["2.0.0-rc.1", "1.5.0"]),
+                    &[],
+                ),
+                None
+            );
+        }
+
+        /// S1 regression: a `^`-ranged requirement whose floor itself names a pre-release
+        /// tag must not enrich, even though `2.0.0-rc.1`'s stable core (`2.0.0`) would
+        /// satisfy `^2.0.0-rc.5` (verified against real `semver` 1.0.28) — the real reason
+        /// `2.0.0-rc.1` doesn't match is ordering against the requirement's own explicit
+        /// floor (`rc.1 < rc.5`), not SemVer's default pre-release exclusion.
+        #[test]
+        fn test_caret_requirement_naming_prerelease_returns_none() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new("^2.0.0-rc.5"),
+                    &versions(&["2.0.0-rc.1", "1.5.0"]),
+                    &[],
+                ),
+                None
+            );
+        }
+
+        /// S1 regression, `~` shape.
+        #[test]
+        fn test_tilde_requirement_naming_prerelease_returns_none() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new("~2.0.0-rc.5"),
+                    &versions(&["2.0.0-rc.1", "1.5.0"]),
+                    &[],
+                ),
+                None
+            );
+        }
+
+        /// S1 regression, `>=` shape.
+        #[test]
+        fn test_gte_requirement_naming_prerelease_returns_none() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new(">=2.0.0-rc.5"),
+                    &versions(&["2.0.0-rc.1", "1.5.0"]),
+                    &[],
+                ),
+                None
+            );
+        }
+
+        /// M1: a matching pre-release that is itself yanked must not be surfaced — it isn't
+        /// actually usable, so naming it as "would satisfy" would be misleading.
+        #[test]
+        fn test_yanked_matching_prerelease_is_skipped() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new("^2.0.0"),
+                    &versions(&["2.0.0-rc.1", "1.5.0"]),
+                    &versions(&["2.0.0-rc.1"]),
+                ),
+                None
+            );
+        }
+
+        /// M1: a yanked pre-release is skipped in favor of an older, non-yanked matching one.
+        #[test]
+        fn test_yanked_matching_prerelease_falls_back_to_non_yanked() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &StrictSemverFormatter,
+                    &VersionReq::new("^2.0.0"),
+                    &versions(&["2.0.0-rc.2", "2.0.0-rc.1", "1.5.0"]),
+                    &versions(&["2.0.0-rc.2"]),
+                ),
+                Some("2.0.0-rc.1".to_string())
+            );
+        }
+
+        /// Ecosystems that have not opted in (Maven/NuGet/Composer/Gradle) never get the
+        /// enrichment, even against a requirement/available pair that would otherwise match.
+        #[test]
+        fn test_non_opted_in_ecosystem_returns_none() {
+            assert_eq!(
+                matching_prerelease_would_satisfy(
+                    &NonStrictFormatter,
+                    &VersionReq::new("^2.0.0"),
+                    &versions(&["2.0.0-rc.1", "1.5.0"]),
+                    &[],
+                ),
+                None
             );
         }
     }
