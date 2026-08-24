@@ -212,8 +212,8 @@ impl deps_core::Version for DartVersion {
         &self.version
     }
 
-    fn is_yanked(&self) -> bool {
-        self.retracted
+    fn removal_status(&self) -> deps_core::RemovalStatus {
+        deps_core::RemovalStatus::from_yanked(self.retracted)
     }
 
     fn is_prerelease(&self) -> bool {
@@ -304,7 +304,7 @@ impl deps_core::Registry for PubDevRegistry {
     ) -> Option<usize> {
         versions.iter().position(|v| {
             crate::version::version_matches_constraint(v.version_string(), req.as_str())
-                && !v.is_yanked()
+                && !v.removal_status().blocks_resolution()
         })
     }
 
@@ -627,7 +627,7 @@ mod tests {
             published_at: None,
         };
         assert_eq!(ver.version_string(), "1.0.0");
-        assert!(ver.is_yanked());
+        assert!(ver.removal_status().blocks_resolution());
         assert!(ver.features().is_empty());
     }
 

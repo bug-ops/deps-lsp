@@ -188,7 +188,7 @@ impl PypiVersion {
 // causing unbounded recursion; keep the two in sync.
 deps_core::impl_version!(PypiVersion {
     version: version,
-    yanked: yanked,
+    status: |v: &PypiVersion| deps_core::RemovalStatus::from_yanked(v.yanked),
     published_at: published_at,
     prerelease: |v: &PypiVersion| v.is_prerelease(),
 });
@@ -482,7 +482,7 @@ mod tests {
         };
 
         assert_eq!(version.version_string(), "2.28.2");
-        assert!(version.is_yanked());
+        assert!(version.removal_status().blocks_resolution());
     }
 
     #[test]

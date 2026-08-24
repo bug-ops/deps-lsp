@@ -354,7 +354,7 @@ mod tests {
         };
 
         assert_eq!(version.version_string(), "1.2.3");
-        assert!(!version.is_yanked());
+        assert!(!version.removal_status().blocks_resolution());
         assert!(version.features().is_empty());
         assert!(version.as_any().is::<BundlerVersion>());
     }
@@ -371,7 +371,7 @@ mod tests {
             platform: "ruby".into(),
         };
 
-        assert!(version.is_yanked());
+        assert!(version.removal_status().blocks_resolution());
     }
 
     #[test]

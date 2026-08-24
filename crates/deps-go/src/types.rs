@@ -108,8 +108,8 @@ impl deps_core::registry::Version for GoVersion {
         &self.version
     }
 
-    fn is_yanked(&self) -> bool {
-        self.retracted
+    fn removal_status(&self) -> deps_core::RemovalStatus {
+        deps_core::RemovalStatus::from_yanked(self.retracted)
     }
 
     fn published_at(&self) -> Option<deps_core::PublishTime> {
@@ -177,7 +177,7 @@ mod tests {
         };
 
         assert_eq!(version.version_string(), "v1.9.1");
-        assert!(!version.is_yanked());
+        assert!(!version.removal_status().blocks_resolution());
         assert!(!version.is_prerelease());
         assert!(version.is_stable());
         assert_eq!(
@@ -208,7 +208,7 @@ mod tests {
             retracted: true,
         };
 
-        assert!(version.is_yanked());
+        assert!(version.removal_status().blocks_resolution());
         assert!(!version.is_stable());
     }
 

@@ -543,8 +543,8 @@ pub fn generate_diagnostics_from_cache(
         // Same source-resolvability guard as `unsatisfiable` above — only meaningful once a
         // requirement is known to match *something* in `available` (see `requirement_is_unsatisfiable`).
         // `yanked_diagnostic_applies_to` additionally opts an ecosystem out for a requirement
-        // shape where `is_yanked()` is not a genuine per-version signal (npm/Composer restrict
-        // to exact pins — see that method's docs). Skipped entirely when the in-use-version
+        // shape where `removal_status()` is not a genuine per-version signal (npm/Composer
+        // restrict to exact pins — see that method's docs). Skipped entirely when the in-use-version
         // check above already pushed a yanked diagnostic for this dependency (see
         // `yanked_diagnostic_pushed`), so the two checks never double-report.
         let yanked_only = !yanked_diagnostic_pushed
@@ -2637,7 +2637,7 @@ mod tests {
 
     /// Coverage for `requirement_matches_only_yanked` and its wiring into
     /// `generate_diagnostics_from_cache` (issue #247): the cache-only diagnostics path's
-    /// substitute for the network path's `current.is_yanked()` check in `generate_diagnostics`,
+    /// substitute for the network path's `current.removal_status()` check in `generate_diagnostics`,
     /// which never fires against a real registry because `Registry::get_latest_matching`
     /// filters yanked entries out by contract on every current implementation (#233). This
     /// scans `available`/`yanked` directly instead, so it observes yanked entries that

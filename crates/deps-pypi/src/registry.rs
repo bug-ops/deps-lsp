@@ -332,8 +332,9 @@ impl deps_core::Registry for PypiRegistry {
             // `is_prerelease` heuristic (substring match on "-alpha"/"-rc"/...), which
             // does not recognize PyPI's unhyphenated prerelease spellings like
             // "1.0.0rc1" and would silently treat them as stable.
-            Version::from_str(v.version_string())
-                .is_ok_and(|ver| specs.contains(&ver) && !v.is_yanked() && !ver.is_pre())
+            Version::from_str(v.version_string()).is_ok_and(|ver| {
+                specs.contains(&ver) && !v.removal_status().blocks_resolution() && !ver.is_pre()
+            })
         })
     }
 

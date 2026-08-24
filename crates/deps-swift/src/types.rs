@@ -73,7 +73,7 @@ pub struct SwiftVersion {
 // hyphen-substring heuristic (#322).
 deps_core::impl_version!(SwiftVersion {
     version: version,
-    yanked: yanked,
+    status: |v: &SwiftVersion| deps_core::RemovalStatus::from_yanked(v.yanked),
     published_at: published_at,
     prerelease: |v: &SwiftVersion| v.prerelease,
 });
@@ -163,7 +163,7 @@ mod tests {
             prerelease: false,
         };
         assert_eq!(ver.version_string(), "2.40.0");
-        assert!(!ver.is_yanked());
+        assert!(!ver.removal_status().blocks_resolution());
     }
 
     #[test]

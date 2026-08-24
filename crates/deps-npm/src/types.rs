@@ -103,7 +103,7 @@ pub struct NpmVersion {
 // not-prerelease) is practically unreachable.
 deps_core::impl_version!(NpmVersion {
     version: version,
-    yanked: deprecated,
+    status: |v: &NpmVersion| deps_core::RemovalStatus::from_advisory(v.deprecated),
     published_at: published_at,
     prerelease: |v: &NpmVersion| {
         node_semver::Version::parse(&v.version).is_ok_and(|parsed| parsed.is_prerelease())
@@ -205,7 +205,11 @@ mod tests {
         };
 
         assert_eq!(version.version_string(), "2.0.0");
-        assert!(version.is_yanked());
+        assert_eq!(
+            version.removal_status(),
+            deps_core::RemovalStatus::AdvisoryDeprecated
+        );
+        assert!(!version.removal_status().blocks_resolution());
     }
 
     #[test]

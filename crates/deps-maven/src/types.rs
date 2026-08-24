@@ -100,11 +100,8 @@ impl deps_core::Version for MavenVersion {
         &self.version
     }
 
-    fn is_yanked(&self) -> bool {
-        // Maven Central does not support version retraction
-        false
-    }
-
+    // No `removal_status` override: Maven Central does not support version
+    // retraction, so the default `RemovalStatus::Available` is correct.
     fn is_prerelease(&self) -> bool {
         crate::version::is_prerelease(&self.version)
     }
@@ -261,7 +258,7 @@ mod tests {
             published_at: Some(deps_core::PublishTime::from_unix_secs(1_699_000_000)),
         };
         assert_eq!(ver.version_string(), "3.14.0");
-        assert!(!ver.is_yanked());
+        assert!(!ver.removal_status().blocks_resolution());
         assert!(!ver.is_prerelease());
         assert!(ver.features().is_empty());
         assert!(ver.as_any().is::<MavenVersion>());

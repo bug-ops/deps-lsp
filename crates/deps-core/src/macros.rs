@@ -89,7 +89,11 @@ macro_rules! impl_dependency {
 ///
 /// * `$type` - The struct type name
 /// * `version` - Field name for version string (`String`)
-/// * `yanked` - Field name for yanked/deprecated status (`bool`)
+/// * `status` - Expression evaluating to a closure `Fn(&$type) -> RemovalStatus`,
+///   restating at every declaration site whether the ecosystem's flag is a hard
+///   removal ([`RemovalStatus::from_yanked`](crate::RemovalStatus::from_yanked)) or an
+///   advisory one ([`RemovalStatus::from_advisory`](crate::RemovalStatus::from_advisory))
+///   — see [`RemovalStatus`](crate::RemovalStatus).
 /// * `published_at` - Optional: field name for publish timestamp
 ///   (`Option<PublishTime>`), already parsed eagerly at construction
 /// * `prerelease` - Optional: expression evaluating to a closure
@@ -105,7 +109,7 @@ macro_rules! impl_dependency {
 /// # Examples
 ///
 /// ```ignore
-/// use deps_core::impl_version;
+/// use deps_core::{impl_version, RemovalStatus};
 ///
 /// pub struct MyVersion {
 ///     pub version: String,
@@ -114,14 +118,14 @@ macro_rules! impl_dependency {
 ///
 /// impl_version!(MyVersion {
 ///     version: version,
-///     yanked: deprecated,
+///     status: |v: &MyVersion| RemovalStatus::from_advisory(v.deprecated),
 /// });
 /// ```
 ///
 /// With a publish timestamp:
 ///
 /// ```ignore
-/// use deps_core::{impl_version, PublishTime};
+/// use deps_core::{impl_version, PublishTime, RemovalStatus};
 ///
 /// pub struct MyVersion {
 ///     pub version: String,
@@ -131,7 +135,7 @@ macro_rules! impl_dependency {
 ///
 /// impl_version!(MyVersion {
 ///     version: version,
-///     yanked: deprecated,
+///     status: |v: &MyVersion| RemovalStatus::from_advisory(v.deprecated),
 ///     published_at: published_at,
 /// });
 /// ```
@@ -139,7 +143,7 @@ macro_rules! impl_dependency {
 /// With a structured prerelease signal:
 ///
 /// ```ignore
-/// use deps_core::impl_version;
+/// use deps_core::{impl_version, RemovalStatus};
 ///
 /// pub struct MyVersion {
 ///     pub version: String,
@@ -148,7 +152,7 @@ macro_rules! impl_dependency {
 ///
 /// impl_version!(MyVersion {
 ///     version: version,
-///     yanked: deprecated,
+///     status: |v: &MyVersion| RemovalStatus::from_advisory(v.deprecated),
 ///     prerelease: |v: &MyVersion| v.version.contains("-pre"),
 /// });
 /// ```
@@ -156,15 +160,15 @@ macro_rules! impl_dependency {
 macro_rules! impl_version {
     ($type:ty {
         version: $version:ident,
-        yanked: $yanked:ident $(,)?
+        status: $status:expr $(,)?
     }) => {
         impl $crate::registry::Version for $type {
             fn version_string(&self) -> &str {
                 &self.$version
             }
 
-            fn is_yanked(&self) -> bool {
-                self.$yanked
+            fn removal_status(&self) -> $crate::registry::RemovalStatus {
+                ($status)(self)
             }
 
             fn as_any(&self) -> &dyn ::std::any::Any {
@@ -174,7 +178,7 @@ macro_rules! impl_version {
     };
     ($type:ty {
         version: $version:ident,
-        yanked: $yanked:ident,
+        status: $status:expr,
         published_at: $published_at:ident $(,)?
     }) => {
         impl $crate::registry::Version for $type {
@@ -182,8 +186,8 @@ macro_rules! impl_version {
                 &self.$version
             }
 
-            fn is_yanked(&self) -> bool {
-                self.$yanked
+            fn removal_status(&self) -> $crate::registry::RemovalStatus {
+                ($status)(self)
             }
 
             fn published_at(&self) -> Option<$crate::freshness::PublishTime> {
@@ -197,7 +201,7 @@ macro_rules! impl_version {
     };
     ($type:ty {
         version: $version:ident,
-        yanked: $yanked:ident,
+        status: $status:expr,
         prerelease: $prerelease:expr $(,)?
     }) => {
         impl $crate::registry::Version for $type {
@@ -205,8 +209,8 @@ macro_rules! impl_version {
                 &self.$version
             }
 
-            fn is_yanked(&self) -> bool {
-                self.$yanked
+            fn removal_status(&self) -> $crate::registry::RemovalStatus {
+                ($status)(self)
             }
 
             fn is_prerelease(&self) -> bool {
@@ -220,7 +224,7 @@ macro_rules! impl_version {
     };
     ($type:ty {
         version: $version:ident,
-        yanked: $yanked:ident,
+        status: $status:expr,
         published_at: $published_at:ident,
         prerelease: $prerelease:expr $(,)?
     }) => {
@@ -229,8 +233,8 @@ macro_rules! impl_version {
                 &self.$version
             }
 
-            fn is_yanked(&self) -> bool {
-                self.$yanked
+            fn removal_status(&self) -> $crate::registry::RemovalStatus {
+                ($status)(self)
             }
 
             fn published_at(&self) -> Option<$crate::freshness::PublishTime> {
@@ -468,24 +472,30 @@ mod tests {
 
     impl_version!(TestVersion {
         version: version,
-        yanked: yanked,
+        status: |v: &TestVersion| crate::registry::RemovalStatus::from_yanked(v.yanked),
     });
 
     impl_version!(TestVersionWithPublishedAt {
         version: version,
-        yanked: yanked,
+        status: |v: &TestVersionWithPublishedAt| crate::registry::RemovalStatus::from_yanked(
+            v.yanked
+        ),
         published_at: published_at,
     });
 
     impl_version!(TestVersionWithPrerelease {
         version: version,
-        yanked: yanked,
+        status: |v: &TestVersionWithPrerelease| crate::registry::RemovalStatus::from_yanked(
+            v.yanked
+        ),
         prerelease: |v: &TestVersionWithPrerelease| v.version.contains(".pre"),
     });
 
     impl_version!(TestVersionWithPublishedAtAndPrerelease {
         version: version,
-        yanked: yanked,
+        status: |v: &TestVersionWithPublishedAtAndPrerelease| {
+            crate::registry::RemovalStatus::from_yanked(v.yanked)
+        },
         published_at: published_at,
         prerelease: |v: &TestVersionWithPublishedAtAndPrerelease| v.version.contains(".pre"),
     });
@@ -535,7 +545,7 @@ mod tests {
         };
 
         assert_eq!(version.version_string(), "2.0.0");
-        assert!(version.is_yanked());
+        assert!(version.removal_status().blocks_resolution());
         assert!(version.as_any().is::<TestVersion>());
         assert!(version.published_at().is_none());
     }
@@ -552,7 +562,7 @@ mod tests {
         };
 
         assert_eq!(version.version_string(), "3.0.0");
-        assert!(!version.is_yanked());
+        assert!(!version.removal_status().blocks_resolution());
         assert_eq!(
             version.published_at(),
             Some(PublishTime::from_unix_secs(1_000))

@@ -903,8 +903,8 @@ pub trait EcosystemFormatter: Send + Sync {
     /// at all for this ecosystem.
     ///
     /// Default `true` — no restriction, every requirement shape is checked. Override to
-    /// `false` for a requirement shape where this ecosystem's `Version::is_yanked()` is not
-    /// a genuine per-version signal. `NpmFormatter` and `ComposerFormatter` restrict this to
+    /// `false` for a requirement shape where this ecosystem's `Version::removal_status()` is
+    /// not a genuine per-version signal. `NpmFormatter` and `ComposerFormatter` restrict this to
     /// exact-pin requirements: npm's yanked flag is sourced from `deprecated`
     /// (`NpmVersion::deprecated`), and Composer's from `abandoned`
     /// (`ComposerVersion::abandoned`) — both are commonly package-wide (a live-verified

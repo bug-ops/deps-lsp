@@ -92,7 +92,7 @@ pub struct JsrVersion {
 // not-prerelease) is practically unreachable given that enforcement.
 deps_core::impl_version!(JsrVersion {
     version: version,
-    yanked: yanked,
+    status: |v: &JsrVersion| deps_core::RemovalStatus::from_yanked(v.yanked),
     published_at: published_at,
     prerelease: |v: &JsrVersion| {
         node_semver::Version::parse(&v.version).is_ok_and(|parsed| parsed.is_prerelease())
@@ -219,7 +219,7 @@ mod tests {
         };
 
         assert_eq!(version.version_string(), "1.0.24");
-        assert!(version.is_yanked());
+        assert!(version.removal_status().blocks_resolution());
     }
 
     #[test]

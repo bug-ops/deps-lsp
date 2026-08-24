@@ -56,7 +56,7 @@ pub use parser::{
     check_yaml_nesting_depth,
 };
 pub use registry::{
-    Metadata, Registry, Version, find_latest_stable, has_default_prerelease_marker,
+    Metadata, Registry, RemovalStatus, Version, find_latest_stable, has_default_prerelease_marker,
 };
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,

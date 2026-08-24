@@ -394,7 +394,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
             versions_list
                 .iter()
                 .find(|v| v.version_string() == version_native)
-                .is_some_and(|v| v.is_yanked())
+                .is_some_and(|v| v.removal_status().blocks_resolution())
         })
     };
     let fix = fix.filter(|f| !is_yanked_target(&f.version_native));
@@ -1498,7 +1498,7 @@ mod tests {
 
         crate::impl_version!(CaVersion {
             version: version,
-            yanked: yanked,
+            status: |v: &CaVersion| crate::RemovalStatus::from_yanked(v.yanked),
         });
 
         struct CaRegistry;

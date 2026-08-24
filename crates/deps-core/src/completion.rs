@@ -659,7 +659,11 @@ impl VersionDisplayItem {
 
 /// Filters and formats versions for LSP display.
 ///
-/// Returns up to 5 non-yanked versions with display metadata.
+/// Returns up to 5 non-yanked versions with display metadata. An
+/// advisory-deprecated version (e.g. an abandoned Composer package, a
+/// deprecated npm package) is not excluded here — only a hard yank is
+/// (#347): excluding advisory-only flags would leave a deprecated-but-
+/// installable package with zero version completions.
 pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
     versions: &[V],
     package_name: &PackageName,
@@ -667,7 +671,7 @@ pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
     versions
         .iter()
         .map(|v| v.as_ref())
-        .filter(|v| !v.is_yanked())
+        .filter(|v| !v.removal_status().blocks_resolution())
         .take(MAX_COMPLETION_VERSIONS)
         .enumerate()
         .map(|(index, version)| VersionDisplayItem::new(version, package_name, index, index == 0))
@@ -967,8 +971,8 @@ mod tests {
             &self.version
         }
 
-        fn is_yanked(&self) -> bool {
-            self.yanked
+        fn removal_status(&self) -> crate::RemovalStatus {
+            crate::RemovalStatus::from_yanked(self.yanked)
         }
 
         fn is_prerelease(&self) -> bool {
@@ -991,10 +995,6 @@ mod tests {
     impl crate::registry::Version for MockVersionWithAge {
         fn version_string(&self) -> &str {
             &self.version
-        }
-
-        fn is_yanked(&self) -> bool {
-            false
         }
 
         fn published_at(&self) -> Option<PublishTime> {

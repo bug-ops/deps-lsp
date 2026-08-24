@@ -217,8 +217,8 @@ impl deps_core::Version for BundlerVersion {
         &self.number
     }
 
-    fn is_yanked(&self) -> bool {
-        self.yanked
+    fn removal_status(&self) -> deps_core::RemovalStatus {
+        deps_core::RemovalStatus::from_yanked(self.yanked)
     }
 
     // RubyGems flags prereleases with dot notation (`7.1.0.beta1`, `7.1.0.rc1`), not the
@@ -312,7 +312,8 @@ impl deps_core::Registry for RubyGemsRegistry {
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
         versions.iter().position(|v| {
-            version_matches_requirement(v.version_string(), req.as_str()) && !v.is_yanked()
+            version_matches_requirement(v.version_string(), req.as_str())
+                && !v.removal_status().blocks_resolution()
         })
     }
 
@@ -734,7 +735,7 @@ mod tests {
         };
 
         assert_eq!(version.version_string(), "1.0.0");
-        assert!(version.is_yanked());
+        assert!(version.removal_status().blocks_resolution());
         assert!(version.features().is_empty());
     }
 

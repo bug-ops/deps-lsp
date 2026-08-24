@@ -639,8 +639,8 @@ impl deps_core::Registry for SwiftRegistry {
         })
     }
 
-    // `Version::is_yanked` is hardcoded `false` (`registry.rs:173`) — Swift
-    // package registries expose no per-tag yank/deprecation signal (#233).
+    // `Version::removal_status` is hardcoded `Available` (`registry.rs:173`) —
+    // Swift package registries expose no per-tag yank/deprecation signal (#233).
     fn reports_yanked(&self) -> bool {
         false
     }

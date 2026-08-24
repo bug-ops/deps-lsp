@@ -180,8 +180,8 @@ impl deps_core::Version for CargoVersion {
         &self.num
     }
 
-    fn is_yanked(&self) -> bool {
-        self.yanked
+    fn removal_status(&self) -> deps_core::RemovalStatus {
+        deps_core::RemovalStatus::from_yanked(self.yanked)
     }
 
     // crates.io enforces valid semver on publish, so `semver::Version::parse`

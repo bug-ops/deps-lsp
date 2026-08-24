@@ -737,12 +737,12 @@ async fn fetch_latest_versions_parallel(
                         // Retained alongside `available` so `generate_diagnostics_from_cache`
                         // can flag a requirement satisfiable only by a yanked version — see
                         // `PackageVersions::yanked`. Gated on `check_yanked`: a registry that
-                        // cannot answer `is_yanked()` (§#298) must not populate this list with
-                        // an untrustworthy always-false signal.
+                        // cannot answer `removal_status()` (§#298) must not populate this list
+                        // with an untrustworthy always-`Available` signal.
                         let yanked_list: Arc<[String]> = if check_yanked {
                             versions
                                 .iter()
-                                .filter(|v| v.is_yanked())
+                                .filter(|v| v.removal_status().is_flagged())
                                 .map(|v| v.version_string().to_string())
                                 .collect()
                         } else {
@@ -757,7 +757,7 @@ async fn fetch_latest_versions_parallel(
                         {
                             let latest = v.version_string().to_string();
                             tracing::debug!(package = %name, version = %latest, "fetched");
-                            Some((latest, v.is_yanked(), v.published_at()))
+                            Some((latest, v.removal_status().is_flagged(), v.published_at()))
                         } else {
                             // The pure list-based pick found nothing — for most
                             // ecosystems this genuinely means "no version found", but
@@ -783,7 +783,11 @@ async fn fetch_latest_versions_parallel(
                                         version = %latest,
                                         "fetched via get_latest_matching fallback"
                                     );
-                                    Some((latest, v.is_yanked(), v.published_at()))
+                                    Some((
+                                        latest,
+                                        v.removal_status().is_flagged(),
+                                        v.published_at(),
+                                    ))
                                 }
                                 Ok(Ok(None)) => {
                                     tracing::debug!(package = %name, "no version found");
@@ -849,7 +853,7 @@ async fn fetch_latest_versions_parallel(
                             if let Some(iv) = in_use_version.as_deref()
                                 && let Some(found) =
                                     versions.iter().find(|v| v.version_string() == iv)
-                                && found.is_yanked()
+                                && found.removal_status().is_flagged()
                             {
                                 yanked = Some((name.clone(), iv.to_string()));
                             }
@@ -2151,10 +2155,6 @@ mod tests {
                 false
             }
 
-            fn is_yanked(&self) -> bool {
-                false
-            }
-
             fn as_any(&self) -> &dyn Any {
                 self
             }
@@ -2307,8 +2307,8 @@ mod tests {
             fn version_string(&self) -> &str {
                 &self.version
             }
-            fn is_yanked(&self) -> bool {
-                self.yanked
+            fn removal_status(&self) -> deps_core::RemovalStatus {
+                deps_core::RemovalStatus::from_yanked(self.yanked)
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -2360,7 +2360,9 @@ mod tests {
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
             ) -> Option<usize> {
-                versions.iter().position(|v| !v.is_yanked())
+                versions
+                    .iter()
+                    .position(|v| !v.removal_status().blocks_resolution())
             }
 
             fn as_any(&self) -> &dyn Any {
@@ -2422,8 +2424,8 @@ mod tests {
             fn version_string(&self) -> &str {
                 &self.version
             }
-            fn is_yanked(&self) -> bool {
-                self.yanked
+            fn removal_status(&self) -> deps_core::RemovalStatus {
+                deps_core::RemovalStatus::from_yanked(self.yanked)
             }
             fn published_at(&self) -> Option<PublishTime> {
                 self.published_at
@@ -2482,7 +2484,9 @@ mod tests {
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
             ) -> Option<usize> {
-                versions.iter().position(|v| !v.is_yanked())
+                versions
+                    .iter()
+                    .position(|v| !v.removal_status().blocks_resolution())
             }
 
             fn as_any(&self) -> &dyn Any {
@@ -2536,9 +2540,6 @@ mod tests {
         impl Version for MockVersion {
             fn version_string(&self) -> &str {
                 &self.version
-            }
-            fn is_yanked(&self) -> bool {
-                false
             }
             fn published_at(&self) -> Option<PublishTime> {
                 self.published_at
@@ -2657,9 +2658,6 @@ mod tests {
         impl Version for MockVersion {
             fn version_string(&self) -> &str {
                 &self.version
-            }
-            fn is_yanked(&self) -> bool {
-                false
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -3587,8 +3585,8 @@ dependencies = ["requests>=2.0.0"]
             fn version_string(&self) -> &str {
                 &self.version
             }
-            fn is_yanked(&self) -> bool {
-                self.yanked
+            fn removal_status(&self) -> deps_core::RemovalStatus {
+                deps_core::RemovalStatus::from_yanked(self.yanked)
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -5371,8 +5369,8 @@ tokio = "1.0"
             fn version_string(&self) -> &str {
                 &self.version
             }
-            fn is_yanked(&self) -> bool {
-                self.yanked
+            fn removal_status(&self) -> deps_core::RemovalStatus {
+                deps_core::RemovalStatus::from_yanked(self.yanked)
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -5439,7 +5437,9 @@ tokio = "1.0"
                 versions: &[Box<dyn Version>],
                 _req: &VersionReq,
             ) -> Option<usize> {
-                versions.iter().position(|v| !v.is_yanked())
+                versions
+                    .iter()
+                    .position(|v| !v.removal_status().blocks_resolution())
             }
 
             fn get_latest_matching<'a>(
@@ -5480,7 +5480,7 @@ tokio = "1.0"
         #[tokio::test]
         async fn reports_yanked_false_never_recorded() {
             // The fetched list carries a yanked in-use entry, but
-            // `reports_yanked() == false` means `is_yanked()` must never be
+            // `reports_yanked() == false` means `removal_status()` must never be
             // trusted, even though the data is already in hand for free.
             let fetch_calls = Arc::new(AtomicUsize::new(0));
             let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
@@ -5741,11 +5741,11 @@ tokio = "1.0"
         async fn latest_is_yanked_not_recorded_when_reports_yanked_false() {
             // impl-critic M1: row 1 must respect the same `reports_yanked()`
             // gate as the in-memory in-use check. Harmless today only
-            // because every opt-out registry also hardcodes `is_yanked` to
-            // `false` — this guards against a follow-up (§8.2/§8.3) making
-            // an opt-out registry's `is_yanked()` real without also
-            // flipping `reports_yanked()`, which would otherwise silently
-            // reintroduce a #233-class bug through this exact row.
+            // because every opt-out registry also hardcodes `removal_status`
+            // to `Available` — this guards against a follow-up (§8.2/§8.3)
+            // making an opt-out registry's `removal_status()` real without
+            // also flipping `reports_yanked()`, which would otherwise
+            // silently reintroduce a #233-class bug through this exact row.
             let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
                 reports_yanked: false,
                 versions: HashMap::from([("pkg", FetchOutcome::Versions(vec![("1.0.0", true)]))]),
@@ -5766,8 +5766,8 @@ tokio = "1.0"
 
             assert!(
                 result.yanked_versions.is_empty(),
-                "a `reports_yanked() == false` registry's `is_yanked()` must never be trusted, \
-                 even on the zero-cost row-1 path"
+                "a `reports_yanked() == false` registry's `removal_status()` must never be \
+                 trusted, even on the zero-cost row-1 path"
             );
             assert!(
                 result
@@ -5777,7 +5777,7 @@ tokio = "1.0"
                     .yanked
                     .is_empty(),
                 "`PackageVersions::yanked` must stay empty for a `reports_yanked() == false` \
-                 registry, even though the fetched version is itself flagged `is_yanked`"
+                 registry, even though the fetched version is itself flagged"
             );
         }
 

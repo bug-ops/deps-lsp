@@ -153,7 +153,7 @@ impl EcosystemFormatter for NpmFormatter {
 
     /// Restricts the yanked-only-match diagnostic to an exact-pin requirement.
     ///
-    /// npm's `Version::is_yanked()` is sourced from `deprecated` (`NpmVersion::deprecated`),
+    /// npm's `Version::removal_status()` is sourced from `deprecated` (`NpmVersion::deprecated`),
     /// which `npm deprecate` sets per-version but is routinely applied to *every* published
     /// version of a package at once (live-verified: the `request` package has all 126/126
     /// versions marked deprecated) — a package-level signal, not a true per-version yank.
@@ -382,7 +382,7 @@ mod tests {
     }
 
     /// S1 regression: a range/caret/tilde requirement must not trigger the yanked-only-match
-    /// diagnostic, since npm's `is_yanked()` is sourced from `deprecated`, which is commonly
+    /// diagnostic, since npm's `removal_status()` is sourced from `deprecated`, which is commonly
     /// applied to every published version of a package at once — a range requirement would
     /// flag every dependency on such a package, conflating this diagnostic with package-level
     /// deprecation (issue #205).

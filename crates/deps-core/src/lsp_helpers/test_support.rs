@@ -2,7 +2,7 @@
 //! this module's per-feature test suites.
 
 use super::*;
-use crate::{PackageName, ParseResult, PublishTime, VersionReq};
+use crate::{PackageName, ParseResult, PublishTime, RemovalStatus, VersionReq};
 use std::any::Any;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind};
 
@@ -346,8 +346,8 @@ impl crate::Version for MockVersionWithAge {
         &self.version
     }
 
-    fn is_yanked(&self) -> bool {
-        self.yanked
+    fn removal_status(&self) -> crate::RemovalStatus {
+        crate::RemovalStatus::from_yanked(self.yanked)
     }
 
     fn published_at(&self) -> Option<PublishTime> {
@@ -369,8 +369,8 @@ impl crate::Version for TestVersion {
         &self.version
     }
 
-    fn is_yanked(&self) -> bool {
-        self.yanked
+    fn removal_status(&self) -> crate::RemovalStatus {
+        crate::RemovalStatus::from_yanked(self.yanked)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -419,6 +419,107 @@ impl crate::Registry for MockRegistryWithVersions {
         _limit: usize,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
         Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    /// Newest entry that is neither yanked nor a prerelease — same predicate hover used
+    /// to derive `live_latest_idx` before it was routed through this trait method
+    /// (#347/#348 S1). A deprecated-but-installable entry is a legitimate "latest" here,
+    /// matching most ecosystems (Cargo, PyPI, ...) which have no ranking preference for
+    /// non-deprecated over deprecated; see `MockRegistryPreferringUnflagged` below for the
+    /// npm-shaped ranking preference.
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn crate::Version>],
+        _req: &crate::VersionReq,
+    ) -> Option<usize> {
+        versions.iter().position(|v| v.is_stable())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A version carrying an explicit [`RemovalStatus`], used where a test needs
+/// `AdvisoryDeprecated` specifically — `MockVersionWithAge`'s `bool` field can only
+/// express `Available`/`Yanked` via [`RemovalStatus::from_yanked`].
+pub(crate) struct MockVersionWithStatus {
+    pub(crate) version: String,
+    pub(crate) status: RemovalStatus,
+}
+
+impl crate::Version for MockVersionWithStatus {
+    fn version_string(&self) -> &str {
+        &self.version
+    }
+
+    fn removal_status(&self) -> RemovalStatus {
+        self.status
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A registry whose `select_latest_matching` mirrors npm's #338 NFR-002 ranking
+/// preference — rung 1: newest entry that is neither flagged nor a prerelease; rung 2:
+/// newest entry that isn't hard-yanked — rather than `MockRegistryWithVersions`'s
+/// generic `is_stable()` scan. Exists for the hover/cache-agreement regression test
+/// (#347/#348 S1): hover must resolve "latest" through this same ranking, not an
+/// independent `is_stable()`-based pick that disagrees with it.
+pub(crate) struct MockRegistryPreferringUnflagged {
+    pub(crate) versions: Vec<MockVersionWithStatus>,
+}
+
+impl crate::Registry for MockRegistryPreferringUnflagged {
+    fn get_versions<'a>(
+        &'a self,
+        _name: &'a crate::PackageName,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
+        let versions = self
+            .versions
+            .iter()
+            .map(|v| {
+                Box::new(MockVersionWithStatus {
+                    version: v.version.clone(),
+                    status: v.status,
+                }) as Box<dyn crate::Version>
+            })
+            .collect();
+        Box::pin(async move { Ok(versions) })
+    }
+
+    fn get_latest_matching<'a>(
+        &'a self,
+        _name: &'a crate::PackageName,
+        _req: &'a crate::VersionReq,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+    {
+        Box::pin(async move { Ok(None) })
+    }
+
+    fn search<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: usize,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn crate::Version>],
+        _req: &crate::VersionReq,
+    ) -> Option<usize> {
+        versions
+            .iter()
+            .position(|v| !v.removal_status().is_flagged() && !v.is_prerelease())
+            .or_else(|| {
+                versions
+                    .iter()
+                    .position(|v| !v.removal_status().blocks_resolution())
+            })
     }
 
     fn as_any(&self) -> &dyn Any {

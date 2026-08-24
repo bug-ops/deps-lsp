@@ -32,7 +32,6 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///
 /// impl Version for MyVersion {
 ///     fn version_string(&self) -> &str { &self.version }
-///     fn is_yanked(&self) -> bool { false }
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
@@ -115,13 +114,15 @@ pub trait Registry: Send + Sync {
 
     /// Finds the latest version matching a version requirement.
     ///
-    /// Only returns stable (non-yanked, non-deprecated) versions unless explicitly
-    /// requested in the version requirement, with one documented exception: under a
-    /// wildcard/empty requirement (`"*"`/`""`), an implementation may treat this as an
-    /// *existence* check ("does this package exist / what is its newest version for
-    /// display purposes") rather than an upgrade recommendation, preferring a stable
-    /// version but falling back to a yanked/deprecated one rather than returning `None`
-    /// when no stable version exists — a yanked/deprecated package still exists. `deps-npm`
+    /// Filter with [`RemovalStatus::blocks_resolution`], never with
+    /// [`RemovalStatus::is_flagged`]. An `AdvisoryDeprecated` version is fully
+    /// installable — excluding it turns an existing package into a false
+    /// "Unknown package" (#347). Under a wildcard/empty requirement
+    /// (`"*"`/`""`) this is an *existence* check ("does this package exist /
+    /// what is its newest version for display purposes"), not an upgrade
+    /// recommendation: an implementation may prefer a non-yanked version but
+    /// fall back to a yanked one rather than returning `None` when no
+    /// non-yanked version exists — a yanked package still exists. `deps-npm`
     /// implements this fallback (mirrored by
     /// [`select_latest_matching`](Self::select_latest_matching)'s wildcard branch on the
     /// same registry, which every caller reaching this trait method through the shared
@@ -159,6 +160,12 @@ pub trait Registry: Send + Sync {
 
     /// Index of the latest version in `versions` satisfying `req`, with no I/O.
     ///
+    /// Filter with [`RemovalStatus::blocks_resolution`], never with
+    /// [`RemovalStatus::is_flagged`]. An `AdvisoryDeprecated` version is fully
+    /// installable — excluding it turns an existing package into a false
+    /// "Unknown package" (#347). Under a wildcard/empty requirement this is
+    /// an *existence* check, not an upgrade recommendation.
+    ///
     /// `versions` must be a newest-first list as returned by this registry's
     /// [`get_versions`](Self::get_versions). Returns an index rather than a reference so
     /// callers holding an owned `Vec` can move the chosen element out
@@ -179,16 +186,17 @@ pub trait Registry: Send + Sync {
     }
 
     /// Whether [`get_versions`](Self::get_versions) results carry meaningful
-    /// per-version yank/deprecation data via [`Version::is_yanked`].
+    /// per-version yank/deprecation data via [`Version::removal_status`].
     ///
     /// Default `true`: a registry is opted into the yanked-version diagnostic
     /// unless it explicitly says it cannot answer. This fails toward
-    /// correctness — a registry whose `is_yanked` later becomes real data
-    /// starts participating automatically, by deleting its opt-out rather
-    /// than by someone remembering to add an opt-in. Return `false` only
-    /// when `is_yanked()` is hardcoded (e.g. always `false`) or otherwise
-    /// cannot reflect real registry data; a `true` return authorizes callers
-    /// to trust `is_yanked()` on versions from this registry's normal
+    /// correctness — a registry whose `removal_status` later becomes real
+    /// data starts participating automatically, by deleting its opt-out
+    /// rather than by someone remembering to add an opt-in. Return `false`
+    /// only when `removal_status()` is hardcoded (e.g. always
+    /// `RemovalStatus::Available`) or otherwise cannot reflect real registry
+    /// data; a `true` return authorizes callers to trust `removal_status()`
+    /// on versions from this registry's normal
     /// [`get_versions`](Self::get_versions)/
     /// [`get_latest_matching`](Self::get_latest_matching) results — it does
     /// not trigger any additional network request.
@@ -231,6 +239,125 @@ pub fn has_default_prerelease_marker(version: &str) -> bool {
         || v.contains("-nightly")
 }
 
+/// Outcome of a registry's per-version removal/deprecation signal.
+///
+/// Replaces a bare `is_yanked(): bool`, which could not distinguish a version
+/// a registry has *hard-removed from resolution* (`Yanked`) from one that is
+/// merely flagged as deprecated/abandoned but still fully installable
+/// (`AdvisoryDeprecated`). Conflating the two caused #347: Composer's
+/// package-level `abandoned` flag was read through `is_yanked()`, so every
+/// version of an abandoned-but-installable package was filtered out of
+/// resolution, turning an existing package into a false "Unknown package"
+/// diagnostic.
+///
+/// Call [`blocks_resolution`](Self::blocks_resolution) to decide whether a
+/// version may be selected as an upgrade/latest candidate. Call
+/// [`is_flagged`](Self::is_flagged) only to surface the registry's flag to
+/// the user (e.g. a yanked/deprecated diagnostic) — never to filter
+/// resolution.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::RemovalStatus;
+///
+/// assert!(!RemovalStatus::Available.blocks_resolution());
+/// assert!(!RemovalStatus::AdvisoryDeprecated.blocks_resolution());
+/// assert!(RemovalStatus::Yanked.blocks_resolution());
+///
+/// assert!(RemovalStatus::AdvisoryDeprecated.is_flagged());
+/// assert!(RemovalStatus::Yanked.is_flagged());
+/// assert!(!RemovalStatus::Available.is_flagged());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemovalStatus {
+    /// The registry reports no removal/deprecation signal for this version.
+    Available,
+    /// The registry flags this version (or its package) as
+    /// deprecated/abandoned, but the version remains fully resolvable and
+    /// installable.
+    AdvisoryDeprecated,
+    /// The registry has hard-removed this version from fresh resolution (a
+    /// real yank/retraction). Existing installs may keep using it, but it
+    /// must not be selected as an upgrade/latest candidate.
+    Yanked,
+}
+
+impl RemovalStatus {
+    /// Whether fresh resolution must skip this version.
+    ///
+    /// `true` only for [`Yanked`](Self::Yanked). An
+    /// [`AdvisoryDeprecated`](Self::AdvisoryDeprecated) version is fully
+    /// installable — excluding it from resolution is what caused #347.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::RemovalStatus;
+    ///
+    /// assert!(!RemovalStatus::AdvisoryDeprecated.blocks_resolution());
+    /// assert!(RemovalStatus::Yanked.blocks_resolution());
+    /// ```
+    #[must_use]
+    pub const fn blocks_resolution(self) -> bool {
+        matches!(self, Self::Yanked)
+    }
+
+    /// Whether the registry flags this version at all, hard or advisory.
+    ///
+    /// Use this only to decide whether to surface a warning to the user —
+    /// never to filter resolution; use
+    /// [`blocks_resolution`](Self::blocks_resolution) for that.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::RemovalStatus;
+    ///
+    /// assert!(!RemovalStatus::Available.is_flagged());
+    /// assert!(RemovalStatus::AdvisoryDeprecated.is_flagged());
+    /// assert!(RemovalStatus::Yanked.is_flagged());
+    /// ```
+    #[must_use]
+    pub const fn is_flagged(self) -> bool {
+        !matches!(self, Self::Available)
+    }
+
+    /// Builds a status from a registry's hard yanked/retracted boolean flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::RemovalStatus;
+    ///
+    /// assert_eq!(RemovalStatus::from_yanked(true), RemovalStatus::Yanked);
+    /// assert_eq!(RemovalStatus::from_yanked(false), RemovalStatus::Available);
+    /// ```
+    #[must_use]
+    pub const fn from_yanked(flag: bool) -> Self {
+        if flag { Self::Yanked } else { Self::Available }
+    }
+
+    /// Builds a status from a registry's advisory deprecated/abandoned boolean flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::RemovalStatus;
+    ///
+    /// assert_eq!(RemovalStatus::from_advisory(true), RemovalStatus::AdvisoryDeprecated);
+    /// assert_eq!(RemovalStatus::from_advisory(false), RemovalStatus::Available);
+    /// ```
+    #[must_use]
+    pub const fn from_advisory(flag: bool) -> Self {
+        if flag {
+            Self::AdvisoryDeprecated
+        } else {
+            Self::Available
+        }
+    }
+}
+
 /// Version information trait.
 ///
 /// All version types must implement this to work with generic handlers.
@@ -238,8 +365,13 @@ pub trait Version: Send + Sync {
     /// Version string (e.g., "1.0.214", "14.21.3").
     fn version_string(&self) -> &str;
 
-    /// Whether this version is yanked/deprecated.
-    fn is_yanked(&self) -> bool;
+    /// This version's removal/deprecation status as reported by the registry.
+    ///
+    /// Default: [`RemovalStatus::Available`] — ecosystems with no
+    /// yank/deprecation signal need no override.
+    fn removal_status(&self) -> RemovalStatus {
+        RemovalStatus::Available
+    }
 
     /// Whether this version is a pre-release (alpha, beta, rc, etc.).
     ///
@@ -257,9 +389,14 @@ pub trait Version: Send + Sync {
     /// Downcast to concrete version type
     fn as_any(&self) -> &dyn Any;
 
-    /// Whether this version is stable (not yanked and not pre-release).
+    /// Whether this version is stable: not hard-yanked and not a pre-release.
+    ///
+    /// An [`AdvisoryDeprecated`](RemovalStatus::AdvisoryDeprecated) version counts as
+    /// stable here — it remains fully resolvable, just flagged. Only
+    /// [`Yanked`](RemovalStatus::Yanked) disqualifies a version; see
+    /// [`RemovalStatus::blocks_resolution`].
     fn is_stable(&self) -> bool {
-        !self.is_yanked() && !self.is_prerelease()
+        !self.removal_status().blocks_resolution() && !self.is_prerelease()
     }
 
     /// When this version was published, if the registry exposes it.
@@ -275,7 +412,9 @@ pub trait Version: Send + Sync {
 /// Finds the latest stable version from a list of versions.
 ///
 /// Returns the first version that is:
-/// - Not yanked/deprecated
+/// - Not hard-yanked ([`RemovalStatus::Yanked`]) — an
+///   [`AdvisoryDeprecated`](RemovalStatus::AdvisoryDeprecated) version still counts as
+///   stable, since it remains fully resolvable
 /// - Not a pre-release (alpha, beta, rc, etc.)
 ///
 /// Assumes versions are sorted newest-first (as returned by registries).
@@ -283,14 +422,14 @@ pub trait Version: Send + Sync {
 /// # Examples
 ///
 /// ```
-/// use deps_core::registry::{Version, find_latest_stable};
+/// use deps_core::registry::{RemovalStatus, Version, find_latest_stable};
 /// use std::any::Any;
 ///
 /// struct MyVersion { version: String, yanked: bool }
 ///
 /// impl Version for MyVersion {
 ///     fn version_string(&self) -> &str { &self.version }
-///     fn is_yanked(&self) -> bool { self.yanked }
+///     fn removal_status(&self) -> RemovalStatus { RemovalStatus::from_yanked(self.yanked) }
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
@@ -353,8 +492,8 @@ mod tests {
             &self.version
         }
 
-        fn is_yanked(&self) -> bool {
-            self.yanked
+        fn removal_status(&self) -> RemovalStatus {
+            RemovalStatus::from_yanked(self.yanked)
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -381,7 +520,7 @@ mod tests {
 
         let boxed: Box<dyn Version> = Box::new(version);
         assert_eq!(boxed.version_string(), "1.2.3");
-        assert!(!boxed.is_yanked());
+        assert!(!boxed.removal_status().blocks_resolution());
     }
 
     #[test]
@@ -663,5 +802,74 @@ mod tests {
         ];
         let latest = super::find_latest_stable(&versions);
         assert!(latest.is_none());
+    }
+
+    struct StatusVersion {
+        version: String,
+        status: RemovalStatus,
+    }
+
+    impl Version for StatusVersion {
+        fn version_string(&self) -> &str {
+            &self.version
+        }
+
+        fn removal_status(&self) -> RemovalStatus {
+            self.status
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn test_is_stable_true_for_advisory_deprecated() {
+        let version = StatusVersion {
+            version: "1.0.0".into(),
+            status: RemovalStatus::AdvisoryDeprecated,
+        };
+        assert!(version.is_stable());
+    }
+
+    #[test]
+    fn test_is_stable_false_for_yanked() {
+        let version = StatusVersion {
+            version: "1.0.0".into(),
+            status: RemovalStatus::Yanked,
+        };
+        assert!(!version.is_stable());
+    }
+
+    #[test]
+    fn test_removal_status_blocks_resolution() {
+        assert!(!RemovalStatus::Available.blocks_resolution());
+        assert!(!RemovalStatus::AdvisoryDeprecated.blocks_resolution());
+        assert!(RemovalStatus::Yanked.blocks_resolution());
+    }
+
+    #[test]
+    fn test_removal_status_is_flagged() {
+        assert!(!RemovalStatus::Available.is_flagged());
+        assert!(RemovalStatus::AdvisoryDeprecated.is_flagged());
+        assert!(RemovalStatus::Yanked.is_flagged());
+    }
+
+    #[test]
+    fn test_removal_status_from_yanked() {
+        assert_eq!(RemovalStatus::from_yanked(true), RemovalStatus::Yanked);
+        assert_eq!(RemovalStatus::from_yanked(false), RemovalStatus::Available);
+    }
+
+    #[test]
+    fn test_removal_status_from_advisory() {
+        assert_eq!(
+            RemovalStatus::from_advisory(true),
+            RemovalStatus::AdvisoryDeprecated
+        );
+        assert_eq!(
+            RemovalStatus::from_advisory(false),
+            RemovalStatus::Available
+        );
     }
 }
