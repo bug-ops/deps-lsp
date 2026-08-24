@@ -1069,14 +1069,18 @@ pub async fn handle_document_open(
             doc.set_loading();
         }
 
-        let (progress, progress_sender) = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            RegistryProgress::start(client_clone.clone(), uri_clone.as_str(), dep_names.len()),
-        )
-        .await
-        {
-            Ok(Ok((p, s))) => (Some(p), Some(s)),
-            _ => (None, None),
+        let (progress, progress_sender) = if state_clone.supports_progress() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                RegistryProgress::start(client_clone.clone(), uri_clone.as_str(), dep_names.len()),
+            )
+            .await
+            {
+                Ok(Ok((p, s))) => (Some(p), Some(s)),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
         };
 
         tracing::debug!("progress started, fetching versions");
@@ -1412,18 +1416,22 @@ pub async fn handle_document_change(
             doc.set_loading();
         }
 
-        let (progress, progress_sender) = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            RegistryProgress::start(
-                client_clone.clone(),
-                uri_clone.as_str(),
-                deps_to_fetch.len(),
-            ),
-        )
-        .await
-        {
-            Ok(Ok((p, s))) => (Some(p), Some(s)),
-            _ => (None, None),
+        let (progress, progress_sender) = if state_clone.supports_progress() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                RegistryProgress::start(
+                    client_clone.clone(),
+                    uri_clone.as_str(),
+                    deps_to_fetch.len(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok((p, s))) => (Some(p), Some(s)),
+                _ => (None, None),
+            }
+        } else {
+            (None, None)
         };
 
         // Build the in-use-version map (§4.6) from the freshly-committed parse

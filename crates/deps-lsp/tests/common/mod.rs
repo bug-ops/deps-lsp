@@ -30,6 +30,29 @@ enum ReaderMessage {
     Error(String),
 }
 
+/// Blocks on `rx` until a message arrives or `deadline` passes, panicking
+/// with the same message `LspClient::read_response` has always used on
+/// timeout. Extracted so the panic branch can be exercised with a short
+/// injected deadline in a unit test instead of waiting out a real
+/// `READ_TIMEOUT`-length hang.
+fn recv_before_deadline(
+    rx: &mpsc::Receiver<ReaderMessage>,
+    deadline: Instant,
+    timeout: Duration,
+) -> ReaderMessage {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(msg) => msg,
+        Err(RecvTimeoutError::Timeout) => panic!(
+            "Server did not respond within {}s (possible hang or deadlock)",
+            timeout.as_secs()
+        ),
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("Server closed connection unexpectedly")
+        }
+    }
+}
+
 /// Continuously read Content-Length-framed messages from `stdout` and push
 /// them to `tx`, decoupling the blocking read from the caller so it can be
 /// bounded with `Receiver::recv_timeout` instead of hanging indefinitely.
@@ -254,17 +277,7 @@ impl LspClient {
     pub(crate) fn read_response(&mut self, expected_id: Option<i64>) -> Value {
         let deadline = Instant::now() + READ_TIMEOUT;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let msg = match self.message_rx.recv_timeout(remaining) {
-                Ok(msg) => msg,
-                Err(RecvTimeoutError::Timeout) => panic!(
-                    "Server did not respond within {}s (possible hang or deadlock)",
-                    READ_TIMEOUT.as_secs()
-                ),
-                Err(RecvTimeoutError::Disconnected) => {
-                    panic!("Server closed connection unexpectedly")
-                }
-            };
+            let msg = recv_before_deadline(&self.message_rx, deadline, READ_TIMEOUT);
 
             let body = match msg {
                 ReaderMessage::Frame(body) => body,
@@ -361,8 +374,17 @@ impl LspClient {
         self.send(&response);
     }
 
-    /// Initialize the LSP session.
+    /// Initialize the LSP session, advertising `window.workDoneProgress` support.
     pub(crate) fn initialize(&mut self) -> Value {
+        self.initialize_with_progress_support(true)
+    }
+
+    /// Initialize the LSP session with `window.workDoneProgress` support toggled.
+    ///
+    /// Used to test that the server does not send `window/workDoneProgress/create`
+    /// requests to a client that declined the capability (see #290).
+    #[allow(dead_code)] // Used by the #290 capability-gating regression test
+    pub(crate) fn initialize_with_progress_support(&mut self, work_done_progress: bool) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -371,7 +393,7 @@ impl LspClient {
                 "processId": null,
                 "capabilities": {
                     "window": {
-                        "workDoneProgress": true
+                        "workDoneProgress": work_done_progress
                     },
                     "workspace": {
                         "inlayHint": {
@@ -517,5 +539,53 @@ impl LspClient {
 impl Drop for LspClient {
     fn drop(&mut self) {
         let _ = self.process.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for #291: exercises `recv_before_deadline`'s panic
+    /// branch — the one `LspClient::read_response` hits on a genuine 10s
+    /// server hang — without spawning the real binary or waiting out a real
+    /// 10-second timeout. A receiver nothing is ever sent on stands in for a
+    /// hung server.
+    #[test]
+    fn test_recv_before_deadline_panics_on_timeout() {
+        let (_tx, rx) = mpsc::channel::<ReaderMessage>();
+        // Short deadline keeps the test fast; `READ_TIMEOUT` is passed
+        // separately as the value used for message formatting, so this test
+        // still asserts the exact production panic string rather than one
+        // derived from the short deadline (which would truncate to "0s").
+        let deadline = Instant::now() + Duration::from_millis(80);
+
+        let start = Instant::now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            recv_before_deadline(&rx, deadline, READ_TIMEOUT)
+        }));
+        let elapsed = start.elapsed();
+
+        let Err(panic_payload) = result else {
+            panic!("expected recv_before_deadline to panic on timeout");
+        };
+        let message = panic_payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                panic_payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+            })
+            .unwrap_or_default();
+
+        assert_eq!(
+            message, "Server did not respond within 10s (possible hang or deadlock)",
+            "unexpected panic message: {message:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "timeout branch took too long: {elapsed:?}"
+        );
     }
 }

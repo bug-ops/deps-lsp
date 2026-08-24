@@ -79,6 +79,14 @@ impl RegistryProgress {
     ///
     /// Returns both the progress tracker and a [`ProgressSender`] for
     /// non-blocking updates from fetch tasks.
+    ///
+    /// Callers wrap this in a short timeout so a slow/unresponsive client can't
+    /// stall a fetch. If the timeout fires while the `create` round-trip is
+    /// still pending after the request bytes already reached the client, the
+    /// client may register a token this call never learns about and therefore
+    /// never sends `begin`/`end` for. This is an accepted trade-off: no `begin`
+    /// means spec-compliant clients show no UI for it, so the only cost is a
+    /// harmless dangling token client-side.
     pub async fn start(
         client: Client,
         uri: &str,
