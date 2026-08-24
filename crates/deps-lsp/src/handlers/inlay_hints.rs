@@ -34,6 +34,9 @@ pub async fn handle_inlay_hints(
         return vec![];
     }
 
+    // Snapshot config before the document lookup (Copy value, no lock held across the call)
+    let loading_config = { full_config.read().await.loading_indicator.clone() };
+
     // Single document lookup: extract all needed data at once
     let doc = match state.get_document(uri) {
         Some(d) => d,
@@ -55,9 +58,6 @@ pub async fn handle_inlay_hints(
         Some(p) => p,
         None => return vec![],
     };
-
-    // Get loading indicator config
-    let loading_config = { full_config.read().await.loading_indicator.clone() };
 
     let ecosystem_config = EcosystemConfig {
         show_up_to_date_hints: true,

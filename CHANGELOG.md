@@ -54,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-npm, deps-swift**: unsatisfiable-requirement WARNING now mentions a matching pre-release when one exists for Cargo/npm/Swift's strict-SemVer requirements, follow-up to #206 (resolves #299) (#305)
 
 ### Fixed
+- **deps-lsp**: `handle_inlay_hints` no longer awaits the config `RwLock` read while holding a `DashMap` document `Ref`, closing the reproducible liveness hazard from #317 (the residual `Ref`-across-`generate_*()` hold is tracked separately).
 - **deps-lsp**: `RegistryProgress::start` no longer sends `window/workDoneProgress/create` to a client that never advertised `window.workDoneProgress` support, an LSP 3.17 spec violation (resolves #290) (#296).
 - **deps-lsp** (tests): `LspClient::read_response`'s 10s hang-detection timeout is now covered by a fast unit test instead of being unexercised (resolves #291) (#296).
 - **deps-bundler**: fix Bundler yanked-diagnostic path incorrectly trusting missing RubyGems yank data (resolves #298) (#301).
