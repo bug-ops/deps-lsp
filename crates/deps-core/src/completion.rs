@@ -428,7 +428,11 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 ///
 /// # Returns
 ///
-/// A complete `CompletionItem` ready to send to the LSP client.
+/// `Some(CompletionItem)` ready to send to the LSP client, or `None` when
+/// `metadata.name()` fails [`crate::is_safe_package_name`] — a malicious/compromised
+/// registry search result must not reach the manifest as an unsanitized `label`,
+/// `insert_text`, `text_edit`, `sort_text`, or `filter_text`, so the item is dropped
+/// rather than built with unsafe text.
 ///
 /// # Examples
 ///
@@ -438,12 +442,18 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 ///
 /// # async fn example(metadata: &dyn deps_core::Metadata) {
 /// let range = Range::default(); // Use actual range from context
-/// let item = build_package_completion(metadata, range);
+/// let item = build_package_completion(metadata, range).unwrap();
 /// assert_eq!(item.label, metadata.name().as_str());
 /// # }
 /// ```
-pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) -> CompletionItem {
+pub fn build_package_completion(
+    metadata: &dyn Metadata,
+    insert_range: Range,
+) -> Option<CompletionItem> {
     let name = metadata.name();
+    if !crate::is_safe_package_name(name.as_str()) {
+        return None;
+    }
     let latest = metadata.latest_version();
 
     // Build markdown documentation
@@ -485,7 +495,7 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
         doc_parts.push(links.join(" | "));
     }
 
-    CompletionItem {
+    Some(CompletionItem {
         label: name.to_string(),
         kind: Some(CompletionItemKind::MODULE),
         detail: if latest.is_empty() {
@@ -505,7 +515,7 @@ pub fn build_package_completion(metadata: &dyn Metadata, insert_range: Range) ->
         sort_text: Some(name.to_string()),
         filter_text: Some(name.to_string()),
         ..Default::default()
-    }
+    })
 }
 
 /// Builds a completion item for a version string.
@@ -742,6 +752,9 @@ pub fn is_valid_completion_prefix_len(prefix: &str) -> bool {
 /// Searches the registry for packages matching `prefix` and returns up to `limit`
 /// completion items, each with its `textEdit` set to replace `insert_range`. Returns
 /// empty vec if `prefix` is shorter than 2 characters or longer than 200 characters.
+/// A result whose name fails [`build_package_completion`]'s [`crate::is_safe_package_name`]
+/// gate is silently dropped rather than surfaced as an error, matching the fallback-search
+/// completion builder's convention (`create_package_completion_item` in `deps-lsp`).
 pub async fn complete_package_names_generic(
     registry: &dyn crate::Registry,
     prefix: &str,
@@ -762,7 +775,7 @@ pub async fn complete_package_names_generic(
 
     results
         .into_iter()
-        .map(|metadata| build_package_completion(metadata.as_ref(), insert_range))
+        .filter_map(|metadata| build_package_completion(metadata.as_ref(), insert_range))
         .collect()
 }
 
@@ -1170,6 +1183,36 @@ mod tests {
 
         let items = complete_package_names_generic(&registry, "s", 5, Range::default()).await;
         assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_complete_package_names_generic_drops_unsafe_names() {
+        // A registry search can return a mix of safe and malicious/compromised
+        // results (e.g. a Gradle Groovy breakout name); only the safe ones should
+        // survive into the returned completion list.
+        let registry = MockSearchRegistry {
+            results: vec![
+                MockMetadata {
+                    name: pkg("serde"),
+                    description: None,
+                    repository: None,
+                    documentation: None,
+                    latest_version: "1.0.0".to_string(),
+                },
+                MockMetadata {
+                    name: pkg("guava'); System.exit(1); //"),
+                    description: None,
+                    repository: None,
+                    documentation: None,
+                    latest_version: "1.0.0".to_string(),
+                },
+            ],
+        };
+
+        let items = complete_package_names_generic(&registry, "gua", 5, Range::default()).await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "serde");
     }
 
     #[test]
@@ -1681,7 +1724,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         assert_eq!(item.label, "serde");
         assert_eq!(item.kind, Some(CompletionItemKind::MODULE));
@@ -1710,7 +1753,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         assert_eq!(item.label, "test-pkg");
         assert_eq!(item.detail, Some("v0.1.0".to_string()));
@@ -1732,7 +1775,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         assert_eq!(item.detail, None);
 
@@ -1753,7 +1796,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(!content.value.contains("*bold*"));
@@ -1780,7 +1823,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(!content.value.contains(")[Click here]("));
@@ -1802,7 +1845,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(!content.value.contains(")[Click here]("));
@@ -1831,7 +1874,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let lines: Vec<_> = content.value.lines().collect();
@@ -1847,15 +1890,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_package_completion_escapes_malicious_name_and_version_link_breakout() {
-        // A crafted package name/version attempting to close the leading bold span
+    fn test_build_package_completion_escapes_malicious_version_link_breakout() {
+        // A crafted latest-version string attempting to close the leading bold span
         // and splice in a live, attacker-controlled markdown link — same injection
-        // class as description/repository/documentation, and reachable simply by
-        // typing a package-name prefix (no malicious manifest required).
-        let malicious_name = "a** [Official Download](https://evil.example) **b";
+        // class as description/repository/documentation. `latest_version` isn't
+        // gated by `is_safe_package_name` (that only guards `name`), so it must
+        // still be escaped in the rendered documentation.
         let malicious_latest = "1.0.0)[click](https://evil.example";
         let metadata = MockMetadata {
-            name: malicious_name.to_string().into(),
+            name: "test-pkg".to_string().into(),
             description: None,
             repository: None,
             documentation: None,
@@ -1863,20 +1906,10 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
-            assert!(
-                !content
-                    .value
-                    .contains("[Official Download](https://evil.example)")
-            );
             assert!(!content.value.contains(")[click]("));
-            assert!(
-                content
-                    .value
-                    .contains(r"a\*\* \[Official Download\]\(https\:\/\/evil\.example\) \*\*b")
-            );
             assert!(
                 content
                     .value
@@ -1885,6 +1918,27 @@ mod tests {
         } else {
             panic!("Expected MarkupContent documentation");
         }
+    }
+
+    #[test]
+    fn test_build_package_completion_rejects_unsafe_name() {
+        // A crafted package name attempting to close the leading bold span and
+        // splice in a live, attacker-controlled markdown link — reachable simply
+        // by typing a package-name prefix (no malicious manifest required). Such
+        // a name fails `is_safe_package_name` (structural characters like `[`,
+        // `]`, `(`, `)`, `*`, and space are not in its allowlist), so the whole
+        // completion item must be dropped rather than built with unsafe text.
+        let malicious_name = "a** [Official Download](https://evil.example) **b";
+        let metadata = MockMetadata {
+            name: malicious_name.to_string().into(),
+            description: None,
+            repository: None,
+            documentation: None,
+            latest_version: "1.0.0".to_string(),
+        };
+
+        let range = Range::default();
+        assert!(build_package_completion(&metadata, range).is_none());
     }
 
     #[test]
@@ -1901,7 +1955,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let unescaped: String = content.value.chars().filter(|&c| c != '\\').collect();
@@ -1922,7 +1976,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(!content.value.contains("<img src=x onerror=alert(1)>"));
@@ -1947,7 +2001,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(content.value.starts_with(r"**test\-pkg** v1\.0\.0"));
@@ -1977,7 +2031,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let lines: Vec<_> = content.value.lines().collect();
@@ -2551,7 +2605,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             // Should be truncated to 200 chars + "..."
@@ -2581,7 +2635,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         // Should not panic on truncation
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
@@ -2609,7 +2663,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range);
+        let item = build_package_completion(&metadata, range).unwrap();
 
         // Should not panic on truncation
         if let Some(Documentation::MarkupContent(content)) = item.documentation {

@@ -29,9 +29,10 @@ use crate::types::SwiftPackage;
 /// — the same safe pattern used by `create_package_completion_item` in `deps-lsp` — rather
 /// than guessing a range.
 ///
-/// Returns `None` when `url` doesn't pass [`is_safe_registry_url`] — a
-/// malicious/compromised search result must not reach the manifest as an unsanitized
-/// `TextEdit`, so the item is dropped rather than built with unsafe text.
+/// Returns `None` when `url` doesn't pass [`is_safe_registry_url`], or when the base
+/// builder itself rejects `package.name` — a malicious/compromised search result must
+/// not reach the manifest as an unsanitized `TextEdit`, so the item is dropped rather
+/// than built with unsafe text.
 fn build_url_completion(
     package: &SwiftPackage,
     replace_range: Option<LspRange>,
@@ -46,7 +47,7 @@ fn build_url_completion(
         return None;
     }
 
-    let mut item = deps_core::completion::build_package_completion(package, LspRange::default());
+    let mut item = deps_core::completion::build_package_completion(package, LspRange::default())?;
 
     item.insert_text = Some(url.clone());
     item.filter_text = Some(url.clone());
@@ -322,6 +323,18 @@ mod tests {
     fn test_build_url_completion_rejects_malicious_name_in_fallback_url() {
         let mut package = test_package(None);
         package.name = "apple/swift-nio\", .exact(\"1\")) //".to_string().into();
+
+        assert!(build_url_completion(&package, None).is_none());
+    }
+
+    #[test]
+    fn test_build_url_completion_rejects_when_base_builder_rejects_name() {
+        // `repository` is a safe URL (passes `is_safe_registry_url`), but
+        // `package.name` fails `is_safe_package_name` (space, quote) — the base
+        // builder must reject it, and that rejection must propagate through
+        // `build_url_completion` even though the URL itself is fine.
+        let mut package = test_package(Some("https://github.com/apple/swift-nio"));
+        package.name = "apple swift-nio\" evil".to_string().into();
 
         assert!(build_url_completion(&package, None).is_none());
     }
