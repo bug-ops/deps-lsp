@@ -1,7 +1,7 @@
 use crate::error::{DepsError, Result};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use reqwest::{Client, Response, StatusCode, header};
+use reqwest::{Client, Response, StatusCode, Url, header};
 use serde::Serialize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -21,7 +21,7 @@ const MAX_CACHE_ENTRIES: usize = 1000;
 /// bounding the pathological case.
 ///
 /// This is a best-effort bound, not a hard guarantee: it is checked once
-/// per request in [`HttpCache::get_cached_with_headers`], so multiple
+/// per request in [`HttpCache::get_cached_with_headers_via`], so multiple
 /// requests already in flight when the budget is crossed can each finish
 /// inserting before the next check fires. [`MAX_CACHEABLE_ENTRY_BYTES`]
 /// keeps that per-request overshoot small (at most one admission-cap-sized
@@ -101,6 +101,72 @@ fn ensure_https(url: &str) -> Result<()> {
         return Ok(());
     }
     Err(DepsError::CacheError(format!("URL must use HTTPS: {url}")))
+}
+
+/// True when a redirect hop moves from an `https` origin to a plain `http` one.
+///
+/// A redirect to any scheme other than `http`/`https` is already rejected by reqwest
+/// itself once a hop is followed, so the downgrade case is the only one this needs to
+/// catch here.
+fn is_https_downgrade(previous: &Url, next: &Url) -> bool {
+    previous.scheme() == "https" && next.scheme() == "http"
+}
+
+/// Redirect policy for [`HttpCache`]'s client.
+///
+/// [`ensure_https`] only validates the *initial* request URL; a `3xx` response can still
+/// redirect the actual connection anywhere, including down to plain HTTP. This policy stops
+/// the redirect chain (rather than erroring) the moment a hop would do that, so the caller
+/// sees the last successful `3xx` response and handles it exactly like any other non-2xx
+/// status (`DepsError::HttpStatus`) instead of needing a distinct "redirect blocked" error
+/// variant. Every other redirect — including cross-host ones, which are out of scope for this
+/// policy — falls through to reqwest's default (`Policy::limited(10)`), preserving the
+/// existing hop-count limit and mockito's plain-`http://` loopback chains
+/// used throughout this module's tests.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let downgraded = attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| is_https_downgrade(previous, attempt.url()));
+        if downgraded {
+            attempt.stop()
+        } else {
+            reqwest::redirect::Policy::default().redirect(attempt)
+        }
+    })
+}
+
+/// Redirect policy for a [`HttpCache::client_for_origin`]-scoped client.
+///
+/// Stops any hop whose URL no longer starts with `trusted_origin` — for a caller (e.g.
+/// NuGet's registration-hive paging) that already validated the *initial* request URL
+/// against a trusted prefix and needs that guarantee to hold through a redirect too. This
+/// alone also covers a downgrade to plain `http://`: every current caller passes an
+/// `https://`-prefixed `trusted_origin`, so an `http://` target already fails the prefix
+/// check — a separate scheme check (as [`redirect_policy`] has, for its no-trusted-prefix
+/// case) would be dead code here.
+fn trusted_origin_redirect_policy(trusted_origin: String) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.url().as_str().starts_with(&trusted_origin) {
+            reqwest::redirect::Policy::default().redirect(attempt)
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// Builds a client with `HttpCache`'s shared configuration (user agent, timeout), varying
+/// only the redirect policy — kept in one place so a future client-wide setting (proxy,
+/// connection pool sizing, etc.) added to [`HttpCache::new`] can't silently miss the pooled
+/// clients [`HttpCache::client_for_origin`] builds.
+fn build_client(redirect: reqwest::redirect::Policy) -> Client {
+    Client::builder()
+        .user_agent(format!("deps-lsp/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .redirect(redirect)
+        .build()
+        .expect("failed to create HTTP client")
 }
 
 /// Reads a response body incrementally, aborting once it exceeds
@@ -204,6 +270,11 @@ pub struct CachedResponse {
 /// distinct representation its own URL (e.g. a query parameter or distinct
 /// path), not just a distinct header value, or callers requesting different
 /// representations of the same URL will silently share one cache entry.
+///
+/// Likewise, the key doesn't encode *which* client (and so which redirect policy)
+/// produced an entry — [`HttpCache::get_cached`] and [`HttpCache::get_cached_trusted_origin`]
+/// share one entry map. No caller today requests the same URL through both, but one that did
+/// could observe the other's cached (and differently redirect-validated) body.
 pub struct HttpCache {
     entries: DashMap<String, CachedResponse>,
     /// Running total of `body.len()` across all `entries`, kept in sync by
@@ -216,6 +287,12 @@ pub struct HttpCache {
     /// under concurrent access.
     total_bytes: AtomicUsize,
     client: Client,
+    /// Per-trusted-origin client pool backing [`Self::get_cached_trusted_origin`], keyed by
+    /// the exact `trusted_origin` prefix string passed to that call. reqwest's redirect
+    /// policy is fixed per-`Client`, so a distinct client is unavoidable per distinct
+    /// origin; pooled here so repeated calls against the same origin reuse one client
+    /// (and its connection pool) instead of rebuilding on every call.
+    trusted_clients: DashMap<String, Client>,
 }
 
 impl HttpCache {
@@ -224,17 +301,31 @@ impl HttpCache {
     /// The cache uses a configurable timeout for all requests and identifies
     /// itself with an auto-versioned user agent.
     pub fn new() -> Self {
-        let client = Client::builder()
-            .user_agent(format!("deps-lsp/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .build()
-            .expect("failed to create HTTP client");
-
         Self {
             entries: DashMap::new(),
             total_bytes: AtomicUsize::new(0),
-            client,
+            client: build_client(redirect_policy()),
+            trusted_clients: DashMap::new(),
         }
+    }
+
+    /// Returns the client scoped to `trusted_origin`, building and pooling one on first use.
+    ///
+    /// The `get` fast path (a shared read lock) serves the common case — a `trusted_origin`
+    /// already pooled — without ever taking `trusted_clients`' write-capable `entry` lock;
+    /// `entry().or_insert_with()` only runs on a miss, so two callers racing on the same new
+    /// origin still only ever build and store one `Client` for it, not one each.
+    fn client_for_origin(&self, trusted_origin: &str) -> Client {
+        if let Some(existing) = self.trusted_clients.get(trusted_origin) {
+            return existing.clone();
+        }
+
+        self.trusted_clients
+            .entry(trusted_origin.to_string())
+            .or_insert_with(|| {
+                build_client(trusted_origin_redirect_policy(trusted_origin.to_string()))
+            })
+            .clone()
     }
 
     /// Retrieves data from URL with intelligent caching.
@@ -278,7 +369,7 @@ impl HttpCache {
     /// Returns the cached body for `url` without making any network request.
     ///
     /// Unlike `get_cached`'s own stale-while-revalidate fallback (the `Err` arm of
-    /// `conditional_request_with_headers`'s match in `get_cached_with_headers`), this
+    /// `conditional_request_with_headers`'s match in `get_cached_with_headers_via`), this
     /// is reachable even when a caller wraps `get_cached` in a short outer timeout: a
     /// hung conditional request that never resolves within that timeout gets its whole
     /// future cancelled, so `get_cached`'s internal fallback logic never runs and the
@@ -311,6 +402,43 @@ impl HttpCache {
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
+        self.get_cached_with_headers_via(url, extra_headers, &self.client)
+            .await
+    }
+
+    /// Like [`Self::get_cached`], but additionally stops any redirect hop whose target no
+    /// longer starts with `trusted_origin` (e.g. `https://api.nuget.org/v3/registration5-gz/`).
+    ///
+    /// For a caller that already validated the *initial* request URL against a trusted
+    /// prefix (NuGet's registration-hive paging validates `page.id` this way) and needs
+    /// that guarantee to hold through any redirect too, not just the first hop —
+    /// [`Self::get_cached`]'s own policy deliberately does not enforce this, since
+    /// cross-host redirects are legitimate for the other registry clients sharing this
+    /// cache; the stricter check is opt-in per call rather than global.
+    ///
+    /// The block only surfaces as an error on a cold cache: like [`Self::get_cached`]'s own
+    /// stale-while-revalidate fallback, a warm entry for `url` still returns the last
+    /// known-good body (itself already fetched and origin-validated on a prior call)
+    /// instead of propagating a blocked-redirect `HttpStatus` from a revalidation attempt.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached`].
+    pub async fn get_cached_trusted_origin(
+        &self,
+        url: &str,
+        trusted_origin: &str,
+    ) -> Result<Bytes> {
+        let client = self.client_for_origin(trusted_origin);
+        self.get_cached_with_headers_via(url, &[], &client).await
+    }
+
+    async fn get_cached_with_headers_via(
+        &self,
+        url: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+        client: &Client,
+    ) -> Result<Bytes> {
         if self.entries.len() >= MAX_CACHE_ENTRIES
             || self.total_bytes.load(Ordering::Relaxed) >= MAX_CACHE_BYTES
         {
@@ -322,7 +450,7 @@ impl HttpCache {
         // need write access to the same shard (e.g., conditional_request_with_headers → insert).
         if let Some(cached) = self.entries.get(url).map(|r| r.clone()) {
             match self
-                .conditional_request_with_headers(url, &cached, extra_headers)
+                .conditional_request_with_headers(url, &cached, extra_headers, client)
                 .await
             {
                 Ok(Some(new_body)) => return Ok(new_body),
@@ -334,7 +462,8 @@ impl HttpCache {
             }
         }
 
-        self.fetch_and_store_with_headers(url, extra_headers).await
+        self.fetch_and_store_with_headers(url, extra_headers, client)
+            .await
     }
 
     /// Performs conditional HTTP request using cached validation headers.
@@ -352,9 +481,10 @@ impl HttpCache {
         url: &str,
         cached: &CachedResponse,
         extra_headers: &[(header::HeaderName, &str)],
+        client: &Client,
     ) -> Result<Option<Bytes>> {
         ensure_https(url)?;
-        let mut request = self.client.get(url);
+        let mut request = client.get(url);
 
         for (name, value) in extra_headers {
             request = request.header(name, *value);
@@ -423,11 +553,12 @@ impl HttpCache {
         &self,
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
+        client: &Client,
     ) -> Result<Bytes> {
         ensure_https(url)?;
         tracing::debug!(extra_headers = extra_headers.len(), "fetching fresh: {url}");
 
-        let mut request = self.client.get(url);
+        let mut request = client.get(url);
         for (name, value) in extra_headers {
             request = request.header(name, *value);
         }
@@ -739,6 +870,249 @@ mod tests {
         assert!(ensure_https("http://[::1]:1234/x").is_ok());
     }
 
+    // reqwest's `Attempt` has no public constructor, so the redirect policy closure
+    // itself can't be unit-tested directly from outside the reqwest crate; this
+    // exercises the pure detection logic it delegates to instead. End-to-end coverage
+    // of an actual https->http redirect is not feasible with mockito, which is
+    // http-only (see test_get_cached_follows_same_scheme_redirect for the
+    // policy-is-wired-in regression check that mockito *can* exercise).
+    #[test]
+    fn test_is_https_downgrade() {
+        let https = Url::parse("https://example.com/a").unwrap();
+        let http = Url::parse("http://example.com/a").unwrap();
+
+        assert!(is_https_downgrade(&https, &http));
+        assert!(!is_https_downgrade(&http, &https));
+        assert!(!is_https_downgrade(&https, &https));
+        assert!(!is_https_downgrade(&http, &http));
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_follows_same_scheme_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let target_url = format!("{}/api/target", server.url());
+
+        let _redirect = server
+            .mock("GET", "/api/source")
+            .with_status(302)
+            .with_header("location", &target_url)
+            .create_async()
+            .await;
+        let _target = server
+            .mock("GET", "/api/target")
+            .with_status(200)
+            .with_body("redirected data")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let source_url = format!("{}/api/source", server.url());
+        let result: Bytes = cache.get_cached(&source_url).await.unwrap();
+
+        assert_eq!(result.as_ref(), b"redirected data");
+    }
+
+    // Unlike the https->http downgrade case, cross-origin redirect blocking IS reachable
+    // through mockito: two separate `mockito::Server` instances bind to distinct ports,
+    // and a distinct port is a distinct origin (scheme+host+port), so a 302 from one to
+    // the other is a genuine cross-origin redirect the trusted-origin policy must stop.
+    #[tokio::test]
+    async fn test_get_cached_trusted_origin_stops_cross_origin_redirect() {
+        let mut trusted_server = mockito::Server::new_async().await;
+        let mut other_server = mockito::Server::new_async().await;
+
+        let trusted_origin = format!("{}/", trusted_server.url());
+        let escape_target = format!("{}/api/stolen", other_server.url());
+
+        let _redirect = trusted_server
+            .mock("GET", "/api/source")
+            .with_status(302)
+            .with_header("location", &escape_target)
+            .create_async()
+            .await;
+        let escape = other_server
+            .mock("GET", "/api/stolen")
+            .with_status(200)
+            .with_body("must not be returned")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let source_url = format!("{}/api/source", trusted_server.url());
+        let result: Result<Bytes> = cache
+            .get_cached_trusted_origin(&source_url, &trusted_origin)
+            .await;
+
+        // The stopped redirect surfaces as the 302 response itself, handled like any
+        // other non-2xx status - not as a distinct "redirect blocked" error variant.
+        match result {
+            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 302),
+            other => panic!("expected HttpStatus(302), got {other:?}"),
+        }
+
+        // Proves the security property itself (the escape origin was never contacted),
+        // not just the symptom (the result is a 302) - a client that followed the
+        // redirect and then discarded the body would still pass the assertion above.
+        escape.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_trusted_origin_follows_same_origin_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let target_url = format!("{}/api/target", server.url());
+
+        let _redirect = server
+            .mock("GET", "/api/source")
+            .with_status(302)
+            .with_header("location", &target_url)
+            .create_async()
+            .await;
+        let _target = server
+            .mock("GET", "/api/target")
+            .with_status(200)
+            .with_body("trusted data")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let source_url = format!("{}/api/source", server.url());
+        let result: Bytes = cache
+            .get_cached_trusted_origin(&source_url, &trusted_origin)
+            .await
+            .unwrap();
+
+        assert_eq!(result.as_ref(), b"trusted data");
+    }
+
+    // Proves every hop is re-checked, not just the first: a same-origin hop is followed,
+    // then a second, cross-origin hop from that (already-followed) intermediate is stopped.
+    #[tokio::test]
+    async fn test_get_cached_trusted_origin_stops_second_hop_of_multi_hop_chain() {
+        let mut trusted_server = mockito::Server::new_async().await;
+        let mut other_server = mockito::Server::new_async().await;
+
+        let trusted_origin = format!("{}/", trusted_server.url());
+        let intermediate_url = format!("{}/api/intermediate", trusted_server.url());
+        let escape_target = format!("{}/api/stolen", other_server.url());
+
+        let _first_hop = trusted_server
+            .mock("GET", "/api/source")
+            .with_status(302)
+            .with_header("location", &intermediate_url)
+            .create_async()
+            .await;
+        let _second_hop = trusted_server
+            .mock("GET", "/api/intermediate")
+            .with_status(302)
+            .with_header("location", &escape_target)
+            .create_async()
+            .await;
+        let escape = other_server
+            .mock("GET", "/api/stolen")
+            .with_status(200)
+            .with_body("must not be returned")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let source_url = format!("{}/api/source", trusted_server.url());
+        let result: Result<Bytes> = cache
+            .get_cached_trusted_origin(&source_url, &trusted_origin)
+            .await;
+
+        match result {
+            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 302),
+            other => panic!("expected HttpStatus(302), got {other:?}"),
+        }
+        escape.assert_async().await;
+    }
+
+    // Sibling path-prefix rejection: `.../api/` must not accept `.../apiX/...`. The other
+    // trusted-origin tests use a bare-host prefix, which never exercises this boundary.
+    #[tokio::test]
+    async fn test_get_cached_trusted_origin_rejects_sibling_path_prefix() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/api/", server.url());
+        let escape_target = format!("{}/apiX/evil", server.url());
+
+        let _redirect = server
+            .mock("GET", "/api/source")
+            .with_status(302)
+            .with_header("location", &escape_target)
+            .create_async()
+            .await;
+        let escape = server
+            .mock("GET", "/apiX/evil")
+            .with_status(200)
+            .with_body("must not be returned")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let source_url = format!("{}/api/source", server.url());
+        let result: Result<Bytes> = cache
+            .get_cached_trusted_origin(&source_url, &trusted_origin)
+            .await;
+
+        match result {
+            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 302),
+            other => panic!("expected HttpStatus(302), got {other:?}"),
+        }
+        escape.assert_async().await;
+    }
+
+    // Proves `redirect_policy`'s `Policy::default().redirect(attempt)` delegation is
+    // actually wired in and live: without it (e.g. a no-op policy that always follows),
+    // this chain would keep following past 10 hops instead of erroring. A single-hop
+    // redirect test alone can't distinguish "delegation is live" from "no policy at all".
+    #[tokio::test]
+    async fn test_get_cached_default_client_enforces_ten_hop_redirect_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        // reqwest's default policy errors once `previous.len() > 10`, i.e. on the 11th
+        // redirect hop - so 11 redirecting steps (step/0 through step/10) are needed to
+        // trigger it; step/11 must never actually be requested.
+        let mut hop_mocks = Vec::new();
+        for i in 0..11u32 {
+            let path = format!("/step/{i}");
+            let next = format!("{base}/step/{}", i + 1);
+            hop_mocks.push(
+                server
+                    .mock("GET", path.as_str())
+                    .with_status(302)
+                    .with_header("location", &next)
+                    .create_async()
+                    .await,
+            );
+        }
+        let final_step = server
+            .mock("GET", "/step/11")
+            .with_status(200)
+            .with_body("unreachable")
+            .expect(0)
+            .create_async()
+            .await;
+
+        // Kept alive (not just built) until here: each `Mock` deregisters on drop, so
+        // dropping this early would silently turn every hop 404 instead of 302.
+        assert_eq!(hop_mocks.len(), 11);
+
+        let cache = HttpCache::new();
+        let start_url = format!("{base}/step/0");
+        let result: Result<Bytes> = cache.get_cached(&start_url).await;
+
+        assert!(
+            matches!(result, Err(DepsError::RegistryError { .. })),
+            "expected a too-many-redirects network error, got {result:?}"
+        );
+        final_step.assert_async().await;
+    }
+
     #[test]
     fn test_cache_creation() {
         let cache = HttpCache::new();
@@ -966,7 +1340,9 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/missing", server.url());
-        let result: Result<Bytes> = cache.fetch_and_store_with_headers(&url, &[]).await;
+        let result: Result<Bytes> = cache
+            .fetch_and_store_with_headers(&url, &[], &cache.client)
+            .await;
 
         assert!(result.is_err());
         match result {
@@ -992,7 +1368,10 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/data", server.url());
-        let _: Bytes = cache.fetch_and_store_with_headers(&url, &[]).await.unwrap();
+        let _: Bytes = cache
+            .fetch_and_store_with_headers(&url, &[], &cache.client)
+            .await
+            .unwrap();
 
         let cached = cache.entries.get(&url).unwrap();
         assert_eq!(cached.etag, Some("\"abc123\"".into()));
@@ -1037,7 +1416,9 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/huge", server.url());
-        let result: Result<Bytes> = cache.fetch_and_store_with_headers(&url, &[]).await;
+        let result: Result<Bytes> = cache
+            .fetch_and_store_with_headers(&url, &[], &cache.client)
+            .await;
 
         match result {
             Err(DepsError::ResponseTooLarge { limit, .. }) => {
@@ -1069,7 +1450,10 @@ mod tests {
 
         let cache = HttpCache::new();
         let url = format!("{}/api/exact", server.url());
-        let result: Bytes = cache.fetch_and_store_with_headers(&url, &[]).await.unwrap();
+        let result: Bytes = cache
+            .fetch_and_store_with_headers(&url, &[], &cache.client)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), MAX_RESPONSE_BYTES);
     }

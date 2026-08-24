@@ -231,6 +231,13 @@ impl NuGetRegistry {
     /// A registration-index fetch or parse failure degrades to no publish times, never to
     /// an error: the version list itself must be unaffected by a listing problem.
     ///
+    /// Both fetches go through `HttpCache::get_cached_trusted_origin`, scoped to the
+    /// resolved `PackageBaseAddress`/`RegistrationsBaseUrl` respectively — not just the
+    /// external registration pages `publish_times_from_index` walks. Every URL this method
+    /// ever contacts (index, flat container, registration index, and — down in
+    /// `publish_times_from_index` — the page `@id`s the index itself supplies) is checked
+    /// against its trusted prefix on every redirect hop, not only its initial request.
+    ///
     /// # Errors
     ///
     /// Returns an error if the service index cannot be resolved or the flat-container
@@ -242,6 +249,7 @@ impl NuGetRegistry {
     ) -> Result<Vec<NuGetVersion>> {
         let index = self.service_index().await?;
         let flat_url = flat_container_url(&index.package_base_address, name);
+        let flat_trusted_prefix = format!("{}/", index.package_base_address);
         let registration_base = if freshness_enabled {
             index.registrations_base_url.clone()
         } else {
@@ -250,15 +258,18 @@ impl NuGetRegistry {
 
         if let Some(base) = registration_base {
             let registration_url = registration_index_url(&base, name);
+            let registration_trusted_prefix = format!("{base}/");
             let (flat_result, registration_result) = tokio::join!(
-                self.cache.get_cached(&flat_url),
-                self.cache.get_cached(&registration_url),
+                self.cache
+                    .get_cached_trusted_origin(&flat_url, &flat_trusted_prefix),
+                self.cache
+                    .get_cached_trusted_origin(&registration_url, &registration_trusted_prefix),
             );
             let mut versions = parse_flat_container(&flat_result?)?;
             match registration_result {
                 Ok(registration_body) => {
                     let times = self
-                        .publish_times_from_index(&registration_body, &base)
+                        .publish_times_from_index(&registration_body, &registration_trusted_prefix)
                         .await;
                     attach_publish_times(&mut versions, &times);
                 }
@@ -268,7 +279,10 @@ impl NuGetRegistry {
             }
             Ok(versions)
         } else {
-            let data = self.cache.get_cached(&flat_url).await?;
+            let data = self
+                .cache
+                .get_cached_trusted_origin(&flat_url, &flat_trusted_prefix)
+                .await?;
             parse_flat_container(&data)
         }
     }
@@ -284,11 +298,11 @@ impl NuGetRegistry {
     /// packages need at most one, per the live measurements this plan is based on).
     ///
     /// Never fails the caller: a malformed index, an unreachable page, or a page `@id`
-    /// outside `base`'s origin all degrade to fewer (or zero) entries in the returned map.
+    /// outside `trusted_prefix` all degrade to fewer (or zero) entries in the returned map.
     async fn publish_times_from_index(
         &self,
         index_body: &[u8],
-        base: &str,
+        trusted_prefix: &str,
     ) -> HashMap<String, PublishTime> {
         let mut times = HashMap::new();
         let Ok(index) = serde_json::from_slice::<RegistrationIndex>(index_body) else {
@@ -297,7 +311,6 @@ impl NuGetRegistry {
 
         let mut collected = 0usize;
         let mut external_fetches = 0usize;
-        let trusted_prefix = format!("{base}/");
 
         for page in index.items.iter().rev() {
             if collected >= HOVER_RECENT_VERSIONS {
@@ -308,16 +321,21 @@ impl NuGetRegistry {
                 Some(inline) => accumulate_catalog_entries(&mut times, &mut collected, inline),
                 None => {
                     // A page `@id` outside the resolved registration base is skipped, not
-                    // trusted — the feed chooses `@id` values, and `ensure_https` blocks
-                    // non-HTTPS but not cross-origin redirection of our fetch (S2/M2).
-                    if !page.id.starts_with(&trusted_prefix) {
+                    // trusted — the feed chooses `@id` values. `get_cached_trusted_origin`
+                    // additionally stops any redirect that would otherwise escape
+                    // `trusted_prefix` after this initial check passes (S2/M2).
+                    if !page.id.starts_with(trusted_prefix) {
                         continue;
                     }
                     if external_fetches >= MAX_EXTERNAL_PAGE_FETCHES {
                         break;
                     }
                     external_fetches += 1;
-                    let Ok(body) = self.cache.get_cached(&page.id).await else {
+                    let Ok(body) = self
+                        .cache
+                        .get_cached_trusted_origin(&page.id, trusted_prefix)
+                        .await
+                    else {
                         continue;
                     };
                     let Ok(parsed) = serde_json::from_slice::<RegistrationPageBody>(&body) else {
@@ -1002,7 +1020,7 @@ mod tests {
             ],
         );
         let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
         assert_eq!(
             times.get("2.0.0").copied(),
@@ -1022,7 +1040,7 @@ mod tests {
             ],
         );
         let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
         assert!(!times.contains_key("1.0.0"));
         assert!(times.contains_key("2.0.0"));
@@ -1036,7 +1054,7 @@ mod tests {
             &[("1.0.0", None), ("2.0.0", Some("2021-01-01T00:00:00Z"))],
         );
         let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
         assert!(!times.contains_key("1.0.0"));
         assert!(times.contains_key("2.0.0"));
@@ -1046,7 +1064,7 @@ mod tests {
     async fn test_publish_times_from_index_malformed_json_returns_empty_map() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
         let times = registry
-            .publish_times_from_index(b"not json", "https://api.nuget.org/v3/reg")
+            .publish_times_from_index(b"not json", "https://api.nuget.org/v3/reg/")
             .await;
         assert!(times.is_empty());
     }
@@ -1061,7 +1079,7 @@ mod tests {
             {"@id": "https://evil.example/pkg/page/0.json", "count": 1}
         ]}"#;
         let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
         assert!(times.is_empty());
     }
@@ -1075,7 +1093,7 @@ mod tests {
             {"@id": "https://api.nuget.org.evil.test/v3/reg/pkg/page/0.json", "count": 1}
         ]}"#;
         let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg")
+            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
         assert!(times.is_empty());
     }
