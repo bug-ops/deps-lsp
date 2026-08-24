@@ -1,4 +1,4 @@
-//! Cross-platform test URI helper shared across ecosystem crates.
+//! Test fixtures and helpers shared across ecosystem crates.
 //!
 //! Test fixtures throughout the workspace write absolute paths in Unix
 //! style (e.g. `/project/Cargo.toml`) for readability. `Uri::from_file_path`
@@ -6,6 +6,15 @@
 //! recognized as absolute on Windows (no drive letter), so calling it
 //! directly with such a literal panics on Windows only. [`test_uri`]
 //! normalizes the path per host platform before constructing the [`Uri`].
+//!
+//! [`assert_dot_segment_gated_or_contained`]/[`assert_dot_segment_gated_or_contained_transformed`]
+//! guard the recurring dot-segment / unvalidated-URL-sink defect class (#337, #341, #349,
+//! #357, #361, #365, #371) against further recurrence.
+//!
+//! [`capture_tracing_output`]/[`capture_tracing_output_async`] let a test assert a
+//! `tracing` call actually fired (originally added standalone in `deps-swift` for #357,
+//! then duplicated per-crate for #380/#378's `warn_rejected_value` coverage before being
+//! consolidated here).
 
 use tower_lsp_server::ls_types::Uri;
 
@@ -210,4 +219,100 @@ pub fn assert_dot_segment_gated_or_contained_transformed(
             );
         }
     }
+}
+
+// Gated separately from the rest of this module (which also compiles under plain
+// `cfg(test)`, i.e. `cargo test -p deps-core` with no explicit features): `tracing-subscriber`
+// is an *optional* dependency enabled only by the `test-util` feature, so a build that hits
+// this module via bare `cfg(test)` alone would fail to resolve it without this narrower gate.
+#[cfg(feature = "test-util")]
+#[derive(Clone, Default)]
+struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(feature = "test-util")]
+impl std::io::Write for CapturingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "test-util")]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+#[cfg(feature = "test-util")]
+fn capturing_subscriber() -> (CapturingWriter, impl tracing::Subscriber) {
+    let writer = CapturingWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer.clone())
+        // INFO (not WARN): some call sites emit `tracing::info!` (e.g. deps-swift's
+        // release-dates token-gate skip) that a WARN-only filter would silently drop,
+        // alongside every `warn_rejected_value`/other WARN-level emission this helper
+        // exists to assert on.
+        .with_max_level(tracing::Level::INFO)
+        .without_time()
+        .with_target(false)
+        .finish();
+    (writer, subscriber)
+}
+
+/// Captures `tracing` output emitted synchronously during `f` into a `String`.
+///
+/// Lets a test assert a `tracing::warn!`/`info!` call actually fired — e.g.
+/// [`crate::lsp_helpers::warn_rejected_value`] — without a real logging sink or a
+/// network-dependent end-to-end path.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::capture_tracing_output;
+///
+/// let output = capture_tracing_output(|| tracing::warn!("something rejected"));
+/// assert!(output.contains("something rejected"));
+/// ```
+#[cfg(feature = "test-util")]
+#[must_use]
+pub fn capture_tracing_output(f: impl FnOnce()) -> String {
+    let (writer, subscriber) = capturing_subscriber();
+    tracing::subscriber::with_default(subscriber, f);
+    String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+}
+
+/// Async counterpart of [`capture_tracing_output`], for a `tracing` emission inside an
+/// `async fn`/`.await`ed future.
+///
+/// Relies on a `#[tokio::test]` current-thread runtime polling `fut` on the same thread
+/// that installed the subscriber as the thread-local default.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::capture_tracing_output_async;
+///
+/// # #[tokio::main]
+/// # async fn main() {
+/// let output = capture_tracing_output_async(async {
+///     tracing::warn!("something rejected");
+/// })
+/// .await;
+/// assert!(output.contains("something rejected"));
+/// # }
+/// ```
+#[cfg(feature = "test-util")]
+pub async fn capture_tracing_output_async(fut: impl std::future::Future<Output = ()>) -> String {
+    let (writer, subscriber) = capturing_subscriber();
+    let guard = tracing::subscriber::set_default(subscriber);
+    fut.await;
+    drop(guard);
+    String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
 }

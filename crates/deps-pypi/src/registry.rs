@@ -10,7 +10,7 @@
 //! All HTTP requests are cached aggressively using ETag/Last-Modified headers.
 
 use crate::types::{PypiPackage, PypiVersion};
-use deps_core::{DepsError, HttpCache, Result};
+use deps_core::{DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value};
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
 use std::any::Any;
@@ -44,6 +44,11 @@ pub const PYPI_URL: &str = "https://pypi.org/project";
 pub fn package_url(name: &str) -> String {
     let normalized = crate::name::normalize(name);
     if normalized.is_empty() {
+        warn_rejected_value(
+            "pypi_normalized_name_empty",
+            "PyPI package display URL",
+            name,
+        );
         return String::new();
     }
     format!("{}/{}", PYPI_URL, urlencoding::encode(&normalized))
@@ -142,6 +147,11 @@ impl PypiRegistry {
     pub async fn get_versions(&self, name: &str) -> Result<Vec<PypiVersion>> {
         let normalized = crate::name::normalize(name);
         if normalized.is_empty() {
+            warn_rejected_value(
+                "pypi_normalized_name_empty",
+                "PyPI simple API request URL",
+                name,
+            );
             return Err(DepsError::PackageNotFound {
                 package: name.to_string(),
                 registry: REGISTRY,
@@ -251,6 +261,11 @@ impl PypiRegistry {
     pub async fn get_package_metadata(&self, name: &str) -> Result<PypiPackage> {
         let normalized = crate::name::normalize(name);
         if normalized.is_empty() {
+            warn_rejected_value(
+                "pypi_normalized_name_empty",
+                "PyPI package metadata request URL",
+                name,
+            );
             return Err(DepsError::PackageNotFound {
                 package: name.to_string(),
                 registry: REGISTRY,
@@ -605,6 +620,8 @@ fn parse_package_info(package_name: &str, data: &[u8]) -> Result<PypiPackage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use deps_core::test_util::{capture_tracing_output, capture_tracing_output_async};
 
     #[test]
     fn test_package_url() {
@@ -1096,6 +1113,17 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_url_encodes_path_traversal_attempt() {
+        // Same #365 sweep coverage as `test_simple_api_url_encodes_malicious_name` —
+        // `metadata_url` shares `simple_api_url`'s encoding but had no adversarial
+        // traversal test of its own (#380).
+        let url = metadata_url("evil/../secret");
+        assert!(url.starts_with(PYPI_BASE));
+        assert!(!url.contains("/../"));
+        assert_eq!(url, format!("{PYPI_BASE}/evil%2F..%2Fsecret/json"));
+    }
+
+    #[test]
     fn test_simple_api_url_normal_names() {
         assert_eq!(
             simple_api_url("requests"),
@@ -1215,6 +1243,71 @@ mod tests {
         let registry = PypiRegistry::new(cache);
         let err = registry.get_package_metadata("...").await.unwrap_err();
         assert!(matches!(err, DepsError::PackageNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_empty_normalized_name_logs_warn_rejected_value() {
+        // #380 B3: the short-circuit test above only proves the `Err` return value, not
+        // that `warn_rejected_value` actually fires — a deleted warn call would still pass it.
+        let cache = std::sync::Arc::new(deps_core::HttpCache::new());
+        let registry = PypiRegistry::new(cache);
+        let output = capture_tracing_output_async(async {
+            let _ = registry.get_versions("---").await;
+        })
+        .await;
+        assert!(
+            output.contains("pypi_normalized_name_empty"),
+            "output was: {output}"
+        );
+        assert!(
+            output.contains("PyPI simple API request URL"),
+            "output was: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_package_metadata_empty_normalized_name_logs_warn_rejected_value() {
+        let cache = std::sync::Arc::new(deps_core::HttpCache::new());
+        let registry = PypiRegistry::new(cache);
+        let output = capture_tracing_output_async(async {
+            let _ = registry.get_package_metadata("...").await;
+        })
+        .await;
+        assert!(
+            output.contains("pypi_normalized_name_empty"),
+            "output was: {output}"
+        );
+        assert!(
+            output.contains("PyPI package metadata request URL"),
+            "output was: {output}"
+        );
+    }
+
+    #[test]
+    fn test_package_url_empty_normalized_name_logs_warn_rejected_value() {
+        let output = capture_tracing_output(|| {
+            let _ = package_url("---");
+        });
+        assert!(
+            output.contains("pypi_normalized_name_empty"),
+            "output was: {output}"
+        );
+        assert!(
+            output.contains("PyPI package display URL"),
+            "output was: {output}"
+        );
+        assert!(
+            !output.contains("---"),
+            "raw rejected value must not be logged: {output}"
+        );
+    }
+
+    #[test]
+    fn test_package_url_accepted_logs_no_warn() {
+        let output = capture_tracing_output(|| {
+            let _ = package_url("requests");
+        });
+        assert!(output.is_empty(), "output was: {output}");
     }
 
     #[test]

@@ -12,6 +12,11 @@ const PUB_DEV_API_BASE: &str = "https://pub.dev/api";
 /// Display name for pub.dev used in not-found and API-response error messages.
 pub const REGISTRY: &str = "pub.dev";
 
+/// Returns the URL for a package's page on pub.dev.
+///
+/// Display link only, never fetched by this process — unlike `package_metadata_url`
+/// (a fetch sink), so it is deliberately not gated against a `.`/`..` name (see
+/// [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link scope split, #379).
 pub fn package_url(name: &str) -> String {
     format!("https://pub.dev/packages/{}", urlencoding::encode(name))
 }

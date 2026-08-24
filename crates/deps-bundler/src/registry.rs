@@ -19,6 +19,10 @@ pub const REGISTRY: &str = "RubyGems";
 pub const RUBYGEMS_URL: &str = "https://rubygems.org/gems";
 
 /// Returns the URL for a gem's page on rubygems.org.
+///
+/// Display link only, never fetched by this process — unlike `versions_url`/`gem_info_url`
+/// (fetch sinks), so it is deliberately not gated against a `.`/`..` name (see
+/// [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link scope split, #379).
 pub fn gem_url(name: &str) -> String {
     format!("{RUBYGEMS_URL}/{}", urlencoding::encode(name))
 }

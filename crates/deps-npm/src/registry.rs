@@ -80,6 +80,11 @@ pub const NPMJS_URL: &str = "https://www.npmjs.com/package";
 /// percent-encoded individually so the URL still resolves, while everything else
 /// (including any attempt to smuggle extra path or Markdown syntax into a segment) is
 /// escaped.
+///
+/// Display link only, never fetched by this process — unlike the packument-fetch URL (see
+/// `get_versions`'s `has_dot_segment` gate), so it is deliberately not gated against a
+/// `.`/`..` segment (see [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link
+/// scope split, #379).
 pub fn package_url(name: &str) -> String {
     if let Some(rest) = name.strip_prefix('@')
         && let Some((scope, pkg)) = rest.split_once('/')

@@ -134,6 +134,10 @@ fn validate_version_string(version: &str) -> crate::error::Result<()> {
 /// as the legitimate path separator in Go module paths (e.g.
 /// `github.com/gin-gonic/gin`) while every other character — including `%`, which a
 /// hand-rolled denylist would otherwise miss — is escaped.
+///
+/// Display link only, never fetched by this process — unlike a registry-fetch URL
+/// builder, so it is deliberately not gated against a `.`/`..` module-path segment (see
+/// [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link scope split, #379).
 pub fn package_url(module_path: &str) -> String {
     let encoded = module_path
         .split('/')

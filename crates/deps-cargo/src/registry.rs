@@ -41,6 +41,11 @@ pub const REGISTRY: &str = "crates.io";
 pub const CRATES_IO_URL: &str = "https://crates.io/crates";
 
 /// Returns the URL for a crate's page on crates.io.
+///
+/// Display link only, never fetched by this process — unlike the sparse-index
+/// registry-fetch URL (`sparse_index_path`), so it is deliberately not gated against a
+/// `.`/`..` name (see [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link
+/// scope split, #379).
 pub fn crate_url(name: &str) -> String {
     format!("{CRATES_IO_URL}/{}", urlencoding::encode(name))
 }

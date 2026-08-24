@@ -494,6 +494,7 @@ dependencies = [
  "tokio-test",
  "tower-lsp-server",
  "tracing",
+ "tracing-subscriber",
  "url",
  "urlencoding",
  "yaml-rust2",
@@ -716,7 +717,6 @@ dependencies = [
  "tokio-test",
  "tower-lsp-server",
  "tracing",
- "tracing-subscriber",
  "urlencoding",
 ]
 

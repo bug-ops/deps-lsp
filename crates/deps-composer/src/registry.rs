@@ -23,6 +23,10 @@ const PACKAGIST_WEB: &str = "https://packagist.org/packages";
 /// Packagist names are `vendor/package`; each segment is percent-encoded
 /// individually so the `/` separator survives while any Markdown/URL-breaking
 /// characters in a segment are escaped.
+///
+/// Display link only, never fetched by this process — unlike the `p2/{vendor}/{package}`
+/// metadata-fetch URL, so it is deliberately not gated against a `.`/`..` segment (see
+/// [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link scope split, #379).
 pub fn package_url(name: &str) -> String {
     if let Some((vendor, package)) = name.split_once('/') {
         format!(

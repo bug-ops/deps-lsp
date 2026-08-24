@@ -162,6 +162,11 @@ struct SearchResultDoc {
 }
 
 /// Returns the nuget.org package page URL for `name`.
+///
+/// Display link only, never fetched by this process — unlike [`flat_container_url`]/
+/// [`registration_index_url`] (fetch sinks), so it is deliberately not gated against a
+/// `.`/`..` name (see [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link
+/// scope split, #379).
 pub fn package_url(name: &str) -> String {
     format!(
         "https://www.nuget.org/packages/{}",
@@ -1047,6 +1052,52 @@ mod tests {
                 "Newtonsoft.Json"
             ),
             "https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json"
+        );
+    }
+
+    #[test]
+    fn test_registration_index_url_encodes_path_traversal_attempt() {
+        // Same #365 sweep coverage as `test_flat_container_url_encodes_path_traversal_attempt`
+        // — `registration_index_url` shares `flat_container_url`'s encoding but had no
+        // adversarial test of its own (#380).
+        let url = registration_index_url(
+            "https://api.nuget.org/v3/registration5-gz-semver2",
+            "../../../../etc/passwd",
+        );
+        assert_eq!(
+            url,
+            "https://api.nuget.org/v3/registration5-gz-semver2/..%2F..%2F..%2F..%2Fetc%2Fpasswd/index.json"
+        );
+        assert!(
+            !url.contains("/../"),
+            "raw path traversal segment leaked into URL: {url}"
+        );
+    }
+
+    #[test]
+    fn test_registration_index_url_encodes_fragment_and_query_delimiters() {
+        assert_eq!(
+            registration_index_url("https://api.nuget.org/v3/registration5-gz-semver2", "Foo#x"),
+            "https://api.nuget.org/v3/registration5-gz-semver2/foo%23x/index.json"
+        );
+        assert_eq!(
+            registration_index_url(
+                "https://api.nuget.org/v3/registration5-gz-semver2",
+                "Foo?x=1"
+            ),
+            "https://api.nuget.org/v3/registration5-gz-semver2/foo%3Fx%3D1/index.json"
+        );
+    }
+
+    #[test]
+    fn test_registration_index_url_encodes_control_characters() {
+        let url = registration_index_url(
+            "https://api.nuget.org/v3/registration5-gz-semver2",
+            "Foo\tBar",
+        );
+        assert_eq!(
+            url,
+            "https://api.nuget.org/v3/registration5-gz-semver2/foo%09bar/index.json"
         );
     }
 

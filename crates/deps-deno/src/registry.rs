@@ -11,7 +11,7 @@ use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use crate::types::{DenoMetadata, JsrPackage, JsrVersion};
 use deps_core::{
     DepsError, FreshnessSettings, HttpCache, Metadata, PackageName, Registry, Result, Version,
-    VersionReq,
+    VersionReq, lsp_helpers::warn_rejected_value,
 };
 use deps_npm::NpmRegistry;
 use serde::Deserialize;
@@ -26,6 +26,12 @@ const JSR_API_BASE: &str = "https://api.jsr.io";
 pub const REGISTRY: &str = "jsr";
 
 /// Returns the URL for a JSR package's page on jsr.io.
+///
+/// Display link only, never fetched by this process — unlike `meta_json_url` (a fetch
+/// sink), so it is deliberately not gated against a `.`/`..` scope or name segment (see
+/// [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link scope split, #379).
+/// `DenoFormatter::package_url` (the sole caller) already rejects a malformed/unscoped `jsr:`
+/// specifier before reaching here (#378/#380 follow-up); this function itself is unchanged.
 #[must_use]
 pub fn jsr_package_url(scope: &str, name: &str) -> String {
     format!(
@@ -208,6 +214,7 @@ impl JsrRegistry {
         // for every `JsrRegistry::get_versions` caller (`DenoRegistry::get_versions`,
         // `get_versions_with`, `get_latest_matching`).
         if is_dot_prefixed(scope) || is_dot_prefixed(name) {
+            warn_rejected_value("is_dot_prefixed", "jsr meta.json request URL", &full_name);
             return Err(DepsError::PackageNotFound {
                 package: full_name,
                 registry: REGISTRY,
@@ -530,6 +537,8 @@ impl Registry for DenoRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use deps_core::test_util::capture_tracing_output_async;
 
     #[test]
     fn test_jsr_package_url() {
@@ -894,6 +903,22 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_jsr_registry_get_versions_rejection_logs_warn_rejected_value() {
+        // N1: the two tests above only prove the `Err` return value, not that
+        // `warn_rejected_value` actually fires from this fetch-sink gate.
+        let registry = unreachable_jsr(Arc::new(HttpCache::new()));
+        let output = capture_tracing_output_async(async {
+            let _ = registry.get_versions("std", "..").await;
+        })
+        .await;
+        assert!(output.contains("is_dot_prefixed"), "output was: {output}");
+        assert!(
+            output.contains("jsr meta.json request URL"),
+            "output was: {output}"
+        );
     }
 
     #[tokio::test]
