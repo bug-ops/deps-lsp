@@ -1112,15 +1112,20 @@ mod tests {
         );
     }
 
+    /// #365 regression sweep: exercises the real production `name::normalize` and
+    /// `metadata_url` together against the shared adversarial input set, mirroring
+    /// `test_simple_api_url_dot_segment_sweep` for the sibling sink (#380).
     #[test]
-    fn test_metadata_url_encodes_path_traversal_attempt() {
-        // Same #365 sweep coverage as `test_simple_api_url_encodes_malicious_name` —
-        // `metadata_url` shares `simple_api_url`'s encoding but had no adversarial
-        // traversal test of its own (#380).
-        let url = metadata_url("evil/../secret");
-        assert!(url.starts_with(PYPI_BASE));
-        assert!(!url.contains("/../"));
-        assert_eq!(url, format!("{PYPI_BASE}/evil%2F..%2Fsecret/json"));
+    fn test_metadata_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained_transformed(
+            |seg| {
+                let normalized = crate::name::normalize(seg);
+                (!normalized.is_empty()).then(|| metadata_url(&normalized))
+            },
+            crate::name::normalize,
+            "pypi.org",
+            "/pypi/",
+        );
     }
 
     #[test]

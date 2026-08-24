@@ -1055,49 +1055,19 @@ mod tests {
         );
     }
 
+    /// #365 regression sweep: exercises the real production `reject_dot_segment` gate and
+    /// `registration_index_url` sink together against the shared adversarial input set,
+    /// mirroring `test_flat_container_url_dot_segment_sweep` for the sibling sink (#380).
     #[test]
-    fn test_registration_index_url_encodes_path_traversal_attempt() {
-        // Same #365 sweep coverage as `test_flat_container_url_encodes_path_traversal_attempt`
-        // — `registration_index_url` shares `flat_container_url`'s encoding but had no
-        // adversarial test of its own (#380).
-        let url = registration_index_url(
-            "https://api.nuget.org/v3/registration5-gz-semver2",
-            "../../../../etc/passwd",
-        );
-        assert_eq!(
-            url,
-            "https://api.nuget.org/v3/registration5-gz-semver2/..%2F..%2F..%2F..%2Fetc%2Fpasswd/index.json"
-        );
-        assert!(
-            !url.contains("/../"),
-            "raw path traversal segment leaked into URL: {url}"
-        );
-    }
-
-    #[test]
-    fn test_registration_index_url_encodes_fragment_and_query_delimiters() {
-        assert_eq!(
-            registration_index_url("https://api.nuget.org/v3/registration5-gz-semver2", "Foo#x"),
-            "https://api.nuget.org/v3/registration5-gz-semver2/foo%23x/index.json"
-        );
-        assert_eq!(
-            registration_index_url(
-                "https://api.nuget.org/v3/registration5-gz-semver2",
-                "Foo?x=1"
-            ),
-            "https://api.nuget.org/v3/registration5-gz-semver2/foo%3Fx%3D1/index.json"
-        );
-    }
-
-    #[test]
-    fn test_registration_index_url_encodes_control_characters() {
-        let url = registration_index_url(
-            "https://api.nuget.org/v3/registration5-gz-semver2",
-            "Foo\tBar",
-        );
-        assert_eq!(
-            url,
-            "https://api.nuget.org/v3/registration5-gz-semver2/foo%09bar/index.json"
+    fn test_registration_index_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| {
+                reject_dot_segment(seg).ok().map(|()| {
+                    registration_index_url("https://api.nuget.org/v3/registration5-gz-semver2", seg)
+                })
+            },
+            "api.nuget.org",
+            "/v3/registration5-gz-semver2/",
         );
     }
 
