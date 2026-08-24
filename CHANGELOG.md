@@ -131,6 +131,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-deno**: remove stale "jsr: completion dead zone" limitation note from README — the underlying gap was closed by #324 (resolves #335) (#346).
 - **deps-bundler**: `canonical_segments` now ports RubyGems' padding-stripping regexes literally at the string level instead of the token-array level, fixing a divergence on versions with two prerelease tag runs separated by a zero segment (e.g. `1.2.3-0.beta1`) (resolves #331).
 - **deps-bundler**: `compile_requirement` now validates a requirement's version operand before compiling a matcher for it, so a malformed `~>`/`<`/`<=`/`=`/bare requirement is suppressed instead of producing a misleading "No published version satisfies requirement" diagnostic (resolves #332).
+- **deps-bundler**: `=`/`!=` and bare (no-operator) version requirement matching now use canonical `Gem::Version` equality instead of raw string comparison, so a version differing only by trailing-zero padding matches correctly (e.g. `1.6` and `1.6.0`) — including the common bare-pin Gemfile style (`gem "x", "7.0"`), which is RubyGems' own `=` operator internally (resolves #345) (#353).
 
 ### Security
 - **deps-core**, **deps-nuget**: `HttpCache` now enforces a redirect policy — blocks `https`->`http` downgrades on every request, and, via a new opt-in `get_cached_trusted_origin`, blocks cross-origin redirect escapes for NuGet's registration-hive fetches (#300).
