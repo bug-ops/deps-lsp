@@ -96,11 +96,18 @@ pub struct NpmVersion {
     pub published_at: Option<deps_core::PublishTime>,
 }
 
-// Use macro to implement VersionInfo and Version traits
+// Use macro to implement VersionInfo and Version traits. `node_semver`
+// reliably exposes npm's own prerelease identifiers instead of falling back
+// to deps-core's default hyphen-substring heuristic (#322). The registry
+// enforces valid semver on publish, so a parse failure here (treated as
+// not-prerelease) is practically unreachable.
 deps_core::impl_version!(NpmVersion {
     version: version,
     yanked: deprecated,
     published_at: published_at,
+    prerelease: |v: &NpmVersion| {
+        node_semver::Version::parse(&v.version).is_ok_and(|parsed| parsed.is_prerelease())
+    },
 });
 
 /// Package metadata from npm registry.
@@ -199,6 +206,25 @@ mod tests {
 
         assert_eq!(version.version_string(), "2.0.0");
         assert!(version.is_yanked());
+    }
+
+    #[test]
+    fn test_npm_version_is_prerelease() {
+        let stable = NpmVersion {
+            version: "18.0.0".into(),
+            deprecated: false,
+            published_at: None,
+        };
+        let prerelease = NpmVersion {
+            version: "18.0.0-beta.1".into(),
+            deprecated: false,
+            published_at: None,
+        };
+
+        assert!(!stable.is_prerelease());
+        assert!(stable.is_stable());
+        assert!(prerelease.is_prerelease());
+        assert!(!prerelease.is_stable());
     }
 
     #[test]

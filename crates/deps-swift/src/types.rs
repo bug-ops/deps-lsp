@@ -62,10 +62,19 @@ pub struct SwiftVersion {
     pub published_at: Option<deps_core::PublishTime>,
 }
 
+// GitHub release tags are parsed as strict semver (the `v` prefix already
+// stripped), so `semver::Version::parse` gives a reliable `pre` component
+// instead of falling back to deps-core's default hyphen-substring
+// heuristic (#322). `tags_to_versions` already filters non-semver tags
+// before this runs, so a parse failure here (treated as not-prerelease) is
+// practically unreachable.
 deps_core::impl_version!(SwiftVersion {
     version: version,
     yanked: yanked,
     published_at: published_at,
+    prerelease: |v: &SwiftVersion| {
+        semver::Version::parse(&v.version).is_ok_and(|parsed| !parsed.pre.is_empty())
+    },
 });
 
 /// Package metadata from GitHub API.
@@ -153,6 +162,25 @@ mod tests {
         };
         assert_eq!(ver.version_string(), "2.40.0");
         assert!(!ver.is_yanked());
+    }
+
+    #[test]
+    fn test_swift_version_is_prerelease() {
+        let stable = SwiftVersion {
+            version: "2.40.0".into(),
+            yanked: false,
+            published_at: None,
+        };
+        let prerelease = SwiftVersion {
+            version: "2.40.0-beta.1".into(),
+            yanked: false,
+            published_at: None,
+        };
+
+        assert!(!stable.is_prerelease());
+        assert!(stable.is_stable());
+        assert!(prerelease.is_prerelease());
+        assert!(!prerelease.is_stable());
     }
 
     #[test]

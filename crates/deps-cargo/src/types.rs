@@ -184,6 +184,15 @@ impl deps_core::Version for CargoVersion {
         self.yanked
     }
 
+    // crates.io enforces valid semver on publish, so `semver::Version::parse`
+    // reliably exposes the `pre` component instead of relying on
+    // deps-core's default hyphen-substring heuristic (#322). A parse
+    // failure (practically unreachable given that enforcement) is treated
+    // as not-prerelease, matching the trait's other implementors.
+    fn is_prerelease(&self) -> bool {
+        semver::Version::parse(&self.num).is_ok_and(|v| !v.pre.is_empty())
+    }
+
     fn features(&self) -> Vec<String> {
         self.features.keys().cloned().collect()
     }
@@ -279,5 +288,28 @@ mod tests {
         assert!(!version.yanked);
         assert!(version.features.is_empty());
         assert!(version.published_at.is_none());
+    }
+
+    #[test]
+    fn test_cargo_version_is_prerelease() {
+        use deps_core::Version;
+
+        let stable = CargoVersion {
+            num: "1.0.0".into(),
+            yanked: false,
+            features: HashMap::new(),
+            published_at: None,
+        };
+        let prerelease = CargoVersion {
+            num: "1.0.0-alpha.1".into(),
+            yanked: false,
+            features: HashMap::new(),
+            published_at: None,
+        };
+
+        assert!(!stable.is_prerelease());
+        assert!(stable.is_stable());
+        assert!(prerelease.is_prerelease());
+        assert!(!prerelease.is_stable());
     }
 }

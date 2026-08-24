@@ -161,6 +161,10 @@ impl deps_core::Version for DartVersion {
         self.retracted
     }
 
+    fn is_prerelease(&self) -> bool {
+        crate::version::is_prerelease(&self.version)
+    }
+
     fn published_at(&self) -> Option<deps_core::PublishTime> {
         self.published_at
     }
