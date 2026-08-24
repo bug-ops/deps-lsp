@@ -691,6 +691,7 @@ async fn fetch_latest_versions_parallel(
     package_names: Vec<PackageName>,
     in_use: &HashMap<PackageName, String>,
     progress_sender: Option<ProgressSender>,
+    freshness: deps_core::freshness::FreshnessSettings,
     timeout_secs: u64,
     max_concurrent: usize,
 ) -> FetchResult {
@@ -717,8 +718,13 @@ async fn fetch_latest_versions_parallel(
                 // Single round trip: the full version list is fetched once, and "latest"
                 // is a pure in-memory pick over it (`Registry::select_latest_matching`) —
                 // no second registry call, so the retained full list costs nothing extra
-                // over the network (see `PackageVersions`).
-                let result = tokio::time::timeout(timeout, registry.get_versions(&name)).await;
+                // over the network (see `PackageVersions`). `get_versions_with` rather than
+                // `get_versions`: this populates `published_at` for registries that support
+                // it (#339), matching hover's existing freshness-aware call — registries with
+                // no override forward straight to `get_versions` at zero extra cost.
+                let result =
+                    tokio::time::timeout(timeout, registry.get_versions_with(&name, freshness))
+                        .await;
 
                 let mut yanked: Option<(PackageName, String)> = None;
                 let mut failed_name: Option<PackageName> = None;
@@ -1103,6 +1109,7 @@ pub async fn handle_document_open(
             dep_names,
             &in_use,
             progress_sender,
+            freshness_settings,
             cache_config.fetch_timeout_secs,
             cache_config.max_concurrent_fetches,
         )
@@ -1467,6 +1474,7 @@ pub async fn handle_document_change(
             deps_to_fetch,
             &in_use,
             progress_sender,
+            freshness_settings,
             cache_config.fetch_timeout_secs,
             cache_config.max_concurrent_fetches,
         )
@@ -1901,8 +1909,16 @@ mod tests {
         let packages = vec![PackageName::new("slow-package")];
 
         // Use 1 second timeout for test speed
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 1, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            1,
+            10,
+        )
+        .await;
 
         // Should return empty (timeout, not success)
         assert!(result.versions.is_empty(), "Slow package should timeout");
@@ -1978,8 +1994,16 @@ mod tests {
         ];
 
         let start = std::time::Instant::now();
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 1, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            1,
+            10,
+        )
+        .await;
         let elapsed = start.elapsed();
 
         // Should complete in ~1s (timeout), not 10s (slow package duration)
@@ -2086,7 +2110,16 @@ mod tests {
             .map(|i| PackageName::new(format!("package-{}", i)))
             .collect();
 
-        fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 20).await;
+        fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            20,
+        )
+        .await;
 
         // Max concurrent should not exceed limit (allow small margin for timing)
         let max = max_seen.load(Ordering::SeqCst);
@@ -2220,8 +2253,16 @@ mod tests {
         ];
 
         // Use 1 second timeout for test speed
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 1, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            1,
+            10,
+        )
+        .await;
 
         // Only the fast package should be in results
         assert_eq!(
@@ -2330,8 +2371,16 @@ mod tests {
         let registry: Arc<dyn Registry> = Arc::new(YankedRegistry);
         let packages = vec![PackageName::new("serde")];
 
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 10, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            10,
+            10,
+        )
+        .await;
 
         let serde = result
             .versions
@@ -2444,8 +2493,16 @@ mod tests {
         let registry: Arc<dyn Registry> = Arc::new(DatedRegistry);
         let packages = vec![PackageName::new("serde")];
 
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 10, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            10,
+            10,
+        )
+        .await;
 
         let serde = result
             .versions
@@ -2456,6 +2513,129 @@ mod tests {
             serde.published_at,
             Some(PublishTime::from_unix_secs(2_000)),
             "published_at must be 1.0.214's own timestamp, not the yanked 1.0.213 entry's"
+        );
+    }
+
+    /// #339 regression guard: the bulk diagnostics-cache-population pass must call the
+    /// freshness-aware `Registry::get_versions_with`, not the freshness-blind `get_versions`,
+    /// for a registry that implements the override — otherwise `published_at` (and the
+    /// cooldown-context diagnostic message it drives) is silently always `None` in
+    /// production even though hover's separate call path gets it right.
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_uses_get_versions_with_for_freshness() {
+        use deps_core::freshness::{FreshnessSettings, PublishTime};
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        #[derive(Debug)]
+        struct MockVersion {
+            version: String,
+            published_at: Option<PublishTime>,
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &str {
+                &self.version
+            }
+            fn is_yanked(&self) -> bool {
+                false
+            }
+            fn published_at(&self) -> Option<PublishTime> {
+                self.published_at
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct FreshnessAwareRegistry;
+
+        impl Registry for FreshnessAwareRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                // Deliberately returns no `published_at` — if the fetch loop ever calls
+                // this instead of `get_versions_with`, the assertion below catches it.
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockVersion {
+                        version: "1.0.0".to_string(),
+                        published_at: None,
+                    }) as Box<dyn Version>])
+                })
+            }
+
+            fn get_versions_with<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                freshness: FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockVersion {
+                        version: "1.0.0".to_string(),
+                        published_at: freshness
+                            .enabled
+                            .then(|| PublishTime::from_unix_secs(5_000)),
+                    }) as Box<dyn Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &deps_core::VersionReq,
+            ) -> Option<usize> {
+                if versions.is_empty() { None } else { Some(0) }
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(FreshnessAwareRegistry);
+        let packages = vec![PackageName::new("widget")];
+
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            FreshnessSettings::default(),
+            10,
+            10,
+        )
+        .await;
+
+        let widget = result
+            .versions
+            .get("widget")
+            .expect("widget should be fetched");
+        assert_eq!(
+            widget.published_at,
+            Some(PublishTime::from_unix_secs(5_000)),
+            "published_at must come from get_versions_with, not the freshness-blind \
+             get_versions (#339)"
         );
     }
 
@@ -2532,8 +2712,16 @@ mod tests {
         let registry: Arc<dyn Registry> = Arc::new(UntaggedModuleRegistry);
         let packages = vec![PackageName::new("golang.org/x/exp")];
 
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            10,
+        )
+        .await;
 
         assert_eq!(
             result
@@ -2603,8 +2791,16 @@ mod tests {
         ];
 
         // Should not panic, just return empty result
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            10,
+        )
+        .await;
 
         // All packages failed, result should be empty
         assert!(
@@ -2688,8 +2884,16 @@ mod tests {
         let registry: Arc<dyn Registry> = Arc::new(NotFoundRegistry);
         let packages = vec![PackageName::new("typo-pkg")];
 
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            10,
+        )
+        .await;
 
         assert!(result.versions.is_empty());
         assert!(
@@ -2756,8 +2960,16 @@ mod tests {
         let registry: Arc<dyn Registry> = Arc::new(Http404Registry);
         let packages = vec![PackageName::new("typo-pkg")];
 
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            10,
+        )
+        .await;
 
         assert!(result.versions.is_empty());
         assert!(
@@ -2826,8 +3038,16 @@ mod tests {
         let registry: Arc<dyn Registry> = Arc::new(FallbackErrorRegistry);
         let packages = vec![PackageName::new("flaky"), PackageName::new("not-found")];
 
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 5, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            10,
+        )
+        .await;
 
         assert!(result.versions.is_empty());
         assert_eq!(
@@ -2892,8 +3112,16 @@ mod tests {
         let packages = vec![PackageName::new("slow-fallback")];
 
         // 1s timeout for test speed.
-        let result =
-            fetch_latest_versions_parallel(registry, packages, &HashMap::new(), None, 1, 10).await;
+        let result = fetch_latest_versions_parallel(
+            registry,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            1,
+            10,
+        )
+        .await;
 
         assert!(result.versions.is_empty());
         assert_eq!(
@@ -3479,8 +3707,16 @@ dependencies = ["requests>=2.0.0"]
             );
 
             let registry: Arc<dyn Registry> = Arc::new(MockYankedRegistry { pinned_version });
-            let fetch_result =
-                fetch_latest_versions_parallel(registry, dep_names, &in_use, None, 5, 10).await;
+            let fetch_result = fetch_latest_versions_parallel(
+                registry,
+                dep_names,
+                &in_use,
+                None,
+                deps_core::freshness::FreshnessSettings::default(),
+                5,
+                10,
+            )
+            .await;
 
             let yanked_versions: HashMap<String, String> = fetch_result
                 .yanked_versions
@@ -5264,6 +5500,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &in_use,
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5290,6 +5527,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &in_use,
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5314,6 +5552,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &HashMap::new(),
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5346,6 +5585,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &in_use,
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5378,6 +5618,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &in_use,
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5410,6 +5651,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &in_use,
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5444,6 +5686,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &in_use,
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5482,6 +5725,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &HashMap::new(),
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5514,6 +5758,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &HashMap::new(),
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5557,6 +5802,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &in_use,
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
             )
@@ -5585,6 +5831,7 @@ tokio = "1.0"
                 vec![PackageName::new("pkg")],
                 &in_use,
                 None,
+                deps_core::freshness::FreshnessSettings::default(),
                 1,
                 10,
             )

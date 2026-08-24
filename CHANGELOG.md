@@ -56,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: extract `Version::is_prerelease()`'s default heuristic into a reusable `has_default_prerelease_marker` function (resolves #327) (#330)
 
 ### Fixed
+- **deps-npm, deps-deno**: npm/JSR packages whose every published version is deprecated or yanked are no longer misreported as "Unknown package" (resolves #338).
+- **deps-lsp**: release-cooldown diagnostic message now fires for npm, Deno, Maven, NuGet, and Swift, not just hover (resolves #339).
+- **deps-maven, deps-gradle**: diagnostics and quick-fix no longer recommend a prerelease as "latest" when a newer stable release exists (resolves #340).
 - **deps-lsp**: `handle_inlay_hints` no longer awaits the config `RwLock` read while holding a `DashMap` document `Ref`, closing the reproducible liveness hazard from #317 (the residual `Ref`-across-`generate_*()` hold is tracked separately) (#318).
 - **deps-bundler**: hover's "Recent versions" list no longer repeats the same version once per RubyGems platform variant; entries are now deduplicated by version number (resolves #311) (#321).
 - **deps-core**: hover's `(latest)` marker in "Recent versions" now matches the `**Latest**` header's stable-version pick instead of the raw highest-numbered entry, which could be a pre-release (resolves #313) (#321).

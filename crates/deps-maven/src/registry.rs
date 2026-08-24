@@ -183,27 +183,42 @@ fn move_release_to_front(versions: &mut Vec<MavenVersion>, release: Option<&str>
 /// Picks the "latest" version for a wildcard (`*`/empty) requirement from already-fetched
 /// `(versions, release)` metadata: prefers the `<release>`-designated entry — synthesizing a
 /// placeholder `MavenVersion` if `release` names something absent from `versions`, since
-/// `<release>` is still authoritative even when the metadata is otherwise inconsistent — else
-/// the first non-prerelease entry, else the first entry.
+/// `<release>` is still authoritative even when the metadata is otherwise inconsistent,
+/// *unless* `release` itself is a prerelease (#340 edge case — see below) — else the first
+/// non-prerelease entry, else the first entry.
 ///
 /// Shares its release-present/absent decision shape with [`move_release_to_front`], but
 /// differs in the one case that function structurally cannot handle: `release` naming an
 /// entry absent from `versions`. `move_release_to_front` must return an index into the
 /// existing slice (or no-op), so it can't invent an entry; this function returns an owned
 /// `MavenVersion` and has no such constraint, so it trusts `release` unconditionally instead
-/// — the same asymmetry `get_latest_matching_typed` had before this extraction.
+/// — the same asymmetry `get_latest_matching_typed` had before this extraction. The one
+/// exception: when `release` is absent from `versions` AND is itself a prerelease, this
+/// returns `None` rather than synthesizing it. This is the sole path through which this
+/// function is reachable in production (`Registry::get_latest_matching`'s only caller,
+/// `deps-lsp`'s bulk fetch loop, only falls back to it when
+/// `Registry::select_latest_matching`'s wildcard branch returned `None`, which for Maven
+/// only happens when `versions` is empty) — so without this guard, a
+/// `<release>`-names-a-prerelease-absent-from-an-empty-`<versions>`-list metadata shape
+/// (malformed but real: `parse_metadata_xml` parses `<release>` and `<versions>`
+/// independently) would reproduce #340 through this one narrow, otherwise-unscoped corner.
+/// Trade-off, not a free fix: `None` here surfaces as diagnostics' "Unknown package" for
+/// this narrow malformed shape — the inverse of #338's general "don't report a resolvable
+/// package as unknown" principle. Accepted deliberately (returning `None` rather than
+/// inventing a version is the safer failure mode for metadata this inconsistent), not
+/// something this function's normal contract silently absorbs.
 fn pick_wildcard_latest(versions: &[MavenVersion], release: Option<&str>) -> Option<MavenVersion> {
     if let Some(rel) = release {
-        return Some(
-            versions
-                .iter()
-                .find(|v| v.version == rel)
-                .cloned()
-                .unwrap_or(MavenVersion {
-                    version: rel.to_string(),
-                    published_at: None,
-                }),
-        );
+        if let Some(found) = versions.iter().find(|v| v.version == rel) {
+            return Some(found.clone());
+        }
+        if crate::version::is_prerelease(rel) {
+            return None;
+        }
+        return Some(MavenVersion {
+            version: rel.to_string(),
+            published_at: None,
+        });
     }
     versions
         .iter()
@@ -830,15 +845,36 @@ impl deps_core::Registry for MavenCentralRegistry {
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
-        // `versions` is `get_versions`'s output, which already moved the
-        // maven-metadata.xml `<release>` entry to the front (`move_release_to_front`) — so
-        // index 0 *is* the authoritative "latest" here, not just a sort-order guess. This
-        // keeps `select_latest_matching` (no I/O, no side channel) in agreement with
-        // `get_latest_matching_typed`'s `<release>`-preferring pick without a second
-        // registry round trip.
+        // `versions` is `get_versions`'s output, which already moved the maven-metadata.xml
+        // `<release>` entry to the front (`move_release_to_front`). Unlike npm's curated
+        // `dist-tags.latest`, Maven Central's `<release>`/`<latest>` tags carry no
+        // prerelease semantics — they simply track the most recently *deployed* artifact,
+        // which can itself be a prerelease. So index 0 is trusted only when it isn't one;
+        // otherwise scan for the newest non-prerelease entry. When every version is a
+        // prerelease (#340), this does NOT fall back to raw index 0 either — see the
+        // version-comparison scan below (M1) — since `move_release_to_front` may have
+        // hoisted a `<release>`-tagged prerelease that isn't actually the newest deployed
+        // one. This keeps `select_latest_matching` (no I/O, no side channel) agreeing with
+        // hover's `is_stable()`-based pick whenever a stable version exists.
         let req_str = req.as_str();
         if req_str.is_empty() || req_str == "*" {
-            return if versions.is_empty() { None } else { Some(0) };
+            if versions.is_empty() {
+                return None;
+            }
+            if let Some(idx) = versions.iter().position(|v| !v.is_prerelease()) {
+                return Some(idx);
+            }
+            // FR-002: every version is a prerelease. Don't just trust index 0 here —
+            // `move_release_to_front` may have hoisted a `<release>`-tagged prerelease
+            // that isn't actually the newest deployed one (M1); scan by actual version
+            // comparison instead, same comparator `get_versions` already sorted by.
+            return versions
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    crate::version::compare_versions(a.version_string(), b.version_string())
+                })
+                .map(|(idx, _)| idx);
         }
         versions.iter().position(|v| v.version_string() == req_str)
     }
@@ -1562,6 +1598,29 @@ mod tests {
         assert_eq!(picked.version, "9.9.9");
     }
 
+    /// #340 residual edge case (found during validation, not the original spec): when
+    /// `release` names a prerelease absent from `versions` — the exact shape
+    /// `Registry::get_latest_matching`'s only production caller reaches this function
+    /// through, since `versions` is always empty there — `pick_wildcard_latest` must not
+    /// synthesize a placeholder for it. Doing so would reproduce #340 through this one
+    /// narrow corner even after the `select_latest_matching` fix.
+    #[test]
+    fn test_pick_wildcard_latest_release_prerelease_absent_from_list_returns_none() {
+        let versions: Vec<MavenVersion> = vec![];
+        let picked = pick_wildcard_latest(&versions, Some("8.0.0.Beta1"));
+        assert!(picked.is_none());
+    }
+
+    /// Companion to the above: a *stable* `release` absent from `versions` is unaffected
+    /// (unlikely to be a real issue in practice — this is the pre-existing, deliberately
+    /// documented synthesis behavior for a non-prerelease `<release>` tag).
+    #[test]
+    fn test_pick_wildcard_latest_release_stable_absent_from_empty_list_still_synthesizes() {
+        let versions: Vec<MavenVersion> = vec![];
+        let picked = pick_wildcard_latest(&versions, Some("1.2.3")).unwrap();
+        assert_eq!(picked.version, "1.2.3");
+    }
+
     #[test]
     fn test_pick_wildcard_latest_no_release_prefers_non_prerelease() {
         let versions = vec![
@@ -1579,10 +1638,16 @@ mod tests {
     }
 
     /// S8: `select_latest_matching` (via `move_release_to_front`) and
-    /// `get_latest_matching_typed` (via `pick_wildcard_latest`) must agree on the same
-    /// `(versions, release)` fixture across the three scenarios that previously diverged
-    /// (S3/S7): release present, release absent with a non-prerelease available, release
-    /// absent with only prereleases available.
+    /// `get_latest_matching_typed`'s own wildcard branch (via `pick_wildcard_latest`) must
+    /// agree on the same `(versions, release)` fixture when `<release>` names a stable
+    /// version or is absent (S3/S7). They deliberately no longer agree when `<release>`
+    /// itself names a prerelease *present in `versions`* (#340): `select_latest_matching`
+    /// now skips past it to the newest stable version, matching hover's
+    /// `is_stable()`-based pick, while `pick_wildcard_latest` still trusts a
+    /// `<release>` found in `versions` verbatim — see
+    /// `test_select_latest_matching_skips_prerelease_release_tag`. When `<release>` names a
+    /// prerelease *absent* from `versions` instead, `pick_wildcard_latest` no longer trusts
+    /// it either (see `test_pick_wildcard_latest_release_prerelease_absent_from_list_returns_none`).
     fn assert_select_latest_matching_agrees_with_pick_wildcard_latest(
         versions: Vec<MavenVersion>,
         release: Option<&str>,
@@ -1611,19 +1676,126 @@ mod tests {
     }
 
     #[test]
-    fn test_select_latest_matching_agrees_with_pick_wildcard_latest_release_present() {
+    fn test_select_latest_matching_agrees_with_pick_wildcard_latest_release_present_stable() {
         assert_select_latest_matching_agrees_with_pick_wildcard_latest(
             vec![
-                MavenVersion {
-                    version: "1.4.0".into(),
-                    published_at: None,
-                },
                 MavenVersion {
                     version: "1.5.0-M1".into(),
                     published_at: None,
                 },
+                MavenVersion {
+                    version: "1.4.0".into(),
+                    published_at: None,
+                },
             ],
-            Some("1.5.0-M1"),
+            Some("1.4.0"),
+        );
+    }
+
+    /// #340: `<release>` names a prerelease (`8.0.0.Beta1`-shaped scenario), but a stable
+    /// release also exists in the list. `select_latest_matching`'s wildcard fast path must
+    /// skip past the front-loaded prerelease and return the newest stable version instead
+    /// of blindly trusting index 0, matching hover's `is_stable()`-based pick (FR-001).
+    #[test]
+    fn test_select_latest_matching_skips_prerelease_release_tag() {
+        use deps_core::{Registry, VersionReq};
+
+        let mut versions = vec![
+            MavenVersion {
+                version: "1.4.0".into(),
+                published_at: None,
+            },
+            MavenVersion {
+                version: "1.5.0-M1".into(),
+                published_at: None,
+            },
+        ];
+        // `<release>` names the prerelease, so `move_release_to_front` puts it at index 0 —
+        // reproducing the real `maven-metadata.xml` shape this bug was found in.
+        move_release_to_front(&mut versions, Some("1.5.0-M1"));
+        assert_eq!(versions[0].version, "1.5.0-M1");
+
+        let boxed: Vec<Box<dyn deps_core::Version>> = versions
+            .into_iter()
+            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+            .collect();
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = MavenCentralRegistry::new(cache);
+        let idx = registry
+            .select_latest_matching(&boxed, &VersionReq::new("*"))
+            .expect("non-empty list must select an index");
+
+        assert_eq!(boxed[idx].version_string(), "1.4.0");
+    }
+
+    /// FR-002: when every version in the list is a prerelease, the wildcard fast path
+    /// falls back to the newest version regardless of prerelease status.
+    #[test]
+    fn test_select_latest_matching_wildcard_all_prerelease_falls_back_to_newest() {
+        use deps_core::{Registry, VersionReq};
+
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(MavenVersion {
+                version: "2.0.0-alpha".into(),
+                published_at: None,
+            }),
+            Box::new(MavenVersion {
+                version: "1.0.0-beta".into(),
+                published_at: None,
+            }),
+        ];
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = MavenCentralRegistry::new(cache);
+        let idx = registry
+            .select_latest_matching(&versions, &VersionReq::new("*"))
+            .expect("non-empty list must select an index");
+
+        assert_eq!(versions[idx].version_string(), "2.0.0-alpha");
+    }
+
+    /// M1: when every version is a prerelease AND `<release>` hoisted an *older*
+    /// prerelease to index 0 (`move_release_to_front` trusts `<release>` unconditionally,
+    /// independent of whether it's actually the newest deployed artifact), the FR-002
+    /// fallback must scan by actual version comparison rather than blindly trusting
+    /// index 0 — otherwise a stale/inconsistent `<release>` tag reproduces #340 even in
+    /// this all-prerelease branch.
+    #[test]
+    fn test_select_latest_matching_wildcard_all_prerelease_ignores_stale_release_hoist() {
+        use deps_core::{Registry, VersionReq};
+
+        let mut versions = vec![
+            MavenVersion {
+                version: "2.0.0-beta".into(),
+                published_at: None,
+            },
+            MavenVersion {
+                version: "1.0.0-alpha".into(),
+                published_at: None,
+            },
+        ];
+        // `<release>` names the OLDER prerelease — `move_release_to_front` hoists it to
+        // index 0 regardless, reproducing the real shape a stale/inconsistent
+        // `maven-metadata.xml` could produce.
+        move_release_to_front(&mut versions, Some("1.0.0-alpha"));
+        assert_eq!(versions[0].version, "1.0.0-alpha");
+
+        let boxed: Vec<Box<dyn deps_core::Version>> = versions
+            .into_iter()
+            .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+            .collect();
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = MavenCentralRegistry::new(cache);
+        let idx = registry
+            .select_latest_matching(&boxed, &VersionReq::new("*"))
+            .expect("non-empty list must select an index");
+
+        assert_eq!(
+            boxed[idx].version_string(),
+            "2.0.0-beta",
+            "must scan for the actual newest prerelease, not trust the release-tag hoist"
         );
     }
 

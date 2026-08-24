@@ -39,6 +39,31 @@ const PUBLISH_TIMES_TTL: Duration = Duration::from_hours(1);
 /// a small constant size.
 const PUBLISH_TIMES_MAX_ENTRIES: usize = 256;
 
+/// Per-request timeout for the full-packument fetch inside
+/// [`NpmRegistry::fetch_publish_times`].
+///
+/// Unlike the abbreviated packument `get_versions` uses, the full packument this fetches
+/// (for `published_at`/freshness) can be multi-MB and has no timeout of its own beyond
+/// `HttpCache`'s generic client timeout. Since #339 routes this through the bulk
+/// diagnostics-cache-population pass (`deps-lsp`'s `fetch_latest_versions_parallel`), a
+/// slow full-packument response now shares the same outer per-package
+/// `tokio::time::timeout` (10s default) as the abbreviated fetch it runs alongside —
+/// without a tighter inner cap, a hanging full-packument request could consume that
+/// entire outer budget and lose the package's whole version list ("Registry lookup
+/// failed") where it previously succeeded. Mirrors `deps-swift`'s
+/// `RELEASE_DATES_FETCH_TIMEOUT` pattern: elapsing this timeout is treated the same as
+/// any other fetch failure — an empty map, never propagated as an error.
+///
+/// This is a mitigation, not a structural bound: it is a fixed, independent cap, not
+/// derived from whatever outer budget remains after the abbreviated fetch that runs first
+/// in the same `get_versions_with` call. `fetch_timeout_secs` is user-configurable down to
+/// 1s (`deps-lsp`'s `default_fetch_timeout_secs`/config bounds), and even at the 10s
+/// default a slow-but-under-cap abbreviated fetch plus a full 5s of this timeout can still
+/// exceed the outer budget. Deriving this from the remaining outer time would close that
+/// gap but needs threading the outer deadline into this call — left as a known limitation
+/// rather than a blocking fix.
+const PUBLISH_TIMES_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Display name for the npm registry used in not-found and API-response
 /// error messages.
 pub const REGISTRY: &str = "npm";
@@ -275,14 +300,22 @@ impl NpmRegistry {
         known_versions: &[String],
     ) -> HashMap<String, PublishTime> {
         let url = versions_url(&self.registry_base, name);
-        let body = match self
-            .cache
-            .get_transport_only_with_headers(&url, &[(reqwest::header::ACCEPT, "application/json")])
-            .await
-        {
-            Ok(body) => body,
-            Err(e) => {
+        let fetch = self.cache.get_transport_only_with_headers(
+            &url,
+            &[(reqwest::header::ACCEPT, "application/json")],
+        );
+        let body = match tokio::time::timeout(PUBLISH_TIMES_FETCH_TIMEOUT, fetch).await {
+            Ok(Ok(body)) => body,
+            Ok(Err(e)) => {
                 tracing::debug!(package = %name, error = %e, "full packument fetch failed, publish times unavailable");
+                return HashMap::new();
+            }
+            Err(_) => {
+                tracing::debug!(
+                    package = %name,
+                    timeout_secs = PUBLISH_TIMES_FETCH_TIMEOUT.as_secs(),
+                    "full packument fetch timed out, publish times unavailable"
+                );
                 return HashMap::new();
             }
         };
@@ -311,7 +344,20 @@ impl NpmRegistry {
 
     /// Finds the latest version matching the given npm semver requirement.
     ///
-    /// Only returns non-deprecated versions.
+    /// Only returns non-deprecated, non-prerelease versions unless explicitly requested in
+    /// the version requirement (e.g. `^1.0.0-beta.1` legitimately matches and returns
+    /// `1.0.0-beta.2`), with one exception: under a wildcard/empty requirement
+    /// (`"*"`/`""`), which answers "does this package exist / what is its newest version"
+    /// for existence checks rather than "what should I recommend installing". That call
+    /// prefers the newest stable version, falls back to the newest non-deprecated version
+    /// (possibly a prerelease — including when every version is a prerelease and none is
+    /// deprecated, which resolves to that newest prerelease rather than `None`; hover's
+    /// separate `is_stable()`-based pick shows no `**Latest**` line in that case, so
+    /// diagnostics and hover intentionally diverge here) when no stable version exists, and
+    /// finally to the newest version overall when every version is deprecated (#338) — a
+    /// deprecated package still exists. Mirrors
+    /// [`Registry::select_latest_matching`](deps_core::Registry::select_latest_matching)'s
+    /// wildcard branch exactly, so the two never disagree on the same input.
     ///
     /// # Errors
     ///
@@ -340,6 +386,19 @@ impl NpmRegistry {
         req_str: &str,
     ) -> Result<Option<NpmVersion>> {
         let versions = self.get_versions(name).await?;
+
+        if req_str.is_empty() || req_str == "*" {
+            if versions.is_empty() {
+                return Ok(None);
+            }
+            use deps_core::Version as _;
+            let idx = versions
+                .iter()
+                .position(|v| v.is_stable())
+                .or_else(|| versions.iter().position(|v| !v.deprecated))
+                .unwrap_or(0);
+            return Ok(versions.into_iter().nth(idx));
+        }
 
         // Parse npm semver requirement
         let req = node_semver::Range::parse(req_str)
@@ -616,7 +675,36 @@ impl deps_core::Registry for NpmRegistry {
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
-        let parsed_req = node_semver::Range::parse(req.as_str()).ok()?;
+        let req_str = req.as_str();
+        if req_str.is_empty() || req_str == "*" {
+            if versions.is_empty() {
+                return None;
+            }
+            // Existence/latest-for-display resolution (#338): prefer the newest
+            // stable (non-yanked, non-prerelease) version — matching
+            // `Version::is_stable()`, mirroring `get_latest_matching`'s identical
+            // wildcard branch above so the two never disagree — falling back to the
+            // newest non-yanked version (possibly a prerelease) when no stable
+            // version exists, and finally to the newest version overall when every
+            // version is yanked. A yanked/deprecated-but-existing package must never
+            // resolve to "no version found", but that must not surface an
+            // unrequested prerelease as "the latest" ahead of a stable release.
+            // Deliberate divergence from hover (W1): a package whose every version
+            // is a prerelease, with none deprecated, resolves here to that newest
+            // prerelease (diagnostics can say "Newer version available:
+            // 0.1.0-alpha.2"), while hover's separate `is_stable()`-based pick shows
+            // no `**Latest**` line at all for the same package — this is accepted as
+            // consistent with #338's own principle of not reporting "Unknown
+            // package"/"no latest" for a package that genuinely exists and resolves.
+            return Some(
+                versions
+                    .iter()
+                    .position(|v| v.is_stable())
+                    .or_else(|| versions.iter().position(|v| !v.is_yanked()))
+                    .unwrap_or(0),
+            );
+        }
+        let parsed_req = node_semver::Range::parse(req_str).ok()?;
         versions.iter().position(|v| {
             node_semver::Version::parse(v.version_string())
                 .is_ok_and(|ver| parsed_req.satisfies(&ver) && !v.is_yanked())
@@ -962,6 +1050,302 @@ mod tests {
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
     }
 
+    /// #338: every version is deprecated, but the wildcard existence/latest-for-display
+    /// resolution must still return the newest one rather than `None` — a deprecated
+    /// package still exists.
+    #[test]
+    fn test_select_latest_matching_wildcard_all_deprecated_returns_newest() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(NpmVersion {
+                version: "1.3.0".into(),
+                deprecated: true,
+                published_at: None,
+            }),
+            Box::new(NpmVersion {
+                version: "1.2.0".into(),
+                deprecated: true,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// Same guarantee for the empty-requirement string, which `lifecycle.rs` treats
+    /// identically to `"*"`.
+    #[test]
+    fn test_select_latest_matching_empty_req_all_deprecated_returns_newest() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(NpmVersion {
+            version: "1.0.0".into(),
+            deprecated: true,
+            published_at: None,
+        })];
+        let req = VersionReq::new("");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// B1 regression: the wildcard existence check must still skip a prerelease sitting
+    /// at index 0 (npm's abbreviated packument sorts newest-first regardless of
+    /// prerelease status — a package that publishes canary/beta builds routinely has one
+    /// at the front) and pick the newest *stable* version instead, matching pre-#338
+    /// behavior and hover's `is_stable()`-based pick. #338's deprecated-fallback must not
+    /// have loosened this.
+    #[test]
+    fn test_select_latest_matching_wildcard_skips_prerelease_at_front() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(NpmVersion {
+                version: "19.2.0-canary.1".into(),
+                deprecated: false,
+                published_at: None,
+            }),
+            Box::new(NpmVersion {
+                version: "19.1.0".into(),
+                deprecated: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    /// B1/FR-002-style fallback: when every version is a prerelease (no stable release
+    /// exists at all), the wildcard existence check still resolves to the newest version
+    /// rather than `None` — a prerelease-only package still exists.
+    #[test]
+    fn test_select_latest_matching_wildcard_all_prerelease_falls_back_to_newest() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(NpmVersion {
+                version: "2.0.0-alpha".into(),
+                deprecated: false,
+                published_at: None,
+            }),
+            Box::new(NpmVersion {
+                version: "1.0.0-beta".into(),
+                deprecated: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// B2: `get_latest_matching`'s wildcard branch must agree with
+    /// `select_latest_matching`'s on the same prerelease-at-front shape.
+    #[tokio::test]
+    async fn test_get_latest_matching_wildcard_skips_prerelease_at_front() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/react")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(
+                r#"{"versions": {
+                    "19.2.0-canary.1": {},
+                    "19.1.0": {}
+                }}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = registry.get_latest_matching("react", "*").await.unwrap();
+
+        let version = latest.expect("react has a stable version");
+        assert_eq!(version.version, "19.1.0");
+    }
+
+    /// N4: `get_latest_matching` and `select_latest_matching` must agree under `"*"` on
+    /// the same version data, mirroring `deps-maven`'s S8 helper pattern. `entries` must
+    /// already be newest-first (matching `parse_package_metadata`'s sort), since that's
+    /// what both the mocked packument response and the directly-built `Vec` assume.
+    async fn assert_get_latest_matching_agrees_with_select_latest_matching(
+        name: &str,
+        entries: &[(&str, bool)],
+    ) {
+        use deps_core::{Registry, VersionReq};
+
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        let versions_json: Vec<String> = entries
+            .iter()
+            .map(|(version, deprecated)| {
+                if *deprecated {
+                    format!(r#""{version}": {{"deprecated": "old"}}"#)
+                } else {
+                    format!(r#""{version}": {{}}"#)
+                }
+            })
+            .collect();
+        server
+            .mock("GET", format!("/{name}").as_str())
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"versions": {{{}}}}}"#,
+                versions_json.join(",")
+            ))
+            .create_async()
+            .await;
+
+        let via_get_latest = registry
+            .get_latest_matching(name, "*")
+            .await
+            .unwrap()
+            .expect("fixture always has a pick");
+
+        let boxed: Vec<Box<dyn deps_core::Version>> = entries
+            .iter()
+            .map(|(version, deprecated)| {
+                Box::new(NpmVersion {
+                    version: (*version).to_string(),
+                    deprecated: *deprecated,
+                    published_at: None,
+                }) as Box<dyn deps_core::Version>
+            })
+            .collect();
+        let idx = registry
+            .select_latest_matching(&boxed, &VersionReq::new("*"))
+            .expect("fixture always has a pick");
+
+        assert_eq!(via_get_latest.version, boxed[idx].version_string());
+    }
+
+    #[tokio::test]
+    async fn test_wildcard_agreement_mixed_prerelease_and_stable() {
+        assert_get_latest_matching_agrees_with_select_latest_matching(
+            "react",
+            &[("19.2.0-canary.1", false), ("19.1.0", false)],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_wildcard_agreement_all_deprecated() {
+        assert_get_latest_matching_agrees_with_select_latest_matching(
+            "left-pad-agree",
+            &[("1.3.0", true), ("1.2.0", true)],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_wildcard_agreement_all_prerelease_none_deprecated() {
+        assert_get_latest_matching_agrees_with_select_latest_matching(
+            "canary-only",
+            &[("2.0.0-alpha", false), ("1.0.0-beta", false)],
+        )
+        .await;
+    }
+
+    /// N4 (tier 2): `get_latest_matching`'s all-prerelease/none-deprecated case (W1) —
+    /// the async path's own dedicated regression, alongside the shared-fixture agreement
+    /// test above.
+    #[tokio::test]
+    async fn test_get_latest_matching_wildcard_all_prerelease_none_deprecated_returns_newest() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/canary-only-solo")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(
+                r#"{"versions": {
+                    "2.0.0-alpha": {},
+                    "1.0.0-beta": {}
+                }}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = registry
+            .get_latest_matching("canary-only-solo", "*")
+            .await
+            .unwrap();
+
+        let version = latest.expect("a prerelease-only, non-deprecated package still exists");
+        assert_eq!(version.version, "2.0.0-alpha");
+        assert!(!version.deprecated);
+    }
+
+    /// #338 NFR-001: `get_latest_matching` under a wildcard requirement, mirroring the
+    /// `left-pad`-shaped real-world case (every published version deprecated), must return
+    /// the newest version rather than `None`.
+    #[tokio::test]
+    async fn test_get_latest_matching_wildcard_all_deprecated_returns_newest() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/left-pad")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(
+                r#"{"versions": {
+                    "1.3.0": {"deprecated": "use String.prototype.padStart()"},
+                    "1.2.0": {"deprecated": "use String.prototype.padStart()"}
+                }}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = registry.get_latest_matching("left-pad", "*").await.unwrap();
+
+        let version = latest.expect("an all-deprecated package must still resolve a latest");
+        assert_eq!(version.version, "1.3.0");
+        assert!(version.deprecated);
+    }
+
+    /// #338 NFR-002 (regression): a mix of deprecated and non-deprecated versions under a
+    /// wildcard requirement must still prefer the newest non-deprecated one, unchanged.
+    #[tokio::test]
+    async fn test_get_latest_matching_wildcard_prefers_non_deprecated_when_available() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/widget")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(
+                r#"{"versions": {
+                    "2.0.0": {"deprecated": "use widget-next"},
+                    "1.0.0": {}
+                }}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = registry.get_latest_matching("widget", "*").await.unwrap();
+
+        let version = latest.expect("widget has a non-deprecated version");
+        assert_eq!(version.version, "1.0.0");
+        assert!(!version.deprecated);
+    }
+
     fn npm_v(s: &str) -> NpmVersion {
         NpmVersion {
             version: s.to_string(),
@@ -1210,6 +1594,20 @@ mod tests {
             .await;
 
         assert!(Arc::ptr_eq(&result, &times));
+    }
+
+    /// H1: `fetch_publish_times`'s internal timeout must stay strictly tighter than the
+    /// bulk fetch loop's outer per-package timeout (10s default, `deps-lsp`'s
+    /// `default_fetch_timeout_secs`) — otherwise a hanging full-packument request could
+    /// consume the entire outer budget and lose the abbreviated fetch's own result too,
+    /// reproducing the "Registry lookup failed" regression #339 introduced by routing
+    /// this fetch through the bulk diagnostics-cache-population pass. A live
+    /// elapsed-timeout test is deliberately not included here (mockito has no built-in
+    /// response-delay primitive in this workspace, and sleeping for real seconds in a
+    /// unit test would slow the suite); this asserts the invariant the fix exists for.
+    #[test]
+    fn test_publish_times_fetch_timeout_is_tighter_than_default_outer_fetch_timeout() {
+        assert!(PUBLISH_TIMES_FETCH_TIMEOUT < Duration::from_secs(10));
     }
 
     // --- publish_times / get_versions_with: end-to-end via mockito (S3 — the mandatory
