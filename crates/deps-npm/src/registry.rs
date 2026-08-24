@@ -845,6 +845,18 @@ mod tests {
         assert_eq!(parsed.path(), "/", "parsed path: {}", parsed.path());
     }
 
+    /// #365 regression sweep: exercises the real production pair (`has_dot_segment` gate +
+    /// `versions_url` sink) against the shared adversarial input set, guarding against a 6th
+    /// recurrence of #341's defect class.
+    #[test]
+    fn test_versions_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| (!has_dot_segment(seg)).then(|| versions_url(REGISTRY_BASE, seg)),
+            "registry.npmjs.org",
+            "/",
+        );
+    }
+
     #[test]
     fn test_has_dot_segment_rejects_scoped_dot_dot_package() {
         assert!(has_dot_segment("@a/.."));
@@ -869,23 +881,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_versions_rejects_bare_dot_dot_as_not_found() {
+        // #365 R1: asserts the exact `PackageNotFound` variant (gate rejected before any
+        // request), not the broader `is_not_found()` (also true for a live 404 `HttpStatus`)
+        // — registry.npmjs.org 404ing for this path today would make a deleted gate go
+        // undetected by this test.
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_versions("..").await.unwrap_err();
-        assert!(err.is_not_found());
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
     }
 
     #[tokio::test]
     async fn test_get_versions_rejects_scoped_dot_dot_package_as_not_found() {
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_versions("@a/..").await.unwrap_err();
-        assert!(err.is_not_found());
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
     }
 
     #[tokio::test]
     async fn test_get_versions_rejects_scoped_dot_package_as_not_found() {
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_versions("@a/.").await.unwrap_err();
-        assert!(err.is_not_found());
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
     }
 
     #[test]

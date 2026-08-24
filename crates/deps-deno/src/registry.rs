@@ -584,6 +584,23 @@ mod tests {
         );
     }
 
+    /// #365 regression sweep: exercises the real production pair (`is_dot_prefixed` gate +
+    /// `meta_json_url` sink) against the shared adversarial input set (varying scope, then
+    /// name), guarding against a 6th recurrence of #337's defect class.
+    #[test]
+    fn test_meta_json_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| (!is_dot_prefixed(seg)).then(|| meta_json_url(JSR_BASE, seg, "pkg")),
+            "jsr.io",
+            "/@",
+        );
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| (!is_dot_prefixed(seg)).then(|| meta_json_url(JSR_BASE, "scope", seg)),
+            "jsr.io",
+            "/@",
+        );
+    }
+
     #[test]
     fn test_parse_meta_json_sorts_newest_first() {
         // C2: the raw object order below is deliberately NOT sorted, mirroring the live

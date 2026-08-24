@@ -28,7 +28,7 @@
 use crate::error::GoError;
 use crate::types::GoVersion;
 use crate::version::{escape_module_path, is_pseudo_version};
-use deps_core::{DepsError, HttpCache, Result};
+use deps_core::{DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value};
 use serde::Deserialize;
 use std::any::Any;
 use std::sync::Arc;
@@ -55,6 +55,7 @@ const MAX_VERSION_LENGTH: usize = 128;
 /// Returns error if:
 /// - Path is empty
 /// - Path exceeds MAX_MODULE_PATH_LENGTH
+/// - Any `/`-separated segment is exactly `.`/`..`
 fn validate_module_path(module_path: &str) -> crate::error::Result<()> {
     if module_path.is_empty() {
         return Err(GoError::InvalidModulePath("module path is empty".into()));
@@ -66,7 +67,28 @@ fn validate_module_path(module_path: &str) -> crate::error::Result<()> {
         )));
     }
 
+    // `escape_module_path` deliberately passes `.` and `/` through unescaped — the Go
+    // module proxy protocol requires literal `/` for multi-segment paths, and Go module
+    // paths legitimately contain dots within a segment (e.g. `golang.org/x/mod`). But a
+    // segment that is *exactly* `.`/`..` is never a valid module path component, and once
+    // spliced into `{PROXY_BASE}/{escaped}/@v/list` (etc.) it is silently collapsed by the
+    // URL parser's dot-segment normalization — the same defect class as #341/#349/#357/#361.
+    if module_path.split('/').any(is_dot_segment) {
+        warn_rejected_value("is_dot_segment", "Go module proxy request URL", module_path);
+        return Err(GoError::InvalidModulePath(format!(
+            "module path '{module_path}' contains a `.`/`..` path segment"
+        )));
+    }
+
     Ok(())
+}
+
+/// Builds the Go module proxy request URL for a module's version list. Callers must run
+/// [`validate_module_path`] first — `escape_module_path` passes `.`/`/` through unescaped by
+/// design, so a `.`/`..` path segment reaches this unfiltered.
+fn versions_list_url(module_path: &str) -> String {
+    let escaped = escape_module_path(module_path);
+    format!("{PROXY_BASE}/{escaped}/@v/list")
 }
 
 /// Validates a version string for length and basic format.
@@ -179,8 +201,7 @@ impl GoRegistry {
     pub async fn get_versions(&self, module_path: &str) -> Result<Vec<GoVersion>> {
         validate_module_path(module_path)?;
 
-        let escaped = escape_module_path(module_path);
-        let url = format!("{PROXY_BASE}/{escaped}/@v/list");
+        let url = versions_list_url(module_path);
 
         let data = self
             .cache
@@ -631,6 +652,23 @@ mod tests {
         let _registry = GoRegistry::new(cache);
     }
 
+    /// #365 end-to-end coverage (critic S2): exercises the real production
+    /// `get_versions` — not a reimplemented gate+sink pair — proving the gate is actually
+    /// wired into the call path a real completion/hover/diagnostic request would take. No
+    /// mock is needed: the gate must reject before any network request is issued.
+    /// `GoError::InvalidModulePath` converts to `DepsError::InvalidVersionReq` (see
+    /// `error.rs`), not `PackageNotFound` — this crate's existing not-found mapping is
+    /// unrelated to the dot-segment gate and is left unchanged.
+    #[tokio::test]
+    async fn test_get_versions_rejects_bare_dot_dot_segment() {
+        let registry = GoRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry
+            .get_versions("github.com/user/..")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DepsError::InvalidVersionReq(_)));
+    }
+
     #[tokio::test]
     async fn test_registry_clone() {
         let cache = Arc::new(HttpCache::new());
@@ -752,6 +790,53 @@ mod tests {
     fn test_validate_module_path_valid() {
         let result = validate_module_path("github.com/user/repo");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_module_path_rejects_bare_dot_dot_segment() {
+        let result = validate_module_path("github.com/user/..");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(GoError::InvalidModulePath(_))));
+    }
+
+    #[test]
+    fn test_validate_module_path_rejects_bare_dot_segment() {
+        let result = validate_module_path("./evil");
+        assert!(result.is_err());
+        assert!(matches!(result, Err(GoError::InvalidModulePath(_))));
+    }
+
+    #[test]
+    fn test_validate_module_path_accepts_dots_within_a_segment() {
+        // A dot inside a segment (a real Go module path, e.g. a domain component) is not a
+        // dot-segment and must stay valid.
+        assert!(validate_module_path("golang.org/x/mod").is_ok());
+    }
+
+    /// Demonstrates the vulnerability the `validate_module_path` dot-segment check exists
+    /// to prevent: `versions_list_url` alone (with no caller-side guard) builds a URL that,
+    /// once parsed, has escaped the module path segment entirely.
+    #[test]
+    fn test_versions_list_url_bare_dot_dot_normalizes_above_proxy_root() {
+        let url = versions_list_url("..");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.path(), "/@v/list", "parsed path: {}", parsed.path());
+    }
+
+    /// #365 regression sweep: exercises the real production pair (`validate_module_path`
+    /// gate + `versions_list_url` sink) against the shared adversarial input set, guarding
+    /// against a 6th recurrence of the dot-segment defect class in this crate.
+    #[test]
+    fn test_versions_list_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| {
+                validate_module_path(seg)
+                    .ok()
+                    .map(|()| versions_list_url(seg))
+            },
+            "proxy.golang.org",
+            "/",
+        );
     }
 
     #[test]

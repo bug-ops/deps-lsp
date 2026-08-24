@@ -1075,6 +1075,26 @@ mod tests {
         assert!(!url.contains('#'));
     }
 
+    /// #365 regression sweep: exercises the real production `name::normalize`
+    /// (collapsing a dot-segment to the empty string, rejected before the sink) and
+    /// `simple_api_url` together against the shared adversarial input set. Uses the
+    /// `_transformed` variant since `normalize` legitimately rewrites a compound input
+    /// (e.g. `../../etc/passwd` -> `/-/etc/passwd`) rather than passing it through
+    /// unchanged, so the survival check must compare against the normalized form, not the
+    /// raw adversarial segment.
+    #[test]
+    fn test_simple_api_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained_transformed(
+            |seg| {
+                let normalized = crate::name::normalize(seg);
+                (!normalized.is_empty()).then(|| simple_api_url(&normalized))
+            },
+            crate::name::normalize,
+            "pypi.org",
+            "/simple/",
+        );
+    }
+
     #[test]
     fn test_simple_api_url_normal_names() {
         assert_eq!(

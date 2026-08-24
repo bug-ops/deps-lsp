@@ -544,18 +544,34 @@ mod tests {
         assert!(reject_dot_segment("../../search").is_ok());
     }
 
+    /// #365 regression sweep: exercises the real production pair (`is_dot_segment` gate +
+    /// `package_metadata_url` sink) against the shared adversarial input set, guarding
+    /// against a 6th recurrence of #349's defect class.
+    #[test]
+    fn test_package_metadata_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| (!is_dot_segment(seg)).then(|| package_metadata_url(PUB_DEV_API_BASE, seg)),
+            "pub.dev",
+            "/api/packages/",
+        );
+    }
+
     #[tokio::test]
     async fn test_get_versions_rejects_bare_dot_dot_as_not_found() {
+        // #365 R1: asserts the exact `PackageNotFound` variant (gate rejected before any
+        // request), not the broader `is_not_found()` (also true for a live 404 `HttpStatus`)
+        // — pub.dev 404ing for this path today would make a deleted gate go undetected by
+        // this test.
         let registry = PubDevRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_versions("..").await.unwrap_err();
-        assert!(err.is_not_found());
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
     }
 
     #[tokio::test]
     async fn test_get_package_info_rejects_bare_dot_as_not_found() {
         let registry = PubDevRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_package_info(".").await.unwrap_err();
-        assert!(err.is_not_found());
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
     }
 
     // --- S2 (impl-critic): `search`'s inner per-result fetch (`entry.package`) was

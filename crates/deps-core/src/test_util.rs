@@ -41,3 +41,173 @@ pub fn test_uri(unix_path: &str) -> Uri {
 
     Uri::from_file_path(path).expect("test_uri: fixture path must be a valid file URI")
 }
+
+/// Canonical adversarial identifier values for the recurring dot-segment /
+/// unvalidated-URL-sink defect class (#337, #341, #349, #357, #361).
+///
+/// A manifest-declared package name, scope, or coordinate segment spliced into a
+/// registry/API URL via `format!`/string interpolation without validation. A bare `.`/`..`
+/// survives naive percent-encoding unchanged (`.` is an RFC 3986 unreserved character) and
+/// is silently removed by a URL parser's dot-segment normalization once the string is
+/// assembled and parsed, letting the request escape the intended host or path prefix; the
+/// remaining entries cover a would-be traversal attempt, whitespace, and query/fragment
+/// injection.
+pub const ADVERSARIAL_URL_SEGMENTS: &[&str] = &[
+    ".",
+    "..",
+    "../../etc/passwd",
+    "a b",
+    "a?b=1",
+    "a#frag",
+    "%2e%2e",
+];
+
+/// Exercises one ecosystem's identifier-to-URL sink against every
+/// [`ADVERSARIAL_URL_SEGMENTS`] entry.
+///
+/// `resolve` should mirror the real request path: apply whatever validation gate
+/// (`is_dot_segment`, `is_safe_package_name`, `is_safe_maven_coordinate_segment`, ...) the
+/// production code runs before building the request, returning `None` when the gate would
+/// reject the identifier (the request is never built, so there is nothing to check), or
+/// `Some(url)` with the URL the identifier resolves to when it reaches the real
+/// fetch-URL-builder function directly.
+///
+/// For every input that reaches `Some(url)`, asserts `url` parses, stays under
+/// `expected_host`/`expected_path_prefix`, and that `segment` itself survives the round
+/// trip. That last check is the one that actually catches a missing/deleted gate: for an
+/// ecosystem whose identifier is the *first* path component (no fixed sub-path to nest
+/// under, e.g. `deps-cargo`'s sparse-index path or `deps-npm`'s bare
+/// `registry.npmjs.org/{name}`), `expected_path_prefix` can only ever be `"/"` — trivially
+/// satisfied by any path — so the prefix check alone is a tautology there. Deleting the
+/// real gate collapses `..`/`.` via dot-segment normalization, which removes it from the
+/// path entirely; the survival check catches that regardless of how trivial
+/// `expected_path_prefix` is, so passing `"/"` is fine as long as this check is also in
+/// effect.
+///
+/// The survival check itself takes one of two forms depending on `segment`:
+/// - For a bare `.`/`..` (the only values `url`'s dot-segment normalization treats
+///   specially): some path segment, once percent-decoded, must *start with* that value.
+///   A whole-path substring search would be too weak here — a coincidental `.` baked into
+///   a static suffix the sink always appends (e.g. `.json`) would satisfy `contains` even
+///   if the real `.`/`..` segment was silently removed, leaving no trace of it anywhere.
+///   `starts_with` (not exact equality) still accommodates a sink that glues the
+///   identifier directly onto a static suffix with no separator (e.g. `deps-bundler`'s
+///   `versions_url`, which decodes a `..` identifier to the segment `"..json"`).
+/// - For every other adversarial entry: the percent-decoded *whole path* must contain
+///   `segment` (or `transform(segment)`) as a substring — safe here since none of those
+///   entries collides with a static suffix the way a bare `.` does.
+///
+/// # Panics
+///
+/// Panics if a returned URL fails to parse, escapes `expected_host` or
+/// `expected_path_prefix`, if the (possibly transformed) segment is empty despite
+/// `resolve` returning `Some`, or if the segment does not survive per the rules above.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::assert_dot_segment_gated_or_contained;
+///
+/// fn build(name: &str) -> String {
+///     format!("https://example.com/api/{}", urlencoding::encode(name))
+/// }
+///
+/// fn resolve(name: &str) -> Option<String> {
+///     (name != "." && name != "..").then(|| build(name))
+/// }
+///
+/// assert_dot_segment_gated_or_contained(resolve, "example.com", "/api/");
+/// ```
+pub fn assert_dot_segment_gated_or_contained(
+    resolve: impl Fn(&str) -> Option<String>,
+    expected_host: &str,
+    expected_path_prefix: &str,
+) {
+    assert_dot_segment_gated_or_contained_transformed(
+        resolve,
+        str::to_string,
+        expected_host,
+        expected_path_prefix,
+    );
+}
+
+/// As [`assert_dot_segment_gated_or_contained`], but for a `resolve` whose production gate
+/// legitimately transforms the identifier before it reaches the URL builder.
+///
+/// E.g. PyPI's PEP 503 `name::normalize`, which collapses `.`/`_`/`-` runs, rather than
+/// passing the identifier through unchanged. `transform` computes what the identifier looks
+/// like once it reaches the sink, so the survival check compares the decoded path against
+/// that instead of the raw adversarial `segment` (which would otherwise never appear
+/// literally, producing a false-positive failure with no real bug behind it).
+///
+/// # Panics
+///
+/// Same conditions as [`assert_dot_segment_gated_or_contained`], with `transform(segment)`
+/// in place of `segment` for the survival check.
+pub fn assert_dot_segment_gated_or_contained_transformed(
+    resolve: impl Fn(&str) -> Option<String>,
+    transform: impl Fn(&str) -> String,
+    expected_host: &str,
+    expected_path_prefix: &str,
+) {
+    for segment in ADVERSARIAL_URL_SEGMENTS {
+        let Some(built) = resolve(segment) else {
+            continue;
+        };
+        let parsed = url::Url::parse(&built).unwrap_or_else(|e| {
+            panic!("adversarial segment {segment:?} produced an unparsable URL {built:?}: {e}")
+        });
+        assert_eq!(
+            parsed.host_str(),
+            Some(expected_host),
+            "adversarial segment {segment:?} escaped host: {built}"
+        );
+        assert!(
+            parsed.path().starts_with(expected_path_prefix),
+            "adversarial segment {segment:?} escaped path prefix {expected_path_prefix:?}: {built}"
+        );
+        let expected_fragment = transform(segment);
+        assert!(
+            !expected_fragment.is_empty(),
+            "adversarial segment {segment:?} transformed to an empty fragment but `resolve` \
+             still returned Some(url) — an empty identifier must be rejected (return `None`) \
+             before reaching the sink, since an empty survival check would trivially pass \
+             (\"\".contains(\"\") is always true) and hide a real gate deletion"
+        );
+        if expected_fragment == "." || expected_fragment == ".." {
+            // A whole-path substring search is too weak here: a coincidental `.` baked
+            // into a static suffix the sink always appends (e.g. `.json`/`.xml`) would
+            // satisfy `contains` even if the real gate is deleted and the actual `.`/`..`
+            // segment was silently removed by dot-segment normalization, leaving no trace
+            // of it anywhere. Require a per-segment match instead: some path segment, once
+            // decoded, must itself start with the dot-segment value — `starts_with` (not
+            // exact equality) accommodates a sink that glues the identifier directly onto a
+            // static suffix with no separator (e.g. deps-bundler's `versions_url`, which
+            // decodes a `..` identifier to the segment `"..json"`).
+            let matched = parsed.path_segments().is_some_and(|mut segs| {
+                segs.any(|seg| {
+                    urlencoding::decode(seg)
+                        .is_ok_and(|decoded| decoded.starts_with(expected_fragment.as_str()))
+                })
+            });
+            assert!(
+                matched,
+                "adversarial segment {segment:?} (expected to survive as {expected_fragment:?}) \
+                 did not survive as its own path segment (silently dropped/collapsed by \
+                 dot-segment normalization?): built url {built}"
+            );
+        } else {
+            let decoded_path = urlencoding::decode(parsed.path()).unwrap_or_else(|e| {
+                panic!(
+                    "adversarial segment {segment:?}'s URL path failed to percent-decode: {built:?}: {e}"
+                )
+            });
+            assert!(
+                decoded_path.contains(&expected_fragment),
+                "adversarial segment {segment:?} (expected to survive as {expected_fragment:?}) \
+                 did not survive intact in the decoded path (silently dropped/collapsed by \
+                 dot-segment normalization?): decoded path {decoded_path:?}, built url {built}"
+            );
+        }
+    }
+}

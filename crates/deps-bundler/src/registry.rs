@@ -722,6 +722,26 @@ mod tests {
         );
     }
 
+    /// #365 regression sweep: exercises the real production `versions_url`/`gem_info_url`
+    /// sinks against the shared adversarial input set. Both are safe by construction — the
+    /// literal `.json` suffix is glued directly onto the encoded name with no `/`
+    /// separator, so a bare `.`/`..` can never become an exact dot-segment — but this
+    /// guards that property against a future regression (e.g. a format string change that
+    /// inserts a separator before `.json`).
+    #[test]
+    fn test_versions_and_gem_info_url_dot_segment_sweep() {
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| Some(versions_url(seg)),
+            "rubygems.org",
+            "/api/v1/versions/",
+        );
+        deps_core::test_util::assert_dot_segment_gated_or_contained(
+            |seg| Some(gem_info_url(seg)),
+            "rubygems.org",
+            "/api/v1/gems/",
+        );
+    }
+
     #[test]
     fn test_version_trait() {
         use deps_core::Version;

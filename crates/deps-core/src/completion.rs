@@ -452,6 +452,11 @@ pub fn build_package_completion(
 ) -> Option<CompletionItem> {
     let name = metadata.name();
     if !crate::is_safe_package_name(name.as_str()) {
+        warn_rejected_value(
+            "is_safe_package_name",
+            "primary completion path package name",
+            name.as_str(),
+        );
         return None;
     }
     let latest = metadata.latest_version();
