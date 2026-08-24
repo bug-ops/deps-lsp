@@ -145,6 +145,12 @@ impl EcosystemFormatter for NpmFormatter {
             .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
 
+    /// `node_semver::Range::satisfies` excludes pre-releases unless `requirement` itself pins
+    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
+    fn strict_semver_prerelease_exclusion(&self) -> bool {
+        true
+    }
+
     /// Restricts the yanked-only-match diagnostic to an exact-pin requirement.
     ///
     /// npm's `Version::is_yanked()` is sourced from `deprecated` (`NpmVersion::deprecated`),
