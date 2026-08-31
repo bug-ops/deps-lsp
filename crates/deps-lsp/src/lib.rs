@@ -459,22 +459,20 @@ mod tests {
                  wildcard requirement (#347)"
             );
 
-            // Go and NuGet are deliberate exceptions to this invariant, not #421-class bugs:
+            // Go is a deliberate exception to this invariant, not an #421-class bug
+            // (documented at #364): `select_latest_matching` intentionally excludes
+            // prerelease pseudo-versions unconditionally, with no wildcard fallback, so the
+            // `/@v/list`-based pick never shadows the `/@latest` fallback the fetch loop
+            // needs for a module whose only tags are prerelease. Asserting this invariant
+            // for Go would mean "fixing" behavior that was already deliberately chosen.
             //
-            // - Go (`deps-go/src/registry.rs`, documented at #364): `select_latest_matching`
-            //   intentionally excludes prerelease pseudo-versions unconditionally, with no
-            //   wildcard fallback, so the `/@v/list`-based pick never shadows the `/@latest`
-            //   fallback the fetch loop needs for a module whose only tags are prerelease.
-            // - NuGet (`deps-nuget/src/registry.rs`, `pick_latest_matching`/`resolve_float`):
-            //   `req = "*"` is NuGet's own floating-version syntax for "latest stable",
-            //   distinct from this ladder's "existence check" wildcard — NuGet's own spec
-            //   requires the separate `*-*` floating pattern to opt into prerelease, so a
-            //   bare `"*"` correctly returning nothing for an all-prerelease package is
-            //   NuGet-specific intended behavior, not a gap to close here.
-            //
-            // Asserting this invariant for either would mean "fixing" behavior that was
-            // already deliberately chosen.
-            if matches!(id, "go" | "nuget") {
+            // NuGet used to be excluded here too (`req = "*"` read as NuGet's own
+            // floating-version "latest stable" syntax rather than this ladder's existence
+            // check), but #423 added a fallback rung to `pick_latest_matching`/
+            // `select_latest_matching` (`deps-nuget/src/registry.rs`) so a prerelease-only
+            // package now resolves under a bare wildcard too, matching every other
+            // ecosystem — no exception needed anymore.
+            if matches!(id, "go") {
                 continue;
             }
 
