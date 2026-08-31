@@ -8,7 +8,8 @@
 //!
 //! - Position-preserving parsing via toml-span spans
 //! - Handles all dependency formats: inline, table, workspace inheritance
-//! - Extracts dependencies from all sections: dependencies, dev-dependencies, build-dependencies
+//! - Extracts dependencies from all sections: dependencies, dev-dependencies, build-dependencies,
+//!   including their `[target.<cfg-expr-or-triple>]` variants
 //! - Converts byte offsets to LSP Position (line, UTF-16 character)
 //!
 //! # Examples
@@ -98,37 +99,25 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
         message: "root is not a table".into(),
     })?;
 
-    if let Some(deps_val) = get_val(root_table, "dependencies")
-        && let Some(deps) = deps_val.as_table()
-    {
-        dependencies.extend(parse_dependencies_section(
-            deps,
-            content,
-            &line_table,
-            DependencySection::Dependencies,
-        ));
-    }
+    parse_dependency_kind_tables(root_table, content, &line_table, &mut dependencies);
 
-    if let Some(dev_deps_val) = get_val(root_table, "dev-dependencies")
-        && let Some(dev_deps) = dev_deps_val.as_table()
+    // Parse target-specific dependency tables: [target.<cfg-expr-or-triple>.dependencies],
+    // .dev-dependencies, .build-dependencies (#392). Each entry under [target] is keyed by a
+    // cfg expression (e.g. `cfg(unix)`) or a target triple; every such table can carry the
+    // same three dependency kinds as the top level.
+    if let Some(target_val) = get_val(root_table, "target")
+        && let Some(target_table) = target_val.as_table()
     {
-        dependencies.extend(parse_dependencies_section(
-            dev_deps,
-            content,
-            &line_table,
-            DependencySection::DevDependencies,
-        ));
-    }
-
-    if let Some(build_deps_val) = get_val(root_table, "build-dependencies")
-        && let Some(build_deps) = build_deps_val.as_table()
-    {
-        dependencies.extend(parse_dependencies_section(
-            build_deps,
-            content,
-            &line_table,
-            DependencySection::BuildDependencies,
-        ));
+        for target_entry in target_table.values() {
+            if let Some(target_spec_table) = target_entry.as_table() {
+                parse_dependency_kind_tables(
+                    target_spec_table,
+                    content,
+                    &line_table,
+                    &mut dependencies,
+                );
+            }
+        }
     }
 
     // Parse workspace dependencies (for workspace root Cargo.toml)
@@ -156,6 +145,51 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
 
 fn get_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
     table.get(key)
+}
+
+/// Parses the `dependencies`, `dev-dependencies`, and `build-dependencies` tables
+/// nested under `table`, extending `dependencies` with what is found.
+///
+/// Shared by the manifest root and by each `[target.<spec>]` table, since both
+/// carry the same three dependency kinds.
+fn parse_dependency_kind_tables(
+    table: &Table<'_>,
+    content: &str,
+    line_table: &LineOffsetTable,
+    dependencies: &mut Vec<ParsedDependency>,
+) {
+    if let Some(deps_val) = get_val(table, "dependencies")
+        && let Some(deps) = deps_val.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            deps,
+            content,
+            line_table,
+            DependencySection::Dependencies,
+        ));
+    }
+
+    if let Some(dev_deps_val) = get_val(table, "dev-dependencies")
+        && let Some(dev_deps) = dev_deps_val.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            dev_deps,
+            content,
+            line_table,
+            DependencySection::DevDependencies,
+        ));
+    }
+
+    if let Some(build_deps_val) = get_val(table, "build-dependencies")
+        && let Some(build_deps) = build_deps_val.as_table()
+    {
+        dependencies.extend(parse_dependencies_section(
+            build_deps,
+            content,
+            line_table,
+            DependencySection::BuildDependencies,
+        ));
+    }
 }
 
 /// Parses a single dependency section (dependencies, dev-dependencies, or build-dependencies).
@@ -206,6 +240,13 @@ fn parse_table_dependency(
     content: &str,
     line_table: &LineOffsetTable,
 ) {
+    // `toml_span::value::Table` is a `BTreeMap` keyed by field name, so it iterates
+    // in alphabetical order (`branch`, `git`, `rev`, `tag`), not TOML source order —
+    // `git` cannot be relied on to run before or after `tag`/`branch`/`rev`. The rev
+    // value is collected here and applied to `dep.source` once the whole table has
+    // been walked, so the result doesn't depend on that ordering (#393).
+    let mut git_rev: Option<String> = None;
+
     for (key, value) in table {
         match key.name.as_ref() {
             "version" => {
@@ -233,6 +274,14 @@ fn parse_table_dependency(
                         url: url.to_string(),
                         rev: None,
                     };
+                }
+            }
+            // Cargo allows at most one of these per git dependency; take
+            // whichever is present rather than duplicating Cargo's own
+            // validation of that constraint.
+            "tag" | "branch" | "rev" => {
+                if let Some(rev) = value.as_str() {
+                    git_rev = Some(rev.to_string());
                 }
             }
             "path" => {
@@ -276,6 +325,10 @@ fn parse_table_dependency(
             }
             _ => {}
         }
+    }
+
+    if let DependencySource::Git { rev, .. } = &mut dep.source {
+        *rev = git_rev;
     }
 }
 
@@ -423,10 +476,46 @@ serde = { workspace = true }";
 tower-lsp = { git = "https://github.com/ebkalderon/tower-lsp", branch = "main" }"#;
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Git { .. }
-        ));
+        match &result.dependencies[0].source {
+            DependencySource::Git { rev, .. } => assert_eq!(rev.as_deref(), Some("main")),
+            other => panic!("expected Git, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_git_dependency_with_tag() {
+        let toml = r#"[dependencies]
+helix-core = { git = "https://github.com/helix-editor/helix", tag = "25.07.1" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::Git { rev, .. } => assert_eq!(rev.as_deref(), Some("25.07.1")),
+            other => panic!("expected Git, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_git_dependency_with_rev() {
+        let toml = r#"[dependencies]
+example = { git = "https://github.com/example/example", rev = "abc123" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::Git { rev, .. } => assert_eq!(rev.as_deref(), Some("abc123")),
+            other => panic!("expected Git, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_git_dependency_without_rev_stays_none() {
+        let toml = r#"[dependencies]
+example = { git = "https://github.com/example/example" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::Git { rev, .. } => assert!(rev.is_none()),
+            other => panic!("expected Git, got {other:?}"),
+        }
     }
 
     #[test]
@@ -518,6 +607,93 @@ cc = "1.0"
             result.dependencies[2].section,
             DependencySection::BuildDependencies
         ));
+    }
+
+    #[test]
+    fn test_parse_target_cfg_dependencies() {
+        let toml = "[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"";
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "libc");
+        assert_eq!(dep.version_req, Some("0.2".into()));
+        assert_eq!(dep.source, DependencySource::Registry);
+        assert!(matches!(dep.section, DependencySection::Dependencies));
+
+        // Position must point into the target table, not the (nonexistent) top-level one.
+        assert_eq!(dep.name_range.start.line, 1);
+        assert_eq!(dep.name_range.start.character, 0);
+        assert_eq!(dep.name_range.end.character, 4);
+    }
+
+    #[test]
+    fn test_parse_target_cfg_dev_dependencies() {
+        let toml = "[target.'cfg(windows)'.dev-dependencies]\nwinapi = \"0.3\"";
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "winapi");
+        assert_eq!(dep.version_req, Some("0.3".into()));
+        assert!(matches!(dep.section, DependencySection::DevDependencies));
+    }
+
+    #[test]
+    fn test_parse_target_triple_build_dependencies() {
+        let toml = "[target.x86_64-unknown-linux-gnu.build-dependencies]\ncc = \"1.0\"";
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "cc");
+        assert_eq!(dep.version_req, Some("1.0".into()));
+        assert!(matches!(dep.section, DependencySection::BuildDependencies));
+    }
+
+    #[test]
+    fn test_parse_target_dependencies_alongside_top_level() {
+        let toml = r#"
+[dependencies]
+serde = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", features = ["extra_traits"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+winapi = "0.3"
+
+[target.x86_64-unknown-linux-gnu.build-dependencies]
+cc = "1.0"
+"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 4);
+
+        let serde = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "serde")
+            .unwrap();
+        assert!(matches!(serde.section, DependencySection::Dependencies));
+
+        let libc = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "libc")
+            .unwrap();
+        assert_eq!(libc.version_req, Some("0.2".into()));
+        assert_eq!(libc.features, vec!["extra_traits"]);
+        assert!(matches!(libc.section, DependencySection::Dependencies));
+
+        let winapi = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "winapi")
+            .unwrap();
+        assert!(matches!(winapi.section, DependencySection::DevDependencies));
+
+        let cc = result.dependencies.iter().find(|d| d.name == "cc").unwrap();
+        assert!(matches!(cc.section, DependencySection::BuildDependencies));
     }
 
     #[test]
