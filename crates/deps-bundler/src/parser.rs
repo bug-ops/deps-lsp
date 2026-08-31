@@ -5,10 +5,11 @@
 
 use crate::types::{BundlerDependency, DependencyGroup, DependencySource};
 use deps_core::Result;
+use deps_core::lsp_helpers::LineOffsetTable;
 use regex::Regex;
 use std::any::Any;
 use std::sync::LazyLock;
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Result of parsing a Gemfile.
 #[derive(Debug, Clone)]
@@ -17,39 +18,6 @@ pub struct BundlerParseResult {
     pub ruby_version: Option<String>,
     pub source_url: Option<String>,
     pub uri: Uri,
-}
-
-// TODO(critic): use deps_core LineOffsetTable::line_start
-/// Pre-computed line start byte offsets for O(1) position lookups.
-struct LineOffsetTable {
-    line_starts: Vec<usize>,
-}
-
-impl LineOffsetTable {
-    fn new(content: &str) -> Self {
-        let mut line_starts = vec![0];
-        for (i, c) in content.char_indices() {
-            if c == '\n' {
-                line_starts.push(i + 1);
-            }
-        }
-        Self { line_starts }
-    }
-
-    fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
-        let line = self
-            .line_starts
-            .partition_point(|&start| start <= offset)
-            .saturating_sub(1);
-        let line_start = self.line_starts[line];
-
-        let character = content[line_start..offset]
-            .chars()
-            .map(|c| c.len_utf16() as u32)
-            .sum();
-
-        Position::new(line as u32, character)
-    }
 }
 
 // Regex patterns for Gemfile parsing
@@ -98,7 +66,9 @@ pub fn parse_gemfile(content: &str, doc_uri: &Uri) -> Result<BundlerParseResult>
     let mut current_group: Option<DependencyGroup> = None;
 
     for (line_idx, line) in content.lines().enumerate() {
-        let line_start = line_table.line_starts[line_idx];
+        let Some(line_start) = line_table.line_start(line_idx) else {
+            continue;
+        };
 
         // Check for source declaration
         if let Some(caps) = SOURCE_PATTERN.captures(line) {
@@ -535,15 +505,6 @@ gem 'rails'
     }
 
     #[test]
-    fn test_line_offset_table() {
-        let content = "abc\ndef";
-        let table = LineOffsetTable::new(content);
-        let pos = table.byte_offset_to_position(content, 4);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.character, 0);
-    }
-
-    #[test]
     fn test_parse_production_group() {
         let gemfile = r"source 'https://rubygems.org'
 gem 'unicorn', group: :production";
@@ -680,41 +641,6 @@ gem 'rails'";
     }
 
     #[test]
-    fn test_line_offset_table_empty() {
-        let content = "";
-        let table = LineOffsetTable::new(content);
-        assert_eq!(table.line_starts.len(), 1);
-        assert_eq!(table.line_starts[0], 0);
-    }
-
-    #[test]
-    fn test_line_offset_table_single_line() {
-        let content = "hello world";
-        let table = LineOffsetTable::new(content);
-        assert_eq!(table.line_starts.len(), 1);
-        let pos = table.byte_offset_to_position(content, 6);
-        assert_eq!(pos.line, 0);
-        assert_eq!(pos.character, 6);
-    }
-
-    #[test]
-    fn test_line_offset_table_multiple_lines() {
-        let content = "line1\nline2\nline3";
-        let table = LineOffsetTable::new(content);
-        assert_eq!(table.line_starts.len(), 3);
-
-        // First char of line 2
-        let pos = table.byte_offset_to_position(content, 6);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.character, 0);
-
-        // First char of line 3
-        let pos = table.byte_offset_to_position(content, 12);
-        assert_eq!(pos.line, 2);
-        assert_eq!(pos.character, 0);
-    }
-
-    #[test]
     fn test_parse_result_trait() {
         use deps_core::ParseResult;
 
@@ -797,15 +723,5 @@ gem 'rspec', group: [:test, :development]";
         let gemfile = "source 'https://rubygems.org'\n# UTF-8: \u{1F600}\ngem 'rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-    }
-
-    #[test]
-    fn test_line_offset_unicode() {
-        let content = "abc\n\u{1F600}def";
-        let table = LineOffsetTable::new(content);
-        // The emoji takes 4 bytes in UTF-8
-        let pos = table.byte_offset_to_position(content, 4);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.character, 0);
     }
 }
