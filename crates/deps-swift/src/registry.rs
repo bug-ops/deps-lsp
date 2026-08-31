@@ -641,11 +641,22 @@ impl deps_core::Registry for SwiftRegistry {
         })
     }
 
+    /// Under a wildcard/empty `req` (see [`deps_core::is_existence_wildcard`]) this is an
+    /// existence check, not an upgrade recommendation — deferred to
+    /// [`deps_core::select_latest_for_existence`], matching
+    /// `deps-cargo`/`deps-pypi`/`deps-dart`/`deps-npm`. Without this gate, a package whose
+    /// only tags so far are prerelease could never resolve under `*`: the `semver` crate's
+    /// `VersionReq::parse("*")` does not match a prerelease `Version` unless the requirement
+    /// itself carries a prerelease component (found via #421's cross-ecosystem conformance
+    /// test in `deps-lsp`).
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
+        if deps_core::is_existence_wildcard(req) {
+            return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
+        }
         let parsed_req = semver::VersionReq::parse(req.as_str()).ok()?;
         versions.iter().position(|v| {
             semver::Version::parse(v.version_string()).is_ok_and(|ver| parsed_req.matches(&ver))
