@@ -13,10 +13,10 @@ deps-lsp provides comprehensive LSP support for 12 package ecosystems:
 | **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens |
 | **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support |
 | **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
-| **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
+| **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover with corrected version ordering (prereleases sort below base release — see below), inlay hints, completion, code actions, diagnostics, code lens |
 | **Maven** | Java | `pom.xml` | `maven-metadata.xml` (CDN) | Hover with corrected version ordering (numeric segments outrank qualifiers, prereleases sort below base release), inlay hints, completion, code actions, diagnostics, code lens (property-versioned dependencies not covered — see below) |
 | **Gradle** | Kotlin/Groovy | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | — | Hover with corrected version ordering (same as Maven), inlay hints, completion, code actions, diagnostics, code lens (variable/catalog-versioned dependencies not covered — see below), variable resolution (`gradle.properties`) |
-| **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
+| **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens (requirement matching uses corrected stability-qualifier ordering; "latest version" selection does not yet filter unstable releases — see below) |
 | **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, code lens (range-form dependencies not covered — see below), GitHub API support |
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling |
 | **Deno** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics, code lens — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
@@ -73,6 +73,25 @@ Versions are now ranked with correct Maven semantics:
 - **Numeric suffixes within qualifiers are compared numerically**: `M10` > `M2` (previously `M2` > `M10`)
 
 These fixes ensure hover's "Recent versions" list and completion sort order match Maven's actual version ordering.
+
+### Dart/Composer Version Comparison
+
+`compare_versions` previously discarded everything after the first non-digit character in a
+dot-separated segment, so a prerelease/qualifier version compared as *equal* to its stable
+counterpart (`2.0.0-beta1` tied with `2.0.0`). Both comparators now apply proper
+prerelease-aware ordering:
+
+- **Dart** (`pubspec.yaml`): SemVer 2.0.0 §11 precedence — numeric identifiers compare
+  numerically, alphanumeric identifiers compare lexically (ASCII), and a version with a
+  prerelease sorts below its base release. Applied both to "latest version" selection
+  (pub.dev's response order) and to constraint matching, so hover/completion sort order and
+  outdated diagnostics are both corrected.
+- **Composer** (`composer.json`): stability precedence `dev` < `alpha` < `beta` < `RC` <
+  `stable`, applied to requirement-satisfaction comparison only. This does **not** extend to
+  "latest version" selection — Packagist's response order is used as-is and
+  `select_latest_matching` has no minimum-stability filter, so an `alpha`/`beta`/`RC` release
+  can still surface as "latest" for a loose requirement. Tracked as a follow-up (see the
+  `registry.rs`-level stability-filtering gap noted in the crate's known issues).
 
 ### Maven/Gradle Version Range Matching
 
