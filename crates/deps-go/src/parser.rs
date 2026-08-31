@@ -13,8 +13,9 @@
 
 use crate::error::Result;
 use crate::types::{GoDependency, GoDirective};
+use deps_core::lsp_helpers::LineOffsetTable;
 use regex::Regex;
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Result of parsing a go.mod file.
 #[derive(Debug, Clone)]
@@ -27,40 +28,6 @@ pub struct GoParseResult {
     pub go_version: Option<String>,
     /// Document URI
     pub uri: Uri,
-}
-
-// TODO(critic): use deps_core LineOffsetTable::line_start
-/// Pre-computed line start byte offsets for O(log n) position lookups.
-struct LineOffsetTable {
-    line_starts: Vec<usize>,
-}
-
-impl LineOffsetTable {
-    fn new(content: &str) -> Self {
-        let mut line_starts = vec![0];
-        for (i, c) in content.char_indices() {
-            if c == '\n' {
-                line_starts.push(i + 1);
-            }
-        }
-        Self { line_starts }
-    }
-
-    /// Converts byte offset to LSP Position (line, UTF-16 character).
-    fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
-        let line = self
-            .line_starts
-            .partition_point(|&start| start <= offset)
-            .saturating_sub(1);
-        let line_start = self.line_starts[line];
-
-        let character = content[line_start..offset]
-            .chars()
-            .map(|c| c.len_utf16() as u32)
-            .sum();
-
-        Position::new(line as u32, character)
-    }
 }
 
 /// Parses a go.mod file and extracts all dependencies with positions.

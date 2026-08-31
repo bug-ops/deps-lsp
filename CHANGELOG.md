@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **deps-bundler, deps-go**: removed private duplicate `LineOffsetTable` structs, both now use the shared `deps_core::lsp_helpers::LineOffsetTable` (resolves #389) (#395)
+
 ### Fixed
 - **deps-pypi, deps-lsp**: package-name completion now works for PEP 621 `dependencies`/`optional-dependencies` arrays in `pyproject.toml`, which previously always returned zero results (resolves #390) (#397)
+- **deps-cargo**: dependencies declared under `[target.<cfg-expr-or-triple>.dependencies|dev-dependencies|build-dependencies]` are now parsed and visible to hover/diagnostics/completion, same as top-level ones (#396)
+- **deps-cargo**: a git dependency's `tag`/`branch`/`rev` key is no longer dropped, populating `DependencySource::Git.rev` (#396)
 
 ## [0.11.0] - 2026-08-24
 
