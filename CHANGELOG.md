@@ -20,8 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-pypi, deps-lsp**: package-name completion now works for PEP 621 `dependencies`/`optional-dependencies` arrays in `pyproject.toml`, which previously always returned zero results (resolves #390) (#397)
 - **workspace**: bumped the transitively-pinned `chacha20` from the yanked `0.10.1` to `0.10.2` in `Cargo.lock`, reachable via `reqwest`'s optional HTTP/3 stack (resolves #407) (#414)
 - **deps-dart, deps-composer**: `compare_versions` no longer truncates prerelease/qualifier suffixes, so a prerelease no longer compares equal to its stable counterpart (resolves #418) (#420)
-- **deps-composer**: "latest version" selection now excludes alpha/beta/RC releases by default, matching Composer's `minimum-stability: stable` semantics, unless the requirement itself names an unstable version; a wildcard requirement still resolves a prerelease-only package instead of reporting no version found (resolves #421)
-- **deps-swift**: a package whose only tags so far are prerelease now resolves under a wildcard requirement instead of `select_latest_matching` returning `None` (found via #421's cross-ecosystem conformance test)
+- **deps-composer**: "latest version" selection now excludes alpha/beta/RC releases by default, matching Composer's `minimum-stability: stable` semantics, unless the requirement itself names an unstable version; a wildcard requirement still resolves a prerelease-only package instead of reporting no version found (resolves #421) (#422)
+- **deps-swift**: a package whose only tags so far are prerelease now resolves under a wildcard requirement instead of `select_latest_matching` returning `None` (found via #421's cross-ecosystem conformance test) (#422)
 
 ### Changed
 - **deps-bundler, deps-go**: removed private duplicate `LineOffsetTable` structs, both now use the shared `deps_core::lsp_helpers::LineOffsetTable` (resolves #389) (#395)
