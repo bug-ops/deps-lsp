@@ -262,8 +262,18 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         }
     }
 
+    // #394 S2: prefer the version-qualified key so a hover on one occurrence
+    // of a duplicated name never shows another occurrence's OSV result. See
+    // `crate::osv::vulnerability_keys` for when qualification kicks in.
+    let vuln_key = versions.ecosystem.and_then(|ecosystem| {
+        crate::osv::vulnerability_keys(parse_result, versions.resolved, formatter, ecosystem)
+            .remove(&dep.name_range())
+    });
     let vuln_outcome = versions.vulnerabilities.and_then(|m| {
-        m.get(&normalized_name)
+        vuln_key
+            .as_deref()
+            .and_then(|key| m.get(key))
+            .or_else(|| m.get(&normalized_name))
             .or_else(|| m.get(dep.name().as_str()))
     });
     push_vulnerability_hover_section(&mut markdown, vuln_outcome);

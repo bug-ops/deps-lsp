@@ -33,12 +33,27 @@ pub async fn handle_hover(
     // (`Registry::get_versions_with`), so holding the guard across that await would
     // block a concurrent `documents.get_mut` on the same shard for the duration (#319).
     // `with_document` makes this structural rather than a convention to remember (#333).
-    let (ecosystem, parse_result, cached_versions, resolved_versions, vulnerabilities) = state
+    let (
+        ecosystem,
+        ecosystem_id,
+        parse_result,
+        cached_versions,
+        resolved_versions,
+        vulnerabilities,
+    ) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
             let parse_result = doc.parse_result_arc()?;
+            // `doc.ecosystem_id()` always originates from a statically
+            // registered ecosystem, so parsing it back can only fail on
+            // an internal registration bug, not on user input.
+            let ecosystem_id: deps_core::EcosystemId = doc
+                .ecosystem_id()
+                .parse()
+                .expect("doc.ecosystem_id() must be a registered EcosystemId");
             Some((
                 ecosystem,
+                ecosystem_id,
                 parse_result,
                 doc.cached_versions.clone(),
                 doc.resolved_versions.clone(),
@@ -52,7 +67,8 @@ pub async fn handle_hover(
             parse_result.as_ref(),
             position,
             VersionData::new(&cached_versions, &resolved_versions)
-                .with_vulnerabilities(&vulnerabilities),
+                .with_vulnerabilities(&vulnerabilities)
+                .with_ecosystem(ecosystem_id),
             freshness,
         )
         .await

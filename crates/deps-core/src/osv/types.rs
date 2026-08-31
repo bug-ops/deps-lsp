@@ -347,13 +347,101 @@ pub enum ScanOutcome {
     Vulnerable(DependencyVulnerabilities),
 }
 
-/// Per-scan result map, keyed by the normalized dependency name.
+/// Per-scan result map.
 ///
-/// The key is `EcosystemFormatter::normalize_package_name` — the same key
+/// Normally keyed by the normalized dependency name
+/// (`EcosystemFormatter::normalize_package_name` — the same key
 /// [`crate::lsp_helpers::generate_diagnostics_from_cache`] and
 /// [`crate::lsp_helpers::generate_hover`] already use to look up
-/// `cached`/`resolved` versions.
+/// `cached`/`resolved` versions), but see [`vulnerability_keys`] for the
+/// version-qualified form a duplicated dependency name's occurrences use.
 pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
+
+/// Computes the [`VulnerabilityMap`] key each occurrence in `parse_result`
+/// should be scanned/looked-up under.
+///
+/// Keyed by [`Dependency::name_range`](crate::Dependency::name_range) —
+/// unique per occurrence within one document, so callers holding a specific
+/// `dep` (not just its name) can look their own key up directly.
+///
+/// Normally an occurrence's key is just its normalized name (the common
+/// case, and the only form most `VulnerabilityMap` test fixtures use). When
+/// two or more occurrences of the *same* name resolve to different signatures
+/// — e.g. the same crate under `[dependencies]` and `[dev-dependencies]`, or
+/// multiple `[target.'cfg(...)'.dependencies]` blocks (#394), pinned to
+/// different versions, or mixing a registry source with a git/path fork —
+/// each such occurrence's key is instead qualified with a signature specific
+/// to it, so their OSV results can never collide in the shared map.
+/// Occurrences that share both a name and an identical signature
+/// (registry-source, same in-use version) intentionally keep the plain,
+/// shared key and get scanned once: the OSV result would be identical
+/// either way, so collapsing them is a dedup, not a gap.
+///
+/// Every caller that builds or looks up a `VulnerabilityMap` entry for a
+/// *specific* dependency occurrence — `deps-lsp`'s `build_scan_targets`,
+/// and the vulnerability lookups in `generate_diagnostics_from_cache`,
+/// `generate_hover`, and `generate_code_actions` — must go through this
+/// function so key construction never drifts out of sync between producer
+/// and consumer. A caller with no [`EcosystemId`](crate::EcosystemId) to
+/// give (most test fixtures) skips this and falls back to the plain
+/// normalized name, which still finds any entry a test inserted under that
+/// name directly.
+pub fn vulnerability_keys(
+    parse_result: &dyn crate::ParseResult,
+    resolved: &HashMap<crate::PackageName, String>,
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+    ecosystem: crate::EcosystemId,
+) -> HashMap<tower_lsp_server::ls_types::Range, String> {
+    use crate::lsp_helpers::in_use_version;
+    use crate::parser::DependencySource;
+
+    let deps = parse_result.dependencies();
+
+    // One signature per occurrence: registry-source deps carry their own
+    // in-use version (or "u" when none is determinable — a range
+    // requirement with no lock file); non-registry deps (git/path forks)
+    // always carry "n", since their `ScanOutcome` is always
+    // `Skipped(NonRegistrySource)` regardless of any declared version.
+    let signatures: Vec<(String, String)> = deps
+        .iter()
+        .map(|dep| {
+            let name = formatter.normalize_package_name(dep.name());
+            let signature = if dep.source() == DependencySource::Registry {
+                match in_use_version(*dep, &name, resolved, formatter, ecosystem) {
+                    Some(v) => format!("v:{v}"),
+                    None => "u".to_string(),
+                }
+            } else {
+                "n".to_string()
+            };
+            (name, signature)
+        })
+        .collect();
+
+    let mut distinct_signatures_by_name: HashMap<&str, std::collections::HashSet<&str>> =
+        HashMap::new();
+    for (name, signature) in &signatures {
+        distinct_signatures_by_name
+            .entry(name.as_str())
+            .or_default()
+            .insert(signature.as_str());
+    }
+
+    deps.iter()
+        .zip(&signatures)
+        .map(|(dep, (name, signature))| {
+            let ambiguous = distinct_signatures_by_name
+                .get(name.as_str())
+                .is_some_and(|s| s.len() > 1);
+            let key = if ambiguous {
+                format!("{name}\u{0}{signature}")
+            } else {
+                name.clone()
+            };
+            (dep.name_range(), key)
+        })
+        .collect()
+}
 
 // ---- OSV wire types (private) -------------------------------------------
 

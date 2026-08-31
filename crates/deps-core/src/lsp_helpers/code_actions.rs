@@ -37,6 +37,7 @@ struct VulnerabilityFixAction {
 /// still reconcile the result against a successful registry fetch when one
 /// is available — see the yank check in [`generate_code_actions`].
 fn build_vulnerability_fix_action(
+    parse_result: &dyn ParseResult,
     dep: &dyn Dependency,
     uri: &Uri,
     version_range: Range,
@@ -45,8 +46,18 @@ fn build_vulnerability_fix_action(
     formatter: &dyn EcosystemFormatter,
 ) -> Option<VulnerabilityFixAction> {
     let normalized_name = formatter.normalize_package_name(dep.name());
+    // #394 S2: prefer the version-qualified key so a fix action for one
+    // occurrence of a duplicated name is never built from another
+    // occurrence's OSV result. See `crate::osv::vulnerability_keys`.
+    let vuln_key = versions.ecosystem.and_then(|ecosystem| {
+        crate::osv::vulnerability_keys(parse_result, versions.resolved, formatter, ecosystem)
+            .remove(&dep.name_range())
+    });
     let outcome = versions.vulnerabilities.and_then(|m| {
-        m.get(&normalized_name)
+        vuln_key
+            .as_deref()
+            .and_then(|key| m.get(key))
+            .or_else(|| m.get(&normalized_name))
             .or_else(|| m.get(dep.name().as_str()))
     })?;
     let ScanOutcome::Vulnerable(dv) = outcome else {
@@ -389,6 +400,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     // Both fix actions are built before the registry fetch below so a registry outage
     // never suppresses an OSV-derived fix (FR-007) or a known-unsatisfiable one.
     let fix = build_vulnerability_fix_action(
+        parse_result,
         dep,
         uri,
         version_range,

@@ -34,6 +34,7 @@ pub async fn handle_code_actions(
     // `with_document` makes this structural rather than a convention to remember (#333).
     let Some((
         ecosystem,
+        ecosystem_id,
         parse_result,
         cached_versions,
         resolved_versions,
@@ -43,8 +44,16 @@ pub async fn handle_code_actions(
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
             let parse_result = doc.parse_result_arc()?;
+            // `doc.ecosystem_id()` always originates from a statically
+            // registered ecosystem, so parsing it back can only fail on an
+            // internal registration bug, not on user input.
+            let ecosystem_id: deps_core::EcosystemId = doc
+                .ecosystem_id()
+                .parse()
+                .expect("doc.ecosystem_id() must be a registered EcosystemId");
             Some((
                 ecosystem,
+                ecosystem_id,
                 parse_result,
                 doc.cached_versions.clone(),
                 doc.resolved_versions.clone(),
@@ -63,7 +72,8 @@ pub async fn handle_code_actions(
             position,
             uri,
             VersionData::new(&cached_versions, &resolved_versions)
-                .with_vulnerabilities(&vulnerabilities),
+                .with_vulnerabilities(&vulnerabilities)
+                .with_ecosystem(ecosystem_id),
             &content,
         )
         .await;
