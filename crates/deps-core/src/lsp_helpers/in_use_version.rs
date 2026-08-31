@@ -71,6 +71,28 @@ fn looks_like_a_single_version(s: &str) -> bool {
 /// *bare* requirement (no marker) is returned verbatim, and is accepted only
 /// for ecosystems where a bare version is not itself a range by default
 /// (critique C2) — see `bare_version_is_a_range`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::EcosystemId;
+/// use deps_core::lsp_helpers::concrete_pin_version;
+///
+/// // An explicit pin marker is stripped, for any ecosystem.
+/// assert_eq!(
+///     concrete_pin_version("=1.2.3", EcosystemId::Cargo),
+///     Some("1.2.3")
+/// );
+///
+/// // Cargo's bare version is a caret range by default, not a pin.
+/// assert_eq!(concrete_pin_version("1.2.3", EcosystemId::Cargo), None);
+///
+/// // Maven has no implicit range operator, so a bare version is exact.
+/// assert_eq!(
+///     concrete_pin_version("2.14.1", EcosystemId::Maven),
+///     Some("2.14.1")
+/// );
+/// ```
 pub fn concrete_pin_version(requirement: &str, ecosystem: EcosystemId) -> Option<&str> {
     let trimmed = requirement.trim();
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("latest") {
@@ -118,6 +140,65 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// (#394 S1) — all three need "what version does the user actually have"
 /// for the same reason: querying a fabricated version produces a silent
 /// false negative.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{EcosystemFormatter, in_use_version};
+/// use deps_core::{Dependency, EcosystemId, PackageName, VersionReq};
+/// use std::any::Any;
+/// use std::collections::HashMap;
+/// use tower_lsp_server::ls_types::Range;
+///
+/// struct SimpleDep {
+///     name: PackageName,
+///     version_req: Option<VersionReq>,
+/// }
+///
+/// impl Dependency for SimpleDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         Range::default()
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         self.version_req.as_ref()
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// struct SimpleFormatter;
+/// impl EcosystemFormatter for SimpleFormatter {
+///     fn format_version_for_text_edit(&self, version: &str) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.to_string()
+///     }
+/// }
+///
+/// let dep = SimpleDep {
+///     name: PackageName::new("time"),
+///     version_req: Some(VersionReq::new("=0.1.43")),
+/// };
+/// let resolved_versions = HashMap::new();
+///
+/// // No lock file, but the requirement is already an exact pin — falls
+/// // back to it, stripped of its `=` marker.
+/// assert_eq!(
+///     in_use_version(&dep, "time", &resolved_versions, &SimpleFormatter, EcosystemId::Cargo),
+///     Some("0.1.43".to_string())
+/// );
+/// ```
 pub fn in_use_version(
     dep: &dyn Dependency,
     normalized_name: &str,

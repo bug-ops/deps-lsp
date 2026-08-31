@@ -386,6 +386,98 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 /// give (most test fixtures) skips this and falls back to the plain
 /// normalized name, which still finds any entry a test inserted under that
 /// name directly.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::EcosystemFormatter;
+/// use deps_core::osv::vulnerability_keys;
+/// use deps_core::{Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
+/// use std::any::Any;
+/// use std::collections::HashMap;
+/// use tower_lsp_server::ls_types::{Position, Range, Uri};
+///
+/// struct SimpleDep {
+///     name: PackageName,
+///     version_req: Option<VersionReq>,
+///     name_range: Range,
+/// }
+///
+/// impl Dependency for SimpleDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         self.name_range
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         self.version_req.as_ref()
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// struct SimpleParseResult {
+///     deps: Vec<SimpleDep>,
+///     uri: Uri,
+/// }
+///
+/// impl ParseResult for SimpleParseResult {
+///     fn dependencies(&self) -> Vec<&dyn Dependency> {
+///         self.deps.iter().map(|d| d as &dyn Dependency).collect()
+///     }
+///     fn workspace_root(&self) -> Option<&std::path::Path> {
+///         None
+///     }
+///     fn uri(&self) -> &Uri {
+///         &self.uri
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// struct SimpleFormatter;
+/// impl EcosystemFormatter for SimpleFormatter {
+///     fn format_version_for_text_edit(&self, version: &str) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.to_string()
+///     }
+/// }
+///
+/// // `time` declared twice, pinned to two different versions.
+/// let parse_result = SimpleParseResult {
+///     deps: vec![
+///         SimpleDep {
+///             name: PackageName::new("time"),
+///             version_req: Some(VersionReq::new("=0.1.43")),
+///             name_range: Range::new(Position::new(0, 0), Position::new(0, 4)),
+///         },
+///         SimpleDep {
+///             name: PackageName::new("time"),
+///             version_req: Some(VersionReq::new("=0.1.44")),
+///             name_range: Range::new(Position::new(3, 0), Position::new(3, 4)),
+///         },
+///     ],
+///     uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+/// };
+/// let resolved = HashMap::new();
+///
+/// let keys = vulnerability_keys(&parse_result, &resolved, &SimpleFormatter, EcosystemId::Cargo);
+/// let deps = parse_result.dependencies();
+/// let key0 = keys.get(&deps[0].name_range()).unwrap();
+/// let key1 = keys.get(&deps[1].name_range()).unwrap();
+/// assert_ne!(key0, key1, "differently-pinned occurrences of one name get distinct keys");
+/// ```
 pub fn vulnerability_keys(
     parse_result: &dyn crate::ParseResult,
     resolved: &HashMap<crate::PackageName, String>,

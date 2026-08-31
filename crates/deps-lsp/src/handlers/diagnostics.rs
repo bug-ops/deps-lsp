@@ -57,16 +57,9 @@ pub(crate) async fn generate_diagnostics_internal(
         }
 
         let parse_result = doc.parse_result_arc()?;
-        // `doc.ecosystem_id()` always originates from a statically
-        // registered ecosystem, so parsing it back can only fail on an
-        // internal registration bug, not on user input.
-        let ecosystem_id: deps_core::EcosystemId = doc
-            .ecosystem_id()
-            .parse()
-            .expect("doc.ecosystem_id() must be a registered EcosystemId");
         Some((
             ecosystem,
-            ecosystem_id,
+            doc.ecosystem,
             parse_result,
             doc.cached_versions.clone(),
             doc.resolved_versions.clone(),
