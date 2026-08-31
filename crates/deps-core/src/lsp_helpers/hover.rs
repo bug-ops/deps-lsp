@@ -1938,6 +1938,98 @@ mod tests {
         assert!(content.value.contains("also affected"));
     }
 
+    #[tokio::test]
+    async fn test_generate_hover_vulnerability_not_shared_across_duplicate_name_occurrences() {
+        // #394 S2: `pkg` declared twice with different pins — one vulnerable,
+        // one patched. Hover on the patched occurrence must not show the
+        // vulnerable occurrence's advisory just because they share a name.
+        use crate::osv::{
+            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+        };
+
+        let vulnerable_dep = MockDep {
+            name: "pkg".into(),
+            version_req: "=1.0.0".into(),
+            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+        };
+        let patched_dep = MockDep {
+            name: "pkg".into(),
+            version_req: "=2.0.0".into(),
+            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
+        };
+        let parse_result = MockParseResult {
+            deps: vec![vulnerable_dep, patched_dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let keys = crate::osv::vulnerability_keys(
+            &parse_result,
+            &resolved_versions,
+            &MockFormatter,
+            crate::EcosystemId::Cargo,
+        );
+        let deps = parse_result.dependencies();
+        let vulnerable_key = keys.get(&deps[0].name_range()).unwrap().clone();
+        let patched_key = keys.get(&deps[1].name_range()).unwrap().clone();
+        assert_ne!(vulnerable_key, patched_key);
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            vulnerable_key,
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+        vulns.insert(patched_key, ScanOutcome::Clean);
+
+        let versions = VersionData::new(&cached_versions, &resolved_versions)
+            .with_vulnerabilities(&vulns)
+            .with_ecosystem(crate::EcosystemId::Cargo);
+
+        let hover_on_patched = generate_hover(
+            &parse_result,
+            Position::new(3, 2),
+            versions,
+            &MockRegistry,
+            &MockFormatter,
+            crate::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+        let HoverContents::Markup(patched_content) = hover_on_patched.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !patched_content.value.contains("RUSTSEC-2020-0071"),
+            "the patched occurrence must not show the other occurrence's advisory: {}",
+            patched_content.value
+        );
+        assert!(patched_content.value.contains("No known vulnerabilities"));
+
+        let hover_on_vulnerable = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            versions,
+            &MockRegistry,
+            &MockFormatter,
+            crate::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+        let HoverContents::Markup(vulnerable_content) = hover_on_vulnerable.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(vulnerable_content.value.contains("RUSTSEC-2020-0071"));
+    }
+
     /// #366: a registry error classified as `PackageNotFound` (e.g. `deps-maven`'s
     /// `metadata_urls` rejecting a dot-segment coordinate like `com.example:..`, mirrored
     /// here by [`NotFoundRegistry`]) must make hover return `None` via this function's own
