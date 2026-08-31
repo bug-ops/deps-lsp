@@ -4,6 +4,7 @@
 [advisories]
 version = 2
 ignore = []
+yanked = "deny"
 
 [licenses]
 version = 2
