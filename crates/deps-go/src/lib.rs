@@ -29,7 +29,6 @@
 //! ```
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
@@ -39,7 +38,6 @@ pub mod version;
 
 // Re-export commonly used types
 pub use ecosystem::GoEcosystem;
-pub use error::{GoError, Result};
 pub use formatter::GoFormatter;
 pub use lockfile::{GoSumParser, parse_go_sum};
 pub use parser::{GoParseResult, parse_go_mod};

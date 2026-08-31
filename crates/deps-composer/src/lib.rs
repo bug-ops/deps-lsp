@@ -4,7 +4,6 @@
 //! for PHP projects.
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
@@ -12,7 +11,6 @@ pub mod registry;
 pub mod types;
 
 pub use ecosystem::ComposerEcosystem;
-pub use error::{ComposerError, Result};
 pub use formatter::ComposerFormatter;
 pub use lockfile::ComposerLockParser;
 pub use parser::{ComposerParseResult, parse_composer_json};

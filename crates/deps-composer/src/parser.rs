@@ -4,8 +4,8 @@
 //! source positions for LSP operations. Platform packages (php, ext-*, lib-*)
 //! are filtered out as they are not Packagist packages.
 
-use crate::error::{ComposerError, Result};
 use crate::types::{ComposerDependency, ComposerSection};
+use deps_core::Result;
 use serde_json::Value;
 use std::any::Any;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
@@ -108,8 +108,7 @@ pub fn is_platform_package(name: &str) -> bool {
 /// assert_eq!(result.dependencies[0].name, "symfony/console");
 /// ```
 pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResult> {
-    let root: Value =
-        serde_json::from_str(content).map_err(|e| ComposerError::JsonParseError { source: e })?;
+    let root: Value = serde_json::from_str(content)?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
@@ -361,7 +360,7 @@ mod tests {
     #[test]
     fn test_parse_invalid_json() {
         let result = parse_composer_json("{invalid json}", &test_uri());
-        assert!(result.is_err());
+        assert!(matches!(result, Err(deps_core::DepsError::Json(_))));
     }
 
     #[test]

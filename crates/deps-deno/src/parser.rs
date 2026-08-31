@@ -6,11 +6,10 @@
 //! specifier value — a find-first-occurrence text search would hand every such alias the
 //! same source position, corrupting hover/inlay-hint/code-action targeting.
 
-use crate::error::{DenoError, Result};
 use crate::specifier::parse_specifier;
 use crate::types::{DenoDependency, DenoDependencySection};
 use deps_core::lsp_helpers::LineOffsetTable;
-use deps_core::{PackageName, VersionReq};
+use deps_core::{DepsError, PackageName, Result, VersionReq};
 use jsonc_parser::ast::{Object, ObjectProp, StringLit, Value};
 use jsonc_parser::{CollectOptions, ParseOptions, parse_to_ast};
 use std::borrow::Cow;
@@ -66,8 +65,9 @@ pub fn parse_deno_json(content: &str, uri: &Uri) -> Result<DenoParseResult> {
         &CollectOptions::default(),
         &ParseOptions::default(),
     )
-    .map_err(|e| DenoError::JsonParseError {
-        message: e.to_string(),
+    .map_err(|e| DepsError::ParseError {
+        file_type: "deno.json".into(),
+        source: e.to_string().into(),
     })?;
 
     let line_table = LineOffsetTable::new(content);
@@ -316,7 +316,10 @@ mod tests {
     fn test_parse_invalid_json_errors() {
         let json = "{ imports: not valid json !!!";
         let result = parse_deno_json(json, &test_uri());
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "deno.json"
+        ));
     }
 
     #[test]

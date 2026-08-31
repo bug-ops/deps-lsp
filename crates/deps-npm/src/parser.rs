@@ -3,8 +3,8 @@
 //! Parses package.json files and extracts dependency information with precise
 //! source positions for LSP operations.
 
-use crate::error::{NpmError, Result};
 use crate::types::{NpmDependency, NpmDependencySection};
+use deps_core::Result;
 use serde_json::Value;
 use std::any::Any;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
@@ -111,8 +111,7 @@ impl deps_core::ParseResult for NpmParseResult {
 /// assert_eq!(result.dependencies[0].name, "express");
 /// ```
 pub fn parse_package_json(content: &str, uri: &Uri) -> Result<NpmParseResult> {
-    let root: Value =
-        serde_json::from_str(content).map_err(|e| NpmError::JsonParseError { source: e })?;
+    let root: Value = serde_json::from_str(content)?;
 
     // Build line offset table once for O(log n) position lookups
     let line_table = LineOffsetTable::new(content);
@@ -394,7 +393,7 @@ mod tests {
     fn test_parse_invalid_json() {
         let json = "{ invalid json }";
         let result = parse_package_json(json, &test_uri());
-        assert!(result.is_err());
+        assert!(matches!(result, Err(deps_core::DepsError::Json(_))));
     }
 
     #[test]

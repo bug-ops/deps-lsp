@@ -250,8 +250,7 @@ impl Ecosystem for MavenEcosystem {
         uri: &'a Uri,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result =
-                crate::parser::parse_pom_xml(content, uri).map_err(deps_core::DepsError::from)?;
+            let result = crate::parser::parse_pom_xml(content, uri)?;
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
     }

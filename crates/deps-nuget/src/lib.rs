@@ -5,7 +5,6 @@
 //! parsing, `packages.lock.json` lock file support, and NuGet V3 registry integration.
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
@@ -14,7 +13,6 @@ pub mod types;
 pub mod version;
 
 pub use ecosystem::NuGetEcosystem;
-pub use error::{NuGetError, Result};
 pub use formatter::NuGetFormatter;
 pub use lockfile::NuGetLockParser;
 pub use parser::{parse_directory_packages_props, parse_packages_config, parse_project_file};

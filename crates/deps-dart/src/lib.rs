@@ -5,7 +5,6 @@
 //! registry integration.
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
@@ -14,7 +13,6 @@ pub mod types;
 pub mod version;
 
 pub use ecosystem::DartEcosystem;
-pub use error::{DartError, Result};
 pub use formatter::DartFormatter;
 pub use lockfile::PubspecLockParser;
 pub use parser::{DartParseResult, parse_pubspec_yaml};

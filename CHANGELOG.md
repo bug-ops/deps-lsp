@@ -9,8 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **deps-bundler, deps-go**: removed private duplicate `LineOffsetTable` structs, both now use the shared `deps_core::lsp_helpers::LineOffsetTable` (resolves #389) (#395)
+- **deps-cargo, deps-npm, deps-composer, deps-dart, deps-deno, deps-go, deps-gradle, deps-maven, deps-nuget**: removed per-crate `{Ecosystem}Error` wrapper enums; call sites now construct `deps_core::DepsError` directly (resolves #388) (#398)
 
 ### Fixed
+- **deps-cargo**: invalid file URI during workspace-root discovery now reports `DepsError::InvalidUri`, matching every other ecosystem, instead of the previously divergent `DepsError::CacheError` (#398)
 - **deps-pypi, deps-lsp**: package-name completion now works for PEP 621 `dependencies`/`optional-dependencies` arrays in `pyproject.toml`, which previously always returned zero results (resolves #390) (#397)
 - **deps-cargo**: dependencies declared under `[target.<cfg-expr-or-triple>.dependencies|dev-dependencies|build-dependencies]` are now parsed and visible to hover/diagnostics/completion, same as top-level ones (#396)
 - **deps-cargo**: a git dependency's `tag`/`branch`/`rev` key is no longer dropped, populating `DependencySource::Git.rev` (#396)

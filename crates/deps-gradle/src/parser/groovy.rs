@@ -2,9 +2,9 @@
 //!
 //! Regex-based extraction of dependency declarations from dependencies { } blocks.
 
-use crate::error::Result;
 use crate::parser::{GradleParseResult, find_name_range, find_version_range};
 use crate::types::GradleDependency;
+use deps_core::Result;
 use regex::Regex;
 use std::sync::OnceLock;
 use tower_lsp_server::ls_types::Uri;

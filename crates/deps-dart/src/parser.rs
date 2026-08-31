@@ -1,7 +1,7 @@
 //! pubspec.yaml parser with position tracking.
 
-use crate::error::Result;
 use crate::types::{DartDependency, DependencySection, DependencySource};
+use deps_core::{DepsError, Result};
 use std::any::Any;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 use yaml_rust2::{Yaml, YamlLoader};
@@ -48,21 +48,23 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
     if let Err(depth) =
         deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)
     {
-        return Err(crate::error::DartError::ParseError {
-            message: format!(
+        return Err(DepsError::ParseError {
+            file_type: "pubspec.yaml".into(),
+            source: Box::new(std::io::Error::other(format!(
                 "YAML nesting depth {depth} exceeds maximum of {}",
                 deps_core::MAX_YAML_NESTING_DEPTH
-            ),
+            ))),
         });
     }
 
     if let Err(bytes) = deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES)
     {
-        return Err(crate::error::DartError::ParseError {
-            message: format!(
+        return Err(DepsError::ParseError {
+            file_type: "pubspec.yaml".into(),
+            source: Box::new(std::io::Error::other(format!(
                 "YAML expansion {bytes} bytes exceeds maximum of {} bytes",
                 deps_core::MAX_YAML_EXPANDED_BYTES
-            ),
+            ))),
         });
     }
 
@@ -70,10 +72,10 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResul
     let mut dependencies = Vec::new();
     let mut sdk_constraint = None;
 
-    let docs =
-        YamlLoader::load_from_str(content).map_err(|e| crate::error::DartError::ParseError {
-            message: e.to_string(),
-        })?;
+    let docs = YamlLoader::load_from_str(content).map_err(|e| DepsError::ParseError {
+        file_type: "pubspec.yaml".into(),
+        source: Box::new(std::io::Error::other(e.to_string())),
+    })?;
 
     let doc = match docs.first() {
         Some(d) => d,
@@ -467,7 +469,10 @@ dependencies:
     fn test_invalid_yaml() {
         let yaml = "{{invalid yaml";
         let result = parse_pubspec_yaml(yaml, &test_uri());
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "pubspec.yaml"
+        ));
     }
 
     #[test]
@@ -511,13 +516,14 @@ dependencies:
         // rejected by the expansion guard specifically, so a future reorder
         // that lets a different guard fire first would be caught.
         match result {
-            Err(crate::error::DartError::ParseError { message }) => {
+            Err(DepsError::ParseError { source, .. }) => {
+                let message = source.to_string();
                 assert!(
                     message.contains("YAML expansion"),
                     "unexpected error message: {message}"
                 );
             }
-            other => panic!("expected DartError::ParseError, got {other:?}"),
+            other => panic!("expected DepsError::ParseError, got {other:?}"),
         }
     }
 

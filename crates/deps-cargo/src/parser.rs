@@ -29,8 +29,8 @@
 //! assert_eq!(result.dependencies[0].name, "serde");
 //! ```
 
-use crate::error::{CargoError, Result};
 use crate::types::{DependencySection, DependencySource, ParsedDependency};
+use deps_core::{DepsError, Result};
 use std::any::Any;
 use std::path::PathBuf;
 use toml_span::value::{Table, Value};
@@ -80,23 +80,26 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
     if let Err(depth) =
         deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
     {
-        return Err(CargoError::TomlParseError {
-            message: format!(
+        return Err(DepsError::ParseError {
+            file_type: "Cargo.toml".into(),
+            source: Box::new(std::io::Error::other(format!(
                 "array/table nesting depth {depth} exceeds maximum of {}",
                 deps_core::MAX_TOML_NESTING_DEPTH
-            ),
+            ))),
         });
     }
 
-    let doc = toml_span::parse(content).map_err(|e| CargoError::TomlParseError {
-        message: e.to_string(),
+    let doc = toml_span::parse(content).map_err(|e| DepsError::ParseError {
+        file_type: "Cargo.toml".into(),
+        source: Box::new(std::io::Error::other(e.to_string())),
     })?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
 
-    let root_table = doc.as_table().ok_or_else(|| CargoError::TomlParseError {
-        message: "root is not a table".into(),
+    let root_table = doc.as_table().ok_or_else(|| DepsError::ParseError {
+        file_type: "Cargo.toml".into(),
+        source: Box::new(std::io::Error::other("root is not a table")),
     })?;
 
     parse_dependency_kind_tables(root_table, content, &line_table, &mut dependencies);
@@ -354,7 +357,7 @@ fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::S
 fn find_workspace_root(doc_uri: &Uri) -> Result<Option<PathBuf>> {
     let path = doc_uri
         .to_file_path()
-        .ok_or_else(|| CargoError::invalid_uri(format!("{doc_uri:?}")))?;
+        .ok_or_else(|| DepsError::InvalidUri(format!("{doc_uri:?}")))?;
 
     let mut current = path.parent();
 
@@ -431,7 +434,24 @@ mod tests {
         // being exercised here, not the crash itself.
         let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
         let result = parse_cargo_toml(&content, &test_url());
-        assert!(matches!(result, Err(CargoError::TomlParseError { .. })));
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "Cargo.toml"
+        ));
+    }
+
+    #[test]
+    fn test_find_workspace_root_rejects_non_file_uri() {
+        // Empty path (`Uri::to_file_path` returns `None` only when the path is
+        // empty, not merely for a non-file scheme) is what actually drives the
+        // `InvalidUri` branch — this pins that call site to `DepsError::InvalidUri`
+        // rather than the pre-fix `DepsError::CacheError`.
+        let uri: Uri = "https://example.com".parse().unwrap();
+        let result = parse_cargo_toml("[dependencies]\nserde = \"1.0\"", &uri);
+        assert!(
+            matches!(result, Err(DepsError::InvalidUri(_))),
+            "expected InvalidUri, got {result:?}"
+        );
     }
 
     #[test]

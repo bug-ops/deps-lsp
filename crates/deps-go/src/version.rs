@@ -1,6 +1,6 @@
 //! Version parsing and module path utilities for Go modules.
 
-use crate::error::{GoError, Result};
+use deps_core::{DepsError, Result};
 use regex::Regex;
 use std::cmp::Ordering;
 
@@ -204,10 +204,8 @@ fn parse_semver(version: &str) -> Result<semver::Version> {
 
     let split_at_prerelease = cleaned.split('-').next().unwrap_or(cleaned);
 
-    semver::Version::parse(split_at_prerelease).map_err(|e| GoError::InvalidVersionSpecifier {
-        specifier: version.to_string(),
-        message: e.to_string(),
-    })
+    semver::Version::parse(split_at_prerelease)
+        .map_err(|e| DepsError::InvalidVersionReq(e.to_string()))
 }
 
 #[cfg(test)]

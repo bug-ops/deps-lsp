@@ -23,9 +23,9 @@
 //! compile and produce garbage ranges. `test_attribute_byte_range_matches_source_bytes`
 //! guards against that regression.
 
-use crate::error::{NuGetError, Result};
 use crate::types::NuGetDependency;
 use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::{DepsError, Result};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, BytesText, Event};
 use tower_lsp_server::ls_types::{Range, Uri};
@@ -62,8 +62,9 @@ pub fn parse_packages_config(content: &str, doc_uri: &Uri) -> Result<NuGetParseR
     let mut dependencies = Vec::new();
 
     loop {
-        let event = reader.read_event().map_err(|e| NuGetError::ParseError {
-            message: e.to_string(),
+        let event = reader.read_event().map_err(|e| DepsError::ParseError {
+            file_type: "NuGet project file".into(),
+            source: Box::new(std::io::Error::other(e.to_string())),
         })?;
 
         match event {
@@ -154,8 +155,9 @@ fn parse_reference_elements(
 
     loop {
         let text_pos = reader.buffer_position();
-        let event = reader.read_event().map_err(|e| NuGetError::ParseError {
-            message: e.to_string(),
+        let event = reader.read_event().map_err(|e| DepsError::ParseError {
+            file_type: "NuGet project file".into(),
+            source: Box::new(std::io::Error::other(e.to_string())),
         })?;
 
         match event {
@@ -621,7 +623,20 @@ mod tests {
     fn test_invalid_xml_errors() {
         let xml = r#"<Project attr="unclosed></Project>"#;
         let result = parse_project_file(xml, &test_uri());
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "NuGet project file"
+        ));
+    }
+
+    #[test]
+    fn test_packages_config_invalid_xml_errors() {
+        let xml = r#"<packages attr="unclosed></packages>"#;
+        let result = parse_packages_config(xml, &test_uri());
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "NuGet project file"
+        ));
     }
 
     #[test]

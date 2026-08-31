@@ -8,8 +8,8 @@ pub mod kotlin;
 pub mod properties;
 pub mod settings;
 
-use crate::error::Result;
 use crate::types::GradleDependency;
+use deps_core::Result;
 use std::any::Any;
 use std::collections::HashMap;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
