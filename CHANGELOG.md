@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cargo**: invalid file URI during workspace-root discovery now reports `DepsError::InvalidUri`, matching every other ecosystem, instead of the previously divergent `DepsError::CacheError` (#398)
 - **deps-pypi, deps-lsp**: package-name completion now works for PEP 621 `dependencies`/`optional-dependencies` arrays in `pyproject.toml`, which previously always returned zero results (resolves #390) (#397)
 - **workspace**: bumped the transitively-pinned `chacha20` from the yanked `0.10.1` to `0.10.2` in `Cargo.lock`, reachable via `reqwest`'s optional HTTP/3 stack (resolves #407) (#414)
+- **deps-dart, deps-composer**: `compare_versions` no longer truncates prerelease/qualifier suffixes, so a prerelease no longer compares equal to its stable counterpart (resolves #418)
 
 ### Changed
 - **deps-bundler, deps-go**: removed private duplicate `LineOffsetTable` structs, both now use the shared `deps_core::lsp_helpers::LineOffsetTable` (resolves #389) (#395)

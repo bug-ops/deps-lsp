@@ -162,24 +162,38 @@ impl EcosystemFormatter for ComposerFormatter {
             return satisfies_tilde_composer(version, req);
         }
 
-        // Comparison operators
+        // Comparison operators. `req` may itself be `v`-prefixed (e.g. ">=v1.0.0"); strip it
+        // the same way the caret/tilde branches above do, so it does not fall into
+        // `split_composer_core_and_suffix`'s qualifier-suffix branch and compare as core `0`.
         if let Some(req) = requirement.strip_prefix(">=") {
-            return compare_versions(version, req.trim()) >= 0;
+            let req = req.trim();
+            let req = req.strip_prefix('v').unwrap_or(req);
+            return compare_versions(version, req) >= 0;
         }
         if let Some(req) = requirement.strip_prefix("<=") {
-            return compare_versions(version, req.trim()) <= 0;
+            let req = req.trim();
+            let req = req.strip_prefix('v').unwrap_or(req);
+            return compare_versions(version, req) <= 0;
         }
         if let Some(req) = requirement.strip_prefix('>') {
-            return compare_versions(version, req.trim()) > 0;
+            let req = req.trim();
+            let req = req.strip_prefix('v').unwrap_or(req);
+            return compare_versions(version, req) > 0;
         }
         if let Some(req) = requirement.strip_prefix('<') {
-            return compare_versions(version, req.trim()) < 0;
+            let req = req.trim();
+            let req = req.strip_prefix('v').unwrap_or(req);
+            return compare_versions(version, req) < 0;
         }
         if let Some(req) = requirement.strip_prefix('=') {
-            return compare_versions(version, req.trim()) == 0;
+            let req = req.trim();
+            let req = req.strip_prefix('v').unwrap_or(req);
+            return compare_versions(version, req) == 0;
         }
         if let Some(req) = requirement.strip_prefix("!=") {
-            return compare_versions(version, req.trim()) != 0;
+            let req = req.trim();
+            let req = req.strip_prefix('v').unwrap_or(req);
+            return compare_versions(version, req) != 0;
         }
 
         // Wildcard: "1.0.*" means >=1.0.0 <1.1.0
@@ -335,22 +349,80 @@ fn satisfies_caret(version: &str, req: &str) -> bool {
     true
 }
 
+/// Rank of a Composer stability keyword in `dev < alpha < beta < RC < stable` (matching
+/// Composer's `VersionParser` keyword aliases `a`/`b` for alpha/beta), matched
+/// case-insensitively. An empty word (no qualifier at all) ranks as `stable`, the top of the
+/// scale, and so does any unrecognized suffix word — this happens to agree with Composer for
+/// its own `stable`/`patch`/`pl`/`p` aliases (all release-equivalent), but is not a general
+/// unknown-qualifier rule: a truly unrecognized word is not otherwise a valid Composer
+/// stability suffix.
+const COMPOSER_STABLE_RANK: u8 = 4;
+
+fn composer_stability_rank(word: &str) -> u8 {
+    match word.to_ascii_lowercase().as_str() {
+        "dev" => 0,
+        "alpha" | "a" => 1,
+        "beta" | "b" => 2,
+        "rc" => 3,
+        _ => COMPOSER_STABLE_RANK,
+    }
+}
+
+/// A parsed Composer stability qualifier: a stability rank plus every numeric group in its
+/// suffix (Composer's modifier regex allows any number of them, e.g. `alpha1.5`), compared
+/// group by group so `beta10` outranks `beta2` and `alpha1.5` outranks `alpha1.2`.
+struct ComposerQualifier {
+    rank: u8,
+    numeric: Vec<u64>,
+}
+
+/// Parses a qualifier suffix (already stripped of its leading separator, e.g. `"beta1"`,
+/// `"RC.2"`, `"dev"`, `"alpha1.5"`) into its stability rank and every digit run that follows
+/// the keyword, in order.
+fn parse_composer_qualifier(suffix: &str) -> ComposerQualifier {
+    let alpha_len = suffix.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let (word, rest) = suffix.split_at(alpha_len);
+    let numeric = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap_or(0))
+        .collect();
+    ComposerQualifier {
+        rank: composer_stability_rank(word),
+        numeric,
+    }
+}
+
+/// Splits `version` into its bare numeric-dot core and, if present, its raw stability
+/// qualifier suffix (leading `-`/`_`/`.` separator stripped). Build metadata (after `+`) is
+/// discarded first.
+fn split_composer_core_and_suffix(version: &str) -> (&str, Option<&str>) {
+    let without_build = version.split('+').next().unwrap_or(version);
+    let split_at = without_build
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(without_build.len());
+    let core = &without_build[..split_at];
+    let rest = without_build[split_at..].trim_start_matches(['-', '_', '.']);
+    if rest.is_empty() {
+        (core, None)
+    } else {
+        (core, Some(rest))
+    }
+}
+
 /// Simple semantic version comparison returning -1, 0, or 1.
 ///
-/// Compares version strings by splitting on '.' and comparing each numeric segment.
+/// Compares the numeric-dot core segment by segment, then applies Composer's stability
+/// precedence to any qualifier suffix (`dev < alpha < beta < RC < stable`, see
+/// [`composer_stability_rank`]) — a qualified version always sorts below its unqualified
+/// counterpart, and two qualifiers of the same stability compare by their numeric suffix
+/// (e.g. `beta2` < `beta10`).
 fn compare_versions(a: &str, b: &str) -> i32 {
-    fn parse_segment(s: &str) -> u64 {
-        let digits: String = s
-            .chars()
-            .skip_while(|c| !c.is_ascii_digit())
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        digits.parse().unwrap_or(0)
-    }
-    let a_trimmed = a.trim_start_matches(|c: char| !c.is_ascii_digit());
-    let b_trimmed = b.trim_start_matches(|c: char| !c.is_ascii_digit());
-    let a_parts: Vec<u64> = a_trimmed.split('.').map(parse_segment).collect();
-    let b_parts: Vec<u64> = b_trimmed.split('.').map(parse_segment).collect();
+    let (a_core, a_suffix) = split_composer_core_and_suffix(a);
+    let (b_core, b_suffix) = split_composer_core_and_suffix(b);
+
+    let a_parts: Vec<u64> = a_core.split('.').map(|s| s.parse().unwrap_or(0)).collect();
+    let b_parts: Vec<u64> = b_core.split('.').map(|s| s.parse().unwrap_or(0)).collect();
 
     let len = a_parts.len().max(b_parts.len());
     for i in 0..len {
@@ -362,6 +434,28 @@ fn compare_versions(a: &str, b: &str) -> i32 {
         if av > bv {
             return 1;
         }
+    }
+
+    let a_q = a_suffix.map_or(
+        ComposerQualifier {
+            rank: COMPOSER_STABLE_RANK,
+            numeric: Vec::new(),
+        },
+        parse_composer_qualifier,
+    );
+    let b_q = b_suffix.map_or(
+        ComposerQualifier {
+            rank: COMPOSER_STABLE_RANK,
+            numeric: Vec::new(),
+        },
+        parse_composer_qualifier,
+    );
+
+    if a_q.rank != b_q.rank {
+        return if a_q.rank < b_q.rank { -1 } else { 1 };
+    }
+    if a_q.numeric != b_q.numeric {
+        return if a_q.numeric < b_q.numeric { -1 } else { 1 };
     }
     0
 }
@@ -467,6 +561,99 @@ mod tests {
         assert!(!f.version_satisfies_requirement("0.0.0", "v"));
     }
 
+    /// Regression test for #418: a stability qualifier suffix must not be silently
+    /// truncated and tie with its stable counterpart.
+    #[test]
+    fn test_compare_versions_prerelease_vs_stable() {
+        assert_eq!(compare_versions("2.0.0", "2.0.0-beta1"), 1);
+        assert_eq!(compare_versions("2.0.0-beta1", "2.0.0"), -1);
+        assert_ne!(compare_versions("2.0.0", "2.0.0-beta1"), 0);
+    }
+
+    #[test]
+    fn test_compare_versions_qualifier_ordering() {
+        // dev < alpha < beta < RC < stable.
+        assert_eq!(compare_versions("1.0.0-dev", "1.0.0-alpha1"), -1);
+        assert_eq!(compare_versions("1.0.0-alpha1", "1.0.0-beta1"), -1);
+        assert_eq!(compare_versions("1.0.0-beta1", "1.0.0-RC1"), -1);
+        assert_eq!(compare_versions("1.0.0-RC1", "1.0.0"), -1);
+        // Keyword aliases (a/b) and case-insensitivity.
+        assert_eq!(compare_versions("1.0.0-a1", "1.0.0-alpha1"), 0);
+        assert_eq!(compare_versions("1.0.0-b1", "1.0.0-beta1"), 0);
+        assert_eq!(compare_versions("1.0.0-rc1", "1.0.0-RC1"), 0);
+    }
+
+    #[test]
+    fn test_compare_versions_qualifier_numeric_suffix() {
+        assert_eq!(compare_versions("1.0.0-beta2", "1.0.0-beta10"), -1);
+        assert_eq!(compare_versions("1.0.0-beta10", "1.0.0-beta2"), 1);
+        assert_eq!(compare_versions("1.0.0-beta.1", "1.0.0-beta.2"), -1);
+    }
+
+    /// Regression test for impl-critic M2: Composer's modifier regex allows any number of
+    /// numeric groups after the stability keyword (`(?:[.-]?\d+)*`), so every group must be
+    /// compared, not just the first — otherwise "alpha1.5" and "alpha1.2" silently tie.
+    #[test]
+    fn test_compare_versions_qualifier_multiple_numeric_groups() {
+        assert_eq!(compare_versions("1.0.0-alpha1.5", "1.0.0-alpha1.2"), 1);
+        assert_eq!(compare_versions("1.0.0-alpha1.2", "1.0.0-alpha1.5"), -1);
+        assert_ne!(compare_versions("1.0.0-alpha1.5", "1.0.0-alpha1.2"), 0);
+    }
+
+    #[test]
+    fn test_compare_versions_numeric_segments_still_correct() {
+        assert_eq!(compare_versions("1.0.0", "1.0.0"), 0);
+        assert_eq!(compare_versions("1.0.1", "1.0.0"), 1);
+        assert_eq!(compare_versions("1.0.0", "1.0.1"), -1);
+        assert_eq!(compare_versions("2.0.0", "1.9.9"), 1);
+        assert_eq!(compare_versions("10.0.0", "9.0.0"), 1);
+    }
+
+    /// A qualified alpha/beta/RC version must not tie with its stable release under this
+    /// comparator. Note this only fixes `version_satisfies_requirement`'s own ordering — it
+    /// does not, by itself, fix "latest version" selection: `registry.rs`'s
+    /// `select_latest_matching` returns the first Packagist entry satisfying a requirement
+    /// with no minimum-stability filter of its own, so a real alpha/beta/RC release (only
+    /// `dev-*`/`*-dev` branches are filtered) can still be reported as "latest" for a
+    /// concrete requirement like `>=1.0` (tracked separately).
+    #[test]
+    fn test_compare_versions_sorts_prerelease_below_stable() {
+        let mut versions = vec!["2.0.0-beta1", "2.0.0", "2.0.0-alpha1", "2.0.0-RC1"];
+        versions.sort_by(|a, b| compare_versions(a, b).cmp(&0));
+        assert_eq!(
+            versions,
+            vec!["2.0.0-alpha1", "2.0.0-beta1", "2.0.0-RC1", "2.0.0"]
+        );
+    }
+
+    #[test]
+    fn test_compare_versions_build_metadata_ignored() {
+        assert_eq!(compare_versions("1.0.0+build1", "1.0.0+build2"), 0);
+    }
+
+    /// Build metadata must be stripped before the qualifier is parsed, not after — otherwise
+    /// a qualifier suffix could be dragged into the discarded build segment or vice versa.
+    #[test]
+    fn test_compare_versions_qualifier_with_build_metadata() {
+        assert_eq!(
+            compare_versions("2.0.0-beta1+build1", "2.0.0-beta1+build2"),
+            0
+        );
+        assert_eq!(compare_versions("2.0.0-beta1+build1", "2.0.0+build2"), -1);
+        assert_eq!(compare_versions("2.0.0+build1", "2.0.0-beta1+build2"), 1);
+    }
+
+    /// Regression guard for a core with fewer dot segments than its counterpart (e.g. a
+    /// Composer partial version): the missing trailing segment must be treated as `0`, not
+    /// cause a spurious mismatch.
+    #[test]
+    fn test_compare_versions_partial_core_length_mismatch() {
+        assert_eq!(compare_versions("1.0", "1.0.0"), 0);
+        assert_eq!(compare_versions("1.0.0", "1.0"), 0);
+        assert_eq!(compare_versions("1.1", "1.0.5"), 1);
+        assert_eq!(compare_versions("1", "1.0.0-beta1"), 1);
+    }
+
     #[test]
     fn test_comparison_operators() {
         let f = ComposerFormatter;
@@ -549,6 +736,23 @@ mod tests {
         assert!(!f.version_satisfies_requirement("2.0.0", "^v1.2.0"));
         // Wildcard with a `v`-prefixed requirement.
         assert!(f.version_satisfies_requirement("1.0.5", "v1.0.*"));
+    }
+
+    /// Regression test for impl-critic S1: a `v`-prefixed literal on the plain
+    /// comparison-operator branches (`>=`, `<=`, `>`, `<`, `=`, `!=`) must be stripped the
+    /// same way the caret/tilde branches already do, not fall into
+    /// `split_composer_core_and_suffix`'s qualifier-suffix branch and compare as core `0`.
+    #[test]
+    fn test_v_prefix_on_comparison_operators() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement("1.5.0", ">=v1.0.0"));
+        assert!(!f.version_satisfies_requirement("0.9.0", ">=v1.0.0"));
+        assert!(f.version_satisfies_requirement("1.5.0", "<=v2.0.0"));
+        assert!(!f.version_satisfies_requirement("2.5.0", "<v2.0.0"));
+        assert!(f.version_satisfies_requirement("2.0.1", ">v2.0.0"));
+        assert!(f.version_satisfies_requirement("2.0.0", "=v2.0.0"));
+        assert!(!f.version_satisfies_requirement("2.0.0", "!=v2.0.0"));
+        assert!(f.version_satisfies_requirement("1.5.0", ">=v1.0.0 <v2.0.0"));
     }
 
     #[test]
