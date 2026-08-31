@@ -117,6 +117,20 @@ fn has_short_stability_alias(s: &str) -> bool {
     false
 }
 
+/// Whether `s` carries any Composer stability marker: `deps-core`'s default hyphen-substring
+/// heuristic (`-alpha`, `-beta`, `-rc`, ...) or Composer's short `-a`/`-b` alias (see
+/// [`has_short_stability_alias`]).
+///
+/// Shared by [`ComposerVersion`]'s `is_prerelease()` (via `impl_version!` below, applied to a
+/// concrete version string) and `registry.rs`'s "is this requirement itself prerelease-bearing"
+/// check (applied to a requirement string, e.g. an exact `2.0.0-a1` pin) — both sides must use
+/// the same predicate, or a requirement naming a short-alias prerelease would be misclassified
+/// as stable while the version it pins is correctly classified as unstable, making it
+/// impossible to ever satisfy (#421 S1).
+pub(crate) fn is_prerelease_marker(s: &str) -> bool {
+    deps_core::has_default_prerelease_marker(s) || has_short_stability_alias(s)
+}
+
 // Packagist versions aren't strict semver, so this layers a Composer-specific
 // short-stability-alias check on the raw `version` on top of `deps-core`'s
 // default hyphen-substring heuristic instead of relying on it alone, which
@@ -131,9 +145,8 @@ deps_core::impl_version!(ComposerVersion {
     status: |v: &ComposerVersion| deps_core::RemovalStatus::from_advisory(v.abandoned),
     published_at: published_at,
     prerelease: |v: &ComposerVersion| {
-        deps_core::has_default_prerelease_marker(&v.version)
+        is_prerelease_marker(&v.version)
             || deps_core::has_default_prerelease_marker(&v.version_normalized)
-            || has_short_stability_alias(&v.version)
     },
 });
 

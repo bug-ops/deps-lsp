@@ -87,6 +87,46 @@ fn reject_dot_segment(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Composer's own wildcard-requirement existence-check ladder (#421 S2).
+///
+/// Deliberately does not reuse [`deps_core::select_latest_for_existence`]: that shared
+/// ladder's rung 1 excludes both a prerelease *and* a flagged (`is_flagged()`) version, but
+/// Composer's `abandoned` flag is package-level advisory data, not a per-version ranking
+/// signal — `select_latest_matching`'s concrete-requirement branch already documents (#347)
+/// that the newest version must resolve as latest regardless of its `abandoned` flag.
+/// Reusing the shared ladder here would silently reintroduce npm's #338 NFR-002
+/// "prefer non-deprecated" preference for Composer, which #347 deliberately opted out of.
+///
+/// So only rung 1 differs from the shared ladder (prerelease alone, not flagged-or-prerelease);
+/// rungs 2 and 3 are identical in effect since `RemovalStatus::blocks_resolution()` is never
+/// true for Composer's `AdvisoryDeprecated` status (see `reports_yanked` below).
+///
+/// This divergence is load-bearing, not a style preference, and must not be collapsed back
+/// into a call to the shared ladder: for an abandoned package whose newest version is itself
+/// a prerelease, the shared ladder's rung 1 (flagged-or-prerelease) rejects every entry, and
+/// rung 2 (`blocks_resolution` only) then returns index 0 — the prerelease — since
+/// `AdvisoryDeprecated` never blocks resolution. That silently reopens #421 for exactly the
+/// case this function exists to fix.
+fn select_latest_for_existence_composer<T>(
+    versions: &[T],
+    as_version: impl Fn(&T) -> &dyn deps_core::Version,
+) -> Option<usize> {
+    if versions.is_empty() {
+        return None;
+    }
+    Some(
+        versions
+            .iter()
+            .position(|v| !as_version(v).is_prerelease())
+            .or_else(|| {
+                versions
+                    .iter()
+                    .position(|v| !as_version(v).removal_status().blocks_resolution())
+            })
+            .unwrap_or(0),
+    )
+}
+
 /// Client for interacting with the Packagist registry.
 ///
 /// Uses the Packagist v2 API for package metadata and search.
@@ -126,6 +166,15 @@ impl PackagistRegistry {
 
     /// Finds the latest non-abandoned version satisfying the given requirement.
     ///
+    /// Applies the same `minimum-stability: stable` default as
+    /// [`Registry::select_latest_matching`](deps_core::Registry::select_latest_matching)
+    /// (#421): an alpha/beta/RC release is excluded unless `req_str` itself is
+    /// prerelease-bearing. Under a wildcard/empty `req_str` (see
+    /// [`deps_core::is_existence_wildcard_str`]) this is an existence check, not an upgrade
+    /// recommendation, so it falls back to [`deps_core::select_latest_for_existence`] —
+    /// matching `deps-cargo`/`deps-pypi`/`deps-dart`/`deps-npm` — rather than returning `None`
+    /// for a package whose only releases so far are all prerelease.
+    ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails.
@@ -135,12 +184,23 @@ impl PackagistRegistry {
         req_str: &str,
     ) -> Result<Option<ComposerVersion>> {
         let versions = self.get_versions(name).await?;
+        use deps_core::Version;
+
+        if deps_core::is_existence_wildcard_str(req_str) {
+            let idx =
+                select_latest_for_existence_composer(&versions, |v| v as &dyn deps_core::Version);
+            return Ok(idx.and_then(|idx| versions.into_iter().nth(idx)));
+        }
+
         let formatter = crate::formatter::ComposerFormatter;
         use deps_core::lsp_helpers::EcosystemFormatter;
 
-        Ok(versions
-            .into_iter()
-            .find(|v| formatter.version_satisfies_requirement(&v.version, req_str)))
+        let req_is_prerelease_bearing = crate::types::is_prerelease_marker(req_str);
+
+        Ok(versions.into_iter().find(|v| {
+            (req_is_prerelease_bearing || !v.is_prerelease())
+                && formatter.version_satisfies_requirement(&v.version, req_str)
+        }))
     }
 
     /// Searches for packages by name/keywords.
@@ -338,18 +398,45 @@ impl deps_core::Registry for PackagistRegistry {
         })
     }
 
+    /// Picks the latest version satisfying `req`, applying Composer's default
+    /// `minimum-stability: stable` semantics (#421): an alpha/beta/RC release is
+    /// excluded from "latest" unless `req` itself names an unstable version (e.g. an
+    /// exact `2.0.0-beta1` pin or a lower bound like `>=2.0.0-beta1`) — mirroring
+    /// `deps-nuget`'s prerelease-bearing-requirement exception (`registry.rs`'s
+    /// `pick_latest_matching`). `dev-*`/`*-dev` branches never reach here at all:
+    /// `expand_minified_versions` already filters them out of every `Registry::get_versions`
+    /// result.
+    ///
+    /// Under a wildcard/empty `req` (see [`deps_core::is_existence_wildcard`]) this is an
+    /// existence check, not an upgrade recommendation, so it defers to
+    /// `select_latest_for_existence_composer` instead — matching the *shape* of
+    /// `deps-cargo`/`deps-pypi`/`deps-dart`/`deps-npm` (a package whose only releases so far
+    /// are all prerelease still resolves to its newest one rather than `None`), while keeping
+    /// Composer's own #347 ranking rule that `abandoned` never demotes a version.
+    ///
+    /// This does not read `composer.json`'s own `minimum-stability` field (unmodeled in this
+    /// crate today) — a manifest that sets a looser project-wide default (e.g.
+    /// `"minimum-stability": "beta"`) still has its unstable releases excluded here for a
+    /// concrete requirement, unless that specific requirement is itself prerelease-bearing.
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
+        if deps_core::is_existence_wildcard(req) {
+            return select_latest_for_existence_composer(versions, |v| v.as_ref());
+        }
+
         let formatter = crate::formatter::ComposerFormatter;
         use deps_core::lsp_helpers::EcosystemFormatter;
+
+        let req_is_prerelease_bearing = crate::types::is_prerelease_marker(req.as_str());
 
         versions.iter().position(|v| {
             // Always true for Composer (`abandoned` maps to `AdvisoryDeprecated`, which
             // never blocks resolution) — kept to document the contract (#347).
             !v.removal_status().blocks_resolution()
+                && (req_is_prerelease_bearing || !v.is_prerelease())
                 && formatter.version_satisfies_requirement(v.version_string(), req.as_str())
         })
     }
@@ -784,6 +871,226 @@ mod tests {
 
         let version = latest.expect("an all-abandoned package still exists and resolves");
         assert_eq!(version.version, "2.0.0");
+    }
+
+    /// Regression for #421: `select_latest_matching` must not surface a real
+    /// alpha/beta/RC release as "latest" for a loose requirement — Composer's default
+    /// `minimum-stability: stable` excludes it even though it satisfies `>=1.0`.
+    #[test]
+    fn test_select_latest_matching_excludes_prerelease_for_loose_requirement() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0-beta1".into(),
+                version_normalized: "2.0.0.0-beta1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.5.0".into(),
+                version_normalized: "1.5.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new(">=1.0");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    /// Regression for #421: an explicit prerelease-bearing requirement (e.g. an exact
+    /// `2.0.0-beta1` pin) must still resolve to that prerelease — the default stability
+    /// filter only applies when the requirement itself does not name an unstable version.
+    #[test]
+    fn test_select_latest_matching_allows_prerelease_when_requirement_names_it() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0-beta1".into(),
+                version_normalized: "2.0.0.0-beta1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.5.0".into(),
+                version_normalized: "1.5.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("2.0.0-beta1");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// Regression for #421 (S2): the inherent `get_latest_matching` fetch-loop fallback
+    /// must apply the same default stability filter as `select_latest_matching`.
+    #[tokio::test]
+    async fn test_get_latest_matching_wildcard_excludes_prerelease() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/p2/vendor/pkg.json")
+            .with_status(200)
+            .with_body(
+                r#"{"packages": {"vendor/pkg": [
+                    {"version": "2.0.0-beta1", "version_normalized": "2.0.0.0-beta1"},
+                    {"version": "1.5.0", "version_normalized": "1.5.0.0"}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = registry
+            .get_latest_matching("vendor/pkg", "*")
+            .await
+            .unwrap();
+
+        let version = latest.expect("a package with a stable release still resolves");
+        assert_eq!(version.version, "1.5.0");
+    }
+
+    /// Regression for #421 S1: the "is this requirement prerelease-bearing" check must use
+    /// the same predicate as `Version::is_prerelease()`, including Composer's short `-a`/`-b`
+    /// stability alias — not just `deps-core`'s default `-alpha`/`-beta`/`-rc` substrings.
+    /// Before the fix, an exact `2.0.0-a1` pin was not recognized as prerelease-bearing even
+    /// though the version it names (`2.0.0-a1`) is itself classified as a prerelease, making
+    /// it impossible to ever satisfy.
+    #[test]
+    fn test_select_latest_matching_allows_short_alias_prerelease_when_requirement_names_it() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0-a1".into(),
+                version_normalized: "2.0.0.0-alpha1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.5.0".into(),
+                version_normalized: "1.5.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("2.0.0-a1");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// Regression for #421 S1's exact measured case: a caret requirement whose lower bound
+    /// is a short-alias prerelease (`^1.0.0-a1`) must also be recognized as
+    /// prerelease-bearing, not just an exact pin.
+    #[test]
+    fn test_select_latest_matching_allows_short_alias_prerelease_with_caret_requirement() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(ComposerVersion {
+            version: "1.0.0-a1".into(),
+            version_normalized: "1.0.0.0-alpha1".into(),
+            abandoned: false,
+            published_at: None,
+        })];
+        let req = VersionReq::new("^1.0.0-a1");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// Regression for #421 (M2): the async `get_latest_matching` fetch-loop fallback must
+    /// also honor an explicit prerelease-bearing requirement, mirroring
+    /// `test_select_latest_matching_allows_prerelease_when_requirement_names_it`.
+    #[tokio::test]
+    async fn test_get_latest_matching_allows_prerelease_when_requirement_names_it() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/p2/vendor/pkg.json")
+            .with_status(200)
+            .with_body(
+                r#"{"packages": {"vendor/pkg": [
+                    {"version": "2.0.0-beta1", "version_normalized": "2.0.0.0-beta1"},
+                    {"version": "1.5.0", "version_normalized": "1.5.0.0"}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = registry
+            .get_latest_matching("vendor/pkg", "2.0.0-beta1")
+            .await
+            .unwrap();
+
+        let version = latest.expect("an explicit prerelease pin resolves to that prerelease");
+        assert_eq!(version.version, "2.0.0-beta1");
+    }
+
+    /// Regression for #421 (S2): a package whose only releases so far are all prerelease
+    /// must still resolve under a wildcard requirement — matching
+    /// `deps-cargo`/`deps-pypi`/`deps-dart`/`deps-npm`'s existence-check behavior — instead
+    /// of `select_latest_matching` returning `None` and the package appearing unresolvable.
+    #[test]
+    fn test_select_latest_matching_wildcard_prerelease_only_still_resolves() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0-beta2".into(),
+                version_normalized: "2.0.0.0-beta2".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "2.0.0-beta1".into(),
+                version_normalized: "2.0.0.0-beta1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// Regression for #421 (S2): the async `get_latest_matching` fetch-loop fallback must
+    /// resolve a prerelease-only package under a wildcard requirement too, mirroring
+    /// `test_select_latest_matching_wildcard_prerelease_only_still_resolves`.
+    #[tokio::test]
+    async fn test_get_latest_matching_wildcard_prerelease_only_still_resolves() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/p2/vendor/prerelease-only.json")
+            .with_status(200)
+            .with_body(
+                r#"{"packages": {"vendor/prerelease-only": [
+                    {"version": "2.0.0-beta2", "version_normalized": "2.0.0.0-beta2"},
+                    {"version": "2.0.0-beta1", "version_normalized": "2.0.0.0-beta1"}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = registry
+            .get_latest_matching("vendor/prerelease-only", "*")
+            .await
+            .unwrap();
+
+        let version = latest.expect("a prerelease-only package still exists and resolves");
+        assert_eq!(version.version, "2.0.0-beta2");
     }
 
     #[tokio::test]

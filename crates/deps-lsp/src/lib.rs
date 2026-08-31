@@ -397,6 +397,42 @@ mod tests {
             ]
         }
 
+        // #421 S2: a package whose only releases so far are all prerelease must still
+        // resolve under a wildcard requirement, same as an all-`AdvisoryDeprecated` one
+        // above — a prerelease-only flag is a ranking preference for "latest", not a hard
+        // removal from existence. `is_prerelease()` is overridden directly rather than
+        // relying on a hyphenated version string, so this fixture is unambiguous regardless
+        // of which ecosystem-specific parser (if any) `select_latest_matching` re-parses
+        // `version_string()` with.
+        struct PrereleaseOnlyVersion {
+            version: &'static str,
+        }
+
+        impl Version for PrereleaseOnlyVersion {
+            fn version_string(&self) -> &str {
+                self.version
+            }
+
+            fn is_prerelease(&self) -> bool {
+                true
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        fn prerelease_only_fixture() -> Vec<Box<dyn Version>> {
+            vec![
+                Box::new(PrereleaseOnlyVersion {
+                    version: "2.0.0-beta2",
+                }),
+                Box::new(PrereleaseOnlyVersion {
+                    version: "2.0.0-beta1",
+                }),
+            ]
+        }
+
         let registry = Arc::new(EcosystemRegistry::new());
         let cache = Arc::new(HttpCache::new());
         register_ecosystems(&registry, Arc::clone(&cache));
@@ -421,6 +457,33 @@ mod tests {
                 subject.is_some(),
                 "{id}: an advisory-only flag must not hide an existing package under a \
                  wildcard requirement (#347)"
+            );
+
+            // Go and NuGet are deliberate exceptions to this invariant, not #421-class bugs:
+            //
+            // - Go (`deps-go/src/registry.rs`, documented at #364): `select_latest_matching`
+            //   intentionally excludes prerelease pseudo-versions unconditionally, with no
+            //   wildcard fallback, so the `/@v/list`-based pick never shadows the `/@latest`
+            //   fallback the fetch loop needs for a module whose only tags are prerelease.
+            // - NuGet (`deps-nuget/src/registry.rs`, `pick_latest_matching`/`resolve_float`):
+            //   `req = "*"` is NuGet's own floating-version syntax for "latest stable",
+            //   distinct from this ladder's "existence check" wildcard — NuGet's own spec
+            //   requires the separate `*-*` floating pattern to opt into prerelease, so a
+            //   bare `"*"` correctly returning nothing for an all-prerelease package is
+            //   NuGet-specific intended behavior, not a gap to close here.
+            //
+            // Asserting this invariant for either would mean "fixing" behavior that was
+            // already deliberately chosen.
+            if matches!(id, "go" | "nuget") {
+                continue;
+            }
+
+            let prerelease_subject =
+                ecosystem_registry.select_latest_matching(&prerelease_only_fixture(), &req);
+            assert!(
+                prerelease_subject.is_some(),
+                "{id}: a package whose only releases so far are prerelease must still \
+                 resolve under a wildcard requirement (#421)"
             );
         }
     }

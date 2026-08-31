@@ -16,7 +16,7 @@ deps-lsp provides comprehensive LSP support for 12 package ecosystems:
 | **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover with corrected version ordering (prereleases sort below base release — see below), inlay hints, completion, code actions, diagnostics, code lens |
 | **Maven** | Java | `pom.xml` | `maven-metadata.xml` (CDN) | Hover with corrected version ordering (numeric segments outrank qualifiers, prereleases sort below base release), inlay hints, completion, code actions, diagnostics, code lens (property-versioned dependencies not covered — see below) |
 | **Gradle** | Kotlin/Groovy | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | — | Hover with corrected version ordering (same as Maven), inlay hints, completion, code actions, diagnostics, code lens (variable/catalog-versioned dependencies not covered — see below), variable resolution (`gradle.properties`) |
-| **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens (requirement matching uses corrected stability-qualifier ordering; "latest version" selection does not yet filter unstable releases — see below) |
+| **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens (requirement matching and "latest version" selection both use corrected stability-qualifier ordering — see below) |
 | **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, code lens (range-form dependencies not covered — see below), GitHub API support |
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling |
 | **Deno** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics, code lens — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
@@ -87,11 +87,13 @@ prerelease-aware ordering:
   (pub.dev's response order) and to constraint matching, so hover/completion sort order and
   outdated diagnostics are both corrected.
 - **Composer** (`composer.json`): stability precedence `dev` < `alpha` < `beta` < `RC` <
-  `stable`, applied to requirement-satisfaction comparison only. This does **not** extend to
-  "latest version" selection — Packagist's response order is used as-is and
-  `select_latest_matching` has no minimum-stability filter, so an `alpha`/`beta`/`RC` release
-  can still surface as "latest" for a loose requirement. Tracked as a follow-up (see the
-  `registry.rs`-level stability-filtering gap noted in the crate's known issues).
+  `stable`, applied both to requirement-satisfaction comparison and to "latest version"
+  selection. `select_latest_matching`/`get_latest_matching` now exclude alpha/beta/RC
+  releases by default (mirroring Composer's `minimum-stability: stable` default) unless the
+  requirement itself names an unstable version; a wildcard/existence-check requirement still
+  resolves a prerelease-only package instead of reporting no version found. Manifest-driven
+  `minimum-stability` overrides from `composer.json` are not yet threaded through — that
+  remains a follow-up.
 
 ### Maven/Gradle Version Range Matching
 
