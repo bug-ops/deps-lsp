@@ -946,10 +946,13 @@ mod tests {
 
         // The stopped redirect surfaces as the 302 response itself, handled like any
         // other non-2xx status - not as a distinct "redirect blocked" error variant.
-        match result {
-            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 302),
-            other => panic!("expected HttpStatus(302), got {other:?}"),
-        }
+        // Assert via `matches!` rather than debug-formatting `result` in a panic message:
+        // on the `Ok` arm that value is the raw response body, which would otherwise be
+        // written to the test log by the panic machinery.
+        assert!(
+            matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
+            "expected HttpStatus(302)"
+        );
 
         // Proves the security property itself (the escape origin was never contacted),
         // not just the symptom (the result is a 302) - a client that followed the
@@ -1023,10 +1026,13 @@ mod tests {
             .get_cached_trusted_origin(&source_url, &trusted_origin)
             .await;
 
-        match result {
-            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 302),
-            other => panic!("expected HttpStatus(302), got {other:?}"),
-        }
+        // Assert via `matches!` rather than debug-formatting `result` in a panic message:
+        // on the `Ok` arm that value is the raw response body, which would otherwise be
+        // written to the test log by the panic machinery.
+        assert!(
+            matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
+            "expected HttpStatus(302)"
+        );
         escape.assert_async().await;
     }
 
@@ -1058,10 +1064,13 @@ mod tests {
             .get_cached_trusted_origin(&source_url, &trusted_origin)
             .await;
 
-        match result {
-            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 302),
-            other => panic!("expected HttpStatus(302), got {other:?}"),
-        }
+        // Assert via `matches!` rather than debug-formatting `result` in a panic message:
+        // on the `Ok` arm that value is the raw response body, which would otherwise be
+        // written to the test log by the panic machinery.
+        assert!(
+            matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
+            "expected HttpStatus(302)"
+        );
         escape.assert_async().await;
     }
 
@@ -1311,7 +1320,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_cached_network_error_fallback() {
         let cache = HttpCache::new();
-        let url = "http://invalid.localhost.test/data";
+        // https:// (not http://) so this exercises DNS-resolution failure, not the
+        // HTTPS-only policy enforced by `ensure_https`.
+        let url = "https://invalid.localhost.test/data";
 
         cache.entries.insert(
             url.to_string(),
