@@ -5,12 +5,13 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
 
 use crate::osv::VulnerabilityMap;
-use crate::{Dependency, InvalidPackageName, PackageName, VersionReq};
+use crate::{Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq};
 
 mod code_actions;
 mod code_lenses;
 mod diagnostics;
 mod hover;
+mod in_use_version;
 mod inlay_hints;
 #[cfg(test)]
 mod test_support;
@@ -22,6 +23,7 @@ pub use diagnostics::{
     generate_diagnostics, generate_diagnostics_from_cache, requirement_is_unsatisfiable,
 };
 pub use hover::generate_hover;
+pub use in_use_version::{concrete_pin_version, in_use_version};
 pub use inlay_hints::generate_inlay_hints;
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
@@ -180,6 +182,21 @@ pub struct VersionData<'a> {
     /// a misleading "Unknown package" diagnostic. `None` when no fetch has
     /// run yet, same convention as [`Self::yanked`].
     pub fetch_failed: Option<&'a HashSet<String>>,
+    /// This document's ecosystem, when the caller has one to give. `None` in
+    /// most test fixtures and a handful of ecosystem-crate self-tests that
+    /// predate this field.
+    ///
+    /// Enables two occurrence-aware refinements added for #394 (duplicate
+    /// dependency names no longer collapsing into one shared finding):
+    /// [`generate_diagnostics_from_cache`] only emits a yanked-version
+    /// diagnostic on the occurrence whose own in-use version actually
+    /// matches the recorded finding (S1), and the vulnerability lookups in
+    /// `generate_diagnostics_from_cache`, [`generate_hover`], and
+    /// `generate_code_actions` prefer a version-qualified
+    /// [`crate::osv::VulnerabilityMap`] key over the plain name when more
+    /// than one occurrence of a name has a distinct in-use version (S2).
+    /// When `None`, both fall back to their pre-#394 name-only behavior.
+    pub ecosystem: Option<EcosystemId>,
 }
 
 impl<'a> VersionData<'a> {
@@ -210,6 +227,7 @@ impl<'a> VersionData<'a> {
             vulnerabilities: None,
             yanked: None,
             fetch_failed: None,
+            ecosystem: None,
         }
     }
 
@@ -272,6 +290,26 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub fn with_fetch_failed(mut self, fetch_failed: &'a HashSet<String>) -> Self {
         self.fetch_failed = Some(fetch_failed);
+        self
+    }
+
+    /// Attaches this document's ecosystem, enabling the occurrence-aware
+    /// refinements described on [`Self::ecosystem`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{EcosystemId, VersionData};
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_ecosystem(EcosystemId::Cargo);
+    /// assert_eq!(versions.ecosystem, Some(EcosystemId::Cargo));
+    /// ```
+    #[must_use]
+    pub const fn with_ecosystem(mut self, ecosystem: EcosystemId) -> Self {
+        self.ecosystem = Some(ecosystem);
         self
     }
 }

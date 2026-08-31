@@ -59,6 +59,7 @@ pub(crate) async fn generate_diagnostics_internal(
         let parse_result = doc.parse_result_arc()?;
         Some((
             ecosystem,
+            doc.ecosystem,
             parse_result,
             doc.cached_versions.clone(),
             doc.resolved_versions.clone(),
@@ -73,6 +74,7 @@ pub(crate) async fn generate_diagnostics_internal(
 
     let Some((
         ecosystem,
+        ecosystem_id,
         parse_result,
         cached_versions,
         resolved_versions,
@@ -90,7 +92,8 @@ pub(crate) async fn generate_diagnostics_internal(
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_vulnerabilities(&vulnerabilities)
                 .with_yanked(&yanked_versions)
-                .with_fetch_failed(&fetch_failed),
+                .with_fetch_failed(&fetch_failed)
+                .with_ecosystem(ecosystem_id),
             uri,
             freshness,
             severities,

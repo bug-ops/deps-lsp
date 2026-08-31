@@ -37,6 +37,7 @@ struct VulnerabilityFixAction {
 /// still reconcile the result against a successful registry fetch when one
 /// is available — see the yank check in [`generate_code_actions`].
 fn build_vulnerability_fix_action(
+    parse_result: &dyn ParseResult,
     dep: &dyn Dependency,
     uri: &Uri,
     version_range: Range,
@@ -45,8 +46,18 @@ fn build_vulnerability_fix_action(
     formatter: &dyn EcosystemFormatter,
 ) -> Option<VulnerabilityFixAction> {
     let normalized_name = formatter.normalize_package_name(dep.name());
+    // #394 S2: prefer the version-qualified key so a fix action for one
+    // occurrence of a duplicated name is never built from another
+    // occurrence's OSV result. See `crate::osv::vulnerability_keys`.
+    let vuln_key = versions.ecosystem.and_then(|ecosystem| {
+        crate::osv::vulnerability_keys(parse_result, versions.resolved, formatter, ecosystem)
+            .remove(&dep.name_range())
+    });
     let outcome = versions.vulnerabilities.and_then(|m| {
-        m.get(&normalized_name)
+        vuln_key
+            .as_deref()
+            .and_then(|key| m.get(key))
+            .or_else(|| m.get(&normalized_name))
             .or_else(|| m.get(dep.name().as_str()))
     })?;
     let ScanOutcome::Vulnerable(dv) = outcome else {
@@ -389,6 +400,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     // Both fix actions are built before the registry fetch below so a registry outage
     // never suppresses an OSV-derived fix (FR-007) or a known-unsatisfiable one.
     let fix = build_vulnerability_fix_action(
+        parse_result,
         dep,
         uri,
         version_range,
@@ -1000,6 +1012,122 @@ mod tests {
         assert!(
             quickfix_titles(&actions).is_empty(),
             "an unsafe fix version must never produce a vulnerability-fix quickfix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_vulnerability_fix_not_offered_on_patched_duplicate_occurrence()
+     {
+        // #394 S2 (critic addendum, security-relevant): the vulnerability
+        // quickfix *mutates the manifest*, so offering it on the wrong
+        // occurrence of a duplicated name is worse than a cosmetic bug.
+        // `log4j-core` appears twice with different pins — one vulnerable,
+        // one already patched. The quickfix must appear only at the
+        // vulnerable occurrence's position, never at the patched one's,
+        // regardless of which occurrence's OSV result happened to be
+        // inserted into the shared map last.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let vulnerable_line = "log4j-core = \"=2.14.1\"";
+        let patched_line = "log4j-core = \"=2.17.1\"";
+        let content = format!("{vulnerable_line}\n{patched_line}\n");
+
+        let name_start = 0u32;
+        let name_end = "log4j-core".len() as u32;
+        let version_start = "log4j-core = \"".len() as u32;
+
+        let vulnerable_dep = MockDep {
+            name: pkg("log4j-core"),
+            version_req: VersionReq::new("=2.14.1"),
+            version_range: Range::new(
+                Position::new(0, version_start),
+                Position::new(0, version_start + "=2.14.1".len() as u32),
+            ),
+            name_range: Range::new(Position::new(0, name_start), Position::new(0, name_end)),
+        };
+        let patched_dep = MockDep {
+            name: pkg("log4j-core"),
+            version_req: VersionReq::new("=2.17.1"),
+            version_range: Range::new(
+                Position::new(1, version_start),
+                Position::new(1, version_start + "=2.17.1".len() as u32),
+            ),
+            name_range: Range::new(Position::new(1, name_start), Position::new(1, name_end)),
+        };
+        let parse_result = MockParseResult {
+            deps: vec![vulnerable_dep, patched_dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        let keys = crate::osv::vulnerability_keys(
+            &parse_result,
+            &resolved,
+            &IdentityFormatter,
+            crate::EcosystemId::Cargo,
+        );
+        let deps = parse_result.dependencies();
+        let vulnerable_key = keys.get(&deps[0].name_range()).unwrap().clone();
+        let patched_key = keys.get(&deps[1].name_range()).unwrap().clone();
+        assert_ne!(vulnerable_key, patched_key);
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            vulnerable_key,
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "GHSA-log4j".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::Critical,
+                    cvss_vector: None,
+                    fixed_versions: vec!["2.17.1".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+        vulnerabilities.insert(patched_key, ScanOutcome::Clean);
+
+        let versions = VersionData::new(&cached, &resolved)
+            .with_vulnerabilities(&vulnerabilities)
+            .with_ecosystem(crate::EcosystemId::Cargo);
+
+        let actions_on_vulnerable = generate_code_actions(
+            &parse_result,
+            Position::new(0, version_start),
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &IdentityFormatter,
+        )
+        .await;
+        assert!(
+            !quickfix_titles(&actions_on_vulnerable).is_empty(),
+            "the vulnerable occurrence must get a fix quickfix"
+        );
+
+        let actions_on_patched = generate_code_actions(
+            &parse_result,
+            Position::new(1, version_start),
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &IdentityFormatter,
+        )
+        .await;
+        assert!(
+            quickfix_titles(&actions_on_patched).is_empty(),
+            "the already-patched occurrence must NOT get a fix quickfix, \
+             even though it shares a name with the vulnerable one: {:?}",
+            quickfix_titles(&actions_on_patched)
         );
     }
 

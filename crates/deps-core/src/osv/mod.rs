@@ -26,7 +26,7 @@ use dashmap::DashMap;
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 pub use types::{
     Advisory, DependencyVulnerabilities, FixRecommendation, ScanOutcome, ScanTarget, SkipReason,
-    UpgradeStatus, VulnSeverity, VulnerabilityMap,
+    UpgradeStatus, VulnSeverity, VulnerabilityMap, vulnerability_keys,
 };
 use types::{
     OsvBatchRequest, OsvBatchResponse, OsvPackage, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,

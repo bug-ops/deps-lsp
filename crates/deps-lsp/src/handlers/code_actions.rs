@@ -34,6 +34,7 @@ pub async fn handle_code_actions(
     // `with_document` makes this structural rather than a convention to remember (#333).
     let Some((
         ecosystem,
+        ecosystem_id,
         parse_result,
         cached_versions,
         resolved_versions,
@@ -45,6 +46,7 @@ pub async fn handle_code_actions(
             let parse_result = doc.parse_result_arc()?;
             Some((
                 ecosystem,
+                doc.ecosystem,
                 parse_result,
                 doc.cached_versions.clone(),
                 doc.resolved_versions.clone(),
@@ -63,7 +65,8 @@ pub async fn handle_code_actions(
             position,
             uri,
             VersionData::new(&cached_versions, &resolved_versions)
-                .with_vulnerabilities(&vulnerabilities),
+                .with_vulnerabilities(&vulnerabilities)
+                .with_ecosystem(ecosystem_id),
             &content,
         )
         .await;

@@ -387,6 +387,15 @@ pub fn generate_diagnostics_from_cache(
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
 
+    // #394 S2: version-qualified OSV lookup keys, so two occurrences of one
+    // name pinned to different versions never share a `Vulnerable`/`Clean`
+    // result. `None` when this `VersionData` carries no ecosystem (most test
+    // fixtures) — the per-dep lookup below then falls back to the plain
+    // name, unaffected.
+    let vuln_keys = versions.ecosystem.map(|ecosystem| {
+        crate::osv::vulnerability_keys(parse_result, versions.resolved, formatter, ecosystem)
+    });
+
     for dep in deps {
         let normalized_name = formatter.normalize_package_name(dep.name());
 
@@ -394,8 +403,11 @@ pub fn generate_diagnostics_from_cache(
         // no version range) so a registry failure never suppresses an OSV
         // finding — the two are independent data sources (FR-007/US-004).
         if let Some(vulnerabilities) = versions.vulnerabilities
-            && let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities
-                .get(&normalized_name)
+            && let Some(ScanOutcome::Vulnerable(dv)) = vuln_keys
+                .as_ref()
+                .and_then(|keys| keys.get(&dep.name_range()))
+                .and_then(|key| vulnerabilities.get(key))
+                .or_else(|| vulnerabilities.get(&normalized_name))
                 .or_else(|| vulnerabilities.get(dep.name().as_str()))
         {
             push_vulnerability_diagnostics(&mut diagnostics, dep, dv);
@@ -427,19 +439,40 @@ pub fn generate_diagnostics_from_cache(
         // `test_yanked_only_match_suppresses_outdated_diagnostic`). Each policy was
         // independently reviewed and tested before this merge; harmonizing them is out
         // of scope here.
-        let yanked_diagnostic_pushed =
-            if let Some(yanked_version) = versions.yanked.and_then(|y| y.get(&normalized_name)) {
-                diagnostics.push(Diagnostic {
-                    range: dep.version_range().unwrap_or_else(|| dep.name_range()),
-                    severity: Some(severities.yanked),
-                    message: format!("{} ({})", formatter.yanked_message(), yanked_version),
-                    source: Some("deps-lsp".into()),
-                    ..Default::default()
-                });
-                true
-            } else {
-                false
-            };
+        // #394 S1: when multiple occurrences share `normalized_name`, the
+        // finding recorded under it may belong to a *different* occurrence
+        // (e.g. `[dependencies] time = "=0.1.43"`, yanked, and
+        // `[dev-dependencies] time = "=0.1.44"`, not yanked — both name-keyed
+        // to the same `yanked_version`). Emitting unconditionally would push
+        // a false-positive "yanked" diagnostic onto the safe occurrence, for
+        // a version string that does not even appear on that line. Gated on
+        // `versions.ecosystem` being set (production always sets it; the
+        // check is skipped, matching pre-#394 behavior, for the test
+        // fixtures that do not).
+        let yanked_diagnostic_pushed = if let Some(yanked_version) =
+            versions.yanked.and_then(|y| y.get(&normalized_name))
+            && versions.ecosystem.is_none_or(|ecosystem| {
+                super::in_use_version(
+                    dep,
+                    &normalized_name,
+                    versions.resolved,
+                    formatter,
+                    ecosystem,
+                )
+                .as_deref()
+                    == Some(yanked_version.as_str())
+            }) {
+            diagnostics.push(Diagnostic {
+                range: dep.version_range().unwrap_or_else(|| dep.name_range()),
+                severity: Some(severities.yanked),
+                message: format!("{} ({})", formatter.yanked_message(), yanked_version),
+                source: Some("deps-lsp".into()),
+                ..Default::default()
+            });
+            true
+        } else {
+            false
+        };
 
         let package_versions = versions
             .cached
@@ -1761,6 +1794,123 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_diagnostics_from_cache_yanked_not_shared_across_duplicate_name_occurrences() {
+        // #394 S1: two occurrences of `time` (e.g. under `[dependencies]` and
+        // `[dev-dependencies]`) pinned to different exact versions, only one
+        // of which is actually yanked. `yanked` is name-keyed (single value),
+        // recording only "0.1.43" — the occurrence pinned to "0.1.44" must
+        // NOT also render "yanked (0.1.43)" just because it shares the name;
+        // that version string doesn't even appear on its line.
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![
+                MockDep {
+                    name: "time".into(),
+                    version_req: "=0.1.43".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                },
+                MockDep {
+                    name: "time".into(),
+                    version_req: "=0.1.44".into(),
+                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        yanked.insert("time".to_string(), "0.1.43".to_string());
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_yanked(&yanked)
+                .with_ecosystem(crate::EcosystemId::Cargo),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let yanked_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with(formatter.yanked_message()))
+            .collect();
+        assert_eq!(
+            yanked_diags.len(),
+            1,
+            "exactly one occurrence must get the yanked diagnostic, got: {diagnostics:?}"
+        );
+        assert_eq!(
+            yanked_diags[0].range.start.line, 0,
+            "must land on the yanked occurrence's own line"
+        );
+        assert!(yanked_diags[0].message.contains("0.1.43"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_yanked_no_ecosystem_keeps_pre_394_behavior() {
+        // Without `with_ecosystem` (most test fixtures, and any caller that
+        // predates #394), the consistency check is skipped entirely and both
+        // occurrences render the shared name-keyed finding — the exact
+        // pre-#394 behavior, preserved deliberately for backward
+        // compatibility rather than silently tightened.
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![
+                MockDep {
+                    name: "time".into(),
+                    version_req: "=0.1.43".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                },
+                MockDep {
+                    name: "time".into(),
+                    version_req: "=0.1.44".into(),
+                    version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+                    name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        yanked.insert("time".to_string(), "0.1.43".to_string());
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let yanked_diags = diagnostics
+            .iter()
+            .filter(|d| d.message.starts_with(formatter.yanked_message()))
+            .count();
+        assert_eq!(
+            yanked_diags, 2,
+            "no `ecosystem` set: both occurrences share the finding as before #394"
+        );
+    }
+
+    #[test]
     fn test_generate_diagnostics_unsatisfiable_enriched_with_matching_prerelease() {
         let cached_versions = {
             let mut m = HashMap::new();
@@ -2170,6 +2320,93 @@ mod tests {
             more_diag.message.contains("+35"),
             "got: {}",
             more_diag.message
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_vulnerability_not_shared_across_duplicate_name_occurrences() {
+        // #394 S2: two occurrences of `pkg` (e.g. under `[dependencies]` and
+        // `[dev-dependencies]`) pinned to different versions — one vulnerable,
+        // one patched. Built via `vulnerability_keys` the same way
+        // `deps-lsp`'s `build_scan_targets` would, so each occurrence's OSV
+        // result lands under its own key instead of colliding on the plain
+        // name. The patched occurrence must render no advisory diagnostic.
+        use crate::osv::{
+            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+            vulnerability_keys,
+        };
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let vulnerable_dep = MockDep {
+            name: "pkg".into(),
+            version_req: "=1.0.0".into(),
+            version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+        };
+        let patched_dep = MockDep {
+            name: "pkg".into(),
+            version_req: "=2.0.0".into(),
+            version_range: Range::new(Position::new(3, 10), Position::new(3, 20)),
+            name_range: Range::new(Position::new(3, 0), Position::new(3, 5)),
+        };
+        let parse_result = MockParseResult {
+            deps: vec![vulnerable_dep, patched_dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let keys = vulnerability_keys(
+            &parse_result,
+            &resolved_versions,
+            &formatter,
+            crate::EcosystemId::Cargo,
+        );
+        let deps = parse_result.dependencies();
+        let vulnerable_key = keys.get(&deps[0].name_range()).unwrap().clone();
+        let patched_key = keys.get(&deps[1].name_range()).unwrap().clone();
+        assert_ne!(
+            vulnerable_key, patched_key,
+            "differently-versioned occurrences of one name must get distinct keys"
+        );
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            vulnerable_key,
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
+                total_known: 1,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+        vulns.insert(patched_key, ScanOutcome::Clean);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulns)
+                .with_ecosystem(crate::EcosystemId::Cargo),
+            &formatter,
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let advisory_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .collect();
+        assert_eq!(
+            advisory_diags.len(),
+            1,
+            "exactly one occurrence must get the advisory diagnostic, got: {diagnostics:?}"
+        );
+        assert_eq!(
+            advisory_diags[0].range.start.line, 0,
+            "must land on the vulnerable occurrence's own line, not the patched one"
         );
     }
 
