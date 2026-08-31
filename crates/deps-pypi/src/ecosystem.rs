@@ -70,13 +70,33 @@ impl PypiEcosystem {
     }
 
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
-        deps_core::completion::complete_package_names_generic(
+        let mut items = deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
             prefix,
             20,
             range,
         )
-        .await
+        .await;
+
+        // #419 S2: the search index matches on the PEP 503 *normalized* name
+        // (`zope.int` typed -> normalized to `zope-int` -> `zope-interface`
+        // found), but `build_package_completion` sets `filter_text` to that same
+        // normalized name — and the LSP client re-filters every returned item
+        // against the RAW TEXT the user actually typed, independent of what the
+        // server matched on. `zope.int` is not a subsequence of `zope-interface`,
+        // so an editor like VS Code silently drops a result the server correctly
+        // found. Rewriting `filter_text` to the raw, as-typed `prefix` makes every
+        // returned item trivially self-matching against what's already on screen.
+        // Safe to do unconditionally (rather than something that must also match
+        // characters not yet typed): PyPI's completions are always
+        // `isIncomplete: true` (see `completions_are_incomplete`), so the client
+        // re-queries — and receives a fresh `filter_text` — on the very next
+        // keystroke rather than continuing to filter this same list locally.
+        for item in &mut items {
+            item.filter_text = Some(prefix.to_string());
+        }
+
+        items
     }
 
     async fn complete_versions(
@@ -155,6 +175,17 @@ impl Ecosystem for PypiEcosystem {
         &self.formatter
     }
 
+    fn completions_are_incomplete(&self) -> bool {
+        // Package-name completion serves unranked, alphabetically-truncated prefix
+        // matches from `PypiRegistry::search`'s local index (issue #419): the
+        // client must re-query as the user keeps typing rather than filter its
+        // existing (possibly cold-start-empty) list. See
+        // `Ecosystem::completions_are_incomplete`'s doc for why this also covers
+        // this ecosystem's other completion contexts (version completion, and
+        // `CompletionContext::None`/`Feature`), not just package-name search.
+        true
+    }
+
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -164,6 +195,14 @@ impl Ecosystem for PypiEcosystem {
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
+
+            // Warms the package-name search index lazily on the first completion
+            // request in this manifest, not just on a package-name completion —
+            // so a version completion (or any other completion in the file)
+            // usually has the index ready before the user starts typing a new
+            // package name. Cheap to call unconditionally: a no-op once the
+            // index is ready or while a prior failed build is within backoff.
+            self.registry.warm_search_index();
 
             let context = detect_completion_context(parse_result, position, content);
 
@@ -357,17 +396,175 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    #[tokio::test]
-    #[ignore] // Requires network access
-    async fn test_complete_package_names_real_search() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
+    /// Builds a `PypiEcosystem` whose registry's search index is pointed at a
+    /// mock server rather than the real `pypi.org/simple/`, so package-name
+    /// completion (issue #419) can be exercised network-free.
+    fn ecosystem_with_index_url(
+        cache: Arc<deps_core::HttpCache>,
+        index_url: String,
+    ) -> PypiEcosystem {
+        PypiEcosystem {
+            registry: Arc::new(PypiRegistry::with_index_url(cache, index_url)),
+            parser: PypiParser::new(),
+            formatter: PypiFormatter,
+        }
+    }
 
-        let results = ecosystem
+    /// Polls `probe` until it returns a non-empty result or `attempts` polls have
+    /// elapsed, returning the last (possibly still empty) result. Used to wait out
+    /// the background index build without a flaky fixed sleep.
+    async fn poll_until_nonempty<F, Fut>(mut probe: F, attempts: u32) -> Vec<CompletionItem>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Vec<CompletionItem>>,
+    {
+        for _ in 0..attempts {
+            let results = probe().await;
+            if !results.is_empty() {
+                return results;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        probe().await
+    }
+
+    /// #419 regression: `test_complete_package_names_real_search` used to be
+    /// `#[ignore]`d (real network access, so never ran in CI). Rewritten
+    /// network-free against a mocked Simple API index: the first call is a cold
+    /// start (empty, index not built yet) and a later call — once the background
+    /// build finishes — finds `requests`.
+    #[tokio::test]
+    async fn test_complete_package_names_uses_index() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&["requests"]))
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let ecosystem = ecosystem_with_index_url(cache, index_url);
+
+        let cold_start = ecosystem
             .complete_package_names("reque", Range::default())
             .await;
+        assert!(
+            cold_start.is_empty(),
+            "cold start must not block on the download"
+        );
+
+        let results = poll_until_nonempty(
+            || ecosystem.complete_package_names("reque", Range::default()),
+            100,
+        )
+        .await;
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.label == "requests"));
+    }
+
+    /// #419 S2 regression: a query using a different separator than the index's
+    /// normalized form (`zope.int`, PEP 503-normalized to `zope-int` server-side)
+    /// must come back with `filter_text` set to the *raw typed* prefix, not the
+    /// normalized `label`/`insert_text` — otherwise an LSP client's local
+    /// re-filtering (`zope.int` is not a subsequence of `zope-interface`) would
+    /// silently drop a result the server correctly matched.
+    #[tokio::test]
+    async fn test_complete_package_names_filter_text_matches_raw_typed_prefix() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&["zope-interface"]))
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let ecosystem = ecosystem_with_index_url(cache, index_url);
+
+        let results = poll_until_nonempty(
+            || ecosystem.complete_package_names("zope.int", Range::default()),
+            100,
+        )
+        .await;
+
+        let item = results
+            .iter()
+            .find(|r| r.label == "zope-interface")
+            .expect("zope-interface should be found via separator-normalized search");
+        assert_eq!(
+            item.filter_text,
+            Some("zope.int".to_string()),
+            "filter_text must be the raw typed prefix, not the normalized label"
+        );
+    }
+
+    /// #419 §4.6/Q2 regression: a *version* completion request (not a
+    /// package-name one) inside a Python manifest must warm the search index —
+    /// `PypiEcosystem::generate_completions` calls `warm_search_index` before
+    /// dispatching on completion context — and repeated requests must still
+    /// produce exactly one index-build fetch (single-flight + build-once).
+    #[tokio::test]
+    async fn test_version_completion_triggers_exactly_one_index_build_attempt() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&["requests"]))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let ecosystem = ecosystem_with_index_url(cache, index_url);
+
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+        let content = "[project]\ndependencies = [\"requests>=2.0\"]\n";
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        // Locate a cursor position that `detect_completion_context` actually
+        // resolves to a Version context, rather than hand-computing a column
+        // offset that would silently drift if the fixture line changes.
+        let version_line = content.lines().nth(1).unwrap();
+        let version_position = (0..=version_line.len() as u32)
+            .map(|character| tower_lsp_server::ls_types::Position::new(1, character))
+            .find(|&position| {
+                matches!(
+                    deps_core::completion::detect_completion_context(
+                        parse_result.as_ref(),
+                        position,
+                        content,
+                    ),
+                    deps_core::completion::CompletionContext::Version { .. }
+                )
+            })
+            .expect("fixture line must contain a Version completion context");
+
+        for _ in 0..3 {
+            let _ = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    version_position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+        }
+
+        // Give the (single-flight) background build a chance to finish.
+        let ready = poll_until_nonempty(
+            || ecosystem.complete_package_names("reque", Range::default()),
+            100,
+        )
+        .await;
+        assert!(
+            ready.iter().any(|r| r.label == "requests"),
+            "index should be ready and contain requests after warming"
+        );
+        mock.assert_async().await;
     }
 
     #[tokio::test]

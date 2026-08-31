@@ -109,6 +109,7 @@ pub mod lockfile;
 pub mod name;
 pub mod parser;
 pub mod registry;
+mod search;
 pub mod types;
 
 // Re-export commonly used types
