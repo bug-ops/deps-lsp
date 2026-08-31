@@ -5,7 +5,6 @@
 //! registry integration.
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod interval;
 pub mod parser;
@@ -15,7 +14,6 @@ pub mod types;
 pub mod version;
 
 pub use ecosystem::MavenEcosystem;
-pub use error::{MavenError, Result};
 pub use formatter::MavenFormatter;
 pub use parser::{MavenParseResult, parse_pom_xml};
 pub use registry::{MavenCentralRegistry, package_url};

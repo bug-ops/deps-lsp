@@ -25,7 +25,6 @@
 //! }
 //! ```
 
-use crate::error::GoError;
 use crate::types::GoVersion;
 use crate::version::{escape_module_path, escape_version, is_pseudo_version};
 use deps_core::{DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value};
@@ -56,13 +55,13 @@ const MAX_VERSION_LENGTH: usize = 128;
 /// - Path is empty
 /// - Path exceeds MAX_MODULE_PATH_LENGTH
 /// - Any `/`-separated segment is exactly `.`/`..`
-fn validate_module_path(module_path: &str) -> crate::error::Result<()> {
+fn validate_module_path(module_path: &str) -> Result<()> {
     if module_path.is_empty() {
-        return Err(GoError::InvalidModulePath("module path is empty".into()));
+        return Err(DepsError::InvalidVersionReq("module path is empty".into()));
     }
 
     if module_path.len() > MAX_MODULE_PATH_LENGTH {
-        return Err(GoError::InvalidModulePath(format!(
+        return Err(DepsError::InvalidVersionReq(format!(
             "module path exceeds maximum length of {MAX_MODULE_PATH_LENGTH} characters"
         )));
     }
@@ -75,7 +74,7 @@ fn validate_module_path(module_path: &str) -> crate::error::Result<()> {
     // URL parser's dot-segment normalization — the same defect class as #341/#349/#357/#361.
     if module_path.split('/').any(is_dot_segment) {
         warn_rejected_value("is_dot_segment", "Go module proxy request URL", module_path);
-        return Err(GoError::InvalidModulePath(format!(
+        return Err(DepsError::InvalidVersionReq(format!(
             "module path '{module_path}' contains a `.`/`..` path segment"
         )));
     }
@@ -99,29 +98,24 @@ fn versions_list_url(module_path: &str) -> String {
 /// - Version is empty
 /// - Version exceeds MAX_VERSION_LENGTH
 /// - Version contains path traversal sequences
-fn validate_version_string(version: &str) -> crate::error::Result<()> {
+fn validate_version_string(version: &str) -> Result<()> {
     if version.is_empty() {
-        return Err(GoError::InvalidVersionSpecifier {
-            specifier: version.to_string(),
-            message: "version string is empty".into(),
-        });
+        return Err(DepsError::InvalidVersionReq(
+            "version string is empty".into(),
+        ));
     }
 
     if version.len() > MAX_VERSION_LENGTH {
-        return Err(GoError::InvalidVersionSpecifier {
-            specifier: version.to_string(),
-            message: format!(
-                "version string exceeds maximum length of {MAX_VERSION_LENGTH} characters"
-            ),
-        });
+        return Err(DepsError::InvalidVersionReq(format!(
+            "version string exceeds maximum length of {MAX_VERSION_LENGTH} characters"
+        )));
     }
 
     // Check for path traversal attempts
     if version.contains("..") || version.contains('/') || version.contains('\\') {
-        return Err(GoError::InvalidVersionSpecifier {
-            specifier: version.to_string(),
-            message: "version string contains invalid characters".into(),
-        });
+        return Err(DepsError::InvalidVersionReq(
+            "version string contains invalid characters".into(),
+        ));
     }
 
     Ok(())
@@ -788,9 +782,9 @@ mod tests {
     /// `get_versions` — not a reimplemented gate+sink pair — proving the gate is actually
     /// wired into the call path a real completion/hover/diagnostic request would take. No
     /// mock is needed: the gate must reject before any network request is issued.
-    /// `GoError::InvalidModulePath` converts to `DepsError::InvalidVersionReq` (see
-    /// `error.rs`), not `PackageNotFound` — this crate's existing not-found mapping is
-    /// unrelated to the dot-segment gate and is left unchanged.
+    /// The dot-segment gate rejects with `DepsError::InvalidVersionReq`, not
+    /// `PackageNotFound` — this crate's existing not-found mapping is unrelated to the
+    /// dot-segment gate and is left unchanged.
     #[tokio::test]
     async fn test_get_versions_rejects_bare_dot_dot_segment() {
         let registry = GoRegistry::new(Arc::new(HttpCache::new()));
@@ -906,8 +900,10 @@ mod tests {
     #[test]
     fn test_validate_module_path_empty() {
         let result = validate_module_path("");
-        assert!(result.is_err());
-        assert!(matches!(result, Err(GoError::InvalidModulePath(_))));
+        match result {
+            Err(DepsError::InvalidVersionReq(msg)) => assert_eq!(msg, "module path is empty"),
+            other => panic!("expected InvalidVersionReq, got {other:?}"),
+        }
     }
 
     #[test]
@@ -915,7 +911,7 @@ mod tests {
         let long_path = "a".repeat(MAX_MODULE_PATH_LENGTH + 1);
         let result = validate_module_path(&long_path);
         assert!(result.is_err());
-        assert!(matches!(result, Err(GoError::InvalidModulePath(_))));
+        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
     }
 
     #[test]
@@ -928,14 +924,14 @@ mod tests {
     fn test_validate_module_path_rejects_bare_dot_dot_segment() {
         let result = validate_module_path("github.com/user/..");
         assert!(result.is_err());
-        assert!(matches!(result, Err(GoError::InvalidModulePath(_))));
+        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
     }
 
     #[test]
     fn test_validate_module_path_rejects_bare_dot_segment() {
         let result = validate_module_path("./evil");
         assert!(result.is_err());
-        assert!(matches!(result, Err(GoError::InvalidModulePath(_))));
+        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
     }
 
     #[test]
@@ -974,11 +970,10 @@ mod tests {
     #[test]
     fn test_validate_version_string_empty() {
         let result = validate_version_string("");
-        assert!(result.is_err());
-        assert!(matches!(
-            result,
-            Err(GoError::InvalidVersionSpecifier { .. })
-        ));
+        match result {
+            Err(DepsError::InvalidVersionReq(msg)) => assert_eq!(msg, "version string is empty"),
+            other => panic!("expected InvalidVersionReq, got {other:?}"),
+        }
     }
 
     #[test]
@@ -986,20 +981,14 @@ mod tests {
         let long_version = "v".to_string() + &"1".repeat(MAX_VERSION_LENGTH);
         let result = validate_version_string(&long_version);
         assert!(result.is_err());
-        assert!(matches!(
-            result,
-            Err(GoError::InvalidVersionSpecifier { .. })
-        ));
+        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
     }
 
     #[test]
     fn test_validate_version_string_path_traversal() {
         let result = validate_version_string("v1.0.0/../etc/passwd");
         assert!(result.is_err());
-        assert!(matches!(
-            result,
-            Err(GoError::InvalidVersionSpecifier { .. })
-        ));
+        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
     }
 
     #[test]

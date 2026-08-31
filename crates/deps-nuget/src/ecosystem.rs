@@ -71,7 +71,7 @@ impl NuGetEcosystem {
     /// `.csproj`/`.fsproj`/`.vbproj` (routed to this ecosystem via `manifest_extensions`)
     /// all share the `PackageReference` MSBuild schema, so anything not matching one of the
     /// two fixed filenames falls through to the project-file parser.
-    fn parse_by_filename(content: &str, uri: &Uri) -> crate::error::Result<NuGetParseResult> {
+    fn parse_by_filename(content: &str, uri: &Uri) -> Result<NuGetParseResult> {
         let path = uri.path().as_str();
         let filename = path.rsplit('/').next().unwrap_or(path);
 
@@ -114,8 +114,7 @@ impl Ecosystem for NuGetEcosystem {
         uri: &'a Uri,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result =
-                Self::parse_by_filename(content, uri).map_err(deps_core::DepsError::from)?;
+            let result = Self::parse_by_filename(content, uri)?;
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
     }

@@ -3,9 +3,9 @@
 //! Uses quick-xml SAX reader to parse Maven POM files.
 //! Tracks byte positions for LSP range computation.
 
-use crate::error::{MavenError, Result};
 use crate::types::{MavenDependency, MavenScope};
 use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::{DepsError, Result};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::any::Any;
@@ -59,8 +59,9 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Uri) -> Result<MavenParseResult> {
 
     loop {
         let pos = reader.buffer_position();
-        let event = reader.read_event().map_err(|e| MavenError::ParseError {
-            message: e.to_string(),
+        let event = reader.read_event().map_err(|e| DepsError::ParseError {
+            file_type: "pom.xml".into(),
+            source: Box::new(std::io::Error::other(e.to_string())),
         })?;
 
         match event {
@@ -566,7 +567,10 @@ mod tests {
         // Malformed attribute triggers a hard error
         let xml2 = r#"<project attr="unclosed></project>"#;
         let result2 = parse_pom_xml(xml2, &test_uri());
-        assert!(result2.is_err());
+        assert!(matches!(
+            result2,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "pom.xml"
+        ));
     }
 
     #[test]

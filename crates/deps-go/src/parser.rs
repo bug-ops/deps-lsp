@@ -11,8 +11,8 @@
 //! - Extracts indirect dependency markers (// indirect)
 //! - Note: retract directive is defined in types but not yet parsed
 
-use crate::error::Result;
 use crate::types::{GoDependency, GoDirective};
+use deps_core::Result;
 use deps_core::lsp_helpers::LineOffsetTable;
 use regex::Regex;
 use tower_lsp_server::ls_types::{Range, Uri};

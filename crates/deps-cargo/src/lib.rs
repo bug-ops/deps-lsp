@@ -21,7 +21,6 @@
 //! ```
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
@@ -30,7 +29,6 @@ pub mod types;
 
 // Re-export commonly used types
 pub use ecosystem::CargoEcosystem;
-pub use error::{CargoError, Result};
 pub use formatter::CargoFormatter;
 pub use lockfile::CargoLockParser;
 pub use parser::{CargoParser, ParseResult, parse_cargo_toml};

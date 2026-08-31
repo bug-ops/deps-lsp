@@ -2,9 +2,9 @@
 //!
 //! Extracts plugin declarations from `pluginManagement { plugins { } }` blocks.
 
-use crate::error::Result;
 use crate::parser::{GradleParseResult, utf16_len};
 use crate::types::GradleDependency;
+use deps_core::Result;
 use regex::Regex;
 use std::sync::OnceLock;
 use tower_lsp_server::ls_types::{Position, Range, Uri};

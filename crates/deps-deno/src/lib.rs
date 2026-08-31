@@ -7,7 +7,6 @@
 //! for the full architecture.
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod parser;
 pub mod registry;
@@ -15,7 +14,6 @@ pub mod specifier;
 pub mod types;
 
 pub use ecosystem::DenoEcosystem;
-pub use error::{DenoError, Result};
 pub use formatter::DenoFormatter;
 pub use parser::{DenoParseResult, parse_deno_json};
 pub use registry::{DenoRegistry, JsrRegistry};

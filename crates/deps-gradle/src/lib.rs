@@ -8,14 +8,12 @@
 //! Registry integration reuses `deps_maven::MavenCentralRegistry`.
 
 pub mod ecosystem;
-pub mod error;
 pub mod formatter;
 pub mod parser;
 pub mod range;
 pub mod types;
 
 pub use ecosystem::GradleEcosystem;
-pub use error::{GradleError, Result};
 pub use formatter::GradleFormatter;
 pub use parser::{GradleParseResult, parse_gradle};
 pub use types::{GradleDependency, GradleVersion};

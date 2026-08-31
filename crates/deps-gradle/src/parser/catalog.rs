@@ -2,9 +2,9 @@
 //!
 //! Handles \[versions\], \[libraries\] sections with position tracking via toml-span.
 
-use crate::error::{GradleError, Result};
 use crate::parser::{GradleParseResult, LineOffsetTable};
 use crate::types::GradleDependency;
+use deps_core::{DepsError, Result};
 use std::collections::HashMap;
 use toml_span::value::{Table, Value};
 use tower_lsp_server::ls_types::{Range, Uri};
@@ -13,16 +13,18 @@ pub fn parse_version_catalog(content: &str, uri: &Uri) -> Result<GradleParseResu
     if let Err(depth) =
         deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
     {
-        return Err(GradleError::ParseError {
-            message: format!(
+        return Err(DepsError::ParseError {
+            file_type: "Gradle".into(),
+            source: Box::new(std::io::Error::other(format!(
                 "array/table nesting depth {depth} exceeds maximum of {}",
                 deps_core::MAX_TOML_NESTING_DEPTH
-            ),
+            ))),
         });
     }
 
-    let doc = toml_span::parse(content).map_err(|e| GradleError::ParseError {
-        message: e.to_string(),
+    let doc = toml_span::parse(content).map_err(|e| DepsError::ParseError {
+        file_type: "Gradle".into(),
+        source: Box::new(std::io::Error::other(e.to_string())),
     })?;
 
     let line_table = LineOffsetTable::new(content);
@@ -171,7 +173,10 @@ mod tests {
         // being exercised here, not the crash itself.
         let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
         let result = parse_version_catalog(&content, &make_uri());
-        assert!(matches!(result, Err(GradleError::ParseError { .. })));
+        assert!(matches!(
+            result,
+            Err(DepsError::ParseError { file_type, .. }) if file_type == "Gradle"
+        ));
     }
 
     #[test]
