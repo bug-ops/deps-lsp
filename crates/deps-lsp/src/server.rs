@@ -389,9 +389,10 @@ impl LanguageServer for Backend {
             }
         }
 
-        // Spawn background cleanup task for cold start rate limiter
+        // Spawn background cleanup task for cold start rate limiter, supervised so a
+        // panic surfaces as an `error!` log instead of silently stopping cleanup forever.
         let state_clone = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        let cleanup_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_mins(1));
             loop {
                 interval.tick().await;
@@ -400,6 +401,11 @@ impl LanguageServer for Backend {
                     .cleanup_old_entries(std::time::Duration::from_mins(5));
                 tracing::trace!("Cleaned up old cold start rate limit entries");
             }
+        });
+        tokio::spawn(async move {
+            // Inner loop never returns (`JoinHandle<!>`), so `Ok` is unreachable and this pattern is irrefutable.
+            let Err(e) = cleanup_task.await;
+            tracing::error!("Cold start rate limiter cleanup task exited unexpectedly: {e}");
         });
     }
 
