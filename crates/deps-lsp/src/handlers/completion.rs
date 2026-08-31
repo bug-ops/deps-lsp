@@ -213,7 +213,10 @@ async fn fallback_completion(
 /// side: a leading `"` when the cursor sits before the closing quote of a still-typed
 /// key, or a trailing `"` when the cursor sits right after a closing quote (e.g. an
 /// editor auto-closed it, or the user retyped it). Either would otherwise reach the
-/// registry as part of the search query and suppress exact matches.
+/// registry as part of the search query and suppress exact matches. PyPI's
+/// `pyproject.toml` entries (`"pytes` inside `dependencies = [...]`) carry the same
+/// surviving-quote shape, just as a TOML array element rather than a JSON key — see
+/// [`uses_toml_string_array_values`].
 ///
 /// For XML manifests (`pom.xml`) an opening tag survives on the left instead (cursor
 /// inside `<artifactId>gua`) — stripped so the extracted text matches what the
@@ -226,7 +229,7 @@ fn extract_prefix(line: &str, character: u32, ecosystem_kind: EcosystemId) -> &s
     let prefix_end =
         deps_core::completion::utf16_to_byte_offset(line, character).unwrap_or(line.len());
     let prefix = line[..prefix_end].trim();
-    if uses_json_quoted_keys(ecosystem_kind) {
+    if uses_json_quoted_keys(ecosystem_kind) || uses_toml_string_array_values(ecosystem_kind) {
         prefix.trim_matches('"')
     } else if uses_xml_tag_values(ecosystem_kind) {
         strip_leading_xml_tag(prefix)
@@ -318,6 +321,34 @@ const fn uses_json_quoted_keys(ecosystem_kind: EcosystemId) -> bool {
     }
 }
 
+/// Whether `ecosystem_kind`'s manifest completes a value positioned as a TOML
+/// string-array *element* (`"pytes` inside `dependencies = [...]`), so
+/// [`extract_prefix`] must strip a surviving quote the same way it does for
+/// [`uses_json_quoted_keys`]'s JSON object-key shape.
+///
+/// PyPI only for now: PEP 621's `dependencies`/`optional-dependencies` entries are
+/// the only raw-text-detected (see [`is_in_dependencies_section`]) dependency shape
+/// in this file that is a bare TOML array of strings. Cargo also flows through
+/// `is_in_toml_dependencies`, but its dependency shape is a *key* (`name =
+/// "version"`), not an array element, so it must stay `false` here — a `true`
+/// value would incorrectly strip a quote from a still-typed Cargo key.
+const fn uses_toml_string_array_values(ecosystem_kind: EcosystemId) -> bool {
+    match ecosystem_kind {
+        EcosystemId::Pypi => true,
+        EcosystemId::Cargo
+        | EcosystemId::Npm
+        | EcosystemId::Composer
+        | EcosystemId::Go
+        | EcosystemId::Dart
+        | EcosystemId::Maven
+        | EcosystemId::Gradle
+        | EcosystemId::Swift
+        | EcosystemId::NuGet
+        | EcosystemId::Bundler
+        | EcosystemId::Deno => false,
+    }
+}
+
 /// Checks if a line is inside a dependencies section.
 ///
 /// Dispatches to a per-ecosystem raw-text heuristic. Matching on [`EcosystemId`]
@@ -330,7 +361,17 @@ fn is_in_dependencies_section(
     ecosystem_id: EcosystemId,
 ) -> bool {
     match ecosystem_id {
-        EcosystemId::Cargo | EcosystemId::Pypi => is_in_toml_dependencies(content, line_number),
+        EcosystemId::Cargo => is_in_toml_dependencies(content, line_number),
+        // PyPI's PEP 621 primary dependency list is a `dependencies = [...]` array
+        // under `[project]`, not a section header like Cargo's `[dependencies]` —
+        // `is_in_toml_dependencies` alone never matches it (see
+        // `is_in_pypi_project_dependencies_array`'s doc). `[project.optional-
+        // dependencies]` groups, by contrast, ARE a real header and stay covered by
+        // `is_in_toml_dependencies`.
+        EcosystemId::Pypi => {
+            is_in_toml_dependencies(content, line_number)
+                || is_in_pypi_project_dependencies_array(content, line_number)
+        }
         EcosystemId::Npm => is_in_json_dependencies(
             content,
             line_number,
@@ -403,6 +444,94 @@ fn is_in_toml_dependencies(content: &str, line_number: usize) -> bool {
     }
 
     false
+}
+
+/// Checks if a line is inside PEP 621's `dependencies = [...]` array under the
+/// `[project]` table.
+///
+/// Unlike `[dependencies]`/`[project.optional-dependencies]`, PEP 621's primary
+/// dependency list is a *value* (an array assigned to the `dependencies` key), not
+/// a section header — no real `pyproject.toml` ever writes a literal
+/// `[project.dependencies]` header — so it needs its own bracket-depth scan rather
+/// than `is_in_toml_dependencies`'s header-string match.
+///
+/// The bracket-depth counter has no string awareness, so an unbalanced `[`/`]`
+/// inside a still-typed extras spec (`"uvicorn[stan`) or a comment would otherwise
+/// desync it permanently. TOML forbids a table header inside an array value, so a
+/// bare `[...]` header line (checked on every line, not just outside the array) is
+/// used as an unambiguous resync point regardless of the counter's state.
+fn is_in_pypi_project_dependencies_array(content: &str, line_number: usize) -> bool {
+    let mut in_project = false;
+    let mut in_array = false;
+    let mut depth: i32 = 0;
+
+    for (i, line) in content.lines().enumerate() {
+        if i > line_number {
+            break;
+        }
+        let trimmed = strip_trailing_toml_comment(line.trim());
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_array = false;
+            in_project = trimmed == "[project]";
+            continue;
+        }
+
+        if !in_array && in_project && is_dependencies_array_start(trimmed) {
+            in_array = true;
+            depth = 0;
+        }
+
+        if in_array {
+            if i == line_number {
+                return true;
+            }
+            for ch in trimmed.chars() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if depth <= 0 {
+                in_array = false;
+            }
+        }
+    }
+
+    false
+}
+
+/// Strips a trailing TOML comment (`# ...`) from `line`, ignoring a `#` that
+/// appears inside a quoted string.
+///
+/// Naive like this file's other hand-rolled raw-text scanners (e.g.
+/// `is_in_json_dependencies`'s brace counting): does not handle a `\"` escape
+/// inside a double-quoted string, which would end the string one character too
+/// early. Good enough for the fallback-completion heuristic this feeds.
+fn strip_trailing_toml_comment(line: &str) -> &str {
+    let mut in_string: Option<char> = None;
+    for (idx, ch) in line.char_indices() {
+        match in_string {
+            Some(quote) if ch == quote => in_string = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => in_string = Some(ch),
+            None if ch == '#' => return line[..idx].trim_end(),
+            None => {}
+        }
+    }
+    line
+}
+
+/// Whether `trimmed` opens the `dependencies = [...]` array (`dependencies = [` or
+/// the single-line `dependencies = [...]`), used by
+/// [`is_in_pypi_project_dependencies_array`].
+fn is_dependencies_array_start(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("dependencies")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('='))
+        .is_some_and(|rest| rest.trim_start().starts_with('['))
 }
 
 /// Checks if a line is inside a JSON dependencies-like section.
@@ -660,10 +789,16 @@ fn create_package_completion_item(
 
     let insert_text = match ecosystem_id {
         // The key is quoted, not bare: a bare TOML key containing `.` (allowed by
-        // `is_safe_package_name` for PyPI names like `zope.interface`) expands into a
-        // nested table instead of a dependency entry — quoting closes that dotted-key
-        // injection and matches real names like `zope.interface` correctly either way.
-        EcosystemId::Cargo | EcosystemId::Pypi => format!("\"{name}\" = \"{latest}\""),
+        // `is_safe_package_name` for Cargo crate names) expands into a nested table
+        // instead of a dependency entry — quoting closes that dotted-key injection.
+        EcosystemId::Cargo => format!("\"{name}\" = \"{latest}\""),
+        // Both real PEP 621 shapes (`dependencies = [...]` and an
+        // `[project.optional-dependencies]` group) are TOML string-array elements,
+        // not a key=value table entry like Cargo's — the surrounding quotes already
+        // exist in the manifest (or the user is still typing them), matching the
+        // bare-name insert `build_package_completion` already uses for PyPI at the
+        // same cursor position on the primary (parsed) completion path.
+        EcosystemId::Pypi => name.to_string(),
         EcosystemId::Npm | EcosystemId::Composer => format!("\"{name}\": \"^{latest}\""),
         EcosystemId::Go => format!("{name} {latest}"),
         // The key is quoted: an unquoted YAML plain scalar can't start with `@`
@@ -857,6 +992,11 @@ mod tests {
     /// Same as [`mock_cargo_state`], but for the `"maven"` ecosystem.
     fn mock_maven_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
         mock_ecosystem_state("maven", "pom.xml", registry)
+    }
+
+    /// Same as [`mock_cargo_state`], but for the `"pypi"` ecosystem.
+    fn mock_pypi_state(registry: Arc<dyn deps_core::Registry>) -> ServerState {
+        mock_ecosystem_state("pypi", "pyproject.toml", registry)
     }
 
     #[tokio::test]
@@ -1393,6 +1533,83 @@ requests
         assert!(is_in_dependencies_section(content, 2, EcosystemId::Pypi));
     }
 
+    /// #390 root cause 1: real PEP 621 files never write a literal
+    /// `[project.dependencies]` header — the primary dependency list is a
+    /// `dependencies = [...]` array under `[project]`.
+    #[test]
+    fn test_is_in_dependencies_section_pypi_project_array_no_literal_header() {
+        let content = "[project]\nname = \"myapp\"\nversion = \"0.1.0\"\ndependencies = [\n    \"requests>=2.31.0\",\n    \"flas\n]\n";
+        // Unterminated entry line ("flas), mid-array.
+        assert!(is_in_dependencies_section(content, 5, EcosystemId::Pypi));
+        // A completed entry line.
+        assert!(is_in_dependencies_section(content, 4, EcosystemId::Pypi));
+        // Unrelated `[project]` keys must not be treated as inside the array.
+        assert!(!is_in_dependencies_section(content, 1, EcosystemId::Pypi));
+        assert!(!is_in_dependencies_section(content, 2, EcosystemId::Pypi));
+        // The `[project]` header line itself is not "inside" the array.
+        assert!(!is_in_dependencies_section(content, 0, EcosystemId::Pypi));
+    }
+
+    #[test]
+    fn test_is_in_dependencies_section_pypi_project_array_single_line() {
+        let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n";
+        assert!(is_in_dependencies_section(content, 1, EcosystemId::Pypi));
+    }
+
+    /// A `dependencies = [...]` array under a table other than `[project]` (e.g. an
+    /// optional-dependencies group using the same key name) must not be picked up
+    /// by the `[project]`-scoped array scan.
+    #[test]
+    fn test_is_in_dependencies_section_pypi_project_array_scoped_to_project_table() {
+        let content = "[tool.other]\ndependencies = [\n    \"foo\n]\n";
+        assert!(!is_in_dependencies_section(content, 2, EcosystemId::Pypi));
+    }
+
+    /// #390 C2: an unbalanced `[` inside a still-typed extras spec (`"uvicorn[stan`,
+    /// common real syntax like `celery[redis]`) must not permanently desync the
+    /// bracket-depth counter. A later, real table header is an unambiguous resync
+    /// point (TOML forbids a header inside an array), so lines under it must not be
+    /// misreported as still inside the dependencies array.
+    #[test]
+    fn test_is_in_dependencies_section_pypi_project_array_resyncs_after_unbalanced_extras_bracket()
+    {
+        let content = "[project]\ndependencies = [\n    \"uvicorn[stan\n]\n\n[tool.pytest.ini_options]\naddopts = \"-v\"\n";
+        // Mid-typing the extras spec: still correctly inside the array.
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::Pypi));
+        // A line under the unrelated later table must not be swept in by the
+        // desynced counter.
+        assert!(!is_in_dependencies_section(content, 6, EcosystemId::Pypi));
+    }
+
+    /// #390 C2: a `#` comment containing `[` inside the array (e.g. `# pinned per
+    /// [PEP 621`) must not be counted as a real bracket — the comment is stripped
+    /// before depth tracking, so the array still closes at its real `]`.
+    #[test]
+    fn test_is_in_dependencies_section_pypi_project_array_ignores_bracket_in_comment() {
+        let content = "[project]\ndependencies = [\n    \"requests>=2.0.0\",  # pinned per [PEP 621\n    \"flas\n]\nrequires-python = \">=3.9\"\n";
+        // Still inside the array on the unterminated entry.
+        assert!(is_in_dependencies_section(content, 3, EcosystemId::Pypi));
+        // The array has closed by the time an unrelated `[project]` key follows.
+        assert!(!is_in_dependencies_section(content, 5, EcosystemId::Pypi));
+    }
+
+    /// #390 C3: a trailing comment on the `[project]` header itself (ordinary TOML)
+    /// must not make the whole array-detection scan inert.
+    #[test]
+    fn test_is_in_dependencies_section_pypi_project_header_with_trailing_comment() {
+        let content = "[project]  # main metadata\ndependencies = [\n    \"flas\n]\n";
+        assert!(is_in_dependencies_section(content, 2, EcosystemId::Pypi));
+    }
+
+    /// #390 C4: a commented non-`[project]` header must correctly clear `in_project`
+    /// (fixed for free by C3's comment stripping) — a later table's own
+    /// `dependencies = [...]` array must not be mistaken for PEP 621's.
+    #[test]
+    fn test_is_in_dependencies_section_pypi_project_state_cleared_by_commented_other_header() {
+        let content = "[project]\nname = \"x\"\n\n[tool.hatch.envs.default] # test env\ndependencies = [\n    \"other\n]\n";
+        assert!(!is_in_dependencies_section(content, 5, EcosystemId::Pypi));
+    }
+
     #[test]
     fn test_is_in_dependencies_section_npm() {
         let content = r#"{
@@ -1646,10 +1863,12 @@ requests
         let item = create_package_completion_item(&meta, EcosystemId::Pypi).unwrap();
 
         assert_eq!(item.label, "requests");
-        assert_eq!(
-            item.insert_text,
-            Some("\"requests\" = \"2.31.0\"".to_string())
-        );
+        // #390 C1: both real PEP 621 shapes (`dependencies = [...]` and an
+        // `[project.optional-dependencies]` group) are TOML array elements, so the
+        // surrounding quotes already exist in the manifest — a bare name matches
+        // `build_package_completion`'s primary-path insert for PyPI at the same
+        // cursor position, unlike Cargo's key=value table-entry shape.
+        assert_eq!(item.insert_text, Some("requests".to_string()));
     }
 
     struct MockMetadata {
@@ -1679,12 +1898,32 @@ requests
     }
 
     #[test]
-    fn test_create_package_completion_item_pypi_dotted_name_quotes_toml_key() {
-        // S1: a bare TOML key containing `.` (legal here — real PyPI names like
-        // `zope.interface` use it) expands into a nested table instead of a
-        // dependency entry (`serde.path = "vendor"` parses as `serde = { path =
-        // "vendor" }`). Quoting the key keeps the dotted name a single dependency
-        // entry regardless of ecosystem-legit or attacker-supplied intent.
+    fn test_create_package_completion_item_cargo_dotted_name_quotes_toml_key() {
+        // S1: a bare TOML key containing `.` (legal here — real crate names can use
+        // it) expands into a nested table instead of a dependency entry
+        // (`serde.path = "vendor"` parses as `serde = { path = "vendor" }`). Quoting
+        // the key keeps the dotted name a single dependency entry regardless of
+        // ecosystem-legit or attacker-supplied intent. Cargo only: after #390 C1,
+        // PyPI no longer emits a TOML key at all (see
+        // `test_create_package_completion_item_pypi_dotted_name_stays_bare_string`).
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("some.crate"),
+            repository: None,
+            latest_version: "6.1",
+        };
+        let item = create_package_completion_item(&meta, EcosystemId::Cargo).unwrap();
+
+        assert_eq!(
+            item.insert_text,
+            Some("\"some.crate\" = \"6.1\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_create_package_completion_item_pypi_dotted_name_stays_bare_string() {
+        // A dotted PyPI name (`zope.interface`) has no TOML-key-injection meaning
+        // once the insert is a bare array-element string, unlike Cargo's key=value
+        // shape (see `test_create_package_completion_item_cargo_dotted_name_quotes_toml_key`).
         let meta = MockMetadata {
             name: deps_core::PackageName::new("zope.interface"),
             repository: None,
@@ -1692,10 +1931,7 @@ requests
         };
         let item = create_package_completion_item(&meta, EcosystemId::Pypi).unwrap();
 
-        assert_eq!(
-            item.insert_text,
-            Some("\"zope.interface\" = \"6.1\"".to_string())
-        );
+        assert_eq!(item.insert_text, Some("zope.interface".to_string()));
     }
 
     #[test]
@@ -2333,6 +2569,88 @@ s
         );
     }
 
+    /// #390 (C5, tester Gap 1 / critic): a direct end-to-end proof, through
+    /// `fallback_completion` itself rather than `is_in_dependencies_section` and
+    /// `extract_prefix` in isolation, that the two root-cause fixes actually compose.
+    /// Verbatim issue repro step 1: an unterminated entry inside the primary
+    /// `dependencies = [...]` array (no literal `[project.dependencies]` header
+    /// anywhere in the fixture) — the registry must see `flas`, not `"flas`.
+    #[tokio::test]
+    async fn test_fallback_completion_pypi_project_array_query_has_no_leaked_quote() {
+        use deps_core::{Metadata, Registry};
+        use std::any::Any;
+        use std::sync::Mutex;
+
+        struct CapturingRegistry {
+            captured_query: Mutex<Option<String>>,
+        }
+        impl Registry for CapturingRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::Result<Vec<Box<dyn deps_core::Version>>>,
+            > {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::Result<Option<Box<dyn deps_core::Version>>>,
+            > {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                *self.captured_query.lock().unwrap() = Some(query.to_string());
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry = Arc::new(CapturingRegistry {
+            captured_query: Mutex::new(None),
+        });
+        let state = mock_pypi_state(Arc::clone(&registry) as Arc<dyn Registry>);
+
+        let content = "[project]\nname = \"myapp\"\nversion = \"0.1.0\"\ndependencies = [\n    \"requests>=2.31.0\",\n    \"flas\n]\n";
+        fallback_completion(&state, EcosystemId::Pypi, Position::new(5, 9), content).await;
+
+        assert_eq!(
+            registry.captured_query.lock().unwrap().as_deref(),
+            Some("flas")
+        );
+    }
+
+    /// #390 (C5, tester Gap 1): the one PEP 621 shape that legitimately uses a
+    /// section header (`[project.optional-dependencies]`) exercised through the real
+    /// `is_in_dependencies_section`/`extract_prefix` composition, not just
+    /// `is_in_toml_dependencies`'s header match in isolation — the existing
+    /// `test_is_in_dependencies_section_pypi` only covers the literal
+    /// `[project.dependencies]` header this fix's own docs say never occurs in real
+    /// files.
+    #[test]
+    fn test_is_in_dependencies_section_and_extract_prefix_pypi_optional_dependencies_group() {
+        let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    \"flas\n]\n";
+        assert!(is_in_dependencies_section(content, 3, EcosystemId::Pypi));
+
+        let line = content.lines().nth(3).unwrap();
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Pypi),
+            "flas"
+        );
+    }
+
     #[test]
     fn test_fallback_rejects_prefix_with_equals() {
         let content = r#"
@@ -2409,13 +2727,36 @@ serde
 
     #[test]
     fn test_extract_prefix_leaves_quotes_for_non_json_ecosystems() {
-        // Cargo/PyPI keys are typed unquoted, so a leading/trailing `"` should never
-        // appear in practice, but the strip must stay scoped: this ecosystem does not
-        // get it.
+        // Cargo keys are typed unquoted, so a leading/trailing `"` should never appear
+        // in practice, but the strip must stay scoped: Cargo does not get it (unlike
+        // PyPI's TOML array-element shape, see
+        // `test_extract_prefix_strips_leading_quote_for_pypi_toml_array`).
         let line = "\"expr";
         assert_eq!(
             extract_prefix(line, line.len() as u32, EcosystemId::Cargo),
             "\"expr"
+        );
+    }
+
+    /// #390 root cause 2: PyPI's `dependencies`/`optional-dependencies` entries are
+    /// TOML array elements (`"pytes`), a different quoting shape from JSON-quoted
+    /// keys, but must still have the surviving quote stripped before it reaches the
+    /// registry search.
+    #[test]
+    fn test_extract_prefix_strips_leading_quote_for_pypi_toml_array() {
+        let line = "    \"flas";
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Pypi),
+            "flas"
+        );
+    }
+
+    #[test]
+    fn test_extract_prefix_strips_trailing_quote_for_pypi_toml_array() {
+        let line = "    \"pytest\"";
+        assert_eq!(
+            extract_prefix(line, line.len() as u32, EcosystemId::Pypi),
+            "pytest"
         );
     }
 

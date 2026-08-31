@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **deps-pypi, deps-lsp**: package-name completion now works for PEP 621 `dependencies`/`optional-dependencies` arrays in `pyproject.toml`, which previously always returned zero results (resolves #390)
+
 ## [0.11.0] - 2026-08-24
 
 ### Added
