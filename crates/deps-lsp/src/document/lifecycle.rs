@@ -233,33 +233,42 @@ fn in_use_version(
     }
 }
 
-/// Builds `dep_name -> in_use_version` (§4.5/§4.6) for every dependency with
-/// a known in-use version, for the yanked-check probe in
+/// Builds `dep_name -> [in_use_version, ...]` (§4.5/§4.6) for every
+/// dependency with a known in-use version, for the yanked-check probe in
 /// `fetch_latest_versions_parallel`. Skips non-registry dependencies
 /// (git/path forks, step 0 of [`build_scan_targets`]'s ladder) so a patched
 /// fork is never flagged for a registry version it does not contain.
+///
+/// One entry per *occurrence* of a name, not a single collapsed value: the
+/// same dependency name can appear more than once in a manifest (duplicate
+/// keys, or the same crate under `[dependencies]`/`[dev-dependencies]` or
+/// multiple `[target.'cfg(...)'.dependencies]` blocks — #394). A HashMap
+/// keyed by name alone would silently drop all but the last occurrence's
+/// in-use version from the yanked probe below.
 fn collect_in_use_versions(
     parse_result: &dyn deps_core::ParseResult,
     resolved_versions: &HashMap<PackageName, String>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
-) -> HashMap<PackageName, String> {
-    parse_result
+) -> HashMap<PackageName, Vec<String>> {
+    let mut map: HashMap<PackageName, Vec<String>> = HashMap::new();
+    for dep in parse_result
         .dependencies()
         .into_iter()
         .filter(|dep| dep.source() == deps_core::parser::DependencySource::Registry)
-        .filter_map(|dep| {
-            let normalized_name = formatter.normalize_package_name(dep.name());
-            in_use_version(
-                dep,
-                &normalized_name,
-                resolved_versions,
-                formatter,
-                ecosystem,
-            )
-            .map(|v| (dep.name().clone(), v))
-        })
-        .collect()
+    {
+        let normalized_name = formatter.normalize_package_name(dep.name());
+        if let Some(v) = in_use_version(
+            dep,
+            &normalized_name,
+            resolved_versions,
+            formatter,
+            ecosystem,
+        ) {
+            map.entry(dep.name().clone()).or_default().push(v);
+        }
+    }
+    map
 }
 
 /// Builds the OSV scan targets for one manifest's dependencies, applying the
@@ -559,11 +568,20 @@ struct DependencyDiff {
 }
 
 impl DependencyDiff {
-    /// `old`/`new` map each dependency name to its declared version
-    /// requirement (`Dependency::version_requirement()`) at parse time.
+    /// `old`/`new` map each dependency name to the declared version
+    /// requirements (`Dependency::version_requirement()`) of *every*
+    /// occurrence of that name at parse time, in document order — not a
+    /// single collapsed value. A name can appear more than once within a
+    /// manifest (accidental duplicate keys, or the same crate declared under
+    /// both `[dependencies]`/`[dev-dependencies]` or under two different
+    /// `[target.'cfg(...)'.dependencies]` blocks — see #394). Comparing the
+    /// full per-name `Vec` rather than a name-keyed single requirement
+    /// ensures an edit to *any* occurrence changes the value the diff
+    /// compares, instead of silently no-opping when a HashMap collapse would
+    /// have kept the "winning" occurrence's requirement unchanged.
     fn compute(
-        old: &HashMap<PackageName, Option<VersionReq>>,
-        new: &HashMap<PackageName, Option<VersionReq>>,
+        old: &HashMap<PackageName, Vec<Option<VersionReq>>>,
+        new: &HashMap<PackageName, Vec<Option<VersionReq>>>,
     ) -> Self {
         let old_names: HashSet<&PackageName> = old.keys().collect();
         let new_names: HashSet<&PackageName> = new.keys().collect();
@@ -612,15 +630,21 @@ impl DependencyDiff {
     }
 }
 
-/// Builds `name -> version_requirement` for every dependency in `pr`, the
-/// shape [`DependencyDiff::compute`] needs.
+/// Builds `name -> [version_requirement, ...]` for every dependency in `pr`,
+/// one entry per occurrence in document order, the shape
+/// [`DependencyDiff::compute`] needs. A `HashMap<PackageName, Option<VersionReq>>`
+/// (single value per name) would silently collapse a duplicate name to its
+/// last occurrence, losing any edit made to an earlier one (#394).
 fn dependency_version_map(
     pr: &dyn deps_core::ParseResult,
-) -> HashMap<PackageName, Option<VersionReq>> {
-    pr.dependencies()
-        .into_iter()
-        .map(|d| (d.name().clone(), d.version_requirement().cloned()))
-        .collect()
+) -> HashMap<PackageName, Vec<Option<VersionReq>>> {
+    let mut map: HashMap<PackageName, Vec<Option<VersionReq>>> = HashMap::new();
+    for d in pr.dependencies() {
+        map.entry(d.name().clone())
+            .or_default()
+            .push(d.version_requirement().cloned());
+    }
+    map
 }
 
 /// Result of parallel version fetching.
@@ -667,9 +691,10 @@ struct FetchResult {
 ///
 /// * `registry` - Package registry to fetch from
 /// * `package_names` - List of package names to fetch
-/// * `in_use` - Raw dependency name -> the version this project actually
-///   has (lockfile-resolved or a concrete pin), checked against the fetched
-///   version list for yank status
+/// * `in_use` - Raw dependency name -> the version(s) this project actually
+///   has (lockfile-resolved or a concrete pin) for every occurrence of that
+///   name in the manifest, checked against the fetched version list for
+///   yank status
 /// * `progress` - Optional progress tracker (will be updated after each fetch)
 /// * `timeout_secs` - Timeout for each individual package fetch (default: 10s)
 /// * `max_concurrent` - Maximum concurrent fetches (default: 20)
@@ -689,7 +714,7 @@ struct FetchResult {
 async fn fetch_latest_versions_parallel(
     registry: Arc<dyn Registry>,
     package_names: Vec<PackageName>,
-    in_use: &HashMap<PackageName, String>,
+    in_use: &HashMap<PackageName, Vec<String>>,
     progress_sender: Option<ProgressSender>,
     freshness: deps_core::freshness::FreshnessSettings,
     timeout_secs: u64,
@@ -713,7 +738,7 @@ async fn fetch_latest_versions_parallel(
             let first_error = Arc::clone(&first_error);
             let progress_sender = progress_sender.clone();
             let wildcard_req = &wildcard_req;
-            let in_use_version = in_use.get(&name).cloned();
+            let in_use_versions = in_use.get(&name).cloned().unwrap_or_default();
             async move {
                 // Single round trip: the full version list is fetched once, and "latest"
                 // is a pure in-memory pick over it (`Registry::select_latest_matching`) —
@@ -850,12 +875,21 @@ async fn fetch_latest_versions_parallel(
                             // yanked in-use version wins over an already
                             // -recorded yanked `latest` — it's the version
                             // the user actually has.
-                            if let Some(iv) = in_use_version.as_deref()
-                                && let Some(found) =
-                                    versions.iter().find(|v| v.version_string() == iv)
-                                && found.removal_status().is_flagged()
-                            {
-                                yanked = Some((name.clone(), iv.to_string()));
+                            //
+                            // Multiple occurrences of the same name (#394,
+                            // e.g. under both `[dependencies]` and
+                            // `[target.*.dependencies]`) can carry different
+                            // in-use versions — every one is checked so a
+                            // yanked pin on any occurrence is never missed
+                            // just because another occurrence happens to
+                            // share the registry lookup.
+                            if let Some(iv) = in_use_versions.iter().find(|iv| {
+                                versions.iter().any(|v| {
+                                    v.version_string() == iv.as_str()
+                                        && v.removal_status().is_flagged()
+                                })
+                            }) {
+                                yanked = Some((name.clone(), iv.clone()));
                             }
                         }
 
@@ -1054,7 +1088,7 @@ pub async fn handle_document_open(
 
         // Collect dependency names and the in-use-version map (§4.6) in one
         // pass while holding the reference (can't hold across await).
-        let (dep_names, in_use): (Vec<PackageName>, HashMap<PackageName, String>) = {
+        let (dep_names, in_use): (Vec<PackageName>, HashMap<PackageName, Vec<String>>) = {
             let doc = match state_clone.get_document(&uri_clone) {
                 Some(d) => d,
                 None => {
@@ -1250,7 +1284,7 @@ pub async fn handle_document_change(
 
     // Extract old dependency name -> version_requirement map before parsing
     // (for diff computation)
-    let old_deps: HashMap<PackageName, Option<VersionReq>> =
+    let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
         state.get_document(&uri).map_or_else(HashMap::new, |doc| {
             doc.parse_result()
                 .map(dependency_version_map)
@@ -1261,7 +1295,7 @@ pub async fn handle_document_change(
     let parse_result = ecosystem.parse_manifest(&content, &uri).await.ok();
 
     // Extract new dependency name -> version_requirement map for diff
-    let new_deps: HashMap<PackageName, Option<VersionReq>> = parse_result
+    let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = parse_result
         .as_ref()
         .map(|pr| dependency_version_map(pr.as_ref()))
         .unwrap_or_default();
@@ -1458,7 +1492,7 @@ pub async fn handle_document_change(
 
         // Build the in-use-version map (§4.6) from the freshly-committed parse
         // result and the resolved versions just loaded above.
-        let in_use: HashMap<PackageName, String> = match state_clone.get_document(&uri_clone) {
+        let in_use: HashMap<PackageName, Vec<String>> = match state_clone.get_document(&uri_clone) {
             Some(doc) => match doc.parse_result() {
                 Some(pr) => collect_in_use_versions(
                     pr,
@@ -3701,7 +3735,7 @@ dependencies = ["requests>=2.0.0"]
             // `==` comparator must already be stripped here.
             assert_eq!(
                 in_use.get(&PackageName::new(raw_name)),
-                Some(&pinned_version.to_string())
+                Some(&vec![pinned_version.to_string()])
             );
 
             let registry: Arc<dyn Registry> = Arc::new(MockYankedRegistry { pinned_version });
@@ -4125,13 +4159,13 @@ time = "0.1.43"
             let content2 = r#"[dependencies]
 serde = "1.0"
 "#;
-            let old_deps: HashMap<PackageName, Option<VersionReq>> =
+            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
                 [("serde", None), ("time", None)]
                     .into_iter()
-                    .map(|(n, r)| (PackageName::new(n), r))
+                    .map(|(n, r)| (PackageName::new(n), vec![r]))
                     .collect();
-            let new_deps: HashMap<PackageName, Option<VersionReq>> =
-                std::iter::once((PackageName::new("serde"), None)).collect();
+            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+                std::iter::once((PackageName::new("serde"), vec![None])).collect();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed, vec![PackageName::new("time")]);
 
@@ -4274,13 +4308,13 @@ time = "0.1.43"
             let content2 = r#"[dependencies]
 serde = "1.0"
 "#;
-            let old_deps: HashMap<PackageName, Option<VersionReq>> =
+            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
                 [("serde", None), ("time", None)]
                     .into_iter()
-                    .map(|(n, r)| (PackageName::new(n), r))
+                    .map(|(n, r)| (PackageName::new(n), vec![r]))
                     .collect();
-            let new_deps: HashMap<PackageName, Option<VersionReq>> =
-                std::iter::once((PackageName::new("serde"), None)).collect();
+            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+                std::iter::once((PackageName::new("serde"), vec![None])).collect();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
             assert_eq!(diff.removed, vec![PackageName::new("time")]);
 
@@ -4491,10 +4525,12 @@ serde = "1.0"
             );
         }
 
-        fn versions(pairs: &[(&str, Option<&str>)]) -> HashMap<PackageName, Option<VersionReq>> {
+        fn versions(
+            pairs: &[(&str, Option<&str>)],
+        ) -> HashMap<PackageName, Vec<Option<VersionReq>>> {
             pairs
                 .iter()
-                .map(|(name, req)| (PackageName::new(*name), req.map(VersionReq::new)))
+                .map(|(name, req)| (PackageName::new(*name), vec![req.map(VersionReq::new)]))
                 .collect()
         }
 
@@ -4550,7 +4586,7 @@ serde = "1.0"
 
         #[test]
         fn test_dependency_diff_empty_to_new() {
-            let old: HashMap<PackageName, Option<VersionReq>> = HashMap::new();
+            let old: HashMap<PackageName, Vec<Option<VersionReq>>> = HashMap::new();
             let new = versions(&[("serde", Some("1.0")), ("tokio", Some("1.0"))]);
 
             let diff = DependencyDiff::compute(&old, &new);
@@ -4581,6 +4617,148 @@ serde = "1.0"
                 diff.needs_osv_rescan(),
                 "a version-only edit must still trigger an OSV rescan"
             );
+        }
+
+        #[tokio::test]
+        async fn test_dependency_version_map_tracks_both_occurrences_of_duplicate_name() {
+            // Regression guard for #394: `time` appears under both
+            // `[dependencies]` and `[dev-dependencies]` with different
+            // requirements. A name-keyed `HashMap<PackageName, Option<VersionReq>>`
+            // would silently collapse this to one entry (whichever section's
+            // entry iterates last); `dependency_version_map` must instead
+            // keep one requirement per occurrence.
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+
+            let content = r#"[dependencies]
+time = "0.1.43"
+
+[dev-dependencies]
+time = "0.1.44"
+"#;
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            assert_eq!(
+                parse_result.dependencies().len(),
+                2,
+                "both `[dependencies]` and `[dev-dependencies]` occurrences of `time` must parse"
+            );
+
+            let deps = dependency_version_map(parse_result.as_ref());
+            let time_reqs = deps
+                .get(&PackageName::new("time"))
+                .expect("duplicated name must still be present in the map");
+            assert_eq!(
+                time_reqs,
+                &vec![
+                    Some(VersionReq::new("0.1.43")),
+                    Some(VersionReq::new("0.1.44")),
+                ],
+                "both occurrences' version requirements must be tracked, not just the last one"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_dependency_diff_detects_edit_to_first_occurrence_of_duplicate_name() {
+            // Regression guard for #394: editing the *first* (`[dependencies]`)
+            // occurrence of a duplicated name, while the second
+            // (`[dev-dependencies]`) occurrence stays unchanged, must still
+            // produce a non-empty diff. Under the pre-fix name-only HashMap,
+            // the unchanged second occurrence "won" the collapse in both the
+            // old and new maps, so this edit was silently invisible to
+            // `DependencyDiff` — the registry fetch and OSV rescan never ran.
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+
+            let content1 = r#"[dependencies]
+time = "0.1.43"
+
+[dev-dependencies]
+time = "0.1.44"
+"#;
+            let old_deps = dependency_version_map(
+                ecosystem
+                    .parse_manifest(content1, &uri)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+            );
+
+            let content2 = r#"[dependencies]
+time = "0.1.50"
+
+[dev-dependencies]
+time = "0.1.44"
+"#;
+            let new_deps = dependency_version_map(
+                ecosystem
+                    .parse_manifest(content2, &uri)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+            );
+
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
+            assert!(diff.added.is_empty());
+            assert!(diff.removed.is_empty());
+            assert_eq!(
+                diff.version_changed,
+                vec![PackageName::new("time")],
+                "editing the losing (first) occurrence of a duplicated name must be detected"
+            );
+            assert!(diff.needs_fetch());
+            assert!(diff.needs_osv_rescan());
+        }
+
+        #[tokio::test]
+        async fn test_dependency_diff_detects_edit_to_second_occurrence_of_duplicate_name() {
+            // Mirrors the previous test in the opposite direction: editing
+            // the *second* (`[dev-dependencies]`) occurrence, with the first
+            // (`[dependencies]`) occurrence unchanged, must also be detected
+            // — confirming the fix is not merely order-dependent.
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+
+            let content1 = r#"[dependencies]
+time = "0.1.43"
+
+[dev-dependencies]
+time = "0.1.44"
+"#;
+            let old_deps = dependency_version_map(
+                ecosystem
+                    .parse_manifest(content1, &uri)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+            );
+
+            let content2 = r#"[dependencies]
+time = "0.1.43"
+
+[dev-dependencies]
+time = "0.1.60"
+"#;
+            let new_deps = dependency_version_map(
+                ecosystem
+                    .parse_manifest(content2, &uri)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+            );
+
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
+            assert!(diff.added.is_empty());
+            assert!(diff.removed.is_empty());
+            assert_eq!(
+                diff.version_changed,
+                vec![PackageName::new("time")],
+                "editing the winning (second) occurrence of a duplicated name must be detected"
+            );
+            assert!(diff.needs_fetch());
+            assert!(diff.needs_osv_rescan());
         }
 
         #[tokio::test]
@@ -4628,13 +4806,14 @@ tokio = "1.0"
 "#;
 
             // Compute diff and apply cache pruning
-            let old_deps: HashMap<PackageName, Option<VersionReq>> = ["serde", "tokio", "anyhow"]
+            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+                ["serde", "tokio", "anyhow"]
+                    .iter()
+                    .map(|s| (PackageName::new(*s), vec![None]))
+                    .collect();
+            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> = ["serde", "tokio"]
                 .iter()
-                .map(|s| (PackageName::new(*s), None))
-                .collect();
-            let new_deps: HashMap<PackageName, Option<VersionReq>> = ["serde", "tokio"]
-                .iter()
-                .map(|s| (PackageName::new(*s), None))
+                .map(|s| (PackageName::new(*s), vec![None]))
                 .collect();
             let diff = DependencyDiff::compute(&old_deps, &new_deps);
 
@@ -5206,7 +5385,7 @@ tokio = "1.0"
             );
             assert_eq!(
                 in_use.get(&PackageName::new("serde")),
-                Some(&"1.0.195".to_string())
+                Some(&vec!["1.0.195".to_string()])
             );
         }
 
@@ -5231,7 +5410,7 @@ tokio = "1.0"
             );
             assert_eq!(
                 in_use.get(&PackageName::new("log4j-core")),
-                Some(&"2.14.1".to_string())
+                Some(&vec!["2.14.1".to_string()])
             );
         }
 
@@ -5301,7 +5480,7 @@ tokio = "1.0"
             );
             assert_eq!(
                 in_use.get(&PackageName::new("typing_extensions")),
-                Some(&"4.9.0".to_string()),
+                Some(&vec!["4.9.0".to_string()]),
                 "pep440 '==' comparator must be stripped, not carried into the in-use version"
             );
         }
@@ -5350,6 +5529,44 @@ tokio = "1.0"
                 EcosystemId::Cargo,
             );
             assert!(in_use.is_empty());
+        }
+
+        #[test]
+        fn collect_in_use_versions_tracks_all_occurrences_of_duplicate_name() {
+            // Regression guard for #394: two occurrences of the same
+            // dependency name (e.g. under different
+            // `[target.*.dependencies]` blocks, or `[dependencies]` +
+            // `[dev-dependencies]`) with different concrete pins and no lock
+            // file must both surface an in-use version for the yanked probe
+            // — a name-keyed `HashMap<PackageName, String>` would silently
+            // drop all but the last occurrence's pin.
+            let parse_result = MockParseResult {
+                deps: vec![
+                    MockDep {
+                        name: PackageName::new("time"),
+                        version_req: Some(VersionReq::new("=0.1.43")),
+                        source: DependencySource::Registry,
+                    },
+                    MockDep {
+                        name: PackageName::new("time"),
+                        version_req: Some(VersionReq::new("=0.1.44")),
+                        source: DependencySource::Registry,
+                    },
+                ],
+            };
+            let resolved = HashMap::new();
+
+            let in_use = collect_in_use_versions(
+                &parse_result,
+                &resolved,
+                &MockFormatter,
+                EcosystemId::Cargo,
+            );
+            assert_eq!(
+                in_use.get(&PackageName::new("time")),
+                Some(&vec!["0.1.43".to_string(), "0.1.44".to_string()]),
+                "both occurrences' in-use versions must be tracked, not just the last one"
+            );
         }
     }
 
@@ -5493,7 +5710,7 @@ tokio = "1.0"
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -5520,7 +5737,7 @@ tokio = "1.0"
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -5578,7 +5795,7 @@ tokio = "1.0"
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -5611,7 +5828,7 @@ tokio = "1.0"
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -5644,7 +5861,7 @@ tokio = "1.0"
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -5679,7 +5896,7 @@ tokio = "1.0"
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -5703,6 +5920,51 @@ tokio = "1.0"
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
                 Some(&"1.0.0".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn in_use_checks_every_occurrence_of_a_duplicate_name() {
+            // Regression guard for #394: a package can appear more than once
+            // in a manifest under the same name (e.g. `[dependencies]` +
+            // `[dev-dependencies]`), each pinned to a different in-use
+            // version. Only one occurrence ("2.0.0") is yanked; the other
+            // ("3.0.0", not fetched here, not yanked) must not shadow it.
+            let registry: Arc<dyn Registry> = Arc::new(MockRegistry {
+                reports_yanked: true,
+                versions: HashMap::from([(
+                    "pkg",
+                    FetchOutcome::Versions(vec![
+                        ("3.0.0", false),
+                        ("2.0.0", true),
+                        ("1.0.0", false),
+                    ]),
+                )]),
+                latest_fallback: HashMap::new(),
+                fetch_calls: Arc::new(AtomicUsize::new(0)),
+            });
+            let mut in_use = HashMap::new();
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec!["1.0.0".to_string(), "2.0.0".to_string()],
+            );
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &in_use,
+                None,
+                deps_core::freshness::FreshnessSettings::default(),
+                5,
+                10,
+            )
+            .await;
+
+            assert_eq!(
+                result.yanked_versions.get(&PackageName::new("pkg")),
+                Some(&"2.0.0".to_string()),
+                "the yanked occurrence must be found even though a name-keyed \
+                 single-value map could have kept only the non-yanked \"1.0.0\" pin"
             );
         }
 
@@ -5795,7 +6057,7 @@ tokio = "1.0"
                 fetch_calls: Arc::new(AtomicUsize::new(0)),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -5823,7 +6085,7 @@ tokio = "1.0"
                 fetch_calls: Arc::new(AtomicUsize::new(0)),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), "1.0.0".to_string());
+            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
 
             // 1 second timeout for test speed.
             let result = fetch_latest_versions_parallel(
