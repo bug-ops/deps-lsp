@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **docs**: `ECOSYSTEM_GUIDE.md`'s Deno row now lists code lens support, matching the shared `deps-core` default it already receives (resolves #410)
+- **docs**: `ECOSYSTEM_GUIDE.md`'s Deno row now lists code lens support, matching the shared `deps-core` default it already receives (resolves #410) (#416)
 - **.gitignore**: added globs for common secret files (SSH private keys, `*.key`/`*.pem`/`*.p12`/`*.pfx`/`*.jks`/`*.keystore`, `*.credentials`, `credentials.json`, `secrets/`) to prevent accidental commits (resolves #411) (#412)
 - **deps-lsp**: background cold-start rate-limiter cleanup task no longer discards its `JoinHandle`, so a panic surfaces as an `error!` log instead of silently stopping cleanup forever (resolves #408) (#413)
 - **deps-go, deps-bundler, deps-dart, deps-composer, deps-nuget, deps-swift**: structurally invalid package names/module paths now report "Invalid package name" instead of a misleading "Registry lookup failed" diagnostic (resolves #402) (#406)
