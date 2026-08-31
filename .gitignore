@@ -22,3 +22,18 @@ target
 .local/
 .env
 .env.local
+
+# Secrets
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+secrets/
+*.credentials
+credentials.json

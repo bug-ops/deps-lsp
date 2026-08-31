@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **.gitignore**: added globs for common secret files (SSH private keys, `*.key`/`*.pem`/`*.p12`/`*.pfx`/`*.jks`/`*.keystore`, `*.credentials`, `credentials.json`, `secrets/`) to prevent accidental commits (resolves #411) (#412)
 - **deps-go, deps-bundler, deps-dart, deps-composer, deps-nuget, deps-swift**: structurally invalid package names/module paths now report "Invalid package name" instead of a misleading "Registry lookup failed" diagnostic (resolves #402) (#406)
 - **docs**: `ECOSYSTEM_GUIDE.md` and the ecosystem-crate template now teach the current direct-`DepsError`-construction convention instead of the per-crate error wrapper pattern removed in #398 (resolves #403) (#405)
 - **deps-core, deps-lsp**: duplicate dependency names within a manifest (e.g. the same crate under `[dependencies]`/`[dev-dependencies]` or multiple `[target.*.dependencies]` blocks) no longer collapse via name-only `HashMap` in the diff/yanked-probe/OSV-scan pipeline, so an edit to any occurrence is correctly diffed and neither yanked nor OSV findings leak between occurrences pinned to different versions (resolves #394)
