@@ -58,7 +58,10 @@ const MAX_VERSION_LENGTH: usize = 128;
 /// - Path is empty
 /// - Path exceeds MAX_MODULE_PATH_LENGTH
 /// - Any `/`-separated segment is exactly `.`/`..`
-fn validate_module_path(module_path: &str) -> Result<()> {
+///
+/// `pub(crate)` (not private) so [`crate::formatter::GoFormatter::validate_package_name`] can
+/// reuse the same structural rule for its "Invalid package name" diagnostic lint (#402).
+pub(crate) fn validate_module_path(module_path: &str) -> Result<()> {
     if module_path.is_empty() {
         return Err(DepsError::InvalidVersionReq("module path is empty".into()));
     }

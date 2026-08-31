@@ -1,6 +1,6 @@
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
-use deps_core::{Dependency, PackageName};
+use deps_core::{Dependency, DepsError, InvalidPackageName, PackageName};
 
 use crate::types::{GoDependency, GoDirective};
 
@@ -58,6 +58,31 @@ impl EcosystemFormatter for GoFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
+    }
+
+    /// Reuses `crate::registry::validate_module_path` — the same structural rule that
+    /// gates every registry request — so a malformed module path (empty, too long, or
+    /// containing a `.`/`..` path segment) is reported as "Invalid package name" instead of
+    /// falling through to a registry lookup and rendering the generic "Registry lookup
+    /// failed" diagnostic (#402).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] carrying `validate_module_path`'s rejection reason.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        let Err(err) = crate::registry::validate_module_path(name) else {
+            return Ok(());
+        };
+        // `validate_module_path` only ever constructs `DepsError::InvalidVersionReq` (#399
+        // documents it as the shared "invalid input" carrier it deliberately reuses for this),
+        // so this is the only reachable arm — matched explicitly rather than a catch-all
+        // `.to_string()` fallback, both to avoid dead code per CLAUDE.md and because
+        // `DepsError`'s `Display` prefixes an unrelated "invalid version requirement: " label
+        // that would misrender the module-path reason here (#402 critique M3).
+        let DepsError::InvalidVersionReq(reason) = err else {
+            unreachable!("validate_module_path only ever returns DepsError::InvalidVersionReq")
+        };
+        Err(InvalidPackageName::new(reason))
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -358,5 +383,42 @@ mod tests {
             .compile_requirement(&VersionReq::new("v2.0.0+incompatible"))
             .expect("a +incompatible tag is not a pseudo-version");
         assert_eq!(matcher.matches("v2.0.0+incompatible"), Some(true));
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_valid_module_path() {
+        let formatter = GoFormatter;
+        assert!(
+            formatter
+                .validate_package_name("github.com/gin-gonic/gin")
+                .is_ok()
+        );
+        assert!(formatter.validate_package_name("golang.org/x/mod").is_ok());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_empty() {
+        let formatter = GoFormatter;
+        assert!(formatter.validate_package_name("").is_err());
+    }
+
+    /// #402: a `.`/`..` module path segment must be reported as an invalid package name,
+    /// not forwarded to the registry lookup that produces the misleading generic diagnostic.
+    #[test]
+    fn test_validate_package_name_rejects_dot_segment() {
+        let formatter = GoFormatter;
+        assert!(
+            formatter
+                .validate_package_name("github.com/user/..")
+                .is_err()
+        );
+        assert!(formatter.validate_package_name("./evil").is_err());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_too_long() {
+        let formatter = GoFormatter;
+        let too_long = "a".repeat(501);
+        assert!(formatter.validate_package_name(&too_long).is_err());
     }
 }

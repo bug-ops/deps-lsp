@@ -74,11 +74,39 @@ impl deps_core::ParseResult for ComposerParseResult {
 /// Returns true if the package is a platform requirement (not a Packagist package).
 ///
 /// Platform packages include:
-/// - `php` — PHP version requirement
+/// - `php`, and its variants `php-64bit`, `php-ipv6`, `php-zts`, `php-debug` — PHP version
+///   requirements
+/// - `hhvm` — HHVM version requirement
+/// - `composer` — the Composer CLI version itself
 /// - `ext-*` — PHP extensions
 /// - `lib-*` — PHP libraries
+/// - `composer-plugin-api`, `composer-runtime-api` — Composer's own virtual packages
+///
+/// Mirrors Composer's `PlatformRepository` package set (#402 critique S1: an incomplete list
+/// here previously let a real platform requirement like `composer-plugin-api` — present in
+/// essentially every Composer plugin's `composer.json` — reach the Packagist-shaped
+/// `vendor/package` name validator and get flagged "Invalid package name"; M6: `composer`
+/// itself was still missing from the set).
+///
+/// Every platform package name is a single bare token with no `/` — a real Packagist package
+/// always has a `vendor/package` shape — so any name containing `/` returns `false`
+/// immediately, before the prefix checks below. Without this guard, `starts_with("php-")` (and
+/// `ext-`/`lib-`) would also match a real package merely because its *vendor* happens to start
+/// with that prefix (e.g. `php-di/php-di`, `php-amqplib/php-amqplib`, `ext-mongo/whatever`),
+/// silently dropping it from the dependency list entirely — no diagnostic, hover, inlay hint,
+/// or code lens — rather than validating it as a normal dependency (#402 critique C2).
 pub fn is_platform_package(name: &str) -> bool {
-    name == "php" || name.starts_with("ext-") || name.starts_with("lib-")
+    if name.contains('/') {
+        return false;
+    }
+    name == "php"
+        || name.starts_with("php-")
+        || name == "hhvm"
+        || name == "composer"
+        || name.starts_with("ext-")
+        || name.starts_with("lib-")
+        || name == "composer-plugin-api"
+        || name == "composer-runtime-api"
 }
 
 /// Parses a composer.json file and extracts all non-platform dependencies with positions.
@@ -319,6 +347,53 @@ mod tests {
         assert!(!is_platform_package("symfony/console"));
         assert!(!is_platform_package("monolog/monolog"));
         assert!(!is_platform_package("extended/package")); // not ext- prefix
+    }
+
+    /// #402 critique S1: the platform-package set previously covered only `php`/`ext-*`/
+    /// `lib-*`, so a real requirement like `composer-plugin-api` fell through to the
+    /// Packagist-shaped `vendor/package` name validator and was flagged "Invalid package
+    /// name" instead of being silently filtered like the other platform packages.
+    #[test]
+    fn test_is_platform_package_covers_full_composer_platform_set() {
+        for name in [
+            "php-64bit",
+            "php-ipv6",
+            "php-zts",
+            "php-debug",
+            "hhvm",
+            "composer",
+            "composer-plugin-api",
+            "composer-runtime-api",
+        ] {
+            assert!(
+                is_platform_package(name),
+                "expected {name:?} to be recognized as a platform package"
+            );
+        }
+    }
+
+    /// #402 critique C2: a real Packagist package under a vendor whose name happens to start
+    /// with a platform prefix (`php-di/php-di`, `php-amqplib/php-amqplib`,
+    /// `ext-mongo/whatever`, `lib-xml/whatever`) must not be misclassified as a platform
+    /// package — that would silently drop it from the dependency list entirely, with no
+    /// diagnostic, hover, inlay hint, or code lens, rather than validating it normally.
+    #[test]
+    fn test_is_platform_package_does_not_swallow_real_packages_with_platform_like_vendors() {
+        for name in [
+            "php-di/php-di",
+            "php-amqplib/php-amqplib",
+            "php-debugbar/php-debugbar",
+            "php-ffmpeg/php-ffmpeg",
+            "ext-mongo/whatever",
+            "lib-xml/whatever",
+            "hhvm/whatever",
+            "composer/whatever",
+        ] {
+            assert!(
+                !is_platform_package(name),
+                "expected {name:?} to NOT be recognized as a platform package"
+            );
+        }
     }
 
     #[test]
