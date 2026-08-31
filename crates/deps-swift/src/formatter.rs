@@ -1,8 +1,10 @@
 //! Swift ecosystem formatter.
 
 use deps_core::Dependency;
+use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
+use deps_core::is_dot_segment;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, warn_rejected_value};
 
 /// Precise semver `VersionReq` matcher, compiled once per dependency by
@@ -52,6 +54,38 @@ impl EcosystemFormatter for SwiftFormatter {
 
     fn normalize_package_name(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()
+    }
+
+    /// Accepts either `is_valid_owner_repo`'s `owner/repo` GitHub identifier shape (the same
+    /// one `package_url` and the registry's fetch-URL gate require), or a bare single-segment
+    /// name with no `/`.
+    ///
+    /// The bare-name case matters because `name` is not always a GitHub coordinate to begin
+    /// with: `deps_swift::parser`'s `.package(path:)` handling sets it to the target
+    /// directory's basename (`crates/deps-swift/src/parser.rs`, the `RE_PATH` arm) for a
+    /// `DependencySource::Path` dependency, which never contains a `/` and has no GitHub
+    /// identity at all. `validate_package_name` only sees the bare string, not the
+    /// dependency's source, so it cannot tell a local package's basename apart from a
+    /// registry-style name typo'd without its `owner/` prefix — per this trait's "err on the
+    /// side of accepting anything ambiguous" contract, the bare form is accepted rather than
+    /// flagged, which also fixes a false "Invalid package name" on every local Swift package
+    /// dependency (#402 critique C1). A multi-segment name (extra segment, disallowed
+    /// character, or a `.`/`..` segment) still fails the `owner/repo` check and is rejected,
+    /// same as before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] when `name` is empty, is exactly `.`/`..`, or contains a
+    /// `/` without matching the `owner/repo` shape.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        let bare_name_ok = !name.contains('/') && !name.is_empty() && !is_dot_segment(name);
+        if is_valid_owner_repo(name) || bare_name_ok {
+            Ok(())
+        } else {
+            Err(InvalidPackageName::new(
+                "name must be a GitHub 'owner/repo' identifier",
+            ))
+        }
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -367,5 +401,48 @@ mod tests {
             .compile_requirement(&VersionReq::new(">=1.0.0"))
             .unwrap();
         assert_eq!(matcher.matches("not-a-version"), None);
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_owner_repo() {
+        let fmt = SwiftFormatter;
+        assert!(fmt.validate_package_name("apple/swift-nio").is_ok());
+    }
+
+    /// #402 critique C1: a `.package(path:)` dependency's name is the target directory's
+    /// basename (see `deps_swift::parser`'s `RE_PATH` arm), never an `owner/repo` GitHub
+    /// coordinate — it must not be flagged as an invalid package name.
+    #[test]
+    fn test_validate_package_name_accepts_bare_name_for_path_dependencies() {
+        let fmt = SwiftFormatter;
+        for name in ["MyLib", "my-package", "LocalPackage", "no-slash"] {
+            assert!(
+                fmt.validate_package_name(name).is_ok(),
+                "expected {name:?} to be accepted"
+            );
+        }
+    }
+
+    /// #402: a structurally invalid Swift package name must be reported as an invalid
+    /// package name, not forwarded to the registry lookup that produces the misleading
+    /// generic "Registry lookup failed" diagnostic. Only multi-segment shapes are still
+    /// checked against `owner/repo` — a bare name has no `/` to validate the shape of (see
+    /// `test_validate_package_name_accepts_bare_name_for_path_dependencies`).
+    #[test]
+    fn test_validate_package_name_rejects_malformed_names() {
+        let fmt = SwiftFormatter;
+        for name in [
+            "",
+            ".",
+            "..",
+            "owner/repo/extra",
+            "../../etc/passwd",
+            "apple/..",
+        ] {
+            assert!(
+                fmt.validate_package_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
     }
 }

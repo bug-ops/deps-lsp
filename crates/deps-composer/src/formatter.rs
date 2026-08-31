@@ -1,8 +1,27 @@
 use deps_core::Dependency;
+use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
 use deps_core::normalize_operator_spacing;
+
+/// Whether `segment` matches Packagist's vendor/package name-segment charset: starts and ends
+/// with an ASCII alphanumeric character, with only `.`, `_`, `-` allowed in between (Composer's
+/// `composer.json` schema pattern, applied case-insensitively here — Composer itself lowercases
+/// dependency names, so a mixed-case `require` entry is not on its own a rejection reason).
+fn is_valid_composer_segment(segment: &str) -> bool {
+    segment
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && segment
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
 
 /// Composer requirement matcher, compiled once per dependency by
 /// [`ComposerFormatter::compile_requirement`]. Shares `version_satisfies_requirement`'s
@@ -35,6 +54,34 @@ impl EcosystemFormatter for ComposerFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
+    }
+
+    /// Lints `name` against Packagist's `vendor/package` coordinate shape (see
+    /// `is_valid_composer_segment`), so a structurally invalid name is reported as
+    /// "Invalid package name" instead of falling through to a registry lookup and rendering
+    /// the generic "Registry lookup failed" diagnostic (#402).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] if `name` is not exactly `vendor/package`, or either
+    /// segment is empty, starts/ends with a separator, or contains a character outside
+    /// Packagist's `[a-zA-Z0-9.\-_]` charset.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        let Some((vendor, package)) = name.split_once('/') else {
+            return Err(InvalidPackageName::new(
+                "name must be in 'vendor/package' form",
+            ));
+        };
+        if package.contains('/') {
+            return Err(InvalidPackageName::new("name must contain exactly one '/'"));
+        }
+        if !is_valid_composer_segment(vendor) {
+            return Err(InvalidPackageName::new("vendor segment is malformed"));
+        }
+        if !is_valid_composer_segment(package) {
+            return Err(InvalidPackageName::new("package segment is malformed"));
+        }
+        Ok(())
     }
 
     fn yanked_message(&self) -> &'static str {
@@ -601,5 +648,39 @@ mod tests {
         let f = ComposerFormatter;
         assert!(f.yanked_diagnostic_applies_to(&VersionReq::new("1.2.3")));
         assert!(!f.yanked_diagnostic_applies_to(&VersionReq::new("^1.2.3")));
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_valid_names() {
+        let f = ComposerFormatter;
+        for name in ["symfony/console", "vendor.name/pkg-name", "a/b"] {
+            assert!(
+                f.validate_package_name(name).is_ok(),
+                "expected {name:?} to be accepted"
+            );
+        }
+    }
+
+    /// #402: a structurally invalid Composer coordinate must be reported as an invalid
+    /// package name, not forwarded to the registry lookup that produces the misleading
+    /// generic diagnostic.
+    #[test]
+    fn test_validate_package_name_rejects_invalid_names() {
+        let f = ComposerFormatter;
+        for name in [
+            "",
+            "symfony",
+            "symfony/console/extra",
+            "/console",
+            "symfony/",
+            "-vendor/pkg",
+            "vendor/-pkg",
+            "vendor name/pkg",
+        ] {
+            assert!(
+                f.validate_package_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
     }
 }

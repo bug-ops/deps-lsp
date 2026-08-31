@@ -1,9 +1,17 @@
 //! Version formatting for Bundler ecosystem.
 
 use crate::version::{compare_versions, is_valid_rubygems_version, version_matches_requirement};
+use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
+
+/// Whether every character of `name` is in RubyGems' gem-name charset
+/// (`Gem::Specification::VALID_NAME_PATTERN`): ASCII letters, digits, `.`, `-`, `_`.
+fn is_rubygems_name_charset(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
 
 /// Extracts the version operand of `requirement` for the operators whose
 /// [`version_matches_requirement`] branch evaluates `false` against every candidate on a
@@ -121,6 +129,35 @@ impl EcosystemFormatter for BundlerFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::gem_url(name.as_str())
+    }
+
+    /// Lints `name` against RubyGems' own gem-name rule (see `is_rubygems_name_charset` plus
+    /// its "must include at least one letter" check), so a structurally invalid gem name is
+    /// reported as "Invalid package name" instead of falling through to a registry lookup and
+    /// rendering the generic "Registry lookup failed" diagnostic (#402).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] if `name` is empty, contains a character outside
+    /// RubyGems' `[a-zA-Z0-9.\-_]` charset, or contains no letter. The charset check runs
+    /// before the letter check (#402 critique M4) so a name that fails both — e.g. a
+    /// non-ASCII name with no ASCII letter at all — reports the charset violation rather than
+    /// the less specific "no letter" message.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        if name.is_empty() {
+            return Err(InvalidPackageName::new("name cannot be empty"));
+        }
+        if !is_rubygems_name_charset(name) {
+            return Err(InvalidPackageName::new(
+                "name must contain only ASCII letters, digits, '.', '-', or '_'",
+            ));
+        }
+        if !name.chars().any(|c| c.is_ascii_alphabetic()) {
+            return Err(InvalidPackageName::new(
+                "name must include at least one letter",
+            ));
+        }
+        Ok(())
     }
 
     fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
@@ -493,5 +530,49 @@ mod tests {
             &VersionReq::new("7.2.0"),
             &available,
         ));
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_valid_names() {
+        let formatter = BundlerFormatter;
+        for name in ["rails", "rspec-rails", "nokogiri", "activesupport.rb"] {
+            assert!(
+                formatter.validate_package_name(name).is_ok(),
+                "expected {name:?} to be accepted"
+            );
+        }
+    }
+
+    /// #402: a structurally invalid gem name must be reported as an invalid package name, not
+    /// forwarded to the registry lookup that produces the misleading generic diagnostic.
+    #[test]
+    fn test_validate_package_name_rejects_invalid_names() {
+        let formatter = BundlerFormatter;
+        for name in ["", "123", "rails util", "rails/util", "日本語"] {
+            assert!(
+                formatter.validate_package_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
+    }
+
+    /// #402 critique M4: a name that fails both checks (no ASCII letter at all, and a
+    /// character outside the charset) must report the charset violation, since that is the
+    /// more specific and actionable diagnosis of the two.
+    #[test]
+    fn test_validate_package_name_prefers_charset_message_over_letter_message() {
+        let formatter = BundlerFormatter;
+        let err = formatter.validate_package_name("日本語").unwrap_err();
+        assert!(err.reason().contains("must contain only ASCII"));
+        assert!(!err.reason().contains("must include at least one letter"));
+    }
+
+    /// A name with valid charset but no letter (e.g. all digits) still reports the "must
+    /// include at least one letter" message — unaffected by the M4 check-order swap.
+    #[test]
+    fn test_validate_package_name_rejects_all_digits_with_letter_message() {
+        let formatter = BundlerFormatter;
+        let err = formatter.validate_package_name("123").unwrap_err();
+        assert!(err.reason().contains("letter"));
     }
 }

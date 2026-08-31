@@ -1,7 +1,23 @@
 //! Version formatting for the NuGet ecosystem.
 
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
-use deps_core::{PackageName, VersionReq};
+use deps_core::{InvalidPackageName, PackageName, VersionReq};
+
+/// Maximum package ID length NuGet's client-side `PackageIdValidator` accepts.
+const MAX_PACKAGE_ID_LENGTH: usize = 100;
+
+/// Whether `name` matches NuGet's package ID rule (`PackageIdValidator.IdRegex` in
+/// NuGet.Client: `^\w+([_.-]\w+)*$`, `\w` restricted to ASCII here): one or more ASCII
+/// alphanumeric/`_` "words" separated by single `.` or `-` characters, with no leading,
+/// trailing, or consecutive `.`/`-`. `_` is itself a `\w` character in .NET regex, not a
+/// separator, so it is treated as ordinary word content — `_foo`/`foo__bar`/a bare `_` are
+/// all accepted by NuGet's real validator (confirmed live: `_` is a published package id,
+/// nuget.org id `_`, #402 critique M1) but were previously rejected here by splitting on `_`
+/// as if it were a separator too.
+fn is_valid_nuget_id(name: &str) -> bool {
+    name.split(['.', '-'])
+        .all(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
 
 /// NuGet interval/floating-pattern matcher, compiled once per dependency by
 /// [`NuGetFormatter::compile_requirement`] — the range or floating pattern is parsed once
@@ -36,6 +52,42 @@ impl EcosystemFormatter for NuGetFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
+    }
+
+    /// Lints `name` against NuGet's own `PackageIdValidator` rule (see
+    /// `is_valid_nuget_id`), so a structurally invalid package ID is reported as "Invalid
+    /// package name" instead of falling through to a registry lookup and rendering the
+    /// generic "Registry lookup failed" diagnostic (#402).
+    ///
+    /// An unresolved MSBuild property reference (e.g. `<PackageReference
+    /// Include="$(MyPackageId)" />`) is checked first and always accepted — the same
+    /// unresolvable-variable treatment `requirement_is_unresolved` already gives a
+    /// `$(...)`-containing *version* string (#402 critique M2): `name` here is not a
+    /// concrete package id at all until MSBuild expands the property, so it has no shape to
+    /// validate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] if `name` is empty, exceeds 100 characters, or contains
+    /// a character outside NuGet's `\w+([_.-]\w+)*` shape.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        if name.contains("$(") {
+            return Ok(());
+        }
+        if name.is_empty() {
+            return Err(InvalidPackageName::new("name cannot be empty"));
+        }
+        if name.chars().count() > MAX_PACKAGE_ID_LENGTH {
+            return Err(InvalidPackageName::new(format!(
+                "name cannot exceed {MAX_PACKAGE_ID_LENGTH} characters"
+            )));
+        }
+        if !is_valid_nuget_id(name) {
+            return Err(InvalidPackageName::new(
+                "name must be ASCII alphanumeric/'_' words separated by single '.' or '-' characters",
+            ));
+        }
+        Ok(())
     }
 
     /// Overridden because the default npm caret/tilde semantics do not apply to NuGet's
@@ -333,5 +385,60 @@ mod tests {
         let f = NuGetFormatter;
         assert!(!f.requirement_is_unresolved(&VersionReq::new("13.0.3")));
         assert!(!f.requirement_is_unresolved(&VersionReq::new("[1.0,2.0)")));
+    }
+
+    #[test]
+    fn test_validate_package_name_accepts_valid_names() {
+        let f = NuGetFormatter;
+        for name in ["Newtonsoft.Json", "Microsoft.Extensions.Logging", "moq"] {
+            assert!(
+                f.validate_package_name(name).is_ok(),
+                "expected {name:?} to be accepted"
+            );
+        }
+    }
+
+    /// #402: a structurally invalid NuGet package ID must be reported as an invalid package
+    /// name, not forwarded to the registry lookup that produces the misleading generic
+    /// diagnostic.
+    #[test]
+    fn test_validate_package_name_rejects_invalid_names() {
+        let f = NuGetFormatter;
+        for name in ["", ".Json", "Json.", "New..Json", "New Json", "日本語"] {
+            assert!(
+                f.validate_package_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
+    }
+
+    /// #402 critique M1: `_` is a `\w` character in NuGet's real `PackageIdValidator.IdRegex`,
+    /// not a separator, so a leading/doubled/bare underscore is accepted (confirmed live:
+    /// nuget.org publishes a package with id `_`).
+    #[test]
+    fn test_validate_package_name_accepts_underscore_as_word_character() {
+        let f = NuGetFormatter;
+        for name in ["_foo", "foo__bar", "_", "foo_bar"] {
+            assert!(
+                f.validate_package_name(name).is_ok(),
+                "expected {name:?} to be accepted"
+            );
+        }
+    }
+
+    /// #402 critique M2: an unexpanded MSBuild property reference in `Include` (e.g.
+    /// `<PackageReference Include="$(MyPackageId)" />`) is not yet a concrete package id and
+    /// must not be flagged as an invalid package name.
+    #[test]
+    fn test_validate_package_name_accepts_unresolved_msbuild_property() {
+        let f = NuGetFormatter;
+        assert!(f.validate_package_name("$(MyPackageId)").is_ok());
+    }
+
+    #[test]
+    fn test_validate_package_name_rejects_too_long() {
+        let f = NuGetFormatter;
+        let too_long = "a".repeat(101);
+        assert!(f.validate_package_name(&too_long).is_err());
     }
 }
