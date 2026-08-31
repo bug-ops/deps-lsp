@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **deps-bundler, deps-go**: removed private duplicate `LineOffsetTable` structs, both now use the shared `deps_core::lsp_helpers::LineOffsetTable` (resolves #389) (#395)
 - **deps-cargo, deps-npm, deps-composer, deps-dart, deps-deno, deps-go, deps-gradle, deps-maven, deps-nuget**: removed per-crate `{Ecosystem}Error` wrapper enums; call sites now construct `deps_core::DepsError` directly (resolves #388) (#398)
+- **deps-core, deps-go**: documented that `deps-go`'s module-path validation intentionally shares `DepsError::InvalidVersionReq` with version-string rejections, no new variant added (resolves #399) (#401)
 
 ### Fixed
 - **deps-cargo**: invalid file URI during workspace-root discovery now reports `DepsError::InvalidUri`, matching every other ecosystem, instead of the previously divergent `DepsError::CacheError` (#398)
