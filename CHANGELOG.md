@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- **deps-bundler, deps-go**: removed private duplicate `LineOffsetTable` structs, both now use the shared `deps_core::lsp_helpers::LineOffsetTable` (resolves #389)
+- **deps-bundler, deps-go**: removed private duplicate `LineOffsetTable` structs, both now use the shared `deps_core::lsp_helpers::LineOffsetTable` (resolves #389) (#395)
 
 ## [0.11.0] - 2026-08-24
 
