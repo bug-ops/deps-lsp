@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **docs**: `ECOSYSTEM_GUIDE.md` and the ecosystem-crate template now teach the current direct-`DepsError`-construction convention instead of the per-crate error wrapper pattern removed in #398 (resolves #403)
+- **docs**: `ECOSYSTEM_GUIDE.md` and the ecosystem-crate template now teach the current direct-`DepsError`-construction convention instead of the per-crate error wrapper pattern removed in #398 (resolves #403) (#405)
 - **deps-core, deps-lsp**: duplicate dependency names within a manifest (e.g. the same crate under `[dependencies]`/`[dev-dependencies]` or multiple `[target.*.dependencies]` blocks) no longer collapse via name-only `HashMap` in the diff/yanked-probe/OSV-scan pipeline, so an edit to any occurrence is correctly diffed and neither yanked nor OSV findings leak between occurrences pinned to different versions (resolves #394)
 - **deps-cargo**: dependencies declared under `[target.<cfg-expr-or-triple>.dependencies|dev-dependencies|build-dependencies]` are now parsed and visible to hover/diagnostics/completion, same as top-level ones (#396)
 - **deps-cargo**: a git dependency's `tag`/`branch`/`rev` key is no longer dropped, populating `DependencySource::Git.rev` (#396)
