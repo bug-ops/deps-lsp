@@ -49,6 +49,9 @@ const MAX_VERSION_LENGTH: usize = 128;
 
 /// Validates a module path for length and basic format.
 ///
+/// Rejections intentionally render through the shared `DepsError::InvalidVersionReq` variant
+/// rather than a Go-specific one — see #399.
+///
 /// # Errors
 ///
 /// Returns error if:
@@ -363,7 +366,7 @@ struct VersionInfo {
 /// `find_latest_stable` returns the correct latest version.
 fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
     let content = std::str::from_utf8(data).map_err(|e| {
-        DepsError::InvalidVersionReq(format!("Invalid UTF-8 in version list response: {e}"))
+        DepsError::CacheError(format!("Invalid UTF-8 in version list response: {e}"))
     })?;
 
     // Parse versions with precomputed sort keys (Schwartzian transform)

@@ -76,6 +76,11 @@ pub enum DepsError {
     #[error("response body for {url} exceeds {limit} byte limit")]
     ResponseTooLarge { url: String, limit: usize },
 
+    /// Deliberately shared between two distinct rejection kinds: malformed version-requirement
+    /// strings (all ecosystems) and malformed Go module paths (`deps-go`, which has no separate
+    /// variant for the latter — see its `validate_module_path`). Nothing in the workspace
+    /// discriminates on this variant beyond rendering its message, so a consumer-specific split
+    /// was deferred (#399).
     #[error("invalid version requirement: {0}")]
     InvalidVersionReq(String),
 
