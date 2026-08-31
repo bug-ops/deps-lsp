@@ -36,6 +36,29 @@ fn resolve_ecosystem_id(ecosystem: &dyn Ecosystem) -> EcosystemId {
         .expect("ecosystem.id() must be a registered EcosystemId")
 }
 
+/// Composer's own `minimum-stability` manifest setting, when `parse_result` is a parsed
+/// `composer.json` (#424 S1).
+///
+/// Downcasts via [`deps_core::ParseResult::as_any`] rather than widening the generic
+/// `ParseResult`/`Registry` traits with an ecosystem-specific field: every other ecosystem has
+/// no equivalent manifest-level stability floor, so this stays local to the one call site
+/// (`fetch_latest_versions_parallel`'s caller) that needs to bridge a Composer-specific
+/// manifest value into the generic `Registry::*_with_context` trait hook.
+#[cfg(feature = "composer")]
+fn composer_minimum_stability(parse_result: &dyn deps_core::ParseResult) -> Option<String> {
+    parse_result
+        .as_any()
+        .downcast_ref::<crate::ComposerParseResult>()
+        .and_then(|r| r.minimum_stability.clone())
+}
+
+/// No-op when the `composer` feature is disabled — `crate::ComposerParseResult` does not
+/// exist in that build, so `parse_result` can never downcast to it.
+#[cfg(not(feature = "composer"))]
+fn composer_minimum_stability(_parse_result: &dyn deps_core::ParseResult) -> Option<String> {
+    None
+}
+
 /// Rejects document content larger than [`MAX_FILE_SIZE`].
 ///
 /// Content from `textDocument/didOpen`/`didChange` reaches this crate directly
@@ -633,6 +656,12 @@ struct FetchResult {
 /// - Sequential: 50 × 100ms = 5000ms
 /// - Parallel (no timeout): max(100ms) ≈ 150ms
 /// - Parallel (10s timeout, 1 slow package at 30s): max(10s) ≈ 10s
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal (non-pub) call-site-controlled fetch tuning + ecosystem-context \
+              parameters; grouping into a config struct would only move, not reduce, the \
+              per-call-site churn across this module's ~15 production and test call sites"
+)]
 async fn fetch_latest_versions_parallel(
     registry: Arc<dyn Registry>,
     package_names: Vec<PackageName>,
@@ -641,6 +670,7 @@ async fn fetch_latest_versions_parallel(
     freshness: deps_core::freshness::FreshnessSettings,
     timeout_secs: u64,
     max_concurrent: usize,
+    minimum_stability: Option<&str>,
 ) -> FetchResult {
     use futures::stream::{self, StreamExt};
     use std::time::Duration;
@@ -698,8 +728,16 @@ async fn fetch_latest_versions_parallel(
                         // `.get(idx)` rather than `versions[idx]`: `select_latest_matching`
                         // is a public `Registry` trait method, so an out-of-tree
                         // implementation returning a stale index must not panic this task.
+                        // `_with_context` (not the plain method) so a registry with
+                        // manifest-level stability state (Composer's `minimum-stability`,
+                        // #424 S1) can apply it — every other registry's default
+                        // implementation just forwards to the plain method unchanged.
                         let resolved = if let Some(v) = registry
-                            .select_latest_matching(&versions, wildcard_req)
+                            .select_latest_matching_with_context(
+                                &versions,
+                                wildcard_req,
+                                minimum_stability,
+                            )
                             .and_then(|idx| versions.get(idx))
                         {
                             let latest = v.version_string().to_string();
@@ -719,7 +757,11 @@ async fn fetch_latest_versions_parallel(
                             // "list-based pick failed" case, not the common path.
                             let fallback = tokio::time::timeout(
                                 timeout,
-                                registry.get_latest_matching(&name, wildcard_req),
+                                registry.get_latest_matching_with_context(
+                                    &name,
+                                    wildcard_req,
+                                    minimum_stability,
+                                ),
                             )
                             .await;
                             match fallback {
@@ -1010,7 +1052,11 @@ pub async fn handle_document_open(
 
         // Collect dependency names and the in-use-version map (§4.6) in one
         // pass while holding the reference (can't hold across await).
-        let (dep_names, in_use): (Vec<PackageName>, HashMap<PackageName, Vec<String>>) = {
+        let (dep_names, in_use, minimum_stability): (
+            Vec<PackageName>,
+            HashMap<PackageName, Vec<String>>,
+            Option<String>,
+        ) = {
             let doc = match state_clone.get_document(&uri_clone) {
                 Some(d) => d,
                 None => {
@@ -1043,7 +1089,8 @@ pub async fn handle_document_open(
                 ecosystem_clone.formatter(),
                 resolve_ecosystem_id(ecosystem_clone.as_ref()),
             );
-            (dep_names, in_use)
+            let minimum_stability = composer_minimum_stability(parse_result);
+            (dep_names, in_use, minimum_stability)
         };
 
         tracing::debug!(count = dep_names.len(), "starting registry fetch");
@@ -1079,6 +1126,7 @@ pub async fn handle_document_open(
             freshness_settings,
             cache_config.fetch_timeout_secs,
             cache_config.max_concurrent_fetches,
+            minimum_stability.as_deref(),
         )
         .await;
 
@@ -1345,6 +1393,14 @@ pub async fn handle_document_change(
 
         // Skip registry fetch if nothing new was added and no existing
         // dependency's version changed.
+        //
+        // Known limitation (#424 N2): editing composer.json's `minimum-stability` field alone
+        // adds no dependency and changes no requirement string, so `deps_to_fetch` stays empty
+        // and this early-return skips the fetch — existing dependencies keep their
+        // `cached_versions` computed under the *previous* stability floor until the document
+        // is closed and reopened. Not fixed here: doing so would mean treating a
+        // `minimum_stability` change as its own full-refetch trigger in the diff above, a
+        // separate concern from #424's parse+thread scope.
         if deps_to_fetch.is_empty() {
             tracing::debug!("no added or version-changed dependencies, skipping registry fetch");
 
@@ -1421,18 +1477,22 @@ pub async fn handle_document_change(
 
         // Build the in-use-version map (§4.6) from the freshly-committed parse
         // result and the resolved versions just loaded above.
-        let in_use: HashMap<PackageName, Vec<String>> = match state_clone.get_document(&uri_clone) {
-            Some(doc) => match doc.parse_result() {
-                Some(pr) => collect_in_use_versions(
-                    pr,
-                    &resolved_versions,
-                    ecosystem_clone.formatter(),
-                    resolve_ecosystem_id(ecosystem_clone.as_ref()),
-                ),
-                None => HashMap::new(),
-            },
-            None => HashMap::new(),
-        };
+        let (in_use, minimum_stability): (HashMap<PackageName, Vec<String>>, Option<String>) =
+            match state_clone.get_document(&uri_clone) {
+                Some(doc) => match doc.parse_result() {
+                    Some(pr) => (
+                        collect_in_use_versions(
+                            pr,
+                            &resolved_versions,
+                            ecosystem_clone.formatter(),
+                            resolve_ecosystem_id(ecosystem_clone.as_ref()),
+                        ),
+                        composer_minimum_stability(pr),
+                    ),
+                    None => (HashMap::new(), None),
+                },
+                None => (HashMap::new(), None),
+            };
 
         // Fetch latest versions only for NEW dependencies
         let registry = ecosystem_clone.registry();
@@ -1444,6 +1504,7 @@ pub async fn handle_document_change(
             freshness_settings,
             cache_config.fetch_timeout_secs,
             cache_config.max_concurrent_fetches,
+            minimum_stability.as_deref(),
         )
         .await;
 
@@ -1884,6 +1945,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             1,
             10,
+            None,
         )
         .await;
 
@@ -1969,6 +2031,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             1,
             10,
+            None,
         )
         .await;
         let elapsed = start.elapsed();
@@ -2085,6 +2148,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             20,
+            None,
         )
         .await;
 
@@ -2224,6 +2288,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             1,
             10,
+            None,
         )
         .await;
 
@@ -2344,6 +2409,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             10,
             10,
+            None,
         )
         .await;
 
@@ -2468,6 +2534,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             10,
             10,
+            None,
         )
         .await;
 
@@ -2588,6 +2655,7 @@ mod tests {
             FreshnessSettings::default(),
             10,
             10,
+            None,
         )
         .await;
 
@@ -2601,6 +2669,236 @@ mod tests {
             "published_at must come from get_versions_with, not the freshness-blind \
              get_versions (#339)"
         );
+    }
+
+    /// #424 S1: `fetch_latest_versions_parallel` must call `select_latest_matching_with_context`
+    /// with the `minimum_stability` value it was given, not the plain `select_latest_matching`
+    /// — otherwise a registry with manifest-level stability state (e.g. Composer's
+    /// `minimum-stability`) never actually sees it, and #424's S1 fix stays unreachable dead
+    /// code from the live LSP fetch path's perspective (critic S3/tester's reachability gap).
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_threads_minimum_stability_into_select_latest_matching_with_context()
+     {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct MockVersion {
+            version: String,
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &str {
+                &self.version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct ContextAwareRegistry {
+            // Records every `minimum_stability` value observed, in call order — an empty
+            // `Vec` after the fetch means the `_with_context` method was never invoked.
+            seen_minimum_stability: Mutex<Vec<Option<String>>>,
+        }
+
+        impl Registry for ContextAwareRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockVersion {
+                        version: "1.0.0".to_string(),
+                    }) as Box<dyn Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            // Deliberately NOT overridden: if the fetch loop ever calls the plain
+            // `select_latest_matching` instead of the `_with_context` variant, this default
+            // (`None`) makes the pick fail, which the fallback below records as "not found" —
+            // distinguishable from the success path this test asserts on.
+            fn select_latest_matching_with_context(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &deps_core::VersionReq,
+                minimum_stability: Option<&str>,
+            ) -> Option<usize> {
+                self.seen_minimum_stability
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(minimum_stability.map(str::to_string));
+                if versions.is_empty() { None } else { Some(0) }
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry = Arc::new(ContextAwareRegistry {
+            seen_minimum_stability: Mutex::new(Vec::new()),
+        });
+        let packages = vec![PackageName::new("vendor/pkg")];
+
+        let result = fetch_latest_versions_parallel(
+            Arc::clone(&registry) as Arc<dyn Registry>,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            10,
+            10,
+            Some("beta"),
+        )
+        .await;
+
+        assert_eq!(
+            *registry
+                .seen_minimum_stability
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            vec![Some("beta".to_string())],
+            "select_latest_matching_with_context must receive the caller's minimum_stability"
+        );
+        assert!(
+            result.versions.contains_key("vendor/pkg"),
+            "the pick must still succeed via the _with_context path"
+        );
+    }
+
+    /// #424 S1: the `get_latest_matching` fallback path (used when the pure list-based pick
+    /// finds nothing) must also thread `minimum_stability` through its own `_with_context`
+    /// variant.
+    #[tokio::test]
+    async fn test_fetch_latest_versions_parallel_threads_minimum_stability_into_get_latest_matching_with_context()
+     {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct MockVersion {
+            version: String,
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &str {
+                &self.version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct FallbackContextAwareRegistry {
+            // Records every `minimum_stability` value observed, in call order — an empty
+            // `Vec` after the fetch means the `_with_context` method was never invoked.
+            seen_minimum_stability: Mutex<Vec<Option<String>>>,
+        }
+
+        impl Registry for FallbackContextAwareRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                // Empty list forces the fetch loop's `get_latest_matching_with_context`
+                // fallback (the pure list-based pick over an empty list finds nothing).
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn get_latest_matching_with_context<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+                minimum_stability: Option<&'a str>,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                self.seen_minimum_stability
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(minimum_stability.map(str::to_string));
+                Box::pin(async move {
+                    Ok(Some(Box::new(MockVersion {
+                        version: "2.0.0-beta1".to_string(),
+                    }) as Box<dyn Version>))
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry = Arc::new(FallbackContextAwareRegistry {
+            seen_minimum_stability: Mutex::new(Vec::new()),
+        });
+        let packages = vec![PackageName::new("vendor/pkg")];
+
+        let result = fetch_latest_versions_parallel(
+            Arc::clone(&registry) as Arc<dyn Registry>,
+            packages,
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            10,
+            10,
+            Some("beta"),
+        )
+        .await;
+
+        assert_eq!(
+            *registry
+                .seen_minimum_stability
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+            vec![Some("beta".to_string())],
+            "get_latest_matching_with_context must receive the caller's minimum_stability"
+        );
+        let widget = result
+            .versions
+            .get("vendor/pkg")
+            .expect("fallback pick should succeed");
+        assert_eq!(widget.latest, "2.0.0-beta1");
     }
 
     /// S3 regression: a registry whose `get_versions` list is incomplete (e.g. Go's
@@ -2681,6 +2979,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
+            None,
         )
         .await;
 
@@ -2760,6 +3059,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
+            None,
         )
         .await;
 
@@ -2853,6 +3153,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
+            None,
         )
         .await;
 
@@ -2929,6 +3230,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
+            None,
         )
         .await;
 
@@ -3007,6 +3309,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
+            None,
         )
         .await;
 
@@ -3081,6 +3384,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             1,
             10,
+            None,
         )
         .await;
 
@@ -3090,6 +3394,74 @@ mod tests {
             HashSet::from([PackageName::new("slow-fallback")])
         );
         assert_eq!(result.failed_count, 1);
+    }
+
+    // Composer-specific tests
+    #[cfg(feature = "composer")]
+    mod composer_tests {
+        use super::*;
+
+        /// #424 S1: `composer_minimum_stability` must extract the manifest's
+        /// `minimum-stability` field via the real `deps_composer::parser::parse_composer_json`
+        /// → `ComposerParseResult` → `deps_core::ParseResult` downcast path, not just a
+        /// hand-built fixture — this is the actual production call path from the fetch task.
+        #[tokio::test]
+        async fn test_composer_minimum_stability_extracts_from_real_parse_result() {
+            let json = r#"{
+  "minimum-stability": "beta",
+  "require": {
+    "symfony/console": "^6.0"
+  }
+}"#;
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+            let parse_result = crate::parse_composer_json(json, &uri).unwrap();
+
+            assert_eq!(
+                composer_minimum_stability(&parse_result as &dyn deps_core::ParseResult),
+                Some("beta".to_string())
+            );
+        }
+
+        /// #424 S1: a `composer.json` with no `minimum-stability` field extracts to `None`,
+        /// not a fabricated `"stable"`.
+        #[tokio::test]
+        async fn test_composer_minimum_stability_none_when_absent() {
+            let json = r#"{"require": {"symfony/console": "^6.0"}}"#;
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+            let parse_result = crate::parse_composer_json(json, &uri).unwrap();
+
+            assert_eq!(
+                composer_minimum_stability(&parse_result as &dyn deps_core::ParseResult),
+                None
+            );
+        }
+
+        /// #424 S1: a non-Composer `ParseResult` (the downcast target type mismatches) must
+        /// extract to `None` rather than panicking — this is what every other ecosystem's
+        /// document hits on every fetch cycle.
+        #[test]
+        fn test_composer_minimum_stability_none_for_non_composer_parse_result() {
+            struct OtherParseResult;
+            impl deps_core::ParseResult for OtherParseResult {
+                fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+                    vec![]
+                }
+                fn workspace_root(&self) -> Option<&std::path::Path> {
+                    None
+                }
+                fn uri(&self) -> &Uri {
+                    unimplemented!("not exercised by this test")
+                }
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+
+            assert_eq!(
+                composer_minimum_stability(&OtherParseResult as &dyn deps_core::ParseResult),
+                None
+            );
+        }
     }
 
     // Cargo-specific tests
@@ -3676,6 +4048,7 @@ dependencies = ["requests>=2.0.0"]
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5589,6 +5962,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5616,6 +5990,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5641,6 +6016,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5674,6 +6050,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5707,6 +6084,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5740,6 +6118,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5775,6 +6154,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5826,6 +6206,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5859,6 +6240,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5892,6 +6274,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5936,6 +6319,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
+                None,
             )
             .await;
 
@@ -5965,6 +6349,7 @@ tokio = "1.0"
                 deps_core::freshness::FreshnessSettings::default(),
                 1,
                 10,
+                None,
             )
             .await;
 

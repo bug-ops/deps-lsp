@@ -48,6 +48,16 @@ impl LineOffsetTable {
 pub struct ComposerParseResult {
     pub dependencies: Vec<ComposerDependency>,
     pub uri: Uri,
+    /// Raw value of the manifest's own top-level `minimum-stability` field (e.g. `"beta"`),
+    /// if present — Composer's project-wide default stability floor, one of `dev`, `alpha`,
+    /// `beta`, `RC`, `stable` (case-insensitive). `None` when the field is absent, which
+    /// Composer itself treats as `stable` (#424).
+    ///
+    /// Consumers rank this word (`registry.rs`'s crate-private stability ranking) rather than
+    /// comparing it as a string — stored raw here rather than pre-ranked so a caller with no
+    /// interest in stability filtering (e.g. a future manifest-summary feature) is not forced
+    /// to depend on that ranking.
+    pub minimum_stability: Option<String>,
 }
 
 impl deps_core::ParseResult for ComposerParseResult {
@@ -159,9 +169,15 @@ pub fn parse_composer_json(content: &str, uri: &Uri) -> Result<ComposerParseResu
         ));
     }
 
+    let minimum_stability = root
+        .get("minimum-stability")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
     Ok(ComposerParseResult {
         dependencies,
         uri: uri.clone(),
+        minimum_stability,
     })
 }
 
@@ -423,6 +439,28 @@ mod tests {
 
         assert_eq!(require_count, 1);
         assert_eq!(dev_count, 1);
+    }
+
+    /// #424: `minimum-stability` is parsed from the manifest root when present.
+    #[test]
+    fn test_parse_minimum_stability_present() {
+        let json = r#"{
+  "minimum-stability": "beta",
+  "require": {
+    "symfony/console": "^6.0"
+  }
+}"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.minimum_stability.as_deref(), Some("beta"));
+    }
+
+    /// #424: a manifest with no `minimum-stability` field parses to `None`, not a fabricated
+    /// `"stable"` — the stable default is applied by the registry ranking, not the parser.
+    #[test]
+    fn test_parse_minimum_stability_absent() {
+        let json = r#"{"require": {"symfony/console": "^6.0"}}"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.minimum_stability, None);
     }
 
     #[test]

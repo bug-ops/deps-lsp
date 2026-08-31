@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-composer**: "latest version" selection now excludes alpha/beta/RC releases by default, matching Composer's `minimum-stability: stable` semantics, unless the requirement itself names an unstable version; a wildcard requirement still resolves a prerelease-only package instead of reporting no version found (resolves #421) (#422)
 - **deps-swift**: a package whose only tags so far are prerelease now resolves under a wildcard requirement instead of `select_latest_matching` returning `None` (found via #421's cross-ecosystem conformance test) (#422)
 - **deps-nuget**: a package whose only versions are prerelease now resolves under an existence-check wildcard requirement (`*`/empty) instead of `pick_latest_matching`/`select_latest_matching` returning `None` (resolves #423) (#425)
+- **deps-composer, deps-core, deps-lsp**: "latest version" selection now honors `composer.json`'s `minimum-stability` field and per-dependency `@stability` flags (e.g. `^1.0@beta`), and consistently classifies separator-less/dot-separated prerelease suffixes (`1.0.0RC1`, `2.6.3.alpha`) regardless of `v`-prefix (resolves #424)
 
 ### Changed
 - **deps-bundler, deps-go**: removed private duplicate `LineOffsetTable` structs, both now use the shared `deps_core::lsp_helpers::LineOffsetTable` (resolves #389) (#395)
