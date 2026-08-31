@@ -476,79 +476,55 @@ members = [
 ]
 ```
 
-## Step 2: Define Error Types
+## Step 2: Handle Errors
 
-Create ecosystem-specific errors in `error.rs`:
+Construct `deps_core::DepsError` directly at call sites instead of using a local error wrapper. Use `deps_core::Result<T>` for function signatures:
 
 ```rust
-//! Errors specific to {Ecosystem} dependency handling.
+use deps_core::DepsError;
 
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum {Ecosystem}Error {
-    /// Failed to parse manifest file
-    #[error("Failed to parse {manifest_file}: {source}")]
-    ParseError {
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    /// Invalid version specifier
-    #[error("Invalid version specifier '{specifier}': {message}")]
-    InvalidVersionSpecifier {
-        specifier: String,
-        message: String,
-    },
-
-    /// Package not found
-    #[error("Package '{package}' not found")]
-    PackageNotFound { package: String },
-
-    /// Registry request failed
-    #[error("Registry request failed for '{package}': {source}")]
-    RegistryError {
-        package: String,
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    /// Cache error
-    #[error("Cache error: {0}")]
-    CacheError(String),
-
-    /// I/O error
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+/// Example: validation function
+fn validate_module_path(path: &str) -> deps_core::Result<()> {
+    if path.is_empty() {
+        return Err(DepsError::InvalidVersionReq("module path is empty".into()));
+    }
+    if path.contains("..") {
+        return Err(DepsError::InvalidVersionReq(
+            format!("invalid module path: {}", path)
+        ));
+    }
+    Ok(())
 }
 
-/// Result type alias for {Ecosystem} operations.
-pub type Result<T> = std::result::Result<T, {Ecosystem}Error>;
+/// Example: parsing function
+fn parse_manifest(content: &str, uri: &Uri) -> deps_core::Result<ParseResult> {
+    // Parse logic...
+    // On error: return Err(DepsError::ParseError { ... })
+    // On success: return Ok(ParseResult { ... })
+}
 
-// Implement conversions to/from deps_core::DepsError
-impl From<{Ecosystem}Error> for deps_core::DepsError {
-    fn from(err: {Ecosystem}Error) -> Self {
-        match err {
-            {Ecosystem}Error::ParseError { source } => deps_core::DepsError::ParseError {
-                file_type: "{manifest_file}".into(),
-                source,
-            },
-            {Ecosystem}Error::InvalidVersionSpecifier { message, .. } => {
-                deps_core::DepsError::InvalidVersionReq(message)
-            }
-            {Ecosystem}Error::PackageNotFound { package } => {
-                deps_core::DepsError::CacheError(format!("Package '{}' not found", package))
-            }
-            {Ecosystem}Error::RegistryError { package, source } => {
-                deps_core::DepsError::ParseError {
-                    file_type: format!("registry for {}", package),
-                    source,
-                }
-            }
-            {Ecosystem}Error::CacheError(msg) => deps_core::DepsError::CacheError(msg),
-            {Ecosystem}Error::Io(e) => deps_core::DepsError::Io(e),
-        }
+/// Example: registry function handling 404
+const REGISTRY: &str = "example-registry";
+
+fn fetch_versions(package: &str) -> deps_core::Result<Vec<Version>> {
+    let response = http_client.get(&url).send()
+        .map_err(|e| DepsError::CacheError(e.to_string()))?;
+    
+    if response.status() == 404 {
+        return Err(DepsError::PackageNotFound {
+            package: package.into(),
+            registry: REGISTRY,
+        });
     }
+    
+    let data: Vec<Version> = response.json()
+        .map_err(|e| DepsError::ApiResponse {
+            package: package.into(),
+            registry: REGISTRY,
+            source: e,
+        })?;
+    
+    Ok(data)
 }
 ```
 
@@ -709,9 +685,8 @@ Create registry client in `registry.rs`:
 ```rust
 //! {Registry} API client with HTTP caching.
 
-use crate::error::Result;
 use crate::types::{Ecosystem}Version;
-use deps_core::{HttpCache, ecosystem::BoxFuture};
+use deps_core::{DepsError, HttpCache, Result, ecosystem::BoxFuture};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -734,7 +709,7 @@ impl {Ecosystem}Registry {
         let data = self.cache
             .get_cached(&url)
             .await
-            .map_err(|e| crate::error::{Ecosystem}Error::CacheError(e.to_string()))?;
+            .map_err(|e| DepsError::CacheError(e.to_string()))?;
 
         // TODO: Parse response and return versions
         Ok(vec![])
@@ -987,7 +962,6 @@ pub mod registry;
 pub mod types;
 
 pub use ecosystem::{Ecosystem}Ecosystem;
-pub use error::{Ecosystem}Error, Result;
 pub use parser::parse_{manifest};
 pub use registry::{Ecosystem}Registry;
 pub use types::{{Ecosystem}Dependency, {Ecosystem}Version};
