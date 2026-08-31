@@ -576,6 +576,25 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         freshness: crate::FreshnessSettings,
     ) -> BoxFuture<'a, Vec<CompletionItem>>;
 
+    /// Whether this ecosystem's completions may be a truncated view of a larger
+    /// candidate set, so the LSP client must re-query as the user keeps typing rather
+    /// than filter the (possibly empty) list it already has client-side.
+    ///
+    /// This is the ecosystem's *worst case across every completion context it
+    /// serves* — not a per-result property — since [`generate_completions`]'s single
+    /// return type gives the handler no way to flag one context (e.g. package-name
+    /// search over an unranked, alphabetically-truncated index) without also
+    /// flagging every other context the same call could have produced (e.g. version
+    /// completion, which is already complete). Over-reporting only costs a redundant
+    /// re-query; under-reporting lets the client silently drop results it should
+    /// have asked for again. Default `false` preserves existing behavior for every
+    /// ecosystem whose completions are always exhaustive.
+    ///
+    /// [`generate_completions`]: Ecosystem::generate_completions
+    fn completions_are_incomplete(&self) -> bool {
+        false
+    }
+
     /// Support for downcasting to concrete ecosystem type
     ///
     /// This allows ecosystem-specific operations when needed.

@@ -28,7 +28,7 @@ pub mod test_util;
 pub mod version_matcher;
 
 // Re-export commonly used types
-pub use cache::{CachedResponse, HttpCache};
+pub use cache::{BodyLimit, CachedResponse, HttpCache};
 pub use ecosystem::{Dependency, Ecosystem, EcosystemConfig, EcosystemId, ParseResult};
 pub use ecosystem_registry::EcosystemRegistry;
 pub use error::{DepsError, Result};

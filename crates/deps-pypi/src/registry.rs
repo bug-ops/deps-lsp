@@ -26,7 +26,10 @@ const PYPI_SIMPLE_BASE: &str = "https://pypi.org/simple";
 /// `Accept` header requesting the PEP 691 Simple API JSON representation.
 /// Roughly a third smaller than the full JSON API (verified against
 /// `django`: 619,755 bytes full vs 411,376 bytes Simple API).
-const SIMPLE_API_ACCEPT: &str = "application/vnd.pypi.simple.v1+json";
+///
+/// Shared with `crate::search`, which requests the same representation for the
+/// full project index.
+pub(crate) const SIMPLE_API_ACCEPT: &str = "application/vnd.pypi.simple.v1+json";
 
 /// Display name for PyPI used in not-found and API-response error messages.
 pub const REGISTRY: &str = "PyPI";
@@ -81,6 +84,25 @@ fn not_found_or(err: DepsError, name: &str) -> DepsError {
     }
 }
 
+/// Builds a search-result stub for `name`, a normalized name matched from the
+/// package-name search index.
+///
+/// [`PypiRegistry::search`] serves unranked prefix matches from a local index that
+/// carries only names, not metadata, so every other field is left at its "unknown"
+/// value. This is safe for completion: `build_package_completion`
+/// (`deps_core::completion`) and `create_package_completion_item`
+/// (`deps-lsp`'s fallback path) both already guard `detail` on `latest_version` being
+/// non-empty, so an empty `latest_version` here renders as no detail line rather than
+/// a misleading `Latest: `.
+fn package_stub(name: &str) -> PypiPackage {
+    PypiPackage {
+        name: deps_core::PackageName::new(name),
+        summary: None,
+        project_urls: Vec::new(),
+        latest_version: String::new(),
+    }
+}
+
 /// Client for interacting with the PyPI registry.
 ///
 /// Uses the PyPI JSON API for package metadata.
@@ -104,12 +126,30 @@ fn not_found_or(err: DepsError, name: &str) -> DepsError {
 #[derive(Clone)]
 pub struct PypiRegistry {
     cache: Arc<HttpCache>,
+    /// Base URL for the package-name search index (see [`Self::search`]).
+    /// Injectable for tests, mirroring `NuGetRegistry::with_service_index_url`.
+    index_url: String,
+    /// Build-once, in-memory package-name search index (issue #419). See
+    /// `crate::search` for the full design.
+    index: Arc<crate::search::IndexCell>,
 }
 
 impl PypiRegistry {
     /// Creates a new PyPI registry client with the given HTTP cache.
-    pub const fn new(cache: Arc<HttpCache>) -> Self {
-        Self { cache }
+    pub fn new(cache: Arc<HttpCache>) -> Self {
+        Self::with_index_url(cache, crate::search::SIMPLE_INDEX_URL.to_string())
+    }
+
+    /// Creates a registry client whose search index is built from `index_url`
+    /// rather than the real [`crate::search::SIMPLE_INDEX_URL`]. `pub(crate)` so
+    /// tests elsewhere in the crate (`crate::ecosystem`) can point it at a mock
+    /// server; mirrors `NuGetRegistry::with_service_index_url`.
+    pub(crate) fn with_index_url(cache: Arc<HttpCache>, index_url: String) -> Self {
+        Self {
+            cache,
+            index_url,
+            index: Arc::new(crate::search::IndexCell::new()),
+        }
     }
 
     /// Fetches all versions for a package from PyPI's Simple API (PEP 691).
@@ -215,15 +255,26 @@ impl PypiRegistry {
         }))
     }
 
-    /// Searches for packages by name/keywords.
+    /// Searches for packages whose PEP 503 normalized name starts with `query`.
     ///
-    /// Note: PyPI does not provide an official search API, so this returns
-    /// an empty result for now. Future implementation could use third-party
-    /// search services or scraping.
+    /// PyPI removed its XML-RPC search API and offers no first-party ranked search,
+    /// so this serves unranked, alphabetically-sorted prefix matches against a
+    /// lazily-built, in-memory index of the full PyPI Simple API project list
+    /// (~882k names) — the same approach PyCharm's PyPI completion uses. See
+    /// `crate::search` for the index's build/backoff lifecycle.
+    ///
+    /// On a cold start (the index has not finished building yet), this returns an
+    /// empty result immediately rather than blocking on a ~9.6 MB download, and
+    /// triggers a background build. Once built, the index is never rebuilt for the
+    /// life of the process — there is no TTL (see `crate::search`'s module doc for
+    /// why). Because the result set can be a truncated view of a much larger match
+    /// set, callers should treat every non-empty result as incomplete; `deps-lsp`
+    /// does this via [`deps_core::Ecosystem::completions_are_incomplete`].
     ///
     /// # Errors
     ///
-    /// Currently always returns Ok with empty vector.
+    /// Never returns `Err`: a failed background build is logged and degrades to an
+    /// empty result, matching this method's pre-existing observable behavior.
     ///
     /// # Examples
     ///
@@ -236,18 +287,51 @@ impl PypiRegistry {
     /// let cache = Arc::new(HttpCache::new());
     /// let registry = PypiRegistry::new(cache);
     ///
-    /// let results = registry.search("flask", 10).await.unwrap();
-    /// // Currently returns empty, to be implemented
+    /// // May be empty on a cold start; a later call (once the index has built)
+    /// // returns matches.
+    /// let _results = registry.search("flask", 10).await.unwrap();
     /// # }
     /// ```
     pub fn search(
         &self,
-        _query: &str,
-        _limit: usize,
-    ) -> impl Future<Output = Result<Vec<PypiPackage>>> {
-        // TODO: Implement search using third-party API or scraping
-        // PyPI deprecated their XML-RPC search API
-        std::future::ready(Ok(Vec::new()))
+        query: &str,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<PypiPackage>>> + use<> {
+        let normalized = crate::name::normalize(query);
+        let cache = Arc::clone(&self.cache);
+        let index_url = self.index_url.clone();
+        let index = Arc::clone(&self.index);
+        async move {
+            if normalized.is_empty() {
+                return Ok(Vec::new());
+            }
+            if let Some(ready) = index.ready() {
+                return Ok(ready
+                    .prefix_matches(&normalized, limit)
+                    .into_iter()
+                    .map(package_stub)
+                    .collect());
+            }
+            crate::search::trigger_index_build(cache, index_url, index);
+            Ok(Vec::new())
+        }
+    }
+
+    /// Starts building the package-name search index in the background if it isn't
+    /// ready yet (or a prior failed attempt's backoff window has elapsed).
+    ///
+    /// Safe to call unconditionally and often — a cheap no-op once the index is
+    /// `crate::search::IndexState::Ready` or while a prior failure
+    /// is still within its backoff window. `deps-pypi`'s `PypiEcosystem` calls this
+    /// on every completion request in a Python manifest (not only package-name
+    /// completion), so the index is typically already built by the time the user
+    /// starts typing a package name.
+    pub fn warm_search_index(&self) {
+        crate::search::trigger_index_build(
+            Arc::clone(&self.cache),
+            self.index_url.clone(),
+            Arc::clone(&self.index),
+        );
     }
 
     /// Fetches package metadata including description and project URLs.
@@ -1405,5 +1489,139 @@ mod tests {
         ];
         let req = VersionReq::new("*");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_search_empty_query_returns_empty_without_building_index() {
+        // A mock with `expect(0)` (the default) fails the test if it's ever hit —
+        // an empty/whitespace query must short-circuit before touching the
+        // network at all.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let registry = PypiRegistry::with_index_url(cache, index_url);
+
+        assert!(registry.search("", 10).await.unwrap().is_empty());
+        assert!(registry.search("---", 10).await.unwrap().is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_search_cold_start_returns_empty_immediately() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&["requests"]))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let registry = PypiRegistry::with_index_url(cache, index_url);
+
+        // The very first call must not block on the download.
+        let results = registry.search("reque", 10).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "cold start must return empty immediately"
+        );
+
+        // #419 M4 regression: the old permanent stub also satisfied the assertion
+        // above, since it always returned empty. What must distinguish the real
+        // implementation is that the cold-start call above actually triggered a
+        // background build — confirmed here by waiting for the mock to be hit,
+        // rather than stopping at "returned empty" alone.
+        for _ in 0..100 {
+            if mock.matched_async().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_search_finds_match_after_index_builds() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&[
+                "requests",
+                "requests-oauthlib",
+            ]))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let registry = PypiRegistry::with_index_url(cache, index_url);
+
+        let mut results = registry.search("reque", 10).await.unwrap();
+        for _ in 0..100 {
+            if !results.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            results = registry.search("reque", 10).await.unwrap();
+        }
+
+        let names: Vec<String> = results.iter().map(|p| p.name.to_string()).collect();
+        assert!(names.contains(&"requests".to_string()));
+        assert!(names.contains(&"requests-oauthlib".to_string()));
+        // C2 build-once: a second round of searches after the index is ready
+        // must not trigger another fetch.
+        let _ = registry.search("req", 10).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_search_no_match_returns_empty_once_index_is_ready() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/simple/")
+            .with_status(200)
+            .with_body(crate::search::sample_index_body(&["requests"]))
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let index_url = format!("{}/simple/", server.url());
+        let registry = PypiRegistry::with_index_url(cache, index_url);
+
+        // Poll on a query that IS expected to eventually match, purely to know
+        // the index has finished building, then assert a non-matching query
+        // against the now-ready index.
+        let mut became_ready = false;
+        for _ in 0..100 {
+            if !registry.search("reque", 10).await.unwrap().is_empty() {
+                became_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // #419 M4 regression: without this assertion, a version of the index that
+        // never finishes building would make the final `no_match.is_empty()`
+        // assertion vacuously true instead of exercising the intended "matched
+        // against a ready index" case.
+        assert!(
+            became_ready,
+            "index never became ready within the poll budget"
+        );
+
+        let no_match = registry
+            .search("this-prefix-matches-nothing-zzz", 10)
+            .await
+            .unwrap();
+        assert!(no_match.is_empty());
     }
 }

@@ -54,8 +54,61 @@ const HTTP_TIMEOUT_SECS: u64 = 30;
 /// as soon as the running total would exceed the limit.
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Ceiling every [`BodyLimit`] is clamped to at construction, so no caller can weaken
+/// the size guard [`read_body_capped`] enforces past this value.
+///
+/// 128 MiB comfortably covers the largest known caller ([`crate`][deps-pypi]'s PyPI
+/// Simple API full index, ~43 MB decompressed today, capped at 96 MiB for organic
+/// growth) while still bounding the pathological case.
+const ABSOLUTE_MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+
 /// Percentage of cache entries to evict when capacity is reached.
 const CACHE_EVICTION_PERCENTAGE: usize = 10;
+
+/// Upper bound on a single response body, clamped at construction so no caller can
+/// weaken the guard `read_body_capped` enforces past `ABSOLUTE_MAX_RESPONSE_BYTES`.
+///
+/// Every cache method that previously read `MAX_RESPONSE_BYTES` directly now takes
+/// this newtype instead (defaulting to it via [`Self::DEFAULT`]), so a caller that
+/// legitimately needs a larger cap — e.g. a full-index fetch that bypasses the entry
+/// cache entirely, like [`HttpCache::get_transport_only_with_headers_limited`] — can
+/// request one without touching the shared constant every other registry client
+/// relies on.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::cache::BodyLimit;
+///
+/// let default_limit = BodyLimit::DEFAULT;
+/// let clamped = BodyLimit::new(usize::MAX);
+/// assert_ne!(clamped, default_limit);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyLimit(usize);
+
+impl BodyLimit {
+    /// The default limit (`MAX_RESPONSE_BYTES`), used by every cache method that
+    /// does not take an explicit [`BodyLimit`].
+    pub const DEFAULT: Self = Self(MAX_RESPONSE_BYTES);
+
+    /// Creates a limit of `bytes`, clamped down to `ABSOLUTE_MAX_RESPONSE_BYTES` if
+    /// `bytes` exceeds it.
+    #[must_use]
+    pub const fn new(bytes: usize) -> Self {
+        if bytes > ABSOLUTE_MAX_RESPONSE_BYTES {
+            Self(ABSOLUTE_MAX_RESPONSE_BYTES)
+        } else {
+            Self(bytes)
+        }
+    }
+
+    /// The clamped byte value this limit enforces.
+    #[must_use]
+    pub const fn bytes(self) -> usize {
+        self.0
+    }
+}
 
 /// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`), with any scheme
 /// and an optional port — the shape every `mockito::Server` binds to.
@@ -169,16 +222,16 @@ fn build_client(redirect: reqwest::redirect::Policy) -> Client {
         .expect("failed to create HTTP client")
 }
 
-/// Reads a response body incrementally, aborting once it exceeds
-/// [`MAX_RESPONSE_BYTES`].
+/// Reads a response body incrementally, aborting once it exceeds `limit`.
 ///
 /// Chunked reading (via [`Response::chunk`]) is required because the
 /// decompressed body size is not known upfront: `gzip` decoding strips
 /// `Content-Length`, so the only reliable guard against an oversized or
 /// maliciously amplified (decompression-bomb) response is counting bytes
 /// as they arrive and bailing before the whole body is buffered.
-async fn read_body_capped(url: &str, mut response: Response) -> Result<Bytes> {
+async fn read_body_capped(url: &str, mut response: Response, limit: BodyLimit) -> Result<Bytes> {
     let mut body = BytesMut::new();
+    let limit = limit.bytes();
 
     while let Some(chunk) = response
         .chunk()
@@ -188,10 +241,10 @@ async fn read_body_capped(url: &str, mut response: Response) -> Result<Bytes> {
             source: e,
         })?
     {
-        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+        if body.len() + chunk.len() > limit {
             return Err(DepsError::ResponseTooLarge {
                 url: url.to_string(),
-                limit: MAX_RESPONSE_BYTES,
+                limit,
             });
         }
         body.extend_from_slice(&chunk);
@@ -522,7 +575,7 @@ impl HttpCache {
             .get(header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        let body = read_body_capped(url, response).await?;
+        let body = read_body_capped(url, response, BodyLimit::DEFAULT).await?;
 
         self.store_entry(
             url.to_string(),
@@ -585,7 +638,7 @@ impl HttpCache {
             .get(header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        let body = read_body_capped(url, response).await?;
+        let body = read_body_capped(url, response, BodyLimit::DEFAULT).await?;
 
         self.store_entry(
             url.to_string(),
@@ -632,7 +685,7 @@ impl HttpCache {
             });
         }
 
-        read_body_capped(url, response).await
+        read_body_capped(url, response, BodyLimit::DEFAULT).await
     }
 
     /// GETs `url` and returns the response body, bypassing the entry-map
@@ -671,9 +724,64 @@ impl HttpCache {
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
+        self.get_transport_only_with_headers_limited(url, extra_headers, BodyLimit::DEFAULT)
+            .await
+    }
+
+    /// Same as [`Self::get_transport_only_with_headers`], but takes an explicit
+    /// [`BodyLimit`] instead of the [`BodyLimit::DEFAULT`] (`MAX_RESPONSE_BYTES`) cap.
+    ///
+    /// For a caller whose response is legitimately larger than every other registry
+    /// payload — e.g. `deps-pypi`'s full Simple API project index — without weakening
+    /// the cap every other caller of this cache relies on. `BodyLimit` clamps at
+    /// construction, so this can never be widened past `ABSOLUTE_MAX_RESPONSE_BYTES`
+    /// regardless of what the caller passes in.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_transport_only_with_headers`].
+    pub async fn get_transport_only_with_headers_limited(
+        &self,
+        url: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+        limit: BodyLimit,
+    ) -> Result<Bytes> {
+        self.transport_only_via(url, extra_headers, limit, &self.client)
+            .await
+    }
+
+    /// Same as [`Self::get_transport_only_with_headers_limited`], but additionally
+    /// stops any redirect hop whose target no longer starts with `trusted_origin`
+    /// (see [`Self::get_cached_trusted_origin`], which applies the identical policy
+    /// to the entry-cached path). For a caller carrying a materially larger
+    /// [`BodyLimit`] than [`BodyLimit::DEFAULT`] — the bigger the budget, the more
+    /// worth pinning the origin an arbitrary cross-host redirect could point it at.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_transport_only_with_headers_limited`].
+    pub async fn get_transport_only_with_headers_limited_trusted_origin(
+        &self,
+        url: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+        limit: BodyLimit,
+        trusted_origin: &str,
+    ) -> Result<Bytes> {
+        let client = self.client_for_origin(trusted_origin);
+        self.transport_only_via(url, extra_headers, limit, &client)
+            .await
+    }
+
+    async fn transport_only_via(
+        &self,
+        url: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+        limit: BodyLimit,
+        client: &Client,
+    ) -> Result<Bytes> {
         ensure_https(url)?;
 
-        let mut request = self.client.get(url);
+        let mut request = client.get(url);
         for (name, value) in extra_headers {
             request = request.header(name, *value);
         }
@@ -690,7 +798,7 @@ impl HttpCache {
             });
         }
 
-        read_body_capped(url, response).await
+        read_body_capped(url, response, limit).await
     }
 
     /// Inserts (or replaces) a cache entry, keeping [`Self::total_bytes`] in sync.

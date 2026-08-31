@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **deps-pypi, deps-core, deps-lsp**: PyPI package-name completion, previously a permanent zero-results stub, now serves matches from a live PyPI package-name index (resolves #419) (#426)
 - **docs**: `ECOSYSTEM_GUIDE.md`'s Deno row now lists code lens support, matching the shared `deps-core` default it already receives (resolves #410) (#416)
 - **.gitignore**: added globs for common secret files (SSH private keys, `*.key`/`*.pem`/`*.p12`/`*.pfx`/`*.jks`/`*.keystore`, `*.credentials`, `credentials.json`, `secrets/`) to prevent accidental commits (resolves #411) (#412)
 - **deps-lsp**: background cold-start rate-limiter cleanup task no longer discards its `JoinHandle`, so a panic surfaces as an `error!` log instead of silently stopping cleanup forever (resolves #408) (#413)

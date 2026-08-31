@@ -64,6 +64,26 @@ This helps you understand when conditional dependencies apply. Markers are shown
 
 Files matching `requirements*.txt`, `*-requirements.txt`, `*.requirements.txt`, or `constraints*.txt` are routed to the PyPI ecosystem and parsed line-by-line (pip's requirements file format), reusing the same PEP 508 machinery as `pyproject.toml` — hover, diagnostics, markers and extras render identically across both. Comments, blank lines, `\`-continuations, per-requirement options (`--hash=...`), and recognized pip options (`-r`, `-c`, `-e`, `--index-url`, `--pre`, etc.) are handled; `-r`/`-c` includes are recognized but not followed (each included file must be opened directly for its own dependencies to be checked). A pinned dependency (`django==5.0.1`) keeps its `==` pin on "update version" instead of widening to a range. Because the routing is by filename pattern rather than a fixed name, a non-manifest file that happens to match (e.g. a `product-requirements.txt` prose document) is detected via a content heuristic and produces no hover/diagnostics/network requests.
 
+### PyPI Package-Name Completion
+
+Package-name completion (issue #419) serves unranked, alphabetically-sorted prefix
+matches from an in-memory index of PyPI's full Simple API project list (~882k names,
+no popularity ranking) — the same approach PyCharm's PyPI completion uses, since PyPI
+removed its XML-RPC search API and offers no first-party ranked search. The index is
+built lazily (on the first completion request in a Python manifest) and once per
+process, not refreshed on a timer.
+
+Two behaviors worth knowing:
+- **Completions insert the PEP 503 normalized spelling**, not the project's display
+  spelling — `Django` is offered (and inserted) as `django`, `Zope.Interface` as
+  `zope-interface`. This matches what `pip install` and both `poetry.lock`/`uv.lock`
+  already normalize to.
+- **Matching is prefix-only against the package name**, not a project's import name
+  or description — typing `yaml` will not surface `pyyaml`, `sklearn` will not
+  surface `scikit-learn`, and `bs4` will not surface `beautifulsoup4`. This is a
+  known, common PyPI-specific expectation gap; a substring/import-name-aware search
+  is tracked as a possible follow-up, not implemented here.
+
 ### Maven/Gradle Version Comparison
 
 Versions are now ranked with correct Maven semantics:

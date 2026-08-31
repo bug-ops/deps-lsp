@@ -14,7 +14,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, InsertTextFormat,
+    CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
+    InsertTextFormat,
 };
 
 // Completion is keystroke-driven and must stay responsive, so registry-backed
@@ -50,6 +51,34 @@ pub async fn handle_completion(
     // this acquires the config RwLock before the DashMap shard guard, never the reverse.
     let freshness = { config.read().await.freshness.to_settings() };
 
+    // Resolved once, from the URI alone via `get_for_uri` (the same routing
+    // `handle_document_open` uses), rather than from the loaded document's
+    // `ecosystem_id` — that would only be available *after* the document-load and
+    // document-lookup early returns below, and both of those used to unconditionally
+    // report `isIncomplete: false`/`null` regardless of ecosystem. That was the exact
+    // C1 defect (#419 S1): the very first completion request against a not-yet-loaded
+    // manifest is also the coldest point for a search-index-backed ecosystem like
+    // PyPI. `is_some_and` (not `?`) so an unrecognized URI falls through to `false`
+    // (matching every ecosystem's default) rather than short-circuiting this function.
+    let is_incomplete = state
+        .ecosystem_registry
+        .get_for_uri(uri)
+        .is_some_and(|e| e.completions_are_incomplete());
+
+    // Shared by every early-return path below and the final response, so all of
+    // them report `isIncomplete` consistently instead of only the paths that reach
+    // the bottom of the function.
+    let empty_response = || {
+        if is_incomplete {
+            Some(CompletionResponse::List(CompletionList {
+                is_incomplete: true,
+                items: vec![],
+            }))
+        } else {
+            None
+        }
+    };
+
     // Check if document is loaded, if not try to load with short timeout
     // Completion is latency-critical, so we use a 200ms timeout
     if state.get_document(uri).is_none() {
@@ -70,7 +99,7 @@ pub async fn handle_completion(
             Ok(false) | Err(_) => {
                 // Load failed or timed out, return empty completions
                 tracing::warn!("completion: document load failed or timed out");
-                return Some(CompletionResponse::Array(vec![]));
+                return empty_response();
             }
         }
     }
@@ -95,7 +124,7 @@ pub async fn handle_completion(
         })
     else {
         tracing::warn!("completion: document not found: {:?}", uri);
-        return None;
+        return empty_response();
     };
 
     tracing::info!(
@@ -106,34 +135,54 @@ pub async fn handle_completion(
 
     // Try parse_result first, fallback to text-based detection
     let items = if let Some(parse_result) = parse_result {
-        let ecosystem = state.ecosystem_registry.get(ecosystem_id)?;
-        // The DashMap shard `Ref` was already dropped above, before this
-        // timeout-bound await: the search can run for up to
-        // `COMPLETION_SEARCH_TIMEOUT`, and holding the guard that long would block a
-        // concurrent `documents.get_mut` on the same shard for the duration (#319).
-        let completion_result = tokio::time::timeout(
-            COMPLETION_SEARCH_TIMEOUT,
-            ecosystem.generate_completions(parse_result.as_ref(), position, &content, freshness),
-        )
-        .await;
+        // `get_for_uri` above already confirmed an ecosystem exists for this URI, so
+        // this `get(ecosystem_id)` realistically cannot miss (ecosystems are
+        // registered once at startup and never removed) — but falls through to an
+        // empty result rather than an unconditional `None` early-return (the
+        // original shape here) so a hypothetical miss still respects `is_incomplete`
+        // instead of silently reverting to the pre-#419 bug class.
+        match state.ecosystem_registry.get(ecosystem_id) {
+            Some(ecosystem) => {
+                // The DashMap shard `Ref` was already dropped above, before this
+                // timeout-bound await: the search can run for up to
+                // `COMPLETION_SEARCH_TIMEOUT`, and holding the guard that long would
+                // block a concurrent `documents.get_mut` on the same shard for the
+                // duration (#319).
+                let completion_result = tokio::time::timeout(
+                    COMPLETION_SEARCH_TIMEOUT,
+                    ecosystem.generate_completions(
+                        parse_result.as_ref(),
+                        position,
+                        &content,
+                        freshness,
+                    ),
+                )
+                .await;
 
-        match completion_result {
-            // Ecosystem returned no completions: try fallback, since this handles the
-            // case where the user is typing a NEW package name.
-            Ok(completions) if completions.is_empty() => {
-                tracing::info!("completion: ecosystem returned empty, trying fallback");
-                fallback_completion(&state, ecosystem_kind, position, &content).await
+                match completion_result {
+                    // Ecosystem returned no completions: try fallback, since this
+                    // handles the case where the user is typing a NEW package name.
+                    Ok(completions) if completions.is_empty() => {
+                        tracing::info!("completion: ecosystem returned empty, trying fallback");
+                        fallback_completion(&state, ecosystem_kind, position, &content).await
+                    }
+                    Ok(completions) => completions,
+                    // Timed out, not genuinely empty: the registry is slow right now,
+                    // so a fallback search against the same registry would likely
+                    // time out too. Skip it instead of doubling the worst-case
+                    // latency.
+                    Err(_) => {
+                        tracing::warn!(
+                            "completion: generate_completions timed out after \
+                             {}s, skipping fallback search",
+                            COMPLETION_SEARCH_TIMEOUT.as_secs()
+                        );
+                        vec![]
+                    }
+                }
             }
-            Ok(completions) => completions,
-            // Timed out, not genuinely empty: the registry is slow right now, so a
-            // fallback search against the same registry would likely time out too.
-            // Skip it instead of doubling the worst-case latency.
-            Err(_) => {
-                tracing::warn!(
-                    "completion: generate_completions timed out after \
-                     {}s, skipping fallback search",
-                    COMPLETION_SEARCH_TIMEOUT.as_secs()
-                );
+            None => {
+                tracing::warn!("completion: ecosystem not found for id: {ecosystem_id}");
                 vec![]
             }
         }
@@ -144,7 +193,16 @@ pub async fn handle_completion(
 
     tracing::info!("completion: returning {} items", items.len());
 
-    if items.is_empty() {
+    if is_incomplete {
+        // Must still be a `List` when `items` is empty: `None` serializes as LSP
+        // `null`, which carries no `isIncomplete` and leaves the client with
+        // nothing to invalidate on the next keystroke (#419 C1) — this is the
+        // cold-start-returns-empty case PyPI's search index relies on.
+        Some(CompletionResponse::List(CompletionList {
+            is_incomplete: true,
+            items,
+        }))
+    } else if items.is_empty() {
         None
     } else {
         Some(CompletionResponse::Array(items))
@@ -1016,9 +1074,142 @@ mod tests {
 
         let (client, config) = create_test_client_and_config();
         let result = handle_completion(state, params, client, config).await;
-        // With cold start support, missing documents trigger background load
-        // and return empty completions for the first request
-        assert!(matches!(result, Some(CompletionResponse::Array(items)) if items.is_empty()));
+        // With cold start support, missing documents trigger background load and
+        // return empty completions for the first request. Cargo does not override
+        // `completions_are_incomplete`, so empty items collapse to `None` here —
+        // matching the same-shaped tail-of-function branch (`items.is_empty() =>
+        // None`), not the pre-#419-fix `Array(vec![])` this path used to return
+        // unconditionally regardless of ecosystem.
+        assert!(result.is_none());
+    }
+
+    /// #419 S1 regression: the document-not-loaded/load-failed early return (the
+    /// branch `test_completion_returns_empty_for_missing_document` exercises for a
+    /// non-flagged ecosystem) is also the *coldest* path for a search-index-backed
+    /// ecosystem like PyPI — the very first completion request against a
+    /// not-yet-loaded manifest. It must still report `isIncomplete: true` rather
+    /// than silently reverting to `Array`/`None`, which the client would cache as
+    /// "no completions, don't ask again".
+    #[tokio::test]
+    async fn test_completion_missing_document_reports_incomplete_for_flagged_ecosystem() {
+        use deps_core::ecosystem::private::Sealed;
+        use deps_core::{Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version};
+        use std::any::Any;
+        use tower_lsp_server::ls_types::Uri;
+
+        struct NoopRegistry;
+        impl Registry for NoopRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct NoopFormatter;
+        impl EcosystemFormatter for NoopFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+
+        /// Stands in for `PypiEcosystem`: only `completions_are_incomplete` and
+        /// routing matter for this test, since the document never loads.
+        struct IncompleteEcosystem;
+        impl Sealed for IncompleteEcosystem {}
+        impl Ecosystem for IncompleteEcosystem {
+            fn id(&self) -> &'static str {
+                "cargo"
+            }
+            fn display_name(&self) -> &'static str {
+                "cargo"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &["Cargo.toml"]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a Uri,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
+            {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn registry(&self) -> Arc<dyn Registry> {
+                Arc::new(NoopRegistry)
+            }
+            fn formatter(&self) -> &dyn EcosystemFormatter {
+                &NoopFormatter
+            }
+            fn completions_are_incomplete(&self) -> bool {
+                true
+            }
+            fn generate_completions<'a>(
+                &'a self,
+                _parse_result: &'a dyn ParseResult,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = Arc::new(ServerState::new());
+        state
+            .ecosystem_registry
+            .register(Arc::new(IncompleteEcosystem));
+        // Deliberately never inserted into `state.documents` — the document-load
+        // path below must time out/fail against a nonexistent file, exactly the
+        // `test_completion_returns_empty_for_missing_document` shape.
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position::new(0, 0),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+
+        let (client, config) = create_test_client_and_config();
+        let result = handle_completion(state, params, client, config).await;
+        match result {
+            Some(CompletionResponse::List(list)) => {
+                assert!(list.is_incomplete);
+                assert!(list.items.is_empty());
+            }
+            other => panic!("expected List{{is_incomplete:true, items:[]}}, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3100,5 +3291,184 @@ serde
         // Empty items collapse to `None` (see `handle_completion`'s tail); reaching
         // this at all (rather than hanging or panicking) is what this test checks.
         assert!(result.is_none());
+    }
+
+    /// #419 C1 regression: an ecosystem whose `completions_are_incomplete()`
+    /// returns `true` (PyPI's package-search-index-backed completion) must always
+    /// get back `CompletionResponse::List { is_incomplete: true, .. }` — on the
+    /// empty-items branch (the cold-start case rev 4's fix missed, since `None`
+    /// serializes as LSP `null` and carries no `isIncomplete`) as well as the
+    /// non-empty branch. An ecosystem that does not override the flag (the
+    /// `test_concurrent_document_write_not_blocked_by_in_flight_completion_search`
+    /// test just above proves the empty case) keeps returning `None`/`Array`
+    /// unchanged.
+    #[tokio::test]
+    async fn test_completions_are_incomplete_flag_shapes_response_both_branches() {
+        use deps_core::ecosystem::private::Sealed;
+        use deps_core::{
+            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
+        };
+        use std::any::Any;
+        use tower_lsp_server::ls_types::Uri;
+
+        struct NoopRegistry;
+        impl Registry for NoopRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct NoopFormatter;
+        impl EcosystemFormatter for NoopFormatter {
+            fn format_version_for_text_edit(&self, version: &str) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+
+        /// Stands in for `PypiEcosystem`: always reports incomplete results, and
+        /// returns either zero or one completion item depending on `has_item`.
+        struct IncompleteEcosystem {
+            has_item: bool,
+        }
+        impl Sealed for IncompleteEcosystem {}
+        impl Ecosystem for IncompleteEcosystem {
+            fn id(&self) -> &'static str {
+                "cargo"
+            }
+            fn display_name(&self) -> &'static str {
+                "cargo"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &["Cargo.toml"]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a Uri,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
+            {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn registry(&self) -> Arc<dyn Registry> {
+                Arc::new(NoopRegistry)
+            }
+            fn formatter(&self) -> &dyn EcosystemFormatter {
+                &NoopFormatter
+            }
+            fn completions_are_incomplete(&self) -> bool {
+                true
+            }
+            fn generate_completions<'a>(
+                &'a self,
+                _parse_result: &'a dyn ParseResult,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+                let items = if self.has_item {
+                    vec![CompletionItem {
+                        label: "requests".to_string(),
+                        ..Default::default()
+                    }]
+                } else {
+                    vec![]
+                };
+                Box::pin(async move { items })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult {
+            uri: Uri,
+        }
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![]
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        async fn run(has_item: bool) -> Option<CompletionResponse> {
+            let state = Arc::new(ServerState::new());
+            state
+                .ecosystem_registry
+                .register(Arc::new(IncompleteEcosystem { has_item }));
+
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+            let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: uri.clone() });
+            let doc =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            state.update_document(uri.clone(), doc);
+
+            let params = CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(0, 0),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            };
+
+            let (client, config) = create_test_client_and_config();
+            handle_completion(state, params, client, config).await
+        }
+
+        match run(false).await {
+            Some(CompletionResponse::List(list)) => {
+                assert!(
+                    list.is_incomplete,
+                    "empty branch must still carry is_incomplete"
+                );
+                assert!(list.items.is_empty());
+            }
+            other => panic!("expected List{{is_incomplete:true, items:[]}}, got {other:?}"),
+        }
+
+        match run(true).await {
+            Some(CompletionResponse::List(list)) => {
+                assert!(list.is_incomplete);
+                assert_eq!(list.items.len(), 1);
+                assert_eq!(list.items[0].label, "requests");
+            }
+            other => panic!("expected List{{is_incomplete:true, items:[requests]}}, got {other:?}"),
+        }
     }
 }
