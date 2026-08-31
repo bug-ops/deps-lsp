@@ -501,6 +501,12 @@ pub fn parse_flat_container(data: &[u8]) -> Result<Vec<NuGetVersion>> {
 /// version list. `req` is treated as `"*"` when empty. Prerelease versions are excluded
 /// unless `req` itself is prerelease-bearing (contains `-`) or is a floating pattern whose
 /// own prerelease inclusion is handled by `crate::version::resolve_float`.
+///
+/// Under an existence-check wildcard (`req` trimmed is `""` or `"*"`), a normal match that
+/// comes up empty falls back to [`deps_core::select_latest_for_existence`] so a
+/// prerelease-only package still reports its newest version instead of `None` — see that
+/// function's doc comment for the 3-rung contract. Non-wildcard requirements (e.g.
+/// `"*-*"`, `"1.*"`) are unaffected: this fallback never fires for them.
 fn pick_latest_matching(versions: Vec<NuGetVersion>, req: &str) -> Option<NuGetVersion> {
     if versions.is_empty() {
         return None;
@@ -508,18 +514,32 @@ fn pick_latest_matching(versions: Vec<NuGetVersion>, req: &str) -> Option<NuGetV
 
     let req = if req.is_empty() { "*" } else { req };
 
-    if req.contains('*') {
+    let matched = if req.contains('*') {
         let strings: Vec<String> = versions.iter().map(|v| v.version.clone()).collect();
-        return crate::version::resolve_float(&strings, req).map(|v| NuGetVersion {
+        crate::version::resolve_float(&strings, req).map(|v| NuGetVersion {
             version: v.to_string(),
             published_at: None,
-        });
-    }
+        })
+    } else {
+        let req_is_prerelease_bearing = req.contains('-');
+        versions
+            .iter()
+            .find(|v| {
+                crate::version::satisfies(&v.version, req)
+                    && (req_is_prerelease_bearing || !crate::version::is_prerelease(&v.version))
+            })
+            .cloned()
+    };
 
-    let req_is_prerelease_bearing = req.contains('-');
-    versions.into_iter().find(|v| {
-        crate::version::satisfies(&v.version, req)
-            && (req_is_prerelease_bearing || !crate::version::is_prerelease(&v.version))
+    matched.or_else(|| {
+        if deps_core::is_existence_wildcard_str(req) {
+            let idx = deps_core::select_latest_for_existence(&versions, |v| {
+                v as &dyn deps_core::Version
+            })?;
+            Some(versions[idx].clone())
+        } else {
+            None
+        }
     })
 }
 
@@ -613,19 +633,26 @@ impl deps_core::Registry for NuGetRegistry {
         let req_str = req.as_str();
         let req_str = if req_str.is_empty() { "*" } else { req_str };
 
-        if req_str.contains('*') {
+        let matched = if req_str.contains('*') {
             let strings: Vec<String> = versions
                 .iter()
                 .map(|v| v.version_string().to_string())
                 .collect();
-            let matched = crate::version::resolve_float(&strings, req_str)?;
-            return strings.iter().position(|s| s == matched);
-        }
+            crate::version::resolve_float(&strings, req_str)
+                .and_then(|matched| strings.iter().position(|s| s == matched))
+        } else {
+            let req_is_prerelease_bearing = req_str.contains('-');
+            versions.iter().position(|v| {
+                crate::version::satisfies(v.version_string(), req_str)
+                    && (req_is_prerelease_bearing
+                        || !crate::version::is_prerelease(v.version_string()))
+            })
+        };
 
-        let req_is_prerelease_bearing = req_str.contains('-');
-        versions.iter().position(|v| {
-            crate::version::satisfies(v.version_string(), req_str)
-                && (req_is_prerelease_bearing || !crate::version::is_prerelease(v.version_string()))
+        matched.or_else(|| {
+            deps_core::is_existence_wildcard_str(req_str)
+                .then(|| deps_core::select_latest_for_existence(versions, |v| v.as_ref()))
+                .flatten()
         })
     }
 
@@ -952,6 +979,56 @@ mod tests {
         assert!(pick_latest_matching(versions, "[1.0.0]").is_none());
     }
 
+    /// Regression for #423: a package whose only releases so far are all prerelease must
+    /// still resolve under a wildcard requirement — matching `deps-cargo`/`deps-composer`'s
+    /// existence-check behavior — instead of `pick_latest_matching` returning `None`.
+    #[test]
+    fn test_pick_latest_matching_wildcard_prerelease_only_still_resolves() {
+        let versions = vec![v("2.0.0-beta2"), v("2.0.0-beta1")];
+        let matched = pick_latest_matching(versions, "*");
+        assert_eq!(matched.unwrap().version, "2.0.0-beta2");
+    }
+
+    /// Regression for #423: empty `req` is treated as `"*"`, so it must also rescue a
+    /// prerelease-only package instead of returning `None`.
+    #[test]
+    fn test_pick_latest_matching_empty_req_prerelease_only_still_resolves() {
+        let versions = vec![v("2.0.0-beta2"), v("2.0.0-beta1")];
+        let matched = pick_latest_matching(versions, "");
+        assert_eq!(matched.unwrap().version, "2.0.0-beta2");
+    }
+
+    /// Regression guard for #423: `"*-*"` is prerelease-bearing but not an existence-check
+    /// wildcard (`is_existence_wildcard_str` requires trimmed `""`/`"*"`), so it must keep
+    /// resolving via `resolve_float`'s own best-match logic, unaffected by the new fallback.
+    #[test]
+    fn test_pick_latest_matching_prerelease_bearing_wildcard_unaffected_by_rescue() {
+        let versions = vec![v("2.0.0-rc"), v("1.5.0"), v("1.0.0")];
+        let matched = pick_latest_matching(versions, "*-*");
+        assert_eq!(matched.unwrap().version, "2.0.0-rc");
+    }
+
+    /// Regression guard for #423: a concrete non-wildcard requirement must NOT be rescued
+    /// by the existence-check fallback, even over a prerelease-only version list — the gate
+    /// is `is_existence_wildcard_str`, not "contains a `*`". If that gate were ever loosened
+    /// to `req.contains('*')`, a floating pattern like `1.*` would start getting rescued
+    /// too; this pins `None` so such a regression fails loudly instead of silently.
+    #[test]
+    fn test_pick_latest_matching_concrete_floating_requirement_not_rescued() {
+        let versions = vec![v("2.0.0-beta2"), v("2.0.0-beta1")];
+        assert!(pick_latest_matching(versions, "1.*").is_none());
+    }
+
+    /// Regression guard for #423: an exact-pin requirement that matches nothing in a
+    /// prerelease-only list must NOT be rescued either — mirrors
+    /// `test_pick_latest_matching_concrete_floating_requirement_not_rescued` for the
+    /// non-floating (exact-pin) matcher branch.
+    #[test]
+    fn test_pick_latest_matching_exact_pin_not_rescued() {
+        let versions = vec![v("2.0.0-beta2"), v("2.0.0-beta1")];
+        assert!(pick_latest_matching(versions, "[9.9.9]").is_none());
+    }
+
     #[test]
     fn test_registry_creation_and_trait_impls() {
         use deps_core::Registry;
@@ -997,6 +1074,84 @@ mod tests {
             vec![Box::new(v("1.1.0-rc.1")), Box::new(v("1.0.0"))];
         let req = VersionReq::new("*");
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    /// Regression for #423: the trait impl's `select_latest_matching` must rescue a
+    /// prerelease-only package under a wildcard requirement too, mirroring
+    /// `test_pick_latest_matching_wildcard_prerelease_only_still_resolves`.
+    #[test]
+    fn test_select_latest_matching_wildcard_prerelease_only_still_resolves() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NuGetRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> =
+            vec![Box::new(v("2.0.0-beta2")), Box::new(v("2.0.0-beta1"))];
+        let req = VersionReq::new("*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// Regression for #423: empty `req` on the trait impl must also rescue a
+    /// prerelease-only package, matching the free-function behavior.
+    #[test]
+    fn test_select_latest_matching_empty_req_prerelease_only_still_resolves() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NuGetRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> =
+            vec![Box::new(v("2.0.0-beta2")), Box::new(v("2.0.0-beta1"))];
+        let req = VersionReq::new("");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// Regression guard for #423: `"*-*"` is not an existence-check wildcard, so the trait
+    /// impl must keep resolving via `resolve_float`'s best-match logic, unaffected by the
+    /// new fallback — mirrors
+    /// `test_pick_latest_matching_prerelease_bearing_wildcard_unaffected_by_rescue`.
+    #[test]
+    fn test_select_latest_matching_prerelease_bearing_wildcard_unaffected_by_rescue() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NuGetRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(v("2.0.0-rc")),
+            Box::new(v("1.5.0")),
+            Box::new(v("1.0.0")),
+        ];
+        let req = VersionReq::new("*-*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// Regression guard for #423: a concrete floating requirement must NOT be rescued by
+    /// the trait impl's existence-check fallback, even over a prerelease-only list — mirrors
+    /// `test_pick_latest_matching_concrete_floating_requirement_not_rescued`.
+    #[test]
+    fn test_select_latest_matching_concrete_floating_requirement_not_rescued() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NuGetRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> =
+            vec![Box::new(v("2.0.0-beta2")), Box::new(v("2.0.0-beta1"))];
+        let req = VersionReq::new("1.*");
+        assert_eq!(registry.select_latest_matching(&versions, &req), None);
+    }
+
+    /// Regression guard for #423: a concrete exact-pin requirement matching nothing in a
+    /// prerelease-only list must NOT be rescued either — mirrors
+    /// `test_pick_latest_matching_exact_pin_not_rescued` for the trait impl.
+    #[test]
+    fn test_select_latest_matching_exact_pin_not_rescued() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NuGetRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> =
+            vec![Box::new(v("2.0.0-beta2")), Box::new(v("2.0.0-beta1"))];
+        let req = VersionReq::new("[9.9.9]");
+        assert_eq!(registry.select_latest_matching(&versions, &req), None);
     }
 
     // --- ServiceIndex::resolve: registrations_base_url preference (S2/rev2 OQ6) ---
