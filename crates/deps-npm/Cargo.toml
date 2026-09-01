@@ -34,8 +34,8 @@ tracing = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
-deps-core = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true, features = ["html_reports"] }
+deps-core = { workspace = true, features = ["test-util"] }
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }
