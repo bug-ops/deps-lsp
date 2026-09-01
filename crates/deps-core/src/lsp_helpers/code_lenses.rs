@@ -45,14 +45,14 @@ use super::{
 /// use deps_core::lsp_helpers::{
 ///     collect_update_all_edits, EcosystemFormatter, PackageVersions, VersionData,
 /// };
-/// use deps_core::{Dependency, ParseResult, PackageName, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, ParseResult, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use tower_lsp_server::ls_types::{Position, Range, Uri};
 ///
 /// struct MockFormatter;
 /// impl EcosystemFormatter for MockFormatter {
-///     fn format_version_for_text_edit(&self, version: &str) -> String {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
@@ -134,15 +134,15 @@ pub fn collect_update_all_edits(
             .cached
             .get(normalized_name.as_str())
             .or_else(|| versions.cached.get(dep.name()))
-            .map(|v| v.latest.as_str())
+            .map(|v| &v.latest)
         else {
             continue;
         };
-        if !is_safe_version_string(latest) {
+        if !is_safe_version_string(latest.as_str()) {
             warn_rejected_value(
                 "is_safe_version_string",
                 "update-all code lens edit",
-                latest,
+                latest.as_str(),
             );
             continue;
         }
@@ -224,12 +224,12 @@ pub fn collect_update_all_edits(
 ///
 /// ```
 /// use deps_core::lsp_helpers::{generate_code_lenses, EcosystemFormatter, VersionData};
-/// use deps_core::{PackageName, ParseResult};
+/// use deps_core::{ConcreteVersion, PackageName, ParseResult};
 /// use std::collections::HashMap;
 ///
 /// struct MockFormatter;
 /// impl EcosystemFormatter for MockFormatter {
-///     fn format_version_for_text_edit(&self, version: &str) -> String {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
@@ -296,7 +296,7 @@ mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::*;
-    use crate::{PackageName, VersionReq};
+    use crate::{ConcreteVersion, PackageName, VersionReq};
     use std::any::Any;
     use std::collections::HashMap;
 
@@ -382,13 +382,17 @@ mod tests {
         struct FloorFormatter;
 
         impl EcosystemFormatter for FloorFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 format!("{version}-forced")
             }
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
-            fn is_requirement_up_to_date(&self, _requirement: &VersionReq, _latest: &str) -> bool {
+            fn is_requirement_up_to_date(
+                &self,
+                _requirement: &VersionReq,
+                _latest: &ConcreteVersion,
+            ) -> bool {
                 false
             }
         }
@@ -434,12 +438,12 @@ mod tests {
             assert_eq!(edits[0].range, range(0, 9, 0, 14));
             assert_eq!(
                 edits[0].new_text,
-                MockFormatter.format_version_for_text_edit("1.2.0")
+                MockFormatter.format_version_for_text_edit(&ConcreteVersion::new("1.2.0"))
             );
             assert_eq!(edits[1].range, range(1, 9, 1, 14));
             assert_eq!(
                 edits[1].new_text,
-                MockFormatter.format_version_for_text_edit("1.3.0")
+                MockFormatter.format_version_for_text_edit(&ConcreteVersion::new("1.3.0"))
             );
 
             let lenses = generate_code_lenses(
@@ -653,19 +657,23 @@ mod tests {
             // outdated dependencies" lens while applying nothing.
             struct NoOpFormatter;
             impl EcosystemFormatter for NoOpFormatter {
-                fn format_version_for_text_edit(&self, version: &str) -> String {
+                fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                     version.to_string()
                 }
                 fn package_url(&self, name: &PackageName) -> String {
                     format!("https://example.com/{name}")
                 }
-                fn format_version_replacing(&self, _version: &str, current: &str) -> String {
+                fn format_version_replacing(
+                    &self,
+                    _version: &ConcreteVersion,
+                    current: &str,
+                ) -> String {
                     current.to_string()
                 }
                 fn is_requirement_up_to_date(
                     &self,
                     _requirement: &VersionReq,
-                    _latest: &str,
+                    _latest: &ConcreteVersion,
                 ) -> bool {
                     false
                 }

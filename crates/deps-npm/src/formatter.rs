@@ -1,12 +1,13 @@
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
-use deps_core::{InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 
 /// Precise npm semver range matcher, compiled once per dependency by
 /// [`NpmFormatter::compile_requirement`].
 struct NodeSemverMatcher(node_semver::Range);
 
 impl RequirementMatcher for NodeSemverMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         node_semver::Version::parse(version)
             .ok()
             .map(|v| self.0.satisfies(&v))
@@ -40,7 +41,8 @@ fn is_url_friendly_segment(segment: &str) -> bool {
 pub struct NpmFormatter;
 
 impl EcosystemFormatter for NpmFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         version.to_string()
     }
 
@@ -277,8 +279,14 @@ mod tests {
     fn test_format_version() {
         let formatter = NpmFormatter;
         // Version should not include quotes - parser's version_range excludes them
-        assert_eq!(formatter.format_version_for_text_edit("1.0.214"), "1.0.214");
-        assert_eq!(formatter.format_version_for_text_edit("18.3.1"), "18.3.1");
+        assert_eq!(
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("1.0.214")),
+            "1.0.214"
+        );
+        assert_eq!(
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("18.3.1")),
+            "18.3.1"
+        );
     }
 
     #[test]
@@ -319,27 +327,31 @@ mod tests {
         let formatter = NpmFormatter;
 
         // Exact match
-        assert!(formatter.version_satisfies_requirement("1.2.3", "1.2.3"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2.3"));
 
         // Partial versions
-        assert!(formatter.version_satisfies_requirement("1.2.3", "1"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2"));
 
         // Caret - allows any version with same major (for major > 0)
-        assert!(formatter.version_satisfies_requirement("1.2.3", "^1.2"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "^1.0"));
-        assert!(formatter.version_satisfies_requirement("1.5.0", "^1.2.3"));
-        assert!(formatter.version_satisfies_requirement("10.1.3", "^10.1.3")); // Same version
-        assert!(formatter.version_satisfies_requirement("10.2.0", "^10.1.3")); // Higher minor
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "^1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "^1.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.2.3"));
+        assert!(
+            formatter.version_satisfies_requirement(&ConcreteVersion::new("10.1.3"), "^10.1.3")
+        ); // Same version
+        assert!(
+            formatter.version_satisfies_requirement(&ConcreteVersion::new("10.2.0"), "^10.1.3")
+        ); // Higher minor
 
         // Tilde - allows patch changes
-        assert!(formatter.version_satisfies_requirement("1.2.3", "~1.2"));
-        assert!(formatter.version_satisfies_requirement("1.2.5", "~1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "~1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.5"), "~1.2"));
 
         // Should not match
-        assert!(!formatter.version_satisfies_requirement("1.2.3", "2.0.0"));
-        assert!(!formatter.version_satisfies_requirement("1.2.3", "1.3"));
-        assert!(!formatter.version_satisfies_requirement("2.0.0", "^1.2.3")); // Different major
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "2.0.0"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.3"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.2.3")); // Different major
     }
 
     #[test]
@@ -348,8 +360,8 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("^1.0.0"))
             .expect("valid npm range must compile");
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
     #[test]
@@ -368,7 +380,10 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("^1.0.0"))
             .unwrap();
-        assert_eq!(matcher.matches("not-a-version"), None);
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("not-a-version")),
+            None
+        );
     }
 
     /// §3.1 worked example counterpart for npm (this formatter also relies on the
@@ -379,7 +394,7 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new(">=1.0.0 <2.0.0"))
             .unwrap();
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
     }
 
     /// §3.3 case for npm: `^0.2.999` and latest `0.2.14` share the leading zero-major
@@ -391,7 +406,10 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("^0.2.999"))
             .unwrap();
-        assert_eq!(matcher.matches("0.2.14"), Some(false));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("0.2.14")),
+            Some(false)
+        );
     }
 
     #[test]

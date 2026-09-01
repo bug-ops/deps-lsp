@@ -78,7 +78,7 @@ pub enum ComposerSection {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ComposerVersion {
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     pub version_normalized: String,
     pub abandoned: bool,
     /// Package-level deprecation payload (issue #205), derived from Packagist's
@@ -213,7 +213,7 @@ deps_core::impl_version!(ComposerVersion {
     status: |v: &ComposerVersion| deps_core::RemovalStatus::from_advisory(v.abandoned),
     published_at: published_at,
     prerelease: |v: &ComposerVersion| {
-        is_prerelease_marker(&v.version)
+        is_prerelease_marker(v.version.as_str())
             || deps_core::has_default_prerelease_marker(&v.version_normalized)
     },
     deprecation: |v: &ComposerVersion| v.deprecation.as_ref(),
@@ -245,7 +245,7 @@ pub struct ComposerPackage {
     pub description: Option<String>,
     pub repository: Option<String>,
     pub homepage: Option<String>,
-    pub latest_version: String,
+    pub latest_version: deps_core::ConcreteVersion,
 }
 
 deps_core::impl_metadata!(ComposerPackage {

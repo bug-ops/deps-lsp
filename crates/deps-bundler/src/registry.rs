@@ -71,7 +71,7 @@ impl RubyGemsRegistry {
         let versions = self.get_versions(name).await?;
         Ok(versions
             .into_iter()
-            .find(|v| version_matches_requirement(&v.number, req_str) && !v.yanked))
+            .find(|v| version_matches_requirement(v.number.as_str(), req_str) && !v.yanked))
     }
 
     /// Searches for gems by name/keywords.
@@ -132,7 +132,7 @@ fn parse_versions_response(data: &[u8], _gem_name: &str) -> Result<Vec<BundlerVe
     let mut index_by_number: HashMap<String, usize> = HashMap::with_capacity(entries.len());
     for e in entries {
         let version = BundlerVersion {
-            number: e.number,
+            number: e.number.into(),
             prerelease: e.prerelease,
             yanked: e.yanked,
             published_at: e
@@ -141,18 +141,18 @@ fn parse_versions_response(data: &[u8], _gem_name: &str) -> Result<Vec<BundlerVe
                 .and_then(deps_core::PublishTime::parse_rfc3339),
             platform: e.platform,
         };
-        if let Some(&idx) = index_by_number.get(&version.number) {
+        if let Some(&idx) = index_by_number.get(version.number.as_str()) {
             if version.platform == "ruby" && versions[idx].platform != "ruby" {
                 versions[idx] = version;
             }
         } else {
-            index_by_number.insert(version.number.clone(), versions.len());
+            index_by_number.insert(version.number.to_string(), versions.len());
             versions.push(version);
         }
     }
 
     // Sort by version descending (newest first)
-    versions.sort_by(|a, b| compare_versions(&b.number, &a.number));
+    versions.sort_by(|a, b| compare_versions(b.number.as_str(), a.number.as_str()));
 
     Ok(versions)
 }
@@ -177,7 +177,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<GemInfo>> {
             homepage_uri: None,
             source_code_uri: None,
             documentation_uri: None,
-            version: e.version,
+            version: e.version.into(),
             licenses: vec![],
             authors: None,
             downloads: e.downloads,
@@ -209,7 +209,7 @@ fn parse_gem_info(data: &[u8]) -> Result<GemInfo> {
         homepage_uri: response.homepage_uri,
         source_code_uri: response.source_code_uri,
         documentation_uri: response.documentation_uri,
-        version: response.version,
+        version: response.version.into(),
         licenses: response.licenses,
         authors: response.authors,
         downloads: response.downloads,
@@ -217,7 +217,7 @@ fn parse_gem_info(data: &[u8]) -> Result<GemInfo> {
 }
 
 impl deps_core::Version for BundlerVersion {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &deps_core::ConcreteVersion {
         &self.number
     }
 
@@ -259,7 +259,7 @@ impl deps_core::Metadata for GemInfo {
         self.documentation_uri.as_deref()
     }
 
-    fn latest_version(&self) -> &str {
+    fn latest_version(&self) -> &deps_core::ConcreteVersion {
         &self.version
     }
 
@@ -316,7 +316,7 @@ impl deps_core::Registry for RubyGemsRegistry {
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
         versions.iter().position(|v| {
-            version_matches_requirement(v.version_string(), req.as_str())
+            version_matches_requirement(v.version_string().as_str(), req.as_str())
                 && !v.removal_status().blocks_resolution()
         })
     }
@@ -814,7 +814,7 @@ mod tests {
 
         let latest = find_latest_stable(&versions);
         assert_eq!(
-            latest.map(deps_core::Version::version_string),
+            latest.map(|v| v.version_string().as_str()),
             Some("7.0.8"),
             "find_latest_stable (which #313's hover fix depends on) must skip the dot-notation prerelease"
         );
@@ -925,6 +925,6 @@ mod tests {
         let versions = registry.get_versions("rails").await.unwrap();
 
         assert!(!versions.is_empty());
-        assert!(versions.iter().any(|v| v.number.starts_with("7.")));
+        assert!(versions.iter().any(|v| v.number.as_str().starts_with("7.")));
     }
 }

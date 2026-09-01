@@ -28,7 +28,7 @@ pub use deps_core::parser::DependencySource;
 
 #[derive(Debug, Clone)]
 pub struct DartVersion {
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     pub retracted: bool,
     /// Publish timestamp, parsed eagerly from the API's `published` field.
     ///
@@ -45,7 +45,7 @@ pub struct PackageInfo {
     pub homepage: Option<String>,
     pub repository: Option<String>,
     pub documentation: Option<String>,
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     pub license: Option<String>,
 }
 

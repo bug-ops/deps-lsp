@@ -390,13 +390,13 @@ mod tests {
     use tower_lsp_server::ls_types::Position;
 
     use crate::{
-        PackageName, ParseResult, Registry, completion::Completions,
+        ConcreteVersion, PackageName, ParseResult, Registry, completion::Completions,
         lsp_helpers::EcosystemFormatter,
     };
 
     struct MockFormatter;
     impl EcosystemFormatter for MockFormatter {
-        fn format_version_for_text_edit(&self, version: &str) -> String {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
             version.to_string()
         }
         fn package_url(&self, name: &PackageName) -> String {

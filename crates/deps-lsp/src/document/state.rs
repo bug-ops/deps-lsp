@@ -3,8 +3,8 @@ use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{
-    Deprecation, EcosystemId, EcosystemRegistry, PackageName, PackageVersions, ParseResult,
-    RemovalStatus,
+    ConcreteVersion, Deprecation, EcosystemId, EcosystemRegistry, PackageName, PackageVersions,
+    ParseResult, RemovalStatus,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -51,7 +51,7 @@ pub struct DocumentState {
     /// single registry round trip (see [`PackageVersions`]).
     pub cached_versions: HashMap<PackageName, PackageVersions>,
     /// Resolved versions from lock file
-    pub resolved_versions: HashMap<PackageName, String>,
+    pub resolved_versions: HashMap<PackageName, ConcreteVersion>,
     /// OSV.dev scan results, keyed by normalized package name. Empty until
     /// the first background scan completes; carried across document edits
     /// by `preserve_cache` so it is not wiped on every keystroke.
@@ -64,7 +64,7 @@ pub struct DocumentState {
     /// ecosystems where normalization changes the name (e.g. PyPI). Empty
     /// until the first fetch completes; carried across document edits by
     /// `preserve_cache`.
-    pub yanked_versions: HashMap<String, (String, RemovalStatus)>,
+    pub yanked_versions: HashMap<String, (ConcreteVersion, RemovalStatus)>,
     /// Package-level deprecation findings from the lifecycle's registry fetch (issue
     /// #205), keyed by **normalized** package name — same raw/normalized split
     /// rationale as [`Self::yanked_versions`]. Empty until the first fetch completes;
@@ -292,7 +292,7 @@ impl DocumentState {
     }
 
     /// Updates the resolved versions from lock file.
-    pub fn update_resolved_versions(&mut self, versions: HashMap<PackageName, String>) {
+    pub fn update_resolved_versions(&mut self, versions: HashMap<PackageName, ConcreteVersion>) {
         self.resolved_versions = versions;
     }
 
@@ -304,7 +304,7 @@ impl DocumentState {
     /// Updates the yanked-version findings, keyed by normalized package name.
     pub fn update_yanked_versions(
         &mut self,
-        yanked_versions: HashMap<String, (String, RemovalStatus)>,
+        yanked_versions: HashMap<String, (ConcreteVersion, RemovalStatus)>,
     ) {
         self.yanked_versions = yanked_versions;
     }

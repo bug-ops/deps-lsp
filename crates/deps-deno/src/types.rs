@@ -79,7 +79,7 @@ pub enum DenoDependencySection {
 #[derive(Debug, Clone)]
 pub struct JsrVersion {
     /// The version string (e.g. `"1.0.24"`).
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     /// Whether JSR marked this specific version as yanked.
     pub yanked: bool,
     /// When this version was published, parsed from `meta.json`'s `createdAt`.
@@ -95,7 +95,7 @@ deps_core::impl_version!(JsrVersion {
     status: |v: &JsrVersion| deps_core::RemovalStatus::from_yanked(v.yanked),
     published_at: published_at,
     prerelease: |v: &JsrVersion| {
-        node_semver::Version::parse(&v.version).is_ok_and(|parsed| parsed.is_prerelease())
+        node_semver::Version::parse(v.version.as_str()).is_ok_and(|parsed| parsed.is_prerelease())
     },
 });
 
@@ -131,7 +131,7 @@ pub struct JsrPackage {
     /// documentation link distinct from the package's own JSR page (`package_url`).
     pub documentation: Option<String>,
     /// Latest published version string.
-    pub latest_version: String,
+    pub latest_version: deps_core::ConcreteVersion,
 }
 
 deps_core::impl_metadata!(JsrPackage {
@@ -181,7 +181,7 @@ impl deps_core::Metadata for DenoMetadata {
         self.inner.documentation()
     }
 
-    fn latest_version(&self) -> &str {
+    fn latest_version(&self) -> &deps_core::ConcreteVersion {
         self.inner.latest_version()
     }
 
@@ -218,7 +218,7 @@ mod tests {
             published_at: None,
         };
 
-        assert_eq!(version.version_string(), "1.0.24");
+        assert_eq!(version.version_string().as_str(), "1.0.24");
         assert!(version.removal_status().blocks_resolution());
     }
 
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(pkg.description(), Some("File system utilities"));
         assert_eq!(pkg.repository(), Some("https://github.com/denoland/std"));
         assert_eq!(pkg.documentation(), None);
-        assert_eq!(pkg.latest_version(), "1.0.24");
+        assert_eq!(pkg.latest_version().as_str(), "1.0.24");
     }
 
     #[test]
@@ -276,8 +276,10 @@ mod tests {
             fn documentation(&self) -> Option<&str> {
                 Some("https://react.dev")
             }
-            fn latest_version(&self) -> &'static str {
-                "18.3.1"
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
+                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("18.3.1"));
+                &VERSION
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -293,6 +295,6 @@ mod tests {
         assert_eq!(wrapped.description(), Some("A JS library"));
         assert_eq!(wrapped.repository(), Some("facebook/react"));
         assert_eq!(wrapped.documentation(), Some("https://react.dev"));
-        assert_eq!(wrapped.latest_version(), "18.3.1");
+        assert_eq!(wrapped.latest_version().as_str(), "18.3.1");
     }
 }

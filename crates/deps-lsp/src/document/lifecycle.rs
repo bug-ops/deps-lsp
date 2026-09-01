@@ -8,6 +8,7 @@ use super::state::{DocumentState, ServerState};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
 use crate::progress::{ProgressSender, RegistryProgress};
+use deps_core::ConcreteVersion;
 use deps_core::Deprecation;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
@@ -194,7 +195,7 @@ const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
 /// version from the yanked probe below.
 fn collect_in_use_versions(
     parse_result: &dyn deps_core::ParseResult,
-    resolved_versions: &HashMap<PackageName, String>,
+    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> HashMap<PackageName, Vec<String>> {
@@ -262,7 +263,7 @@ fn collect_in_use_versions(
 /// a dedup, not a gap, since the OSV result would be identical either way.
 fn build_scan_targets(
     parse_result: &dyn deps_core::ParseResult,
-    resolved_versions: &HashMap<PackageName, String>,
+    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> (
@@ -500,8 +501,8 @@ async fn run_osv_phase_b_and_commit(
                     Some(deps_core::osv::ScanTarget {
                         key: key.clone(),
                         osv_name,
-                        version: formatter.osv_version(&latest),
-                        display_version: latest,
+                        version: formatter.osv_version(latest.as_str()),
+                        display_version: latest.to_string(),
                     })
                 })
                 .collect()
@@ -658,7 +659,7 @@ struct FetchResult {
     /// `AdvisoryDeprecated` specifically, never a genuine `Yanked` finding.
     /// Callers must re-key through `EcosystemFormatter::normalize_package_name`
     /// before merging into document state.
-    yanked_versions: HashMap<PackageName, (String, RemovalStatus)>,
+    yanked_versions: HashMap<PackageName, (ConcreteVersion, RemovalStatus)>,
     /// Package-level deprecation findings (issue #205), keyed by **raw** package name
     /// (same raw/normalized split as `yanked_versions` above). Derived from the
     /// `resolved`/"latest" pick in the fetch loop below, not by scanning the full
@@ -765,25 +766,25 @@ async fn fetch_latest_versions_parallel(
                     tokio::time::timeout(timeout, registry.get_versions_with(&name, freshness))
                         .await;
 
-                let mut yanked: Option<(PackageName, String, RemovalStatus)> = None;
+                let mut yanked: Option<(PackageName, ConcreteVersion, RemovalStatus)> = None;
                 let mut failed_name: Option<PackageName> = None;
                 let mut deprecation: Option<(PackageName, Deprecation)> = None;
                 let version = match result {
                     Ok(Ok(versions)) => {
-                        let available: Arc<[String]> = versions
+                        let available: Arc<[ConcreteVersion]> = versions
                             .iter()
-                            .map(|v| v.version_string().to_string())
+                            .map(|v| v.version_string().clone())
                             .collect();
                         // Retained alongside `available` so `generate_diagnostics_from_cache`
                         // can flag a requirement satisfiable only by a yanked version — see
                         // `PackageVersions::yanked`. Gated on `check_yanked`: a registry that
                         // cannot answer `removal_status()` (§#298) must not populate this list
                         // with an untrustworthy always-`Available` signal.
-                        let yanked_list: Arc<[String]> = if check_yanked {
+                        let yanked_list: Arc<[ConcreteVersion]> = if check_yanked {
                             versions
                                 .iter()
                                 .filter(|v| v.removal_status().is_flagged())
-                                .map(|v| v.version_string().to_string())
+                                .map(|v| v.version_string().clone())
                                 .collect()
                         } else {
                             Arc::from([])
@@ -803,7 +804,7 @@ async fn fetch_latest_versions_parallel(
                             )
                             .and_then(|idx| versions.get(idx))
                         {
-                            let latest = v.version_string().to_string();
+                            let latest = v.version_string().clone();
                             tracing::debug!(package = %name, version = %latest, "fetched");
                             Some((
                                 latest,
@@ -834,7 +835,7 @@ async fn fetch_latest_versions_parallel(
                             .await;
                             match fallback {
                                 Ok(Ok(Some(v))) => {
-                                    let latest = v.version_string().to_string();
+                                    let latest = v.version_string().clone();
                                     tracing::debug!(
                                         package = %name,
                                         version = %latest,
@@ -933,7 +934,7 @@ async fn fetch_latest_versions_parallel(
                                     })
                                     .map(|v| (iv, v.removal_status()))
                             }) {
-                                yanked = Some((name.clone(), iv.clone(), status));
+                                yanked = Some((name.clone(), iv.as_str().into(), status));
                             }
                         }
 
@@ -1117,7 +1118,7 @@ pub async fn handle_document_open(
             // `resolved` value during the cold-open window before the
             // registry fetch completes (critique S1).
             let formatter = ecosystem_clone.formatter();
-            let instant_resolved: HashMap<PackageName, String> = match doc.parse_result() {
+            let instant_resolved: HashMap<PackageName, ConcreteVersion> = match doc.parse_result() {
                 Some(parse_result) => {
                     let deps = parse_result.dependencies();
                     resolved_versions
@@ -1726,7 +1727,7 @@ pub async fn handle_document_change(
 /// let the unsatisfiable-requirement check compute a false verdict on every document open,
 /// before the fetch that's supposed to suppress it has a chance to run.
 fn cached_versions_from_lockfile(
-    resolved: &HashMap<PackageName, String>,
+    resolved: &HashMap<PackageName, ConcreteVersion>,
 ) -> HashMap<PackageName, PackageVersions> {
     resolved
         .iter()
@@ -1748,7 +1749,7 @@ async fn load_resolved_versions(
     uri: &Uri,
     state: &ServerState,
     ecosystem: &dyn Ecosystem,
-) -> HashMap<PackageName, String> {
+) -> HashMap<PackageName, ConcreteVersion> {
     let lock_provider = match ecosystem.lockfile_provider() {
         Some(p) => p,
         None => {
@@ -1778,7 +1779,7 @@ async fn load_resolved_versions(
             );
             resolved
                 .iter()
-                .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone()))
+                .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone().into()))
                 .collect()
         }
         Err(e) => {
@@ -1948,8 +1949,8 @@ mod tests {
     #[test]
     fn test_cached_versions_from_lockfile_has_empty_available() {
         let mut resolved = HashMap::new();
-        resolved.insert(PackageName::new("serde"), "1.0.195".to_string());
-        resolved.insert(PackageName::new("tokio"), "1.35.0".to_string());
+        resolved.insert(PackageName::new("serde"), "1.0.195".into());
+        resolved.insert(PackageName::new("tokio"), "1.35.0".into());
 
         let cached = cached_versions_from_lockfile(&resolved);
 
@@ -2293,11 +2294,11 @@ mod tests {
         // Mock version for successful fetches
         #[derive(Debug)]
         struct MockVersion {
-            version: String,
+            version: ConcreteVersion,
         }
 
         impl Version for MockVersion {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &ConcreteVersion {
                 &self.version
             }
 
@@ -2327,7 +2328,7 @@ mod tests {
                         "package-fast" => {
                             // Return immediately with a stable version
                             Ok(vec![Box::new(MockVersion {
-                                version: "1.0.0".to_string(),
+                                version: "1.0.0".into(),
                             }) as Box<dyn Version>])
                         }
                         "package-slow" => {
@@ -2355,7 +2356,7 @@ mod tests {
                 Box::pin(async move {
                     match name.as_str() {
                         "package-fast" => Ok(Some(Box::new(MockVersion {
-                            version: "1.0.0".to_string(),
+                            version: "1.0.0".into(),
                         }) as Box<dyn Version>)),
                         "package-slow" => {
                             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -2450,12 +2451,12 @@ mod tests {
 
         #[derive(Debug)]
         struct MockVersion {
-            version: String,
+            version: ConcreteVersion,
             yanked: bool,
         }
 
         impl Version for MockVersion {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &ConcreteVersion {
                 &self.version
             }
             fn removal_status(&self) -> deps_core::RemovalStatus {
@@ -2477,11 +2478,11 @@ mod tests {
                 Box::pin(async move {
                     Ok(vec![
                         Box::new(MockVersion {
-                            version: "1.0.214".to_string(),
+                            version: "1.0.214".into(),
                             yanked: false,
                         }) as Box<dyn Version>,
                         Box::new(MockVersion {
-                            version: "1.0.213".to_string(),
+                            version: "1.0.213".into(),
                             yanked: true,
                         }) as Box<dyn Version>,
                     ])
@@ -2543,12 +2544,15 @@ mod tests {
         assert_eq!(serde.latest, "1.0.214", "latest must skip the yanked entry");
         assert_eq!(
             &*serde.available,
-            &["1.0.214".to_string(), "1.0.213".to_string()],
+            &[
+                ConcreteVersion::new("1.0.214"),
+                ConcreteVersion::new("1.0.213")
+            ],
             "available must remain unfiltered"
         );
         assert_eq!(
             &*serde.yanked,
-            &["1.0.213".to_string()],
+            &[ConcreteVersion::new("1.0.213")],
             "yanked must carry only the entries reported as yanked"
         );
     }
@@ -2567,13 +2571,13 @@ mod tests {
 
         #[derive(Debug)]
         struct MockVersion {
-            version: String,
+            version: ConcreteVersion,
             yanked: bool,
             published_at: Option<PublishTime>,
         }
 
         impl Version for MockVersion {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &ConcreteVersion {
                 &self.version
             }
             fn removal_status(&self) -> deps_core::RemovalStatus {
@@ -2598,12 +2602,12 @@ mod tests {
                 Box::pin(async move {
                     Ok(vec![
                         Box::new(MockVersion {
-                            version: "1.0.214".to_string(),
+                            version: "1.0.214".into(),
                             yanked: false,
                             published_at: Some(PublishTime::from_unix_secs(2_000)),
                         }) as Box<dyn Version>,
                         Box::new(MockVersion {
-                            version: "1.0.213".to_string(),
+                            version: "1.0.213".into(),
                             yanked: true,
                             // Deliberately a different timestamp — proves the fetch loop
                             // never accidentally attaches this entry's age to `latest`.
@@ -2686,12 +2690,12 @@ mod tests {
 
         #[derive(Debug)]
         struct MockVersion {
-            version: String,
+            version: ConcreteVersion,
             published_at: Option<PublishTime>,
         }
 
         impl Version for MockVersion {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &ConcreteVersion {
                 &self.version
             }
             fn published_at(&self) -> Option<PublishTime> {
@@ -2714,7 +2718,7 @@ mod tests {
                 // this instead of `get_versions_with`, the assertion below catches it.
                 Box::pin(async move {
                     Ok(vec![Box::new(MockVersion {
-                        version: "1.0.0".to_string(),
+                        version: "1.0.0".into(),
                         published_at: None,
                     }) as Box<dyn Version>])
                 })
@@ -2728,7 +2732,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Ok(vec![Box::new(MockVersion {
-                        version: "1.0.0".to_string(),
+                        version: "1.0.0".into(),
                         published_at: freshness
                             .enabled
                             .then(|| PublishTime::from_unix_secs(5_000)),
@@ -2808,11 +2812,11 @@ mod tests {
 
         #[derive(Debug)]
         struct MockVersion {
-            version: String,
+            version: ConcreteVersion,
         }
 
         impl Version for MockVersion {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &ConcreteVersion {
                 &self.version
             }
             fn as_any(&self) -> &dyn Any {
@@ -2834,7 +2838,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Ok(vec![Box::new(MockVersion {
-                        version: "1.0.0".to_string(),
+                        version: "1.0.0".into(),
                     }) as Box<dyn Version>])
                 })
             }
@@ -2922,11 +2926,11 @@ mod tests {
 
         #[derive(Debug)]
         struct MockVersion {
-            version: String,
+            version: ConcreteVersion,
         }
 
         impl Version for MockVersion {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &ConcreteVersion {
                 &self.version
             }
             fn as_any(&self) -> &dyn Any {
@@ -2973,7 +2977,7 @@ mod tests {
                     .push(minimum_stability.map(str::to_string));
                 Box::pin(async move {
                     Ok(Some(Box::new(MockVersion {
-                        version: "2.0.0-beta1".to_string(),
+                        version: "2.0.0-beta1".into(),
                     }) as Box<dyn Version>))
                 })
             }
@@ -3036,11 +3040,11 @@ mod tests {
 
         #[derive(Debug)]
         struct MockVersion {
-            version: String,
+            version: ConcreteVersion,
         }
 
         impl Version for MockVersion {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &ConcreteVersion {
                 &self.version
             }
             fn as_any(&self) -> &dyn Any {
@@ -3072,7 +3076,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Ok(Some(Box::new(MockVersion {
-                        version: "v0.0.0-20191109021931-daa7c04131f5".to_string(),
+                        version: "v0.0.0-20191109021931-daa7c04131f5".into(),
                     }) as Box<dyn Version>))
                 })
             }
@@ -4035,12 +4039,12 @@ dependencies = ["requests>=2.0.0"]
 
         #[derive(Debug, Clone)]
         struct MockYankVersion {
-            version: String,
+            version: ConcreteVersion,
             yanked: bool,
         }
 
         impl Version for MockYankVersion {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &ConcreteVersion {
                 &self.version
             }
             fn removal_status(&self) -> deps_core::RemovalStatus {
@@ -4066,11 +4070,11 @@ dependencies = ["requests>=2.0.0"]
             {
                 let versions = vec![
                     Box::new(MockYankVersion {
-                        version: "9.9.9".to_string(),
+                        version: "9.9.9".into(),
                         yanked: false,
                     }) as Box<dyn Version>,
                     Box::new(MockYankVersion {
-                        version: self.pinned_version.to_string(),
+                        version: self.pinned_version.into(),
                         yanked: true,
                     }) as Box<dyn Version>,
                 ];
@@ -4084,7 +4088,7 @@ dependencies = ["requests>=2.0.0"]
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 let latest = Box::new(MockYankVersion {
-                    version: "9.9.9".to_string(),
+                    version: "9.9.9".into(),
                     yanked: false,
                 }) as Box<dyn Version>;
                 Box::pin(async move { Ok(Some(latest)) })
@@ -4113,7 +4117,7 @@ dependencies = ["requests>=2.0.0"]
             pinned_version: &'static str,
         ) -> (
             Vec<tower_lsp_server::ls_types::Diagnostic>,
-            HashMap<String, (String, RemovalStatus)>,
+            HashMap<String, (ConcreteVersion, RemovalStatus)>,
         ) {
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
@@ -4175,7 +4179,7 @@ dependencies = ["requests>=2.0.0"]
             )
             .await;
 
-            let yanked_versions: HashMap<String, (String, RemovalStatus)> = fetch_result
+            let yanked_versions: HashMap<String, (ConcreteVersion, RemovalStatus)> = fetch_result
                 .yanked_versions
                 .into_iter()
                 .map(|(name, v)| (formatter.normalize_package_name(&name), v))
@@ -4210,7 +4214,7 @@ dependencies = ["requests>=2.0.0"]
 
             assert_eq!(
                 yanked_versions.get("typing-extensions"),
-                Some(&("4.9.0".to_string(), RemovalStatus::Yanked)),
+                Some(&(ConcreteVersion::new("4.9.0"), RemovalStatus::Yanked)),
                 "must be keyed by the normalized (dash) name, not the raw manifest name"
             );
             assert!(
@@ -4225,7 +4229,7 @@ dependencies = ["requests>=2.0.0"]
 
             assert_eq!(
                 yanked_versions.get("zope-interface"),
-                Some(&("5.0.0".to_string(), RemovalStatus::Yanked)),
+                Some(&(ConcreteVersion::new("5.0.0"), RemovalStatus::Yanked)),
                 "must be keyed by the normalized (dotted -> dash) name"
             );
             assert!(
@@ -4352,7 +4356,7 @@ github.com/gorilla/mux v1.8.1 h1:hash2=
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
                 doc.resolved_versions.get(&dep_name),
-                Some(&"v1.8.1".to_string()),
+                Some(&ConcreteVersion::new("v1.8.1")),
                 "sanity check: go.sum's last-occurrence-wins parsing does surface the stale version"
             );
             assert!(
@@ -4398,9 +4402,9 @@ tokio = "1.0"
                 doc.cached_versions
                     .insert("tokio".into(), PackageVersions::latest_only("1.40.0"));
                 doc.resolved_versions
-                    .insert("serde".into(), "1.0.195".to_string());
+                    .insert("serde".into(), "1.0.195".into());
                 doc.resolved_versions
-                    .insert("tokio".into(), "1.35.0".to_string());
+                    .insert("tokio".into(), "1.35.0".into());
             }
 
             // Verify cache populated
@@ -4528,7 +4532,7 @@ time = "0.1.43"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_yanked_versions(HashMap::from([(
                     "time".to_string(),
-                    ("0.1.43".to_string(), RemovalStatus::Yanked),
+                    (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
                 )]));
             }
 
@@ -4554,7 +4558,7 @@ time = "0.1.43"
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
                 doc.yanked_versions.get("time"),
-                Some(&("0.1.43".to_string(), RemovalStatus::Yanked))
+                Some(&(ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked))
             );
         }
 
@@ -4709,7 +4713,7 @@ time = "0.1.44"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_yanked_versions(HashMap::from([(
                     "time".to_string(),
-                    ("0.1.44".to_string(), RemovalStatus::Yanked),
+                    ("0.1.44".into(), RemovalStatus::Yanked),
                 )]));
                 doc.update_deprecations(HashMap::from([(
                     "time".to_string(),
@@ -4908,7 +4912,7 @@ time = "0.1.43"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_yanked_versions(HashMap::from([(
                     "time".to_string(),
-                    ("0.1.43".to_string(), RemovalStatus::Yanked),
+                    (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
                 )]));
             }
 
@@ -4981,7 +4985,7 @@ time = "=0.1.43"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_yanked_versions(HashMap::from([(
                     "time".to_string(),
-                    ("0.1.43".to_string(), RemovalStatus::Yanked),
+                    (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
                 )]));
             }
 
@@ -5168,7 +5172,7 @@ time = "0.1.43"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_yanked_versions(HashMap::from([(
                     "time".to_string(),
-                    ("0.1.43".to_string(), RemovalStatus::Yanked),
+                    (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
                 )]));
             }
 
@@ -5194,7 +5198,7 @@ time = "0.1.43"
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
                 doc.yanked_versions.get("time"),
-                Some(&("0.1.43".to_string(), RemovalStatus::Yanked))
+                Some(&(ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked))
             );
         }
 
@@ -5681,7 +5685,7 @@ tokio = "1.0"
 
         struct MockFormatter;
         impl EcosystemFormatter for MockFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
@@ -5765,7 +5769,7 @@ tokio = "1.0"
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("time"), "0.1.43".to_string());
+            resolved.insert(PackageName::new("time"), "0.1.43".into());
 
             let (targets, skipped) =
                 build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
@@ -5786,7 +5790,7 @@ tokio = "1.0"
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("serde"), "1.0.195".to_string());
+            resolved.insert(PackageName::new("serde"), "1.0.195".into());
 
             let (targets, skipped) =
                 build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
@@ -5800,7 +5804,7 @@ tokio = "1.0"
         /// (#235's `manifest_requirement_is_resolved_version` unification).
         struct MockGoFormatter;
         impl EcosystemFormatter for MockGoFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
@@ -5813,7 +5817,7 @@ tokio = "1.0"
 
         struct MockVPrefixFormatter;
         impl EcosystemFormatter for MockVPrefixFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
@@ -5840,7 +5844,7 @@ tokio = "1.0"
             let mut resolved = HashMap::new();
             resolved.insert(
                 PackageName::new("github.com/gin-gonic/gin"),
-                "v1.9.0".to_string(),
+                "v1.9.0".into(),
             );
 
             let (targets, skipped) = build_scan_targets(
@@ -5870,7 +5874,7 @@ tokio = "1.0"
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("serde"), "1.0.195".to_string());
+            resolved.insert(PackageName::new("serde"), "1.0.195".into());
 
             let (targets, skipped) =
                 build_scan_targets(&parse_result, &resolved, &MockFormatter, EcosystemId::Cargo);
@@ -5902,10 +5906,7 @@ tokio = "1.0"
             // Stale entry: go.sum still records v0.9.1 from before a
             // downgrade back to v0.8.1 that only `go get` (not `go mod
             // tidy`) performed.
-            resolved.insert(
-                PackageName::new("github.com/pkg/errors"),
-                "v0.9.1".to_string(),
-            );
+            resolved.insert(PackageName::new("github.com/pkg/errors"), "v0.9.1".into());
 
             let (targets, skipped) =
                 build_scan_targets(&parse_result, &resolved, &MockGoFormatter, EcosystemId::Go);
@@ -6043,7 +6044,7 @@ tokio = "1.0"
                     }],
                 };
                 let mut resolved = HashMap::new();
-                resolved.insert(PackageName::new("pkg"), "1.0.0".to_string());
+                resolved.insert(PackageName::new("pkg"), "1.0.0".into());
 
                 let (targets, skipped) = build_scan_targets(
                     &parse_result,
@@ -6117,7 +6118,7 @@ tokio = "1.0"
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("serde"), "1.0.195".to_string());
+            resolved.insert(PackageName::new("serde"), "1.0.195".into());
 
             let in_use = collect_in_use_versions(
                 &parse_result,
@@ -6219,7 +6220,7 @@ tokio = "1.0"
                 }],
             };
             let mut resolved = HashMap::new();
-            resolved.insert(PackageName::new("time"), "0.1.43".to_string());
+            resolved.insert(PackageName::new("time"), "0.1.43".into());
 
             let in_use = collect_in_use_versions(
                 &parse_result,
@@ -6277,12 +6278,12 @@ tokio = "1.0"
 
         #[derive(Debug, Clone)]
         struct MockYankVersion {
-            version: String,
+            version: ConcreteVersion,
             yanked: bool,
         }
 
         impl Version for MockYankVersion {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &ConcreteVersion {
                 &self.version
             }
             fn removal_status(&self) -> deps_core::RemovalStatus {
@@ -6331,7 +6332,7 @@ tokio = "1.0"
                             .iter()
                             .map(|(v, y)| {
                                 Box::new(MockYankVersion {
-                                    version: (*v).to_string(),
+                                    version: (*v).into(),
                                     yanked: *y,
                                 }) as Box<dyn Version>
                             })
@@ -6368,7 +6369,7 @@ tokio = "1.0"
                 Box::pin(async move {
                     Ok(outcome.map(|(v, y)| {
                         Box::new(MockYankVersion {
-                            version: v.to_string(),
+                            version: v.into(),
                             yanked: y,
                         }) as Box<dyn Version>
                     }))
@@ -6514,7 +6515,7 @@ tokio = "1.0"
             assert_eq!(fetch_calls.load(Ordering::Relaxed), 1);
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&("1.0.0".to_string(), RemovalStatus::Yanked))
+                Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked))
             );
         }
 
@@ -6581,7 +6582,7 @@ tokio = "1.0"
 
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&("1.0.0".to_string(), RemovalStatus::Yanked))
+                Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked))
             );
             assert!(result.versions.is_empty());
         }
@@ -6625,7 +6626,7 @@ tokio = "1.0"
             );
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&("1.0.0".to_string(), RemovalStatus::Yanked))
+                Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked))
             );
         }
 
@@ -6669,7 +6670,7 @@ tokio = "1.0"
 
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&("2.0.0".to_string(), RemovalStatus::Yanked)),
+                Some(&(ConcreteVersion::new("2.0.0"), RemovalStatus::Yanked)),
                 "the yanked occurrence must be found even though a name-keyed \
                  single-value map could have kept only the non-yanked \"1.0.0\" pin"
             );
@@ -6703,7 +6704,7 @@ tokio = "1.0"
 
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&("1.0.0".to_string(), RemovalStatus::Yanked))
+                Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked))
             );
         }
 
@@ -6827,13 +6828,13 @@ tokio = "1.0"
         use std::any::Any;
 
         struct MockDeprecatedVersion {
-            version: &'static str,
+            version: ConcreteVersion,
             deprecation: Option<Deprecation>,
         }
 
         impl Version for MockDeprecatedVersion {
-            fn version_string(&self) -> &str {
-                self.version
+            fn version_string(&self) -> &ConcreteVersion {
+                &self.version
             }
             fn removal_status(&self) -> RemovalStatus {
                 RemovalStatus::from_advisory(self.deprecation.is_some())
@@ -6860,7 +6861,7 @@ tokio = "1.0"
                 let deprecation = self.deprecation.clone();
                 Box::pin(async move {
                     Ok(vec![Box::new(MockDeprecatedVersion {
-                        version: "1.0.0",
+                        version: "1.0.0".into(),
                         deprecation,
                     }) as Box<dyn Version>])
                 })

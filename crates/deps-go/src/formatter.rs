@@ -1,6 +1,6 @@
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
-use deps_core::{Dependency, DepsError, InvalidPackageName, PackageName};
+use deps_core::{ConcreteVersion, Dependency, DepsError, InvalidPackageName, PackageName};
 
 use crate::types::{GoDependency, GoDirective};
 
@@ -36,7 +36,8 @@ fn go_version_matches(version: &str, requirement: &str) -> bool {
 struct ExactMatcher(String);
 
 impl RequirementMatcher for ExactMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         Some(go_version_matches(version, &self.0))
     }
 }
@@ -50,7 +51,8 @@ impl RequirementMatcher for ExactMatcher {
 pub struct GoFormatter;
 
 impl EcosystemFormatter for GoFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         // Go versions in go.mod are unquoted: v1.2.3
         // Return version as-is since it should already have "v" prefix from registry
         version.to_string()
@@ -85,7 +87,8 @@ impl EcosystemFormatter for GoFormatter {
         Err(InvalidPackageName::new(reason))
     }
 
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
         go_version_matches(version, requirement)
     }
 
@@ -189,17 +192,22 @@ mod tests {
         let formatter = GoFormatter;
 
         // Standard semantic version
-        assert_eq!(formatter.format_version_for_text_edit("v1.2.3"), "v1.2.3");
+        assert_eq!(
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("v1.2.3")),
+            "v1.2.3"
+        );
 
         // Pseudo-version
         assert_eq!(
-            formatter.format_version_for_text_edit("v0.0.0-20191109021931-daa7c04131f5"),
+            formatter.format_version_for_text_edit(&ConcreteVersion::new(
+                "v0.0.0-20191109021931-daa7c04131f5"
+            )),
             "v0.0.0-20191109021931-daa7c04131f5"
         );
 
         // Version with +incompatible
         assert_eq!(
-            formatter.format_version_for_text_edit("v2.0.0+incompatible"),
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("v2.0.0+incompatible")),
             "v2.0.0+incompatible"
         );
     }
@@ -244,8 +252,8 @@ mod tests {
         let formatter = GoFormatter;
 
         // Exact version match
-        assert!(formatter.version_satisfies_requirement("v1.2.3", "v1.2.3"));
-        assert!(formatter.version_satisfies_requirement("v0.1.0", "v0.1.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "v1.2.3"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("v0.1.0"), "v0.1.0"));
     }
 
     #[test]
@@ -253,13 +261,14 @@ mod tests {
         let formatter = GoFormatter;
 
         // Pseudo-version prefix match
-        assert!(
-            formatter.version_satisfies_requirement("v0.0.0-20191109021931-daa7c04131f5", "v0.0.0")
-        );
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("v0.0.0-20191109021931-daa7c04131f5"),
+            "v0.0.0"
+        ));
 
         // Full pseudo-version match
         assert!(formatter.version_satisfies_requirement(
-            "v0.0.0-20191109021931-daa7c04131f5",
+            &ConcreteVersion::new("v0.0.0-20191109021931-daa7c04131f5"),
             "v0.0.0-20191109021931-daa7c04131f5"
         ));
     }
@@ -269,12 +278,18 @@ mod tests {
         let formatter = GoFormatter;
 
         // +incompatible suffix handling
-        assert!(formatter.version_satisfies_requirement("v2.0.0+incompatible", "v2.0.0"));
+        assert!(
+            formatter.version_satisfies_requirement(
+                &ConcreteVersion::new("v2.0.0+incompatible"),
+                "v2.0.0"
+            )
+        );
 
         // Exact match with +incompatible
-        assert!(
-            formatter.version_satisfies_requirement("v2.0.0+incompatible", "v2.0.0+incompatible")
-        );
+        assert!(formatter.version_satisfies_requirement(
+            &ConcreteVersion::new("v2.0.0+incompatible"),
+            "v2.0.0+incompatible"
+        ));
     }
 
     #[test]
@@ -282,11 +297,17 @@ mod tests {
         let formatter = GoFormatter;
 
         // Different versions
-        assert!(!formatter.version_satisfies_requirement("v1.2.3", "v1.2.4"));
-        assert!(!formatter.version_satisfies_requirement("v2.0.0", "v1.0.0"));
+        assert!(
+            !formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "v1.2.4")
+        );
+        assert!(
+            !formatter.version_satisfies_requirement(&ConcreteVersion::new("v2.0.0"), "v1.0.0")
+        );
 
         // Partial match that doesn't start with requirement
-        assert!(!formatter.version_satisfies_requirement("v1.2.3", "v1.2.3.4"));
+        assert!(
+            !formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "v1.2.3.4")
+        );
     }
 
     #[test]
@@ -294,16 +315,20 @@ mod tests {
         let formatter = GoFormatter;
 
         // Version is prefix of requirement (should NOT match)
-        assert!(!formatter.version_satisfies_requirement("v1.2", "v1.2.3"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2"), "v1.2.3"));
 
         // Requirement is prefix of version with dot boundary (should match)
-        assert!(formatter.version_satisfies_requirement("v1.2.3", "v1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "v1.2"));
 
         // False positive prevention: v1.2.30 should NOT match v1.2.3
-        assert!(!formatter.version_satisfies_requirement("v1.2.30", "v1.2.3"));
+        assert!(
+            !formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.30"), "v1.2.3")
+        );
 
         // But v1.2.3.1 SHOULD match v1.2.3 (if it has dot boundary)
-        assert!(formatter.version_satisfies_requirement("v1.2.3.1", "v1.2.3"));
+        assert!(
+            formatter.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3.1"), "v1.2.3")
+        );
     }
 
     #[test]
@@ -346,8 +371,11 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("v1.9.1"))
             .expect("an ordinary tagged requirement compiles");
-        assert_eq!(matcher.matches("v1.9.1"), Some(true));
-        assert_eq!(matcher.matches("v1.9.2"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("v1.9.1")), Some(true));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("v1.9.2")),
+            Some(false)
+        );
     }
 
     #[test]
@@ -358,7 +386,10 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("v1.9.1"))
             .unwrap();
-        assert_eq!(matcher.matches("not-a-version-at-all"), Some(false));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("not-a-version-at-all")),
+            Some(false)
+        );
     }
 
     /// S1 regression: `/@v/list` never enumerates pseudo-versions, so a pseudo-version
@@ -382,7 +413,10 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("v2.0.0+incompatible"))
             .expect("a +incompatible tag is not a pseudo-version");
-        assert_eq!(matcher.matches("v2.0.0+incompatible"), Some(true));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("v2.0.0+incompatible")),
+            Some(true)
+        );
     }
 
     #[test]

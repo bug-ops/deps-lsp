@@ -1,5 +1,5 @@
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
-use deps_core::{InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 
 /// Maximum crate name length this diagnostic accepts.
 ///
@@ -16,7 +16,8 @@ const MAX_NAME_LENGTH: usize = 64;
 struct SemverMatcher(semver::VersionReq);
 
 impl RequirementMatcher for SemverMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         version
             .parse::<semver::Version>()
             .ok()
@@ -27,7 +28,8 @@ impl RequirementMatcher for SemverMatcher {
 pub struct CargoFormatter;
 
 impl EcosystemFormatter for CargoFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         version.to_string()
     }
 
@@ -118,8 +120,14 @@ mod tests {
     #[test]
     fn test_format_version() {
         let formatter = CargoFormatter;
-        assert_eq!(formatter.format_version_for_text_edit("1.0.214"), "1.0.214");
-        assert_eq!(formatter.format_version_for_text_edit("0.1.0"), "0.1.0");
+        assert_eq!(
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("1.0.214")),
+            "1.0.214"
+        );
+        assert_eq!(
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("0.1.0")),
+            "0.1.0"
+        );
     }
 
     #[test]
@@ -267,14 +275,14 @@ mod tests {
     fn test_version_satisfies_requirement() {
         let formatter = CargoFormatter;
 
-        assert!(formatter.version_satisfies_requirement("1.2.3", "1.2.3"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "^1.2"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "~1.2"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "1"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2.3"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "^1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "~1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2"));
 
-        assert!(!formatter.version_satisfies_requirement("1.2.3", "2.0.0"));
-        assert!(!formatter.version_satisfies_requirement("1.2.3", "1.3"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "2.0.0"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.3"));
     }
 
     #[test]
@@ -283,8 +291,8 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("^1.0"))
             .expect("valid semver requirement must compile");
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
     #[test]
@@ -303,7 +311,10 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("^1.0"))
             .unwrap();
-        assert_eq!(matcher.matches("not-a-version"), None);
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("not-a-version")),
+            None
+        );
     }
 
     /// §3.1 worked example: an ordinary comparator-list requirement, which
@@ -316,7 +327,7 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new(">=1.0, <2.0"))
             .unwrap();
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
     }
 
     /// §3.3 case: `~1.0.999` and latest `1.0.214` share major/minor, so the loose
@@ -329,6 +340,9 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("~1.0.999"))
             .unwrap();
-        assert_eq!(matcher.matches("1.0.214"), Some(false));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("1.0.214")),
+            Some(false)
+        );
     }
 }

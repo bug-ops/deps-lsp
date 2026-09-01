@@ -366,13 +366,13 @@ mod tests {
         use std::any::Any;
 
         struct StatusVersion {
-            version: &'static str,
+            version: deps_core::ConcreteVersion,
             status: RemovalStatus,
         }
 
         impl Version for StatusVersion {
-            fn version_string(&self) -> &str {
-                self.version
+            fn version_string(&self) -> &deps_core::ConcreteVersion {
+                &self.version
             }
 
             fn removal_status(&self) -> RemovalStatus {
@@ -387,11 +387,11 @@ mod tests {
         fn fixture(status: RemovalStatus) -> Vec<Box<dyn Version>> {
             vec![
                 Box::new(StatusVersion {
-                    version: "2.0.0",
+                    version: "2.0.0".into(),
                     status,
                 }),
                 Box::new(StatusVersion {
-                    version: "1.2.3",
+                    version: "1.2.3".into(),
                     status,
                 }),
             ]
@@ -405,12 +405,12 @@ mod tests {
         // of which ecosystem-specific parser (if any) `select_latest_matching` re-parses
         // `version_string()` with.
         struct PrereleaseOnlyVersion {
-            version: &'static str,
+            version: deps_core::ConcreteVersion,
         }
 
         impl Version for PrereleaseOnlyVersion {
-            fn version_string(&self) -> &str {
-                self.version
+            fn version_string(&self) -> &deps_core::ConcreteVersion {
+                &self.version
             }
 
             fn is_prerelease(&self) -> bool {
@@ -425,10 +425,10 @@ mod tests {
         fn prerelease_only_fixture() -> Vec<Box<dyn Version>> {
             vec![
                 Box::new(PrereleaseOnlyVersion {
-                    version: "2.0.0-beta2",
+                    version: "2.0.0-beta2".into(),
                 }),
                 Box::new(PrereleaseOnlyVersion {
-                    version: "2.0.0-beta1",
+                    version: "2.0.0-beta1".into(),
                 }),
             ]
         }

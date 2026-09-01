@@ -1,7 +1,7 @@
 //! Version formatting for the NuGet ecosystem.
 
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
-use deps_core::{InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 
 /// Maximum package ID length NuGet's client-side `PackageIdValidator` accepts.
 const MAX_PACKAGE_ID_LENGTH: usize = 100;
@@ -31,7 +31,8 @@ enum NuGetMatcher {
 }
 
 impl RequirementMatcher for NuGetMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         Some(match self {
             Self::Range(range) => crate::version::range_contains(version, range),
             Self::Float(pattern) => {
@@ -45,7 +46,8 @@ impl RequirementMatcher for NuGetMatcher {
 pub struct NuGetFormatter;
 
 impl EcosystemFormatter for NuGetFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         // NuGet manifests store plain version text; no prefix/wrapping on insert.
         version.to_string()
     }
@@ -92,7 +94,8 @@ impl EcosystemFormatter for NuGetFormatter {
 
     /// Overridden because the default npm caret/tilde semantics do not apply to NuGet's
     /// interval-notation ranges (`[1.0,2.0)`) and floating patterns (`1.1.*`).
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
         if requirement.contains('*') {
             let versions = [version.to_string()];
             return crate::version::resolve_float(&versions, requirement).is_some();
@@ -114,12 +117,16 @@ impl EcosystemFormatter for NuGetFormatter {
     /// `latest <= floor` here, not `latest == floor`. Exact pins, maximums, bounded ranges,
     /// and floating patterns (`1.1.*`) already express the intended forward-compatibility
     /// window, so those keep the general satisfies check.
-    fn is_requirement_up_to_date(&self, requirement: &VersionReq, latest: &str) -> bool {
+    fn is_requirement_up_to_date(
+        &self,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> bool {
         let requirement = requirement.as_str();
         if requirement.contains('*') {
             return self.version_satisfies_requirement(latest, requirement);
         }
-        match crate::version::compare_minimum_floor(requirement, latest) {
+        match crate::version::compare_minimum_floor(requirement, latest.as_str()) {
             Some(ordering) => ordering != std::cmp::Ordering::Less,
             None => self.version_satisfies_requirement(latest, requirement),
         }
@@ -176,7 +183,10 @@ mod tests {
     #[test]
     fn test_format_version() {
         let f = NuGetFormatter;
-        assert_eq!(f.format_version_for_text_edit("13.0.3"), "13.0.3");
+        assert_eq!(
+            f.format_version_for_text_edit(&ConcreteVersion::new("13.0.3")),
+            "13.0.3"
+        );
     }
 
     #[test]
@@ -191,22 +201,22 @@ mod tests {
     #[test]
     fn test_version_satisfies_exact_pin() {
         let f = NuGetFormatter;
-        assert!(f.version_satisfies_requirement("1.0.0", "[1.0.0]"));
-        assert!(!f.version_satisfies_requirement("1.0.1", "[1.0.0]"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "[1.0.0]"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "[1.0.0]"));
     }
 
     #[test]
     fn test_version_satisfies_bare_floor() {
         let f = NuGetFormatter;
-        assert!(f.version_satisfies_requirement("2.0.0", "1.0.0"));
-        assert!(!f.version_satisfies_requirement("0.9.0", "1.0.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "1.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "1.0.0"));
     }
 
     #[test]
     fn test_version_satisfies_floating() {
         let f = NuGetFormatter;
-        assert!(f.version_satisfies_requirement("1.1.5", "1.1.*"));
-        assert!(!f.version_satisfies_requirement("1.2.0", "1.1.*"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.1.5"), "1.1.*"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "1.1.*"));
     }
 
     #[test]
@@ -214,24 +224,45 @@ mod tests {
         let f = NuGetFormatter;
         // Bare floors are pins under PackageReference: a newer latest is outdated,
         // even though it satisfies the floor (>= 13.0.3).
-        assert!(!f.is_requirement_up_to_date(&VersionReq::new("13.0.3"), "13.0.4"));
-        assert!(!f.is_requirement_up_to_date(&VersionReq::new("13.0.3"), "14.0.0"));
+        assert!(!f.is_requirement_up_to_date(
+            &VersionReq::new("13.0.3"),
+            &ConcreteVersion::new("13.0.4")
+        ));
+        assert!(!f.is_requirement_up_to_date(
+            &VersionReq::new("13.0.3"),
+            &ConcreteVersion::new("14.0.0")
+        ));
     }
 
     #[test]
     fn test_is_up_to_date_bare_floor_matches_latest() {
         let f = NuGetFormatter;
-        assert!(f.is_requirement_up_to_date(&VersionReq::new("13.0.3"), "13.0.3"));
+        assert!(f.is_requirement_up_to_date(
+            &VersionReq::new("13.0.3"),
+            &ConcreteVersion::new("13.0.3")
+        ));
     }
 
     #[test]
     fn test_is_up_to_date_open_ended_minimum_bracket_forms_outdated() {
         let f = NuGetFormatter;
         // Same floor semantics as a bare version, spelled with explicit interval brackets.
-        assert!(!f.is_requirement_up_to_date(&VersionReq::new("[13.0.3,)"), "13.0.4"));
-        assert!(!f.is_requirement_up_to_date(&VersionReq::new("(13.0.3,)"), "13.0.4"));
-        assert!(!f.is_requirement_up_to_date(&VersionReq::new("[13.0.3,]"), "13.0.4"));
-        assert!(f.is_requirement_up_to_date(&VersionReq::new("[13.0.3,)"), "13.0.3"));
+        assert!(!f.is_requirement_up_to_date(
+            &VersionReq::new("[13.0.3,)"),
+            &ConcreteVersion::new("13.0.4")
+        ));
+        assert!(!f.is_requirement_up_to_date(
+            &VersionReq::new("(13.0.3,)"),
+            &ConcreteVersion::new("13.0.4")
+        ));
+        assert!(!f.is_requirement_up_to_date(
+            &VersionReq::new("[13.0.3,]"),
+            &ConcreteVersion::new("13.0.4")
+        ));
+        assert!(f.is_requirement_up_to_date(
+            &VersionReq::new("[13.0.3,)"),
+            &ConcreteVersion::new("13.0.3")
+        ));
     }
 
     #[test]
@@ -239,20 +270,42 @@ mod tests {
         let f = NuGetFormatter;
         // A floor already ahead of the registry's latest (a preview/prerelease pin, or a
         // latest that regressed) must not render a downgrade suggestion.
-        assert!(f.is_requirement_up_to_date(&VersionReq::new("13.0.5"), "13.0.4"));
-        assert!(f.is_requirement_up_to_date(&VersionReq::new("9.0.0-preview.5"), "8.0.11"));
+        assert!(f.is_requirement_up_to_date(
+            &VersionReq::new("13.0.5"),
+            &ConcreteVersion::new("13.0.4")
+        ));
+        assert!(f.is_requirement_up_to_date(
+            &VersionReq::new("9.0.0-preview.5"),
+            &ConcreteVersion::new("8.0.11")
+        ));
         // A prerelease pin genuinely behind a newer stable release is still outdated.
-        assert!(!f.is_requirement_up_to_date(&VersionReq::new("9.0.0-preview.5"), "9.0.0"));
+        assert!(!f.is_requirement_up_to_date(
+            &VersionReq::new("9.0.0-preview.5"),
+            &ConcreteVersion::new("9.0.0")
+        ));
     }
 
     #[test]
     fn test_is_up_to_date_exact_pin_and_ranges_keep_satisfies_semantics() {
         let f = NuGetFormatter;
-        assert!(f.is_requirement_up_to_date(&VersionReq::new("[13.0.3]"), "13.0.3"));
-        assert!(!f.is_requirement_up_to_date(&VersionReq::new("[13.0.3]"), "14.0.0"));
-        assert!(f.is_requirement_up_to_date(&VersionReq::new("[1.0,2.0)"), "1.5.0"));
-        assert!(f.is_requirement_up_to_date(&VersionReq::new("1.1.*"), "1.1.5"));
-        assert!(!f.is_requirement_up_to_date(&VersionReq::new("1.1.*"), "1.2.0"));
+        assert!(f.is_requirement_up_to_date(
+            &VersionReq::new("[13.0.3]"),
+            &ConcreteVersion::new("13.0.3")
+        ));
+        assert!(!f.is_requirement_up_to_date(
+            &VersionReq::new("[13.0.3]"),
+            &ConcreteVersion::new("14.0.0")
+        ));
+        assert!(f.is_requirement_up_to_date(
+            &VersionReq::new("[1.0,2.0)"),
+            &ConcreteVersion::new("1.5.0")
+        ));
+        assert!(
+            f.is_requirement_up_to_date(&VersionReq::new("1.1.*"), &ConcreteVersion::new("1.1.5"))
+        );
+        assert!(
+            !f.is_requirement_up_to_date(&VersionReq::new("1.1.*"), &ConcreteVersion::new("1.2.0"))
+        );
     }
 
     #[test]
@@ -305,6 +358,7 @@ mod tests {
         let osv_version = "12.0.1";
         let native = f.osv_version_to_native(osv_version);
         assert_eq!(native, osv_version);
+        let native = ConcreteVersion::new(native);
         let edit_text = f.format_version_for_text_edit(&native);
         assert!(f.version_satisfies_requirement(&native, &edit_text));
     }
@@ -315,8 +369,11 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("[13.0.3]"))
             .expect("well-formed exact pin must compile");
-        assert_eq!(matcher.matches("13.0.3"), Some(true));
-        assert_eq!(matcher.matches("13.0.4"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("13.0.3")), Some(true));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("13.0.4")),
+            Some(false)
+        );
     }
 
     #[test]
@@ -325,8 +382,8 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("[1.0,2.0)"))
             .expect("well-formed range must compile");
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
     #[test]
@@ -335,8 +392,8 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("1.1.*"))
             .expect("well-formed floating pattern must compile");
-        assert_eq!(matcher.matches("1.1.5"), Some(true));
-        assert_eq!(matcher.matches("1.2.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.1.5")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.2.0")), Some(false));
     }
 
     #[test]
@@ -348,8 +405,8 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("1.0.0"))
             .expect("a bare version is a well-formed minimum floor");
-        assert_eq!(matcher.matches("2.0.0"), Some(true));
-        assert_eq!(matcher.matches("0.9.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("0.9.0")), Some(false));
     }
 
     /// The malformed-requirement guard this formatter's `compile_requirement` adds — the

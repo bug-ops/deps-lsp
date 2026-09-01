@@ -381,7 +381,7 @@ fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
             let is_pseudo = is_pseudo_version(line);
             let sort_key = parse_sort_key(line, is_pseudo);
             let version = GoVersion {
-                version: line.to_string(),
+                version: line.into(),
                 // `/@v/list` carries no dates — a documented Go-specific
                 // limitation of this Ch2 path, not a parse failure.
                 published_at: None,
@@ -397,7 +397,7 @@ fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
         (Some(v1), Some(v2)) => v1.cmp(v2),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => b.0.version.cmp(&a.0.version),
+        (None, None) => b.0.version.as_str().cmp(a.0.version.as_str()),
     });
 
     Ok(versions_with_keys.into_iter().map(|(v, _)| v).collect())
@@ -431,7 +431,7 @@ fn parse_version_info(module_path: &str, data: &[u8]) -> Result<GoVersion> {
 
     let is_pseudo = is_pseudo_version(&info.version);
     Ok(GoVersion {
-        version: info.version,
+        version: info.version.into(),
         published_at: deps_core::PublishTime::parse_rfc3339(&info.time),
         is_pseudo,
         retracted: false,
@@ -842,7 +842,11 @@ mod tests {
             .unwrap();
 
         assert!(!versions.is_empty());
-        assert!(versions.iter().any(|v| v.version.starts_with("v1.")));
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version.as_str().starts_with("v1."))
+        );
     }
 
     #[tokio::test]
@@ -869,7 +873,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(latest.version.starts_with('v'));
+        assert!(latest.version.as_str().starts_with('v'));
         assert!(!latest.is_pseudo);
     }
 
@@ -1050,19 +1054,19 @@ mod tests {
         let registry = GoRegistry::new(cache);
         let typed = vec![
             GoVersion {
-                version: "v2.0.0-pseudo".to_string(),
+                version: "v2.0.0-pseudo".into(),
                 published_at: None,
                 is_pseudo: true,
                 retracted: false,
             },
             GoVersion {
-                version: "v1.5.0".to_string(),
+                version: "v1.5.0".into(),
                 published_at: None,
                 is_pseudo: false,
                 retracted: true,
             },
             GoVersion {
-                version: "v1.0.0".to_string(),
+                version: "v1.0.0".into(),
                 published_at: None,
                 is_pseudo: false,
                 retracted: false,
@@ -1073,7 +1077,7 @@ mod tests {
         let fallback_pick = typed
             .iter()
             .find(|v| !v.is_pseudo && !v.retracted)
-            .map(|v| v.version.clone());
+            .map(|v| v.version.to_string());
 
         let boxed: Vec<Box<dyn deps_core::Version>> = typed
             .into_iter()
@@ -1095,13 +1099,13 @@ mod tests {
         let registry = GoRegistry::new(cache);
         let versions: Vec<Box<dyn deps_core::Version>> = vec![
             Box::new(GoVersion {
-                version: "v2.0.0".to_string(),
+                version: "v2.0.0".into(),
                 published_at: None,
                 is_pseudo: false,
                 retracted: true,
             }),
             Box::new(GoVersion {
-                version: "v1.0.0".to_string(),
+                version: "v1.0.0".into(),
                 published_at: None,
                 is_pseudo: false,
                 retracted: false,
@@ -1126,13 +1130,13 @@ mod tests {
         let registry = GoRegistry::new(cache);
         let versions: Vec<Box<dyn deps_core::Version>> = vec![
             Box::new(GoVersion {
-                version: "v0.0.0-20191109021931-daa7c04131f5".to_string(),
+                version: "v0.0.0-20191109021931-daa7c04131f5".into(),
                 published_at: None,
                 is_pseudo: true,
                 retracted: false,
             }),
             Box::new(GoVersion {
-                version: "v1.0.0-beta.1".to_string(),
+                version: "v1.0.0-beta.1".into(),
                 published_at: None,
                 is_pseudo: false,
                 retracted: false,

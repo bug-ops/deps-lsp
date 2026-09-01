@@ -230,7 +230,7 @@ mod tests {
             description: Some("Networking framework".to_string()),
             repository: repository.map(str::to_string),
             homepage: None,
-            latest_version: String::new(),
+            latest_version: deps_core::ConcreteVersion::new(""),
         }
     }
 
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn test_build_url_completion_clears_detail_when_latest_version_empty() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
-        assert!(package.latest_version.is_empty());
+        assert!(package.latest_version.as_str().is_empty());
         let item = build_url_completion(&package, None).unwrap();
 
         assert_eq!(item.detail, None);
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn test_build_url_completion_keeps_detail_when_latest_version_present() {
         let mut package = test_package(Some("https://github.com/apple/swift-nio"));
-        package.latest_version = "2.40.0".to_string();
+        package.latest_version = "2.40.0".into();
         let item = build_url_completion(&package, None).unwrap();
 
         assert_eq!(item.detail, Some("v2.40.0".to_string()));

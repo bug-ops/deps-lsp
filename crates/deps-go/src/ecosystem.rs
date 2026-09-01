@@ -279,7 +279,7 @@ mod tests {
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
+        resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
@@ -369,7 +369,7 @@ mod tests {
 
         // Lock file has the latest version - but show_up_to_date_hints is false
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".to_string());
+        resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
         let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),

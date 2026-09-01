@@ -128,8 +128,9 @@ fn select_latest_for_existence_composer<T>(
         versions
             .iter()
             .position(|v| {
-                crate::formatter::composer_version_stability_rank(as_version(v).version_string())
-                    >= minimum_rank
+                crate::formatter::composer_version_stability_rank(
+                    as_version(v).version_string().as_str(),
+                ) >= minimum_rank
             })
             .or_else(|| {
                 versions
@@ -311,7 +312,7 @@ impl PackagistRegistry {
         use deps_core::lsp_helpers::EcosystemFormatter;
 
         Ok(versions.into_iter().find(|v| {
-            crate::formatter::composer_version_stability_rank(&v.version) >= minimum_rank
+            crate::formatter::composer_version_stability_rank(v.version.as_str()) >= minimum_rank
                 && formatter.version_satisfies_requirement(&v.version, req_str)
         }))
     }
@@ -353,7 +354,7 @@ impl PackagistRegistry {
             // Always true for Composer (`abandoned` maps to `AdvisoryDeprecated`, which
             // never blocks resolution) — kept to document the contract (#347).
             !v.removal_status().blocks_resolution()
-                && crate::formatter::composer_version_stability_rank(v.version_string())
+                && crate::formatter::composer_version_stability_rank(v.version_string().as_str())
                     >= minimum_rank
                 && formatter.version_satisfies_requirement(v.version_string(), req.as_str())
         })
@@ -453,7 +454,7 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
         let deprecation = deprecation_from_abandoned(current.abandoned.as_ref());
 
         result.push(ComposerVersion {
-            version: version.clone(),
+            version: version.clone().into(),
             version_normalized: current
                 .version_normalized
                 .clone()
@@ -540,7 +541,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<ComposerPackage>> {
             description: r.description,
             repository: r.repository,
             homepage: r.url,
-            latest_version: r.version.unwrap_or_default(),
+            latest_version: r.version.unwrap_or_default().into(),
         })
         .collect())
 }
@@ -2067,7 +2068,11 @@ mod tests {
         let versions = registry.get_versions("monolog/monolog").await.unwrap();
 
         assert!(!versions.is_empty());
-        assert!(versions.iter().any(|v| v.version.starts_with("3.")));
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version.as_str().starts_with("3."))
+        );
     }
 
     #[tokio::test]

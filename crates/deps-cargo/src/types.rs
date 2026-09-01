@@ -99,7 +99,7 @@ pub enum DependencySection {
 /// ```
 #[derive(Debug, Clone)]
 pub struct CargoVersion {
-    pub num: String,
+    pub num: deps_core::ConcreteVersion,
     pub yanked: bool,
     pub features: HashMap<String, Vec<String>>,
     /// Publish timestamp, parsed from the sparse index's `pubtime` field.
@@ -136,7 +136,7 @@ pub struct CrateInfo {
     pub description: Option<String>,
     pub repository: Option<String>,
     pub documentation: Option<String>,
-    pub max_version: String,
+    pub max_version: deps_core::ConcreteVersion,
 }
 
 // Trait implementations for deps-core integration
@@ -176,7 +176,7 @@ impl deps_core::Dependency for ParsedDependency {
 }
 
 impl deps_core::Version for CargoVersion {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &deps_core::ConcreteVersion {
         &self.num
     }
 
@@ -190,7 +190,7 @@ impl deps_core::Version for CargoVersion {
     // failure (practically unreachable given that enforcement) is treated
     // as not-prerelease, matching the trait's other implementors.
     fn is_prerelease(&self) -> bool {
-        semver::Version::parse(&self.num).is_ok_and(|v| !v.pre.is_empty())
+        semver::Version::parse(self.num.as_str()).is_ok_and(|v| !v.pre.is_empty())
     }
 
     fn features(&self) -> Vec<String> {
@@ -223,7 +223,7 @@ impl deps_core::Metadata for CrateInfo {
         self.documentation.as_deref()
     }
 
-    fn latest_version(&self) -> &str {
+    fn latest_version(&self) -> &deps_core::ConcreteVersion {
         &self.max_version
     }
 

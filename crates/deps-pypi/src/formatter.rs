@@ -1,3 +1,4 @@
+use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
@@ -12,7 +13,8 @@ use tower_lsp_server::ls_types::Position;
 struct Pep440Matcher(VersionSpecifiers);
 
 impl RequirementMatcher for Pep440Matcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         Version::from_str(version).ok().map(|v| self.0.contains(&v))
     }
 }
@@ -48,7 +50,8 @@ impl EcosystemFormatter for PypiFormatter {
         }
     }
 
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         let next_major = version
             .split('.')
             .next()
@@ -59,7 +62,8 @@ impl EcosystemFormatter for PypiFormatter {
         format!(">={version},<{next_major}")
     }
 
-    fn format_version_replacing(&self, version: &str, current: &str) -> String {
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        let version = version.as_str();
         let terms: Vec<&str> = current.trim().split(',').map(str::trim).collect();
 
         if terms.iter().any(|t| t.starts_with("===")) {
@@ -106,14 +110,15 @@ impl EcosystemFormatter for PypiFormatter {
             } else {
                 // `~=3` has a single release segment, which is not valid PEP 440
                 // on its own — don't emit another invalid pin.
-                self.format_version_for_text_edit(version)
+                self.format_version_for_text_edit(&ConcreteVersion::new(version))
             };
         }
 
-        self.format_version_for_text_edit(version)
+        self.format_version_for_text_edit(&ConcreteVersion::new(version))
     }
 
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
         let Ok(ver) = Version::from_str(version) else {
             return false;
         };
@@ -218,15 +223,15 @@ mod tests {
     fn test_format_version() {
         let formatter = PypiFormatter;
         assert_eq!(
-            formatter.format_version_for_text_edit("1.2.3"),
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("1.2.3")),
             ">=1.2.3,<2"
         );
         assert_eq!(
-            formatter.format_version_for_text_edit("2.28.0"),
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("2.28.0")),
             ">=2.28.0,<3"
         );
         assert_eq!(
-            formatter.format_version_for_text_edit("0.1.0"),
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("0.1.0")),
             ">=0.1.0,<1"
         );
     }
@@ -236,7 +241,7 @@ mod tests {
         let formatter = PypiFormatter;
         // u32::MAX should not overflow, checked_add returns None
         assert_eq!(
-            formatter.format_version_for_text_edit("4294967295.0.0"),
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("4294967295.0.0")),
             ">=4294967295.0.0,<1"
         );
     }
@@ -258,25 +263,35 @@ mod tests {
     fn test_version_satisfies_pep440() {
         let formatter = PypiFormatter;
 
-        assert!(formatter.version_satisfies_requirement("1.2.3", ">=1.0,<2"));
-        assert!(formatter.version_satisfies_requirement("2.28.0", ">=2.0"));
-        assert!(formatter.version_satisfies_requirement("1.0.0", "==1.0.0"));
-        assert!(formatter.version_satisfies_requirement("1.2.0", "~=1.2.0"));
+        assert!(
+            formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), ">=1.0,<2")
+        );
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("2.28.0"), ">=2.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "==1.0.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "~=1.2.0"));
 
-        assert!(!formatter.version_satisfies_requirement("2.0.0", ">=1.0,<2"));
-        assert!(!formatter.version_satisfies_requirement("0.9.0", ">=1.0"));
+        assert!(
+            !formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">=1.0,<2")
+        );
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), ">=1.0"));
     }
 
     #[test]
     fn test_version_satisfies_invalid_version() {
         let formatter = PypiFormatter;
-        assert!(!formatter.version_satisfies_requirement("not-a-version", ">=1.0"));
+        assert!(
+            !formatter
+                .version_satisfies_requirement(&ConcreteVersion::new("not-a-version"), ">=1.0")
+        );
     }
 
     #[test]
     fn test_version_satisfies_invalid_specifier() {
         let formatter = PypiFormatter;
-        assert!(!formatter.version_satisfies_requirement("1.0.0", "not-a-specifier"));
+        assert!(
+            !formatter
+                .version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "not-a-specifier")
+        );
     }
 
     #[test]
@@ -285,8 +300,8 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new(">=1.0,<2.0"))
             .expect("valid PEP 440 specifier must compile");
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
     #[test]
@@ -315,7 +330,7 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new(">=1.0"))
             .unwrap();
-        assert_eq!(matcher.matches("2011k"), None);
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2011k")), None);
     }
 
     #[test]
@@ -337,6 +352,7 @@ mod tests {
         let osv_version = "2.28.0";
         let native = formatter.osv_version_to_native(osv_version);
         assert_eq!(native, osv_version);
+        let native = ConcreteVersion::new(native);
         let edit_text = formatter.format_version_for_text_edit(&native);
         assert!(formatter.version_satisfies_requirement(&native, &edit_text));
     }
@@ -352,6 +368,7 @@ mod tests {
         let osv_version = "2.28.0";
         let native = formatter.osv_version_to_native(osv_version);
         assert_eq!(native, osv_version);
+        let native = ConcreteVersion::new(native);
 
         for current in ["==2.20.0", "==2.20.*", "~=2.20", "~=2.20.0", ">=2.20,<2.21"] {
             let edit_text = formatter.format_version_replacing(&native, current);
@@ -405,28 +422,31 @@ mod tests {
 
         // starts `===`
         assert_eq!(
-            formatter.format_version_replacing("1.2", "===1.0"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.2"), "===1.0"),
             "===1.2"
         );
 
         // starts `==`, no wildcard
-        assert_eq!(formatter.format_version_replacing("1.2", "==1.0"), "==1.2");
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("1.2"), "==1.0"),
+            "==1.2"
+        );
 
         // starts `==`, wildcard, latest has enough segments
         assert_eq!(
-            formatter.format_version_replacing("1.6.2", "==1.4.*"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.6.2"), "==1.4.*"),
             "==1.6.*"
         );
 
         // `~=` with >=2 release segments truncates, never over-specifies
         assert_eq!(
-            formatter.format_version_replacing("1.26.4", "~=1.24"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.26.4"), "~=1.24"),
             "~=1.26"
         );
 
         // `~=` with a single release segment is invalid PEP 440 on its own; default
         assert_eq!(
-            formatter.format_version_replacing("4.0.0", "~=3"),
+            formatter.format_version_replacing(&ConcreteVersion::new("4.0.0"), "~=3"),
             ">=4.0.0,<5"
         );
 
@@ -434,23 +454,24 @@ mod tests {
         // regardless of position (N1 fix — pep440_rs sorts specifiers by version, so
         // `!=0.9,==1.0` in source may render sorted either way)
         assert_eq!(
-            formatter.format_version_replacing("1.2", "==1.0, !=1.0.1"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.2"), "==1.0, !=1.0.1"),
             "==1.2"
         );
         assert_eq!(
-            formatter.format_version_replacing("1.2", "!=0.9, ==1.0"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.2"), "!=0.9, ==1.0"),
             "==1.2"
         );
 
         // comma-separated, no `==`/`===`/`~=` term -> default range
         assert_eq!(
-            formatter.format_version_replacing("2.0.0", ">=1.0, !=1.5, <2.0"),
+            formatter
+                .format_version_replacing(&ConcreteVersion::new("2.0.0"), ">=1.0, !=1.5, <2.0"),
             ">=2.0.0,<3"
         );
 
         // anything else -> default
         assert_eq!(
-            formatter.format_version_replacing("2.0.0", ">=1.0"),
+            formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), ">=1.0"),
             ">=2.0.0,<3"
         );
     }
@@ -467,11 +488,11 @@ mod tests {
         let formatter = PypiFormatter;
 
         assert_eq!(
-            formatter.format_version_replacing("1.0.2", "~=1.0"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.0.2"), "~=1.0"),
             "~=1.0.2"
         );
         assert_eq!(
-            formatter.format_version_replacing("1.0.2", "==1.0.*"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.0.2"), "==1.0.*"),
             "==1.0.2"
         );
 
@@ -479,7 +500,7 @@ mod tests {
         // untruncated fallback text is identical to the truncated one, so
         // this is a genuine no-op either way (unaffected by the fallback).
         assert_eq!(
-            formatter.format_version_replacing("1.0.2", "~=1.0.2"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.0.2"), "~=1.0.2"),
             "~=1.0.2"
         );
         // `==V.*` has no floor semantics (it is a release-prefix match, not
@@ -487,7 +508,7 @@ mod tests {
         // no-op" fallback for it — the wildcard is narrowed to an exact pin
         // instead, which is always at least as safe as leaving it alone.
         assert_eq!(
-            formatter.format_version_replacing("1.0.2", "==1.0.2.*"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.0.2"), "==1.0.2.*"),
             "==1.0.2"
         );
     }

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, Uri, WorkspaceEdit};
 
 use crate::osv::ScanOutcome;
-use crate::{Dependency, ParseResult, Registry, VersionReq};
+use crate::{ConcreteVersion, Dependency, ParseResult, Registry, VersionReq};
 
 use super::{
     DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, LineOffsetTable, UNSATISFIABLE_DIAGNOSTIC_CODE,
@@ -79,7 +79,8 @@ fn build_vulnerability_fix_action(
     // `^`-prefix, a range), and `deps-pypi` rewrites it in place to preserve
     // the manifest's existing pin style (`==1.0.1` -> `==1.0.2`) — the guard
     // must compare the text that would actually be written.
-    let new_text = formatter.format_version_replacing(&version_native, version_req);
+    let new_text = formatter
+        .format_version_replacing(&ConcreteVersion::new(version_native.as_str()), version_req);
 
     // N1: skip a no-op edit — the manifest already declares exactly the text
     // this action would write, so applying it would rewrite the text to
@@ -214,11 +215,11 @@ fn build_unsatisfiable_fix_action(
     }
 
     let latest = package_versions.latest.clone();
-    if !is_safe_version_string(&latest) {
+    if !is_safe_version_string(latest.as_str()) {
         warn_rejected_value(
             "is_safe_version_string",
             "unsatisfiable-requirement fix code action",
-            &latest,
+            latest.as_str(),
         );
         return None;
     }
@@ -240,7 +241,7 @@ fn build_unsatisfiable_fix_action(
     let edits = single_file_edit(uri, version_range, new_text.clone());
 
     Some(UnsatisfiableFixAction {
-        version_native: latest.clone(),
+        version_native: latest.to_string(),
         new_text,
         action: CodeAction {
             title: format!("Fix unsatisfiable requirement: update to {latest}"),
@@ -570,11 +571,11 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     if let Some(registry_versions) = &registry_versions {
         let display_items = prepare_version_display_items(registry_versions, dep.name());
         for item in display_items {
-            if !is_safe_version_string(&item.version) {
+            if !is_safe_version_string(item.version.as_str()) {
                 warn_rejected_value(
                     "is_safe_version_string",
                     "update-to-version refactor code action",
-                    &item.version,
+                    item.version.as_str(),
                 );
                 continue;
             }
@@ -1377,7 +1378,7 @@ mod tests {
 
         let cached = HashMap::new();
         let mut resolved = HashMap::new();
-        resolved.insert(pkg("pkg"), "1.0.1".to_string());
+        resolved.insert(pkg("pkg"), "1.0.1".into());
         let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
 
         let actions = generate_code_actions(
@@ -1785,7 +1786,7 @@ mod tests {
         }
 
         struct CaVersion {
-            version: String,
+            version: ConcreteVersion,
             yanked: bool,
         }
 
@@ -1804,7 +1805,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Ok(vec![Box::new(CaVersion {
-                        version: "2.0.0".to_string(),
+                        version: "2.0.0".into(),
                         yanked: false,
                     }) as Box<dyn crate::Version>])
                 })
@@ -2092,13 +2093,17 @@ mod tests {
         struct NonFixingFormatter;
 
         impl EcosystemFormatter for NonFixingFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
-            fn format_version_replacing(&self, _version: &str, _current: &str) -> String {
+            fn format_version_replacing(
+                &self,
+                _version: &ConcreteVersion,
+                _current: &str,
+            ) -> String {
                 "still-bad".to_string()
             }
             fn compile_requirement(
@@ -2119,13 +2124,17 @@ mod tests {
         struct CollidingTextFormatter;
 
         impl EcosystemFormatter for CollidingTextFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
-            fn format_version_replacing(&self, _version: &str, _current: &str) -> String {
+            fn format_version_replacing(
+                &self,
+                _version: &ConcreteVersion,
+                _current: &str,
+            ) -> String {
                 "9.9.9".to_string()
             }
             fn compile_requirement(
@@ -2141,7 +2150,7 @@ mod tests {
         struct NormalizingExactFormatter;
 
         impl EcosystemFormatter for NormalizingExactFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
@@ -2216,9 +2225,12 @@ mod tests {
             m.insert(
                 pkg(key),
                 PackageVersions {
-                    latest: latest.to_string(),
+                    latest: latest.into(),
                     available: Arc::from(
-                        available.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                        available
+                            .iter()
+                            .map(|s| ConcreteVersion::new(*s))
+                            .collect::<Vec<_>>(),
                     ),
                     yanked: Arc::from(Vec::new()),
                     published_at: None,

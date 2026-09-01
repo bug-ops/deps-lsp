@@ -89,7 +89,7 @@ pub enum NpmDependencySection {
 /// ```
 #[derive(Debug, Clone)]
 pub struct NpmVersion {
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     pub deprecated: bool,
     /// Package-level deprecation payload (issue #205), derived from the packument's
     /// `deprecated` free-text field. `None` whenever `deprecated` is absent, `null`, or
@@ -116,7 +116,7 @@ deps_core::impl_version!(NpmVersion {
     status: |v: &NpmVersion| deps_core::RemovalStatus::from_advisory(v.deprecated),
     published_at: published_at,
     prerelease: |v: &NpmVersion| {
-        node_semver::Version::parse(&v.version).is_ok_and(|parsed| parsed.is_prerelease())
+        node_semver::Version::parse(v.version.as_str()).is_ok_and(|parsed| parsed.is_prerelease())
     },
     deprecation: |v: &NpmVersion| v.deprecation.as_ref(),
 });
@@ -147,7 +147,7 @@ pub struct NpmPackage {
     pub description: Option<String>,
     pub homepage: Option<String>,
     pub repository: Option<String>,
-    pub latest_version: String,
+    pub latest_version: deps_core::ConcreteVersion,
 }
 
 // Use macro to implement PackageMetadata and Metadata traits

@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use crate::lsp_helpers::EcosystemFormatter;
-use crate::{Dependency, EcosystemId, PackageName};
+use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
 
 /// Ecosystems whose *bare* (no explicit pin marker) version requirement is a
 /// range under that ecosystem's own default semantics — Cargo's implicit
@@ -145,7 +145,7 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 ///
 /// ```
 /// use deps_core::lsp_helpers::{EcosystemFormatter, in_use_version};
-/// use deps_core::{Dependency, EcosystemId, PackageName, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use tower_lsp_server::ls_types::Range;
@@ -178,7 +178,7 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 ///
 /// struct SimpleFormatter;
 /// impl EcosystemFormatter for SimpleFormatter {
-///     fn format_version_for_text_edit(&self, version: &str) -> String {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
@@ -190,7 +190,7 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 ///     name: PackageName::new("time"),
 ///     version_req: Some(VersionReq::new("=0.1.43")),
 /// };
-/// let resolved_versions = HashMap::new();
+/// let resolved_versions: HashMap<PackageName, ConcreteVersion> = HashMap::new();
 ///
 /// // No lock file, but the requirement is already an exact pin — falls
 /// // back to it, stripped of its `=` marker.
@@ -202,7 +202,7 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 pub fn in_use_version(
     dep: &dyn Dependency,
     normalized_name: &str,
-    resolved_versions: &HashMap<PackageName, String>,
+    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
     formatter: &dyn EcosystemFormatter,
     ecosystem: EcosystemId,
 ) -> Option<String> {
@@ -214,7 +214,7 @@ pub fn in_use_version(
         resolved_versions
             .get(normalized_name)
             .or_else(|| resolved_versions.get(dep.name()))
-            .cloned()
+            .map(ConcreteVersion::to_string)
             .or_else(|| {
                 dep.version_requirement()
                     .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))

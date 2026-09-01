@@ -53,19 +53,19 @@ deps_core::impl_parse_result!(
 /// ecosystems with a structural (non-keyword) prerelease convention.
 #[derive(Debug, Clone)]
 pub struct NuGetVersion {
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     /// Publish timestamp, populated only when `Registry::get_versions_with` is called with
     /// freshness enabled and the version was covered by the registration-hive walk.
     pub published_at: Option<deps_core::PublishTime>,
 }
 
 impl deps_core::Version for NuGetVersion {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &deps_core::ConcreteVersion {
         &self.version
     }
 
     fn is_prerelease(&self) -> bool {
-        crate::version::is_prerelease(&self.version)
+        crate::version::is_prerelease(self.version.as_str())
     }
 
     fn published_at(&self) -> Option<deps_core::PublishTime> {
@@ -84,7 +84,7 @@ pub struct PackageInfo {
     pub description: Option<String>,
     pub repository: Option<String>,
     pub documentation: Option<String>,
-    pub latest_version: String,
+    pub latest_version: deps_core::ConcreteVersion,
 }
 
 deps_core::impl_metadata!(PackageInfo {

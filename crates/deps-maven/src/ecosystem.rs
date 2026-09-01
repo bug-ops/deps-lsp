@@ -623,7 +623,7 @@ mod tests {
             artifact_id: "commons-lang3".to_string(),
             name: "org.apache.commons:commons-lang3".to_string().into(),
             description: Some("Apache Commons Lang".to_string()),
-            latest_version: "3.14.0".to_string(),
+            latest_version: "3.14.0".into(),
             repository: None,
         }
     }
@@ -722,7 +722,7 @@ mod tests {
                 artifact_id: "commons-lang3".to_string(),
                 name: "org.apache.commons:commons-lang3".to_string().into(),
                 description: None,
-                latest_version: "3.14.0".to_string(),
+                latest_version: "3.14.0".into(),
                 repository: None,
             },
             ArtifactInfo {
@@ -730,7 +730,7 @@ mod tests {
                 artifact_id: "payload".to_string(),
                 name: "org.evil:payload".to_string().into(),
                 description: None,
-                latest_version: "1.0.0".to_string(),
+                latest_version: "1.0.0".into(),
                 repository: None,
             },
         ];
@@ -750,7 +750,7 @@ mod tests {
                 artifact_id: "commons-lang3".to_string(),
                 name: "org.apache.commons:commons-lang3".to_string().into(),
                 description: None,
-                latest_version: "3.14.0".to_string(),
+                latest_version: "3.14.0".into(),
                 repository: None,
             },
             ArtifactInfo {
@@ -758,7 +758,7 @@ mod tests {
                 artifact_id: "commons-io".to_string(),
                 name: "org.apache.commons:commons-io".to_string().into(),
                 description: None,
-                latest_version: "2.16.1".to_string(),
+                latest_version: "2.16.1".into(),
                 repository: None,
             },
             ArtifactInfo {
@@ -766,7 +766,7 @@ mod tests {
                 artifact_id: "commons-collections4".to_string(),
                 name: "org.apache.commons:commons-collections4".to_string().into(),
                 description: None,
-                latest_version: "4.4".to_string(),
+                latest_version: "4.4".into(),
                 repository: None,
             },
         ];
@@ -786,7 +786,7 @@ mod tests {
                 artifact_id: "commons-lang3".to_string(),
                 name: "org.apache.commons:commons-lang3".to_string().into(),
                 description: None,
-                latest_version: "3.14.0".to_string(),
+                latest_version: "3.14.0".into(),
                 repository: None,
             },
             ArtifactInfo {
@@ -794,7 +794,7 @@ mod tests {
                 artifact_id: "guava".to_string(),
                 name: "com.google.guava:guava".to_string().into(),
                 description: None,
-                latest_version: "33.2.1-jre".to_string(),
+                latest_version: "33.2.1-jre".into(),
                 repository: None,
             },
         ];
@@ -813,7 +813,7 @@ mod tests {
                 artifact_id: "commons".to_string(),
                 name: "org.foo:commons".to_string().into(),
                 description: None,
-                latest_version: "1.0.0".to_string(),
+                latest_version: "1.0.0".into(),
                 repository: None,
             },
             ArtifactInfo {
@@ -821,7 +821,7 @@ mod tests {
                 artifact_id: "commons".to_string(),
                 name: "org.bar:commons".to_string().into(),
                 description: None,
-                latest_version: "2.0.0".to_string(),
+                latest_version: "2.0.0".into(),
                 repository: None,
             },
         ];

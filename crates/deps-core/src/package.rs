@@ -1,11 +1,13 @@
-//! Newtypes distinguishing package names from version requirement strings.
+//! Newtypes distinguishing package names, version requirement strings, and
+//! concrete resolved versions.
 //!
-//! [`PackageName`] and [`VersionReq`] wrap `String` to give the two kinds of
-//! manifest data their own types, so a function that expects one cannot
-//! accidentally be called with the other. Neither type validates, trims, or
-//! normalizes its contents: ecosystem-specific normalization (case folding,
-//! separator rewriting, etc.) belongs to `EcosystemFormatter`, not to these
-//! types. See each type's documentation for details.
+//! [`PackageName`], [`VersionReq`], and [`ConcreteVersion`] wrap `String` to
+//! give these kinds of manifest and registry data their own types, so a
+//! function that expects one cannot accidentally be called with another.
+//! None of these types validate, trim, or normalize their contents:
+//! ecosystem-specific normalization (case folding, separator rewriting,
+//! etc.) belongs to `EcosystemFormatter`, not to these types. See each
+//! type's documentation for details.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -279,9 +281,118 @@ impl PartialEq<&str> for VersionReq {
     }
 }
 
+/// A concrete, resolved version string as returned by a registry.
+///
+/// This is deliberately permissive: it stores whatever bytes the registry
+/// returned (e.g. `"1.2.3"`, `"2.0.0-beta.1"`), including the empty string.
+/// No parsing, validation, trimming, or normalization is performed by this
+/// type — ecosystems that need to parse a version (via `semver`,
+/// `node-semver`, `pep440_rs`, etc.) do so from [`ConcreteVersion::as_str`],
+/// not from this type. It is distinct from [`VersionReq`]: a `VersionReq` is
+/// a constraint written in a manifest (`"^1.0"`), while a `ConcreteVersion`
+/// is a single resolved version (`"1.0.4"`).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ConcreteVersion;
+///
+/// let version = ConcreteVersion::new("1.2.3");
+/// assert_eq!(version.as_str(), "1.2.3");
+/// assert_eq!(version, "1.2.3");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConcreteVersion(String);
+
+impl ConcreteVersion {
+    /// Wraps `value` as a `ConcreteVersion`, unchanged.
+    ///
+    /// This never fails and never modifies its input: an empty string is a
+    /// valid `ConcreteVersion`, as is a string with surrounding whitespace.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    ///
+    /// let version = ConcreteVersion::new(String::from("1.0.0"));
+    /// assert_eq!(version.as_str(), "1.0.0");
+    /// ```
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the concrete version as a string slice.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    ///
+    /// let version = ConcreteVersion::new("4.5.6");
+    /// assert_eq!(version.as_str(), "4.5.6");
+    /// ```
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the `ConcreteVersion`, returning the wrapped `String`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    ///
+    /// let version = ConcreteVersion::new("4.5.6");
+    /// let owned: String = version.into_string();
+    /// assert_eq!(owned, "4.5.6");
+    /// ```
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for ConcreteVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for ConcreteVersion {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ConcreteVersion {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl AsRef<str> for ConcreteVersion {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for ConcreteVersion {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ConcreteVersion {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PackageName, VersionReq};
+    use super::{ConcreteVersion, PackageName, VersionReq};
 
     #[test]
     fn package_name_round_trips_empty_string() {
@@ -362,5 +473,41 @@ mod tests {
         let original = String::from("~2.3.4");
         let req = VersionReq::new(original.clone());
         assert_eq!(req.into_string(), original);
+    }
+
+    #[test]
+    fn concrete_version_round_trips_empty_string() {
+        let version = ConcreteVersion::new("");
+        assert_eq!(version.as_str(), "");
+        assert_eq!(version, "");
+    }
+
+    #[test]
+    fn concrete_version_round_trips_surrounding_whitespace() {
+        let version = ConcreteVersion::new("  1.0.0  ");
+        assert_eq!(version.as_str(), "  1.0.0  ");
+        assert_eq!(version, "  1.0.0  ");
+    }
+
+    #[test]
+    fn concrete_version_round_trips_non_ascii() {
+        let version = ConcreteVersion::new("バージョン");
+        assert_eq!(version.as_str(), "バージョン");
+        assert_eq!(version, "バージョン");
+    }
+
+    #[test]
+    fn concrete_version_compares_byte_wise_like_string() {
+        assert_ne!(
+            ConcreteVersion::new("1.0.0"),
+            ConcreteVersion::new("1.0.0 ")
+        );
+    }
+
+    #[test]
+    fn concrete_version_into_string_roundtrip() {
+        let original = String::from("2.3.4");
+        let version = ConcreteVersion::new(original.clone());
+        assert_eq!(version.into_string(), original);
     }
 }

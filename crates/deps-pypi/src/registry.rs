@@ -99,7 +99,7 @@ fn package_stub(name: &str) -> PypiPackage {
         name: deps_core::PackageName::new(name),
         summary: None,
         project_urls: Vec::new(),
-        latest_version: String::new(),
+        latest_version: deps_core::ConcreteVersion::new(""),
     }
 }
 
@@ -247,7 +247,7 @@ impl PypiRegistry {
             .map_err(|e| DepsError::InvalidVersionReq(format!("{req_str}: {e}")))?;
 
         Ok(versions.into_iter().find(|v| {
-            if let Ok(version) = Version::from_str(&v.version) {
+            if let Ok(version) = Version::from_str(v.version.as_str()) {
                 specs.contains(&version) && !v.yanked && !v.is_prerelease()
             } else {
                 false
@@ -434,7 +434,7 @@ impl deps_core::Registry for PypiRegistry {
             // `is_prerelease` heuristic (substring match on "-alpha"/"-rc"/...), which
             // does not recognize PyPI's unhyphenated prerelease spellings like
             // "1.0.0rc1" and would silently treat them as stable.
-            Version::from_str(v.version_string()).is_ok_and(|ver| {
+            Version::from_str(v.version_string().as_str()).is_ok_and(|ver| {
                 specs.contains(&ver) && !v.removal_status().blocks_resolution() && !ver.is_pre()
             })
         })
@@ -664,7 +664,7 @@ fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<Pypi
             let published_at = meta.and_then(|m| m.published_at);
             Some((
                 PypiVersion {
-                    version: version_str,
+                    version: version_str.into(),
                     yanked,
                     published_at,
                 },
@@ -699,7 +699,7 @@ fn parse_package_info(package_name: &str, data: &[u8]) -> Result<PypiPackage> {
         name: response.info.name.into(),
         summary: response.info.summary,
         project_urls,
-        latest_version: response.info.version,
+        latest_version: response.info.version.into(),
     })
 }
 

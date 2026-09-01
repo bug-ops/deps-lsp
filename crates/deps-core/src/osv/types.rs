@@ -392,7 +392,7 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 /// ```
 /// use deps_core::lsp_helpers::EcosystemFormatter;
 /// use deps_core::osv::vulnerability_keys;
-/// use deps_core::{Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
+/// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
 /// use tower_lsp_server::ls_types::{Position, Range, Uri};
@@ -446,7 +446,7 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 ///
 /// struct SimpleFormatter;
 /// impl EcosystemFormatter for SimpleFormatter {
-///     fn format_version_for_text_edit(&self, version: &str) -> String {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
@@ -470,7 +470,7 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 ///     ],
 ///     uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
 /// };
-/// let resolved = HashMap::new();
+/// let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
 ///
 /// let keys = vulnerability_keys(&parse_result, &resolved, &SimpleFormatter, EcosystemId::Cargo);
 /// let deps = parse_result.dependencies();
@@ -480,7 +480,7 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 /// ```
 pub fn vulnerability_keys(
     parse_result: &dyn crate::ParseResult,
-    resolved: &HashMap<crate::PackageName, String>,
+    resolved: &HashMap<crate::PackageName, crate::ConcreteVersion>,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     ecosystem: crate::EcosystemId,
 ) -> HashMap<tower_lsp_server::ls_types::Range, String> {

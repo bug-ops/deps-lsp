@@ -1,6 +1,7 @@
 //! Version formatting for Dart ecosystem.
 
 use crate::version::{version_matches_constraint, version_matches_normalized_constraint};
+use deps_core::ConcreteVersion;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
@@ -26,7 +27,8 @@ fn is_valid_dart_identifier(name: &str) -> bool {
 struct PubDevMatcher(String);
 
 impl RequirementMatcher for PubDevMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         Some(version_matches_normalized_constraint(version, &self.0))
     }
 }
@@ -34,7 +36,8 @@ impl RequirementMatcher for PubDevMatcher {
 pub struct DartFormatter;
 
 impl EcosystemFormatter for DartFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         format!("^{version}")
     }
 
@@ -63,7 +66,8 @@ impl EcosystemFormatter for DartFormatter {
         Ok(())
     }
 
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
         version_matches_constraint(version, requirement)
     }
 
@@ -84,8 +88,14 @@ mod tests {
     #[test]
     fn test_format_version() {
         let f = DartFormatter;
-        assert_eq!(f.format_version_for_text_edit("1.0.0"), "^1.0.0");
-        assert_eq!(f.format_version_for_text_edit("6.1.2"), "^6.1.2");
+        assert_eq!(
+            f.format_version_for_text_edit(&ConcreteVersion::new("1.0.0")),
+            "^1.0.0"
+        );
+        assert_eq!(
+            f.format_version_for_text_edit(&ConcreteVersion::new("6.1.2")),
+            "^6.1.2"
+        );
     }
 
     #[test]
@@ -100,8 +110,8 @@ mod tests {
     #[test]
     fn test_version_satisfies() {
         let f = DartFormatter;
-        assert!(f.version_satisfies_requirement("1.5.0", "^1.0.0"));
-        assert!(!f.version_satisfies_requirement("2.0.0", "^1.0.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.0.0"));
     }
 
     #[test]
@@ -119,8 +129,8 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("^1.0.0"))
             .expect("Dart requirement always compiles");
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
     #[test]
@@ -129,10 +139,13 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new(">= 1.15.0 < 2.0.0"))
             .expect("Dart requirement always compiles");
-        assert_eq!(matcher.matches("1.15.0"), Some(true));
-        assert_eq!(matcher.matches("1.99.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
-        assert_eq!(matcher.matches("1.14.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.15.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.99.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("1.14.0")),
+            Some(false)
+        );
     }
 
     #[test]

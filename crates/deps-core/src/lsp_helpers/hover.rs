@@ -2,8 +2,8 @@ use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind
 
 use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome};
 use crate::{
-    Deprecation, ParseResult, PublishTime, Registry, Version, VersionReq, format_relative_age,
-    is_within_cooldown,
+    ConcreteVersion, Deprecation, ParseResult, PublishTime, Registry, Version, VersionReq,
+    format_relative_age, is_within_cooldown,
 };
 
 use super::{
@@ -99,7 +99,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             .resolved
             .get(normalized_name.as_str())
             .or_else(|| versions.resolved.get(dep.name()))
-            .map(String::as_str)
+            .map(ConcreteVersion::as_str)
     };
     if let Some(resolved_ver) = resolved {
         write!(
@@ -228,11 +228,11 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let latest_line: Option<(&str, Option<PublishTime>)> = match &available_versions {
         Some(v) if !v.is_empty() => live_latest_idx
             .map(|idx| &v[idx])
-            .map(|live| (live.version_string(), live.published_at()))
+            .map(|live| (live.version_string().as_str(), live.published_at()))
             .or_else(|| {
                 list_fallback_latest
                     .as_deref()
-                    .map(|live| (live.version_string(), live.published_at()))
+                    .map(|live| (live.version_string().as_str(), live.published_at()))
             }),
         _ => cached_latest.map(|v| (v.latest.as_str(), v.published_at)),
     };
@@ -298,7 +298,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             .take(HOVER_RECENT_VERSIONS)
             .enumerate()
         {
-            let version_span = markdown_code_span(version.version_string());
+            let version_span = markdown_code_span(version.version_string().as_str());
             let age_suffix = if freshness.enabled {
                 version_age_suffix(version.as_ref(), now)
             } else {
@@ -486,7 +486,7 @@ mod tests {
 
         let registry = MockRegistryWithVersions {
             versions: vec![MockVersionWithAge {
-                version: "1.2.3".to_string(),
+                version: "1.2.3".into(),
                 yanked: false,
                 // 2 days ago — safely mid-bucket, immune to sub-second test flakiness.
                 published_at: Some(PublishTime::from_unix_secs(
@@ -524,7 +524,7 @@ mod tests {
 
         let registry = MockRegistryWithVersions {
             versions: vec![MockVersionWithAge {
-                version: "1.2.3".to_string(),
+                version: "1.2.3".into(),
                 yanked: false,
                 published_at: None,
             }],
@@ -561,12 +561,12 @@ mod tests {
         let registry = MockRegistryWithVersions {
             versions: vec![
                 MockVersionWithAge {
-                    version: "13.0.5-beta1".to_string(),
+                    version: "13.0.5-beta1".into(),
                     yanked: false,
                     published_at: None,
                 },
                 MockVersionWithAge {
-                    version: "13.0.4".to_string(),
+                    version: "13.0.4".into(),
                     yanked: false,
                     published_at: None,
                 },
@@ -614,13 +614,13 @@ mod tests {
         // `HOVER_RECENT_VERSIONS`, so it never appears in the rendered list.
         let mut versions: Vec<MockVersionWithAge> = (0..=HOVER_RECENT_VERSIONS)
             .map(|i| MockVersionWithAge {
-                version: format!("2.0.0-alpha{i}"),
+                version: format!("2.0.0-alpha{i}").into(),
                 yanked: false,
                 published_at: None,
             })
             .collect();
         versions.push(MockVersionWithAge {
-            version: "1.9.0".to_string(),
+            version: "1.9.0".into(),
             yanked: false,
             published_at: None,
         });
@@ -663,17 +663,17 @@ mod tests {
         let registry = MockRegistryWithVersions {
             versions: vec![
                 MockVersionWithAge {
-                    version: "2.0.0-beta2".to_string(),
+                    version: "2.0.0-beta2".into(),
                     yanked: false,
                     published_at: None,
                 },
                 MockVersionWithAge {
-                    version: "2.0.0-beta1".to_string(),
+                    version: "2.0.0-beta1".into(),
                     yanked: false,
                     published_at: None,
                 },
                 MockVersionWithAge {
-                    version: "1.9.0-alpha1".to_string(),
+                    version: "1.9.0-alpha1".into(),
                     yanked: false,
                     published_at: None,
                 },
@@ -725,7 +725,7 @@ mod tests {
         // fixed to prevent, just reached through this all-prerelease path instead (#313 S2).
         let registry = MockRegistryWithVersions {
             versions: vec![MockVersionWithAge {
-                version: "2.0.0-beta2".to_string(),
+                version: "2.0.0-beta2".into(),
                 yanked: false,
                 published_at: None,
             }],
@@ -774,12 +774,12 @@ mod tests {
 
         let registry = MockRegistryListFailsLatestFallbackSucceeds {
             versions: vec![MockVersionWithAge {
-                version: "v0.0.0-20230101000000-abcdef123456".to_string(),
+                version: "v0.0.0-20230101000000-abcdef123456".into(),
                 yanked: false,
                 published_at: None,
             }],
             fallback_latest: MockVersionWithAge {
-                version: "v1.2.3".to_string(),
+                version: "v1.2.3".into(),
                 yanked: false,
                 published_at: None,
             },
@@ -822,12 +822,12 @@ mod tests {
 
         let registry = MockRegistryListFailsLatestFallbackSucceeds {
             versions: vec![MockVersionWithAge {
-                version: "v1.2.3".to_string(),
+                version: "v1.2.3".into(),
                 yanked: false,
                 published_at: None,
             }],
             fallback_latest: MockVersionWithAge {
-                version: "v9.9.9".to_string(),
+                version: "v9.9.9".into(),
                 yanked: false,
                 published_at: None,
             },
@@ -882,7 +882,7 @@ mod tests {
         // records the higher v0.9.1 and sorts last, so it would win naive
         // last-occurrence-wins parsing if hover trusted `versions.resolved` here.
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example.com/mod".into(), "v0.9.1".to_string());
+        resolved_versions.insert("example.com/mod".into(), "v0.9.1".into());
         let cached_versions = HashMap::new();
 
         let hover = generate_hover(
@@ -927,7 +927,7 @@ mod tests {
         };
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.2.0".to_string());
+        resolved_versions.insert("serde".into(), "1.2.0".into());
         let cached_versions = HashMap::new();
 
         let hover = generate_hover(
@@ -963,12 +963,12 @@ mod tests {
         let registry = MockRegistryWithVersions {
             versions: vec![
                 MockVersionWithAge {
-                    version: "1.2.3".to_string(),
+                    version: "1.2.3".into(),
                     yanked: false,
                     published_at: None,
                 },
                 MockVersionWithAge {
-                    version: "1.2.1".to_string(),
+                    version: "1.2.1".into(),
                     yanked: true,
                     // ~5 months ago.
                     published_at: Some(PublishTime::from_unix_secs(
@@ -1009,7 +1009,7 @@ mod tests {
 
         let registry = MockRegistryWithVersions {
             versions: vec![MockVersionWithAge {
-                version: "1.2.3".to_string(),
+                version: "1.2.3".into(),
                 yanked: false,
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 2 * 24 * 60 * 60,
@@ -1051,8 +1051,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 // 1 hour ago — well within the default 3-day cooldown.
                 published_at: Some(PublishTime::from_unix_secs(
@@ -1104,8 +1104,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 // 10 days ago — outside the default 3-day cooldown.
                 published_at: Some(PublishTime::from_unix_secs(
@@ -1182,8 +1182,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 60 * 60,
@@ -1233,8 +1233,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_at_boundary),
             },
@@ -1281,8 +1281,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_just_inside),
             },
@@ -1330,12 +1330,12 @@ mod tests {
         let registry = MockRegistryWithVersions {
             versions: vec![
                 MockVersionWithAge {
-                    version: "1.0.214".to_string(),
+                    version: "1.0.214".into(),
                     yanked: false,
                     published_at: Some(live_latest_published),
                 },
                 MockVersionWithAge {
-                    version: "1.0.213".to_string(),
+                    version: "1.0.213".into(),
                     yanked: false,
                     published_at: Some(PublishTime::from_unix_secs(
                         now.as_unix_secs() - 30 * 24 * 60 * 60,
@@ -1351,8 +1351,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "1.0.213".to_string(),
-                available: Arc::from(vec!["1.0.213".to_string()]),
+                latest: "1.0.213".into(),
+                available: Arc::from(vec!["1.0.213".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(PublishTime::from_unix_secs(
                     now.as_unix_secs() - 90 * 24 * 60 * 60,
@@ -1416,11 +1416,11 @@ mod tests {
         let registry = MockRegistryPreferringUnflagged {
             versions: vec![
                 MockVersionWithStatus {
-                    version: "2.0.0".to_string(),
+                    version: "2.0.0".into(),
                     status: RemovalStatus::AdvisoryDeprecated,
                 },
                 MockVersionWithStatus {
-                    version: "1.9.0".to_string(),
+                    version: "1.9.0".into(),
                     status: RemovalStatus::Available,
                 },
             ],
@@ -1477,7 +1477,7 @@ mod tests {
         let now = PublishTime::now();
         let registry = MockRegistryPreferringUnflagged {
             versions: vec![MockVersionWithStatus {
-                version: "2.0.0".to_string(),
+                version: "2.0.0".into(),
                 status: RemovalStatus::AdvisoryDeprecated,
             }],
         };
@@ -1527,11 +1527,11 @@ mod tests {
         let registry = MockRegistryPreferringUnflagged {
             versions: vec![
                 MockVersionWithStatus {
-                    version: "2.0.0".to_string(),
+                    version: "2.0.0".into(),
                     status: RemovalStatus::Yanked,
                 },
                 MockVersionWithStatus {
-                    version: "1.9.0".to_string(),
+                    version: "1.9.0".into(),
                     status: RemovalStatus::Yanked,
                 },
             ],
@@ -1574,7 +1574,7 @@ mod tests {
     struct NpmLikeFormatter;
 
     impl EcosystemFormatter for NpmLikeFormatter {
-        fn format_version_for_text_edit(&self, version: &str) -> String {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
             version.to_string()
         }
 
@@ -1599,7 +1599,7 @@ mod tests {
         let now = PublishTime::now();
         let registry = MockRegistryPreferringUnflagged {
             versions: vec![MockVersionWithStatus {
-                version: "1.0.0".to_string(),
+                version: "1.0.0".into(),
                 status: RemovalStatus::AdvisoryDeprecated,
             }],
         };
@@ -1887,7 +1887,7 @@ mod tests {
 
         let registry = MockRegistryWithVersions {
             versions: vec![MockVersionWithAge {
-                version: "9.9.9".to_string(),
+                version: "9.9.9".into(),
                 yanked: false,
                 published_at: None,
             }],
@@ -2041,7 +2041,7 @@ mod tests {
                 advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
                 total_known: 3,
                 upgrade_status: UpgradeStatus::CandidateVulnerable {
-                    version: "2.0.0".to_string(),
+                    version: "2.0.0".into(),
                     advisory_ids: vec!["RUSTSEC-2020-0071".to_string()],
                 },
             }),

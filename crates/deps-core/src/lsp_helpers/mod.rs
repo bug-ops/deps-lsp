@@ -6,8 +6,8 @@ use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
 
 use crate::osv::VulnerabilityMap;
 use crate::{
-    Dependency, Deprecation, EcosystemId, InvalidPackageName, PackageName, RemovalStatus,
-    VersionReq,
+    ConcreteVersion, Dependency, Deprecation, EcosystemId, InvalidPackageName, PackageName,
+    RemovalStatus, VersionReq,
 };
 
 mod code_actions;
@@ -61,11 +61,11 @@ pub const HOVER_RECENT_VERSIONS: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageVersions {
     /// Latest usable version for this package.
-    pub latest: String,
+    pub latest: ConcreteVersion,
     /// Every published version, newest-first, unfiltered.
-    pub available: Arc<[String]>,
+    pub available: Arc<[ConcreteVersion]>,
     /// Subset of `available` reported as yanked/deprecated by the registry.
-    pub yanked: Arc<[String]>,
+    pub yanked: Arc<[ConcreteVersion]>,
     /// When `latest` was published, if the registry exposes it. `None` when
     /// the ecosystem doesn't wire [`crate::Version::published_at`] or the fetch
     /// never ran.
@@ -97,13 +97,13 @@ impl PackageVersions {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::PackageVersions;
+    /// use deps_core::{ConcreteVersion, PackageVersions};
     ///
     /// let versions = PackageVersions::latest_only("1.0.214");
     /// assert_eq!(versions.latest, "1.0.214");
-    /// assert_eq!(&*versions.available, &["1.0.214".to_string()]);
+    /// assert_eq!(&*versions.available, &[ConcreteVersion::new("1.0.214")]);
     /// ```
-    pub fn latest_only(latest: impl Into<String>) -> Self {
+    pub fn latest_only(latest: impl Into<ConcreteVersion>) -> Self {
         let latest = latest.into();
         let available = Arc::from(vec![latest.clone()]);
         Self {
@@ -129,7 +129,7 @@ impl PackageVersions {
     /// assert_eq!(versions.latest, "1.0.195");
     /// assert!(versions.available.is_empty());
     /// ```
-    pub fn latest_without_list(latest: impl Into<String>) -> Self {
+    pub fn latest_without_list(latest: impl Into<ConcreteVersion>) -> Self {
         Self {
             latest: latest.into(),
             available: Arc::from(Vec::new()),
@@ -148,26 +148,26 @@ impl PackageVersions {
 /// # Examples
 ///
 /// ```
-/// use deps_core::{PackageName, PackageVersions, VersionData};
+/// use deps_core::{ConcreteVersion, PackageName, PackageVersions, VersionData};
 /// use std::collections::HashMap;
 ///
 /// let mut cached = HashMap::new();
 /// cached.insert(PackageName::new("serde"), PackageVersions::latest_only("1.0.214"));
 ///
 /// let mut resolved = HashMap::new();
-/// resolved.insert(PackageName::new("serde"), "1.0.200".to_string());
+/// resolved.insert(PackageName::new("serde"), ConcreteVersion::new("1.0.200"));
 ///
 /// let versions = VersionData::new(&cached, &resolved);
 ///
 /// assert_eq!(versions.cached.get("serde").map(|v| v.latest.as_str()), Some("1.0.214"));
-/// assert_eq!(versions.resolved.get("serde"), Some(&"1.0.200".to_string()));
+/// assert_eq!(versions.resolved.get("serde").map(ConcreteVersion::as_str), Some("1.0.200"));
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct VersionData<'a> {
     /// Latest known versions and full version lists from the registry, keyed by package name.
     pub cached: &'a HashMap<PackageName, PackageVersions>,
     /// Versions actually resolved in the lock file, keyed by package name.
-    pub resolved: &'a HashMap<PackageName, String>,
+    pub resolved: &'a HashMap<PackageName, ConcreteVersion>,
     /// OSV scan results, keyed by normalized package name. `None` when no
     /// scan has run yet (e.g. the feature is disabled) — distinct from an
     /// empty map, which would mean "scanned, nothing found".
@@ -181,7 +181,7 @@ pub struct VersionData<'a> {
     /// a genuine `Yanked` finding (see that function's D5 handling). `None`
     /// when no yanked check has run yet — distinct from an empty map, which
     /// would mean "checked, nothing yanked".
-    pub yanked: Option<&'a HashMap<String, (String, RemovalStatus)>>,
+    pub yanked: Option<&'a HashMap<String, (ConcreteVersion, RemovalStatus)>>,
     /// Package-level deprecation findings, keyed by normalized package name.
     /// `None` when no fetch has run yet — distinct from an empty map, which
     /// would mean "checked, nothing deprecated". See [`crate::Deprecation`].
@@ -231,7 +231,7 @@ impl<'a> VersionData<'a> {
     /// ```
     pub fn new(
         cached: &'a HashMap<PackageName, PackageVersions>,
-        resolved: &'a HashMap<PackageName, String>,
+        resolved: &'a HashMap<PackageName, ConcreteVersion>,
     ) -> Self {
         Self {
             cached,
@@ -270,17 +270,20 @@ impl<'a> VersionData<'a> {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::{RemovalStatus, VersionData};
+    /// use deps_core::{ConcreteVersion, RemovalStatus, VersionData};
     /// use std::collections::HashMap;
     ///
     /// let cached = HashMap::new();
     /// let resolved = HashMap::new();
-    /// let yanked: HashMap<String, (String, RemovalStatus)> = HashMap::new();
+    /// let yanked: HashMap<String, (ConcreteVersion, RemovalStatus)> = HashMap::new();
     /// let versions = VersionData::new(&cached, &resolved).with_yanked(&yanked);
     /// assert!(versions.yanked.is_some());
     /// ```
     #[must_use]
-    pub fn with_yanked(mut self, yanked: &'a HashMap<String, (String, RemovalStatus)>) -> Self {
+    pub fn with_yanked(
+        mut self,
+        yanked: &'a HashMap<String, (ConcreteVersion, RemovalStatus)>,
+    ) -> Self {
         self.yanked = Some(yanked);
         self
     }
@@ -588,18 +591,19 @@ pub enum RequirementStatus {
 ///
 /// ```
 /// use deps_core::lsp_helpers::RequirementMatcher;
+/// use deps_core::ConcreteVersion;
 ///
 /// struct ExactMatch(String);
 ///
 /// impl RequirementMatcher for ExactMatch {
-///     fn matches(&self, version: &str) -> Option<bool> {
-///         Some(version == self.0)
+///     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+///         Some(version.as_str() == self.0)
 ///     }
 /// }
 ///
 /// let matcher = ExactMatch("1.0.0".to_string());
-/// assert_eq!(matcher.matches("1.0.0"), Some(true));
-/// assert_eq!(matcher.matches("2.0.0"), Some(false));
+/// assert_eq!(matcher.matches(&ConcreteVersion::new("1.0.0")), Some(true));
+/// assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
 /// ```
 pub trait RequirementMatcher: Send + Sync {
     /// Tests one candidate version string against the compiled requirement.
@@ -611,7 +615,7 @@ pub trait RequirementMatcher: Send + Sync {
     /// return `None` to mean "the requirement itself is unusable"; that is
     /// [`EcosystemFormatter::compile_requirement`]'s job, via returning `None` from that
     /// method instead of constructing a matcher at all.
-    fn matches(&self, version: &str) -> Option<bool>;
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool>;
 }
 
 /// Ecosystem-specific formatting and comparison logic.
@@ -638,13 +642,13 @@ pub trait EcosystemFormatter: Send + Sync {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::PackageName;
+    /// use deps_core::{ConcreteVersion, PackageName};
     /// use deps_core::lsp_helpers::EcosystemFormatter;
     ///
     /// struct PermissiveFormatter;
     ///
     /// impl EcosystemFormatter for PermissiveFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
     ///         version.to_string()
     ///     }
     ///
@@ -662,7 +666,7 @@ pub trait EcosystemFormatter: Send + Sync {
     }
 
     /// Format version string for code action text edit.
-    fn format_version_for_text_edit(&self, version: &str) -> String;
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String;
 
     /// Format `version` as a replacement for the existing requirement text
     /// `current`, preserving `current`'s operator/pin style where the
@@ -674,7 +678,7 @@ pub trait EcosystemFormatter: Send + Sync {
     /// silently change the requirement's semantics — e.g. PyPI's `==1.0.1`
     /// pin becoming `>=1.0.1,<2` on "update version" would defeat the point
     /// of pinning.
-    fn format_version_replacing(&self, version: &str, _current: &str) -> String {
+    fn format_version_replacing(&self, version: &ConcreteVersion, _current: &str) -> String {
         self.format_version_for_text_edit(version)
     }
 
@@ -685,7 +689,8 @@ pub trait EcosystemFormatter: Send + Sync {
     /// which has its own default and its own override points; an ecosystem whose bare
     /// requirement is a floor rather than an auto-following range (see `deps-nuget`)
     /// overrides that method, not this one.
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
         // Handle caret (^) - allows changes that don't modify left-most non-zero
         // ^2.0 allows 2.x.x, ^0.2 allows 0.2.x, ^0.0.3 allows only 0.0.3
         if let Some(req) = requirement.strip_prefix('^') {
@@ -735,7 +740,11 @@ pub trait EcosystemFormatter: Send + Sync {
     /// than an auto-following range (NuGet's bare `Version="1.0.0"`) must override this,
     /// since "does the floor accept `latest`" and "is the pin already `latest`" are
     /// different questions there.
-    fn is_requirement_up_to_date(&self, requirement: &VersionReq, latest: &str) -> bool {
+    fn is_requirement_up_to_date(
+        &self,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> bool {
         self.version_satisfies_requirement(latest, requirement.as_str())
     }
 
@@ -752,11 +761,11 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// ```
     /// use deps_core::lsp_helpers::EcosystemFormatter;
-    /// use deps_core::{PackageName, VersionReq};
+    /// use deps_core::{ConcreteVersion, PackageName, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
     ///         version.to_string()
     ///     }
     ///     fn package_url(&self, name: &PackageName) -> String {
@@ -783,11 +792,11 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// ```
     /// use deps_core::lsp_helpers::{EcosystemFormatter, RequirementStatus};
-    /// use deps_core::{PackageName, VersionReq};
+    /// use deps_core::{ConcreteVersion, PackageName, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
     ///         version.to_string()
     ///     }
     ///     fn package_url(&self, name: &PackageName) -> String {
@@ -796,15 +805,19 @@ pub trait EcosystemFormatter: Send + Sync {
     /// }
     ///
     /// assert_eq!(
-    ///     DefaultFormatter.requirement_status(&VersionReq::new("^1.2"), "1.5.0"),
+    ///     DefaultFormatter.requirement_status(&VersionReq::new("^1.2"), &ConcreteVersion::new("1.5.0")),
     ///     RequirementStatus::UpToDate
     /// );
     /// assert_eq!(
-    ///     DefaultFormatter.requirement_status(&VersionReq::new("^1.2"), "2.0.0"),
+    ///     DefaultFormatter.requirement_status(&VersionReq::new("^1.2"), &ConcreteVersion::new("2.0.0")),
     ///     RequirementStatus::Outdated
     /// );
     /// ```
-    fn requirement_status(&self, requirement: &VersionReq, latest: &str) -> RequirementStatus {
+    fn requirement_status(
+        &self,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> RequirementStatus {
         if self.requirement_is_unresolved(requirement) {
             return RequirementStatus::Unresolved;
         }
@@ -849,11 +862,11 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// ```
     /// use deps_core::lsp_helpers::EcosystemFormatter;
-    /// use deps_core::{PackageName, VersionReq};
+    /// use deps_core::{ConcreteVersion, PackageName, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
     ///         version.to_string()
     ///     }
     ///     fn package_url(&self, name: &PackageName) -> String {
@@ -893,11 +906,11 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// ```
     /// use deps_core::lsp_helpers::EcosystemFormatter;
-    /// use deps_core::{PackageName, VersionReq};
+    /// use deps_core::{ConcreteVersion, PackageName, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
     ///         version.to_string()
     ///     }
     ///     fn package_url(&self, name: &PackageName) -> String {
@@ -907,13 +920,13 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// assert!(!DefaultFormatter.requirement_is_undecidable_given_available(
     ///     &VersionReq::new("1.6.13"),
-    ///     &["1.6.9".to_string(), "1.6.14".to_string()],
+    ///     &[ConcreteVersion::new("1.6.9"), ConcreteVersion::new("1.6.14")],
     /// ));
     /// ```
     fn requirement_is_undecidable_given_available(
         &self,
         _requirement: &VersionReq,
-        _available: &[String],
+        _available: &[ConcreteVersion],
     ) -> bool {
         false
     }
@@ -938,11 +951,11 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// ```
     /// use deps_core::lsp_helpers::EcosystemFormatter;
-    /// use deps_core::PackageName;
+    /// use deps_core::{ConcreteVersion, PackageName};
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
     ///         version.to_string()
     ///     }
     ///     fn package_url(&self, name: &PackageName) -> String {
@@ -1019,11 +1032,11 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// ```
     /// use deps_core::lsp_helpers::EcosystemFormatter;
-    /// use deps_core::{PackageName, VersionReq};
+    /// use deps_core::{ConcreteVersion, PackageName, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
     ///         version.to_string()
     ///     }
     ///     fn package_url(&self, name: &PackageName) -> String {
@@ -1077,12 +1090,12 @@ pub trait EcosystemFormatter: Send + Sync {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::PackageName;
+    /// use deps_core::{ConcreteVersion, PackageName};
     /// use deps_core::lsp_helpers::EcosystemFormatter;
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
     ///         version.to_string()
     ///     }
     ///     fn package_url(&self, name: &PackageName) -> String {
@@ -1112,12 +1125,12 @@ pub trait EcosystemFormatter: Send + Sync {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::PackageName;
+    /// use deps_core::{ConcreteVersion, PackageName};
     /// use deps_core::lsp_helpers::EcosystemFormatter;
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
-    ///     fn format_version_for_text_edit(&self, version: &str) -> String {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
     ///         version.to_string()
     ///     }
     ///     fn package_url(&self, name: &PackageName) -> String {
@@ -1962,16 +1975,16 @@ mod tests {
     fn test_ecosystem_formatter_version_satisfies() {
         let formatter = MockFormatter;
 
-        assert!(formatter.version_satisfies_requirement("1.2.3", "1.2.3"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2.3"));
 
-        assert!(formatter.version_satisfies_requirement("1.2.3", "^1.2"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "~1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "^1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "~1.2"));
 
-        assert!(formatter.version_satisfies_requirement("1.2.3", "1"));
-        assert!(formatter.version_satisfies_requirement("1.2.3", "1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2"));
 
-        assert!(!formatter.version_satisfies_requirement("1.2.3", "2.0.0"));
-        assert!(!formatter.version_satisfies_requirement("1.2.3", "1.3"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "2.0.0"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.3"));
     }
 
     #[test]
@@ -1983,11 +1996,11 @@ mod tests {
                 name.as_str().to_lowercase().replace('-', "_")
             }
 
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 format!(
                     ">={},<{}",
                     version,
-                    version.split('.').next().unwrap_or("0")
+                    version.as_str().split('.').next().unwrap_or("0")
                 )
             }
 
@@ -2002,7 +2015,7 @@ mod tests {
             "test_package"
         );
         assert_eq!(
-            formatter.format_version_for_text_edit("1.2.3"),
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("1.2.3")),
             ">=1.2.3,<1"
         );
         assert_eq!(

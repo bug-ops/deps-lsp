@@ -289,7 +289,7 @@ impl Default for EcosystemConfig {
 /// # Examples
 ///
 /// ```no_run
-/// use deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig, PackageName};
+/// use deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig, PackageName, ConcreteVersion};
 /// use deps_core::completion::Completions;
 /// use deps_core::lsp_helpers::EcosystemFormatter;
 /// use std::sync::Arc;
@@ -298,7 +298,7 @@ impl Default for EcosystemConfig {
 ///
 /// struct MyFormatter;
 /// impl EcosystemFormatter for MyFormatter {
-///     fn format_version_for_text_edit(&self, version: &str) -> String { version.to_string() }
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String { version.to_string() }
 ///     fn package_url(&self, name: &PackageName) -> String { format!("https://example.com/{name}") }
 /// }
 ///

@@ -1,7 +1,9 @@
 //! Version formatting for Maven ecosystem.
 
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
-use deps_core::{InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment};
+use deps_core::{
+    ConcreteVersion, InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment,
+};
 
 pub struct MavenFormatter;
 
@@ -78,7 +80,8 @@ enum MavenMatcher {
 }
 
 impl RequirementMatcher for MavenMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         Some(match self {
             Self::AlwaysSatisfied => true,
             Self::Ranges(ranges) => crate::range::satisfies_ranges(version, ranges),
@@ -91,7 +94,8 @@ impl RequirementMatcher for MavenMatcher {
 }
 
 impl EcosystemFormatter for MavenFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         // Maven uses exact versions, no prefix
         version.to_string()
     }
@@ -152,7 +156,8 @@ impl EcosystemFormatter for MavenFormatter {
     // docs for the two precision differences), but any reordering here must be checked
     // against `compile_requirement`'s malformed-range guard placement too, since S1/S2
     // happened in `deps-gradle` from exactly this kind of drift between two copies.
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
         // Unresolved properties (missing from <properties>) — skip comparison
         if is_unresolved(requirement) {
             return true;
@@ -212,9 +217,12 @@ mod tests {
     #[test]
     fn test_format_version() {
         let f = MavenFormatter;
-        assert_eq!(f.format_version_for_text_edit("3.14.0"), "3.14.0");
         assert_eq!(
-            f.format_version_for_text_edit("1.0.0-SNAPSHOT"),
+            f.format_version_for_text_edit(&ConcreteVersion::new("3.14.0")),
+            "3.14.0"
+        );
+        assert_eq!(
+            f.format_version_for_text_edit(&ConcreteVersion::new("1.0.0-SNAPSHOT")),
             "1.0.0-SNAPSHOT"
         );
     }
@@ -231,26 +239,32 @@ mod tests {
     #[test]
     fn test_version_satisfies() {
         let f = MavenFormatter;
-        assert!(f.version_satisfies_requirement("3.14.0", "3.14.0"));
-        assert!(!f.version_satisfies_requirement("3.14.0", "3.13.0"));
-        assert!(!f.version_satisfies_requirement("3.14.0", "3.14.1"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "3.14.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "3.13.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "3.14.1"));
     }
 
     #[test]
     fn test_version_satisfies_range() {
         let f = MavenFormatter;
-        assert!(f.version_satisfies_requirement("1.5.0", "[1.0,2.0)"));
-        assert!(!f.version_satisfies_requirement("2.0.0", "[1.0,2.0)"));
-        assert!(f.version_satisfies_requirement("1.0.0", "[1.0.0]"));
-        assert!(!f.version_satisfies_requirement("1.0.1", "[1.0.0]"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "[1.0,2.0)"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "[1.0,2.0)"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "[1.0.0]"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "[1.0.0]"));
     }
 
     #[test]
     fn test_version_satisfies_maven_property() {
         let f = MavenFormatter;
-        assert!(f.version_satisfies_requirement("7.1.1", "${woodstoxVersion}"));
-        assert!(f.version_satisfies_requirement("2.0.17", "${slf4j.version}"));
-        assert!(f.version_satisfies_requirement("1.0.0", "${project.version}"));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("7.1.1"), "${woodstoxVersion}")
+        );
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("2.0.17"), "${slf4j.version}")
+        );
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "${project.version}")
+        );
     }
 
     #[test]
@@ -312,11 +326,17 @@ mod tests {
     fn test_requirement_status_unresolved_property() {
         let f = MavenFormatter;
         assert_eq!(
-            f.requirement_status(&VersionReq::new("${woodstoxVersion}"), "7.1.1"),
+            f.requirement_status(
+                &VersionReq::new("${woodstoxVersion}"),
+                &ConcreteVersion::new("7.1.1")
+            ),
             RequirementStatus::Unresolved
         );
         assert_eq!(
-            f.requirement_status(&VersionReq::new("${project.version}"), "1.0.0"),
+            f.requirement_status(
+                &VersionReq::new("${project.version}"),
+                &ConcreteVersion::new("1.0.0")
+            ),
             RequirementStatus::Unresolved
         );
     }
@@ -325,7 +345,7 @@ mod tests {
     fn test_requirement_status_up_to_date() {
         let f = MavenFormatter;
         assert_eq!(
-            f.requirement_status(&VersionReq::new("3.14.0"), "3.14.0"),
+            f.requirement_status(&VersionReq::new("3.14.0"), &ConcreteVersion::new("3.14.0")),
             RequirementStatus::UpToDate
         );
     }
@@ -334,7 +354,7 @@ mod tests {
     fn test_requirement_status_outdated() {
         let f = MavenFormatter;
         assert_eq!(
-            f.requirement_status(&VersionReq::new("3.13.0"), "3.14.0"),
+            f.requirement_status(&VersionReq::new("3.13.0"), &ConcreteVersion::new("3.14.0")),
             RequirementStatus::Outdated
         );
     }
@@ -350,6 +370,7 @@ mod tests {
         let osv_version = "1.2.3";
         let native = f.osv_version_to_native(osv_version);
         assert_eq!(native, osv_version);
+        let native = ConcreteVersion::new(native);
         let edit_text = f.format_version_for_text_edit(&native);
         assert!(f.version_satisfies_requirement(&native, &edit_text));
     }
@@ -360,8 +381,11 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("3.14.0"))
             .expect("Maven requirement always compiles");
-        assert_eq!(matcher.matches("3.14.0"), Some(true));
-        assert_eq!(matcher.matches("3.13.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("3.14.0")), Some(true));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("3.13.0")),
+            Some(false)
+        );
     }
 
     #[test]
@@ -370,8 +394,8 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("[1.0,2.0)"))
             .unwrap();
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
     #[test]
@@ -390,8 +414,8 @@ mod tests {
     fn test_compile_requirement_trailing_zero_segments_are_equal() {
         let f = MavenFormatter;
         let matcher = f.compile_requirement(&VersionReq::new("1.0")).unwrap();
-        assert_eq!(matcher.matches("1.0.0"), Some(true));
-        assert_eq!(matcher.matches("1.1.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.0.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.1.0")), Some(false));
     }
 
     /// M2: `LATEST`/`RELEASE` resolve against maven-metadata.xml's `<latest>`/`<release>`
@@ -401,10 +425,10 @@ mod tests {
     fn test_compile_requirement_latest_keyword_always_satisfied() {
         let f = MavenFormatter;
         let matcher = f.compile_requirement(&VersionReq::new("LATEST")).unwrap();
-        assert_eq!(matcher.matches("3.14.0"), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("3.14.0")), Some(true));
 
         let matcher = f.compile_requirement(&VersionReq::new("RELEASE")).unwrap();
-        assert_eq!(matcher.matches("3.14.0"), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("3.14.0")), Some(true));
     }
 
     /// S6: a `-SNAPSHOT` pin resolves against the snapshot repository, which this registry
@@ -416,8 +440,8 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("7.0.0-SNAPSHOT"))
             .unwrap();
-        assert_eq!(matcher.matches("6.9.0"), Some(true));
-        assert_eq!(matcher.matches("7.0.0"), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("6.9.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("7.0.0")), Some(true));
     }
 
     /// #249 review regression: a malformed range that also happens to end in `-SNAPSHOT` or
@@ -445,12 +469,18 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("1.0-20260101.120000-1"))
             .unwrap();
-        assert_eq!(matcher.matches("6.9.0"), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("6.9.0")), Some(true));
 
         // A version with a trailing numeric qualifier that merely looks similar but isn't
         // a `yyyyMMdd.HHmmss-N` stamp must still be compared normally.
         let matcher = f.compile_requirement(&VersionReq::new("1.0-1-2")).unwrap();
-        assert_eq!(matcher.matches("1.0-1-2"), Some(true));
-        assert_eq!(matcher.matches("1.0-1-3"), Some(false));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("1.0-1-2")),
+            Some(true)
+        );
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("1.0-1-3")),
+            Some(false)
+        );
     }
 }
