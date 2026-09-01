@@ -20,17 +20,21 @@
 //! let _deps: Vec<ParsedDependency> = vec![];
 //! ```
 
+pub mod config;
 pub mod ecosystem;
 pub mod formatter;
 pub mod lockfile;
 pub mod parser;
 pub mod registry;
+pub mod sparse;
 pub mod types;
 
 // Re-export commonly used types
+pub use config::{CargoConfig, Provenance, RegistryIndex, ResolvedRegistryEntry};
 pub use ecosystem::CargoEcosystem;
 pub use formatter::CargoFormatter;
 pub use lockfile::CargoLockParser;
 pub use parser::{CargoParser, ParseResult, parse_cargo_toml};
-pub use registry::{CratesIoRegistry, crate_url};
+pub use registry::{CargoRegistry, CratesIoRegistry, crate_url};
+pub use sparse::SparseIndexClient;
 pub use types::{CargoVersion, CrateInfo, DependencySection, DependencySource, ParsedDependency};

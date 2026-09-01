@@ -23,8 +23,7 @@ pub use code_actions::generate_code_actions;
 pub use code_lenses::{collect_update_all_edits, generate_code_lenses};
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, UNSATISFIABLE_DIAGNOSTIC_CODE,
-    compile_requirement_unless, generate_diagnostics, generate_diagnostics_from_cache,
-    requirement_is_unsatisfiable,
+    compile_requirement_unless, generate_diagnostics_from_cache, requirement_is_unsatisfiable,
 };
 pub use hover::generate_hover;
 pub use in_use_version::{concrete_pin_version, in_use_version};
@@ -1184,6 +1183,84 @@ pub trait EcosystemFormatter: Send + Sync {
     /// `require`.
     fn manifest_requirement_is_resolved_version(&self, dep: &dyn Dependency) -> bool {
         let _ = dep;
+        false
+    }
+
+    /// Whether this ecosystem's registry can resolve version data for `source`.
+    ///
+    /// Hover, diagnostics, and code actions gate every registry lookup on this instead of
+    /// [`crate::parser::DependencySource::is_version_resolvable`] directly, so an ecosystem
+    /// whose `Registry` implementation routes *more* sources than the generic
+    /// crates.io-shaped default (e.g. `deps-cargo`'s `CargoRegistry`, which additionally
+    /// resolves a `DependencySource::AlternateRegistry` against a private sparse index) can
+    /// opt those sources in without widening the `Registry` trait itself or touching any of
+    /// this hook's call sites.
+    ///
+    /// Default: delegates to
+    /// [`DependencySource::is_version_resolvable`](crate::parser::DependencySource::is_version_resolvable),
+    /// so every ecosystem that does not override this method keeps its exact pre-existing
+    /// resolvability answer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    /// use deps_core::parser::DependencySource;
+    /// use deps_core::{ConcreteVersion, PackageName};
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert!(DefaultFormatter.can_resolve_source(&DependencySource::Registry));
+    /// assert!(!DefaultFormatter.can_resolve_source(&DependencySource::AlternateRegistry {
+    ///     index: "https://index.mycorp.dev".into(),
+    /// }));
+    /// ```
+    fn can_resolve_source(&self, source: &crate::parser::DependencySource) -> bool {
+        source.is_version_resolvable()
+    }
+
+    /// Whether hover should omit [`Self::package_url`]'s heading link for a dependency
+    /// resolved against `source`.
+    ///
+    /// [`Self::package_url`] always names the ecosystem's *default* public registry (e.g.
+    /// crates.io) — correct for a plain [`DependencySource::Registry`](crate::parser::DependencySource::Registry)
+    /// dependency, but wrong for one resolved against a different registry entirely (e.g.
+    /// `deps-cargo`'s resolved `AlternateRegistry`): once live version data from that other
+    /// registry renders alongside the link, an unrelated crates.io link reads as
+    /// confirmation the link is real, which is worse than showing no link at all.
+    ///
+    /// Default `false` — every ecosystem with only one registry concept keeps its existing
+    /// hover heading unchanged; only `deps-cargo`'s `CargoFormatter` overrides this.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    /// use deps_core::parser::DependencySource;
+    /// use deps_core::{ConcreteVersion, PackageName};
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert!(!DefaultFormatter.suppress_package_url(&DependencySource::Registry));
+    /// ```
+    fn suppress_package_url(&self, source: &crate::parser::DependencySource) -> bool {
+        let _ = source;
         false
     }
 }

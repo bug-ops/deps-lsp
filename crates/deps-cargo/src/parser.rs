@@ -29,9 +29,11 @@
 //! assert_eq!(result.dependencies[0].name, "serde");
 //! ```
 
+use crate::config::{AuthToken, RegistryIndex};
 use crate::types::{DependencySection, DependencySource, ParsedDependency};
 use deps_core::{DepsError, Result};
 use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use toml_span::value::{Table, Value};
 use tower_lsp_server::ls_types::{Range, Uri};
@@ -50,6 +52,16 @@ pub struct ParseResult {
     pub workspace_root: Option<PathBuf>,
     /// Document URI
     pub uri: Uri,
+    /// Every alternate-registry index this parse resolved (spec FR-002), paired with the
+    /// credential (if any) to attach to requests against it.
+    ///
+    /// `crate::ecosystem::CargoEcosystem::parse_manifest` registers each of these into the
+    /// shared `CargoRegistry` router immediately after parsing, so a later
+    /// `Registry::get_versions_from` call for the matching
+    /// `DependencySource::AlternateRegistry` source can find its (possibly authenticated)
+    /// client. Always empty when [`Self::dependencies`] contains no `CustomRegistry`
+    /// source (spec NFR-004's zero-extra-work lazy trigger).
+    pub resolved_registries: Vec<(RegistryIndex, Option<AuthToken>)>,
 }
 
 /// Parses a Cargo.toml file and extracts all dependencies with positions.
@@ -139,15 +151,119 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
 
     let workspace_root = find_workspace_root(doc_uri)?;
 
+    let resolved_registries = resolve_alternate_registries(&mut dependencies, doc_uri);
+
     Ok(ParseResult {
         dependencies,
         workspace_root,
         uri: doc_uri.clone(),
+        resolved_registries,
     })
 }
 
 fn get_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
     table.get(key)
+}
+
+/// Rewrites every `DependencySource::CustomRegistry` entry in `dependencies` into a
+/// resolved `DependencySource::AlternateRegistry` when possible (spec FR-002), returning
+/// the newly-resolved `(index, auth)` pairs for `crate::ecosystem::CargoEcosystem::parse_manifest`
+/// to register into the shared `CargoRegistry` router.
+///
+/// Two distinct forms reach this function, both stored as `CustomRegistry { url }` by the
+/// caller above:
+/// - `registry-index = "sparse+https://..."` — `url` is already a concrete index URL, so it
+///   resolves directly via [`RegistryIndex::new`], with no `.cargo/config.toml` lookup and
+///   no possible credential (a literal URL in `Cargo.toml` is workspace-declared by
+///   definition — `auth` is always `None` for this form).
+/// - `registry = "<alias>"` — `url` is an alias name, which does not parse as a URL, so it
+///   falls through to alias resolution via `crate::config::resolve` against the
+///   `.cargo/config.toml` hierarchy plus `$CARGO_HOME/config.toml` (spec FR-003: an alias
+///   with no matching entry stays `CustomRegistry`, unchanged, with a `tracing::warn!`).
+///
+/// A no-op — zero additional filesystem reads (spec NFR-004) — when `dependencies` contains
+/// no `CustomRegistry` source at all.
+fn resolve_alternate_registries(
+    dependencies: &mut [ParsedDependency],
+    doc_uri: &Uri,
+) -> Vec<(RegistryIndex, Option<AuthToken>)> {
+    let raw_values: HashSet<String> = dependencies
+        .iter()
+        .filter_map(|dep| match &dep.source {
+            DependencySource::CustomRegistry { url } => Some(url.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if raw_values.is_empty() {
+        return Vec::new();
+    }
+
+    let mut aliases: HashSet<String> = HashSet::new();
+    // Maps each raw `CustomRegistry.url` value that resolved to its concrete index, so the
+    // rewrite pass below can look a dependency's exact declared value back up.
+    let mut resolved_by_raw_value: HashMap<String, RegistryIndex> = HashMap::new();
+    let mut newly_resolved: Vec<(RegistryIndex, Option<AuthToken>)> = Vec::new();
+
+    for value in &raw_values {
+        match RegistryIndex::new(value) {
+            Ok(index) => {
+                resolved_by_raw_value.insert(value.clone(), index.clone());
+                newly_resolved.push((index, None));
+            }
+            Err(_) => {
+                aliases.insert(value.clone());
+            }
+        }
+    }
+
+    if !aliases.is_empty() {
+        match doc_uri.to_file_path() {
+            Some(manifest_path) => {
+                let start_dir = manifest_path
+                    .parent()
+                    .map_or_else(|| manifest_path.to_path_buf(), std::path::Path::to_path_buf);
+                let workspace_paths = crate::config::discover_workspace_config_paths(&start_dir);
+                let cargo_home_path = crate::config::cargo_home_config_path();
+                let config =
+                    crate::config::resolve(&aliases, &workspace_paths, cargo_home_path.as_deref());
+
+                for alias in &aliases {
+                    if let Some(entry) = config.get(alias) {
+                        resolved_by_raw_value.insert(alias.clone(), entry.index.clone());
+                        newly_resolved.push((entry.index.clone(), entry.auth.clone()));
+                    } else {
+                        tracing::warn!(
+                            alias,
+                            "registry alias did not resolve via the .cargo/config.toml \
+                             hierarchy or $CARGO_HOME/config.toml; dependency stays unresolved"
+                        );
+                    }
+                }
+            }
+            None => {
+                for alias in &aliases {
+                    tracing::warn!(
+                        alias,
+                        "could not determine a directory to search for .cargo/config.toml; \
+                         alias stays unresolved"
+                    );
+                }
+            }
+        }
+    }
+
+    for dep in dependencies.iter_mut() {
+        if let DependencySource::CustomRegistry { url } = &dep.source
+            && let Some(index) = resolved_by_raw_value.get(url)
+        {
+            dep.source = DependencySource::AlternateRegistry {
+                index: index.as_str().to_string(),
+            };
+        }
+    }
+
+    newly_resolved
 }
 
 /// Parses the `dependencies`, `dev-dependencies`, and `build-dependencies` tables
@@ -575,17 +691,97 @@ serde = { version = "1.0", registry = "crates-io" }"#;
 
     #[test]
     fn test_parse_registry_index_custom_url() {
+        // A literal `registry-index` URL is already a concrete, fetchable index — it
+        // resolves to `AlternateRegistry` directly, with no `.cargo/config.toml` lookup
+        // needed (spec FR-002).
         let toml = r#"[dependencies]
 internal-crate = { version = "1.0", registry-index = "https://gitlab.mycorp.com/registry-index" }"#;
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         match &result.dependencies[0].source {
+            DependencySource::AlternateRegistry { index } => {
+                assert_eq!(index, "https://gitlab.mycorp.com/registry-index");
+            }
+            other => panic!("expected AlternateRegistry, got {other:?}"),
+        }
+        assert_eq!(result.resolved_registries.len(), 1);
+        assert!(result.resolved_registries[0].1.is_none());
+    }
+
+    #[test]
+    fn test_parse_registry_index_invalid_url_stays_custom_registry() {
+        // An http:// registry-index URL fails `RegistryIndex` validation, so it must stay
+        // unresolved rather than silently downgrading to an insecure fetch.
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry-index = "http://insecure.mycorp.com/index" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
             DependencySource::CustomRegistry { url } => {
-                assert_eq!(url, "https://gitlab.mycorp.com/registry-index");
+                assert_eq!(url, "http://insecure.mycorp.com/index");
             }
             other => panic!("expected CustomRegistry, got {other:?}"),
         }
-        assert!(!result.dependencies[0].source.is_version_resolvable());
+        assert!(result.resolved_registries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_custom_registry_alias_unresolved_without_config() {
+        // No `.cargo/config.toml` exists anywhere above the test fixture path, so the
+        // alias stays unresolved (spec FR-003) — this is the pre-existing
+        // `test_parse_custom_registry_dependency` scenario, additionally asserting the
+        // resolution attempt itself doesn't panic or resolve anything.
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry = "my-corp" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::CustomRegistry { url } => assert_eq!(url, "my-corp"),
+            other => panic!("expected CustomRegistry, got {other:?}"),
+        }
+        assert!(result.resolved_registries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_custom_registry_alias_resolves_via_workspace_config() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[registries.my-corp]\nindex = \"sparse+https://index.mycorp.dev\"\n",
+        )
+        .unwrap();
+
+        let manifest_path = root.path().join("Cargo.toml");
+        std::fs::write(&manifest_path, "").unwrap();
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry = "my-corp" }"#;
+        let result = parse_cargo_toml(toml, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::AlternateRegistry { index } => {
+                assert_eq!(index, "https://index.mycorp.dev/");
+            }
+            other => panic!("expected AlternateRegistry, got {other:?}"),
+        }
+        assert_eq!(result.resolved_registries.len(), 1);
+        assert!(
+            result.resolved_registries[0].1.is_none(),
+            "workspace-sourced entry must never carry a token"
+        );
+    }
+
+    #[test]
+    fn test_parse_no_custom_registry_dependency_resolves_nothing() {
+        // NFR-004: a manifest with no CustomRegistry source resolves nothing at all — the
+        // lazy trigger, asserted at the parser's own boundary rather than only inferred
+        // from behavior.
+        let toml = r#"[dependencies]
+serde = "1.0""#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert!(result.resolved_registries.is_empty());
     }
 
     #[test]

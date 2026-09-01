@@ -440,9 +440,14 @@ dependencies = [
 name = "deps-cargo"
 version = "0.11.1"
 dependencies = [
+ "bytes",
  "criterion",
+ "dashmap",
+ "deps-cargo",
  "deps-core",
  "insta",
+ "mockito",
+ "reqwest",
  "semver",
  "serde",
  "serde_json",

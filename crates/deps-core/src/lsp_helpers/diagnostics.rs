@@ -4,8 +4,8 @@ use tower_lsp_server::ls_types::{
 
 use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome, diagnostic_severity_for};
 use crate::{
-    ConcreteVersion, Dependency, Deprecation, ParseResult, PublishTime, Registry, RemovalStatus,
-    VersionReq, format_relative_age, is_within_cooldown,
+    ConcreteVersion, Dependency, Deprecation, ParseResult, PublishTime, RemovalStatus, VersionReq,
+    format_relative_age, is_within_cooldown,
 };
 
 use super::{EcosystemFormatter, RequirementMatcher, RequirementStatus, VersionData};
@@ -29,8 +29,7 @@ pub const DEPRECATED_DIAGNOSTIC_CODE: &str = "deprecated-package";
 /// Diagnostic severity levels for the four per-dependency issue categories.
 ///
 /// Threaded from `DiagnosticsConfig` (`deps-lsp`) through
-/// [`crate::Ecosystem::generate_diagnostics`] into [`generate_diagnostics_from_cache`]
-/// and [`generate_diagnostics`].
+/// [`crate::Ecosystem::generate_diagnostics`] into [`generate_diagnostics_from_cache`].
 ///
 /// # Examples
 ///
@@ -503,16 +502,15 @@ pub fn generate_diagnostics_from_cache(
         // vulnerability push above — a registry-reported deprecation must never be
         // suppressed by an unrelated "latest" lookup failure.
         //
-        // I4: gated on `is_version_resolvable()`, same guard `unsatisfiable`/`yanked_only`
+        // I4: gated on `can_resolve_source()`, same guard `unsatisfiable`/`yanked_only`
         // apply further down — `versions.deprecations` is name-keyed, so a git/path/SDK
         // occurrence sharing a name with an unrelated registry-resolved package (the same
         // #248 coincidental-namesake hazard) must not surface a diagnostic for a package
         // it doesn't actually resolve against. Folded into `deprecation` itself (rather
         // than only guarding the `push` call) so the D5 suppression gate below — which
         // reads `deprecation.is_some()` — sees the same answer.
-        let deprecation = dep
-            .source()
-            .is_version_resolvable()
+        let deprecation = formatter
+            .can_resolve_source(&dep.source())
             .then(|| versions.deprecations.and_then(|d| d.get(&normalized_name)))
             .flatten();
         if let Some(dep_info) = deprecation {
@@ -601,7 +599,7 @@ pub fn generate_diagnostics_from_cache(
                 // distinctly from a genuine "not found" so a transient registry
                 // outage or a malformed response (e.g. unparseable
                 // maven-metadata.xml) doesn't masquerade as "Unknown package".
-                let fetch_failed = dep.source().is_version_resolvable()
+                let fetch_failed = formatter.can_resolve_source(&dep.source())
                     && versions
                         .fetch_failed
                         .is_some_and(|f| f.contains(normalized_name.as_str()));
@@ -611,7 +609,7 @@ pub fn generate_diagnostics_from_cache(
                         "Registry lookup failed for '{}'; package status could not be determined",
                         dep.name()
                     )),
-                    Ok(()) if dep.source().is_version_resolvable() => {
+                    Ok(()) if formatter.can_resolve_source(&dep.source()) => {
                         Some(format!("Unknown package '{}'", dep.name()))
                     }
                     Ok(()) => None,
@@ -643,7 +641,7 @@ pub fn generate_diagnostics_from_cache(
         // unrelated package (Dart's `{ sdk: flutter, version = "^3.24.0" }`
         // resolves against pub.dev's unrelated `flutter` package). Neither
         // is a meaningful "no published version satisfies this" check.
-        let unsatisfiable = dep.source().is_version_resolvable()
+        let unsatisfiable = formatter.can_resolve_source(&dep.source())
             && dep.version_requirement().is_some_and(|version_req| {
                 requirement_is_unsatisfiable(formatter, version_req, &package_versions.available)
             });
@@ -691,8 +689,11 @@ pub fn generate_diagnostics_from_cache(
         // `yanked_263_diagnostic_pushed`), so the two checks never double-report — but,
         // critically (#437 S1), NOT skipped merely because the #263 check was D5-suppressed:
         // that suppression pushed nothing, so #247 must still be free to decide for itself.
+        // Source-resolvability guard migrated to `can_resolve_source` (#431) so a source this
+        // ecosystem cannot fetch from (e.g. an unresolved Cargo registry alias) is excluded the
+        // same way the other diagnostics in this function already are.
         let yanked_only_status = (!yanked_263_diagnostic_pushed
-            && dep.source().is_version_resolvable())
+            && formatter.can_resolve_source(&dep.source()))
         .then(|| dep.version_requirement())
         .flatten()
         .filter(|version_req| formatter.yanked_diagnostic_applies_to(version_req))
@@ -733,7 +734,7 @@ pub fn generate_diagnostics_from_cache(
         // not a real lookup against the registry this dependency actually resolves
         // against — so "Outdated" must not be evaluated for it either (#248).
         let status = match dep.version_requirement() {
-            Some(version_req) if dep.source().is_version_resolvable() => {
+            Some(version_req) if formatter.can_resolve_source(&dep.source()) => {
                 formatter.requirement_status(version_req, latest)
             }
             _ => RequirementStatus::Unresolved,
@@ -862,89 +863,6 @@ fn push_vulnerability_diagnostics(
             ..Default::default()
         });
     }
-}
-
-/// Generates diagnostics by fetching from registry (makes network calls).
-///
-/// **Warning**: This function makes network requests for each dependency.
-/// Prefer `generate_diagnostics_from_cache` when cached versions are available. Not called
-/// anywhere in this workspace (`deps-lsp` always has cached versions by the time
-/// diagnostics run) — kept as public API for external callers of `deps-core` as a library,
-/// re-exported as `deps_core::lsp_generate_diagnostics`. Does not emit a yanked-version
-/// diagnostic: `get_latest_matching`'s trait contract filters yanked versions by default
-/// (see [`Registry::get_latest_matching`]), so the version it returns is never yanked
-/// under a normal requirement (#233).
-pub async fn generate_diagnostics<R: Registry + ?Sized>(
-    parse_result: &dyn ParseResult,
-    registry: &R,
-    formatter: &dyn EcosystemFormatter,
-    _freshness: crate::freshness::FreshnessSettings,
-    severities: DiagnosticSeverities,
-) -> Vec<Diagnostic> {
-    let deps = parse_result.dependencies();
-    let mut diagnostics = Vec::with_capacity(deps.len());
-
-    for dep in deps {
-        // Deliberately `get_versions`, not `get_versions_with`: diagnostics render no
-        // publish ages, so paying for a registry's extra freshness fetch here would be
-        // pure waste. This function is not called anywhere in this workspace (see the
-        // doc comment above), so `_freshness` stays unused by design, not oversight.
-        let versions = match registry.get_versions(dep.name()).await {
-            Ok(v) => v,
-            Err(e) => {
-                // Same distinction as `generate_diagnostics_from_cache`/`FetchResult::fetch_failed`
-                // (#267): a genuine not-found means the registry answered "no such package",
-                // while any other error means the registry couldn't be asked at all.
-                let message = match formatter.validate_package_name(dep.name().as_str()) {
-                    Err(reason) => format!("Invalid package name '{}': {reason}", dep.name()),
-                    Ok(()) if e.is_not_found() => format!("Unknown package '{}'", dep.name()),
-                    Ok(()) => format!(
-                        "Registry lookup failed for '{}'; package status could not be determined",
-                        dep.name()
-                    ),
-                };
-                diagnostics.push(Diagnostic {
-                    range: dep.name_range(),
-                    severity: Some(severities.unknown),
-                    message,
-                    source: Some("deps-lsp".into()),
-                    ..Default::default()
-                });
-                continue;
-            }
-        };
-
-        let Some(version_req) = dep.version_requirement() else {
-            continue;
-        };
-        let Some(version_range) = dep.version_range() else {
-            continue;
-        };
-
-        let matching = registry
-            .get_latest_matching(dep.name(), version_req)
-            .await
-            .ok()
-            .flatten();
-
-        if matching.is_some() {
-            let latest = crate::registry::find_latest_stable(&versions);
-            if let Some(latest) = latest
-                && formatter.requirement_status(version_req, latest.version_string())
-                    == RequirementStatus::Outdated
-            {
-                diagnostics.push(Diagnostic {
-                    range: version_range,
-                    severity: Some(severities.outdated),
-                    message: format!("Newer version available: {}", latest.version_string()),
-                    source: Some("deps-lsp".into()),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
-    diagnostics
 }
 
 #[cfg(test)]
@@ -1105,151 +1023,6 @@ mod tests {
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
         assert!(diagnostics[0].message.starts_with("Invalid package name"));
         assert!(!diagnostics[0].message.contains("Unknown package"));
-    }
-
-    #[tokio::test]
-    async fn test_generate_diagnostics_invalid_package_name() {
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        // Network variant: a registry lookup failure combined with a rejected
-        // name must produce "Invalid package name", not "Unknown package".
-        let formatter = RejectingFormatter;
-
-        let parse_result = MockParseResult {
-            deps: vec![MockDep {
-                name: "bad-pkg".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
-            }],
-            uri: crate::test_util::test_uri("/test/package.json"),
-        };
-
-        let diagnostics = generate_diagnostics(
-            &parse_result,
-            &ErrorRegistry,
-            &formatter,
-            crate::FreshnessSettings::default(),
-            DiagnosticSeverities::default(),
-        )
-        .await;
-
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
-        assert!(diagnostics[0].message.starts_with("Invalid package name"));
-        assert!(!diagnostics[0].message.contains("Unknown package"));
-    }
-
-    #[tokio::test]
-    async fn test_generate_diagnostics_unknown_uses_configured_severity() {
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        // `NotFoundRegistry`, not `ErrorRegistry`: "Unknown package" is only
-        // correct when the registry was actually asked and said "no such
-        // package" (#267 C1) — an opaque `CacheError` must not reach this
-        // branch, or a transient outage would be mislabeled as a genuinely
-        // nonexistent dependency.
-        let formatter = MockFormatter;
-
-        let parse_result = MockParseResult {
-            deps: vec![MockDep {
-                name: "serde".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-            }],
-            uri: crate::test_util::test_uri("/test/Cargo.toml"),
-        };
-
-        let severities = DiagnosticSeverities {
-            unknown: DiagnosticSeverity::ERROR,
-            ..DiagnosticSeverities::default()
-        };
-
-        let diagnostics = generate_diagnostics(
-            &parse_result,
-            &NotFoundRegistry,
-            &formatter,
-            crate::FreshnessSettings::default(),
-            severities,
-        )
-        .await;
-
-        assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.starts_with("Unknown package"));
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
-    }
-
-    #[tokio::test]
-    async fn test_generate_diagnostics_registry_error_not_reported_as_unknown() {
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        // #267 C1: an opaque registry failure (`ErrorRegistry`'s `CacheError`,
-        // standing in for a network error, timeout, or malformed response)
-        // must not produce "Unknown package" — the registry was never
-        // successfully asked, so absence of a result is not evidence the
-        // package doesn't exist.
-        let formatter = MockFormatter;
-
-        let parse_result = MockParseResult {
-            deps: vec![MockDep {
-                name: "serde".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-            }],
-            uri: crate::test_util::test_uri("/test/Cargo.toml"),
-        };
-
-        let diagnostics = generate_diagnostics(
-            &parse_result,
-            &ErrorRegistry,
-            &formatter,
-            crate::FreshnessSettings::default(),
-            DiagnosticSeverities::default(),
-        )
-        .await;
-
-        assert_eq!(diagnostics.len(), 1);
-        assert!(!diagnostics[0].message.contains("Unknown package"));
-        assert!(diagnostics[0].message.contains("Registry lookup failed"));
-    }
-
-    #[tokio::test]
-    async fn test_generate_diagnostics_outdated_uses_configured_severity() {
-        use tower_lsp_server::ls_types::{Position, Range};
-
-        let formatter = MockFormatter;
-
-        let parse_result = MockParseResult {
-            deps: vec![MockDep {
-                name: "serde".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
-                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
-            }],
-            uri: crate::test_util::test_uri("/test/Cargo.toml"),
-        };
-
-        let severities = DiagnosticSeverities {
-            outdated: DiagnosticSeverity::ERROR,
-            ..DiagnosticSeverities::default()
-        };
-
-        let diagnostics = generate_diagnostics(
-            &parse_result,
-            &OutdatedRegistry,
-            &formatter,
-            crate::FreshnessSettings::default(),
-            severities,
-        )
-        .await;
-
-        let outdated_diag = diagnostics
-            .iter()
-            .find(|d| d.message.starts_with("Newer version available"))
-            .expect("expected an outdated diagnostic");
-        assert_eq!(outdated_diag.severity, Some(DiagnosticSeverity::ERROR));
     }
 
     #[test]

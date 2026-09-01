@@ -60,34 +60,55 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // against `registry` at all — fetching by name here would silently check an
     // unrelated or coincidentally-named public-registry package (#248), so hover
     // must skip the registry lookup and every section built from it entirely.
-    let resolvable = dep.source().is_version_resolvable();
+    // `can_resolve_source` (not the bare `DependencySource::is_version_resolvable`)
+    // so an ecosystem whose registry routes more sources than the generic default
+    // (e.g. `deps-cargo`'s resolved `AlternateRegistry`) gets hover support for
+    // them without a new gate here.
+    let dep_source = dep.source();
+    let resolvable = formatter.can_resolve_source(&dep_source);
 
     // `now` is a caller-supplied parameter (issue #227 M4) rather than computed
     // internally via `PublishTime::now()` — this is what lets tests pin an exact
     // cooldown-boundary instant deterministically, and guarantees every age rendered
     // in this single hover response (the `**Latest**` line and the "Recent versions"
     // list below) is aged against the same instant.
+    //
+    // `.ok()`, not `.ok()?`: a fetch failure here (off-VPN, an expired token, a
+    // DNS-blocked internal host — routine for a self-hosted registry's normal users)
+    // must degrade to the same basic name/requirement/features card the `!resolvable`
+    // branch below renders, not vanish the entire hover response. Propagating `None`
+    // out of the whole function on any transient fetch error was a real regression
+    // once a resolvable source could be a private index rather than always crates.io.
     let available_versions = if resolvable {
-        Some(
-            registry
-                .get_versions_with(dep.name(), freshness)
-                .await
-                .ok()?,
-        )
+        registry
+            .get_versions_from(dep.name(), &dep_source, freshness)
+            .await
+            .ok()
     } else {
         None
     };
 
-    let url = formatter.package_url(dep.name());
+    // FR-014: a resolved-but-not-crates.io source (e.g. Cargo's `AlternateRegistry`) must
+    // not carry a link to the ecosystem's *default* registry — once live version data from
+    // the real registry renders below, an unrelated link reads as confirmation it's real.
+    let url =
+        (!formatter.suppress_package_url(&dep_source)).then(|| formatter.package_url(dep.name()));
 
     // Pre-allocate with estimated capacity to reduce allocations
     let mut markdown = String::with_capacity(512);
-    write!(
-        &mut markdown,
-        "# [{}]({})\n\n",
-        escape_markdown(dep.name().as_str()),
-        url
-    )
+    match &url {
+        Some(url) => write!(
+            &mut markdown,
+            "# [{}]({})\n\n",
+            escape_markdown(dep.name().as_str()),
+            url
+        ),
+        None => write!(
+            &mut markdown,
+            "# {}\n\n",
+            escape_markdown(dep.name().as_str())
+        ),
+    }
     .unwrap();
 
     let normalized_name = formatter.normalize_package_name(dep.name());
@@ -184,7 +205,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     {
         match tokio::time::timeout(
             HOVER_FALLBACK_TIMEOUT,
-            registry.get_latest_matching(dep.name(), &wildcard_req),
+            registry.get_latest_matching_from(dep.name(), &dep_source, &wildcard_req, None),
         )
         .await
         {
@@ -860,6 +881,44 @@ mod tests {
             registry.get_latest_matching_calls.load(Ordering::Relaxed),
             0,
             "get_latest_matching must not be called when the list-based pick already succeeded"
+        );
+    }
+
+    /// Review regression: a fetch failure for a resolvable source (off-VPN, an expired
+    /// token, a DNS-blocked internal host — routine for a private-registry user) must
+    /// degrade to the basic name/requirement/features card, not vanish the whole hover
+    /// response. `.ok()?` on the fetch would have propagated `None` out of the entire
+    /// function here; `.ok()` must let `available_versions` become `None` instead.
+    #[tokio::test]
+    async fn test_generate_hover_renders_basic_card_when_fetch_fails() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("serde");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &ErrorRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover must still render on a fetch failure, not disappear entirely");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("serde"),
+            "basic card must still render the package name; got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("**Latest**"),
+            "no version data is available on a fetch failure; got: {}",
+            content.value
         );
     }
 
@@ -2165,13 +2224,20 @@ mod tests {
         assert!(vulnerable_content.value.contains("RUSTSEC-2020-0071"));
     }
 
-    /// #366: a registry error classified as `PackageNotFound` (e.g. `deps-maven`'s
-    /// `metadata_urls` rejecting a dot-segment coordinate like `com.example:..`, mirrored
-    /// here by [`NotFoundRegistry`]) must make hover return `None` via this function's own
-    /// `get_versions_with(...).await.ok()?` chain, exactly like it already does for a
-    /// genuine 404 — not a broken hover section built from an empty version list.
+    /// #366, revised by the PR-431 review's Critical finding #3: a registry error
+    /// classified as `PackageNotFound` (e.g. `deps-maven`'s `metadata_urls` rejecting a
+    /// dot-segment coordinate like `com.example:..`, mirrored here by [`NotFoundRegistry`])
+    /// used to make hover return `None` entirely via `.ok()?`. That chain was widened to
+    /// plain `.ok()` because a *transient* fetch failure (off-VPN, an expired token, a
+    /// DNS-blocked internal host) must degrade to the basic name/requirement/features
+    /// card instead of vanishing the whole hover response — a real regression once a
+    /// resolvable source could be a private registry rather than always crates.io. A
+    /// `PackageNotFound` error takes the same, now-shared path: hover still renders (the
+    /// basic card, exactly as the non-resolvable-source branch already produces), just
+    /// with no version section — never "a broken hover section built from an empty
+    /// version list".
     #[tokio::test]
-    async fn test_generate_hover_none_when_registry_reports_not_found() {
+    async fn test_generate_hover_renders_basic_card_when_registry_reports_not_found() {
         let parse_result = MockParseResult {
             deps: vec![dep_at("com.example:..")],
             uri: crate::test_util::test_uri("/test/pom.xml"),
@@ -2188,8 +2254,21 @@ mod tests {
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
-        .await;
+        .await
+        .expect("hover must still render the basic card on a registry error");
 
-        assert!(hover.is_none());
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("**Latest**"),
+            "no version data is available on a registry error; got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("Recent versions"),
+            "must not render a broken version section from an empty list; got: {}",
+            content.value
+        );
     }
 }

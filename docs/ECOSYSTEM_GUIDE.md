@@ -8,7 +8,7 @@ deps-lsp provides comprehensive LSP support for 12 package ecosystems:
 
 | Ecosystem | Language | Manifest File(s) | Lock File(s) | Features |
 |-----------|----------|-----------------|--------------|----------|
-| **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens, feature flag completion |
+| **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens, feature flag completion, alternate/private registry resolution via `.cargo/config.toml` (see below) |
 | **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
 | **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens |
 | **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support |
@@ -20,6 +20,45 @@ deps-lsp provides comprehensive LSP support for 12 package ecosystems:
 | **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, code lens (range-form dependencies not covered — see below), GitHub API support |
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json` | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling |
 | **Deno** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics, code lens — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
+
+### Cargo Custom/Private Registries
+
+A Cargo dependency declared as `registry = "<alias>"` or `registry-index = "<url>"`
+resolves against that registry's own sparse index — hover, diagnostics, completion,
+and code actions all work against it exactly as they do for a plain crates.io
+dependency, instead of showing no version data at all.
+
+**Resolution**: `registry = "<alias>"` is resolved by reading `[registries.<alias>]`
+from the same `.cargo/config.toml` hierarchy Cargo itself consults — every
+ancestor directory's `.cargo/config.toml` between the opened manifest and the
+filesystem root, closest directory winning — plus `$CARGO_HOME/config.toml` as the
+lowest-precedence tier. `registry-index = "<url>"` needs no config lookup: it is
+already a concrete index URL. Only `sparse+https://` (or a bare `https://`) index
+URLs are supported; `http://` and any URL carrying `user:pass@` are rejected.
+Cargo's `CARGO_REGISTRIES_<NAME>_INDEX`/`_TOKEN` environment variable overrides are
+also honored.
+
+**Authentication**: a bearer token is attached to requests against a registry
+resolved from `$CARGO_HOME/config.toml` (or its own `CARGO_REGISTRIES_<NAME>_TOKEN`
+environment variable) only. A registry alias resolved from a workspace
+`.cargo/config.toml` — a file a cloned, untrusted repository fully controls — never
+gets a credential attached, even if an identically-named alias is configured with
+one in `$CARGO_HOME`. This is deliberate: it prevents a hostile repository from
+redirecting a familiar alias name (e.g. `"github"`) to an attacker-controlled host
+and harvesting whatever token the user's real, differently-scoped registry of that
+name would have used.
+
+**Known limitations**:
+- The `[source]` replace-with mechanism (mirroring crates.io through a corporate
+  proxy) is not yet supported — tracked as a follow-up.
+- Editing `.cargo/config.toml` does not take effect until the affected `Cargo.toml`
+  is next reparsed (edited, or the document reopened) — there is no dedicated file
+  watcher for it yet.
+- The sparse index protocol has no search endpoint, so package-*name* completion
+  (typing a brand-new dependency) always searches crates.io, even inside a
+  workspace whose default registry is mirrored elsewhere.
+- Git-index (non-sparse) private registries remain unsupported, matching prior
+  behavior.
 
 ### Yanked-Version Diagnostics
 

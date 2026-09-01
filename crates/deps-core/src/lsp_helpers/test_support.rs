@@ -211,8 +211,8 @@ impl crate::Registry for MockRegistry {
     }
 }
 
-/// A registry whose `get_versions` always errs, for exercising
-/// `generate_diagnostics`'s `Err` arm.
+/// A registry whose `get_versions` always errs, for exercising a fetch-failure code
+/// path (e.g. `generate_hover`'s degrade-to-basic-card behavior on a failed fetch).
 pub(crate) struct ErrorRegistry;
 
 impl crate::Registry for ErrorRegistry {
@@ -250,9 +250,9 @@ impl crate::Registry for ErrorRegistry {
 }
 
 /// A registry whose `get_versions` always errs with `PackageNotFound`, for
-/// exercising `generate_diagnostics`'s "Unknown package" branch (#267 C1) —
-/// distinct from [`ErrorRegistry`], whose `CacheError` must instead produce
-/// the "Registry lookup failed" message.
+/// exercising a "package genuinely doesn't exist" code path — distinct from
+/// [`ErrorRegistry`], whose `CacheError` stands in for a transient/unanswerable
+/// failure instead.
 pub(crate) struct NotFoundRegistry;
 
 impl crate::Registry for NotFoundRegistry {
@@ -275,53 +275,6 @@ impl crate::Registry for NotFoundRegistry {
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         Box::pin(async move { Ok(None) })
-    }
-
-    fn search<'a>(
-        &'a self,
-        _query: &'a str,
-        _limit: usize,
-    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
-        Box::pin(async move { Ok(Vec::new()) })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-/// A registry whose `get_versions` succeeds with a newer stable version and
-/// whose `get_latest_matching` returns a non-yanked current version, for
-/// exercising `generate_diagnostics`'s outdated-severity wiring.
-pub(crate) struct OutdatedRegistry;
-
-impl crate::Registry for OutdatedRegistry {
-    fn get_versions<'a>(
-        &'a self,
-        _name: &'a PackageName,
-    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
-        Box::pin(async move {
-            Ok(vec![Box::new(MockVersionWithAge {
-                version: "2.0.0".into(),
-                yanked: false,
-                published_at: None,
-            }) as Box<dyn crate::Version>])
-        })
-    }
-
-    fn get_latest_matching<'a>(
-        &'a self,
-        _name: &'a PackageName,
-        _req: &'a VersionReq,
-    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
-    {
-        Box::pin(async move {
-            Ok(Some(Box::new(MockVersionWithAge {
-                version: "1.0.0".into(),
-                yanked: false,
-                published_at: None,
-            }) as Box<dyn crate::Version>))
-        })
     }
 
     fn search<'a>(

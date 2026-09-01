@@ -12,8 +12,18 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Relaxes `RegistryIndex::new`'s https-only gate for a loopback host, so a test (unit or
+# integration) can point it at a `mockito::Server` without weakening the gate for real
+# builds — mirrors `deps-core`'s own `test-util` feature and `HttpCache::ensure_https`'s
+# identical precedent.
+test-util = []
+
 [dependencies]
+bytes = { workspace = true }
+dashmap = { workspace = true }
 deps-core = { workspace = true }
+reqwest = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -22,16 +32,18 @@ tokio = { workspace = true, features = ["fs"] }
 toml-span = { workspace = true }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
+deps-cargo = { path = ".", features = ["test-util"] }
 deps-core = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true, features = ["html_reports"] }
 insta = { workspace = true, features = ["json"] }
+mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test = { workspace = true }
-url = { workspace = true }
 
 [[bench]]
 name = "cargo_benchmarks"

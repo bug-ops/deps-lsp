@@ -200,7 +200,7 @@ fn build_unsatisfiable_fix_action(
     version_req: &VersionReq,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<UnsatisfiableFixAction> {
-    if !dep.source().is_version_resolvable() {
+    if !formatter.can_resolve_source(&dep.source()) {
         return None;
     }
 
@@ -495,7 +495,29 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         formatter,
     );
 
-    let registry_versions = registry.get_versions(dep.name()).await.ok();
+    // Gated on `can_resolve_source` (#248/FR-001): a Git/Path/unresolved-custom-registry
+    // dependency must never have its name looked up against this ecosystem's default
+    // registry client, which would silently check an unrelated or coincidentally-named
+    // package and offer bogus "update to X" actions for it. `FreshnessSettings::enabled:
+    // false` preserves this call's original `Registry::get_versions` behavior exactly (no
+    // publish-time enrichment) now that it is routed through the freshness-aware
+    // `get_versions_from`.
+    let dep_source = dep.source();
+    let registry_versions = if formatter.can_resolve_source(&dep_source) {
+        registry
+            .get_versions_from(
+                dep.name(),
+                &dep_source,
+                crate::freshness::FreshnessSettings {
+                    enabled: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()
+    } else {
+        None
+    };
 
     // A fix target that the registry reports as yanked is dropped entirely rather than
     // offered — the surviving diagnostics carry the finding either way, and there is no

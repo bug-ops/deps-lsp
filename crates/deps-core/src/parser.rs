@@ -871,8 +871,30 @@ pub enum DependencySource {
     /// Workspace-inherited dependency (Cargo: `workspace = true`).
     Workspace,
 
-    /// Custom/alternative registry (Bundler custom sources, private registries).
+    /// Custom/alternative registry, named by an unresolved alias or raw index URL
+    /// (Bundler custom sources, an unresolved Cargo `registry = "my-corp"`).
+    ///
+    /// This variant's meaning is unchanged by [`AlternateRegistry`](Self::AlternateRegistry)'s
+    /// addition: it always means "not yet resolved to a concrete index this LSP can query" —
+    /// `url` may hold a bare alias (`"my-corp"`) or a URL string, but never a value this LSP
+    /// has validated and can fetch against. See [`AlternateRegistry`](Self::AlternateRegistry)
+    /// for the resolved counterpart.
     CustomRegistry { url: String },
+
+    /// A custom/alternative registry resolved to a concrete, fetchable index URL.
+    ///
+    /// Distinct from [`CustomRegistry`](Self::CustomRegistry) so "resolved" is a type-level
+    /// state instead of string-sniffing an unresolved alias vs. a URL. Produced only by a
+    /// parser that validated `index` against its own registry-configuration source (e.g.
+    /// `deps-cargo`'s `.cargo/config.toml` resolution) — `deps-core` itself never constructs
+    /// this variant. `index` is the `sparse+` prefix-stripped, https-only index URL; it
+    /// carries no credential and is not itself an authorization decision — see the
+    /// originating crate's config-resolution module for how (and whether) a request against
+    /// it is authenticated.
+    AlternateRegistry {
+        /// The resolved index URL, validated and normalized by the originating parser.
+        index: String,
+    },
 }
 
 impl DependencySource {
@@ -881,7 +903,10 @@ impl DependencySource {
     /// Registry dependencies support version fetching and update checks.
     /// Git, Path, Url, Sdk, and Workspace dependencies do not.
     pub fn is_registry(&self) -> bool {
-        matches!(self, Self::Registry | Self::CustomRegistry { .. })
+        matches!(
+            self,
+            Self::Registry | Self::CustomRegistry { .. } | Self::AlternateRegistry { .. }
+        )
     }
 
     /// Returns true if this LSP can resolve version data for this source
@@ -897,6 +922,13 @@ impl DependencySource {
     /// `CustomRegistry` dependency's name against the *public* registry, so
     /// this deliberately diverges from `is_registry()` and returns `false`
     /// for it, alongside Git/Path/Url/Sdk/Workspace sources.
+    ///
+    /// Also `false` for `AlternateRegistry`, even though it is resolved: this method answers
+    /// "does the generic `Registry` trait (crates.io-shaped, one client per ecosystem)
+    /// resolve this", not "is version data reachable at all". An ecosystem whose registry
+    /// implements per-source routing (`deps-cargo`'s `CargoRegistry`) must use
+    /// [`crate::lsp_helpers::EcosystemFormatter::can_resolve_source`] instead, which defaults
+    /// to this method and is the only override point — see that method's docs.
     pub fn is_version_resolvable(&self) -> bool {
         matches!(self, Self::Registry)
     }
@@ -1744,6 +1776,19 @@ dev_dependencies:
         // `is_registry()` stays true (it does name a registry), but this LSP
         // has no client for a private/custom registry, so it must not be
         // treated as version-resolvable against the public registry (#248).
+        assert!(source.is_registry());
+        assert!(!source.is_version_resolvable());
+    }
+
+    #[test]
+    fn test_dependency_source_alternate_registry() {
+        let source = DependencySource::AlternateRegistry {
+            index: "https://index.mycorp.dev".into(),
+        };
+        // `is_registry()` is true (it is a registry, just not the default one), but
+        // the generic `Registry` trait still can't resolve it — only an ecosystem
+        // whose `EcosystemFormatter::can_resolve_source` override understands this
+        // variant (e.g. `deps-cargo`'s `CargoFormatter`) can.
         assert!(source.is_registry());
         assert!(!source.is_version_resolvable());
     }
