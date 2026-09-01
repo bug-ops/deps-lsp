@@ -9,21 +9,25 @@
 //! # Examples
 //!
 //! ```no_run
+//! use deps_cargo::config::{IndexTrust, RegistryIndex};
 //! use deps_cargo::sparse::SparseIndexClient;
 //! use deps_core::HttpCache;
+//! use deps_core::net_policy::RegistryAccessPolicy;
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     let cache = Arc::new(HttpCache::new());
-//!     let client = SparseIndexClient::new("https://index.crates.io".to_string(), cache);
+//!     let policy = RegistryAccessPolicy::default();
+//!     let index = RegistryIndex::new("https://index.crates.io", IndexTrust::Trusted, &policy).unwrap();
+//!     let client = SparseIndexClient::new(index, cache);
 //!
 //!     let versions = client.get_versions("serde").await.unwrap();
 //!     println!("Latest serde: {}", versions[0].num);
 //! }
 //! ```
 
-use crate::config::AuthToken;
+use crate::config::{AuthToken, RegistryIndex};
 use crate::types::CargoVersion;
 use deps_core::{DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value};
 use semver::{Version, VersionReq};
@@ -220,27 +224,32 @@ pub struct SparseIndexClient {
 }
 
 impl SparseIndexClient {
-    /// Creates a new unauthenticated sparse-index client for `base_url`.
-    pub fn new(base_url: String, cache: Arc<HttpCache>) -> Self {
+    /// Creates a new unauthenticated sparse-index client for `index`.
+    ///
+    /// Takes a validated [`RegistryIndex`], not a bare `String` (plan-1b §1.2, critic S2):
+    /// `RegistryIndex::new`'s [`crate::config::IndexTrust`]/policy gate is the *only* public
+    /// constructor of a fetchable index URL, so this client cannot be built with one that
+    /// skipped it.
+    pub fn new(index: RegistryIndex, cache: Arc<HttpCache>) -> Self {
         Self {
-            base_url,
+            base_url: index.as_str().to_string(),
             cache,
             auth: None,
             registry_display_name: "sparse index",
         }
     }
 
-    /// Creates a new sparse-index client for `base_url`, attaching `auth` (if any) to
+    /// Creates a new sparse-index client for `index`, attaching `auth` (if any) to
     /// every request as a `Bearer` `Authorization` header, and using
     /// `registry_display_name` in not-found error messages.
     pub fn with_auth(
-        base_url: String,
+        index: RegistryIndex,
         cache: Arc<HttpCache>,
         auth: Option<AuthToken>,
         registry_display_name: &'static str,
     ) -> Self {
         Self {
-            base_url,
+            base_url: index.as_str().to_string(),
             cache,
             auth,
             registry_display_name,
@@ -267,7 +276,13 @@ impl SparseIndexClient {
     /// # #[tokio::main]
     /// # async fn main() {
     /// let cache = Arc::new(HttpCache::new());
-    /// let client = SparseIndexClient::new("https://index.crates.io".to_string(), cache);
+    /// let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+    /// let index = deps_cargo::config::RegistryIndex::new(
+    ///     "https://index.crates.io",
+    ///     deps_cargo::config::IndexTrust::Trusted,
+    ///     &policy,
+    /// ).unwrap();
+    /// let client = SparseIndexClient::new(index, cache);
     ///
     /// let versions = client.get_versions("serde").await.unwrap();
     /// assert!(!versions.is_empty());
@@ -332,6 +347,16 @@ impl SparseIndexClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IndexTrust;
+    use deps_core::net_policy::RegistryAccessPolicy;
+
+    /// Wraps `raw` into a [`RegistryIndex`] for test call sites, using an all-allow policy
+    /// so a test's own choice of URL (including a loopback mockito URL) is never blocked —
+    /// the policy gate itself is unit-tested directly in `config.rs`, not re-exercised here.
+    fn test_index(raw: &str) -> RegistryIndex {
+        let policy = RegistryAccessPolicy::default();
+        RegistryIndex::new(raw, IndexTrust::Trusted, &policy).unwrap()
+    }
 
     /// Live-network smoke test against the real crates.io sparse index. Restored
     /// (review finding #8) after being dropped, undisclosed, during the extraction of
@@ -340,7 +365,7 @@ mod tests {
     #[ignore]
     async fn test_fetch_real_serde_versions() {
         let cache = Arc::new(HttpCache::new());
-        let client = SparseIndexClient::new("https://index.crates.io".to_string(), cache);
+        let client = SparseIndexClient::new(test_index("https://index.crates.io"), cache);
         let versions = client.get_versions("serde").await.unwrap();
 
         assert!(!versions.is_empty());
@@ -353,7 +378,7 @@ mod tests {
     #[ignore]
     async fn test_get_latest_matching_real() {
         let cache = Arc::new(HttpCache::new());
-        let client = SparseIndexClient::new("https://index.crates.io".to_string(), cache);
+        let client = SparseIndexClient::new(test_index("https://index.crates.io"), cache);
         let latest = client.get_latest_matching("serde", "^1.0").await.unwrap();
 
         assert!(latest.is_some());
@@ -660,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_versions_rejects_bare_dot_dot_as_not_found() {
         let client = SparseIndexClient::new(
-            "https://index.crates.io".to_string(),
+            test_index("https://index.crates.io"),
             Arc::new(HttpCache::new()),
         );
         let err = client.get_versions("..").await.unwrap_err();
@@ -670,7 +695,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_versions_rejects_embedded_slash_as_not_found() {
         let client = SparseIndexClient::new(
-            "https://index.crates.io".to_string(),
+            test_index("https://index.crates.io"),
             Arc::new(HttpCache::new()),
         );
         let err = client.get_versions("../../etc/passwd").await.unwrap_err();
@@ -687,7 +712,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = SparseIndexClient::new(server.url(), Arc::new(HttpCache::new()));
+        let client = SparseIndexClient::new(test_index(&server.url()), Arc::new(HttpCache::new()));
         let versions = client.get_versions("serde").await.unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].num, "1.0.0");
@@ -705,7 +730,7 @@ mod tests {
             .await;
 
         let client = SparseIndexClient::with_auth(
-            server.url(),
+            test_index(&server.url()),
             Arc::new(HttpCache::new()),
             Some(AuthToken::new("secret-token".to_string())),
             "my-corp",
@@ -727,7 +752,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = SparseIndexClient::new(server.url(), Arc::new(HttpCache::new()));
+        let client = SparseIndexClient::new(test_index(&server.url()), Arc::new(HttpCache::new()));
         let latest = client.get_latest_matching("serde", "^1.0").await.unwrap();
         assert_eq!(latest.unwrap().num, "1.0.0");
     }

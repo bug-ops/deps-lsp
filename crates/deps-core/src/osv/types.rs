@@ -485,20 +485,20 @@ pub fn vulnerability_keys(
     ecosystem: crate::EcosystemId,
 ) -> HashMap<tower_lsp_server::ls_types::Range, String> {
     use crate::lsp_helpers::in_use_version;
-    use crate::parser::DependencySource;
 
     let deps = parse_result.dependencies();
 
-    // One signature per occurrence: registry-source deps carry their own
-    // in-use version (or "u" when none is determinable — a range
-    // requirement with no lock file); non-registry deps (git/path forks)
-    // always carry "n", since their `ScanOutcome` is always
+    // One signature per occurrence: public-registry-content deps (crates.io itself, or a
+    // verified crates.io mirror per `source_is_public_registry_content` — F1b) carry their
+    // own in-use version (or "u" when none is determinable — a range requirement with no
+    // lock file); every other source (git/path forks, a genuinely different private
+    // registry) always carries "n", since their `ScanOutcome` is always
     // `Skipped(NonRegistrySource)` regardless of any declared version.
     let signatures: Vec<(String, String)> = deps
         .iter()
         .map(|dep| {
             let name = formatter.normalize_package_name(dep.name());
-            let signature = if dep.source() == DependencySource::Registry {
+            let signature = if formatter.source_is_public_registry_content(&dep.source()) {
                 match in_use_version(*dep, &name, resolved, formatter, ecosystem) {
                     Some(v) => format!("v:{v}"),
                     None => "u".to_string(),

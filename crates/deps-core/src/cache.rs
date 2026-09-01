@@ -165,14 +165,42 @@ fn is_https_downgrade(previous: &Url, next: &Url) -> bool {
     previous.scheme() == "https" && next.scheme() == "http"
 }
 
+/// Whether a redirect hop's target host is one [`crate::net_policy::HostClass::never_a_registry`]
+/// blocks, exempting `Loopback` in test builds — the identical carve-out [`ensure_https`]
+/// already uses, without which every mockito redirect chain in this workspace's tests would
+/// break.
+fn hop_targets_blocked_host(url: &Url) -> bool {
+    let class = crate::net_policy::classify_host(url);
+    #[cfg(any(test, feature = "test-util"))]
+    let class_blocked = class.never_a_registry() && class != crate::net_policy::HostClass::Loopback;
+    #[cfg(not(any(test, feature = "test-util")))]
+    let class_blocked = class.never_a_registry();
+    class_blocked
+}
+
 /// Redirect policy for [`HttpCache`]'s client.
 ///
 /// [`ensure_https`] only validates the *initial* request URL; a `3xx` response can still
-/// redirect the actual connection anywhere, including down to plain HTTP. This policy stops
-/// the redirect chain (rather than erroring) the moment a hop would do that, so the caller
-/// sees the last successful `3xx` response and handles it exactly like any other non-2xx
-/// status (`DepsError::HttpStatus`) instead of needing a distinct "redirect blocked" error
-/// variant. Every other redirect — including cross-host ones, which are out of scope for this
+/// redirect the actual connection anywhere, including down to plain HTTP — or, per spec
+/// `.local/specs/023-cargo-custom-registries/spec.md` NFR-003/plan-1b §1.1, straight to a
+/// cloud metadata endpoint or other host no legitimate registry redirect ever targets. This
+/// policy stops the redirect chain (rather than erroring) the moment a hop would do either,
+/// so the caller sees the last successful `3xx` response and handles it exactly like any
+/// other non-2xx status (`DepsError::HttpStatus`) instead of needing a distinct
+/// "redirect blocked" error variant.
+///
+/// The blocked-host check is unconditional and policy-independent — it does not consult
+/// [`crate::net_policy::RegistryAccessPolicy`] at all, since [`HostClass::never_a_registry`](crate::net_policy::HostClass::never_a_registry)
+/// is deliberately narrower than any workspace-registry policy setting: it blocks only the
+/// classes (loopback, link-local, cloud metadata, unspecified) that are never a legitimate
+/// registry redirect target for *any* ecosystem, benefiting every one of the eleven crates
+/// sharing this client, not only Cargo's workspace-declared indexes.
+///
+/// TODO(#443 follow-up): this only classifies the redirect target's URL, not its
+/// DNS-resolved address — a hop to an attacker-controlled name that merely *resolves* into a
+/// blocked range is not caught here (see plan-1b §5's residual-risk statement, D1).
+///
+/// Every other redirect — including cross-host ones, which are out of scope for this
 /// policy — falls through to reqwest's default (`Policy::limited(10)`), preserving the
 /// existing hop-count limit and mockito's plain-`http://` loopback chains
 /// used throughout this module's tests.
@@ -182,7 +210,7 @@ fn redirect_policy() -> reqwest::redirect::Policy {
             .previous()
             .last()
             .is_some_and(|previous| is_https_downgrade(previous, attempt.url()));
-        if downgraded {
+        if downgraded || hop_targets_blocked_host(attempt.url()) {
             attempt.stop()
         } else {
             reqwest::redirect::Policy::default().redirect(attempt)
@@ -1043,6 +1071,52 @@ mod tests {
         assert!(!is_https_downgrade(&http, &https));
         assert!(!is_https_downgrade(&https, &https));
         assert!(!is_https_downgrade(&http, &http));
+    }
+
+    #[test]
+    fn test_hop_targets_blocked_host_blocks_cloud_metadata() {
+        let url = Url::parse("https://169.254.169.254/latest/meta-data/").unwrap();
+        assert!(hop_targets_blocked_host(&url));
+    }
+
+    #[test]
+    fn test_hop_targets_blocked_host_allows_global() {
+        let url = Url::parse("https://index.crates.io/").unwrap();
+        assert!(!hop_targets_blocked_host(&url));
+    }
+
+    // The loopback carve-out (identical to `ensure_https`'s) must still exempt
+    // loopback hops under `cfg(test)`, or every mockito redirect chain in this
+    // module's own tests would start failing.
+    #[test]
+    fn test_hop_targets_blocked_host_exempts_loopback_under_test_cfg() {
+        let url = Url::parse("http://127.0.0.1:1234/api/target").unwrap();
+        assert!(!hop_targets_blocked_host(&url));
+    }
+
+    // S5 (plan-1b §1.1/§4): a 302 to the cloud-metadata IP must be stopped by the
+    // *unconditional* redirect policy, not just the trusted-origin one — this is the
+    // empirical proof that #443's default unauthenticated client also closes the
+    // redirect-hop bypass, not only `get_cached_trusted_origin`.
+    #[tokio::test]
+    async fn test_get_cached_stops_redirect_to_cloud_metadata() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _redirect = server
+            .mock("GET", "/api/source")
+            .with_status(302)
+            .with_header("location", "https://169.254.169.254/latest/meta-data/")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let source_url = format!("{}/api/source", server.url());
+        let result: Result<Bytes> = cache.get_cached(&source_url).await;
+
+        assert!(
+            matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
+            "expected the redirect to be stopped and surfaced as HttpStatus(302)"
+        );
     }
 
     #[tokio::test]

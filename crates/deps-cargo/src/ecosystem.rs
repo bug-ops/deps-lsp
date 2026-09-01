@@ -14,6 +14,7 @@ use deps_core::{
 };
 
 use crate::formatter::CargoFormatter;
+use crate::parser::CargoParseContext;
 use crate::registry::CargoRegistry;
 
 /// Cargo ecosystem implementation.
@@ -28,6 +29,12 @@ use crate::registry::CargoRegistry;
 pub struct CargoEcosystem {
     registry: Arc<CargoRegistry>,
     formatter: CargoFormatter,
+    /// The reachability policy (spec #443) and `.cargo/config.toml` memoization cache (spec
+    /// NFR-005) every `parse_manifest` call threads through to
+    /// [`crate::parser::parse_cargo_toml_with_context`]. Defaulted by [`Self::new`]; set
+    /// explicitly by [`Self::with_context`] so `crate::lib::register_ecosystems` can share
+    /// one process-wide policy handle with `ServerState`.
+    context: CargoParseContext,
 }
 
 /// The source(s) a `CompletionContext::Version`/`Feature`'s bare `package_name` joins back
@@ -72,11 +79,24 @@ fn resolve_completion_source(
 }
 
 impl CargoEcosystem {
-    /// Creates a new Cargo ecosystem with the given HTTP cache.
+    /// Creates a new Cargo ecosystem with the given HTTP cache, using a fresh, default
+    /// [`CargoParseContext`] — an all-`PublicOnly`-policy, empty-cache context private to
+    /// this ecosystem instance. Production use goes through [`Self::with_context`] instead,
+    /// so the policy handle is shared with `ServerState` and live-updatable via
+    /// `workspace/didChangeConfiguration`.
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
+        Self::with_context(cache, CargoParseContext::default())
+    }
+
+    /// Creates a new Cargo ecosystem sharing `ctx`'s reachability policy and config-file
+    /// cache — the production constructor (plan-1b §1.6), used by
+    /// `crate::lib::register_ecosystems` so `initialize`/`workspace/didChangeConfiguration`
+    /// can update the same `Arc<RegistryAccessPolicy>` this ecosystem's every parse reads.
+    pub fn with_context(cache: Arc<deps_core::HttpCache>, ctx: CargoParseContext) -> Self {
         Self {
             registry: Arc::new(CargoRegistry::new(cache)),
             formatter: CargoFormatter,
+            context: ctx,
         }
     }
 
@@ -119,7 +139,7 @@ impl CargoEcosystem {
                 )
                 .await
             }
-            CompletionSource::Resolved(DependencySource::AlternateRegistry { index }) => {
+            CompletionSource::Resolved(DependencySource::AlternateRegistry { index, .. }) => {
                 match self.registry.alternate_client(&index) {
                     Some(client) => {
                         deps_core::completion::complete_versions_generic(
@@ -158,12 +178,12 @@ impl CargoEcosystem {
                 | CompletionSource::Resolved(DependencySource::Registry) => {
                     Registry::get_versions(self.registry.as_ref(), package_name).await
                 }
-                CompletionSource::Resolved(DependencySource::AlternateRegistry { index }) => {
-                    match self.registry.alternate_client(&index) {
-                        Some(client) => Registry::get_versions(client.as_ref(), package_name).await,
-                        None => return vec![],
-                    }
-                }
+                CompletionSource::Resolved(DependencySource::AlternateRegistry {
+                    index, ..
+                }) => match self.registry.alternate_client(&index) {
+                    Some(client) => Registry::get_versions(client.as_ref(), package_name).await,
+                    None => return vec![],
+                },
                 CompletionSource::Resolved(_) => return vec![],
             };
 
@@ -218,7 +238,7 @@ impl Ecosystem for CargoEcosystem {
         uri: &'a Uri,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result = crate::parser::parse_cargo_toml(content, uri)?;
+            let result = crate::parser::parse_cargo_toml_with_context(content, uri, &self.context)?;
             // Registers every alternate index this parse resolved (spec FR-002) into the
             // shared router, including its credential (if any) — the only point in the
             // whole pipeline where a `.cargo/config.toml`/`$CARGO_HOME` resolution and the
@@ -742,6 +762,7 @@ mod tests {
         let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
         alternate_dep.source = DependencySource::AlternateRegistry {
             index: "https://index.mycorp.dev".into(),
+            mirrors_crates_io: false,
         };
         let parse_result = MockParseResult {
             dependencies: vec![registry_dep, alternate_dep],
@@ -773,6 +794,7 @@ mod tests {
         let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
         alternate_dep.source = DependencySource::AlternateRegistry {
             index: "https://index.mycorp.dev".into(),
+            mirrors_crates_io: false,
         };
         let parse_result = MockParseResult {
             dependencies: vec![registry_dep, alternate_dep],

@@ -5,9 +5,10 @@
 
 use deps_cargo::DependencySource;
 use deps_cargo::config::{
-    RegistryIndex, cargo_home_config_path, discover_workspace_config_paths, resolve,
+    ConfigFileCache, IndexTrust, RegistryIndex, cargo_home_config_path, resolve,
 };
 use deps_cargo::parse_cargo_toml;
+use deps_core::net_policy::RegistryAccessPolicy;
 use std::collections::HashSet;
 use tower_lsp_server::ls_types::Uri;
 
@@ -15,6 +16,10 @@ fn write_manifest(dir: &std::path::Path, content: &str) -> Uri {
     let path = dir.join("Cargo.toml");
     std::fs::write(&path, content).unwrap();
     Uri::from_file_path(&path).unwrap()
+}
+
+fn test_policy() -> RegistryAccessPolicy {
+    RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All)
 }
 
 /// FR-002: an alias resolves end-to-end, from the raw `registry = "<alias>"` manifest
@@ -42,7 +47,7 @@ fn test_alias_resolves_end_to_end_via_workspace_config() {
 
     assert_eq!(result.dependencies.len(), 1);
     match &result.dependencies[0].source {
-        DependencySource::AlternateRegistry { index } => {
+        DependencySource::AlternateRegistry { index, .. } => {
             assert_eq!(index, "https://index.mycorp.dev/");
         }
         other => panic!("expected AlternateRegistry, got {other:?}"),
@@ -106,7 +111,7 @@ fn test_ancestor_precedence_closest_directory_wins() {
     .unwrap();
 
     match &result.dependencies[0].source {
-        DependencySource::AlternateRegistry { index } => {
+        DependencySource::AlternateRegistry { index, .. } => {
             assert_eq!(index, "https://close.example/", "closest ancestor must win");
         }
         other => panic!("expected AlternateRegistry, got {other:?}"),
@@ -134,10 +139,25 @@ fn test_no_custom_registry_dependency_triggers_no_resolution() {
 /// exercised through the crate's public type rather than only inside `config.rs`.
 #[test]
 fn test_registry_index_validation_public_api() {
-    assert!(RegistryIndex::new("sparse+https://index.mycorp.dev").is_ok());
-    assert!(RegistryIndex::new("http://index.mycorp.dev").is_err());
-    assert!(RegistryIndex::new("https://user:pass@index.mycorp.dev").is_err());
-    assert!(RegistryIndex::new("not a url").is_err());
+    let policy = test_policy();
+    assert!(
+        RegistryIndex::new(
+            "sparse+https://index.mycorp.dev",
+            IndexTrust::Trusted,
+            &policy
+        )
+        .is_ok()
+    );
+    assert!(RegistryIndex::new("http://index.mycorp.dev", IndexTrust::Trusted, &policy).is_err());
+    assert!(
+        RegistryIndex::new(
+            "https://user:pass@index.mycorp.dev",
+            IndexTrust::Trusted,
+            &policy
+        )
+        .is_err()
+    );
+    assert!(RegistryIndex::new("not a url", IndexTrust::Trusted, &policy).is_err());
 }
 
 /// FR-004: `$CARGO_HOME` unset yields no cargo-home config path, and no
@@ -148,12 +168,16 @@ fn test_registry_index_validation_public_api() {
 /// it is `unsafe`-free by the same workspace-wide constraint).
 #[test]
 fn test_discover_and_resolve_public_api_smoke() {
-    let root = tempfile::tempdir().unwrap();
-    let paths = discover_workspace_config_paths(root.path());
-    assert!(paths.is_empty(), "no .cargo/config.toml exists yet");
-
     let aliases: HashSet<String> = std::iter::once("nonexistent".to_string()).collect();
-    let config = resolve(&aliases, &paths, cargo_home_config_path().as_deref());
+    let cache = ConfigFileCache::new();
+    let policy = test_policy();
+    let (config, _) = resolve(
+        &aliases,
+        &[],
+        cargo_home_config_path().as_deref(),
+        &cache,
+        &policy,
+    );
     assert!(config.get("nonexistent").is_none());
 }
 
@@ -208,7 +232,7 @@ fn test_registry_index_literal_resolves_without_config_and_without_auth() {
     .unwrap();
 
     match &result.dependencies[0].source {
-        DependencySource::AlternateRegistry { index } => {
+        DependencySource::AlternateRegistry { index, .. } => {
             assert_eq!(index, "https://index.mycorp.dev/");
         }
         other => panic!("expected AlternateRegistry, got {other:?}"),

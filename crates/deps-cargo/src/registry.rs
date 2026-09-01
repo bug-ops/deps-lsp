@@ -67,7 +67,10 @@ impl CratesIoRegistry {
     /// Creates a new registry client with the given HTTP cache.
     pub fn new(cache: Arc<HttpCache>) -> Self {
         Self {
-            sparse: SparseIndexClient::new(SPARSE_INDEX_BASE.to_string(), Arc::clone(&cache)),
+            sparse: SparseIndexClient::new(
+                RegistryIndex::builtin(SPARSE_INDEX_BASE),
+                Arc::clone(&cache),
+            ),
             cache,
         }
     }
@@ -370,14 +373,21 @@ const MAX_ALTERNATE_REGISTRIES: usize = 256;
 /// ```
 pub struct CargoRegistry {
     crates_io: CratesIoRegistry,
-    /// Resolved alternate-registry clients, keyed by their validated index URL. Populated
-    /// by [`Self::register_alternate`] at parse time (see `crate::ecosystem`'s
+    /// Resolved alternate-registry clients, keyed by [`RegistryIndex::as_str`] (plan-1b
+    /// §1.2, critic S2: re-keyed from `RegistryIndex` to `String` so registration
+    /// (`Self::register_alternate`) and lookup (`Self::alternate_client`) both key off one
+    /// already-validated `RegistryIndex::as_str()`, symmetrically — a lookup no longer needs
+    /// to reconstruct and re-validate a `RegistryIndex` of its own, which would otherwise
+    /// need its own `IndexTrust`/policy argument just to answer a plain map lookup).
+    /// Populated by [`Self::register_alternate`] at parse time (see `crate::ecosystem`'s
     /// `parse_manifest` override) — the *only* place an [`AuthToken`] is ever attached to a
-    /// client, since only that call site has the [`crate::config::CargoConfig`] resolution
-    /// in hand. A fetch that lands here with an unregistered index (never resolved, or
-    /// dropped for capacity) has no way to recover a token and must not fall back to
-    /// crates.io — see [`Self::alternate_client`].
-    alternates: dashmap::DashMap<RegistryIndex, Arc<SparseIndexClient>>,
+    /// client, since only that call site has the [`crate::config::CargoConfig`]/
+    /// [`crate::config::SourceReplacement`] resolution in hand. A fetch that lands here with
+    /// an unregistered index (never resolved, or dropped for capacity) has no way to
+    /// recover a token and must not fall back to crates.io unless the dependency is a
+    /// verified crates.io mirror (`mirrors_crates_io`, spec plan-1b §6 M2) — see
+    /// [`Self::get_versions_for_source`]/[`Self::get_latest_matching_for_source`].
+    alternates: dashmap::DashMap<String, Arc<SparseIndexClient>>,
     cache: Arc<HttpCache>,
 }
 
@@ -407,7 +417,8 @@ impl CargoRegistry {
     /// and `index` is not already present (spec NFR-007) — the dependency stays
     /// unregistered rather than evicting an existing, possibly still-in-use, client.
     pub fn register_alternate(&self, index: RegistryIndex, auth: Option<AuthToken>) {
-        if self.alternates.contains_key(&index) {
+        let key = index.as_str().to_string();
+        if self.alternates.contains_key(&key) {
             return;
         }
         if self.alternates.len() >= MAX_ALTERNATE_REGISTRIES {
@@ -419,23 +430,27 @@ impl CargoRegistry {
             return;
         }
         let client = Arc::new(SparseIndexClient::with_auth(
-            index.as_str().to_string(),
+            index,
             Arc::clone(&self.cache),
             auth,
             "alternate registry",
         ));
-        self.alternates.entry(index).or_insert(client);
+        self.alternates.entry(key).or_insert(client);
     }
 
-    /// The registered client for `index`, if any — read-only, performs no registration.
+    /// The registered client for `index`, if any — read-only, performs no registration, no
+    /// validation. A plain map lookup: `index` only ever originates from an already-validated
+    /// [`RegistryIndex::as_str`], on both sides — registration above, and a dependency's own
+    /// resolved `index` string (`crate::parser`) — so normalization stays symmetric with no
+    /// need to reconstruct a `RegistryIndex` (and the `IndexTrust`/policy that would require)
+    /// just to look one up (plan-1b §1.2, critic S2).
     ///
     /// Used by completion (`crate::ecosystem::CargoEcosystem::generate_completions`, FR-012)
     /// to address one specific alternate index directly via [`deps_core::Registry`]'s
     /// generic helpers, without going through this router's source-based dispatch.
     #[must_use]
     pub fn alternate_client(&self, index: &str) -> Option<Arc<SparseIndexClient>> {
-        let index = RegistryIndex::new(index).ok()?;
-        self.alternates.get(&index).map(|entry| Arc::clone(&entry))
+        self.alternates.get(index).map(|entry| Arc::clone(&entry))
     }
 
     async fn get_versions_for_source(
@@ -444,15 +459,22 @@ impl CargoRegistry {
         source: &DependencySource,
     ) -> Result<Vec<CargoVersion>> {
         match source {
-            DependencySource::AlternateRegistry { index } => {
-                let client =
-                    self.alternate_client(index)
-                        .ok_or_else(|| DepsError::PackageNotFound {
-                            package: name.to_string(),
-                            registry: "alternate registry (not registered)",
-                        })?;
-                client.get_versions(name.as_str()).await
-            }
+            DependencySource::AlternateRegistry {
+                index,
+                mirrors_crates_io,
+            } => match self.alternate_client(index) {
+                Some(client) => client.get_versions(name.as_str()).await,
+                // M2 (plan-1b §6): an unregistered *verified crates.io mirror* degrades to
+                // crates.io rather than blanking the whole manifest — correct for a mirror
+                // (Cargo verifies per-version checksum equality against crates.io for it),
+                // wrong for a genuinely private/unregistered registry, which must keep
+                // failing `PackageNotFound` below.
+                None if *mirrors_crates_io => self.crates_io.get_versions(name.as_str()).await,
+                None => Err(DepsError::PackageNotFound {
+                    package: name.to_string(),
+                    registry: "alternate registry (not registered)",
+                }),
+            },
             _ => self.crates_io.get_versions(name.as_str()).await,
         }
     }
@@ -464,17 +486,28 @@ impl CargoRegistry {
         req: &deps_core::VersionReq,
     ) -> Result<Option<CargoVersion>> {
         match source {
-            DependencySource::AlternateRegistry { index } => {
-                let client =
-                    self.alternate_client(index)
-                        .ok_or_else(|| DepsError::PackageNotFound {
-                            package: name.to_string(),
-                            registry: "alternate registry (not registered)",
-                        })?;
-                client
-                    .get_latest_matching(name.as_str(), req.as_str())
-                    .await
-            }
+            DependencySource::AlternateRegistry {
+                index,
+                mirrors_crates_io,
+            } => match self.alternate_client(index) {
+                Some(client) => {
+                    client
+                        .get_latest_matching(name.as_str(), req.as_str())
+                        .await
+                }
+                // M2 (plan-1b §6, N4): the hover-fallback/background-fetch-mirror dispatch
+                // site needs the identical arm — this exact enumeration has been wrong twice
+                // during design review, so both sites are asserted independently in tests.
+                None if *mirrors_crates_io => {
+                    self.crates_io
+                        .get_latest_matching(name.as_str(), req.as_str())
+                        .await
+                }
+                None => Err(DepsError::PackageNotFound {
+                    package: name.to_string(),
+                    registry: "alternate registry (not registered)",
+                }),
+            },
             _ => {
                 self.crates_io
                     .get_latest_matching(name.as_str(), req.as_str())
@@ -578,7 +611,16 @@ impl deps_core::Registry for CargoRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IndexTrust;
+    use deps_core::net_policy::RegistryAccessPolicy;
     use std::collections::HashMap;
+
+    /// Wraps `raw` into a [`RegistryIndex`] for test call sites — see `sparse.rs`'s
+    /// identical helper for why an all-allow-equivalent (`Trusted`) policy is used.
+    fn test_index(raw: &str) -> RegistryIndex {
+        let policy = RegistryAccessPolicy::default();
+        RegistryIndex::new(raw, IndexTrust::Trusted, &policy).unwrap()
+    }
 
     /// Live-network smoke test against the real crates.io search API. Restored (review
     /// finding #8) after being dropped, undisclosed, during the `SparseIndexClient`
@@ -798,6 +840,7 @@ mod tests {
         let registry = CargoRegistry::new(cache);
         let source = DependencySource::AlternateRegistry {
             index: "https://index.mycorp.dev".to_string(),
+            mirrors_crates_io: false,
         };
         let name = PackageName::new("internal-crate");
         let result = registry
@@ -810,11 +853,110 @@ mod tests {
         assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
     }
 
+    /// Builds a `CargoRegistry` whose `crates_io` field points at `mockito_url` instead of
+    /// the real crates.io index — direct struct-literal construction (both `CratesIoRegistry`
+    /// and `CargoRegistry`'s fields are private, but this test module is a descendant of
+    /// their defining module) is the only way to make the M2 fallback observable without a
+    /// real network request.
+    fn cargo_registry_with_mocked_crates_io(
+        mockito_url: &str,
+        cache: Arc<HttpCache>,
+    ) -> CargoRegistry {
+        let sparse = SparseIndexClient::new(test_index(mockito_url), Arc::clone(&cache));
+        CargoRegistry {
+            crates_io: CratesIoRegistry {
+                sparse,
+                cache: Arc::clone(&cache),
+            },
+            alternates: dashmap::DashMap::new(),
+            cache,
+        }
+    }
+
+    /// M2 (plan-1b §6, N4), dispatch site 1 of 2: an unregistered `mirrors_crates_io: true`
+    /// source must fall back to crates.io through `get_versions_for_source` — a missed
+    /// registration degrades gracefully instead of blanking the whole manifest.
+    #[tokio::test]
+    async fn test_get_versions_for_source_unregistered_mirror_falls_back_to_crates_io() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/se/rd/serde")
+            .with_status(200)
+            .with_body(r#"{"name":"serde","vers":"1.0.0","yanked":false,"features":{},"deps":[]}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = cargo_registry_with_mocked_crates_io(&server.url(), cache);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "https://index.never-registered.example".to_string(),
+            mirrors_crates_io: true,
+        };
+        let name = PackageName::new("serde");
+        let versions = registry
+            .get_versions_for_source(&name, &source)
+            .await
+            .expect("an unregistered mirror must fall back to crates.io, not error");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].num, "1.0.0");
+        mock.assert_async().await;
+    }
+
+    /// M2, dispatch site 2 of 2: the hover-fallback/background-fetch-mirror path
+    /// (`get_latest_matching_for_source`) needs the identical arm — this exact enumeration
+    /// has been wrong twice during design review, so both sites are asserted independently.
+    #[tokio::test]
+    async fn test_get_latest_matching_for_source_unregistered_mirror_falls_back_to_crates_io() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/se/rd/serde")
+            .with_status(200)
+            .with_body(r#"{"name":"serde","vers":"1.0.0","yanked":false,"features":{},"deps":[]}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = cargo_registry_with_mocked_crates_io(&server.url(), cache);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "https://index.never-registered.example".to_string(),
+            mirrors_crates_io: true,
+        };
+        let name = PackageName::new("serde");
+        let req = deps_core::VersionReq::new("^1.0");
+        let latest = registry
+            .get_latest_matching_for_source(&name, &source, &req)
+            .await
+            .expect("an unregistered mirror must fall back to crates.io, not error");
+        assert_eq!(latest.expect("a matching version").num, "1.0.0");
+        mock.assert_async().await;
+    }
+
+    /// The non-mirror counterpart: an unregistered, genuinely private (`mirrors_crates_io:
+    /// false`) alternate index must keep failing `PackageNotFound` — the M2 fallback is
+    /// scoped strictly to verified crates.io mirrors.
+    #[tokio::test]
+    async fn test_get_latest_matching_for_source_unregistered_non_mirror_stays_not_found() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = CargoRegistry::new(cache);
+        let source = DependencySource::AlternateRegistry {
+            index: "https://index.never-registered.example".to_string(),
+            mirrors_crates_io: false,
+        };
+        let name = PackageName::new("internal-crate");
+        let req = deps_core::VersionReq::new("^1.0");
+        let result = registry
+            .get_latest_matching_for_source(&name, &source, &req)
+            .await;
+        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+    }
+
     #[tokio::test]
     async fn test_cargo_registry_register_alternate_is_idempotent() {
         let cache = Arc::new(HttpCache::new());
         let registry = CargoRegistry::new(cache);
-        let index = RegistryIndex::new("https://index.mycorp.dev").unwrap();
+        let index = test_index("https://index.mycorp.dev");
 
         registry.register_alternate(index.clone(), None);
         assert!(
@@ -838,12 +980,12 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = CargoRegistry::new(cache);
         for i in 0..MAX_ALTERNATE_REGISTRIES {
-            let index = RegistryIndex::new(&format!("https://index{i}.example")).unwrap();
+            let index = test_index(&format!("https://index{i}.example"));
             registry.register_alternate(index, None);
         }
         assert_eq!(registry.alternates.len(), MAX_ALTERNATE_REGISTRIES);
 
-        let overflow = RegistryIndex::new("https://overflow.example").unwrap();
+        let overflow = test_index("https://overflow.example");
         registry.register_alternate(overflow, None);
         assert_eq!(registry.alternates.len(), MAX_ALTERNATE_REGISTRIES);
         assert!(

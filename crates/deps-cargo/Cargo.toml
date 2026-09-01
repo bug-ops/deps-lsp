@@ -17,6 +17,10 @@ workspace = true
 # integration) can point it at a `mockito::Server` without weakening the gate for real
 # builds — mirrors `deps-core`'s own `test-util` feature and `HttpCache::ensure_https`'s
 # identical precedent.
+#
+# Security note: this feature is publicly enablable by any downstream Cargo.toml (this
+# crate has `publish = true`), so it must never be enabled in a shipped/release build — see
+# `config::RegistryIndex::new`'s loopback carve-out for the full contract.
 test-util = []
 
 [dependencies]

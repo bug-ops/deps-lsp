@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
+use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{
     ConcreteVersion, Deprecation, EcosystemId, EcosystemRegistry, PackageName, PackageVersions,
@@ -481,6 +482,12 @@ pub struct ServerState {
     pub lockfile_cache: Arc<LockFileCache>,
     /// Ecosystem registry for trait-based architecture
     pub ecosystem_registry: Arc<EcosystemRegistry>,
+    /// Live-updatable Cargo workspace-registry reachability policy (spec #443,
+    /// `cargo.workspace_registries`) — the same handle `crate::register_ecosystems` hands to
+    /// `CargoEcosystem::with_context`, so `Backend::initialize`/`did_change_configuration`
+    /// updating this value here takes effect on every parse from then on, with no need to
+    /// reconstruct the ecosystem.
+    pub registry_policy: Arc<RegistryAccessPolicy>,
     /// Cold start rate limiter
     pub cold_start_limiter: ColdStartLimiter,
     /// Background task handles
@@ -499,9 +506,14 @@ impl ServerState {
         let osv = Arc::new(OsvClient::new(Arc::clone(&cache)));
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
+        let registry_policy = Arc::new(RegistryAccessPolicy::default());
 
         // Register ecosystems based on enabled features
-        crate::register_ecosystems(&ecosystem_registry, Arc::clone(&cache));
+        crate::register_ecosystems(
+            &ecosystem_registry,
+            Arc::clone(&cache),
+            Arc::clone(&registry_policy),
+        );
 
         // Create cold start limiter with default 100ms interval (10 req/sec per URI)
         let cold_start_limiter = ColdStartLimiter::new(Duration::from_millis(100));
@@ -512,6 +524,7 @@ impl ServerState {
             osv,
             lockfile_cache,
             ecosystem_registry,
+            registry_policy,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
             progress_supported: AtomicBool::new(false),

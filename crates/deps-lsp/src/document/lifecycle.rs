@@ -279,7 +279,7 @@ fn collect_in_use_versions(
     for dep in parse_result
         .dependencies()
         .into_iter()
-        .filter(|dep| dep.source() == deps_core::parser::DependencySource::Registry)
+        .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
     {
         let normalized_name = formatter.normalize_package_name(dep.name());
         if let Some(v) = in_use_version(
@@ -298,9 +298,11 @@ fn collect_in_use_versions(
 /// Builds the OSV scan targets for one manifest's dependencies, applying the
 /// version-selection policy from `architecture.md` §3 in order:
 ///
-/// 0. Skip unless `dep.source() == DependencySource::Registry` — a patched
+/// 0. Skip unless `formatter.source_is_public_registry_content(&dep.source())` — a patched
 ///    git/path fork must never be flagged with a CVE for a version it does
-///    not actually contain.
+///    not actually contain, and neither must a genuinely different private registry's
+///    dependency (only a verified crates.io mirror counts as public-registry content,
+///    F1/F1b).
 /// 1. Use the lock-file-resolved version if present.
 /// 2. Otherwise use the declared requirement, if it is already concrete.
 /// 3. Otherwise skip — querying a fabricated version is a silent false
@@ -360,7 +362,7 @@ fn build_scan_targets(
             .cloned()
             .unwrap_or_else(|| normalized_name.clone());
 
-        if dep.source() != deps_core::parser::DependencySource::Registry {
+        if !formatter.source_is_public_registry_content(&dep.source()) {
             skipped.insert(key, ScanOutcome::Skipped(SkipReason::NonRegistrySource));
             continue;
         }
@@ -2129,6 +2131,7 @@ mod tests {
                         name: PackageName::new("shared-name"),
                         source: DependencySource::AlternateRegistry {
                             index: "https://index.mycorp.dev".into(),
+                            mirrors_crates_io: false,
                         },
                         addr_tag: 1,
                     },

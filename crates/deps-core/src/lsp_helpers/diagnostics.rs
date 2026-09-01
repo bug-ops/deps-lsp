@@ -19,6 +19,31 @@ use super::{EcosystemFormatter, RequirementMatcher, RequirementStatus, VersionDa
 /// identifier.
 pub const UNSATISFIABLE_DIAGNOSTIC_CODE: &str = "unsatisfiable-requirement";
 
+/// Maximum character count of a blocked-registry diagnostic's raw declared value (an alias
+/// or literal URL) before it is truncated with an ellipsis marker.
+///
+/// The value is attacker-controlled — an arbitrary string from a cloned repository's
+/// `Cargo.toml`/`.cargo/config.toml` — and nothing upstream in the TOML parse pipeline caps
+/// an individual string field's length (only nesting depth and table count are bounded), so
+/// this is the last chokepoint before it renders inline in the editor as a
+/// [`DiagnosticSeverity::INFORMATION`] message.
+const MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS: usize = 128;
+
+/// Truncates `value` to at most `max_chars` characters, appending `…` when truncated, so an
+/// attacker-controlled string interpolated into a diagnostic message can never render an
+/// unbounded amount of text inline in the editor.
+///
+/// Counts characters, not bytes, so a truncation point never lands mid-character (`value` may
+/// contain multi-byte UTF-8).
+fn truncate_for_diagnostic(value: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+    if value.chars().count() <= max_chars {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut truncated: String = value.chars().take(max_chars).collect();
+    truncated.push('…');
+    std::borrow::Cow::Owned(truncated)
+}
+
 /// Stable [`Diagnostic::code`] set on the package-level deprecation diagnostic (issue #205).
 ///
 /// Mirrors [`UNSATISFIABLE_DIAGNOSTIC_CODE`] — lets `build_replacement_action`'s stashed
@@ -434,6 +459,24 @@ pub fn generate_diagnostics_from_cache(
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
+
+    // #443/plan-1b §1.7: a registry index blocked by `cargo.workspace_registries` must not
+    // degrade silently — surface it as an informational diagnostic on the dependency's own
+    // line, independent of the loop below (a blocked dependency never reaches version
+    // resolution, so it would otherwise leave no trace at all in the editor).
+    for (range, class, raw_value) in parse_result.blocked_registries() {
+        diagnostics.push(Diagnostic {
+            range,
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            message: format!(
+                "registry index \"{}\" blocked by cargo.workspace_registries policy \
+                 (host class: {class})",
+                truncate_for_diagnostic(&raw_value, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS)
+            ),
+            source: Some("deps-lsp".into()),
+            ..Default::default()
+        });
+    }
 
     // #394 S2: version-qualified OSV lookup keys, so two occurrences of one
     // name pinned to different versions never share a `Vulnerable`/`Clean`
@@ -908,6 +951,176 @@ mod tests {
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
         assert!(diagnostics[0].message.contains("Unknown package"));
         assert!(diagnostics[0].message.contains("unknown-pkg"));
+    }
+
+    /// S3 (impl-critic): `generate_diagnostics_from_cache` must actually emit the
+    /// `INFORMATION` diagnostic for a `ParseResult::blocked_registries()` entry — the
+    /// §1.7 "must not degrade silently" requirement, previously entirely untested.
+    #[test]
+    fn test_generate_diagnostics_from_cache_emits_blocked_registry_diagnostic() {
+        use crate::net_policy::HostClass;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct BlockedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+            blocked: Vec<(Range, HostClass, String)>,
+        }
+
+        impl ParseResult for BlockedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<(Range, HostClass, String)> {
+                self.blocked.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+        let formatter = MockFormatter;
+        let parse_result = BlockedRegistryParseResult {
+            deps: vec![MockDep {
+                name: "internal-crate".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            blocked: vec![(
+                name_range,
+                HostClass::CloudMetadata,
+                "https://169.254.169.254/index".to_string(),
+            )],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let blocked_diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("blocked"))
+            .expect("expected a blocked-registry diagnostic");
+        assert_eq!(blocked_diagnostic.range, name_range);
+        assert_eq!(
+            blocked_diagnostic.severity,
+            Some(DiagnosticSeverity::INFORMATION)
+        );
+        assert!(blocked_diagnostic.message.contains("169.254.169.254"));
+        assert!(blocked_diagnostic.message.contains("cloud metadata"));
+        assert!(
+            !blocked_diagnostic.message.contains("CloudMetadata"),
+            "message must use the Display form, not the Debug identifier"
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_diagnostic_leaves_short_value_untouched() {
+        assert_eq!(truncate_for_diagnostic("my-corp", 128), "my-corp");
+    }
+
+    #[test]
+    fn test_truncate_for_diagnostic_truncates_and_appends_ellipsis() {
+        let long_value = "a".repeat(200);
+        let truncated = truncate_for_diagnostic(&long_value, 128);
+        assert_eq!(truncated.chars().count(), 129); // 128 chars + the ellipsis marker
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.starts_with(&"a".repeat(128)));
+    }
+
+    #[test]
+    fn test_truncate_for_diagnostic_never_splits_a_multibyte_character() {
+        // Each "日" is a multi-byte UTF-8 character; a byte-based truncation could panic or
+        // produce invalid UTF-8 landing mid-character.
+        let long_value = "日".repeat(200);
+        let truncated = truncate_for_diagnostic(&long_value, 128);
+        assert_eq!(truncated.chars().count(), 129);
+    }
+
+    /// The reviewer's finding: `raw_value` is attacker-controlled and unbounded upstream (no
+    /// TOML string-length cap exists, only nesting-depth/table-count caps) — the diagnostic
+    /// message itself must still cap it before interpolation.
+    #[test]
+    fn test_generate_diagnostics_from_cache_blocked_registry_message_caps_long_raw_value() {
+        use crate::net_policy::HostClass;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        struct BlockedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: Uri,
+            blocked: Vec<(Range, HostClass, String)>,
+        }
+
+        impl ParseResult for BlockedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<(Range, HostClass, String)> {
+                self.blocked.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+        let formatter = MockFormatter;
+        let long_alias = "x".repeat(10_000);
+        let parse_result = BlockedRegistryParseResult {
+            deps: vec![MockDep {
+                name: "internal-crate".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            blocked: vec![(name_range, HostClass::InternalName, long_alias.clone())],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let blocked_diagnostic = diagnostics
+            .iter()
+            .find(|d| d.message.contains("blocked"))
+            .expect("expected a blocked-registry diagnostic");
+        assert!(
+            blocked_diagnostic.message.len() < long_alias.len(),
+            "a 10,000-char alias must not render in full inside the diagnostic message"
+        );
+        assert!(blocked_diagnostic.message.contains('…'));
     }
 
     #[test]
