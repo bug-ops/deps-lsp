@@ -120,7 +120,7 @@ impl Clone for DocumentState {
 /// use deps_lsp::document::ColdStartLimiter;
 /// use std::time::Duration;
 ///
-/// let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+/// let limiter = ColdStartLimiter::new(Duration::from_secs(10));
 /// let uri = deps_core::test_util::test_uri("/test.toml");
 ///
 /// assert!(limiter.allow_cold_start(&uri));
