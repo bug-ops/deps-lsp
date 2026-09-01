@@ -810,6 +810,19 @@ mod tests {
         assert!(url.contains("%25"));
     }
 
+    /// #436: npm keeps `reports_yanked() == true` (the trait default) — the registry's
+    /// `removal_status()` is genuine per-version data, and the #263 in-use-version yanked
+    /// check (`crates/deps-core/src/lsp_helpers/diagnostics.rs`) depends on this staying
+    /// populated. Only the manifest-requirement-level diagnostic is suppressed, via
+    /// `NpmFormatter::yanked_diagnostic_applies_to` — see that method's docs.
+    #[test]
+    fn test_registry_reports_yanked_true() {
+        use deps_core::Registry;
+
+        let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
+        assert!(registry.reports_yanked());
+    }
+
     #[test]
     fn test_package_url_empty_name() {
         assert_eq!(package_url(""), "https://www.npmjs.com/package/");

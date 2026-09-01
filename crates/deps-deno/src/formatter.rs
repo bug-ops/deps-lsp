@@ -132,12 +132,22 @@ impl EcosystemFormatter for DenoFormatter {
             .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
 
-    /// Restricts the yanked-only-match diagnostic to an exact-pin requirement, copying
-    /// npm's rationale (`deps-npm/src/formatter.rs`): applies uniformly to `jsr:` and
-    /// `npm:` since this hook takes only a `&VersionReq`, with no way to tell which
-    /// scheme it came from (accepted limitation L1 — JSR's genuinely better per-version
-    /// signal is under-used for range requirements, in exchange for not reintroducing
-    /// npm's package-wide-`deprecated` false-positive storm).
+    /// Restricts the yanked-only-match diagnostic to an exact-pin requirement: evaluating
+    /// a range requirement against a package-wide deprecation signal would flag every
+    /// dependency on such a package, conflating this diagnostic with package-level
+    /// deprecation (issue #205). Applies uniformly to `jsr:` and `npm:` since this hook
+    /// takes only a `&VersionReq`, with no way to tell which scheme it came from (accepted
+    /// limitation L1 — JSR's genuinely better per-version signal is under-used for range
+    /// requirements, in exchange for not reintroducing npm's package-wide-`deprecated`
+    /// false-positive storm).
+    ///
+    /// Known cross-ecosystem divergence (#436 M1, not fixed here — out of scope for that
+    /// issue's npm/Composer-only formatter changes): `NpmFormatter::yanked_diagnostic_applies_to`
+    /// now returns `false` unconditionally, so an exact-pin `npm:` dependency in `deno.json`
+    /// (e.g. `npm:lodash@4.17.20`) can still surface this diagnostic while the equivalent
+    /// exact-pin `package.json` dependency (`"lodash": "4.17.20"`) no longer does, since this
+    /// method doesn't delegate to `NpmFormatter`'s. Candidate for a follow-up issue rather than
+    /// silently matched or left unremarked.
     fn yanked_diagnostic_applies_to(&self, requirement: &VersionReq) -> bool {
         node_semver::Version::parse(requirement.as_str().trim()).is_ok()
     }
