@@ -2,7 +2,10 @@ use dashmap::DashMap;
 use deps_core::HttpCache;
 use deps_core::lockfile::LockFileCache;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
-use deps_core::{EcosystemId, EcosystemRegistry, PackageName, PackageVersions, ParseResult};
+use deps_core::{
+    Deprecation, EcosystemId, EcosystemRegistry, PackageName, PackageVersions, ParseResult,
+    RemovalStatus,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,7 +64,12 @@ pub struct DocumentState {
     /// ecosystems where normalization changes the name (e.g. PyPI). Empty
     /// until the first fetch completes; carried across document edits by
     /// `preserve_cache`.
-    pub yanked_versions: HashMap<String, String>,
+    pub yanked_versions: HashMap<String, (String, RemovalStatus)>,
+    /// Package-level deprecation findings from the lifecycle's registry fetch (issue
+    /// #205), keyed by **normalized** package name — same raw/normalized split
+    /// rationale as [`Self::yanked_versions`]. Empty until the first fetch completes;
+    /// carried across document edits by `preserve_cache`.
+    pub deprecations: HashMap<String, Deprecation>,
     /// Packages whose registry fetch errored or timed out on the most recent
     /// lifecycle fetch, keyed by **normalized** package name (same raw/normalized
     /// split as `yanked_versions` above, for the same reason — see §3.1). Lets
@@ -97,6 +105,7 @@ impl Clone for DocumentState {
             resolved_versions: self.resolved_versions.clone(),
             vulnerabilities: self.vulnerabilities.clone(),
             yanked_versions: self.yanked_versions.clone(),
+            deprecations: self.deprecations.clone(),
             fetch_failed: self.fetch_failed.clone(),
             parsed_at: self.parsed_at,
             loading_state: self.loading_state,
@@ -197,6 +206,7 @@ impl std::fmt::Debug for DocumentState {
             .field("resolved_versions_count", &self.resolved_versions.len())
             .field("vulnerabilities_count", &self.vulnerabilities.len())
             .field("yanked_versions_count", &self.yanked_versions.len())
+            .field("deprecations_count", &self.deprecations.len())
             .field("fetch_failed_count", &self.fetch_failed.len())
             .field("parsed_at", &self.parsed_at)
             .field("loading_state", &self.loading_state)
@@ -223,6 +233,7 @@ impl DocumentState {
             resolved_versions: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
             yanked_versions: HashMap::new(),
+            deprecations: HashMap::new(),
             fetch_failed: HashSet::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
@@ -244,6 +255,7 @@ impl DocumentState {
             resolved_versions: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
             yanked_versions: HashMap::new(),
+            deprecations: HashMap::new(),
             fetch_failed: HashSet::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
@@ -290,8 +302,17 @@ impl DocumentState {
     }
 
     /// Updates the yanked-version findings, keyed by normalized package name.
-    pub fn update_yanked_versions(&mut self, yanked_versions: HashMap<String, String>) {
+    pub fn update_yanked_versions(
+        &mut self,
+        yanked_versions: HashMap<String, (String, RemovalStatus)>,
+    ) {
         self.yanked_versions = yanked_versions;
+    }
+
+    /// Updates the package-level deprecation findings (issue #205), keyed by
+    /// normalized package name.
+    pub fn update_deprecations(&mut self, deprecations: HashMap<String, Deprecation>) {
+        self.deprecations = deprecations;
     }
 
     /// Replaces the set of packages whose registry fetch errored or timed out

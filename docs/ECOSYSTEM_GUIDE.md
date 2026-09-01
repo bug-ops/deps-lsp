@@ -413,10 +413,10 @@ dependency, so only one yanked diagnostic is ever shown per dependency.
   flag from a package-wide signal — npm's from `deprecated` (live-verified: the `request`
   package has 126/126 versions marked deprecated), Composer's from `abandoned` — not a true
   per-version yank. Evaluating a range requirement against either would flag every dependency
-  on a deprecated/abandoned package under this diagnostic's wording, which is a distinct,
-  separately-planned diagnostic (package-level deprecation, issue #205). A bare exact pin
-  (`"1.2.3"`, not `"^1.2.3"`) is unaffected by that ambiguity, so the check still applies
-  there.
+  on a deprecated/abandoned package under this diagnostic's wording, which is a distinct
+  diagnostic — see [Package Deprecation Diagnostics](#package-deprecation-diagnostics-issue-205)
+  below. A bare exact pin (`"1.2.3"`, not `"^1.2.3"`) is unaffected by that ambiguity, so the
+  check still applies there.
 
 **Ecosystem coverage, live-verified per registry rather than assumed from code:**
 
@@ -438,6 +438,45 @@ dependency, so only one yanked diagnostic is ever shown per dependency.
 6 of 12 ecosystems can produce this diagnostic today; the other 6 have no real yanked signal
 to source it from (three are architecturally impossible — no such registry concept exists —
 and Go's is a fixable but separate gap).
+
+### Package Deprecation Diagnostics (issue #205)
+
+The two yanked diagnostics above answer "is *this version* installable"; this one answers a
+different, package-level question — "is the project itself still maintained" — regardless of
+which version is declared or resolved. When the registry reports the package's latest version
+as deprecated/abandoned, `deps-lsp` shows a diagnostic (configurable via
+`diagnostics.deprecated_severity`, default WARNING):
+
+```
+This package is deprecated: use String.prototype.padStart() instead
+```
+
+The hover popup gets a matching `### Deprecated` section with the same reason text and, when
+the registry names one, a suggested replacement package. Derived entirely from data the
+regular version fetch already retrieves — no extra registry request.
+
+**Suppression against the yanked diagnostics above.** npm's yanked signal is itself sourced
+from the same `deprecated` field this diagnostic reads, so a dependency pinned to an exact,
+deprecated version would otherwise show two near-duplicate diagnostics. When this diagnostic
+fires, it suppresses the in-use-version yanked check for the same dependency — but only when
+the yanked finding's underlying signal is an advisory (`AdvisoryDeprecated`), never a genuine
+hard yank/retraction. A package that is both deprecated *and* has a specific version really
+withdrawn from resolution still shows both diagnostics; "the exact version you have was
+pulled" is strictly more actionable than "the project is archived," and one must never hide
+the other.
+
+**Composer-only "Replace with X" code action.** When Packagist's `abandoned` field names a
+successor package, a `QUICKFIX` titled `Replace with <package>` rewrites the dependency's name
+in place. Not offered for npm: its only successor signal is free-text prose inside the
+`deprecated` message, and regex-extracting a package name from registry-controlled text to
+rewrite a manifest is a typosquatting vector — npm still gets the diagnostic and hover (the
+message is shown verbatim, which is the useful part), just not an automated rename.
+
+| Ecosystem | Works today? | Source |
+| --------- | ------------- | ------ |
+| npm | Yes | `deprecated` free-text message (no structured replacement — see above) |
+| Composer | Yes, with replace action | `abandoned` (bare `true`, or a string naming a successor package) |
+| Cargo, Go, PyPI, Bundler, Dart, Maven, Gradle, Swift, NuGet, Deno | Not yet | No registry-native package-level deprecation signal wired up yet (tracked as fast-follows; Dart's `isDiscontinued`/`replacedBy` and PyPI's PEP 792 `project-status` already exist on the wire and are the best next targets) |
 
 ### npm Package Name Validation
 

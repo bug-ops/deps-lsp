@@ -2,7 +2,7 @@ use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind
 
 use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome};
 use crate::{
-    ParseResult, PublishTime, Registry, Version, VersionReq, format_relative_age,
+    Deprecation, ParseResult, PublishTime, Registry, Version, VersionReq, format_relative_age,
     is_within_cooldown,
 };
 
@@ -276,6 +276,13 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             .or_else(|| m.get(&normalized_name))
             .or_else(|| m.get(dep.name().as_str()))
     });
+    // Package-level context (#205) renders before per-version security advisories:
+    // deprecation is a property of the package, advisories of the version.
+    push_deprecation_hover_section(
+        &mut markdown,
+        formatter,
+        versions.deprecations.and_then(|m| m.get(&normalized_name)),
+    );
     push_vulnerability_hover_section(&mut markdown, vuln_outcome);
 
     if let Some(available_versions) = &available_versions {
@@ -346,6 +353,43 @@ const fn severity_label(severity: crate::osv::VulnSeverity) -> &'static str {
         crate::osv::VulnSeverity::Medium => "medium",
         crate::osv::VulnSeverity::Low => "low",
         crate::osv::VulnSeverity::Unknown => "unknown severity",
+    }
+}
+
+/// Appends the hover "Deprecated" section (issue #205), gated strictly on `deprecation`
+/// being present — never rendered as "not deprecated" for a clean package, the same
+/// discipline [`push_vulnerability_hover_section`] applies to `Skipped`/`None`.
+///
+/// Deliberately not deduped against npm's per-row `*(deprecated)*` "Recent versions"
+/// labels (S4, plan.md D6): suppressing those would require threading this finding into
+/// the version-list renderer, which takes no such parameter today.
+fn push_deprecation_hover_section(
+    markdown: &mut String,
+    formatter: &dyn EcosystemFormatter,
+    deprecation: Option<&Deprecation>,
+) {
+    use std::fmt::Write as _;
+
+    let Some(deprecation) = deprecation else {
+        return;
+    };
+
+    // I3: each part gets its own blank-line-separated paragraph, mirroring
+    // `push_vulnerability_hover_section`'s discipline — three bare consecutive
+    // `writeln!` lines with no blank line between them collapse into one CommonMark
+    // paragraph, rendering the message/reason/replacement joined instead of as the
+    // visually distinct lines the section is meant to show.
+    markdown.push_str("### Deprecated\n\n");
+    let _ = writeln!(markdown, "{}\n", formatter.deprecated_message());
+    if let Some(reason) = deprecation.reason.as_deref().filter(|r| !r.is_empty()) {
+        let _ = writeln!(markdown, "{}\n", escape_markdown(reason));
+    }
+    if let Some(replacement) = deprecation.replacement.as_deref().filter(|r| !r.is_empty()) {
+        let _ = writeln!(
+            markdown,
+            "Suggested replacement: {}\n",
+            markdown_code_span(replacement)
+        );
     }
 }
 
@@ -1521,6 +1565,97 @@ mod tests {
         assert!(
             content.value.contains("- `2.0.0` *(latest)* *(yanked)*"),
             "the resolved latest must keep its yanked label, got: {}",
+            content.value
+        );
+    }
+
+    /// npm-shaped formatter stub for T7: overrides `yanked_label` to npm's actual
+    /// `"*(deprecated)*"` wording (`deps-npm/src/formatter.rs`), everything else default.
+    struct NpmLikeFormatter;
+
+    impl EcosystemFormatter for NpmLikeFormatter {
+        fn format_version_for_text_edit(&self, version: &str) -> String {
+            version.to_string()
+        }
+
+        fn package_url(&self, name: &crate::PackageName) -> String {
+            format!("https://example.com/{name}")
+        }
+
+        fn yanked_label(&self) -> &'static str {
+            "*(deprecated)*"
+        }
+    }
+
+    /// T7 (S4, accepted redundancy): hover for a deprecated npm-shaped package renders
+    /// **both** the new `### Deprecated` section (D6) and the pre-existing per-row
+    /// `*(deprecated)*` "Recent versions" labels — pinning the deliberate decision not to
+    /// dedupe them (plan.md D6), so a later dedupe reads as an intentional change rather
+    /// than a silent regression.
+    #[tokio::test]
+    async fn test_generate_hover_deprecated_section_and_per_row_labels_both_render() {
+        use std::collections::HashMap;
+
+        let now = PublishTime::now();
+        let registry = MockRegistryPreferringUnflagged {
+            versions: vec![MockVersionWithStatus {
+                version: "1.0.0".to_string(),
+                status: RemovalStatus::AdvisoryDeprecated,
+            }],
+        };
+
+        let parse_result = freshness_test_parse_result("pkg");
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut deprecations = HashMap::new();
+        deprecations.insert(
+            "pkg".to_string(),
+            crate::Deprecation {
+                reason: Some("no longer maintained".to_string()),
+                replacement: None,
+            },
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions).with_deprecations(&deprecations),
+            &registry,
+            &NpmLikeFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("### Deprecated"),
+            "expected the package-level Deprecated section, got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("no longer maintained"),
+            "expected the deprecation reason, got: {}",
+            content.value
+        );
+        // I3: the message and the reason must render as separate CommonMark paragraphs
+        // (blank-line separated), not collapse into one joined paragraph.
+        assert!(
+            content
+                .value
+                .contains("This package is deprecated\n\nno longer maintained"),
+            "expected the message and reason on separate paragraphs, got: {}",
+            content.value
+        );
+        assert!(
+            content
+                .value
+                .contains("- `1.0.0` *(latest)* *(deprecated)*"),
+            "expected the pre-existing per-row label to still render alongside the new \
+             section (deliberately not deduped, S4), got: {}",
             content.value
         );
     }

@@ -105,6 +105,10 @@ macro_rules! impl_dependency {
 ///   it when the default is provably correct for the registry's version
 ///   format (as of #322, `deps-composer` is the sole deliberate holdout,
 ///   since Packagist versions aren't strict semver).
+/// * `deprecation` - Optional, requires both `published_at` and `prerelease` to also be
+///   given: expression evaluating to a closure `Fn(&$type) -> Option<&Deprecation>`,
+///   for an ecosystem whose registry exposes a package-level deprecation payload
+///   (issue #205). Omitting this arm installs the trait default (`None`).
 ///
 /// # Examples
 ///
@@ -243,6 +247,45 @@ macro_rules! impl_version {
 
             fn is_prerelease(&self) -> bool {
                 ($prerelease)(self)
+            }
+
+            fn as_any(&self) -> &dyn ::std::any::Any {
+                self
+            }
+        }
+    };
+    ($type:ty {
+        version: $version:ident,
+        status: $status:expr,
+        published_at: $published_at:ident,
+        prerelease: $prerelease:expr,
+        deprecation: $deprecation:expr $(,)?
+    }) => {
+        impl $crate::registry::Version for $type {
+            fn version_string(&self) -> &str {
+                &self.$version
+            }
+
+            fn removal_status(&self) -> $crate::registry::RemovalStatus {
+                ($status)(self)
+            }
+
+            fn published_at(&self) -> Option<$crate::freshness::PublishTime> {
+                self.$published_at
+            }
+
+            fn is_prerelease(&self) -> bool {
+                ($prerelease)(self)
+            }
+
+            fn deprecation(&self) -> Option<&$crate::registry::Deprecation> {
+                // Coerced through a plain `fn` pointer (rather than calling the closure
+                // expression directly) so it is forced to be `for<'a> Fn(&'a Self) ->
+                // Option<&'a Deprecation>` — a bare closure literal here infers a single
+                // concrete lifetime from its first call site instead of generalizing,
+                // which fails to typecheck against `self`'s elided lifetime.
+                let f: fn(&$type) -> Option<&$crate::registry::Deprecation> = $deprecation;
+                f(self)
             }
 
             fn as_any(&self) -> &dyn ::std::any::Any {

@@ -8,11 +8,13 @@ use super::state::{DocumentState, ServerState};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
 use crate::progress::{ProgressSender, RegistryProgress};
+use deps_core::Deprecation;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
 use deps_core::PackageVersions;
 use deps_core::Registry;
+use deps_core::RemovalStatus;
 use deps_core::Result;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::in_use_version;
@@ -114,10 +116,62 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     new_state
         .yanked_versions
         .clone_from(&old_state.yanked_versions);
+    // Same rationale — without this the #205 deprecation diagnostic/hover/quickfix
+    // would flicker off on every keystroke until the next fetch.
+    new_state.deprecations.clone_from(&old_state.deprecations);
     // Same rationale — without this a registry-outage package would flip
     // back to a misleading "Unknown package" diagnostic on every keystroke
     // until the next fetch cycle re-populates it (#267).
     new_state.fetch_failed.clone_from(&old_state.fetch_failed);
+}
+
+/// Merges a partial fetch's #205 deprecation findings into `doc.deprecations`
+/// (incremental didChange path — S1).
+///
+/// Without the clearing half of this (S1), a package that stops being deprecated
+/// (`npm deprecate pkg ""`) would keep a stale finding for the document's lifetime —
+/// nothing else ever removes one (a package-level finding does not become stale on a
+/// version-only edit — see the comment above `diff.version_changed`'s pruning loop in
+/// `handle_document_change`).
+///
+/// `fetched_names` — every raw package name successfully fetched this round (i.e. the
+/// keys of `fetch_result.versions`, captured before it is consumed) — must clear any
+/// previously-recorded finding when `fetched_deprecations` has no entry for it ("fetched
+/// and clean"); a name *not* fetched this round (untouched by `deps_to_fetch`) must not
+/// be touched at all, which is why this takes the explicit fetched-name list rather than
+/// iterating `doc.deprecations` itself.
+fn merge_deprecations_after_fetch(
+    doc: &mut DocumentState,
+    fetched_names: &[PackageName],
+    mut fetched_deprecations: HashMap<PackageName, Deprecation>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) {
+    // I2: decided per *normalized* name in one pass, not applied incrementally per raw
+    // name — `fetched_names` iterates a `HashMap`'s keys, so its order is unspecified,
+    // and two raw names that normalize to the same key (e.g. Composer's case-insensitive
+    // `require` keys) would otherwise let "insert B's finding, then clear it because A
+    // (processed after) had none" flip on iteration order alone. Collecting first means
+    // "any fetched raw name under this key reported a finding" wins deterministically,
+    // regardless of which one is visited first.
+    let mut per_normalized: HashMap<String, Option<Deprecation>> = HashMap::new();
+    for name in fetched_names {
+        let normalized = formatter.normalize_package_name(name);
+        let found = fetched_deprecations.remove(name);
+        let entry = per_normalized.entry(normalized).or_insert(None);
+        if entry.is_none() {
+            *entry = found;
+        }
+    }
+    for (normalized, deprecation) in per_normalized {
+        match deprecation {
+            Some(deprecation) => {
+                doc.deprecations.insert(normalized, deprecation);
+            }
+            None => {
+                doc.deprecations.remove(&normalized);
+            }
+        }
+    }
 }
 
 /// Ceiling on the OSV scan timeout, independent of the configured
@@ -598,10 +652,18 @@ struct FetchResult {
     versions: HashMap<PackageName, PackageVersions>,
     /// Yanked-version findings, keyed by **raw** package name (unlike
     /// `DocumentState::yanked_versions`, which is normalized-keyed — see
-    /// §3.1 of the design). Callers must re-key through
-    /// `EcosystemFormatter::normalize_package_name` before merging into
-    /// document state.
-    yanked_versions: HashMap<PackageName, String>,
+    /// §3.1 of the design), to (the version string found yanked, its
+    /// `RemovalStatus`). The status rides alongside so #205's package-level
+    /// deprecation diagnostic can gate its yanked-check suppression on
+    /// `AdvisoryDeprecated` specifically, never a genuine `Yanked` finding.
+    /// Callers must re-key through `EcosystemFormatter::normalize_package_name`
+    /// before merging into document state.
+    yanked_versions: HashMap<PackageName, (String, RemovalStatus)>,
+    /// Package-level deprecation findings (issue #205), keyed by **raw** package name
+    /// (same raw/normalized split as `yanked_versions` above). Derived from the
+    /// `resolved`/"latest" pick in the fetch loop below, not by scanning the full
+    /// `versions` list — see that loop's comments for why.
+    deprecations: HashMap<PackageName, Deprecation>,
     /// Packages whose registry fetch errored or timed out, keyed by **raw**
     /// package name (same raw/normalized split as `yanked_versions` above).
     /// Lets diagnostic generation (#267) distinguish "the registry said this
@@ -703,8 +765,9 @@ async fn fetch_latest_versions_parallel(
                     tokio::time::timeout(timeout, registry.get_versions_with(&name, freshness))
                         .await;
 
-                let mut yanked: Option<(PackageName, String)> = None;
+                let mut yanked: Option<(PackageName, String, RemovalStatus)> = None;
                 let mut failed_name: Option<PackageName> = None;
+                let mut deprecation: Option<(PackageName, Deprecation)> = None;
                 let version = match result {
                     Ok(Ok(versions)) => {
                         let available: Arc<[String]> = versions
@@ -742,7 +805,12 @@ async fn fetch_latest_versions_parallel(
                         {
                             let latest = v.version_string().to_string();
                             tracing::debug!(package = %name, version = %latest, "fetched");
-                            Some((latest, v.removal_status().is_flagged(), v.published_at()))
+                            Some((
+                                latest,
+                                v.removal_status(),
+                                v.published_at(),
+                                v.deprecation().cloned(),
+                            ))
                         } else {
                             // The pure list-based pick found nothing — for most
                             // ecosystems this genuinely means "no version found", but
@@ -774,8 +842,9 @@ async fn fetch_latest_versions_parallel(
                                     );
                                     Some((
                                         latest,
-                                        v.removal_status().is_flagged(),
+                                        v.removal_status(),
                                         v.published_at(),
+                                        v.deprecation().cloned(),
                                     ))
                                 }
                                 Ok(Ok(None)) => {
@@ -824,8 +893,10 @@ async fn fetch_latest_versions_parallel(
                             // registry under today's hardcoded wildcard (one
                             // never returns a yanked version for `*`), but
                             // stays correct as a defense-in-depth check.
-                            if let Some((latest, true, _)) = &resolved {
-                                yanked = Some((name.clone(), latest.clone()));
+                            if let Some((latest, status, _, _)) = &resolved
+                                && status.is_flagged()
+                            {
+                                yanked = Some((name.clone(), latest.clone(), *status));
                             }
 
                             // Row 2/3 (§4.7, revised under #206): `versions`
@@ -847,17 +918,38 @@ async fn fetch_latest_versions_parallel(
                             // yanked pin on any occurrence is never missed
                             // just because another occurrence happens to
                             // share the registry lookup.
-                            if let Some(iv) = in_use_versions.iter().find(|iv| {
-                                versions.iter().any(|v| {
-                                    v.version_string() == iv.as_str()
-                                        && v.removal_status().is_flagged()
-                                })
+                            // Filters on `is_flagged()` inside the `find` predicate itself
+                            // (not via a separate `.filter()` on the first version-string
+                            // match) so a registry response with more than one entry sharing
+                            // `iv`'s version string still finds a flagged one if any exists —
+                            // mirroring the pre-#205 `.any(matches && flagged)` scan rather
+                            // than narrowing to "is the *first* same-string entry flagged".
+                            if let Some((iv, status)) = in_use_versions.iter().find_map(|iv| {
+                                versions
+                                    .iter()
+                                    .find(|v| {
+                                        v.version_string() == iv.as_str()
+                                            && v.removal_status().is_flagged()
+                                    })
+                                    .map(|v| (iv, v.removal_status()))
                             }) {
-                                yanked = Some((name.clone(), iv.clone()));
+                                yanked = Some((name.clone(), iv.clone(), status));
                             }
                         }
 
-                        resolved.map(|(latest, _, published_at)| {
+                        // #205: the package-level deprecation finding is derived from the
+                        // same `Version` `resolved` already picked as "latest" — covering
+                        // the `get_latest_matching_with_context` fallback branch above too,
+                        // whose returned `Version` is not a member of `versions` at all. See
+                        // `FetchResult::deprecations`'s docs for why this must not instead
+                        // scan `versions`.
+                        if let Some((_, _, _, dep_info)) = &resolved
+                            && let Some(dep_info) = dep_info
+                        {
+                            deprecation = Some((name.clone(), dep_info.clone()));
+                        }
+
+                        resolved.map(|(latest, _, published_at, _)| {
                             (
                                 name.clone(),
                                 PackageVersions {
@@ -903,7 +995,7 @@ async fn fetch_latest_versions_parallel(
                     sender.send(count);
                 }
 
-                (version, yanked, failed_name)
+                (version, yanked, failed_name, deprecation)
             }
         })
         .buffer_unordered(max_concurrent)
@@ -913,15 +1005,19 @@ async fn fetch_latest_versions_parallel(
     let mut versions = HashMap::with_capacity(results.len());
     let mut yanked_versions = HashMap::new();
     let mut fetch_failed = HashSet::new();
-    for (version, yanked, failed_name) in results {
+    let mut deprecations = HashMap::new();
+    for (version, yanked, failed_name, deprecation) in results {
         if let Some((name, v)) = version {
             versions.insert(name, v);
         }
-        if let Some((name, v)) = yanked {
-            yanked_versions.insert(name, v);
+        if let Some((name, v, status)) = yanked {
+            yanked_versions.insert(name, (v, status));
         }
         if let Some(name) = failed_name {
             fetch_failed.insert(name);
+        }
+        if let Some((name, d)) = deprecation {
+            deprecations.insert(name, d);
         }
     }
 
@@ -929,6 +1025,7 @@ async fn fetch_latest_versions_parallel(
         versions,
         yanked_versions,
         fetch_failed,
+        deprecations,
         failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
         first_error: first_error.lock().unwrap_or_else(|p| p.into_inner()).take(),
     }
@@ -1144,6 +1241,13 @@ pub async fn handle_document_open(
             // Re-key raw -> normalized (§3.1): `FetchResult::yanked_versions`
             // is raw-keyed, `DocumentState::yanked_versions` is normalized.
             let formatter = ecosystem_clone.formatter();
+            doc.update_deprecations(
+                fetch_result
+                    .deprecations
+                    .into_iter()
+                    .map(|(name, d)| (formatter.normalize_package_name(&name), d))
+                    .collect(),
+            );
             doc.update_yanked_versions(
                 fetch_result
                     .yanked_versions
@@ -1316,6 +1420,9 @@ pub async fn handle_document_change(
         doc_state
             .fetch_failed
             .remove(&formatter.normalize_package_name(removed_dep));
+        doc_state
+            .deprecations
+            .remove(&formatter.normalize_package_name(removed_dep));
     }
 
     // A version-only edit (name unchanged, requirement changed) invalidates
@@ -1327,6 +1434,11 @@ pub async fn handle_document_change(
     // the *new* version also turns out to be yanked. Same for `fetch_failed`
     // (#267): a stale fetch-error marker must not survive an edit that gets
     // re-fetched below.
+    //
+    // Deliberately NOT mirrored for `deprecations`: #205's finding is
+    // package-level, derived from `latest`, not the dependency's declared
+    // version — editing which version is pinned does not make the package
+    // any less (or more) deprecated, so there is nothing stale to drop here.
     for changed_dep in &diff.version_changed {
         doc_state
             .yanked_versions
@@ -1512,6 +1624,11 @@ pub async fn handle_document_change(
 
         // Merge new versions into existing cache
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
+            // Captured before `fetch_result.versions` is consumed below: every name
+            // successfully fetched this round, used by the S1 deprecation-clearing
+            // loop further down to distinguish "fetched and clean" from "not fetched
+            // this round" — only the former may clear a stale finding.
+            let fetched_names: Vec<PackageName> = fetch_result.versions.keys().cloned().collect();
             for (name, version) in fetch_result.versions {
                 doc.cached_versions.insert(name, version);
             }
@@ -1525,6 +1642,12 @@ pub async fn handle_document_change(
                 doc.fetch_failed
                     .insert(formatter.normalize_package_name(&name));
             }
+            merge_deprecations_after_fetch(
+                &mut doc,
+                &fetched_names,
+                fetch_result.deprecations,
+                formatter,
+            );
             if success {
                 doc.set_loaded();
             } else {
@@ -3990,7 +4113,7 @@ dependencies = ["requests>=2.0.0"]
             pinned_version: &'static str,
         ) -> (
             Vec<tower_lsp_server::ls_types::Diagnostic>,
-            HashMap<String, String>,
+            HashMap<String, (String, RemovalStatus)>,
         ) {
             let state = Arc::new(ServerState::new());
             let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
@@ -4052,7 +4175,7 @@ dependencies = ["requests>=2.0.0"]
             )
             .await;
 
-            let yanked_versions: HashMap<String, String> = fetch_result
+            let yanked_versions: HashMap<String, (String, RemovalStatus)> = fetch_result
                 .yanked_versions
                 .into_iter()
                 .map(|(name, v)| (formatter.normalize_package_name(&name), v))
@@ -4087,7 +4210,7 @@ dependencies = ["requests>=2.0.0"]
 
             assert_eq!(
                 yanked_versions.get("typing-extensions"),
-                Some(&"4.9.0".to_string()),
+                Some(&("4.9.0".to_string(), RemovalStatus::Yanked)),
                 "must be keyed by the normalized (dash) name, not the raw manifest name"
             );
             assert!(
@@ -4102,7 +4225,7 @@ dependencies = ["requests>=2.0.0"]
 
             assert_eq!(
                 yanked_versions.get("zope-interface"),
-                Some(&"5.0.0".to_string()),
+                Some(&("5.0.0".to_string(), RemovalStatus::Yanked)),
                 "must be keyed by the normalized (dotted -> dash) name"
             );
             assert!(
@@ -4405,7 +4528,7 @@ time = "0.1.43"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_yanked_versions(HashMap::from([(
                     "time".to_string(),
-                    "0.1.43".to_string(),
+                    ("0.1.43".to_string(), RemovalStatus::Yanked),
                 )]));
             }
 
@@ -4429,7 +4552,338 @@ time = "0.1.43"
             state.update_document(uri.clone(), doc_state2);
 
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.yanked_versions.get("time"), Some(&"0.1.43".to_string()));
+            assert_eq!(
+                doc.yanked_versions.get("time"),
+                Some(&("0.1.43".to_string(), RemovalStatus::Yanked))
+            );
+        }
+
+        #[tokio::test]
+        async fn test_preserve_cache_carries_deprecations_across_edit() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+time = "0.1.43"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_deprecations(HashMap::from([(
+                    "time".to_string(),
+                    Deprecation {
+                        reason: Some("archived".to_string()),
+                        replacement: None,
+                    },
+                )]));
+            }
+
+            // A whitespace-only edit: DocumentState is rebuilt from scratch, which
+            // would silently flicker the deprecation diagnostic off on every keystroke
+            // without preserve_cache carrying it through.
+            let content2 = r#"[dependencies]
+time = "0.1.43"
+
+"#;
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+            state.update_document(uri.clone(), doc_state2);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.deprecations.get("time"),
+                Some(&Deprecation {
+                    reason: Some("archived".to_string()),
+                    replacement: None,
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn test_deprecations_pruned_on_dependency_removal_by_normalized_name() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+serde = "1.0"
+time = "0.1.43"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_deprecations(HashMap::from([(
+                    "time".to_string(),
+                    Deprecation {
+                        reason: Some("archived".to_string()),
+                        replacement: None,
+                    },
+                )]));
+            }
+
+            let content2 = r#"[dependencies]
+serde = "1.0"
+"#;
+            let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+                [("serde", None), ("time", None)]
+                    .into_iter()
+                    .map(|(n, r)| (PackageName::new(n), vec![r]))
+                    .collect();
+            let new_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
+                std::iter::once((PackageName::new("serde"), vec![None])).collect();
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
+            assert_eq!(diff.removed, vec![PackageName::new("time")]);
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            let formatter = ecosystem.formatter();
+            for removed_dep in &diff.removed {
+                doc_state2
+                    .deprecations
+                    .remove(&formatter.normalize_package_name(removed_dep));
+            }
+
+            state.update_document(uri.clone(), doc_state2);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                !doc.deprecations.contains_key("time"),
+                "removed dependency's deprecation entry must be pruned"
+            );
+        }
+
+        /// D2 invariant: unlike `yanked_versions`, a #205 finding is package-level, not
+        /// tied to the declared version — editing which version is pinned must NOT
+        /// drop it, mirroring the deliberate absence of a
+        /// `diff.version_changed`-triggered prune in `handle_document_change`.
+        #[tokio::test]
+        async fn test_deprecations_survive_version_change_unlike_yanked_versions() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+time = "0.1.44"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_yanked_versions(HashMap::from([(
+                    "time".to_string(),
+                    ("0.1.44".to_string(), RemovalStatus::Yanked),
+                )]));
+                doc.update_deprecations(HashMap::from([(
+                    "time".to_string(),
+                    Deprecation {
+                        reason: Some("archived".to_string()),
+                        replacement: None,
+                    },
+                )]));
+            }
+
+            // Edit the pin from a yanked version to a safe one — the *version-level*
+            // yanked finding is stale and must be dropped, but the *package-level*
+            // deprecation finding is not tied to which version is pinned.
+            let content2 = r#"[dependencies]
+time = "0.1.43"
+"#;
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+            doc_state2.yanked_versions.remove("time");
+
+            state.update_document(uri.clone(), doc_state2);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                !doc.yanked_versions.contains_key("time"),
+                "the stale version-level yanked finding must be dropped"
+            );
+            assert_eq!(
+                doc.deprecations.get("time"),
+                Some(&Deprecation {
+                    reason: Some("archived".to_string()),
+                    replacement: None,
+                }),
+                "the package-level deprecation finding must survive a version-only edit"
+            );
+        }
+
+        /// T4 (C3): a deprecation finding recorded on the full-fetch path must survive
+        /// a partial didChange fetch that does not re-fetch that package.
+        #[test]
+        fn test_merge_deprecations_after_fetch_retains_finding_for_name_not_refetched() {
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let formatter = ecosystem.formatter();
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.deprecations.insert(
+                "vendor/a".to_string(),
+                Deprecation {
+                    reason: None,
+                    replacement: Some("vendor/a2".to_string()),
+                },
+            );
+
+            // Only "vendor/b" was fetched this round (e.g. a new dependency added by
+            // the edit); "vendor/a" was untouched.
+            let mut fetched = HashMap::new();
+            fetched.insert(
+                PackageName::new("vendor/b"),
+                Deprecation {
+                    reason: Some("abandoned".to_string()),
+                    replacement: None,
+                },
+            );
+            merge_deprecations_after_fetch(
+                &mut doc,
+                &[PackageName::new("vendor/b")],
+                fetched,
+                formatter,
+            );
+
+            assert_eq!(
+                doc.deprecations.get("vendor/a"),
+                Some(&Deprecation {
+                    reason: None,
+                    replacement: Some("vendor/a2".to_string()),
+                }),
+                "a finding for a name not in this round's fetch must survive untouched"
+            );
+            assert_eq!(
+                doc.deprecations.get("vendor/b"),
+                Some(&Deprecation {
+                    reason: Some("abandoned".to_string()),
+                    replacement: None,
+                })
+            );
+        }
+
+        /// T5 (S1): a package that stops being deprecated must have its finding
+        /// cleared once re-fetched clean — distinct from a name simply not fetched
+        /// this round (T4), which must be left untouched.
+        #[test]
+        fn test_merge_deprecations_after_fetch_clears_finding_when_refetched_clean() {
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let formatter = ecosystem.formatter();
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.deprecations.insert(
+                "vendor/a".to_string(),
+                Deprecation {
+                    reason: None,
+                    replacement: None,
+                },
+            );
+
+            // "vendor/a" was re-fetched this round and no longer reports a finding.
+            merge_deprecations_after_fetch(
+                &mut doc,
+                &[PackageName::new("vendor/a")],
+                HashMap::new(),
+                formatter,
+            );
+
+            assert!(
+                !doc.deprecations.contains_key("vendor/a"),
+                "a name that was fetched and produced no finding must be cleared"
+            );
+        }
+
+        /// I2: two raw names that normalize to the same key (Composer's `normalize_package_name`
+        /// lowercases, so `"Vendor/Package"` and `"vendor/package"` collide) must merge
+        /// deterministically — a finding under either raw name must survive regardless of
+        /// `fetched_names`' (unspecified `HashMap::keys()`) iteration order.
+        #[test]
+        fn test_merge_deprecations_after_fetch_is_order_independent_across_normalization_collision()
+        {
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("composer").unwrap();
+            let formatter = ecosystem.formatter();
+
+            for names in [
+                [
+                    PackageName::new("vendor/package"),
+                    PackageName::new("Vendor/Package"),
+                ],
+                [
+                    PackageName::new("Vendor/Package"),
+                    PackageName::new("vendor/package"),
+                ],
+            ] {
+                let mut doc =
+                    DocumentState::new_without_parse_result(EcosystemId::Composer, String::new());
+
+                let mut fetched = HashMap::new();
+                fetched.insert(
+                    PackageName::new("Vendor/Package"),
+                    Deprecation {
+                        reason: None,
+                        replacement: Some("vendor/other".to_string()),
+                    },
+                );
+                // "vendor/package" (lowercase) is fetched too and reports no finding.
+
+                merge_deprecations_after_fetch(&mut doc, &names, fetched, formatter);
+
+                assert_eq!(
+                    doc.deprecations.get("vendor/package"),
+                    Some(&Deprecation {
+                        reason: None,
+                        replacement: Some("vendor/other".to_string()),
+                    }),
+                    "a finding under either raw name sharing a normalized key must survive, \
+                     regardless of fetch order: {names:?}"
+                );
+            }
         }
 
         #[tokio::test]
@@ -4454,7 +4908,7 @@ time = "0.1.43"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_yanked_versions(HashMap::from([(
                     "time".to_string(),
-                    "0.1.43".to_string(),
+                    ("0.1.43".to_string(), RemovalStatus::Yanked),
                 )]));
             }
 
@@ -4527,7 +4981,7 @@ time = "=0.1.43"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_yanked_versions(HashMap::from([(
                     "time".to_string(),
-                    "0.1.43".to_string(),
+                    ("0.1.43".to_string(), RemovalStatus::Yanked),
                 )]));
             }
 
@@ -4714,7 +5168,7 @@ time = "0.1.43"
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_yanked_versions(HashMap::from([(
                     "time".to_string(),
-                    "0.1.43".to_string(),
+                    ("0.1.43".to_string(), RemovalStatus::Yanked),
                 )]));
             }
 
@@ -4738,7 +5192,10 @@ time = "0.1.43"
             // un-yanked (or a different version newly yanked) in the
             // lockfile in the meantime, nothing here would know.
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.yanked_versions.get("time"), Some(&"0.1.43".to_string()));
+            assert_eq!(
+                doc.yanked_versions.get("time"),
+                Some(&("0.1.43".to_string(), RemovalStatus::Yanked))
+            );
         }
 
         #[tokio::test]
@@ -6057,7 +6514,7 @@ tokio = "1.0"
             assert_eq!(fetch_calls.load(Ordering::Relaxed), 1);
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&"1.0.0".to_string())
+                Some(&("1.0.0".to_string(), RemovalStatus::Yanked))
             );
         }
 
@@ -6124,7 +6581,7 @@ tokio = "1.0"
 
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&"1.0.0".to_string())
+                Some(&("1.0.0".to_string(), RemovalStatus::Yanked))
             );
             assert!(result.versions.is_empty());
         }
@@ -6168,7 +6625,7 @@ tokio = "1.0"
             );
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&"1.0.0".to_string())
+                Some(&("1.0.0".to_string(), RemovalStatus::Yanked))
             );
         }
 
@@ -6212,7 +6669,7 @@ tokio = "1.0"
 
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&"2.0.0".to_string()),
+                Some(&("2.0.0".to_string(), RemovalStatus::Yanked)),
                 "the yanked occurrence must be found even though a name-keyed \
                  single-value map could have kept only the non-yanked \"1.0.0\" pin"
             );
@@ -6246,7 +6703,7 @@ tokio = "1.0"
 
             assert_eq!(
                 result.yanked_versions.get(&PackageName::new("pkg")),
-                Some(&"1.0.0".to_string())
+                Some(&("1.0.0".to_string(), RemovalStatus::Yanked))
             );
         }
 
@@ -6356,6 +6813,137 @@ tokio = "1.0"
             assert!(result.yanked_versions.is_empty());
             assert_eq!(result.failed_count, 1);
             assert!(result.versions.is_empty());
+        }
+    }
+
+    /// #205: the `fetch_latest_versions_parallel` wiring that derives `FetchResult::deprecations`
+    /// from the `resolved`/"latest" pick, self-contained rather than extending
+    /// `yanked_check_tests`'s shared `MockYankVersion`/`FetchOutcome` (whose tuple shape has
+    /// no room for a per-version `Deprecation` payload without touching its many existing
+    /// call sites).
+    mod deprecation_derivation_tests {
+        use super::*;
+        use deps_core::{Metadata, Version};
+        use std::any::Any;
+
+        struct MockDeprecatedVersion {
+            version: &'static str,
+            deprecation: Option<Deprecation>,
+        }
+
+        impl Version for MockDeprecatedVersion {
+            fn version_string(&self) -> &str {
+                self.version
+            }
+            fn removal_status(&self) -> RemovalStatus {
+                RemovalStatus::from_advisory(self.deprecation.is_some())
+            }
+            fn deprecation(&self) -> Option<&Deprecation> {
+                self.deprecation.as_ref()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// Always resolves to its single configured version.
+        struct SingleVersionRegistry {
+            deprecation: Option<Deprecation>,
+        }
+
+        impl Registry for SingleVersionRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                let deprecation = self.deprecation.clone();
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockDeprecatedVersion {
+                        version: "1.0.0",
+                        deprecation,
+                    }) as Box<dyn Version>])
+                })
+            }
+
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &VersionReq,
+            ) -> Option<usize> {
+                (!versions.is_empty()).then_some(0)
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        #[tokio::test]
+        async fn fetch_result_carries_deprecation_from_resolved_pick() {
+            let registry: Arc<dyn Registry> = Arc::new(SingleVersionRegistry {
+                deprecation: Some(Deprecation {
+                    reason: Some("archived".to_string()),
+                    replacement: Some("other/pkg".to_string()),
+                }),
+            });
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &HashMap::new(),
+                None,
+                deps_core::freshness::FreshnessSettings::default(),
+                5,
+                10,
+                None,
+            )
+            .await;
+
+            assert_eq!(
+                result.deprecations.get(&PackageName::new("pkg")),
+                Some(&Deprecation {
+                    reason: Some("archived".to_string()),
+                    replacement: Some("other/pkg".to_string()),
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_result_has_no_deprecation_when_resolved_pick_is_clean() {
+            let registry: Arc<dyn Registry> = Arc::new(SingleVersionRegistry { deprecation: None });
+
+            let result = fetch_latest_versions_parallel(
+                registry,
+                vec![PackageName::new("pkg")],
+                &HashMap::new(),
+                None,
+                deps_core::freshness::FreshnessSettings::default(),
+                5,
+                10,
+                None,
+            )
+            .await;
+
+            assert!(result.deprecations.is_empty());
         }
     }
 }

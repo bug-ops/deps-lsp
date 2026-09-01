@@ -5,7 +5,10 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
 
 use crate::osv::VulnerabilityMap;
-use crate::{Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq};
+use crate::{
+    Dependency, Deprecation, EcosystemId, InvalidPackageName, PackageName, RemovalStatus,
+    VersionReq,
+};
 
 mod code_actions;
 mod code_lenses;
@@ -19,8 +22,9 @@ mod test_support;
 pub use code_actions::generate_code_actions;
 pub use code_lenses::{collect_update_all_edits, generate_code_lenses};
 pub use diagnostics::{
-    DiagnosticSeverities, UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless,
-    generate_diagnostics, generate_diagnostics_from_cache, requirement_is_unsatisfiable,
+    DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, UNSATISFIABLE_DIAGNOSTIC_CODE,
+    compile_requirement_unless, generate_diagnostics, generate_diagnostics_from_cache,
+    requirement_is_unsatisfiable,
 };
 pub use hover::generate_hover;
 pub use in_use_version::{concrete_pin_version, in_use_version};
@@ -168,12 +172,20 @@ pub struct VersionData<'a> {
     /// scan has run yet (e.g. the feature is disabled) — distinct from an
     /// empty map, which would mean "scanned, nothing found".
     pub vulnerabilities: Option<&'a VulnerabilityMap>,
-    /// Yanked-version findings, keyed by normalized package name -> the
+    /// Yanked-version findings, keyed by normalized package name -> (the
     /// version string found yanked (the in-use version, or `latest` when
-    /// only `latest` itself is yanked — see `deps-lsp`'s lifecycle probe).
-    /// `None` when no yanked check has run yet — distinct from an empty map,
-    /// which would mean "checked, nothing yanked".
-    pub yanked: Option<&'a HashMap<String, String>>,
+    /// only `latest` itself is yanked — see `deps-lsp`'s lifecycle probe),
+    /// its [`RemovalStatus`]). The status rides alongside the version string
+    /// so [`generate_diagnostics_from_cache`] can gate #205's package-level
+    /// deprecation suppression on `AdvisoryDeprecated` specifically, never on
+    /// a genuine `Yanked` finding (see that function's D5 handling). `None`
+    /// when no yanked check has run yet — distinct from an empty map, which
+    /// would mean "checked, nothing yanked".
+    pub yanked: Option<&'a HashMap<String, (String, RemovalStatus)>>,
+    /// Package-level deprecation findings, keyed by normalized package name.
+    /// `None` when no fetch has run yet — distinct from an empty map, which
+    /// would mean "checked, nothing deprecated". See [`crate::Deprecation`].
+    pub deprecations: Option<&'a HashMap<String, Deprecation>>,
     /// Packages whose registry fetch errored or timed out during the most
     /// recent lifecycle fetch, keyed by normalized package name. Lets
     /// [`generate_diagnostics_from_cache`] distinguish "the registry was
@@ -226,6 +238,7 @@ impl<'a> VersionData<'a> {
             resolved,
             vulnerabilities: None,
             yanked: None,
+            deprecations: None,
             fetch_failed: None,
             ecosystem: None,
         }
@@ -257,18 +270,38 @@ impl<'a> VersionData<'a> {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::VersionData;
+    /// use deps_core::{RemovalStatus, VersionData};
     /// use std::collections::HashMap;
     ///
     /// let cached = HashMap::new();
     /// let resolved = HashMap::new();
-    /// let yanked = HashMap::new();
+    /// let yanked: HashMap<String, (String, RemovalStatus)> = HashMap::new();
     /// let versions = VersionData::new(&cached, &resolved).with_yanked(&yanked);
     /// assert!(versions.yanked.is_some());
     /// ```
     #[must_use]
-    pub fn with_yanked(mut self, yanked: &'a HashMap<String, String>) -> Self {
+    pub fn with_yanked(mut self, yanked: &'a HashMap<String, (String, RemovalStatus)>) -> Self {
         self.yanked = Some(yanked);
+        self
+    }
+
+    /// Attaches package-level deprecation findings to this `VersionData`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{Deprecation, VersionData};
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let deprecations: HashMap<String, Deprecation> = HashMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_deprecations(&deprecations);
+    /// assert!(versions.deprecations.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_deprecations(mut self, deprecations: &'a HashMap<String, Deprecation>) -> Self {
+        self.deprecations = Some(deprecations);
         self
     }
 
@@ -936,6 +969,35 @@ pub trait EcosystemFormatter: Send + Sync {
         "*(yanked)*"
     }
 
+    /// Message for a package-level deprecation/abandonment diagnostic (issue #205).
+    ///
+    /// Distinct from [`Self::yanked_message`]: that one describes a single flagged
+    /// *version*, this one describes the *package* being deprecated/abandoned/archived.
+    /// Default wording is generic; `ComposerFormatter` overrides both this and
+    /// [`Self::deprecated_label`] to "abandoned", matching Packagist's own vocabulary —
+    /// the same pattern it already applies to the yanked pair.
+    fn deprecated_message(&self) -> &'static str {
+        "This package is deprecated"
+    }
+
+    /// Label for a deprecated package in hover.
+    fn deprecated_label(&self) -> &'static str {
+        "*(deprecated)*"
+    }
+
+    /// Whether this ecosystem's deprecation payload ([`crate::Deprecation::replacement`])
+    /// is safe to offer as a "Replace with X" rename quickfix.
+    ///
+    /// Default `false`. Only an ecosystem whose replacement name comes from a
+    /// **structured, registry-validated** field may override this to `true` — never one
+    /// synthesized by parsing free text, which is a typosquatting vector (npm's
+    /// `deprecated` message names a successor only in prose). `ComposerFormatter`
+    /// overrides this to `true`: Packagist's `abandoned` replacement is a real package
+    /// name field, not extracted text.
+    fn supports_package_rename(&self) -> bool {
+        false
+    }
+
     /// Whether the "requirement satisfiable only by a yanked version" diagnostic
     /// (`crate::lsp_helpers::requirement_matches_only_yanked`) should evaluate `requirement`
     /// at all for this ecosystem.
@@ -949,9 +1011,9 @@ pub trait EcosystemFormatter: Send + Sync {
     /// npm package had 126/126 versions marked deprecated), so evaluating a range
     /// requirement against them would flag every dependency on a deprecated/abandoned
     /// package under this diagnostic's wording, conflating it with package-level
-    /// deprecation — a distinct, separately-planned diagnostic (issue #205). Restricting to
-    /// an exact pin keeps this diagnostic scoped to #247's actual scenario: "you are pinned
-    /// to this one specific version, and it has been yanked."
+    /// deprecation — a distinct diagnostic ([`Self::deprecated_message`], issue #205).
+    /// Restricting to an exact pin keeps this diagnostic scoped to #247's actual scenario:
+    /// "you are pinned to this one specific version, and it has been yanked."
     ///
     /// # Examples
     ///
