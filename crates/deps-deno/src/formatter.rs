@@ -138,24 +138,29 @@ impl EcosystemFormatter for DenoFormatter {
     /// `npm:lodash@4.17.20`) no longer surfaces this diagnostic, consistent with the
     /// equivalent exact-pin `package.json` dependency.
     ///
-    /// For `jsr:` specifiers, keeps the pre-existing exact-pin restriction. Historically
-    /// this was the only option: the hook took just a `&VersionReq`, with no way to tell
-    /// `jsr:` from `npm:` apart, so both had to share one answer. That blindness is now
-    /// fixed, and it does not actually justify restricting `jsr:` on its own terms — unlike
-    /// npm's `deprecated`, JSR's `yanked` flag is a genuine per-version signal with no
-    /// package-level deprecation diagnostic (#205) for a range-requirement check to
-    /// conflate with. Keeping the restriction here is a deliberate scope decision, not a
-    /// technical constraint: relaxing it is out of scope for #448, which targets only the
-    /// `npm:` cross-ecosystem divergence. Tracked as a follow-up: #454.
-    fn yanked_diagnostic_applies_to(&self, dep: &dyn Dependency, requirement: &VersionReq) -> bool {
+    /// For `jsr:` specifiers, applies unconditionally (`true`), matching the trait default
+    /// that Cargo/PyPI/Dart already rely on (#454, dropping the exact-pin-only restriction
+    /// this hook carried before #448 made it scheme-aware). Unlike npm's `deprecated` — which
+    /// #436 found routinely applied to *every* published version at once, making this
+    /// diagnostic redundant with the package-level deprecation diagnostic (#205) — JSR's
+    /// `yanked` flag has no package-level counterpart to conflate with:
+    /// [`JsrVersion`](crate::types::JsrVersion)'s `impl_version!` invocation leaves
+    /// `deprecation` unset, so `Version::deprecation()` is structurally `None` for every JSR
+    /// version and #205 never fires for `jsr:` dependencies. There is also no data gap: JSR's
+    /// `meta.json` (`JsrRegistry::get_versions`) returns every version's `yanked` flag in one
+    /// fetch, identical whether the manifest requirement is a range or an exact pin.
+    fn yanked_diagnostic_applies_to(
+        &self,
+        dep: &dyn Dependency,
+        _requirement: &VersionReq,
+    ) -> bool {
         match split_scheme(dep.name().as_str()) {
             Some((Scheme::Npm, _)) => false,
             // `None` is unreachable in practice — every parser-produced `DenoDependency` name
             // is scheme-qualified (see `package_url`'s `warn_rejected_value` handling of the
-            // same case above) — folded into the `jsr:` exact-pin path as a harmless default.
-            Some((Scheme::Jsr, _)) | None => {
-                node_semver::Version::parse(requirement.as_str().trim()).is_ok()
-            }
+            // same case above) — folded into the `jsr:` unconditional-true path as a harmless
+            // default.
+            Some((Scheme::Jsr, _)) | None => true,
         }
     }
 
@@ -363,21 +368,19 @@ mod tests {
         }
     }
 
+    /// #454: drops the pre-#448-blindness exact-pin-only restriction — a `jsr:` range
+    /// requirement now surfaces the diagnostic just like an exact pin, matching
+    /// Cargo/PyPI/Dart (which never override this hook and so keep the trait default).
     #[test]
-    fn test_yanked_diagnostic_applies_to_jsr_exact_pin_only() {
+    fn test_yanked_diagnostic_applies_to_jsr_scheme_always_true() {
         let formatter = DenoFormatter;
-        assert!(formatter.yanked_diagnostic_applies_to(
-            &test_dep("jsr:@std/fs", "1.2.3"),
-            &VersionReq::new("1.2.3")
-        ));
-        assert!(!formatter.yanked_diagnostic_applies_to(
-            &test_dep("jsr:@std/fs", "^1.2.3"),
-            &VersionReq::new("^1.2.3")
-        ));
-        assert!(
-            !formatter
-                .yanked_diagnostic_applies_to(&test_dep("jsr:@std/fs", "*"), &VersionReq::new("*"))
-        );
+        for requirement in ["1.2.3", "^1.2.3", "~1.2.3", "*"] {
+            let dep = test_dep("jsr:@std/fs", requirement);
+            assert!(
+                formatter.yanked_diagnostic_applies_to(&dep, &VersionReq::new(requirement)),
+                "expected {requirement:?} to be accepted for jsr: scheme"
+            );
+        }
     }
 
     /// #448: fixes the #436 M1 cross-ecosystem divergence — an `npm:` specifier in

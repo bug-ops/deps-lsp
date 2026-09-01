@@ -496,7 +496,10 @@ dependency, so only one yanked diagnostic is ever shown per dependency.
   Deno's `npm:` specifiers, which delegate to npm's own registry data (resolves #448). For
   Composer, evaluating a range requirement against it would flag every dependency on an
   abandoned package, so a bare exact pin (`"1.2.3"`, not `"^1.2.3"`) is unaffected by that
-  ambiguity and the check still applies there.
+  ambiguity and the check still applies there. Deno's `jsr:` specifiers are unrestricted (any
+  requirement shape): JSR's `meta.json` `yanked` flag is a true per-version signal with no
+  package-level deprecation payload to conflate with, unlike npm/Composer above (resolves
+  #454).
 
 **Ecosystem coverage, live-verified per registry rather than assumed from code:**
 
@@ -513,7 +516,7 @@ dependency, so only one yanked diagnostic is ever shown per dependency.
 | Gradle | No | reuses Maven Central's registry client, same hardcoded `false` |
 | NuGet | No | `NuGetVersion::is_yanked` is a hardcoded `false` constant |
 | Swift | No | `SwiftVersion.yanked` is a field that is always `false` for GitHub tags (no such concept in the source) |
-| Deno | `jsr:` yes, exact pins only; `npm:` no | JSR `meta.json` per-version `yanked` for `jsr:` specifiers; npm `deprecated` (unconditionally off, see restriction above) for `npm:` specifiers |
+| Deno | `jsr:` yes, any requirement shape; `npm:` no | JSR `meta.json` per-version `yanked` for `jsr:` specifiers; npm `deprecated` (unconditionally off, see restriction above) for `npm:` specifiers |
 
 5 of 12 ecosystems can produce this diagnostic today; npm is disabled by design rather than
 lacking a real signal (see restriction above), and that also covers Deno's `npm:` specifiers;

@@ -51,9 +51,11 @@ render the scheme as part of the package name. See the crate's module docs
 - No `deno.lock` support — hover/completion/diagnostics compare against the manifest
   requirement, not a resolved version (consistent with Gradle's lockfile-free MVP)
 - The `scopes` field and `importMap` file are not parsed — only the `imports` map
-- The yanked-only-match diagnostic is restricted to exact-pin requirements for both `jsr:`
-  and `npm:` specifiers (matches `deps-npm`'s own restriction, for the same reason:
-  avoiding false positives from package-wide deprecation)
+- The yanked-only-match diagnostic is disabled entirely for `npm:` specifiers (matches
+  `deps-npm`'s own restriction: npm's `deprecated` flag is often applied package-wide,
+  which would too often duplicate the package-level deprecation diagnostic instead of
+  signaling a genuine per-version yank); `jsr:` specifiers are unaffected and fire it for
+  any requirement shape, since JSR's `yanked` flag is a true per-version signal
 - Package-name completion works for a bare, still-being-typed `jsr:`/`npm:` specifier
   (`"jsr:"`, `"jsr:@"`, `"jsr:@std"`, `"jsr:@std/"`): `partial_name_range` in
   `specifier.rs` models the in-progress name so completion has a dependency to attach to,
