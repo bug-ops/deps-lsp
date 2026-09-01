@@ -14,7 +14,7 @@
 //! the same class of validation (DRY). [`crate::cache`]'s redirect-hop hardening also needs
 //! this exact classifier — see [`HostClass::never_a_registry`].
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Classification of a URL's host, for [`RegistryAccessPolicy`] to evaluate against
@@ -88,22 +88,46 @@ impl std::fmt::Display for HostClass {
     }
 }
 
-/// Unwraps an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to its embedded IPv4 form, so
-/// classification cannot be bypassed by writing the same address in its mapped form (e.g.
-/// `::ffff:169.254.169.254`).
+/// Unwraps an IPv4-mapped (`::ffff:a.b.c.d`) or NAT64-embedded (`64:ff9b::a.b.c.d`, RFC 6052
+/// well-known prefix) IPv6 address to its embedded IPv4 form, so classification cannot be
+/// bypassed by writing the same address in either v4-in-v6 form (e.g. `::ffff:169.254.169.254`
+/// or `64:ff9b::a9fe:a9fe`). The NAT64 case matters here specifically because an attacker's DNS
+/// answer can return any AAAA record it likes, and a client behind a NAT64/DNS64 gateway (or a
+/// local 464XLAT/CLAT translator) treats `64:ff9b::/96` as routable to the embedded IPv4 address
+/// (impl-critic finding, verified empirically: `64:ff9b::a9fe:a9fe` classified `Global` before
+/// this fix).
 ///
-/// Deliberately does **not** additionally unwrap the deprecated IPv4-*compatible* form
-/// (`::a.b.c.d`, RFC 4291 §2.5.5.1, no `ffff` prefix): `Ipv6Addr::to_ipv4()` treats *any*
-/// address with its first 96 bits zero as embedding an IPv4 address, which would
-/// misclassify `::1` (loopback) as `0.0.0.1` and `::` (unspecified) as `0.0.0.0` — a
-/// narrower, *new* bypass in exchange for closing a narrower, legacy one. Modern network
-/// stacks generally do not route this deprecated form at all, so it is accepted as
-/// low-real-world-risk (impl-critic finding, unwrap-mapped-v6 is the actively-exploitable
-/// form and is handled above).
+/// Deliberately does **not** additionally unwrap:
+/// - The deprecated IPv4-*compatible* form (`::a.b.c.d`, RFC 4291 §2.5.5.1, no `ffff` prefix):
+///   `Ipv6Addr::to_ipv4()` treats *any* address with its first 96 bits zero as embedding an
+///   IPv4 address, which would misclassify `::1` (loopback) as `0.0.0.1` and `::` (unspecified)
+///   as `0.0.0.0` — a narrower, *new* bypass in exchange for closing a narrower, legacy one.
+///   Modern network stacks generally do not route this deprecated form at all, so it is
+///   accepted as low-real-world-risk (impl-critic finding, unwrap-mapped-v6/NAT64 are the
+///   actively-exploitable forms and are handled above).
+/// - 6to4 (`2002::/16`, RFC 3056), which also embeds an IPv4 address in its prefix: a narrower,
+///   largely-deprecated IPv6-transition mechanism — NAT64/DNS64 remains commonly deployed
+///   today, 6to4 does not — documented as a residual, not fixed by this pass.
 fn unwrap_mapped_v4(addr: IpAddr) -> IpAddr {
     match addr {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(addr, IpAddr::V4),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .or_else(|| nat64_embedded_v4(v6))
+            .map_or(addr, IpAddr::V4),
         IpAddr::V4(_) => addr,
+    }
+}
+
+/// Extracts the IPv4 address embedded in a NAT64 well-known-prefix (RFC 6052 `64:ff9b::/96`)
+/// IPv6 address, e.g. `64:ff9b::a9fe:a9fe` -> `169.254.169.254`.
+fn nat64_embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = v6.segments();
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0] {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        Some(Ipv4Addr::new(a, b, c, d))
+    } else {
+        None
     }
 }
 
@@ -113,7 +137,7 @@ fn classify_ip(addr: IpAddr) -> HostClass {
         IpAddr::V4(v4) => {
             if v4.is_loopback() {
                 HostClass::Loopback
-            } else if v4 == std::net::Ipv4Addr::new(169, 254, 169, 254) {
+            } else if v4 == Ipv4Addr::new(169, 254, 169, 254) {
                 HostClass::CloudMetadata
             } else if v4.is_link_local() {
                 HostClass::LinkLocal
@@ -174,6 +198,27 @@ fn classify_name(host: &str) -> HostClass {
         return HostClass::InternalName;
     }
     HostClass::Global
+}
+
+/// Classifies a DNS-resolved socket address into a [`HostClass`].
+///
+/// The counterpart to [`classify_host`] used by [`crate::cache`]'s connect-time resolver guard
+/// (issue #449) to close the DNS-rebinding TOCTOU gap the module docs describe: a hostname's
+/// *resolved* address, not just its string form, needs the same classification. Reuses this
+/// module's own private IP-classification and mapped-address-unwrapping helpers rather than
+/// duplicating their match arms (DRY).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::{HostClass, classify_addr};
+///
+/// let addr = "169.254.169.254".parse().unwrap();
+/// assert_eq!(classify_addr(addr), HostClass::CloudMetadata);
+/// ```
+#[must_use]
+pub fn classify_addr(addr: IpAddr) -> HostClass {
+    classify_ip(unwrap_mapped_v4(addr))
 }
 
 /// Classifies `url`'s host into a [`HostClass`], from the URL alone — **no DNS resolution**
@@ -329,6 +374,17 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_cloud_metadata_nat64_bypass() {
+        // The NAT64 well-known-prefix bypass (impl-critic finding, verified empirically):
+        // `64:ff9b::/96` embeds an IPv4 address and must classify identically to the bare
+        // IPv4 form, not fall through to `Global`.
+        assert_eq!(
+            host_class("https://[64:ff9b::a9fe:a9fe]/"),
+            HostClass::CloudMetadata
+        );
+    }
+
+    #[test]
     fn test_classify_cloud_metadata_ec2_ipv6() {
         assert_eq!(
             host_class("https://[fd00:ec2::254]/"),
@@ -432,6 +488,44 @@ mod tests {
     #[test]
     fn test_classify_global_public_name() {
         assert_eq!(host_class("https://index.crates.io/"), HostClass::Global);
+    }
+
+    #[test]
+    fn test_classify_addr_cloud_metadata() {
+        let addr: IpAddr = "169.254.169.254".parse().unwrap();
+        assert_eq!(classify_addr(addr), HostClass::CloudMetadata);
+    }
+
+    #[test]
+    fn test_classify_addr_private_v4() {
+        let addr: IpAddr = "10.0.0.1".parse().unwrap();
+        assert_eq!(classify_addr(addr), HostClass::PrivateV4);
+    }
+
+    #[test]
+    fn test_classify_addr_unwraps_mapped_v4() {
+        let addr: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        assert_eq!(classify_addr(addr), HostClass::CloudMetadata);
+    }
+
+    #[test]
+    fn test_classify_addr_unwraps_nat64_cloud_metadata() {
+        // impl-critic S2: verified empirically that this classified `Global` before the fix.
+        let addr: IpAddr = "64:ff9b::a9fe:a9fe".parse().unwrap();
+        assert_eq!(classify_addr(addr), HostClass::CloudMetadata);
+    }
+
+    #[test]
+    fn test_classify_addr_unwraps_nat64_loopback() {
+        // impl-critic S2's second verified example: `64:ff9b::7f00:1` embeds `127.0.0.1`.
+        let addr: IpAddr = "64:ff9b::7f00:1".parse().unwrap();
+        assert_eq!(classify_addr(addr), HostClass::Loopback);
+    }
+
+    #[test]
+    fn test_classify_addr_global() {
+        let addr: IpAddr = "1.1.1.1".parse().unwrap();
+        assert_eq!(classify_addr(addr), HostClass::Global);
     }
 
     #[test]

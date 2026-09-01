@@ -196,9 +196,10 @@ fn hop_targets_blocked_host(url: &Url) -> bool {
 /// registry redirect target for *any* ecosystem, benefiting every one of the eleven crates
 /// sharing this client, not only Cargo's workspace-declared indexes.
 ///
-/// TODO(#443 follow-up): this only classifies the redirect target's URL, not its
-/// DNS-resolved address — a hop to an attacker-controlled name that merely *resolves* into a
-/// blocked range is not caught here (see plan-1b §5's residual-risk statement, D1).
+/// This only classifies the redirect target's URL string, not its DNS-resolved address — that
+/// residual gap (issue #449, "D1" in PR #447's plan) is now closed by [`BlockedAddrResolver`],
+/// which [`build_client`] wires into every client this module builds: a redirect hop reuses the
+/// same `Client`, so its target's resolved address is validated too, for free (FR-007).
 ///
 /// Every other redirect — including cross-host ones, which are out of scope for this
 /// policy — falls through to reqwest's default (`Policy::limited(10)`), preserving the
@@ -237,15 +238,128 @@ fn trusted_origin_redirect_policy(trusted_origin: String) -> reqwest::redirect::
     })
 }
 
-/// Builds a client with `HttpCache`'s shared configuration (user agent, timeout), varying
-/// only the redirect policy — kept in one place so a future client-wide setting (proxy,
+/// Error returned by [`BlockedAddrResolver`] when a DNS resolution cannot be trusted for
+/// connection use — either it produced no address, or at least one resolved address falls into
+/// a blocked [`crate::net_policy::HostClass`].
+///
+/// Kept distinct from [`DepsError`] since this crosses into `reqwest::dns::Resolve`'s own
+/// `BoxError` (`Box<dyn std::error::Error + Send + Sync>`) return type, not this crate's own
+/// error type.
+#[derive(Debug, thiserror::Error)]
+enum ResolveGuardError {
+    /// The resolver returned zero addresses for `host` — fail-closed (NFR-004) rather than
+    /// silently treating "nothing resolved" as "nothing to block".
+    #[error("DNS resolution for {host} returned no addresses")]
+    NoAddresses { host: String },
+    /// `addr`, resolved for `host`, falls into `class`, one of the
+    /// [`crate::net_policy::HostClass::never_a_registry`] classes no legitimate registry index
+    /// (or a redirect from one) could ever target.
+    #[error("resolved address {addr} for host {host} is {class}, blocked by net_policy")]
+    Blocked {
+        host: String,
+        addr: std::net::IpAddr,
+        class: crate::net_policy::HostClass,
+    },
+}
+
+/// Validates every address `tokio::net::lookup_host` returned for `host`, rejecting the whole
+/// resolution if any is blocked — an attacker's public A record alongside a blocked one must not
+/// keep the probe alive (FR-003).
+fn validate_resolved_addrs(
+    host: &str,
+    addrs: Vec<std::net::SocketAddr>,
+) -> std::result::Result<Vec<std::net::SocketAddr>, ResolveGuardError> {
+    if addrs.is_empty() {
+        tracing::warn!(host, "DNS resolution returned no addresses");
+        return Err(ResolveGuardError::NoAddresses {
+            host: host.to_string(),
+        });
+    }
+    for addr in &addrs {
+        let class = crate::net_policy::classify_addr(addr.ip());
+        if class.never_a_registry() {
+            tracing::warn!(host, addr = %addr.ip(), %class, "blocking DNS-resolved address");
+            return Err(ResolveGuardError::Blocked {
+                host: host.to_string(),
+                addr: addr.ip(),
+                class,
+            });
+        }
+    }
+    Ok(addrs)
+}
+
+/// Connect-time DNS resolver that closes the rebinding TOCTOU gap left by [`ensure_https`]/
+/// [`hop_targets_blocked_host`]'s URL-string-only classification (issue #449): those check the
+/// declared hostname, but `reqwest`'s connector resolves DNS independently, later, and an
+/// attacker who controls the hostname's DNS can rebind it to a blocked address in between.
+///
+/// Wired into every client [`build_client`] returns, so all 11 ecosystem crates sharing this
+/// client pool inherit it with zero per-crate plumbing (FR-006/NFR-002).
+///
+/// # Scope
+///
+/// A resolver only ever sees a hostname, never which [`crate::net_policy::WorkspaceRegistryAccess`]
+/// policy applies to the request that triggered it — so this enforces only the
+/// policy-independent [`crate::net_policy::HostClass::never_a_registry`] tier (loopback,
+/// link-local, cloud-metadata, unspecified), the same tier [`hop_targets_blocked_host`] already
+/// applies. It closes issue #449's filed exploit (cloud-metadata rebinding) but does **not**
+/// enforce full `PublicOnly` semantics: a hostname that legitimately resolves to
+/// `HostClass::Global` at classification time and is rebound to an RFC1918/CGNAT address at
+/// connect time is not caught here — closing that residual needs policy provenance at the
+/// connector, tracked as issue #455.
+///
+/// # Fail-closed (NFR-004)
+///
+/// Returns `Err` — never `Ok`, never a fallback resolver — on a `lookup_host` error, zero
+/// addresses, or any resolved address [`crate::net_policy::HostClass::never_a_registry`] blocks.
+///
+/// # Known limitations
+///
+/// - [`ClientBuilder::resolve`](reqwest::ClientBuilder::resolve)/
+///   [`resolve_to_addrs`](reqwest::ClientBuilder::resolve_to_addrs) overrides wrap *outside* the
+///   configured resolver (`reqwest`'s `DnsResolverWithOverrides`) and would bypass this guard
+///   entirely if ever called — this workspace does not call them today.
+/// - A configured system proxy (`HTTPS_PROXY`) resolves the target hostname itself; this
+///   resolver then only ever sees the proxy's own address. Operator configuration, not
+///   attacker-controlled, so NOT claimed as a defended case.
+/// - Never applies to an IP-literal host (`https://169.254.169.254/`): `hyper-util`'s connector
+///   parses those directly and never calls the configured resolver, so
+///   [`classify_host`](crate::net_policy::classify_host) (via [`ensure_https`]/
+///   [`hop_targets_blocked_host`]) remains the sole guard for literals — a disjoint domain from
+///   this resolver's name-based one, not a gap.
+/// - Unlike [`ensure_https`]/[`hop_targets_blocked_host`], this resolver has **no** `test-util`
+///   carve-out for `Loopback`: it blocks a `localhost`/`127.0.0.1` *name* unconditionally, in
+///   every build. A downstream `test-util` consumer that mocks by binding an IP literal (as
+///   this workspace's own `mockito` usage does) is unaffected — literals never reach this
+///   resolver at all — but one that mocks via a `localhost` *name* would be newly blocked.
+#[derive(Debug, Clone, Copy)]
+struct BlockedAddrResolver;
+
+impl reqwest::dns::Resolve for BlockedAddrResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let addrs = validate_resolved_addrs(&host, addrs)?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Builds a client with `HttpCache`'s shared configuration (user agent, timeout, resolver),
+/// varying only the redirect policy — kept in one place so a future client-wide setting (proxy,
 /// connection pool sizing, etc.) added to [`HttpCache::new`] can't silently miss the pooled
-/// clients [`HttpCache::client_for_origin`] builds.
+/// clients [`HttpCache::client_for_origin`] builds. This is also the workspace's only
+/// `Client::builder()` call site, so [`BlockedAddrResolver`] applies everywhere without
+/// per-crate plumbing.
 fn build_client(redirect: reqwest::redirect::Policy) -> Client {
     Client::builder()
         .user_agent(format!("deps-lsp/{}", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .redirect(redirect)
+        .dns_resolver(BlockedAddrResolver)
         .build()
         .expect("failed to create HTTP client")
 }
@@ -1092,6 +1206,115 @@ mod tests {
     fn test_hop_targets_blocked_host_exempts_loopback_under_test_cfg() {
         let url = Url::parse("http://127.0.0.1:1234/api/target").unwrap();
         assert!(!hop_targets_blocked_host(&url));
+    }
+
+    // Issue #449: the connect-time resolver guard's pure classification core, unit-tested
+    // directly rather than through `tokio::net::lookup_host` — no live DNS/network needed.
+    #[test]
+    fn test_validate_resolved_addrs_blocks_cloud_metadata() {
+        let addrs = vec!["169.254.169.254:0".parse().unwrap()];
+        assert!(matches!(
+            validate_resolved_addrs("evil.example", addrs),
+            Err(ResolveGuardError::Blocked { .. })
+        ));
+    }
+
+    // FR-003: an attacker's public A record alongside a blocked one must not keep the probe
+    // alive — the whole resolution is rejected, not filtered down to the public address.
+    #[test]
+    fn test_validate_resolved_addrs_blocks_when_any_address_is_blocked() {
+        let addrs = vec![
+            "1.1.1.1:0".parse().unwrap(),
+            "169.254.169.254:0".parse().unwrap(),
+        ];
+        assert!(matches!(
+            validate_resolved_addrs("evil.example", addrs),
+            Err(ResolveGuardError::Blocked { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_resolved_addrs_allows_global() {
+        let addrs = vec!["1.1.1.1:0".parse().unwrap()];
+        assert_eq!(
+            validate_resolved_addrs("index.crates.io", addrs.clone()).unwrap(),
+            addrs
+        );
+    }
+
+    // NFR-004: fail-closed on an empty resolution rather than silently treating "nothing
+    // resolved" as "nothing to block".
+    #[test]
+    fn test_validate_resolved_addrs_fails_closed_on_empty() {
+        assert!(matches!(
+            validate_resolved_addrs("evil.example", vec![]),
+            Err(ResolveGuardError::NoAddresses { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_resolved_addrs_unwraps_mapped_v4() {
+        let addrs = vec!["[::ffff:169.254.169.254]:0".parse().unwrap()];
+        assert!(matches!(
+            validate_resolved_addrs("evil.example", addrs),
+            Err(ResolveGuardError::Blocked { .. })
+        ));
+    }
+
+    // Direct unit coverage of `BlockedAddrResolver::resolve` on a *name* (not an IP literal —
+    // that path never reaches any resolver in production, see the struct's `# Known
+    // limitations` doc). `localhost` resolves via the OS's own hosts file, no network needed.
+    // This alone does not prove the resolver is wired into `build_client` — see the sibling
+    // test below (critic S1) for that.
+    #[tokio::test]
+    async fn test_blocked_addr_resolver_rejects_loopback_name_directly() {
+        use reqwest::dns::Resolve;
+
+        let addrs = BlockedAddrResolver
+            .resolve("localhost".parse().unwrap())
+            .await;
+        assert!(addrs.is_err());
+    }
+
+    // Issue #449 critic S1: the previous version of this test called
+    // `BlockedAddrResolver::resolve` directly and never went through `build_client` at all —
+    // deleting `.dns_resolver(BlockedAddrResolver)` from `build_client` left it green. This
+    // version proves actual wiring behaviorally: a real mockito listener answers on
+    // `server.socket_address()`'s port, reached here through the `localhost` *name* (so the
+    // request actually reaches the configured resolver, unlike an IP literal, which
+    // hyper-util's connector parses directly and never consults the resolver — see
+    // `BlockedAddrResolver`'s `# Known limitations` doc). Without the guard wired in, this
+    // request would succeed against the real listener; with it wired in, it must fail before
+    // ever reaching the listener.
+    #[tokio::test]
+    async fn test_build_client_wires_in_blocked_addr_resolver() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/")
+            .with_status(200)
+            .create_async()
+            .await;
+        let port = server.socket_address().port();
+
+        let client = build_client(redirect_policy());
+        let result = client.get(format!("http://localhost:{port}/")).send().await;
+
+        let err = result.expect_err(
+            "expected the wired-in resolver guard to reject a loopback-resolving name even \
+             though a real listener answers at this port",
+        );
+        // Not just any failure: the `Debug` impl (unlike `Display`) surfaces the boxed
+        // `source` chain, so this confirms `ResolveGuardError::Blocked` itself produced the
+        // error rather than an unrelated failure (timeout, TLS, connection refused)
+        // coincidentally also erroring. `derive(Debug)` on an enum prints only the variant
+        // name, not `ResolveGuardError::`, hence checking for `Blocked`/`Loopback` together
+        // rather than the enum's own name.
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("Blocked") && debug.contains("Loopback"),
+            "expected the failure to originate from ResolveGuardError::Blocked with class \
+             Loopback, got: {debug}"
+        );
     }
 
     // S5 (plan-1b §1.1/§4): a 302 to the cloud-metadata IP must be stopped by the
