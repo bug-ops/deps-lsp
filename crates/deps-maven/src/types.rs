@@ -43,7 +43,7 @@ impl std::str::FromStr for MavenScope {
 
 #[derive(Debug, Clone)]
 pub struct MavenVersion {
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     /// When this version was published, from the `repo1.maven.org` directory listing.
     ///
     /// `None` whenever the listing could not be fetched or parsed (Google Maven and the
@@ -59,7 +59,7 @@ pub struct ArtifactInfo {
     /// "{groupId}:{artifactId}"
     pub name: deps_core::PackageName,
     pub description: Option<String>,
-    pub latest_version: String,
+    pub latest_version: deps_core::ConcreteVersion,
     pub repository: Option<String>,
 }
 
@@ -96,14 +96,14 @@ impl deps_core::Dependency for MavenDependency {
 }
 
 impl deps_core::Version for MavenVersion {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &deps_core::ConcreteVersion {
         &self.version
     }
 
     // No `removal_status` override: Maven Central does not support version
     // retraction, so the default `RemovalStatus::Available` is correct.
     fn is_prerelease(&self) -> bool {
-        crate::version::is_prerelease(&self.version)
+        crate::version::is_prerelease(self.version.as_str())
     }
 
     fn features(&self) -> Vec<String> {
@@ -136,7 +136,7 @@ impl deps_core::Metadata for ArtifactInfo {
         None
     }
 
-    fn latest_version(&self) -> &str {
+    fn latest_version(&self) -> &deps_core::ConcreteVersion {
         &self.latest_version
     }
 

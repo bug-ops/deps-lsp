@@ -37,7 +37,7 @@ pub enum DependencyGroup {
 /// Version information for a gem from rubygems.org.
 #[derive(Debug, Clone)]
 pub struct BundlerVersion {
-    pub number: String,
+    pub number: deps_core::ConcreteVersion,
     pub prerelease: bool,
     pub yanked: bool,
     /// Publish timestamp, parsed eagerly from the API's `created_at` field.
@@ -64,7 +64,7 @@ pub struct GemInfo {
     pub homepage_uri: Option<String>,
     pub source_code_uri: Option<String>,
     pub documentation_uri: Option<String>,
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     pub licenses: Vec<String>,
     pub authors: Option<String>,
     pub downloads: u64,

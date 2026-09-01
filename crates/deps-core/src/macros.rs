@@ -88,7 +88,7 @@ macro_rules! impl_dependency {
 /// # Arguments
 ///
 /// * `$type` - The struct type name
-/// * `version` - Field name for version string (`String`)
+/// * `version` - Field name for version string (`ConcreteVersion`)
 /// * `status` - Expression evaluating to a closure `Fn(&$type) -> RemovalStatus`,
 ///   restating at every declaration site whether the ecosystem's flag is a hard
 ///   removal ([`RemovalStatus::from_yanked`](crate::RemovalStatus::from_yanked)) or an
@@ -109,10 +109,10 @@ macro_rules! impl_dependency {
 /// # Examples
 ///
 /// ```ignore
-/// use deps_core::{impl_version, RemovalStatus};
+/// use deps_core::{ConcreteVersion, impl_version, RemovalStatus};
 ///
 /// pub struct MyVersion {
-///     pub version: String,
+///     pub version: ConcreteVersion,
 ///     pub deprecated: bool,
 /// }
 ///
@@ -125,10 +125,10 @@ macro_rules! impl_dependency {
 /// With a publish timestamp:
 ///
 /// ```ignore
-/// use deps_core::{impl_version, PublishTime, RemovalStatus};
+/// use deps_core::{ConcreteVersion, impl_version, PublishTime, RemovalStatus};
 ///
 /// pub struct MyVersion {
-///     pub version: String,
+///     pub version: ConcreteVersion,
 ///     pub deprecated: bool,
 ///     pub published_at: Option<PublishTime>,
 /// }
@@ -143,17 +143,17 @@ macro_rules! impl_dependency {
 /// With a structured prerelease signal:
 ///
 /// ```ignore
-/// use deps_core::{impl_version, RemovalStatus};
+/// use deps_core::{ConcreteVersion, impl_version, RemovalStatus};
 ///
 /// pub struct MyVersion {
-///     pub version: String,
+///     pub version: ConcreteVersion,
 ///     pub deprecated: bool,
 /// }
 ///
 /// impl_version!(MyVersion {
 ///     version: version,
 ///     status: |v: &MyVersion| RemovalStatus::from_advisory(v.deprecated),
-///     prerelease: |v: &MyVersion| v.version.contains("-pre"),
+///     prerelease: |v: &MyVersion| v.version.as_str().contains("-pre"),
 /// });
 /// ```
 #[macro_export]
@@ -163,7 +163,7 @@ macro_rules! impl_version {
         status: $status:expr $(,)?
     }) => {
         impl $crate::registry::Version for $type {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &$crate::ConcreteVersion {
                 &self.$version
             }
 
@@ -182,7 +182,7 @@ macro_rules! impl_version {
         published_at: $published_at:ident $(,)?
     }) => {
         impl $crate::registry::Version for $type {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &$crate::ConcreteVersion {
                 &self.$version
             }
 
@@ -205,7 +205,7 @@ macro_rules! impl_version {
         prerelease: $prerelease:expr $(,)?
     }) => {
         impl $crate::registry::Version for $type {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &$crate::ConcreteVersion {
                 &self.$version
             }
 
@@ -229,7 +229,7 @@ macro_rules! impl_version {
         prerelease: $prerelease:expr $(,)?
     }) => {
         impl $crate::registry::Version for $type {
-            fn version_string(&self) -> &str {
+            fn version_string(&self) -> &$crate::ConcreteVersion {
                 &self.$version
             }
 
@@ -261,19 +261,19 @@ macro_rules! impl_version {
 /// * `description` - Field name for description (`Option<String>`)
 /// * `repository` - Field name for repository (`Option<String>`)
 /// * `documentation` - Field name for documentation URL (`Option<String>`)
-/// * `latest_version` - Field name for latest version (`String`)
+/// * `latest_version` - Field name for latest version (`ConcreteVersion`)
 ///
 /// # Examples
 ///
 /// ```ignore
-/// use deps_core::{PackageName, impl_metadata};
+/// use deps_core::{ConcreteVersion, PackageName, impl_metadata};
 ///
 /// pub struct MyPackage {
 ///     pub name: PackageName,
 ///     pub description: Option<String>,
 ///     pub repository: Option<String>,
 ///     pub homepage: Option<String>,
-///     pub latest_version: String,
+///     pub latest_version: ConcreteVersion,
 /// }
 ///
 /// impl_metadata!(MyPackage {
@@ -310,7 +310,7 @@ macro_rules! impl_metadata {
                 self.$documentation.as_deref()
             }
 
-            fn latest_version(&self) -> &str {
+            fn latest_version(&self) -> &$crate::ConcreteVersion {
                 &self.$latest_version
             }
 
@@ -410,6 +410,7 @@ macro_rules! impl_parse_result {
 
 #[cfg(test)]
 mod tests {
+    use crate::ConcreteVersion;
     use tower_lsp_server::ls_types::{Position, Range, Uri};
 
     // Test structs
@@ -423,26 +424,26 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct TestVersion {
-        version: String,
+        version: ConcreteVersion,
         yanked: bool,
     }
 
     #[derive(Debug, Clone)]
     struct TestVersionWithPublishedAt {
-        version: String,
+        version: ConcreteVersion,
         yanked: bool,
         published_at: Option<crate::freshness::PublishTime>,
     }
 
     #[derive(Debug, Clone)]
     struct TestVersionWithPrerelease {
-        version: String,
+        version: ConcreteVersion,
         yanked: bool,
     }
 
     #[derive(Debug, Clone)]
     struct TestVersionWithPublishedAtAndPrerelease {
-        version: String,
+        version: ConcreteVersion,
         yanked: bool,
         published_at: Option<crate::freshness::PublishTime>,
     }
@@ -453,7 +454,7 @@ mod tests {
         description: Option<String>,
         repository: Option<String>,
         homepage: Option<String>,
-        latest_version: String,
+        latest_version: ConcreteVersion,
     }
 
     #[derive(Debug)]
@@ -488,7 +489,7 @@ mod tests {
         status: |v: &TestVersionWithPrerelease| crate::registry::RemovalStatus::from_yanked(
             v.yanked
         ),
-        prerelease: |v: &TestVersionWithPrerelease| v.version.contains(".pre"),
+        prerelease: |v: &TestVersionWithPrerelease| v.version.as_str().contains(".pre"),
     });
 
     impl_version!(TestVersionWithPublishedAtAndPrerelease {
@@ -497,7 +498,10 @@ mod tests {
             crate::registry::RemovalStatus::from_yanked(v.yanked)
         },
         published_at: published_at,
-        prerelease: |v: &TestVersionWithPublishedAtAndPrerelease| v.version.contains(".pre"),
+        prerelease: |v: &TestVersionWithPublishedAtAndPrerelease| v
+            .version
+            .as_str()
+            .contains(".pre"),
     });
 
     impl_metadata!(TestPackage {
@@ -544,7 +548,7 @@ mod tests {
             yanked: true,
         };
 
-        assert_eq!(version.version_string(), "2.0.0");
+        assert_eq!(version.version_string().as_str(), "2.0.0");
         assert!(version.removal_status().blocks_resolution());
         assert!(version.as_any().is::<TestVersion>());
         assert!(version.published_at().is_none());
@@ -561,7 +565,7 @@ mod tests {
             published_at: Some(PublishTime::from_unix_secs(1_000)),
         };
 
-        assert_eq!(version.version_string(), "3.0.0");
+        assert_eq!(version.version_string().as_str(), "3.0.0");
         assert!(!version.removal_status().blocks_resolution());
         assert_eq!(
             version.published_at(),

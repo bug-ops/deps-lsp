@@ -63,7 +63,7 @@ impl deps_core::ecosystem::Dependency for SwiftDependency {
 #[derive(Debug, Clone)]
 pub struct SwiftVersion {
     /// Semver version string (v prefix stripped)
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     /// Always false for GitHub tags
     pub yanked: bool,
     /// GitHub Release publish time for this tag, if a matching Release exists
@@ -100,7 +100,7 @@ pub struct SwiftPackage {
     /// GitHub URL (same as repository)
     pub homepage: Option<String>,
     /// Latest semver tag
-    pub latest_version: String,
+    pub latest_version: deps_core::ConcreteVersion,
 }
 
 deps_core::impl_metadata!(SwiftPackage {

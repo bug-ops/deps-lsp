@@ -128,7 +128,7 @@ pub use deps_core::parser::DependencySource as PypiDependencySource;
 #[derive(Debug, Clone)]
 pub struct PypiVersion {
     /// Version string (PEP 440 compliant)
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     /// Whether this version has been yanked from PyPI
     pub yanked: bool,
     /// Earliest `upload-time` across this version's release files.
@@ -168,7 +168,7 @@ impl PypiVersion {
         use pep440_rs::Version;
         use std::str::FromStr;
 
-        Version::from_str(&self.version)
+        Version::from_str(self.version.as_str())
             .map(|v| v.is_pre())
             .unwrap_or(false)
     }
@@ -224,7 +224,7 @@ pub struct PypiPackage {
     /// Project URLs (homepage, repository, documentation, etc.)
     pub project_urls: Vec<(String, String)>,
     /// Latest stable version
-    pub latest_version: String,
+    pub latest_version: deps_core::ConcreteVersion,
 }
 
 // Implement deps_core traits
@@ -298,7 +298,7 @@ impl deps_core::Metadata for PypiPackage {
             .map(|(_, url)| url.as_str())
     }
 
-    fn latest_version(&self) -> &str {
+    fn latest_version(&self) -> &deps_core::ConcreteVersion {
         &self.latest_version
     }
 

@@ -42,7 +42,7 @@
 
 use crate::lsp_helpers::{escape_markdown, is_safe_version_string, warn_rejected_value};
 use crate::{
-    FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
+    ConcreteVersion, FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
     format_relative_age,
 };
 use std::time::Duration;
@@ -490,7 +490,7 @@ pub fn build_package_completion(
         );
         return None;
     }
-    let latest = metadata.latest_version();
+    let latest = metadata.latest_version().as_str();
 
     // Build markdown documentation
     let header = if latest.is_empty() {
@@ -629,11 +629,11 @@ pub fn build_version_completion(
         kind: Some(CompletionItemKind::VALUE),
         detail: Some(display_item.description.clone()),
         documentation: None,
-        insert_text: Some(display_item.version.clone()),
+        insert_text: Some(display_item.version.to_string()),
         text_edit: insert_range.map(|range| {
             CompletionTextEdit::Edit(TextEdit {
                 range,
-                new_text: display_item.version.clone(),
+                new_text: display_item.version.to_string(),
             })
         }),
         sort_text: Some(sort_text),
@@ -649,7 +649,7 @@ pub fn build_version_completion(
 #[derive(Debug, Clone)]
 pub struct VersionDisplayItem {
     /// Raw version string (e.g., "1.0.0")
-    pub version: String,
+    pub version: ConcreteVersion,
     /// Display label with "(latest)" suffix for first item
     pub label: String,
     /// Action description (e.g., "Update serde to 1.0.0")
@@ -683,7 +683,7 @@ impl VersionDisplayItem {
         let description = format!("Update {} to {}", package_name, version_str);
 
         Self {
-            version: version_str.to_string(),
+            version: version_str.clone(),
             label,
             description,
             index,
@@ -885,7 +885,7 @@ pub async fn complete_versions_generic(
     // Filter versions by prefix first
     let filtered_versions: Vec<_> = versions
         .iter()
-        .filter(|v| v.version_string().starts_with(clean_prefix))
+        .filter(|v| v.version_string().as_str().starts_with(clean_prefix))
         .collect();
 
     // Use filtered or all versions, prepare_version_display_items will handle yanked filtering
@@ -905,12 +905,12 @@ pub async fn complete_versions_generic(
         // `insert_text`/`text_edit` is a manifest-write sink too, and fires on
         // ordinary typing rather than a quickfix click.
         .filter(|item| {
-            let safe = is_safe_version_string(&item.version);
+            let safe = is_safe_version_string(item.version.as_str());
             if !safe {
                 warn_rejected_value(
                     "is_safe_version_string",
                     "version completion item",
-                    &item.version,
+                    item.version.as_str(),
                 );
             }
             safe
@@ -997,13 +997,13 @@ mod tests {
     }
 
     struct MockVersion {
-        version: String,
+        version: ConcreteVersion,
         yanked: bool,
         prerelease: bool,
     }
 
     impl crate::registry::Version for MockVersion {
-        fn version_string(&self) -> &str {
+        fn version_string(&self) -> &ConcreteVersion {
             &self.version
         }
 
@@ -1024,12 +1024,12 @@ mod tests {
     /// freshness-specific tests below — kept separate so the many pre-existing
     /// `MockVersion` literals do not need a new field added to every call site.
     struct MockVersionWithAge {
-        version: String,
+        version: ConcreteVersion,
         published_at: Option<PublishTime>,
     }
 
     impl crate::registry::Version for MockVersionWithAge {
-        fn version_string(&self) -> &str {
+        fn version_string(&self) -> &ConcreteVersion {
             &self.version
         }
 
@@ -1048,7 +1048,7 @@ mod tests {
         description: Option<String>,
         repository: Option<String>,
         documentation: Option<String>,
-        latest_version: String,
+        latest_version: ConcreteVersion,
     }
 
     impl crate::registry::Metadata for MockMetadata {
@@ -1068,7 +1068,7 @@ mod tests {
             self.documentation.as_deref()
         }
 
-        fn latest_version(&self) -> &str {
+        fn latest_version(&self) -> &ConcreteVersion {
             &self.latest_version
         }
 
@@ -1177,7 +1177,7 @@ mod tests {
                 description: None,
                 repository: None,
                 documentation: None,
-                latest_version: "1.0.0".to_string(),
+                latest_version: "1.0.0".into(),
             }],
         };
 
@@ -1213,7 +1213,7 @@ mod tests {
                 description: None,
                 repository: None,
                 documentation: None,
-                latest_version: "1.0.0".to_string(),
+                latest_version: "1.0.0".into(),
             }],
         };
 
@@ -1233,14 +1233,14 @@ mod tests {
                     description: None,
                     repository: None,
                     documentation: None,
-                    latest_version: "1.0.0".to_string(),
+                    latest_version: "1.0.0".into(),
                 },
                 MockMetadata {
                     name: pkg("guava'); System.exit(1); //"),
                     description: None,
                     repository: None,
                     documentation: None,
-                    latest_version: "1.0.0".to_string(),
+                    latest_version: "1.0.0".into(),
                 },
             ],
         };
@@ -1277,7 +1277,7 @@ mod tests {
                 description: None,
                 repository: None,
                 documentation: None,
-                latest_version: "1.0.0".to_string(),
+                latest_version: "1.0.0".into(),
             }],
         };
 
@@ -1294,7 +1294,7 @@ mod tests {
                 description: None,
                 repository: None,
                 documentation: None,
-                latest_version: "1.0.0".to_string(),
+                latest_version: "1.0.0".into(),
             }],
         };
 
@@ -1752,11 +1752,11 @@ mod tests {
     #[test]
     fn test_build_package_completion_full() {
         let metadata = MockMetadata {
-            name: "serde".to_string().into(),
+            name: "serde".into(),
             description: Some("Serialization framework".to_string()),
             repository: Some("https://github.com/serde-rs/serde".to_string()),
             documentation: Some("https://docs.rs/serde".to_string()),
-            latest_version: "1.0.214".to_string(),
+            latest_version: "1.0.214".into(),
         };
 
         let range = Range::default();
@@ -1781,11 +1781,11 @@ mod tests {
     #[test]
     fn test_build_package_completion_minimal() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: None,
             repository: None,
             documentation: None,
-            latest_version: "0.1.0".to_string(),
+            latest_version: "0.1.0".into(),
         };
 
         let range = Range::default();
@@ -1803,11 +1803,11 @@ mod tests {
     #[test]
     fn test_build_package_completion_empty_latest_version() {
         let metadata = MockMetadata {
-            name: "swift-nio".to_string().into(),
+            name: "swift-nio".into(),
             description: None,
             repository: None,
             documentation: None,
-            latest_version: String::new(),
+            latest_version: String::new().into(),
         };
 
         let range = Range::default();
@@ -1824,11 +1824,11 @@ mod tests {
     #[test]
     fn test_build_package_completion_escapes_description_markdown() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: Some("Fast *bold* _italic_ [link](evil) `code`".to_string()),
             repository: None,
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -1851,11 +1851,11 @@ mod tests {
         // link early and splice in a new, attacker-controlled markdown link.
         let malicious_repo = "https://legit.example)[Click here](https://evil.example";
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: None,
             repository: Some(malicious_repo.to_string()),
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -1873,11 +1873,11 @@ mod tests {
     fn test_build_package_completion_escapes_documentation_link_breakout() {
         let malicious_docs = "https://legit.example)[Click here](https://evil.example";
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: None,
             repository: None,
             documentation: Some(malicious_docs.to_string()),
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -1902,11 +1902,11 @@ mod tests {
         desc.push_str(&"b".repeat(50));
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: Some(desc),
             repository: None,
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -1934,11 +1934,11 @@ mod tests {
         // still be escaped in the rendered documentation.
         let malicious_latest = "1.0.0)[click](https://evil.example";
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: None,
             repository: None,
             documentation: None,
-            latest_version: malicious_latest.to_string(),
+            latest_version: malicious_latest.into(),
         };
 
         let range = Range::default();
@@ -1966,11 +1966,11 @@ mod tests {
         // completion item must be dropped rather than built with unsafe text.
         let malicious_name = "a** [Official Download](https://evil.example) **b";
         let metadata = MockMetadata {
-            name: malicious_name.to_string().into(),
+            name: malicious_name.into(),
             description: None,
             repository: None,
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -1983,11 +1983,11 @@ mod tests {
         // strips the backslash for the literal character), so a normal URL must still
         // render as the same, unmangled link once those escapes are stripped.
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: None,
             repository: Some("https://github.com/owner/repo".to_string()),
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -2004,11 +2004,11 @@ mod tests {
     #[test]
     fn test_build_package_completion_escapes_html_in_description() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: Some("<img src=x onerror=alert(1)>".to_string()),
             repository: None,
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -2029,11 +2029,11 @@ mod tests {
     #[test]
     fn test_build_package_completion_empty_description() {
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: Some(String::new()),
             repository: None,
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -2059,11 +2059,11 @@ mod tests {
         desc.push_str(&"b".repeat(50));
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: Some(desc),
             repository: None,
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -2082,7 +2082,7 @@ mod tests {
     #[test]
     fn test_build_version_completion_stable() {
         let version = MockVersion {
-            version: "1.0.0".to_string(),
+            version: "1.0.0".into(),
             yanked: false,
             prerelease: false,
         };
@@ -2103,7 +2103,7 @@ mod tests {
     #[test]
     fn test_build_version_completion_latest() {
         let version = MockVersion {
-            version: "1.0.0".to_string(),
+            version: "1.0.0".into(),
             yanked: false,
             prerelease: false,
         };
@@ -2124,7 +2124,7 @@ mod tests {
     #[test]
     fn test_build_version_completion_not_latest() {
         let version = MockVersion {
-            version: "0.9.0".to_string(),
+            version: "0.9.0".into(),
             yanked: false,
             prerelease: false,
         };
@@ -2144,17 +2144,17 @@ mod tests {
     #[test]
     fn test_build_version_completion_sort_order() {
         let v1 = MockVersion {
-            version: "1.0.0".to_string(),
+            version: "1.0.0".into(),
             yanked: false,
             prerelease: false,
         };
         let v2 = MockVersion {
-            version: "0.9.0".to_string(),
+            version: "0.9.0".into(),
             yanked: false,
             prerelease: false,
         };
         let v3 = MockVersion {
-            version: "0.8.0".to_string(),
+            version: "0.8.0".into(),
             yanked: false,
             prerelease: false,
         };
@@ -2182,17 +2182,17 @@ mod tests {
     fn test_version_completion_semantic_ordering() {
         let versions = [
             MockVersion {
-                version: "0.14.0".to_string(),
+                version: "0.14.0".into(),
                 yanked: false,
                 prerelease: false,
             },
             MockVersion {
-                version: "0.8.0".to_string(),
+                version: "0.8.0".into(),
                 yanked: false,
                 prerelease: false,
             },
             MockVersion {
-                version: "0.2.0".to_string(),
+                version: "0.2.0".into(),
                 yanked: false,
                 prerelease: false,
             },
@@ -2235,7 +2235,7 @@ mod tests {
             .enumerate()
             .map(|(idx, ver)| {
                 let v = MockVersion {
-                    version: ver.to_string(),
+                    version: (*ver).into(),
                     yanked: false,
                     prerelease: false,
                 };
@@ -2268,7 +2268,7 @@ mod tests {
     #[test]
     fn test_version_display_item_latest() {
         let version = MockVersion {
-            version: "1.0.0".to_string(),
+            version: "1.0.0".into(),
             yanked: false,
             prerelease: false,
         };
@@ -2285,7 +2285,7 @@ mod tests {
     #[test]
     fn test_version_display_item_not_latest() {
         let version = MockVersion {
-            version: "0.9.0".to_string(),
+            version: "0.9.0".into(),
             yanked: false,
             prerelease: false,
         };
@@ -2303,17 +2303,17 @@ mod tests {
     fn test_prepare_version_display_items_filters_yanked() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
             std::sync::Arc::new(MockVersion {
-                version: "1.0.0".to_string(),
+                version: "1.0.0".into(),
                 yanked: false,
                 prerelease: false,
             }),
             std::sync::Arc::new(MockVersion {
-                version: "0.9.0".to_string(),
+                version: "0.9.0".into(),
                 yanked: true,
                 prerelease: false,
             }),
             std::sync::Arc::new(MockVersion {
-                version: "0.8.0".to_string(),
+                version: "0.8.0".into(),
                 yanked: false,
                 prerelease: false,
             }),
@@ -2335,7 +2335,7 @@ mod tests {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = (0..10)
             .map(|i| {
                 std::sync::Arc::new(MockVersion {
-                    version: format!("1.0.{}", i),
+                    version: format!("1.0.{}", i).into(),
                     yanked: false,
                     prerelease: false,
                 }) as std::sync::Arc<dyn crate::Version>
@@ -2364,12 +2364,12 @@ mod tests {
     fn test_prepare_version_display_items_all_yanked() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
             std::sync::Arc::new(MockVersion {
-                version: "1.0.0".to_string(),
+                version: "1.0.0".into(),
                 yanked: true,
                 prerelease: false,
             }),
             std::sync::Arc::new(MockVersion {
-                version: "0.9.0".to_string(),
+                version: "0.9.0".into(),
                 yanked: true,
                 prerelease: false,
             }),
@@ -2633,11 +2633,11 @@ mod tests {
     fn test_build_package_completion_long_description_ascii() {
         let long_desc = "a".repeat(250);
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: Some(long_desc),
             repository: None,
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -2663,11 +2663,11 @@ mod tests {
         }
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: Some(long_desc),
             repository: None,
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -2691,11 +2691,11 @@ mod tests {
         let long_desc = "😀".repeat(51);
 
         let metadata = MockMetadata {
-            name: "test-pkg".to_string().into(),
+            name: "test-pkg".into(),
             description: Some(long_desc),
             repository: None,
             documentation: None,
-            latest_version: "1.0.0".to_string(),
+            latest_version: "1.0.0".into(),
         };
 
         let range = Range::default();
@@ -2765,22 +2765,22 @@ mod tests {
         let registry = MockRegistry {
             versions: vec![
                 MockVersion {
-                    version: "1.0.0".to_string(),
+                    version: "1.0.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "1.0.1".to_string(),
+                    version: "1.0.1".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "1.1.0".to_string(),
+                    version: "1.1.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "2.0.0".to_string(),
+                    version: "2.0.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
@@ -2848,22 +2848,22 @@ mod tests {
         let registry = MockRegistry {
             versions: vec![
                 MockVersion {
-                    version: "1.0.0".to_string(),
+                    version: "1.0.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "1.1.0".to_string(),
+                    version: "1.1.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "2.0.0".to_string(),
+                    version: "2.0.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "2.1.0".to_string(),
+                    version: "2.1.0".into(),
                     yanked: true, // Yanked version
                     prerelease: false,
                 },
@@ -2910,17 +2910,17 @@ mod tests {
         let registry = MockRegistry {
             versions: vec![
                 MockVersion {
-                    version: "1.0.0".to_string(),
+                    version: "1.0.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "1.0.1".to_string(),
+                    version: "1.0.1".into(),
                     yanked: true, // Yanked version
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "1.0.2".to_string(),
+                    version: "1.0.2".into(),
                     yanked: false,
                     prerelease: false,
                 },
@@ -2956,12 +2956,12 @@ mod tests {
         let registry = MockRegistry {
             versions: vec![
                 MockVersion {
-                    version: "1.0.0".to_string(),
+                    version: "1.0.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "1.0.1\", \"evil\": \"true".to_string(),
+                    version: "1.0.1\", \"evil\": \"true".into(),
                     yanked: false,
                     prerelease: false,
                 },
@@ -2992,7 +2992,7 @@ mod tests {
         // Create more than 5 versions
         let versions: Vec<_> = (0..10)
             .map(|i| MockVersion {
-                version: format!("1.0.{}", i),
+                version: format!("1.0.{}", i).into(),
                 yanked: false,
                 prerelease: false,
             })
@@ -3020,17 +3020,17 @@ mod tests {
         let registry = MockRegistry {
             versions: vec![
                 MockVersion {
-                    version: "v1.9.0".to_string(),
+                    version: "v1.9.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "v1.9.1".to_string(),
+                    version: "v1.9.1".into(),
                     yanked: false,
                     prerelease: false,
                 },
                 MockVersion {
-                    version: "v1.10.0".to_string(),
+                    version: "v1.10.0".into(),
                     yanked: false,
                     prerelease: false,
                 },
@@ -3327,7 +3327,7 @@ mod tests {
     #[test]
     fn test_version_display_item_captures_published_at() {
         let version = MockVersionWithAge {
-            version: "1.0.0".to_string(),
+            version: "1.0.0".into(),
             published_at: Some(PublishTime::from_unix_secs(1_000)),
         };
 
@@ -3341,7 +3341,7 @@ mod tests {
         // Plain `MockVersion` doesn't override `published_at`, so it falls back to
         // the `Version` trait's default `None` — the ecosystems-without-metadata case.
         let version = MockVersion {
-            version: "1.0.0".to_string(),
+            version: "1.0.0".into(),
             yanked: false,
             prerelease: false,
         };
@@ -3356,7 +3356,7 @@ mod tests {
         let now = PublishTime::from_unix_secs(10_000);
         let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
         let version = MockVersionWithAge {
-            version: "1.2.3".to_string(),
+            version: "1.2.3".into(),
             published_at: Some(published_two_hours_ago),
         };
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
@@ -3377,7 +3377,7 @@ mod tests {
         let now = PublishTime::from_unix_secs(10_000);
         let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
         let version = MockVersionWithAge {
-            version: "1.2.3".to_string(),
+            version: "1.2.3".into(),
             published_at: Some(published_two_hours_ago),
         };
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
@@ -3390,7 +3390,7 @@ mod tests {
     #[test]
     fn test_build_version_completion_label_details_absent_when_published_at_unknown() {
         let version = MockVersion {
-            version: "1.2.3".to_string(),
+            version: "1.2.3".into(),
             yanked: false,
             prerelease: false,
         };
@@ -3409,17 +3409,17 @@ mod tests {
     fn test_build_version_completion_byte_identical_output_without_freshness_data() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
             std::sync::Arc::new(MockVersion {
-                version: "1.0.0".to_string(),
+                version: "1.0.0".into(),
                 yanked: false,
                 prerelease: false,
             }),
             std::sync::Arc::new(MockVersion {
-                version: "0.9.0".to_string(),
+                version: "0.9.0".into(),
                 yanked: true,
                 prerelease: false,
             }),
             std::sync::Arc::new(MockVersion {
-                version: "0.8.0".to_string(),
+                version: "0.8.0".into(),
                 yanked: false,
                 prerelease: false,
             }),

@@ -38,7 +38,7 @@ pub enum GoDirective {
 #[derive(Debug, Clone)]
 pub struct GoVersion {
     /// Version string (e.g., "v1.9.1")
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     /// Publish timestamp, parsed eagerly from the `/@latest` and
     /// `/@v/{version}.info` endpoints' `Time` field.
     ///
@@ -59,7 +59,7 @@ pub struct GoMetadata {
     /// Module path
     pub module_path: deps_core::PackageName,
     /// Latest stable version
-    pub latest_version: String,
+    pub latest_version: deps_core::ConcreteVersion,
     /// Description (if available from go.mod or README)
     pub description: Option<String>,
     /// Repository URL (inferred from module path)
@@ -104,7 +104,7 @@ impl deps_core::ecosystem::Dependency for GoDependency {
 // NOTE: Cannot use impl_version! macro because GoVersion has custom is_prerelease() logic.
 // Go considers pseudo-versions as pre-releases, and has special handling for +incompatible suffix.
 impl deps_core::registry::Version for GoVersion {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &deps_core::ConcreteVersion {
         &self.version
     }
 
@@ -120,7 +120,9 @@ impl deps_core::registry::Version for GoVersion {
         // Go considers pseudo-versions as pre-releases (they're commit-based).
         // Regular pre-releases contain '-' (e.g., v1.0.0-beta.1).
         // BUT: +incompatible suffix is NOT a pre-release indicator.
-        self.is_pseudo || (self.version.contains('-') && !self.version.contains("+incompatible"))
+        self.is_pseudo
+            || (self.version.as_str().contains('-')
+                && !self.version.as_str().contains("+incompatible"))
     }
 
     fn features(&self) -> Vec<String> {
@@ -170,13 +172,13 @@ mod tests {
     #[test]
     fn test_go_version_trait() {
         let version = GoVersion {
-            version: "v1.9.1".to_string(),
+            version: "v1.9.1".into(),
             published_at: deps_core::PublishTime::parse_rfc3339("2023-01-01T00:00:00Z"),
             is_pseudo: false,
             retracted: false,
         };
 
-        assert_eq!(version.version_string(), "v1.9.1");
+        assert_eq!(version.version_string().as_str(), "v1.9.1");
         assert!(!version.removal_status().blocks_resolution());
         assert!(!version.is_prerelease());
         assert!(version.is_stable());
@@ -189,7 +191,7 @@ mod tests {
     #[test]
     fn test_pseudo_version_is_prerelease() {
         let version = GoVersion {
-            version: "v0.0.0-20191109021931-daa7c04131f5".to_string(),
+            version: "v0.0.0-20191109021931-daa7c04131f5".into(),
             published_at: None,
             is_pseudo: true,
             retracted: false,
@@ -202,7 +204,7 @@ mod tests {
     #[test]
     fn test_retracted_version_is_yanked() {
         let version = GoVersion {
-            version: "v1.0.0".to_string(),
+            version: "v1.0.0".into(),
             published_at: None,
             is_pseudo: false,
             retracted: true,
@@ -216,7 +218,7 @@ mod tests {
     fn test_go_metadata_trait() {
         let metadata = GoMetadata {
             module_path: "github.com/gin-gonic/gin".into(),
-            latest_version: "v1.9.1".to_string(),
+            latest_version: "v1.9.1".into(),
             description: Some("Gin is a HTTP web framework".to_string()),
             repository: Some("https://github.com/gin-gonic/gin".to_string()),
             documentation: Some("https://pkg.go.dev/github.com/gin-gonic/gin".to_string()),
