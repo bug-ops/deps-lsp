@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **repo**: root `Cargo.toml` `[workspace.dependencies]` is now fully, case-insensitively sorted alphabetically (resolves #442) (#444)
-- **repo**: per-crate `[dependencies]`/`[dev-dependencies]` tables in 8 member crates are now sorted alphabetically (resolves #445) (#NNN)
+- **repo**: per-crate `[dependencies]`/`[dev-dependencies]` tables in 8 member crates are now sorted alphabetically (resolves #445) (#446)
 - **Breaking (pre-1.0, public API)**: `PackageVersions::yanked` field type changed from `Arc<[ConcreteVersion]>` to `Arc<[(ConcreteVersion, RemovalStatus)]>`, carrying each yanked/deprecated version's `RemovalStatus` (resolves #437) (#438)
 - **deps-npm, deps-composer**: `AdvisoryDeprecated` no longer feeds the manifest-requirement yanked diagnostic; the #205 package-level deprecation diagnostic is now its sole signal (resolves #436) (#439)
 
