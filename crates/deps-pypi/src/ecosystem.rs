@@ -304,6 +304,12 @@ impl Ecosystem for PypiEcosystem {
                 }
                 let target_path = base_dir.join(&link.target);
                 let target_uri = Uri::from_file_path(&target_path)?;
+                // Tooltip is derived from the URI's own round-tripped path, not
+                // `target_path` directly: on Windows, `Uri::to_file_path` builds its
+                // string with forward slashes while `Path::join` inserts the native
+                // `\` separator, so the two disagree on separator style for the same
+                // path — always resolve through the URI to keep them in sync.
+                let tooltip = target_uri.to_file_path()?.display().to_string();
                 Some(DocumentLink {
                     range: link.range,
                     target: Some(target_uri),
@@ -311,7 +317,7 @@ impl Ecosystem for PypiEcosystem {
                     // trick in the rendered line (rejected above) or a merely confusing
                     // relative path still leaves the user a way to verify the real
                     // target before clicking.
-                    tooltip: Some(target_path.display().to_string()),
+                    tooltip: Some(tooltip),
                     data: None,
                 })
             })
