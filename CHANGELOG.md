@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-nuget**: hover now flags an unlisted (delisted/pulled) NuGet version with a `*(unlisted)*` marker in "Recent versions", enriched from `RegistrationsBaseUrl/3.6.0` on the hover path only (resolves #451) (#458)
+- **deps-nuget**: a multi-project `packages.<project>.lock.json` lock file is now resolved by the manifest's own project name instead of picking an arbitrary `packages.*.lock.json` match from the directory (resolves #451) (#458)
+- **deps-pypi, deps-lsp**: `-r`/`-c` (and `--requirement`/`--constraint`) targets in a `requirements.txt`/`constraints.txt` file are now surfaced as clickable `documentLink`s, resolved relative to the containing file (resolves #452) (#458)
+- **deps-core, deps-pypi**: the `requirements/*.txt` directory-layout convention (e.g. `requirements/base.txt`, `requirements/dev.txt`) is now recognized and routed to PyPI, matching a bare `requirements.txt` at the root (resolves #452) (#458)
 - **deps-core, deps-cargo, deps-lsp**: Cargo custom/private registry support — a `registry = "<alias>"` or `registry-index = "<url>"` dependency resolved via `.cargo/config.toml`/`$CARGO_HOME/config.toml` now gets live hover/diagnostic/completion data from its own sparse index instead of no data at all; `$CARGO_HOME`-declared registries may attach a bearer token, workspace-declared ones never can (resolves #431) (#440)
 - **deps-cargo, deps-lsp**: `[source.crates-io] replace-with` resolution to a sparse-index mirror — plain dependencies in a mirrored workspace now resolve against the mirror instead of crates.io, while still receiving crates.io-content-correct OSV scanning and hover links (resolves #441) (#447)
 - **deps-core, deps-cargo, deps-lsp**: new `cargo.workspace_registries` setting (`off`/`public_only`/`all`, default `public_only`) blocking workspace-declared registry/source URLs that resolve to loopback, link-local, cloud-metadata, RFC1918/CGNAT/ULA, or internal-name hosts, plus redirect-hop host reclassification shared by every ecosystem — closes the SSRF/reachability-probing sign-off from #443 (#447)

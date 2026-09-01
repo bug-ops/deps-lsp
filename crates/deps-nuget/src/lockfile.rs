@@ -6,10 +6,15 @@
 //! only surface on multi-project solutions and not on the single-project fixture a test is
 //! most likely to use. Entries without `resolved` are simply skipped.
 //!
-//! `packages.<project_name>.lock.json` cannot be expressed here — `lockfile_filenames()` is
-//! an exact-name list with no glob support (D3, follow-up).
-// TODO(critic): multi-project lock file names (packages.<project>.lock.json) cannot be
-// expressed as exact names.
+//! `packages.<project_name>.lock.json` (per-project lock files, used when multiple projects
+//! share a directory) cannot be expressed as an exact name —
+//! [`NuGetLockParser::locate_lockfile`] falls back to that computed name (`<project_name>`
+//! being the manifest's own file stem, NuGet's convention) once the exact
+//! `packages.lock.json` name misses (D3, #451). This must be an exact match against *this*
+//! manifest's project name, not the first `packages.*.lock.json` found in the directory —
+//! a directory shared by multiple projects can hold several such files, and taking the
+//! first one silently attaches an unrelated project's resolved versions (#451 follow-up,
+//! tester-found regression).
 
 use deps_core::error::{DepsError, Result};
 use deps_core::lockfile::{
@@ -23,10 +28,51 @@ use tower_lsp_server::ls_types::Uri;
 
 const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
 
+/// Mirrors `deps_core::lockfile::locate_lockfile_for_manifest`'s workspace-root search
+/// depth, so the multi-project fallback below walks exactly the same directories the
+/// exact-name search already tried.
+const MAX_WORKSPACE_DEPTH: usize = 5;
+
 pub struct NuGetLockParser;
 
 impl NuGetLockParser {
     const LOCKFILE_NAMES: &'static [&'static str] = &["packages.lock.json"];
+}
+
+/// Falls back to *this manifest's own* multi-project lock file name —
+/// `packages.<project_name>.lock.json`, where `<project_name>` is the manifest's file stem
+/// (NuGet's convention: the project name defaults to the project file's name without its
+/// extension) — once the exact `packages.lock.json` search (same directory, then up to
+/// [`MAX_WORKSPACE_DEPTH`] parent directories) has already missed. Mirrors
+/// `locate_lockfile_for_manifest`'s own directory-walk order, but against this one computed
+/// filename rather than a fixed list — an exact match, deliberately, not "the first
+/// `packages.*.lock.json` in the directory": a directory shared by multiple projects can
+/// hold several per-project lock files, and picking the wrong one would silently attach an
+/// unrelated project's resolved versions (#451 follow-up regression).
+fn locate_multi_project_lockfile(manifest_uri: &Uri) -> Option<PathBuf> {
+    let manifest_path = manifest_uri.to_file_path()?;
+    let project_name = manifest_path.file_stem()?.to_str()?;
+    if project_name.is_empty() {
+        return None;
+    }
+    let lock_filename = format!("packages.{project_name}.lock.json");
+    let manifest_dir = manifest_path.parent()?;
+
+    let mut lock_path = manifest_dir.to_path_buf();
+    lock_path.push(&lock_filename);
+    if lock_path.is_file() {
+        return Some(lock_path);
+    }
+
+    let mut current_dir = manifest_dir.parent()?;
+    for _ in 0..MAX_WORKSPACE_DEPTH {
+        lock_path = current_dir.join(&lock_filename);
+        if lock_path.is_file() {
+            return Some(lock_path);
+        }
+        current_dir = current_dir.parent()?;
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -49,6 +95,7 @@ struct LockEntry {
 impl LockFileProvider for NuGetLockParser {
     fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
+            .or_else(|| locate_multi_project_lockfile(manifest_uri))
     }
 
     fn parse_lockfile<'a>(
@@ -276,5 +323,116 @@ mod tests {
         let parser = NuGetLockParser;
         let located = parser.locate_lockfile(&manifest_uri);
         assert_eq!(located, Some(lock_path));
+    }
+
+    // --- locate_lockfile: multi-project fallback (D3, #451) ---
+
+    /// Regression test (tester-found, #451 follow-up): with two per-project lock files in
+    /// the same directory, each manifest must resolve to *its own* lock file by matching
+    /// the `<project>` segment against the manifest's file stem — not just the first
+    /// `packages.*.lock.json` a directory scan happens to find.
+    #[test]
+    fn test_locate_lockfile_multi_project_matches_own_project_not_first_found() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app1_manifest = temp_dir.path().join("App1.csproj");
+        let app2_manifest = temp_dir.path().join("App2.csproj");
+        let app1_lock = temp_dir.path().join("packages.App1.lock.json");
+        let app2_lock = temp_dir.path().join("packages.App2.lock.json");
+        std::fs::write(&app1_manifest, "<Project></Project>").unwrap();
+        std::fs::write(&app2_manifest, "<Project></Project>").unwrap();
+        std::fs::write(&app1_lock, "{}").unwrap();
+        std::fs::write(&app2_lock, "{}").unwrap();
+
+        let parser = NuGetLockParser;
+        assert_eq!(
+            parser.locate_lockfile(&Uri::from_file_path(&app1_manifest).unwrap()),
+            Some(app1_lock)
+        );
+        assert_eq!(
+            parser.locate_lockfile(&Uri::from_file_path(&app2_manifest).unwrap()),
+            Some(app2_lock)
+        );
+    }
+
+    /// Same scenario as above but with only the *other* project's lock file present: must
+    /// return `None` rather than wrongly attaching an unrelated project's resolved versions.
+    #[test]
+    fn test_locate_lockfile_multi_project_does_not_match_other_projects_lock_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let app1_manifest = temp_dir.path().join("App1.csproj");
+        let app2_lock = temp_dir.path().join("packages.App2.lock.json");
+        std::fs::write(&app1_manifest, "<Project></Project>").unwrap();
+        std::fs::write(&app2_lock, "{}").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&app1_manifest).unwrap();
+        let parser = NuGetLockParser;
+        assert_eq!(parser.locate_lockfile(&manifest_uri), None);
+    }
+
+    #[test]
+    fn test_locate_lockfile_finds_multi_project_name_in_manifest_dir() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("MyApp.csproj");
+        let lock_path = temp_dir.path().join("packages.MyApp.lock.json");
+        std::fs::write(&manifest_path, "<Project></Project>").unwrap();
+        std::fs::write(&lock_path, "{}").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let parser = NuGetLockParser;
+        assert_eq!(parser.locate_lockfile(&manifest_uri), Some(lock_path));
+    }
+
+    #[test]
+    fn test_locate_lockfile_prefers_exact_name_over_multi_project() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("MyApp.csproj");
+        let exact_lock_path = temp_dir.path().join("packages.lock.json");
+        let multi_lock_path = temp_dir.path().join("packages.MyApp.lock.json");
+        std::fs::write(&manifest_path, "<Project></Project>").unwrap();
+        std::fs::write(&exact_lock_path, "{}").unwrap();
+        std::fs::write(&multi_lock_path, "{}").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let parser = NuGetLockParser;
+        assert_eq!(parser.locate_lockfile(&manifest_uri), Some(exact_lock_path));
+    }
+
+    #[test]
+    fn test_locate_lockfile_finds_multi_project_name_in_workspace_parent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().join("src").join("MyApp");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let manifest_path = project_dir.join("MyApp.csproj");
+        let lock_path = temp_dir.path().join("packages.MyApp.lock.json");
+        std::fs::write(&manifest_path, "<Project></Project>").unwrap();
+        std::fs::write(&lock_path, "{}").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let parser = NuGetLockParser;
+        assert_eq!(parser.locate_lockfile(&manifest_uri), Some(lock_path));
+    }
+
+    #[test]
+    fn test_locate_lockfile_no_match_returns_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("MyApp.csproj");
+        std::fs::write(&manifest_path, "<Project></Project>").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let parser = NuGetLockParser;
+        assert_eq!(parser.locate_lockfile(&manifest_uri), None);
+    }
+
+    #[test]
+    fn test_locate_lockfile_ignores_unrelated_files_in_dir() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("MyApp.csproj");
+        std::fs::write(&manifest_path, "<Project></Project>").unwrap();
+        std::fs::write(temp_dir.path().join("packages.json"), "{}").unwrap();
+        std::fs::write(temp_dir.path().join("packages..lock.json"), "{}").unwrap();
+
+        let manifest_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let parser = NuGetLockParser;
+        assert_eq!(parser.locate_lockfile(&manifest_uri), None);
     }
 }

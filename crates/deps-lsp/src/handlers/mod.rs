@@ -9,6 +9,7 @@
 //! - [`diagnostics`]: Outdated/yanked version warnings
 //! - [`code_actions`]: Quick fixes (e.g., "Update to latest version")
 //! - [`code_lens`]: "Update N outdated dependencies" document-scoped lens
+//! - [`document_link`]: Clickable references to other files (e.g. pip's `-r`/`-c`)
 //!
 //! # Handler Architecture
 //!
@@ -36,5 +37,6 @@ pub mod code_actions;
 pub mod code_lens;
 pub mod completion;
 pub mod diagnostics;
+pub mod document_link;
 pub mod hover;
 pub mod inlay_hints;

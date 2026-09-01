@@ -1,7 +1,9 @@
 use crate::config::DepsConfig;
 use crate::document::{ServerState, handle_document_change, handle_document_open};
 use crate::file_watcher;
-use crate::handlers::{code_actions, code_lens, completion, diagnostics, hover, inlay_hints};
+use crate::handlers::{
+    code_actions, code_lens, completion, diagnostics, document_link, hover, inlay_hints,
+};
 use deps_core::{PackageName, is_safe_version_string};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,7 +15,8 @@ use tower_lsp_server::ls_types::{
     DidChangeConfigurationParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentChanges,
     DocumentDiagnosticParams, DocumentDiagnosticReport, DocumentDiagnosticReportResult,
-    ExecuteCommandOptions, ExecuteCommandParams, FullDocumentDiagnosticReport, Hover, HoverParams,
+    DocumentLink, DocumentLinkOptions, DocumentLinkParams, ExecuteCommandOptions,
+    ExecuteCommandParams, FullDocumentDiagnosticReport, Hover, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, InlayHint,
     InlayHintParams, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Range,
     Registration, RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo,
@@ -303,6 +306,10 @@ impl Backend {
             })),
             code_lens_provider: Some(CodeLensOptions {
                 resolve_provider: Some(false),
+            }),
+            document_link_provider: Some(DocumentLinkOptions {
+                resolve_provider: Some(false),
+                work_done_progress_options: Default::default(),
             }),
             diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
                 identifier: Some("deps".into()),
@@ -599,6 +606,17 @@ impl LanguageServer for Backend {
         )
         .await;
         Ok(Some(lenses))
+    }
+
+    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
+        let links = document_link::handle_document_link(
+            Arc::clone(&self.state),
+            params,
+            self.client.clone(),
+            Arc::clone(&self.config),
+        )
+        .await;
+        Ok(Some(links))
     }
 
     async fn diagnostic(

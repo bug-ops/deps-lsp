@@ -11,13 +11,11 @@
 //! `product-requirements.txt`) from producing spurious network requests and
 //! diagnostics.
 
-use super::{ParseResult, PypiParser};
+use super::{ParseResult, PypiParser, RequirementRef};
 use crate::error::Result;
 use crate::types::{PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
-use tower_lsp_server::ls_types::Uri;
-
-// TODO(critic): surface -r/-c targets as documentLinks
+use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Pip option tokens recognized on an option line (a line whose first
 /// whitespace-delimited token starts with `-`). Matched by exact equality
@@ -76,13 +74,24 @@ impl PypiParser {
     /// single-word line. The gate keeps the parsed dependencies only if the
     /// file shows a strong pip signal — a recognized option, or a
     /// successfully parsed line whose dependency carries a version
-    /// requirement or a Git/URL source — or more lines parsed than failed —
-    /// real prose fails every line, but a hand-written unpinned
-    /// `requests\nflask\nnumpy` (or that file mid-edit, with one partially
-    /// typed line) survives. The signal is read off the *parsed* dependency
-    /// rather than scanned from raw text, so an operator- or `@`-looking
-    /// substring inside a prose sentence (an email address, a comparison)
-    /// cannot short-circuit the gate.
+    /// requirement or a Git/URL source — or, when `require_strong_signal` is
+    /// `false`, more lines parsed than failed — real prose fails every line,
+    /// but a hand-written unpinned `requests\nflask\nnumpy` (or that file
+    /// mid-edit, with one partially typed line) survives. The signal is read
+    /// off the *parsed* dependency rather than scanned from raw text, so an
+    /// operator- or `@`-looking substring inside a prose sentence (an email
+    /// address, a comparison) cannot short-circuit the gate.
+    ///
+    /// `require_strong_signal` drops that ratio-based arm entirely, requiring
+    /// the strong-signal check alone. Set this when the caller routed to this
+    /// parser via a weaker signal than a basename match — PyPI's
+    /// `requirements/*.txt` [`Ecosystem::manifest_directory_patterns`](deps_core::Ecosystem::manifest_directory_patterns)
+    /// fallback matches *every* `.txt` file under a directory literally named
+    /// `requirements/`, including requirements-engineering docs folders with
+    /// no relation to Python; without this, prose lines that happen to parse
+    /// as bare PEP 508 names (`"Introduction"`, `"Scope"`) can still clear the
+    /// ratio arm and trigger live PyPI lookups on what is not a manifest at
+    /// all (#452 S6).
     ///
     /// # Errors
     ///
@@ -98,13 +107,19 @@ impl PypiParser {
     /// let parser = PypiParser::new();
     /// let uri = Uri::from_file_path("/project/requirements.txt").unwrap();
     /// let result = parser
-    ///     .parse_requirements("requests==2.31.0\nflask>=3.0\n", &uri)
+    ///     .parse_requirements("requests==2.31.0\nflask>=3.0\n", &uri, false)
     ///     .unwrap();
     /// assert_eq!(result.dependencies.len(), 2);
     /// ```
-    pub fn parse_requirements(&self, content: &str, uri: &Uri) -> Result<ParseResult> {
+    pub fn parse_requirements(
+        &self,
+        content: &str,
+        uri: &Uri,
+        require_strong_signal: bool,
+    ) -> Result<ParseResult> {
         let line_table = LineOffsetTable::new(content);
         let mut dependencies = Vec::new();
+        let mut document_links = Vec::new();
         let mut strong_signal = false;
         let mut failed_lines: usize = 0;
 
@@ -175,6 +190,20 @@ impl PypiParser {
                 let option_name = first_token.split('=').next().unwrap_or(first_token);
                 if KNOWN_OPTIONS.contains(&option_name) {
                     strong_signal = true;
+                    if matches!(option_name, "-r" | "-c" | "--requirement" | "--constraint")
+                        && let Some((target, target_offset)) =
+                            extract_option_target(first_token, text)
+                    {
+                        let target_abs_start = abs_start + target_offset;
+                        let target_abs_end = target_abs_start + target.len();
+                        document_links.push(RequirementRef {
+                            range: Range::new(
+                                line_table.byte_offset_to_position(content, target_abs_start),
+                                line_table.byte_offset_to_position(content, target_abs_end),
+                            ),
+                            target: target.to_string(),
+                        });
+                    }
                 } else {
                     failed_lines += 1;
                 }
@@ -248,14 +277,36 @@ impl PypiParser {
             }
         }
 
-        let keep = strong_signal || (!dependencies.is_empty() && failed_lines < dependencies.len());
+        let keep = strong_signal
+            || (!require_strong_signal
+                && !dependencies.is_empty()
+                && failed_lines < dependencies.len());
 
         Ok(ParseResult {
             dependencies: if keep { dependencies } else { Vec::new() },
             workspace_root: None,
             uri: uri.clone(),
+            document_links: if keep { document_links } else { Vec::new() },
         })
     }
+}
+
+/// Extracts the target path/URL text and its byte offset within `text` for a
+/// `-r`/`-c`/`--requirement`/`--constraint` option line — either the
+/// `--long=value` spelling (target sliced out of `text` right after the
+/// matched `=`) or the space-separated spelling (target is whatever follows
+/// `first_token`, whitespace-trimmed). Returns `None` when the option carries
+/// no target text at all (a bare `-r` with nothing after it).
+fn extract_option_target<'a>(first_token: &str, text: &'a str) -> Option<(&'a str, usize)> {
+    if let Some(eq_idx) = first_token.find('=') {
+        let target = &text[eq_idx + 1..];
+        return (!target.is_empty()).then_some((target, eq_idx + 1));
+    }
+
+    let rest = &text[first_token.len()..];
+    let leading_ws = rest.len() - rest.trim_start().len();
+    let target = rest.trim();
+    (!target.is_empty()).then_some((target, first_token.len() + leading_ws))
 }
 
 /// Cuts `line` at the first `#` that is at index 0 or preceded by ASCII
@@ -315,7 +366,15 @@ mod tests {
 
     fn parse(content: &str) -> ParseResult {
         PypiParser::new()
-            .parse_requirements(content, &test_uri())
+            .parse_requirements(content, &test_uri(), false)
+            .unwrap()
+    }
+
+    /// Like [`parse`], but with `require_strong_signal: true` — the gate a
+    /// directory-pattern-only match (`requirements/base.txt`) gets (#452 S6).
+    fn parse_strict(content: &str) -> ParseResult {
+        PypiParser::new()
+            .parse_requirements(content, &test_uri(), true)
             .unwrap()
     }
 
@@ -794,6 +853,59 @@ mod tests {
         assert_eq!(result.dependencies[0].name, "requests");
     }
 
+    // --- documentLink targets (#452) ---
+
+    #[test]
+    fn test_document_links_short_form() {
+        let content = "-r other-requirements.txt\n-c constraints.txt\nrequests==1.0\n";
+        let result = parse(content);
+        assert_eq!(result.document_links.len(), 2);
+        assert_eq!(result.document_links[0].target, "other-requirements.txt");
+        assert_eq!(result.document_links[1].target, "constraints.txt");
+    }
+
+    #[test]
+    fn test_document_links_long_form_space_separated() {
+        let content = "--requirement base.txt\n--constraint constraints.txt\n";
+        let result = parse(content);
+        assert_eq!(result.document_links.len(), 2);
+        assert_eq!(result.document_links[0].target, "base.txt");
+        assert_eq!(result.document_links[1].target, "constraints.txt");
+    }
+
+    #[test]
+    fn test_document_links_long_form_equals_separated() {
+        let content = "--requirement=base.txt\n--constraint=constraints.txt\n";
+        let result = parse(content);
+        assert_eq!(result.document_links.len(), 2);
+        assert_eq!(result.document_links[0].target, "base.txt");
+        assert_eq!(result.document_links[1].target, "constraints.txt");
+    }
+
+    #[test]
+    fn test_document_links_range_slices_to_target_text_only() {
+        let content = "-r other-requirements.txt\n";
+        let result = parse(content);
+        let link = &result.document_links[0];
+        assert_eq!(slice(content, link.range), "other-requirements.txt");
+    }
+
+    #[test]
+    fn test_document_links_ignores_unrelated_options() {
+        // Options other than -r/-c/--requirement/--constraint (even other
+        // known ones) must never produce a document link.
+        let content = "-e .\n--index-url https://example.com\n--pre\nrequests==1.0\n";
+        let result = parse(content);
+        assert!(result.document_links.is_empty());
+    }
+
+    #[test]
+    fn test_document_links_bare_option_with_no_target_is_skipped() {
+        let content = "-r\nrequests==1.0\n";
+        let result = parse(content);
+        assert!(result.document_links.is_empty());
+    }
+
     // --- pip-compile shape (S1) ---
 
     #[test]
@@ -894,7 +1006,7 @@ mod tests {
     fn test_constraints_txt_parses_identically() {
         let uri = deps_core::test_util::test_uri("/test/constraints.txt");
         let result = PypiParser::new()
-            .parse_requirements("requests==1.0\nflask==2.0\n", &uri)
+            .parse_requirements("requests==1.0\nflask==2.0\n", &uri, false)
             .unwrap();
         assert_eq!(result.dependencies.len(), 2);
         assert!(
@@ -964,5 +1076,45 @@ mod tests {
     fn test_gate_option_only_file_no_panic() {
         let result = parse("-r base.txt\n");
         assert!(result.dependencies.is_empty());
+    }
+
+    // --- require_strong_signal: directory-pattern-only gate (#452 S6) ---
+
+    #[test]
+    fn test_strict_gate_drops_prose_that_would_survive_ratio_gate() {
+        // A requirements-engineering docs file living under a directory literally
+        // named `requirements/` is routed to PyPI purely by directory-name
+        // convention (`Ecosystem::manifest_directory_patterns`) — far weaker
+        // evidence than a basename match. Bare-word lines like "Introduction"/
+        // "Scope" parse as valid (unpinned) PEP 508 names, so the ratio-based
+        // arm alone keeps this file; `require_strong_signal: true` must still
+        // drop it.
+        let content = "Introduction\n\nScope\n\nThis document defines the requirements.\n";
+
+        let lenient = parse(content);
+        assert!(
+            !lenient.dependencies.is_empty(),
+            "sanity check: the ratio gate alone would keep this file"
+        );
+
+        let strict = parse_strict(content);
+        assert!(strict.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_strict_gate_still_keeps_file_with_real_pip_option() {
+        // A genuine pip option line is a strong signal regardless of the gate
+        // mode — `require_strong_signal` only removes the *ratio* arm.
+        let content = "-r base.txt\nrequests==1.0\n";
+        let result = parse_strict(content);
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.document_links.len(), 1);
+    }
+
+    #[test]
+    fn test_strict_gate_still_keeps_file_with_version_specifier() {
+        let content = "requests==2.31.0\n";
+        let result = parse_strict(content);
+        assert_eq!(result.dependencies.len(), 1);
     }
 }

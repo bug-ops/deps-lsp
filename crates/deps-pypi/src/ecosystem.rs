@@ -7,7 +7,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Position, Range, Uri};
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
@@ -101,6 +101,30 @@ impl PypiEcosystem {
         items
     }
 
+    /// True when `uri`'s basename matches neither an exact
+    /// [`Ecosystem::manifest_filenames`] entry nor a
+    /// [`Ecosystem::manifest_patterns`] glob — i.e. this file was routed to PyPI
+    /// purely via the [`Ecosystem::manifest_directory_patterns`] fallback
+    /// (`requirements/*.txt`, matched by `EcosystemRegistry::get_for_uri` on
+    /// directory name alone), not a primary basename match.
+    ///
+    /// Recomputes the same basename check `EcosystemRegistry::get_for_uri`
+    /// already performed, from the single source of truth (`self`'s own
+    /// `manifest_filenames`/`manifest_patterns`) rather than threading a
+    /// match-kind flag through `parse_manifest`'s signature — cheap, and
+    /// correct as long as this ecosystem's directory-pattern fallback is only
+    /// ever reached after both basename stages miss (true by construction in
+    /// [`deps_core::EcosystemRegistry::get_for_uri`]).
+    fn matched_only_via_directory_pattern(&self, uri: &Uri) -> bool {
+        let basename = uri.path().as_str().rsplit('/').next().unwrap_or_default();
+        if self.manifest_filenames().contains(&basename) {
+            return false;
+        }
+        !self.manifest_patterns().iter().any(|pattern| {
+            deps_core::ecosystem_registry::manifest_pattern_matches(basename, pattern)
+        })
+    }
+
     async fn complete_versions(
         &self,
         package_name: &deps_core::PackageName,
@@ -142,6 +166,10 @@ impl Ecosystem for PypiEcosystem {
         ]
     }
 
+    fn manifest_directory_patterns(&self) -> &[(&'static str, &'static str)] {
+        &[("requirements", ".txt")]
+    }
+
     fn lockfile_filenames(&self) -> &[&'static str] {
         &["poetry.lock", "uv.lock"]
     }
@@ -155,7 +183,11 @@ impl Ecosystem for PypiEcosystem {
             let kind = PypiManifestKind::from_uri(uri);
             let result = match kind {
                 PypiManifestKind::PyProject => self.parser.parse_content(content, uri),
-                PypiManifestKind::Requirements => self.parser.parse_requirements(content, uri),
+                PypiManifestKind::Requirements => {
+                    let require_strong_signal = self.matched_only_via_directory_pattern(uri);
+                    self.parser
+                        .parse_requirements(content, uri, require_strong_signal)
+                }
             }
             .map_err(|e| deps_core::DepsError::ParseError {
                 file_type: kind.file_type().into(),
@@ -230,9 +262,99 @@ impl Ecosystem for PypiEcosystem {
         true
     }
 
+    fn generate_document_links(
+        &self,
+        parse_result: &dyn ParseResultTrait,
+        uri: &Uri,
+    ) -> Vec<DocumentLink> {
+        let Some(result) = parse_result
+            .as_any()
+            .downcast_ref::<crate::parser::ParseResult>()
+        else {
+            return Vec::new();
+        };
+        if result.document_links.is_empty() {
+            return Vec::new();
+        }
+
+        let Some(base_dir) = uri
+            .to_file_path()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        else {
+            return Vec::new();
+        };
+
+        result
+            .document_links
+            .iter()
+            .filter_map(|link| {
+                // Only local relative/absolute filesystem paths are resolved — an
+                // already-absolute URL (`http://...`) is left alone rather than
+                // mangled by joining it onto a filesystem directory.
+                if link.target.contains("://") {
+                    return None;
+                }
+                if !is_safe_document_link_target(&link.target) {
+                    deps_core::lsp_helpers::warn_rejected_value(
+                        "is_safe_document_link_target",
+                        "pypi requirements -r/-c document link target",
+                        &link.target,
+                    );
+                    return None;
+                }
+                let target_path = base_dir.join(&link.target);
+                let target_uri = Uri::from_file_path(&target_path)?;
+                // Tooltip is derived from the URI's own round-tripped path, not
+                // `target_path` directly: on Windows, `Uri::to_file_path` builds its
+                // string with forward slashes while `Path::join` inserts the native
+                // `\` separator, so the two disagree on separator style for the same
+                // path — always resolve through the URI to keep them in sync.
+                let tooltip = target_uri.to_file_path()?.display().to_string();
+                Some(DocumentLink {
+                    range: link.range,
+                    target: Some(target_uri),
+                    // Resolved absolute path, shown on hover — a bidi/format-character
+                    // trick in the rendered line (rejected above) or a merely confusing
+                    // relative path still leaves the user a way to verify the real
+                    // target before clicking.
+                    tooltip: Some(tooltip),
+                    data: None,
+                })
+            })
+            .collect()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Whether `target` is safe to resolve into a clickable `DocumentLink`.
+///
+/// Rejects every ASCII control character (`char::is_control()`, the same gate
+/// [`deps_core::lsp_helpers::escape_markdown`] uses) plus the Unicode
+/// bidi/format characters that gate alone misses — RLO/LRO-family overrides
+/// (U+202A-U+202E, U+2066-U+2069), explicit directional marks (U+200E/U+200F),
+/// zero-width joiners/spaces (U+200B-U+200D, U+2060, U+FEFF), and the
+/// JS/JSON5 line terminators U+2028/U+2029. Without this, a target like
+/// `"safe.txt\u{202E}txt.evil"` renders right-to-left in the editor (reading
+/// as an innocuous `.txt` file) while the link actually opens `.evil` —
+/// link-target spoofing, not merely a cosmetic issue, since the resolved URI
+/// is exactly what the user's click opens.
+fn is_safe_document_link_target(target: &str) -> bool {
+    !target.is_empty()
+        && target.chars().all(|c| {
+            !c.is_control()
+                && !matches!(c,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2060}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{FEFF}'
+                )
+        })
 }
 
 #[cfg(test)]
@@ -267,6 +389,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_matched_only_via_directory_pattern() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+
+        // Directory-pattern-only: no basename filename/pattern match.
+        let uri = deps_core::test_util::test_uri("/project/requirements/base.txt");
+        assert!(ecosystem.matched_only_via_directory_pattern(&uri));
+
+        // Basename matches (exact `requirements.txt` and a `*-requirements.txt`
+        // pattern respectively), even from inside a `requirements/` directory.
+        for path in [
+            "/project/requirements.txt",
+            "/project/requirements/dev-requirements.txt",
+        ] {
+            let uri = deps_core::test_util::test_uri(path);
+            assert!(
+                !ecosystem.matched_only_via_directory_pattern(&uri),
+                "{path} should be a basename match, not directory-pattern-only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_manifest_directory_pattern_only_applies_strict_gate() {
+        // #452 S6 end-to-end: a `requirements/` docs file with only prose-shaped
+        // bare names must not survive the ratio gate through `parse_manifest`.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/requirements/base.txt");
+
+        let result = ecosystem
+            .parse_manifest(
+                "Introduction\n\nScope\n\nThis document defines the requirements.\n",
+                &uri,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.dependencies().is_empty());
+    }
+
     #[tokio::test]
     async fn test_parse_manifest_requirements_txt_uri_yields_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -279,6 +443,72 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.dependencies().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_generate_document_links_resolves_relative_target() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+        let parse_result = ecosystem
+            .parse_manifest("-r base.txt\n", &uri)
+            .await
+            .unwrap();
+
+        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+        assert_eq!(links.len(), 1);
+        let target = links[0].target.as_ref().unwrap();
+        assert!(target.path().as_str().ends_with("/project/base.txt"));
+        assert_eq!(
+            links[0].tooltip.as_deref(),
+            target.to_file_path().unwrap().to_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_document_links_rejects_bidi_override_target() {
+        // #452 S2 (security): a bidi override in the target text could make the
+        // rendered requirements.txt line read as an innocuous filename while the
+        // link itself opens something else entirely — link-target spoofing.
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+        let parse_result = ecosystem
+            .parse_manifest("-r safe.txt\u{202E}txt.evil\n", &uri)
+            .await
+            .unwrap();
+
+        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn test_is_safe_document_link_target_rejects_invisible_unicode() {
+        for bad in [
+            "safe.txt\u{202E}txt.evil",
+            "a\u{200B}b.txt",
+            "a\u{2028}b.txt",
+            "a\u{FEFF}b.txt",
+            "a\nb.txt",
+        ] {
+            assert!(
+                !is_safe_document_link_target(bad),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_document_link_target_accepts_normal_paths() {
+        for good in [
+            "base.txt",
+            "../shared/constraints.txt",
+            "dev-requirements.txt",
+        ] {
+            assert!(is_safe_document_link_target(good));
+        }
     }
 
     #[tokio::test]
