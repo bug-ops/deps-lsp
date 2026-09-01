@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-core, deps-lsp**: the "requirement satisfiable only by a yanked version" diagnostic no longer lets a co-occurring package-level deprecation finding hide a genuine hard yank (resolves #437) (#438)
+- **deps-deno, deps-npm**: an exact-pin `npm:` dependency in `deno.json` no longer surfaces the yanked-worded diagnostic, matching the equivalent `package.json` dependency's post-#436 behavior; `jsr:` specifiers are unaffected (resolves #448)
 
 ## [0.11.1] - 2026-09-01
 

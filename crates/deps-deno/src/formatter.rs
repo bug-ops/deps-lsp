@@ -132,24 +132,31 @@ impl EcosystemFormatter for DenoFormatter {
             .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
 
-    /// Restricts the yanked-only-match diagnostic to an exact-pin requirement: evaluating
-    /// a range requirement against a package-wide deprecation signal would flag every
-    /// dependency on such a package, conflating this diagnostic with package-level
-    /// deprecation (issue #205). Applies uniformly to `jsr:` and `npm:` since this hook
-    /// takes only a `&VersionReq`, with no way to tell which scheme it came from (accepted
-    /// limitation L1 — JSR's genuinely better per-version signal is under-used for range
-    /// requirements, in exchange for not reintroducing npm's package-wide-`deprecated`
-    /// false-positive storm).
+    /// Scheme-aware (#448, fixing the #436 M1 divergence): for `npm:` specifiers, returns
+    /// `false` unconditionally, mirroring `NpmFormatter::yanked_diagnostic_applies_to`'s
+    /// post-#436 behavior — an exact-pin `npm:` dependency in `deno.json` (e.g.
+    /// `npm:lodash@4.17.20`) no longer surfaces this diagnostic, consistent with the
+    /// equivalent exact-pin `package.json` dependency.
     ///
-    /// Known cross-ecosystem divergence (#436 M1, not fixed here — out of scope for that
-    /// issue's npm/Composer-only formatter changes): `NpmFormatter::yanked_diagnostic_applies_to`
-    /// now returns `false` unconditionally, so an exact-pin `npm:` dependency in `deno.json`
-    /// (e.g. `npm:lodash@4.17.20`) can still surface this diagnostic while the equivalent
-    /// exact-pin `package.json` dependency (`"lodash": "4.17.20"`) no longer does, since this
-    /// method doesn't delegate to `NpmFormatter`'s. Candidate for a follow-up issue rather than
-    /// silently matched or left unremarked.
-    fn yanked_diagnostic_applies_to(&self, requirement: &VersionReq) -> bool {
-        node_semver::Version::parse(requirement.as_str().trim()).is_ok()
+    /// For `jsr:` specifiers, keeps the pre-existing exact-pin restriction. Historically
+    /// this was the only option: the hook took just a `&VersionReq`, with no way to tell
+    /// `jsr:` from `npm:` apart, so both had to share one answer. That blindness is now
+    /// fixed, and it does not actually justify restricting `jsr:` on its own terms — unlike
+    /// npm's `deprecated`, JSR's `yanked` flag is a genuine per-version signal with no
+    /// package-level deprecation diagnostic (#205) for a range-requirement check to
+    /// conflate with. Keeping the restriction here is a deliberate scope decision, not a
+    /// technical constraint: relaxing it is out of scope for #448, which targets only the
+    /// `npm:` cross-ecosystem divergence. Tracked as a follow-up: #454.
+    fn yanked_diagnostic_applies_to(&self, dep: &dyn Dependency, requirement: &VersionReq) -> bool {
+        match split_scheme(dep.name().as_str()) {
+            Some((Scheme::Npm, _)) => false,
+            // `None` is unreachable in practice — every parser-produced `DenoDependency` name
+            // is scheme-qualified (see `package_url`'s `warn_rejected_value` handling of the
+            // same case above) — folded into the `jsr:` exact-pin path as a harmless default.
+            Some((Scheme::Jsr, _)) | None => {
+                node_semver::Version::parse(requirement.as_str().trim()).is_ok()
+            }
+        }
     }
 
     /// `npm:` dependencies map to OSV's `npm` ecosystem via their bare name (D5);
@@ -343,12 +350,49 @@ mod tests {
         );
     }
 
+    // Mirrors the sole call site (`crate::lsp_helpers::diagnostics::generate_diagnostics_from_cache`),
+    // where `requirement` is always `dep.version_requirement().unwrap()` — never an
+    // unrelated pair, even though `DenoFormatter` itself only consults `dep.name()`.
+    fn test_dep(name: &str, requirement: &str) -> crate::types::DenoDependency {
+        crate::types::DenoDependency {
+            name: PackageName::new(name),
+            name_range: tower_lsp_server::ls_types::Range::default(),
+            version_req: Some(VersionReq::new(requirement)),
+            version_range: None,
+            section: crate::types::DenoDependencySection::Imports,
+        }
+    }
+
     #[test]
-    fn test_yanked_diagnostic_applies_to_exact_pin_only() {
+    fn test_yanked_diagnostic_applies_to_jsr_exact_pin_only() {
         let formatter = DenoFormatter;
-        assert!(formatter.yanked_diagnostic_applies_to(&VersionReq::new("1.2.3")));
-        assert!(!formatter.yanked_diagnostic_applies_to(&VersionReq::new("^1.2.3")));
-        assert!(!formatter.yanked_diagnostic_applies_to(&VersionReq::new("*")));
+        assert!(formatter.yanked_diagnostic_applies_to(
+            &test_dep("jsr:@std/fs", "1.2.3"),
+            &VersionReq::new("1.2.3")
+        ));
+        assert!(!formatter.yanked_diagnostic_applies_to(
+            &test_dep("jsr:@std/fs", "^1.2.3"),
+            &VersionReq::new("^1.2.3")
+        ));
+        assert!(
+            !formatter
+                .yanked_diagnostic_applies_to(&test_dep("jsr:@std/fs", "*"), &VersionReq::new("*"))
+        );
+    }
+
+    /// #448: fixes the #436 M1 cross-ecosystem divergence — an `npm:` specifier in
+    /// `deno.json` no longer surfaces this diagnostic, for any requirement shape,
+    /// consistent with `NpmFormatter`'s post-#436 behavior for `package.json`.
+    #[test]
+    fn test_yanked_diagnostic_applies_to_npm_scheme_always_false() {
+        let formatter = DenoFormatter;
+        for requirement in ["1.2.3", "^1.2.3", "~1.2.3", "*"] {
+            let dep = test_dep("npm:lodash", requirement);
+            assert!(
+                !formatter.yanked_diagnostic_applies_to(&dep, &VersionReq::new(requirement)),
+                "expected {requirement:?} to be rejected for npm: scheme"
+            );
+        }
     }
 
     #[test]

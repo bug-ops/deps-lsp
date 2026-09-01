@@ -1031,14 +1031,27 @@ pub trait EcosystemFormatter: Send + Sync {
     /// `removal_status()` data is trusted at all (and thus whether the separate #263
     /// in-use-version yanked check runs), while this hook only narrows *this* diagnostic.
     ///
-    /// `DenoFormatter` restricts this to exact-pin requirements — its `jsr:`/`npm:`
-    /// specifiers share npm's package-wide deprecation semantics — see that formatter's docs.
-    /// `NpmFormatter` returns `false` unconditionally (#436): npm's `AdvisoryDeprecated` is
-    /// genuinely per-version but commonly applied package-wide, so even an exact pin would
-    /// often just duplicate the dedicated package-level deprecation diagnostic
-    /// ([`Self::deprecated_message`], issue #205); npm keeps `reports_yanked() == true`; so the
-    /// #263 in-use-version check stays live. `ComposerFormatter` does not override this hook
-    /// at all — it opts out at the registry level instead
+    /// `dep` is passed alongside `requirement` (rather than `requirement` alone) so an
+    /// implementor can key its decision off the dependency's package name — needed by
+    /// `DenoFormatter` (#448) to tell its `jsr:`- and `npm:`-scheme specifiers apart, since
+    /// the scheme lives in the name, not in the requirement text. At the sole call site
+    /// (`crate::lsp_helpers::diagnostics::generate_diagnostics_from_cache`), `requirement`
+    /// is always `dep.version_requirement().unwrap()` for the same `dep` — the two are
+    /// never independent, though an implementor is free to key off either or both.
+    ///
+    /// `DenoFormatter` returns `false` unconditionally for `npm:` specifiers, mirroring
+    /// `NpmFormatter` (#448), and restricts `jsr:` specifiers to exact-pin requirements — a
+    /// scope decision carried over from before this hook could tell the two schemes apart,
+    /// not a technical constraint: JSR's `yanked` flag is a genuine per-version signal with
+    /// no package-level deprecation diagnostic to conflate with (unlike npm's), so relaxing
+    /// it is a real option, just one left to a tracked follow-up (#454) rather than done
+    /// here — see that formatter's docs. `NpmFormatter` returns `false`
+    /// unconditionally (#436): npm's `AdvisoryDeprecated` is genuinely per-version but
+    /// commonly applied package-wide, so even an exact pin would often just duplicate the
+    /// dedicated package-level deprecation diagnostic ([`Self::deprecated_message`], issue
+    /// #205); npm keeps `reports_yanked() == true`; so the #263 in-use-version check stays
+    /// live. `ComposerFormatter` does not override this hook at all — it opts out at the
+    /// registry level instead
     /// ([`Registry::reports_yanked`](crate::Registry::reports_yanked) `== false`, pre-dating
     /// #436, independently justified by #233 R2): Packagist's `abandoned` is package-level via
     /// p2 minified inheritance, so its yanked map is never populated and this hook has nothing
@@ -1048,7 +1061,7 @@ pub trait EcosystemFormatter: Send + Sync {
     ///
     /// ```
     /// use deps_core::lsp_helpers::EcosystemFormatter;
-    /// use deps_core::{ConcreteVersion, PackageName, VersionReq};
+    /// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl EcosystemFormatter for DefaultFormatter {
@@ -1060,9 +1073,36 @@ pub trait EcosystemFormatter: Send + Sync {
     ///     }
     /// }
     ///
-    /// assert!(DefaultFormatter.yanked_diagnostic_applies_to(&VersionReq::new("^1.2")));
+    /// # struct FakeDep(PackageName);
+    /// # impl Dependency for FakeDep {
+    /// #     fn name(&self) -> &PackageName {
+    /// #         &self.0
+    /// #     }
+    /// #     fn name_range(&self) -> tower_lsp_server::ls_types::Range {
+    /// #         tower_lsp_server::ls_types::Range::default()
+    /// #     }
+    /// #     fn version_requirement(&self) -> Option<&VersionReq> {
+    /// #         None
+    /// #     }
+    /// #     fn version_range(&self) -> Option<tower_lsp_server::ls_types::Range> {
+    /// #         None
+    /// #     }
+    /// #     fn source(&self) -> deps_core::parser::DependencySource {
+    /// #         deps_core::parser::DependencySource::Registry
+    /// #     }
+    /// #     fn as_any(&self) -> &dyn std::any::Any {
+    /// #         self
+    /// #     }
+    /// # }
+    /// #
+    /// let dep = FakeDep(PackageName::new("example"));
+    /// assert!(DefaultFormatter.yanked_diagnostic_applies_to(&dep, &VersionReq::new("^1.2")));
     /// ```
-    fn yanked_diagnostic_applies_to(&self, _requirement: &VersionReq) -> bool {
+    fn yanked_diagnostic_applies_to(
+        &self,
+        _dep: &dyn Dependency,
+        _requirement: &VersionReq,
+    ) -> bool {
         true
     }
 

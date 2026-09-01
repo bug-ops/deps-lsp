@@ -804,6 +804,121 @@ serde = "1.0.0"
         }
     }
 
+    // Deno-specific tests
+    #[cfg(feature = "deno")]
+    mod deno_tests {
+        use super::*;
+        use crate::document::DocumentState;
+        use deps_core::EcosystemFormatter;
+
+        /// #448 regression: mirrors npm_tests'
+        /// `test_handle_diagnostics_manifest_requirement_yanked_stays_suppressed_for_exact_pin`
+        /// through the real `DocumentState` -> `Ecosystem::generate_diagnostics` ->
+        /// `generate_diagnostics_from_cache` -> `DenoFormatter::yanked_diagnostic_applies_to`
+        /// path — an exact-pin `npm:` specifier in `deno.json` satisfiable only by a flagged
+        /// version must NOT surface the #247 manifest-requirement yanked diagnostic, exactly
+        /// like the equivalent `package.json` dependency (fixes the #436 M1 divergence).
+        #[tokio::test]
+        async fn test_handle_diagnostics_npm_scheme_exact_pin_yanked_stays_suppressed() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/deno.json");
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("deno").unwrap();
+            let content = r#"{"imports": {"lodash": "npm:lodash@4.17.20"}}"#.to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Deno, content, parse_result);
+
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                "npm:lodash".into(),
+                deps_core::PackageVersions {
+                    // The pin is satisfiable only by a flagged version — for `package.json`
+                    // this exact shape used to fire the #247 "yanked" diagnostic pre-#436.
+                    latest: "4.17.20".into(),
+                    available: std::sync::Arc::from(vec!["4.17.20".into()]),
+                    yanked: std::sync::Arc::from(vec![(
+                        "4.17.20".into(),
+                        deps_core::RemovalStatus::AdvisoryDeprecated,
+                    )]),
+                    published_at: None,
+                },
+            );
+            doc_state.update_cached_versions(cached);
+            // No `resolved_versions`/`yanked_versions` — isolates this assertion to the #247
+            // manifest-requirement path, same as the npm companion test.
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert!(
+                result.is_empty(),
+                "expected no diagnostics for an exact-pin npm: specifier satisfiable only by a \
+                 flagged version — the #247 manifest-requirement diagnostic must stay \
+                 suppressed for deno's npm: scheme (#448), got {result:?}"
+            );
+        }
+
+        /// #448 companion: `jsr:` specifiers keep the pre-existing exact-pin-only behavior
+        /// (L1) — proves the scheme split actually discriminates end-to-end, not just in the
+        /// isolated `yanked_diagnostic_applies_to` unit tests.
+        #[tokio::test]
+        async fn test_handle_diagnostics_jsr_scheme_exact_pin_yanked_still_fires() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/deno.json");
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("deno").unwrap();
+            let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@1.0.0"}}"#.to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Deno, content, parse_result);
+
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                "jsr:@std/fs".into(),
+                deps_core::PackageVersions {
+                    latest: "1.0.1".into(),
+                    available: std::sync::Arc::from(vec!["1.0.1".into(), "1.0.0".into()]),
+                    yanked: std::sync::Arc::from(vec![(
+                        "1.0.0".into(),
+                        deps_core::RemovalStatus::Yanked,
+                    )]),
+                    published_at: None,
+                },
+            );
+            doc_state.update_cached_versions(cached);
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "expected the #247 diagnostic to still fire for an exact-pin jsr: specifier, \
+                 got {result:?}"
+            );
+            assert_eq!(
+                result[0].message,
+                format!(
+                    "{}; latest is 1.0.1",
+                    deps_deno::DenoFormatter.yanked_message()
+                )
+            );
+        }
+    }
+
     // PyPI-specific tests
     #[cfg(feature = "pypi")]
     mod pypi_tests {
