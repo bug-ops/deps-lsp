@@ -865,9 +865,10 @@ serde = "1.0.0"
             );
         }
 
-        /// #448 companion: `jsr:` specifiers keep the pre-existing exact-pin-only behavior
-        /// (L1) — proves the scheme split actually discriminates end-to-end, not just in the
-        /// isolated `yanked_diagnostic_applies_to` unit tests.
+        /// #448/#454: an exact-pin `jsr:` specifier satisfiable only by a flagged version
+        /// fires the #247 diagnostic, proving the scheme split actually discriminates
+        /// `jsr:` from `npm:` end-to-end, not just in the isolated
+        /// `yanked_diagnostic_applies_to` unit tests.
         #[tokio::test]
         async fn test_handle_diagnostics_jsr_scheme_exact_pin_yanked_still_fires() {
             let state = Arc::new(ServerState::new());
@@ -908,6 +909,67 @@ serde = "1.0.0"
                 1,
                 "expected the #247 diagnostic to still fire for an exact-pin jsr: specifier, \
                  got {result:?}"
+            );
+            assert_eq!(
+                result[0].message,
+                format!(
+                    "{}; latest is 1.0.1",
+                    deps_deno::DenoFormatter.yanked_message()
+                )
+            );
+        }
+
+        /// #454: the actual bug fix, proven end-to-end — a `jsr:` *range* requirement
+        /// satisfiable only by yanked versions must now surface the #247
+        /// manifest-requirement diagnostic too, matching Cargo/PyPI/Dart's behavior for the
+        /// equivalent case (previously this was silent: `yanked_diagnostic_applies_to`
+        /// rejected any non-exact-pin `jsr:` requirement). Exactly one diagnostic fires,
+        /// confirming this does not double up with any package-level deprecation (#205)
+        /// signal — deno has no such diagnostic for `jsr:` in the first place.
+        #[tokio::test]
+        async fn test_handle_diagnostics_jsr_scheme_range_yanked_only_now_fires() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/deno.json");
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("deno").unwrap();
+            let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0.0"}}"#.to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Deno, content, parse_result);
+
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                "jsr:@std/fs".into(),
+                deps_core::PackageVersions {
+                    // Every version matching "^1.0.0" is yanked — the concrete #454 bug
+                    // scenario, which previously produced zero diagnostic signal.
+                    latest: "1.0.1".into(),
+                    available: std::sync::Arc::from(vec!["1.0.1".into(), "1.0.0".into()]),
+                    yanked: std::sync::Arc::from(vec![
+                        ("1.0.1".into(), deps_core::RemovalStatus::Yanked),
+                        ("1.0.0".into(), deps_core::RemovalStatus::Yanked),
+                    ]),
+                    published_at: None,
+                },
+            );
+            doc_state.update_cached_versions(cached);
+            // No `resolved_versions`/`yanked_versions` — isolates this assertion to the #247
+            // manifest-requirement path, same as the sibling exact-pin test.
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "expected exactly one diagnostic for a jsr: range satisfiable only by yanked \
+                 versions (#454), got {result:?}"
             );
             assert_eq!(
                 result[0].message,

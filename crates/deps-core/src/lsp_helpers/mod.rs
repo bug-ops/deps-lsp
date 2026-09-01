@@ -1040,12 +1040,11 @@ pub trait EcosystemFormatter: Send + Sync {
     /// never independent, though an implementor is free to key off either or both.
     ///
     /// `DenoFormatter` returns `false` unconditionally for `npm:` specifiers, mirroring
-    /// `NpmFormatter` (#448), and restricts `jsr:` specifiers to exact-pin requirements — a
-    /// scope decision carried over from before this hook could tell the two schemes apart,
-    /// not a technical constraint: JSR's `yanked` flag is a genuine per-version signal with
-    /// no package-level deprecation diagnostic to conflate with (unlike npm's), so relaxing
-    /// it is a real option, just one left to a tracked follow-up (#454) rather than done
-    /// here — see that formatter's docs. `NpmFormatter` returns `false`
+    /// `NpmFormatter` (#448), and applies unconditionally (`true`, the same as leaving this
+    /// hook at its default) for `jsr:` specifiers, for any requirement shape (#454): unlike
+    /// npm's `deprecated`, JSR's `yanked` flag is a genuine per-version signal with no
+    /// package-level deprecation diagnostic to conflate with, so `jsr:` needs no restriction
+    /// here at all — see that formatter's docs. `NpmFormatter` returns `false`
     /// unconditionally (#436): npm's `AdvisoryDeprecated` is genuinely per-version but
     /// commonly applied package-wide, so even an exact pin would often just duplicate the
     /// dedicated package-level deprecation diagnostic ([`Self::deprecated_message`], issue
