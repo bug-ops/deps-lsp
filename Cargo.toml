@@ -12,22 +12,23 @@ license = "MIT"
 repository = "https://github.com/bug-ops/deps-lsp"
 
 [workspace.dependencies]
+bytes = "1"
 criterion = "0.8"
 dashmap = "6.2"
-deps-core = { version = "0.11.1", path ="crates/deps-core" }
-deps-cargo = { version = "0.11.1", path ="crates/deps-cargo" }
-deps-deno = { version = "0.11.1", path ="crates/deps-deno" }
-deps-npm = { version = "0.11.1", path ="crates/deps-npm" }
-deps-pypi = { version = "0.11.1", path ="crates/deps-pypi" }
-deps-go = { version = "0.11.1", path ="crates/deps-go" }
 deps-bundler = { version = "0.11.1", path ="crates/deps-bundler" }
-deps-dart = { version = "0.11.1", path ="crates/deps-dart" }
-deps-maven = { version = "0.11.1", path ="crates/deps-maven" }
-deps-nuget = { version = "0.11.1", path ="crates/deps-nuget" }
+deps-cargo = { version = "0.11.1", path ="crates/deps-cargo" }
 deps-composer = { version = "0.11.1", path ="crates/deps-composer" }
+deps-core = { version = "0.11.1", path ="crates/deps-core" }
+deps-dart = { version = "0.11.1", path ="crates/deps-dart" }
+deps-deno = { version = "0.11.1", path ="crates/deps-deno" }
+deps-go = { version = "0.11.1", path ="crates/deps-go" }
 deps-gradle = { version = "0.11.1", path ="crates/deps-gradle" }
-deps-swift = { version = "0.11.1", path ="crates/deps-swift" }
 deps-lsp = { version = "0.11.1", path ="crates/deps-lsp" }
+deps-maven = { version = "0.11.1", path ="crates/deps-maven" }
+deps-npm = { version = "0.11.1", path ="crates/deps-npm" }
+deps-nuget = { version = "0.11.1", path ="crates/deps-nuget" }
+deps-pypi = { version = "0.11.1", path ="crates/deps-pypi" }
+deps-swift = { version = "0.11.1", path ="crates/deps-swift" }
 futures = "0.3"
 insta = "1.48"
 jsonc-parser = "0.33"
@@ -35,7 +36,7 @@ mockito = "1"
 node-semver = "2.2"
 pep440_rs = "0.7"
 pep508_rs = "0.9"
-bytes = "1"
+quick-xml = "0.42"
 regex = "1"
 reqwest = "0.13"
 semver = "1"
@@ -50,9 +51,8 @@ toml-span = "0.7"
 tower-lsp-server = "0.23"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-urlencoding = "2.1"
 url = "2.5"
-quick-xml = "0.42"
+urlencoding = "2.1"
 yaml-rust2 = "0.12"
 zed_extension_api = "0.7"
 
