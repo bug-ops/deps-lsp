@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **deps-core, deps-cargo, deps-lsp**: Cargo custom/private registry support — a `registry = "<alias>"` or `registry-index = "<url>"` dependency resolved via `.cargo/config.toml`/`$CARGO_HOME/config.toml` now gets live hover/diagnostic/completion data from its own sparse index instead of no data at all; `$CARGO_HOME`-declared registries may attach a bearer token, workspace-declared ones never can (resolves #431)
+- **deps-core, deps-cargo, deps-lsp**: Cargo custom/private registry support — a `registry = "<alias>"` or `registry-index = "<url>"` dependency resolved via `.cargo/config.toml`/`$CARGO_HOME/config.toml` now gets live hover/diagnostic/completion data from its own sparse index instead of no data at all; `$CARGO_HOME`-declared registries may attach a bearer token, workspace-declared ones never can (resolves #431) (#440)
 - **deps-core, deps-npm, deps-composer, deps-lsp**: package-level deprecation/abandoned diagnostic and hover section (npm `deprecated`, Composer `abandoned`), plus a Composer-only "Replace with X" code action when a successor package is named (resolves #205) (#435)
 
 ### Changed
