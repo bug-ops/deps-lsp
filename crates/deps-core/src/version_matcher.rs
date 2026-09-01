@@ -3,6 +3,7 @@
 //! Provides traits and implementations for version requirement matching
 //! across different package ecosystems (semver, PEP 440, etc.).
 
+use crate::ConcreteVersion;
 use semver::Version;
 use std::borrow::Cow;
 
@@ -24,7 +25,8 @@ pub trait VersionRequirementMatcher: Send + Sync {
     /// For PyPI (PEP 440):
     /// - `">=8.0"` with latest `"8.3.5"` → true (same major version)
     /// - `">=8.0"` with latest `"9.0.0"` → false (new major version)
-    fn is_latest_satisfying(&self, requirement: &str, latest: &str) -> bool;
+    fn is_latest_satisfying(&self, requirement: &ConcreteVersion, latest: &ConcreteVersion)
+    -> bool;
 }
 
 /// Semver-based version matcher for Cargo and npm.
@@ -35,8 +37,15 @@ pub trait VersionRequirementMatcher: Send + Sync {
 pub struct SemverMatcher;
 
 impl VersionRequirementMatcher for SemverMatcher {
-    fn is_latest_satisfying(&self, requirement: &str, latest: &str) -> bool {
+    fn is_latest_satisfying(
+        &self,
+        requirement: &ConcreteVersion,
+        latest: &ConcreteVersion,
+    ) -> bool {
         use semver::VersionReq;
+
+        let requirement = requirement.as_str();
+        let latest = latest.as_str();
 
         // Parse the latest version
         let latest_ver = match latest.parse::<Version>() {
@@ -72,7 +81,14 @@ impl VersionRequirementMatcher for SemverMatcher {
 pub struct Pep440Matcher;
 
 impl VersionRequirementMatcher for Pep440Matcher {
-    fn is_latest_satisfying(&self, requirement: &str, latest: &str) -> bool {
+    fn is_latest_satisfying(
+        &self,
+        requirement: &ConcreteVersion,
+        latest: &ConcreteVersion,
+    ) -> bool {
+        let requirement = requirement.as_str();
+        let latest = latest.as_str();
+
         // Parse the latest version (normalize to three parts if needed)
         let latest_ver = match normalize_and_parse_version(latest) {
             Some(v) => v,
@@ -238,55 +254,112 @@ mod tests {
     #[test]
     fn test_semver_matcher_exact_match() {
         let matcher = SemverMatcher;
-        assert!(matcher.is_latest_satisfying("1.0.0", "1.0.0"));
-        assert!(matcher.is_latest_satisfying("^1.0.0", "1.0.0"));
-        assert!(matcher.is_latest_satisfying("~1.0.0", "1.0.0"));
-        assert!(matcher.is_latest_satisfying("=1.0.0", "1.0.0"));
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new("1.0.0"),
+            &ConcreteVersion::new("1.0.0")
+        ));
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new("^1.0.0"),
+            &ConcreteVersion::new("1.0.0")
+        ));
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new("~1.0.0"),
+            &ConcreteVersion::new("1.0.0")
+        ));
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new("=1.0.0"),
+            &ConcreteVersion::new("1.0.0")
+        ));
     }
 
     #[test]
     fn test_semver_matcher_compatible_versions() {
         let matcher = SemverMatcher;
         // Latest version satisfies the requirement (up-to-date)
-        assert!(matcher.is_latest_satisfying("1.0.0", "1.0.5")); // ^1.0.0 allows 1.0.5
-        assert!(matcher.is_latest_satisfying("^1.0.0", "1.5.0")); // ^1.0.0 allows 1.5.0
-        assert!(matcher.is_latest_satisfying("0.1", "0.1.83")); // ^0.1 allows 0.1.83
-        assert!(matcher.is_latest_satisfying("1", "1.5.0")); // ^1 allows 1.5.0
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new("1.0.0"),
+            &ConcreteVersion::new("1.0.5")
+        )); // ^1.0.0 allows 1.0.5
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new("^1.0.0"),
+            &ConcreteVersion::new("1.5.0")
+        )); // ^1.0.0 allows 1.5.0
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new("0.1"),
+            &ConcreteVersion::new("0.1.83")
+        )); // ^0.1 allows 0.1.83
+        assert!(
+            matcher
+                .is_latest_satisfying(&ConcreteVersion::new("1"), &ConcreteVersion::new("1.5.0"))
+        ); // ^1 allows 1.5.0
     }
 
     #[test]
     fn test_semver_matcher_incompatible_versions() {
         let matcher = SemverMatcher;
         // Latest version doesn't satisfy requirement (new major available)
-        assert!(!matcher.is_latest_satisfying("1.0.0", "2.0.0")); // 2.0.0 breaks ^1.0.0
-        assert!(!matcher.is_latest_satisfying("0.1", "0.2.0")); // 0.2.0 breaks ^0.1
-        assert!(!matcher.is_latest_satisfying("~1.0.0", "1.1.0")); // ~1.0.0 doesn't allow 1.1.0
+        assert!(!matcher.is_latest_satisfying(
+            &ConcreteVersion::new("1.0.0"),
+            &ConcreteVersion::new("2.0.0")
+        )); // 2.0.0 breaks ^1.0.0
+        assert!(
+            !matcher
+                .is_latest_satisfying(&ConcreteVersion::new("0.1"), &ConcreteVersion::new("0.2.0"))
+        ); // 0.2.0 breaks ^0.1
+        assert!(!matcher.is_latest_satisfying(
+            &ConcreteVersion::new("~1.0.0"),
+            &ConcreteVersion::new("1.1.0")
+        )); // ~1.0.0 doesn't allow 1.1.0
     }
 
     #[test]
     fn test_pep440_matcher_same_major() {
         let matcher = Pep440Matcher;
         // Same major version = up to date
-        assert!(matcher.is_latest_satisfying(">=8.0", "8.3.5")); // 8.x matches 8.x
-        assert!(matcher.is_latest_satisfying(">=1.0", "1.5.0")); // 1.x matches 1.x
-        assert!(matcher.is_latest_satisfying(">=1.0,<2.0", "1.9.0")); // constrained but same major
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new(">=8.0"),
+            &ConcreteVersion::new("8.3.5")
+        )); // 8.x matches 8.x
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new(">=1.0"),
+            &ConcreteVersion::new("1.5.0")
+        )); // 1.x matches 1.x
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new(">=1.0,<2.0"),
+            &ConcreteVersion::new("1.9.0")
+        )); // constrained but same major
     }
 
     #[test]
     fn test_pep440_matcher_new_major() {
         let matcher = Pep440Matcher;
         // New major version available = needs update
-        assert!(!matcher.is_latest_satisfying(">=8.0", "9.0.2")); // 8.x vs 9.x
-        assert!(!matcher.is_latest_satisfying(">=1.0", "2.0.0")); // 1.x vs 2.x
-        assert!(!matcher.is_latest_satisfying(">=4.0,<8.0", "8.0.0")); // 4.x vs 8.x
+        assert!(!matcher.is_latest_satisfying(
+            &ConcreteVersion::new(">=8.0"),
+            &ConcreteVersion::new("9.0.2")
+        )); // 8.x vs 9.x
+        assert!(!matcher.is_latest_satisfying(
+            &ConcreteVersion::new(">=1.0"),
+            &ConcreteVersion::new("2.0.0")
+        )); // 1.x vs 2.x
+        assert!(!matcher.is_latest_satisfying(
+            &ConcreteVersion::new(">=4.0,<8.0"),
+            &ConcreteVersion::new("8.0.0")
+        )); // 4.x vs 8.x
     }
 
     #[test]
     fn test_pep440_matcher_zero_version() {
         let matcher = Pep440Matcher;
         // For 0.x versions, minor must also match
-        assert!(matcher.is_latest_satisfying(">=0.8", "0.8.5")); // 0.8.x matches 0.8.x
-        assert!(!matcher.is_latest_satisfying(">=0.8", "0.9.0")); // 0.8.x vs 0.9.x
+        assert!(matcher.is_latest_satisfying(
+            &ConcreteVersion::new(">=0.8"),
+            &ConcreteVersion::new("0.8.5")
+        )); // 0.8.x matches 0.8.x
+        assert!(!matcher.is_latest_satisfying(
+            &ConcreteVersion::new(">=0.8"),
+            &ConcreteVersion::new("0.9.0")
+        )); // 0.8.x vs 0.9.x
     }
 
     #[test]

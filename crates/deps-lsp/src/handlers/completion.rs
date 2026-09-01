@@ -840,7 +840,7 @@ fn create_package_completion_item(
     ecosystem_id: EcosystemId,
 ) -> Option<CompletionItem> {
     let name = metadata.name();
-    let latest = metadata.latest_version();
+    let latest = metadata.latest_version().as_str();
     let description = metadata.description();
 
     if !is_safe_package_name(name.as_str()) {
@@ -995,7 +995,7 @@ mod tests {
 
         struct MockFormatter;
         impl EcosystemFormatter for MockFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &deps_core::PackageName) -> String {
@@ -1145,7 +1145,7 @@ mod tests {
 
         struct NoopFormatter;
         impl EcosystemFormatter for NoopFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &deps_core::PackageName) -> String {
@@ -1401,7 +1401,7 @@ mod tests {
 
         struct NoopFormatter;
         impl EcosystemFormatter for NoopFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &deps_core::PackageName) -> String {
@@ -1980,8 +1980,10 @@ requests
             fn documentation(&self) -> Option<&str> {
                 None
             }
-            fn latest_version(&self) -> &'static str {
-                "1.0.214"
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
+                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("1.0.214"));
+                &VERSION
             }
             fn as_any(&self) -> &dyn std::any::Any {
                 self
@@ -2021,8 +2023,10 @@ requests
             fn documentation(&self) -> Option<&str> {
                 None
             }
-            fn latest_version(&self) -> &'static str {
-                "4.18.2"
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
+                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("4.18.2"));
+                &VERSION
             }
             fn as_any(&self) -> &dyn std::any::Any {
                 self
@@ -2059,8 +2063,10 @@ requests
             fn documentation(&self) -> Option<&str> {
                 None
             }
-            fn latest_version(&self) -> &'static str {
-                "2.31.0"
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
+                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("2.31.0"));
+                &VERSION
             }
             fn as_any(&self) -> &dyn std::any::Any {
                 self
@@ -2084,7 +2090,7 @@ requests
     struct MockMetadata {
         name: deps_core::PackageName,
         repository: Option<&'static str>,
-        latest_version: &'static str,
+        latest_version: deps_core::ConcreteVersion,
     }
     impl deps_core::Metadata for MockMetadata {
         fn name(&self) -> &deps_core::PackageName {
@@ -2099,8 +2105,8 @@ requests
         fn documentation(&self) -> Option<&str> {
             None
         }
-        fn latest_version(&self) -> &'static str {
-            self.latest_version
+        fn latest_version(&self) -> &deps_core::ConcreteVersion {
+            &self.latest_version
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self
@@ -2119,7 +2125,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("some.crate"),
             repository: None,
-            latest_version: "6.1",
+            latest_version: "6.1".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Cargo).unwrap();
 
@@ -2137,7 +2143,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("zope.interface"),
             repository: None,
-            latest_version: "6.1",
+            latest_version: "6.1".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Pypi).unwrap();
 
@@ -2149,7 +2155,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
             repository: None,
-            latest_version: "3.14.0",
+            latest_version: "3.14.0".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Maven).unwrap();
 
@@ -2168,7 +2174,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("commons-lang3"),
             repository: None,
-            latest_version: "3.14.0",
+            latest_version: "3.14.0".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Maven).unwrap();
 
@@ -2188,7 +2194,7 @@ requests
                 "org.apache.commons:commons</artifactId><parent><groupId>evil",
             ),
             repository: None,
-            latest_version: "3.14.0",
+            latest_version: "3.14.0".into(),
         };
 
         assert!(create_package_completion_item(&meta, EcosystemId::Maven).is_none());
@@ -2199,7 +2205,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("org.evil</groupId><parent>:commons-lang3"),
             repository: None,
-            latest_version: "3.14.0",
+            latest_version: "3.14.0".into(),
         };
 
         assert!(create_package_completion_item(&meta, EcosystemId::Maven).is_none());
@@ -2210,7 +2216,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("commons</artifactId><parent>"),
             repository: None,
-            latest_version: "3.14.0",
+            latest_version: "3.14.0".into(),
         };
 
         assert!(create_package_completion_item(&meta, EcosystemId::Maven).is_none());
@@ -2224,7 +2230,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("serde"),
             repository: None,
-            latest_version: "1.0.0\", git = \"https://evil",
+            latest_version: "1.0.0\", git = \"https://evil".into(),
         };
 
         assert!(create_package_completion_item(&meta, EcosystemId::Cargo).is_none());
@@ -2235,7 +2241,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("apple/swift-nio"),
             repository: Some("https://github.com/apple/swift-nio"),
-            latest_version: "2.62.0",
+            latest_version: "2.62.0".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Swift).unwrap();
 
@@ -2253,7 +2259,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("apple/swift-nio"),
             repository: Some("https://github.com/apple/swift-nio"),
-            latest_version: "",
+            latest_version: "".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Swift).unwrap();
 
@@ -2268,7 +2274,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("apple/swift-nio"),
             repository: None,
-            latest_version: "2.62.0",
+            latest_version: "2.62.0".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Swift).unwrap();
 
@@ -2290,7 +2296,7 @@ requests
             repository: Some(
                 "https://evil.example\", .exact(\"1.0.0\")), .package(url: \"https://real",
             ),
-            latest_version: "2.62.0",
+            latest_version: "2.62.0".into(),
         };
 
         assert!(create_package_completion_item(&meta, EcosystemId::Swift).is_none());
@@ -2301,7 +2307,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("apple/swift-nio\", .exact(\"1\")) //"),
             repository: None,
-            latest_version: "2.62.0",
+            latest_version: "2.62.0".into(),
         };
 
         assert!(create_package_completion_item(&meta, EcosystemId::Swift).is_none());
@@ -2318,7 +2324,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("apple/swift-nio\", .exact(\"1\")) //"),
             repository: Some("https://github.com/apple/swift-nio"),
-            latest_version: "2.62.0",
+            latest_version: "2.62.0".into(),
         };
 
         assert!(create_package_completion_item(&meta, EcosystemId::Swift).is_none());
@@ -2329,7 +2335,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("jsr:@std/fs"),
             repository: None,
-            latest_version: "1.0.24",
+            latest_version: "1.0.24".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Deno).unwrap();
 
@@ -2344,7 +2350,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("npm:react"),
             repository: None,
-            latest_version: "18.3.1",
+            latest_version: "18.3.1".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Deno).unwrap();
 
@@ -2360,7 +2366,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("jsr:@std/fs"),
             repository: None,
-            latest_version: "",
+            latest_version: "".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Deno).unwrap();
 
@@ -2375,7 +2381,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("monolog/monolog"),
             repository: None,
-            latest_version: "3.5.0",
+            latest_version: "3.5.0".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Composer).unwrap();
 
@@ -2390,7 +2396,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("github.com/stretchr/testify"),
             repository: None,
-            latest_version: "v1.9.0",
+            latest_version: "v1.9.0".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Go).unwrap();
 
@@ -2405,7 +2411,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("path"),
             repository: None,
-            latest_version: "1.9.0",
+            latest_version: "1.9.0".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Dart).unwrap();
 
@@ -2417,7 +2423,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("org.apache.commons:commons-lang3"),
             repository: None,
-            latest_version: "3.14.0",
+            latest_version: "3.14.0".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Gradle).unwrap();
 
@@ -2432,7 +2438,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("Newtonsoft.Json"),
             repository: None,
-            latest_version: "13.0.3",
+            latest_version: "13.0.3".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::NuGet).unwrap();
 
@@ -2447,7 +2453,7 @@ requests
         let meta = MockMetadata {
             name: deps_core::PackageName::new("rails"),
             repository: None,
-            latest_version: "7.1.3",
+            latest_version: "7.1.3".into(),
         };
         let item = create_package_completion_item(&meta, EcosystemId::Bundler).unwrap();
 
@@ -2478,7 +2484,7 @@ requests
             let meta = MockMetadata {
                 name: evil.clone(),
                 repository: None,
-                latest_version: "9.9.9",
+                latest_version: "9.9.9".into(),
             };
             assert!(
                 create_package_completion_item(&meta, ecosystem).is_none(),
@@ -2602,8 +2608,10 @@ s
             fn documentation(&self) -> Option<&str> {
                 None
             }
-            fn latest_version(&self) -> &'static str {
-                "1.0.0"
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
+                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("1.0.0"));
+                &VERSION
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -3014,8 +3022,10 @@ serde
             fn documentation(&self) -> Option<&str> {
                 None
             }
-            fn latest_version(&self) -> &'static str {
-                "4.18.2"
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
+                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("4.18.2"));
+                &VERSION
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -3089,8 +3099,10 @@ serde
             fn documentation(&self) -> Option<&str> {
                 None
             }
-            fn latest_version(&self) -> &'static str {
-                "3.14.0"
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                static VERSION: std::sync::LazyLock<deps_core::ConcreteVersion> =
+                    std::sync::LazyLock::new(|| deps_core::ConcreteVersion::new("3.14.0"));
+                &VERSION
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -3209,7 +3221,7 @@ serde
 
         struct MockFormatter;
         impl EcosystemFormatter for MockFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &deps_core::PackageName) -> String {
@@ -3366,7 +3378,7 @@ serde
 
         struct NoopFormatter;
         impl EcosystemFormatter for NoopFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &deps_core::PackageName) -> String {

@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::{PackageName, VersionReq};
+use crate::{ConcreteVersion, PackageName, VersionReq};
 use std::any::Any;
 use std::pin::Pin;
 
@@ -21,29 +21,29 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 /// # Examples
 ///
 /// ```no_run
-/// use deps_core::{Registry, Version, Metadata, PackageName};
+/// use deps_core::{Registry, Version, Metadata, PackageName, ConcreteVersion};
 /// use std::any::Any;
 /// use std::pin::Pin;
 ///
 /// struct MyRegistry;
 ///
 /// #[derive(Clone)]
-/// struct MyVersion { version: String }
+/// struct MyVersion { version: ConcreteVersion }
 ///
 /// impl Version for MyVersion {
-///     fn version_string(&self) -> &str { &self.version }
+///     fn version_string(&self) -> &ConcreteVersion { &self.version }
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
 /// #[derive(Clone)]
-/// struct MyMetadata { name: PackageName }
+/// struct MyMetadata { name: PackageName, latest: ConcreteVersion }
 ///
 /// impl Metadata for MyMetadata {
 ///     fn name(&self) -> &PackageName { &self.name }
 ///     fn description(&self) -> Option<&str> { None }
 ///     fn repository(&self) -> Option<&str> { None }
 ///     fn documentation(&self) -> Option<&str> { None }
-///     fn latest_version(&self) -> &str { "1.0.0" }
+///     fn latest_version(&self) -> &ConcreteVersion { &self.latest }
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
 ///
@@ -408,7 +408,7 @@ impl RemovalStatus {
 /// All version types must implement this to work with generic handlers.
 pub trait Version: Send + Sync {
     /// Version string (e.g., "1.0.214", "14.21.3").
-    fn version_string(&self) -> &str;
+    fn version_string(&self) -> &ConcreteVersion;
 
     /// This version's removal/deprecation status as reported by the registry.
     ///
@@ -423,7 +423,7 @@ pub trait Version: Send + Sync {
     /// Default implementation checks for common pre-release patterns via
     /// [`has_default_prerelease_marker`].
     fn is_prerelease(&self) -> bool {
-        has_default_prerelease_marker(self.version_string())
+        has_default_prerelease_marker(self.version_string().as_str())
     }
 
     /// Available feature flags (empty if not supported by ecosystem).
@@ -468,12 +468,13 @@ pub trait Version: Send + Sync {
 ///
 /// ```
 /// use deps_core::registry::{RemovalStatus, Version, find_latest_stable};
+/// use deps_core::ConcreteVersion;
 /// use std::any::Any;
 ///
-/// struct MyVersion { version: String, yanked: bool }
+/// struct MyVersion { version: ConcreteVersion, yanked: bool }
 ///
 /// impl Version for MyVersion {
-///     fn version_string(&self) -> &str { &self.version }
+///     fn version_string(&self) -> &ConcreteVersion { &self.version }
 ///     fn removal_status(&self) -> RemovalStatus { RemovalStatus::from_yanked(self.yanked) }
 ///     fn as_any(&self) -> &dyn Any { self }
 /// }
@@ -485,7 +486,7 @@ pub trait Version: Send + Sync {
 /// ];
 ///
 /// let latest = find_latest_stable(&versions);
-/// assert_eq!(latest.map(|v| v.version_string()), Some("1.4.0"));
+/// assert_eq!(latest.map(|v| v.version_string().as_str()), Some("1.4.0"));
 /// ```
 pub fn find_latest_stable(versions: &[Box<dyn Version>]) -> Option<&dyn Version> {
     versions.iter().find(|v| v.is_stable()).map(|v| v.as_ref())
@@ -566,12 +567,13 @@ pub fn is_existence_wildcard_str(req: &str) -> bool {
 ///
 /// ```
 /// use deps_core::registry::{RemovalStatus, Version, select_latest_for_existence};
+/// use deps_core::ConcreteVersion;
 /// use std::any::Any;
 ///
-/// struct MyVersion { version: String, status: RemovalStatus, prerelease: bool }
+/// struct MyVersion { version: ConcreteVersion, status: RemovalStatus, prerelease: bool }
 ///
 /// impl Version for MyVersion {
-///     fn version_string(&self) -> &str { &self.version }
+///     fn version_string(&self) -> &ConcreteVersion { &self.version }
 ///     fn removal_status(&self) -> RemovalStatus { self.status }
 ///     fn is_prerelease(&self) -> bool { self.prerelease }
 ///     fn as_any(&self) -> &dyn Any { self }
@@ -638,7 +640,7 @@ pub trait Metadata: Send + Sync {
     fn documentation(&self) -> Option<&str>;
 
     /// Latest stable version.
-    fn latest_version(&self) -> &str;
+    fn latest_version(&self) -> &ConcreteVersion;
 
     /// Downcast to concrete metadata type
     fn as_any(&self) -> &dyn Any;
@@ -649,12 +651,12 @@ mod tests {
     use super::*;
 
     struct MockVersion {
-        version: String,
+        version: ConcreteVersion,
         yanked: bool,
     }
 
     impl Version for MockVersion {
-        fn version_string(&self) -> &str {
+        fn version_string(&self) -> &ConcreteVersion {
             &self.version
         }
 
@@ -685,7 +687,7 @@ mod tests {
         };
 
         let boxed: Box<dyn Version> = Box::new(version);
-        assert_eq!(boxed.version_string(), "1.2.3");
+        assert_eq!(boxed.version_string().as_str(), "1.2.3");
         assert!(!boxed.removal_status().blocks_resolution());
     }
 
@@ -704,7 +706,7 @@ mod tests {
 
     struct MockMetadata {
         name: crate::PackageName,
-        latest: String,
+        latest: ConcreteVersion,
     }
 
     impl Metadata for MockMetadata {
@@ -724,7 +726,7 @@ mod tests {
             None
         }
 
-        fn latest_version(&self) -> &str {
+        fn latest_version(&self) -> &ConcreteVersion {
             &self.latest
         }
 
@@ -742,7 +744,7 @@ mod tests {
 
         let boxed: Box<dyn Metadata> = Box::new(metadata);
         assert_eq!(boxed.name(), "test-package");
-        assert_eq!(boxed.latest_version(), "2.0.0");
+        assert_eq!(boxed.latest_version().as_str(), "2.0.0");
         assert!(boxed.description().is_none());
         assert!(boxed.repository().is_none());
         assert!(boxed.documentation().is_none());
@@ -755,7 +757,7 @@ mod tests {
             desc: String,
             repo: String,
             docs: String,
-            latest: String,
+            latest: ConcreteVersion,
         }
 
         impl Metadata for FullMetadata {
@@ -771,7 +773,7 @@ mod tests {
             fn documentation(&self) -> Option<&str> {
                 Some(&self.docs)
             }
-            fn latest_version(&self) -> &str {
+            fn latest_version(&self) -> &ConcreteVersion {
                 &self.latest
             }
             fn as_any(&self) -> &dyn Any {
@@ -904,7 +906,7 @@ mod tests {
             }),
         ];
         let latest = super::find_latest_stable(&versions);
-        assert_eq!(latest.map(|v| v.version_string()), Some("1.5.0"));
+        assert_eq!(latest.map(|v| v.version_string().as_str()), Some("1.5.0"));
     }
 
     #[test]
@@ -920,7 +922,7 @@ mod tests {
             }),
         ];
         let latest = super::find_latest_stable(&versions);
-        assert_eq!(latest.map(|v| v.version_string()), Some("1.5.0"));
+        assert_eq!(latest.map(|v| v.version_string().as_str()), Some("1.5.0"));
     }
 
     #[test]
@@ -944,7 +946,7 @@ mod tests {
             }),
         ];
         let latest = super::find_latest_stable(&versions);
-        assert_eq!(latest.map(|v| v.version_string()), Some("1.5.0"));
+        assert_eq!(latest.map(|v| v.version_string().as_str()), Some("1.5.0"));
     }
 
     #[test]
@@ -971,12 +973,12 @@ mod tests {
     }
 
     struct StatusVersion {
-        version: String,
+        version: ConcreteVersion,
         status: RemovalStatus,
     }
 
     impl Version for StatusVersion {
-        fn version_string(&self) -> &str {
+        fn version_string(&self) -> &ConcreteVersion {
             &self.version
         }
 

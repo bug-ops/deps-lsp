@@ -327,9 +327,9 @@ impl SwiftRegistry {
             }
         };
 
-        Ok(versions
-            .into_iter()
-            .find(|v| semver::Version::parse(&v.version).is_ok_and(|ver| req.matches(&ver))))
+        Ok(versions.into_iter().find(|v| {
+            semver::Version::parse(v.version.as_str()).is_ok_and(|ver| req.matches(&ver))
+        }))
     }
 
     /// Searches GitHub repositories for Swift packages.
@@ -452,7 +452,7 @@ fn tags_to_versions(tags: Vec<GithubTag>) -> Vec<SwiftVersion> {
             let prerelease = !parsed.pre.is_empty();
             Some((
                 SwiftVersion {
-                    version: name,
+                    version: name.into(),
                     yanked: false,
                     published_at: None,
                     prerelease,
@@ -539,7 +539,7 @@ fn classify_release_fetch(
 /// `dates` keeps `published_at: None` — exactly the pre-feature rendering (#223).
 fn attach_publish_times(versions: &mut [SwiftVersion], dates: &HashMap<String, PublishTime>) {
     for version in versions {
-        version.published_at = dates.get(&version.version).copied();
+        version.published_at = dates.get(version.version.as_str()).copied();
     }
 }
 
@@ -577,7 +577,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<SwiftPackage>> {
             description: item.description,
             repository: Some(item.html_url.clone()),
             homepage: Some(item.html_url),
-            latest_version: String::new(),
+            latest_version: deps_core::ConcreteVersion::new(""),
         })
         .collect())
 }
@@ -659,7 +659,8 @@ impl deps_core::Registry for SwiftRegistry {
         }
         let parsed_req = semver::VersionReq::parse(req.as_str()).ok()?;
         versions.iter().position(|v| {
-            semver::Version::parse(v.version_string()).is_ok_and(|ver| parsed_req.matches(&ver))
+            semver::Version::parse(v.version_string().as_str())
+                .is_ok_and(|ver| parsed_req.matches(&ver))
         })
     }
 
@@ -711,7 +712,7 @@ mod tests {
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "apple/swift-nio");
         assert_eq!(packages[0].description, Some("Networking framework".into()));
-        assert!(packages[0].latest_version.is_empty());
+        assert!(packages[0].latest_version.as_str().is_empty());
     }
 
     #[test]
@@ -787,8 +788,8 @@ mod tests {
         let versions = parse_tags_response(json.as_bytes()).unwrap();
         assert_eq!(versions.len(), 2);
         // Versions should have 'v' prefix stripped
-        assert!(!versions[0].version.starts_with('v'));
-        assert!(!versions[1].version.starts_with('v'));
+        assert!(!versions[0].version.as_str().starts_with('v'));
+        assert!(!versions[1].version.as_str().starts_with('v'));
     }
 
     #[test]

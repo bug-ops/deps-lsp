@@ -440,7 +440,7 @@ pub fn registration_index_url(base: &str, name: &str) -> String {
 /// error: it simply keeps/never gets a `published_at`. Order is untouched.
 fn attach_publish_times(versions: &mut [NuGetVersion], times: &HashMap<String, PublishTime>) {
     for v in versions {
-        v.published_at = times.get(&v.version).copied();
+        v.published_at = times.get(v.version.as_str()).copied();
     }
 }
 
@@ -492,7 +492,7 @@ pub fn parse_flat_container(data: &[u8]) -> Result<Vec<NuGetVersion>> {
     Ok(versions
         .into_iter()
         .map(|version| NuGetVersion {
-            version,
+            version: version.into(),
             published_at: None,
         })
         .collect())
@@ -516,9 +516,9 @@ fn pick_latest_matching(versions: Vec<NuGetVersion>, req: &str) -> Option<NuGetV
     let req = if req.is_empty() { "*" } else { req };
 
     let matched = if req.contains('*') {
-        let strings: Vec<String> = versions.iter().map(|v| v.version.clone()).collect();
+        let strings: Vec<String> = versions.iter().map(|v| v.version.to_string()).collect();
         crate::version::resolve_float(&strings, req).map(|v| NuGetVersion {
-            version: v.to_string(),
+            version: v.into(),
             published_at: None,
         })
     } else {
@@ -526,8 +526,9 @@ fn pick_latest_matching(versions: Vec<NuGetVersion>, req: &str) -> Option<NuGetV
         versions
             .iter()
             .find(|v| {
-                crate::version::satisfies(&v.version, req)
-                    && (req_is_prerelease_bearing || !crate::version::is_prerelease(&v.version))
+                crate::version::satisfies(v.version.as_str(), req)
+                    && (req_is_prerelease_bearing
+                        || !crate::version::is_prerelease(v.version.as_str()))
             })
             .cloned()
     };
@@ -556,7 +557,7 @@ fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<PackageInfo>> 
             description: d.description,
             repository: d.project_url,
             documentation: None,
-            latest_version: d.version.unwrap_or_default(),
+            latest_version: d.version.unwrap_or_default().into(),
         })
         .collect())
 }
@@ -644,9 +645,9 @@ impl deps_core::Registry for NuGetRegistry {
         } else {
             let req_is_prerelease_bearing = req_str.contains('-');
             versions.iter().position(|v| {
-                crate::version::satisfies(v.version_string(), req_str)
+                crate::version::satisfies(v.version_string().as_str(), req_str)
                     && (req_is_prerelease_bearing
-                        || !crate::version::is_prerelease(v.version_string()))
+                        || !crate::version::is_prerelease(v.version_string().as_str()))
             })
         };
 
@@ -929,7 +930,7 @@ mod tests {
 
     fn v(s: &str) -> NuGetVersion {
         NuGetVersion {
-            version: s.to_string(),
+            version: s.into(),
             published_at: None,
         }
     }

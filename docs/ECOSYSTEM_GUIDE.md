@@ -622,7 +622,7 @@ pub enum {Ecosystem}DependencySection {
 /// Version information from the registry.
 #[derive(Debug, Clone)]
 pub struct {Ecosystem}Version {
-    pub version: String,
+    pub version: deps_core::ConcreteVersion,
     pub yanked: bool,
     // Add ecosystem-specific fields
 }
@@ -655,7 +655,7 @@ impl deps_core::Dependency for {Ecosystem}Dependency {
 }
 
 impl deps_core::Version for {Ecosystem}Version {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &deps_core::ConcreteVersion {
         &self.version
     }
 
@@ -665,7 +665,8 @@ impl deps_core::Version for {Ecosystem}Version {
 
     fn is_prerelease(&self) -> bool {
         // Implement based on ecosystem's prerelease conventions
-        self.version.contains('-') || self.version.contains("alpha") || self.version.contains("beta")
+        let version = self.version.as_str();
+        version.contains('-') || version.contains("alpha") || version.contains("beta")
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -984,7 +985,7 @@ use deps_core::lsp_helpers::EcosystemFormatter;
 pub struct {Ecosystem}Formatter;
 
 impl EcosystemFormatter for {Ecosystem}Formatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
         // Format version string for use in code action text edits
         format!("\"{}\"", version)
     }

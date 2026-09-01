@@ -293,8 +293,8 @@ serde = "1.0.0"
             cached.insert(
                 "serde".into(),
                 deps_core::PackageVersions {
-                    latest: "2.0.0".to_string(),
-                    available: std::sync::Arc::from(vec!["2.0.0".to_string(), "1.0.0".to_string()]),
+                    latest: "2.0.0".into(),
+                    available: std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
                     yanked: std::sync::Arc::from(Vec::new()),
                     published_at: None,
                 },
@@ -334,8 +334,8 @@ serde = "1.0.0"
             cached.insert(
                 "serde".into(),
                 deps_core::PackageVersions {
-                    latest: "2.0.0".to_string(),
-                    available: std::sync::Arc::from(vec!["2.0.0".to_string(), "1.0.0".to_string()]),
+                    latest: "2.0.0".into(),
+                    available: std::sync::Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
                     yanked: std::sync::Arc::from(Vec::new()),
                     published_at: None,
                 },
@@ -372,11 +372,8 @@ serde = "1.0.0"
             cached.insert(
                 "serde".into(),
                 deps_core::PackageVersions {
-                    latest: "1.0.214".to_string(),
-                    available: std::sync::Arc::from(vec![
-                        "1.0.214".to_string(),
-                        "1.0.213".to_string(),
-                    ]),
+                    latest: "1.0.214".into(),
+                    available: std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
                     yanked: std::sync::Arc::from(Vec::new()),
                     published_at: None,
                 },
@@ -463,11 +460,8 @@ serde = "1.0.0"
             cached.insert(
                 "serde".into(),
                 deps_core::PackageVersions {
-                    latest: "1.0.214".to_string(),
-                    available: std::sync::Arc::from(vec![
-                        "1.0.214".to_string(),
-                        "1.0.213".to_string(),
-                    ]),
+                    latest: "1.0.214".into(),
+                    available: std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
                     yanked: std::sync::Arc::from(Vec::new()),
                     published_at: None,
                 },
@@ -550,8 +544,8 @@ serde = "1.0.0"
             cached.insert(
                 "serde".into(),
                 deps_core::PackageVersions {
-                    latest: "1.0.214".to_string(),
-                    available: std::sync::Arc::from(vec!["1.0.214".to_string()]),
+                    latest: "1.0.214".into(),
+                    available: std::sync::Arc::from(vec!["1.0.214".into()]),
                     yanked: std::sync::Arc::from(Vec::new()),
                     published_at: None,
                 },
@@ -559,12 +553,12 @@ serde = "1.0.0"
             cached.insert(
                 "tokio".into(),
                 deps_core::PackageVersions {
-                    latest: "2.0.0".to_string(),
+                    latest: "2.0.0".into(),
                     // Includes an older version satisfying "1.0" (^1.0) so this dependency
                     // is genuinely outdated-but-satisfiable, not unsatisfiable — an
                     // available list containing only `latest` would make every requirement
                     // that latest doesn't itself satisfy look unsatisfiable.
-                    available: std::sync::Arc::from(vec!["2.0.0".to_string(), "1.5.0".to_string()]),
+                    available: std::sync::Arc::from(vec!["2.0.0".into(), "1.5.0".into()]),
                     yanked: std::sync::Arc::from(Vec::new()),
                     published_at: None,
                 },
@@ -613,12 +607,9 @@ serde = "1.0.0"
             cached.insert(
                 "serde".into(),
                 deps_core::PackageVersions {
-                    latest: "1.0.214".to_string(),
-                    available: std::sync::Arc::from(vec![
-                        "1.0.214".to_string(),
-                        "1.0.213".to_string(),
-                    ]),
-                    yanked: std::sync::Arc::from(vec!["1.0.213".to_string()]),
+                    latest: "1.0.214".into(),
+                    available: std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
+                    yanked: std::sync::Arc::from(vec!["1.0.213".into()]),
                     published_at: None,
                 },
             );

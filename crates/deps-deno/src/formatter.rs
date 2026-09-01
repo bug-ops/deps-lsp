@@ -9,7 +9,7 @@
 
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, warn_rejected_value};
-use deps_core::{Dependency, InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Precise `node-semver` range matcher, compiled once per dependency by
 /// [`DenoFormatter::compile_requirement`]. Correct for both `jsr:` and `npm:`
@@ -18,7 +18,8 @@ use deps_core::{Dependency, InvalidPackageName, PackageName, VersionReq};
 struct NodeSemverMatcher(node_semver::Range);
 
 impl RequirementMatcher for NodeSemverMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         node_semver::Version::parse(version)
             .ok()
             .map(|v| self.0.satisfies(&v))
@@ -54,7 +55,8 @@ fn validate_jsr_segment(segment: &str) -> Result<(), InvalidPackageName> {
 pub struct DenoFormatter;
 
 impl EcosystemFormatter for DenoFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         // `version_range` covers only the version text inside the specifier string — no
         // quotes, no '@' — exactly like npm's (`deps-npm/src/formatter.rs`).
         version.to_string()
@@ -309,8 +311,8 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("^1.0.0"))
             .expect("valid node-semver range must compile");
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
     #[test]

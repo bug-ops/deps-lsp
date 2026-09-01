@@ -1,6 +1,7 @@
 //! Version formatting for Bundler ecosystem.
 
 use crate::version::{compare_versions, is_valid_rubygems_version, version_matches_requirement};
+use deps_core::ConcreteVersion;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
@@ -53,7 +54,8 @@ fn fail_closed_operand(requirement: &str) -> Option<&str> {
 struct RubygemsMatcher(String);
 
 impl RequirementMatcher for RubygemsMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         Some(version_matches_requirement(version, &self.0))
     }
 }
@@ -109,21 +111,25 @@ fn exact_pin_version(requirement: &str) -> Option<&str> {
 /// two no longer can.) A prerelease-tagged pin like `"2.0.0.rc1"` against a published
 /// `"2.0.0"` does not reach this path either: `compare_versions` correctly orders it below
 /// the stable release instead of tying, since #323's fix.
-fn exact_pin_could_be_yanked(requirement: &str, available: &[String]) -> bool {
+fn exact_pin_could_be_yanked(requirement: &str, available: &[ConcreteVersion]) -> bool {
     let Some(pin) = exact_pin_version(requirement) else {
         return false;
     };
-    let Some(max) = available.iter().max_by(|a, b| compare_versions(a, b)) else {
+    let Some(max) = available
+        .iter()
+        .max_by(|a, b| compare_versions(a.as_str(), b.as_str()))
+    else {
         return false;
     };
-    !compare_versions(pin, max).is_gt()
+    !compare_versions(pin, max.as_str()).is_gt()
 }
 
 /// Formatter for Bundler/Ruby gem versions.
 pub struct BundlerFormatter;
 
 impl EcosystemFormatter for BundlerFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         version.to_string()
     }
 
@@ -160,7 +166,8 @@ impl EcosystemFormatter for BundlerFormatter {
         Ok(())
     }
 
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
         version_matches_requirement(version, requirement)
     }
 
@@ -191,7 +198,7 @@ impl EcosystemFormatter for BundlerFormatter {
     fn requirement_is_undecidable_given_available(
         &self,
         requirement: &VersionReq,
-        available: &[String],
+        available: &[ConcreteVersion],
     ) -> bool {
         exact_pin_could_be_yanked(requirement.as_str(), available)
     }
@@ -204,8 +211,14 @@ mod tests {
     #[test]
     fn test_format_version() {
         let formatter = BundlerFormatter;
-        assert_eq!(formatter.format_version_for_text_edit("7.0.8"), "7.0.8");
-        assert_eq!(formatter.format_version_for_text_edit("1.0.0"), "1.0.0");
+        assert_eq!(
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("7.0.8")),
+            "7.0.8"
+        );
+        assert_eq!(
+            formatter.format_version_for_text_edit(&ConcreteVersion::new("1.0.0")),
+            "1.0.0"
+        );
     }
 
     #[test]
@@ -226,17 +239,25 @@ mod tests {
         let formatter = BundlerFormatter;
 
         // ~> 7.0 means >= 7.0, < 8.0
-        assert!(formatter.version_satisfies_requirement("7.0.8", "~> 7.0"));
-        assert!(formatter.version_satisfies_requirement("7.0.0", "~> 7.0"));
-        assert!(formatter.version_satisfies_requirement("7.9.9", "~> 7.0"));
-        assert!(!formatter.version_satisfies_requirement("8.0.0", "~> 7.0"));
-        assert!(!formatter.version_satisfies_requirement("6.9.9", "~> 7.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("7.0.8"), "~> 7.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("7.0.0"), "~> 7.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("7.9.9"), "~> 7.0"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("8.0.0"), "~> 7.0"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("6.9.9"), "~> 7.0"));
 
         // ~> 1.0.5 means >= 1.0.5, < 1.1.0
-        assert!(formatter.version_satisfies_requirement("1.0.5", "~> 1.0.5"));
-        assert!(formatter.version_satisfies_requirement("1.0.9", "~> 1.0.5"));
-        assert!(!formatter.version_satisfies_requirement("1.1.0", "~> 1.0.5"));
-        assert!(!formatter.version_satisfies_requirement("1.0.4", "~> 1.0.5"));
+        assert!(
+            formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.5"), "~> 1.0.5")
+        );
+        assert!(
+            formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.9"), "~> 1.0.5")
+        );
+        assert!(
+            !formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "~> 1.0.5")
+        );
+        assert!(
+            !formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.4"), "~> 1.0.5")
+        );
     }
 
     #[test]
@@ -244,32 +265,38 @@ mod tests {
         let formatter = BundlerFormatter;
 
         // >= operator
-        assert!(formatter.version_satisfies_requirement("1.5.0", ">= 1.1"));
-        assert!(formatter.version_satisfies_requirement("1.1.0", ">= 1.1"));
-        assert!(!formatter.version_satisfies_requirement("1.0.0", ">= 1.1"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">= 1.1"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), ">= 1.1"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), ">= 1.1"));
 
         // > operator
-        assert!(formatter.version_satisfies_requirement("2.0.0", "> 1.0"));
-        assert!(!formatter.version_satisfies_requirement("1.0.0", "> 1.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "> 1.0"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "> 1.0"));
 
         // <= operator
-        assert!(formatter.version_satisfies_requirement("1.0.0", "<= 1.0"));
-        assert!(!formatter.version_satisfies_requirement("1.1.0", "<= 1.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "<= 1.0"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "<= 1.0"));
 
         // < operator
-        assert!(formatter.version_satisfies_requirement("0.9.0", "< 1.0"));
-        assert!(!formatter.version_satisfies_requirement("1.0.0", "< 1.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "< 1.0"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "< 1.0"));
     }
 
     #[test]
     fn test_exact_match() {
         let formatter = BundlerFormatter;
 
-        assert!(formatter.version_satisfies_requirement("1.0.0", "= 1.0.0"));
-        assert!(!formatter.version_satisfies_requirement("1.0.1", "= 1.0.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "= 1.0.0"));
+        assert!(
+            !formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "= 1.0.0")
+        );
 
-        assert!(formatter.version_satisfies_requirement("1.0.1", "!= 1.0.0"));
-        assert!(!formatter.version_satisfies_requirement("1.0.0", "!= 1.0.0"));
+        assert!(
+            formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "!= 1.0.0")
+        );
+        assert!(
+            !formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "!= 1.0.0")
+        );
     }
 
     #[test]
@@ -291,8 +318,8 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("~> 7.0"))
             .expect("Bundler requirement always compiles");
-        assert_eq!(matcher.matches("7.0.8"), Some(true));
-        assert_eq!(matcher.matches("8.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("7.0.8")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("8.0.0")), Some(false));
     }
 
     #[test]
@@ -301,8 +328,11 @@ mod tests {
         let matcher = formatter
             .compile_requirement(&VersionReq::new("1.6.13"))
             .expect("Bundler requirement always compiles");
-        assert_eq!(matcher.matches("1.6.13"), Some(true));
-        assert_eq!(matcher.matches("1.6.14"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.6.13")), Some(true));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("1.6.14")),
+            Some(false)
+        );
     }
 
     #[test]
@@ -431,14 +461,14 @@ mod tests {
     /// unsatisfiable.
     #[test]
     fn test_exact_pin_could_be_yanked_interior_pin_suppressed() {
-        let available = ["1.6.14".to_string(), "1.6.9".to_string()];
+        let available = ["1.6.14".into(), "1.6.9".into()];
         assert!(exact_pin_could_be_yanked("1.6.13", &available));
         assert!(exact_pin_could_be_yanked("= 1.6.10", &available));
     }
 
     #[test]
     fn test_exact_pin_could_be_yanked_boundary_pin_suppressed() {
-        let available = ["1.6.14".to_string(), "1.6.9".to_string()];
+        let available = ["1.6.14".into(), "1.6.9".into()];
         assert!(exact_pin_could_be_yanked("1.6.9", &available));
         assert!(exact_pin_could_be_yanked("1.6.14", &available));
     }
@@ -449,7 +479,7 @@ mod tests {
     /// still be suppressed rather than flagged unsatisfiable.
     #[test]
     fn test_exact_pin_could_be_yanked_below_minimum_pin_suppressed() {
-        let available = ["7.2.1".to_string()];
+        let available = ["7.2.1".into()];
         assert!(exact_pin_could_be_yanked("7.2.0", &available));
         assert!(exact_pin_could_be_yanked("6.0.0", &available));
     }
@@ -460,13 +490,13 @@ mod tests {
     /// when `foo` only publishes up to `2.0`).
     #[test]
     fn test_exact_pin_could_be_yanked_above_maximum_pin_not_suppressed() {
-        let available = ["1.6.14".to_string(), "1.6.9".to_string()];
+        let available = ["1.6.14".into(), "1.6.9".into()];
         assert!(!exact_pin_could_be_yanked("99.0.0", &available));
     }
 
     #[test]
     fn test_exact_pin_could_be_yanked_non_exact_pin_not_suppressed() {
-        let available = ["1.6.14".to_string(), "1.6.9".to_string()];
+        let available = ["1.6.14".into(), "1.6.9".into()];
         assert!(!exact_pin_could_be_yanked("~> 1.6", &available));
         assert!(!exact_pin_could_be_yanked("*", &available));
     }
@@ -482,7 +512,7 @@ mod tests {
     /// actual string-based `RubygemsMatcher` would never treat `1.6` and `1.6.0` as equal.
     #[test]
     fn test_exact_pin_could_be_yanked_short_pin_numeric_boundary_suppressed() {
-        let available = ["1.6.14".to_string(), "1.6.9".to_string()];
+        let available = ["1.6.14".into(), "1.6.9".into()];
         assert!(exact_pin_could_be_yanked("1.6", &available));
     }
 
@@ -494,7 +524,7 @@ mod tests {
         use deps_core::lsp_helpers::requirement_is_unsatisfiable;
 
         let formatter = BundlerFormatter;
-        let available = vec!["2.0.0".to_string(), "1.0.0".to_string()];
+        let available = vec!["2.0.0".into(), "1.0.0".into()];
         assert!(requirement_is_unsatisfiable(
             &formatter,
             &VersionReq::new("99.0.0"),
@@ -508,7 +538,7 @@ mod tests {
         use deps_core::lsp_helpers::requirement_is_unsatisfiable;
 
         let formatter = BundlerFormatter;
-        let available = vec!["1.6.14".to_string(), "1.6.9".to_string()];
+        let available = vec!["1.6.14".into(), "1.6.9".into()];
         assert!(!requirement_is_unsatisfiable(
             &formatter,
             &VersionReq::new("1.6.13"),
@@ -524,7 +554,7 @@ mod tests {
         use deps_core::lsp_helpers::requirement_is_unsatisfiable;
 
         let formatter = BundlerFormatter;
-        let available = vec!["7.2.1".to_string()];
+        let available = vec!["7.2.1".into()];
         assert!(!requirement_is_unsatisfiable(
             &formatter,
             &VersionReq::new("7.2.0"),

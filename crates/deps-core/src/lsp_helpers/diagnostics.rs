@@ -4,8 +4,8 @@ use tower_lsp_server::ls_types::{
 
 use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome, diagnostic_severity_for};
 use crate::{
-    Dependency, ParseResult, PublishTime, Registry, VersionReq, format_relative_age,
-    is_within_cooldown,
+    ConcreteVersion, Dependency, ParseResult, PublishTime, Registry, VersionReq,
+    format_relative_age, is_within_cooldown,
 };
 
 use super::{EcosystemFormatter, RequirementMatcher, RequirementStatus, VersionData};
@@ -86,11 +86,12 @@ impl Default for DiagnosticSeverities {
 ///
 /// ```
 /// use deps_core::lsp_helpers::{compile_requirement_unless, RequirementMatcher};
+/// use deps_core::ConcreteVersion;
 ///
 /// struct ExactMatcher(String);
 /// impl RequirementMatcher for ExactMatcher {
-///     fn matches(&self, version: &str) -> Option<bool> {
-///         Some(version == self.0)
+///     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+///         Some(version.as_str() == self.0)
 ///     }
 /// }
 ///
@@ -165,18 +166,18 @@ const MAX_REQUIREMENT_LEN: usize = 256;
 ///
 /// ```
 /// use deps_core::lsp_helpers::{requirement_is_unsatisfiable, EcosystemFormatter, RequirementMatcher};
-/// use deps_core::{PackageName, VersionReq};
+/// use deps_core::{ConcreteVersion, PackageName, VersionReq};
 ///
 /// struct ExactMatcher(String);
 /// impl RequirementMatcher for ExactMatcher {
-///     fn matches(&self, version: &str) -> Option<bool> {
-///         Some(version == self.0)
+///     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+///         Some(version.as_str() == self.0)
 ///     }
 /// }
 ///
 /// struct ExactFormatter;
 /// impl EcosystemFormatter for ExactFormatter {
-///     fn format_version_for_text_edit(&self, version: &str) -> String {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
@@ -190,7 +191,7 @@ const MAX_REQUIREMENT_LEN: usize = 256;
 ///     }
 /// }
 ///
-/// let available = vec!["1.0.0".to_string(), "0.9.0".to_string()];
+/// let available = vec![ConcreteVersion::new("1.0.0"), ConcreteVersion::new("0.9.0")];
 /// assert!(requirement_is_unsatisfiable(
 ///     &ExactFormatter,
 ///     &VersionReq::new("2.0.0"),
@@ -205,7 +206,7 @@ const MAX_REQUIREMENT_LEN: usize = 256;
 pub fn requirement_is_unsatisfiable(
     formatter: &dyn EcosystemFormatter,
     requirement: &VersionReq,
-    available: &[String],
+    available: &[ConcreteVersion],
 ) -> bool {
     if available.is_empty() || requirement.as_str().trim().is_empty() {
         return false;
@@ -283,8 +284,8 @@ fn requirement_names_prerelease(requirement: &str) -> bool {
 fn matching_prerelease_would_satisfy(
     formatter: &dyn EcosystemFormatter,
     requirement: &VersionReq,
-    available: &[String],
-    yanked: &[String],
+    available: &[ConcreteVersion],
+    yanked: &[ConcreteVersion],
 ) -> Option<String> {
     if !formatter.strict_semver_prerelease_exclusion() {
         return None;
@@ -294,9 +295,10 @@ fn matching_prerelease_would_satisfy(
     }
     let matcher = formatter.compile_requirement(requirement)?;
     available.iter().find_map(|candidate| {
-        let base = semver_prerelease_base(candidate)?;
-        (!yanked.iter().any(|y| y == candidate) && matcher.matches(base) == Some(true))
-            .then(|| candidate.clone())
+        let base = semver_prerelease_base(candidate.as_str())?;
+        (!yanked.iter().any(|y| y == candidate)
+            && matcher.matches(&ConcreteVersion::new(base)) == Some(true))
+        .then(|| candidate.to_string())
     })
 }
 
@@ -325,8 +327,8 @@ fn matching_prerelease_would_satisfy(
 fn requirement_matches_only_yanked(
     formatter: &dyn EcosystemFormatter,
     requirement: &VersionReq,
-    available: &[String],
-    yanked: &[String],
+    available: &[ConcreteVersion],
+    yanked: &[ConcreteVersion],
 ) -> bool {
     if available.is_empty() || yanked.is_empty() || requirement.as_str().trim().is_empty() {
         return false;
@@ -522,7 +524,7 @@ pub fn generate_diagnostics_from_cache(
             }
             continue;
         };
-        let latest = package_versions.latest.as_str();
+        let latest = &package_versions.latest;
 
         let Some(version_range) = dep.version_range() else {
             continue;
@@ -1152,8 +1154,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 // 1 hour ago — well within the default 3-day cooldown.
                 published_at: Some(PublishTime::from_unix_secs(
@@ -1206,8 +1208,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 // 10 days ago — outside the default 3-day cooldown.
                 published_at: Some(PublishTime::from_unix_secs(
@@ -1253,8 +1255,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 60 * 60,
@@ -1308,8 +1310,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_at_boundary),
             },
@@ -1361,8 +1363,8 @@ mod tests {
         cached_versions.insert(
             "serde".into(),
             PackageVersions {
-                latest: "2.0.0".to_string(),
-                available: Arc::from(vec!["2.0.0".to_string()]),
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_just_inside),
             },
@@ -1545,7 +1547,7 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), "1.0.5".to_string());
+        yanked.insert("serde".to_string(), "1.0.5".into());
 
         let severities = DiagnosticSeverities {
             yanked: DiagnosticSeverity::ERROR,
@@ -1589,7 +1591,7 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), "1.0.5".to_string());
+        yanked.insert("serde".to_string(), "1.0.5".into());
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1672,7 +1674,7 @@ mod tests {
         cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), "1.0.5".to_string());
+        yanked.insert("serde".to_string(), "1.0.5".into());
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1720,7 +1722,7 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), "1.0.5".to_string());
+        yanked.insert("serde".to_string(), "1.0.5".into());
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1747,7 +1749,7 @@ mod tests {
         /// name differs from the manifest-declared raw name.
         struct MockLowercaseFormatter;
         impl EcosystemFormatter for MockLowercaseFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
@@ -1774,7 +1776,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
         // Keyed by the *normalized* (lowercase) name, not the raw manifest name.
-        yanked.insert("newtonsoft.json".to_string(), "13.0.1".to_string());
+        yanked.insert("newtonsoft.json".to_string(), "13.0.1".into());
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1827,7 +1829,7 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("time".to_string(), "0.1.43".to_string());
+        yanked.insert("time".to_string(), "0.1.43".into());
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1889,7 +1891,7 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("time".to_string(), "0.1.43".to_string());
+        yanked.insert("time".to_string(), "0.1.43".into());
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1917,13 +1919,9 @@ mod tests {
             m.insert(
                 "dep".into(),
                 PackageVersions {
-                    latest: "1.5.0".to_string(),
-                    available: Arc::from(vec![
-                        "2.0.0-rc.1".to_string(),
-                        "1.5.0".to_string(),
-                        "1.4.0".to_string(),
-                    ]),
-                    yanked: Arc::from(Vec::<String>::new()),
+                    latest: "1.5.0".into(),
+                    available: Arc::from(vec!["2.0.0-rc.1".into(), "1.5.0".into(), "1.4.0".into()]),
+                    yanked: Arc::from(Vec::new()),
                     published_at: None,
                 },
             );
@@ -1965,9 +1963,9 @@ mod tests {
             m.insert(
                 "dep".into(),
                 PackageVersions {
-                    latest: "1.5.0".to_string(),
-                    available: Arc::from(vec!["1.5.0".to_string(), "1.4.0".to_string()]),
-                    yanked: Arc::from(Vec::<String>::new()),
+                    latest: "1.5.0".into(),
+                    available: Arc::from(vec!["1.5.0".into(), "1.4.0".into()]),
+                    yanked: Arc::from(Vec::new()),
                     published_at: None,
                 },
             );
@@ -2457,8 +2455,8 @@ mod tests {
         struct ClosureMatcher(Decide);
 
         impl RequirementMatcher for ClosureMatcher {
-            fn matches(&self, version: &str) -> Option<bool> {
-                (self.0)(version)
+            fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+                (self.0)(version.as_str())
             }
         }
 
@@ -2479,7 +2477,7 @@ mod tests {
         }
 
         impl EcosystemFormatter for TableFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
@@ -2500,8 +2498,8 @@ mod tests {
             }
         }
 
-        fn versions(strs: &[&str]) -> Vec<String> {
-            strs.iter().map(|s| (*s).to_string()).collect()
+        fn versions(strs: &[&str]) -> Vec<ConcreteVersion> {
+            strs.iter().map(|s| (*s).into()).collect()
         }
 
         #[test]
@@ -2661,7 +2659,7 @@ mod tests {
         /// Gradle, which must never get the enrichment.
         struct NonStrictFormatter;
         impl EcosystemFormatter for NonStrictFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
@@ -2679,8 +2677,8 @@ mod tests {
             }
         }
 
-        fn versions(strs: &[&str]) -> Vec<String> {
-            strs.iter().map(|s| (*s).to_string()).collect()
+        fn versions(strs: &[&str]) -> Vec<ConcreteVersion> {
+            strs.iter().map(|s| (*s).into()).collect()
         }
 
         #[test]
@@ -2887,8 +2885,8 @@ mod tests {
         struct ClosureMatcher(Decide);
 
         impl RequirementMatcher for ClosureMatcher {
-            fn matches(&self, version: &str) -> Option<bool> {
-                (self.0)(version)
+            fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+                (self.0)(version.as_str())
             }
         }
 
@@ -2907,7 +2905,7 @@ mod tests {
         }
 
         impl EcosystemFormatter for TableFormatter {
-            fn format_version_for_text_edit(&self, version: &str) -> String {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
@@ -2928,8 +2926,8 @@ mod tests {
             }
         }
 
-        fn versions(strs: &[&str]) -> Vec<String> {
-            strs.iter().map(|s| (*s).to_string()).collect()
+        fn versions(strs: &[&str]) -> Vec<ConcreteVersion> {
+            strs.iter().map(|s| (*s).into()).collect()
         }
 
         #[test]
@@ -3048,9 +3046,9 @@ mod tests {
             cached_versions.insert(
                 "serde".into(),
                 PackageVersions {
-                    latest: "2.0.0".to_string(),
-                    available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
-                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    latest: "2.0.0".into(),
+                    available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
+                    yanked: Arc::from(vec!["1.2.1".into()]),
                     published_at: None,
                 },
             );
@@ -3096,15 +3094,15 @@ mod tests {
             cached_versions.insert(
                 "serde".into(),
                 PackageVersions {
-                    latest: "2.0.0".to_string(),
-                    available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
-                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    latest: "2.0.0".into(),
+                    available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
+                    yanked: Arc::from(vec!["1.2.1".into()]),
                     published_at: None,
                 },
             );
             let resolved_versions = HashMap::new();
             let mut in_use_yanked = HashMap::new();
-            in_use_yanked.insert("serde".to_string(), "1.2.1".to_string());
+            in_use_yanked.insert("serde".to_string(), "1.2.1".into());
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
@@ -3171,9 +3169,9 @@ mod tests {
             cached_versions.insert(
                 "serde".into(),
                 PackageVersions {
-                    latest: "1.2.1".to_string(),
-                    available: Arc::from(vec!["1.2.1".to_string()]),
-                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    latest: "1.2.1".into(),
+                    available: Arc::from(vec!["1.2.1".into()]),
+                    yanked: Arc::from(vec!["1.2.1".into()]),
                     published_at: None,
                 },
             );
@@ -3218,13 +3216,9 @@ mod tests {
             cached_versions.insert(
                 "serde".into(),
                 PackageVersions {
-                    latest: "2.0.0".to_string(),
-                    available: Arc::from(vec![
-                        "2.0.0".to_string(),
-                        "1.0.1".to_string(),
-                        "1.0.0".to_string(),
-                    ]),
-                    yanked: Arc::from(vec!["1.0.0".to_string()]),
+                    latest: "2.0.0".into(),
+                    available: Arc::from(vec!["2.0.0".into(), "1.0.1".into(), "1.0.0".into()]),
+                    yanked: Arc::from(vec!["1.0.0".into()]),
                     published_at: None,
                 },
             );
@@ -3309,9 +3303,9 @@ mod tests {
             cached_versions.insert(
                 "dep".into(),
                 PackageVersions {
-                    latest: "2.0.0".to_string(),
-                    available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
-                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    latest: "2.0.0".into(),
+                    available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
+                    yanked: Arc::from(vec!["1.2.1".into()]),
                     published_at: None,
                 },
             );
@@ -3371,9 +3365,9 @@ mod tests {
             cached_versions.insert(
                 "serde".into(),
                 PackageVersions {
-                    latest: "2.0.0".to_string(),
-                    available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
-                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    latest: "2.0.0".into(),
+                    available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
+                    yanked: Arc::from(vec!["1.2.1".into()]),
                     published_at: None,
                 },
             );

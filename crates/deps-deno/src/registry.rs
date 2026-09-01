@@ -317,7 +317,7 @@ fn parse_meta_json(data: &[u8]) -> Result<Vec<JsrVersion>> {
                 .and_then(deps_core::PublishTime::parse_rfc3339);
             Some((
                 JsrVersion {
-                    version,
+                    version: version.into(),
                     yanked: entry.yanked,
                     published_at,
                 },
@@ -348,7 +348,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<JsrPackage>> {
                 description,
                 repository,
                 documentation: None,
-                latest_version: item.latest_version.unwrap_or_default(),
+                latest_version: item.latest_version.unwrap_or_default().into(),
             }
         })
         .collect())
@@ -1050,7 +1050,7 @@ mod tests {
             description: None,
             repository: None,
             documentation: None,
-            latest_version: String::new(),
+            latest_version: deps_core::ConcreteVersion::new(""),
         };
         assert_eq!(package_scope(&pkg), "std");
     }

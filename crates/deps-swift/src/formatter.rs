@@ -1,5 +1,6 @@
 //! Swift ecosystem formatter.
 
+use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
@@ -13,7 +14,8 @@ use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, warn_reject
 struct SemverMatcher(semver::VersionReq);
 
 impl RequirementMatcher for SemverMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         semver::Version::parse(version)
             .ok()
             .map(|v| self.0.matches(&v))
@@ -35,7 +37,8 @@ fn is_valid_owner_repo(name: &str) -> bool {
 pub struct SwiftFormatter;
 
 impl EcosystemFormatter for SwiftFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         version.to_string()
     }
 
@@ -88,7 +91,8 @@ impl EcosystemFormatter for SwiftFormatter {
         }
     }
 
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
         let Ok(ver) = semver::Version::parse(version) else {
             return false;
         };
@@ -151,7 +155,10 @@ mod tests {
     #[test]
     fn test_format_version() {
         let fmt = SwiftFormatter;
-        assert_eq!(fmt.format_version_for_text_edit("2.40.0"), "2.40.0");
+        assert_eq!(
+            fmt.format_version_for_text_edit(&ConcreteVersion::new("2.40.0")),
+            "2.40.0"
+        );
     }
 
     #[test]
@@ -226,10 +233,14 @@ mod tests {
     #[test]
     fn test_version_satisfies() {
         let fmt = SwiftFormatter;
-        assert!(fmt.version_satisfies_requirement("2.62.0", ">=2.0.0, <3.0.0"));
-        assert!(!fmt.version_satisfies_requirement("3.0.0", ">=2.0.0, <3.0.0"));
-        assert!(fmt.version_satisfies_requirement("1.4.2", "=1.4.2"));
-        assert!(!fmt.version_satisfies_requirement("1.4.3", "=1.4.2"));
+        assert!(
+            fmt.version_satisfies_requirement(&ConcreteVersion::new("2.62.0"), ">=2.0.0, <3.0.0")
+        );
+        assert!(
+            !fmt.version_satisfies_requirement(&ConcreteVersion::new("3.0.0"), ">=2.0.0, <3.0.0")
+        );
+        assert!(fmt.version_satisfies_requirement(&ConcreteVersion::new("1.4.2"), "=1.4.2"));
+        assert!(!fmt.version_satisfies_requirement(&ConcreteVersion::new("1.4.3"), "=1.4.2"));
     }
 
     #[test]
@@ -243,39 +254,59 @@ mod tests {
     fn test_version_satisfies_up_to_next_major_range() {
         let fmt = SwiftFormatter;
         // upToNextMajor(from: "1.5.0") → ">=1.5.0, <2.0.0"
-        assert!(fmt.version_satisfies_requirement("1.9.9", ">=1.5.0, <2.0.0"));
-        assert!(!fmt.version_satisfies_requirement("2.0.0", ">=1.5.0, <2.0.0"));
-        assert!(!fmt.version_satisfies_requirement("1.4.9", ">=1.5.0, <2.0.0"));
+        assert!(
+            fmt.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), ">=1.5.0, <2.0.0")
+        );
+        assert!(
+            !fmt.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">=1.5.0, <2.0.0")
+        );
+        assert!(
+            !fmt.version_satisfies_requirement(&ConcreteVersion::new("1.4.9"), ">=1.5.0, <2.0.0")
+        );
     }
 
     #[test]
     fn test_version_satisfies_up_to_next_minor_range() {
         let fmt = SwiftFormatter;
         // upToNextMinor(from: "2.3.0") → ">=2.3.0, <2.4.0"
-        assert!(fmt.version_satisfies_requirement("2.3.5", ">=2.3.0, <2.4.0"));
-        assert!(!fmt.version_satisfies_requirement("2.4.0", ">=2.3.0, <2.4.0"));
-        assert!(!fmt.version_satisfies_requirement("2.2.9", ">=2.3.0, <2.4.0"));
+        assert!(
+            fmt.version_satisfies_requirement(&ConcreteVersion::new("2.3.5"), ">=2.3.0, <2.4.0")
+        );
+        assert!(
+            !fmt.version_satisfies_requirement(&ConcreteVersion::new("2.4.0"), ">=2.3.0, <2.4.0")
+        );
+        assert!(
+            !fmt.version_satisfies_requirement(&ConcreteVersion::new("2.2.9"), ">=2.3.0, <2.4.0")
+        );
     }
 
     #[test]
     fn test_version_satisfies_closed_range() {
         let fmt = SwiftFormatter;
         // "1.0.0"..."1.9.9" → ">=1.0.0, <=1.9.9"
-        assert!(fmt.version_satisfies_requirement("1.9.9", ">=1.0.0, <=1.9.9"));
-        assert!(fmt.version_satisfies_requirement("1.0.0", ">=1.0.0, <=1.9.9"));
-        assert!(!fmt.version_satisfies_requirement("2.0.0", ">=1.0.0, <=1.9.9"));
+        assert!(
+            fmt.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), ">=1.0.0, <=1.9.9")
+        );
+        assert!(
+            fmt.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), ">=1.0.0, <=1.9.9")
+        );
+        assert!(
+            !fmt.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), ">=1.0.0, <=1.9.9")
+        );
     }
 
     #[test]
     fn test_version_satisfies_invalid_version_returns_false() {
         let fmt = SwiftFormatter;
-        assert!(!fmt.version_satisfies_requirement("not-a-version", ">=1.0.0"));
+        assert!(
+            !fmt.version_satisfies_requirement(&ConcreteVersion::new("not-a-version"), ">=1.0.0")
+        );
     }
 
     #[test]
     fn test_version_satisfies_invalid_requirement_returns_false() {
         let fmt = SwiftFormatter;
-        assert!(!fmt.version_satisfies_requirement("1.0.0", "not-a-req"));
+        assert!(!fmt.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "not-a-req"));
     }
 
     fn dep_with_url(name: &str, url: &str) -> SwiftDependency {
@@ -358,7 +389,10 @@ mod tests {
     fn test_version_satisfies_prerelease() {
         let fmt = SwiftFormatter;
         // Pre-release versions should not satisfy ranges by default (semver crate behavior)
-        assert!(!fmt.version_satisfies_requirement("2.0.0-beta.1", ">=1.0.0, <3.0.0"));
+        assert!(!fmt.version_satisfies_requirement(
+            &ConcreteVersion::new("2.0.0-beta.1"),
+            ">=1.0.0, <3.0.0"
+        ));
     }
 
     #[test]
@@ -371,6 +405,7 @@ mod tests {
         let osv_version = "1.2.3";
         let native = fmt.osv_version_to_native(osv_version);
         assert_eq!(native, osv_version);
+        let native = ConcreteVersion::new(native);
         let edit_text = fmt.format_version_for_text_edit(&native);
         assert!(fmt.version_satisfies_requirement(&native, &edit_text));
     }
@@ -381,8 +416,8 @@ mod tests {
         let matcher = fmt
             .compile_requirement(&VersionReq::new(">=1.5.0, <2.0.0"))
             .expect("valid semver requirement must compile");
-        assert_eq!(matcher.matches("1.9.9"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.9.9")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
     #[test]
@@ -400,7 +435,10 @@ mod tests {
         let matcher = fmt
             .compile_requirement(&VersionReq::new(">=1.0.0"))
             .unwrap();
-        assert_eq!(matcher.matches("not-a-version"), None);
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("not-a-version")),
+            None
+        );
     }
 
     #[test]

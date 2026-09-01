@@ -503,7 +503,7 @@ fn parse_package_metadata(data: &[u8]) -> Result<Vec<NpmVersion>> {
             let parsed = node_semver::Version::parse(&version).ok()?;
             Some((
                 NpmVersion {
-                    version,
+                    version: version.into(),
                     deprecated: meta.deprecated.is_some(),
                     published_at: None,
                 },
@@ -555,7 +555,11 @@ struct PackageLinks {
 /// sorted newest-first (true of [`NpmRegistry::get_versions`]'s output) — this is the input
 /// set [`NpmRegistry::publish_times`] invalidates its TTL cache against.
 fn top_n(versions: &[NpmVersion], n: usize) -> Box<[String]> {
-    versions.iter().take(n).map(|v| v.version.clone()).collect()
+    versions
+        .iter()
+        .take(n)
+        .map(|v| v.version.to_string())
+        .collect()
 }
 
 /// Whether a [`CachedTimes`] entry must be refetched: expired by TTL, **or** the top-8 set
@@ -611,7 +615,7 @@ fn parse_package_times(
 /// `published_at == None`. Order and set of `versions` are untouched (FR-006 guard).
 fn attach_publish_times(versions: &mut [NpmVersion], times: &HashMap<String, PublishTime>) {
     for v in versions {
-        v.published_at = times.get(&v.version).copied();
+        v.published_at = times.get(v.version.as_str()).copied();
     }
 }
 
@@ -629,7 +633,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<NpmPackage>> {
                 description: pkg.description,
                 homepage: pkg.links.as_ref().and_then(|l| l.homepage.clone()),
                 repository: pkg.links.as_ref().and_then(|l| l.repository.clone()),
-                latest_version: pkg.version,
+                latest_version: pkg.version.into(),
             }
         })
         .collect())
@@ -659,7 +663,7 @@ impl deps_core::Registry for NpmRegistry {
             let mut versions = self.get_versions(name.as_str()).await?;
             if freshness.enabled {
                 let all_versions: Vec<String> =
-                    versions.iter().map(|v| v.version.clone()).collect();
+                    versions.iter().map(|v| v.version.to_string()).collect();
                 let top8 = top_n(&versions, HOVER_RECENT_VERSIONS);
                 let times = self
                     .publish_times(name.as_str(), &all_versions, &top8)
@@ -1143,7 +1147,11 @@ mod tests {
         let versions = registry.get_versions("express").await.unwrap();
 
         assert!(!versions.is_empty());
-        assert!(versions.iter().any(|v| v.version.starts_with("4.")));
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version.as_str().starts_with("4."))
+        );
     }
 
     #[tokio::test]
@@ -1169,7 +1177,7 @@ mod tests {
 
         assert!(latest.is_some());
         let version = latest.unwrap();
-        assert!(version.version.starts_with("4."));
+        assert!(version.version.as_str().starts_with("4."));
         assert!(!version.deprecated);
     }
 
@@ -1364,7 +1372,7 @@ mod tests {
             .iter()
             .map(|(version, deprecated)| {
                 Box::new(NpmVersion {
-                    version: (*version).to_string(),
+                    version: (*version).into(),
                     deprecated: *deprecated,
                     published_at: None,
                 }) as Box<dyn deps_core::Version>
@@ -1374,8 +1382,11 @@ mod tests {
             .select_latest_matching(&boxed, &VersionReq::new("*"))
             .expect("fixture always has a pick");
 
-        assert_eq!(via_get_latest.version, boxed[idx].version_string());
-        via_get_latest.version
+        assert_eq!(
+            via_get_latest.version.as_str(),
+            boxed[idx].version_string().as_str()
+        );
+        via_get_latest.version.to_string()
     }
 
     #[tokio::test]
@@ -1513,7 +1524,7 @@ mod tests {
 
     fn npm_v(s: &str) -> NpmVersion {
         NpmVersion {
-            version: s.to_string(),
+            version: s.into(),
             deprecated: false,
             published_at: None,
         }

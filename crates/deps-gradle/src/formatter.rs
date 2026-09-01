@@ -1,7 +1,9 @@
 //! Version formatting for Gradle ecosystem.
 
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
-use deps_core::{InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment};
+use deps_core::{
+    ConcreteVersion, InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment,
+};
 
 pub struct GradleFormatter;
 
@@ -121,7 +123,8 @@ enum GradleMatcher {
 }
 
 impl RequirementMatcher for GradleMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        let version = version.as_str();
         Some(match self {
             Self::AlwaysSatisfied => true,
             Self::DynamicPrefix(prefix) => {
@@ -134,7 +137,8 @@ impl RequirementMatcher for GradleMatcher {
 }
 
 impl EcosystemFormatter for GradleFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
         version.to_string()
     }
 
@@ -158,12 +162,13 @@ impl EcosystemFormatter for GradleFormatter {
     /// un-trimmed-catalog-value reason as `strip_strict_marker` above. A no-op
     /// return here is safely excluded from `deps-core`'s `collect_update_all_edits`
     /// ("Update N outdated dependencies" lens) by its own no-op guard.
-    fn format_version_replacing(&self, version: &str, current: &str) -> String {
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        let version = version.as_str();
         let trimmed = current.trim();
         match trimmed.split_once("!!") {
             Some((_, "")) => format!("{version}!!"),
             Some(_) => trimmed.to_string(),
-            None => self.format_version_for_text_edit(version),
+            None => self.format_version_for_text_edit(&ConcreteVersion::new(version)),
         }
     }
 
@@ -210,7 +215,8 @@ impl EcosystemFormatter for GradleFormatter {
         Ok(())
     }
 
-    fn version_satisfies_requirement(&self, version: &str, requirement: &str) -> bool {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
         gradle_version_matches(version, requirement)
     }
 
@@ -276,9 +282,12 @@ mod tests {
     #[test]
     fn test_format_version() {
         let f = GradleFormatter;
-        assert_eq!(f.format_version_for_text_edit("3.2.0"), "3.2.0");
         assert_eq!(
-            f.format_version_for_text_edit("1.0.0-SNAPSHOT"),
+            f.format_version_for_text_edit(&ConcreteVersion::new("3.2.0")),
+            "3.2.0"
+        );
+        assert_eq!(
+            f.format_version_for_text_edit(&ConcreteVersion::new("1.0.0-SNAPSHOT")),
             "1.0.0-SNAPSHOT"
         );
     }
@@ -286,13 +295,19 @@ mod tests {
     #[test]
     fn test_format_version_replacing_preserves_strict_marker() {
         let f = GradleFormatter;
-        assert_eq!(f.format_version_replacing("1.2.4", "1.2.3!!"), "1.2.4!!");
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.4"), "1.2.3!!"),
+            "1.2.4!!"
+        );
     }
 
     #[test]
     fn test_format_version_replacing_no_marker_stays_plain() {
         let f = GradleFormatter;
-        assert_eq!(f.format_version_replacing("1.2.4", "1.2.3"), "1.2.4");
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.4"), "1.2.3"),
+            "1.2.4"
+        );
     }
 
     /// M1: a version-catalog entry's raw value is not trimmed by the parser
@@ -301,7 +316,10 @@ mod tests {
     #[test]
     fn test_format_version_replacing_preserves_strict_marker_with_trailing_whitespace() {
         let f = GradleFormatter;
-        assert_eq!(f.format_version_replacing("1.2.4", "1.2.3!! "), "1.2.4!!");
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.4"), "1.2.3!! "),
+            "1.2.4!!"
+        );
     }
 
     /// S1/C2: the full `{strictlyVersion}!!{preferredVersion}` shorthand has no
@@ -315,7 +333,7 @@ mod tests {
     fn test_format_version_replacing_infix_shorthand_is_unchanged() {
         let f = GradleFormatter;
         assert_eq!(
-            f.format_version_replacing("9.9.9", "[1.7, 1.8[!!1.7.25"),
+            f.format_version_replacing(&ConcreteVersion::new("9.9.9"), "[1.7, 1.8[!!1.7.25"),
             "[1.7, 1.8[!!1.7.25"
         );
     }
@@ -325,7 +343,7 @@ mod tests {
     fn test_format_version_replacing_infix_shorthand_with_trailing_whitespace() {
         let f = GradleFormatter;
         assert_eq!(
-            f.format_version_replacing("9.9.9", "[1.7,1.8[!!1.7.25 "),
+            f.format_version_replacing(&ConcreteVersion::new("9.9.9"), "[1.7,1.8[!!1.7.25 "),
             "[1.7,1.8[!!1.7.25"
         );
     }
@@ -344,37 +362,40 @@ mod tests {
     #[test]
     fn test_version_satisfies() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("3.2.0", "3.2.0"));
-        assert!(!f.version_satisfies_requirement("3.2.0", "3.1.0"));
-        assert!(!f.version_satisfies_requirement("3.2.0", "3.2.1"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.2.0"), "3.2.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.2.0"), "3.1.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.2.0"), "3.2.1"));
     }
 
     #[test]
     fn test_version_satisfies_dynamic_prefix() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("1.0.5", "1.0.+"));
-        assert!(f.version_satisfies_requirement("1.0", "1.0.+"));
-        assert!(!f.version_satisfies_requirement("1.1.0", "1.0.+"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.5"), "1.0.+"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0"), "1.0.+"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "1.0.+"));
         // Prefix boundary: "2.10.+" must not false-match "2.1.5" via a naive
         // non-dot-anchored prefix check.
-        assert!(!f.version_satisfies_requirement("2.1.5", "2.10.+"));
-        assert!(f.version_satisfies_requirement("2.10.5", "2.10.+"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.5"), "2.10.+"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.10.5"), "2.10.+"));
     }
 
     #[test]
     fn test_version_satisfies_latest_selector() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("3.2.0", "latest.release"));
-        assert!(f.version_satisfies_requirement("3.2.0-SNAPSHOT", "latest.integration"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.2.0"), "latest.release"));
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("3.2.0-SNAPSHOT"),
+            "latest.integration"
+        ));
     }
 
     #[test]
     fn test_version_satisfies_range() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("1.5.0", "[1.0,2.0)"));
-        assert!(!f.version_satisfies_requirement("2.0.0", "[1.0,2.0)"));
-        assert!(f.version_satisfies_requirement("1.0.0", "[1.0.0]"));
-        assert!(!f.version_satisfies_requirement("1.0.1", "[1.0.0]"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "[1.0,2.0)"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "[1.0,2.0)"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "[1.0.0]"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "[1.0.0]"));
     }
 
     #[test]
@@ -383,11 +404,11 @@ mod tests {
         // `implementation 'com.google.guava:guava:[30.0,31.0['` — Gradle's documented
         // exclusive-upper-bound notation, leading with `[` but trailing with `[` instead of
         // `)`/`]`.
-        assert!(f.version_satisfies_requirement("30.5", "[30.0,31.0["));
-        assert!(!f.version_satisfies_requirement("31.0", "[30.0,31.0["));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("30.5"), "[30.0,31.0["));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("31.0"), "[30.0,31.0["));
         // Exclusive-lower-bound notation, which leads with `]` rather than `[`/`(`.
-        assert!(!f.version_satisfies_requirement("1.2", "]1.2,1.5]"));
-        assert!(f.version_satisfies_requirement("1.3", "]1.2,1.5]"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2"), "]1.2,1.5]"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.3"), "]1.2,1.5]"));
     }
 
     /// S2/C1: the full `{strictlyVersion}!!{preferredVersion}` shorthand matches
@@ -399,9 +420,15 @@ mod tests {
     #[test]
     fn test_version_satisfies_strict_range_with_preferred() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("1.7.25", "[1.7,1.8[!!1.7.25"));
-        assert!(f.version_satisfies_requirement("1.7.30", "[1.7,1.8[!!1.7.25"));
-        assert!(!f.version_satisfies_requirement("1.8.0", "[1.7,1.8[!!1.7.25"));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.7.25"), "[1.7,1.8[!!1.7.25")
+        );
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.7.30"), "[1.7,1.8[!!1.7.25")
+        );
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("1.8.0"), "[1.7,1.8[!!1.7.25")
+        );
     }
 
     /// C3: an unresolved Gradle variable inside the `strictlyVersion` half must
@@ -410,7 +437,7 @@ mod tests {
     #[test]
     fn test_version_satisfies_unresolved_variable_with_strict_marker() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("1.7.25", "${r}!!1.7.25"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.7.25"), "${r}!!1.7.25"));
     }
 
     /// C3: same guarantee when the unresolved variable sits in the
@@ -419,7 +446,9 @@ mod tests {
     #[test]
     fn test_version_satisfies_unresolved_variable_in_preferred_half() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("1.7.25", "[1.7,1.8[!!${r}"));
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.7.25"), "[1.7,1.8[!!${r}")
+        );
     }
 
     /// M3: the discriminating case for the raw-string pre-check's documented
@@ -433,25 +462,25 @@ mod tests {
     #[test]
     fn test_version_satisfies_unresolved_variable_in_preferred_half_over_permissive() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("1.8.0", "[1.7,1.8[!!${r}"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.8.0"), "[1.7,1.8[!!${r}"));
     }
 
     #[test]
     fn test_version_satisfies_unresolved_bare_variable() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("3.14.0", "$someVersion"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "$someVersion"));
     }
 
     #[test]
     fn test_version_satisfies_unresolved_braced_variable() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("3.14.0", "${someVersion}"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "${someVersion}"));
     }
 
     #[test]
     fn test_version_satisfies_unresolved_compound_variable() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("3.14.0", "1.0.0-$suffix"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("3.14.0"), "1.0.0-$suffix"));
     }
 
     #[test]
@@ -501,7 +530,10 @@ mod tests {
     fn test_requirement_status_unresolved_bare_variable() {
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status(&VersionReq::new("$someVersion"), "3.14.0"),
+            f.requirement_status(
+                &VersionReq::new("$someVersion"),
+                &ConcreteVersion::new("3.14.0")
+            ),
             RequirementStatus::Unresolved
         );
     }
@@ -510,7 +542,10 @@ mod tests {
     fn test_requirement_status_unresolved_braced_variable() {
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status(&VersionReq::new("${someVersion}"), "3.14.0"),
+            f.requirement_status(
+                &VersionReq::new("${someVersion}"),
+                &ConcreteVersion::new("3.14.0")
+            ),
             RequirementStatus::Unresolved
         );
     }
@@ -521,7 +556,10 @@ mod tests {
         // missing from `[versions]` — must be treated the same as an unresolved variable.
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status(&VersionReq::new("$missing"), "3.14.0"),
+            f.requirement_status(
+                &VersionReq::new("$missing"),
+                &ConcreteVersion::new("3.14.0")
+            ),
             RequirementStatus::Unresolved
         );
     }
@@ -530,7 +568,7 @@ mod tests {
     fn test_requirement_status_up_to_date() {
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status(&VersionReq::new("3.2.0"), "3.2.0"),
+            f.requirement_status(&VersionReq::new("3.2.0"), &ConcreteVersion::new("3.2.0")),
             RequirementStatus::UpToDate
         );
     }
@@ -539,7 +577,7 @@ mod tests {
     fn test_requirement_status_outdated() {
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status(&VersionReq::new("3.1.0"), "3.2.0"),
+            f.requirement_status(&VersionReq::new("3.1.0"), &ConcreteVersion::new("3.2.0")),
             RequirementStatus::Outdated
         );
     }
@@ -550,8 +588,8 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("3.2.0"))
             .expect("Gradle requirement always compiles");
-        assert_eq!(matcher.matches("3.2.0"), Some(true));
-        assert_eq!(matcher.matches("3.1.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("3.2.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("3.1.0")), Some(false));
     }
 
     #[test]
@@ -560,8 +598,8 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("[1.0,2.0)"))
             .unwrap();
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
     /// S2: `requirement_status` must reach `UpToDate` for a strict pin sitting on
@@ -572,7 +610,7 @@ mod tests {
     fn test_requirement_status_strict_marker_up_to_date() {
         let f = GradleFormatter;
         assert_eq!(
-            f.requirement_status(&VersionReq::new("1.2.3!!"), "1.2.3"),
+            f.requirement_status(&VersionReq::new("1.2.3!!"), &ConcreteVersion::new("1.2.3")),
             RequirementStatus::UpToDate
         );
     }
@@ -588,9 +626,9 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("[1.7,1.8[!!1.7.25"))
             .unwrap();
-        assert_eq!(matcher.matches("1.7.25"), Some(true));
-        assert_eq!(matcher.matches("1.7.30"), Some(true));
-        assert_eq!(matcher.matches("1.8.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.7.25")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.7.30")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.8.0")), Some(false));
     }
 
     #[test]
@@ -624,13 +662,13 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("7.0.0-SNAPSHOT"))
             .unwrap();
-        assert_eq!(matcher.matches("6.9.0"), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("6.9.0")), Some(true));
     }
 
     #[test]
     fn test_version_satisfies_snapshot() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("6.9.0", "7.0.0-SNAPSHOT"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("6.9.0"), "7.0.0-SNAPSHOT"));
     }
 
     /// #249 review regression: a malformed bracket range that also happens to end in `+`
@@ -651,16 +689,16 @@ mod tests {
     #[test]
     fn test_version_satisfies_strict_shorthand() {
         let f = GradleFormatter;
-        assert!(f.version_satisfies_requirement("1.2.3", "1.2.3!!"));
-        assert!(!f.version_satisfies_requirement("1.2.4", "1.2.3!!"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2.3!!"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.4"), "1.2.3!!"));
     }
 
     #[test]
     fn test_compile_requirement_strict_shorthand() {
         let f = GradleFormatter;
         let matcher = f.compile_requirement(&VersionReq::new("1.2.3!!")).unwrap();
-        assert_eq!(matcher.matches("1.2.3"), Some(true));
-        assert_eq!(matcher.matches("1.2.4"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.2.3")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.2.4")), Some(false));
     }
 
     /// M6: `compile_requirement`'s range-validity guard must strip `!!` the same way
@@ -673,7 +711,7 @@ mod tests {
         let matcher = f
             .compile_requirement(&VersionReq::new("[1.0,2.0)!!"))
             .expect("strict range must still compile a matcher");
-        assert_eq!(matcher.matches("1.5.0"), Some(true));
-        assert_eq!(matcher.matches("2.0.0"), Some(false));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+        assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 }

@@ -1,6 +1,6 @@
 use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip};
 
-use crate::{EcosystemConfig, ParseResult, VersionReq};
+use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
 
 use super::{EcosystemFormatter, RequirementStatus, VersionData};
 
@@ -24,16 +24,17 @@ pub fn generate_inlay_hints(
             .cached
             .get(normalized_name.as_str())
             .or_else(|| versions.cached.get(dep.name()))
-            .map(|v| v.latest.as_str());
-        let resolved_version: Option<&str> =
+            .map(|v| &v.latest);
+        let resolved_version: Option<ConcreteVersion> =
             if formatter.manifest_requirement_is_resolved_version(dep) {
-                dep.version_requirement().map(VersionReq::as_str)
+                dep.version_requirement()
+                    .map(|r| ConcreteVersion::new(r.as_str()))
             } else {
                 versions
                     .resolved
                     .get(normalized_name.as_str())
                     .or_else(|| versions.resolved.get(dep.name()))
-                    .map(String::as_str)
+                    .cloned()
             };
 
         // Show loading hint if loading and no cached version
@@ -57,7 +58,7 @@ pub fn generate_inlay_hints(
         }
 
         let Some(latest) = latest_version else {
-            if let Some(resolved) = resolved_version
+            if let Some(resolved) = &resolved_version
                 && config.show_up_to_date_hints
             {
                 hints.push(InlayHint {
@@ -80,7 +81,7 @@ pub fn generate_inlay_hints(
         // Two-tier check for up-to-date status:
         // 1. If lock file has the dep, check if resolved == latest
         // 2. If NOT in lock file, check the version requirement against latest
-        let status = if let Some(resolved) = resolved_version {
+        let status = if let Some(resolved) = &resolved_version {
             if resolved == latest {
                 RequirementStatus::UpToDate
             } else {
@@ -98,7 +99,7 @@ pub fn generate_inlay_hints(
         let label_text = match status {
             RequirementStatus::UpToDate => {
                 if config.show_up_to_date_hints {
-                    if let Some(resolved) = resolved_version {
+                    if let Some(resolved) = &resolved_version {
                         format!("{} {}", config.up_to_date_text, resolved)
                     } else {
                         config.up_to_date_text.clone()
@@ -107,7 +108,7 @@ pub fn generate_inlay_hints(
                     continue;
                 }
             }
-            RequirementStatus::Outdated => config.needs_update_text.replace("{}", latest),
+            RequirementStatus::Outdated => config.needs_update_text.replace("{}", latest.as_str()),
             // Resolution failed (e.g. dangling alias/unexpanded variable) — neither
             // "up to date" nor "outdated" was actually verified, so show nothing.
             RequirementStatus::Unresolved => continue,
@@ -162,7 +163,7 @@ mod tests {
         cached_versions.insert("serde".into(), PackageVersions::latest_only("2.1.1"));
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "2.0.12".to_string());
+        resolved_versions.insert("serde".into(), "2.0.12".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -209,7 +210,7 @@ mod tests {
         cached_versions.insert("serde".into(), PackageVersions::latest_only("2.1.1"));
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "2.1.1".to_string());
+        resolved_versions.insert("serde".into(), "2.1.1".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -266,7 +267,7 @@ mod tests {
         // semver, so it sorts last and would win naive last-occurrence-wins parsing
         // even though go.mod's `require` line was downgraded back to v0.8.1 (#235).
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("example.com/mod".into(), "v0.9.1".to_string());
+        resolved_versions.insert("example.com/mod".into(), "v0.9.1".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -319,7 +320,7 @@ mod tests {
         cached_versions.insert("serde".into(), PackageVersions::latest_only("1.2.0"));
 
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.2.0".to_string());
+        resolved_versions.insert("serde".into(), "1.2.0".into());
 
         let hints = generate_inlay_hints(
             &parse_result,
@@ -442,23 +443,23 @@ mod tests {
         let formatter = MockFormatter;
 
         // ^0.2 should only allow 0.2.x
-        assert!(formatter.version_satisfies_requirement("0.2.0", "^0.2"));
-        assert!(formatter.version_satisfies_requirement("0.2.5", "^0.2"));
-        assert!(formatter.version_satisfies_requirement("0.2.99", "^0.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.2.0"), "^0.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.2.5"), "^0.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.2.99"), "^0.2"));
 
         // ^0.2 should NOT allow 0.3.x or 0.1.x
-        assert!(!formatter.version_satisfies_requirement("0.3.0", "^0.2"));
-        assert!(!formatter.version_satisfies_requirement("0.1.0", "^0.2"));
-        assert!(!formatter.version_satisfies_requirement("1.0.0", "^0.2"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.3.0"), "^0.2"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.1.0"), "^0.2"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^0.2"));
 
         // ^0.0.3 should only allow 0.0.3 (left-most non-zero is patch)
-        assert!(formatter.version_satisfies_requirement("0.0.3", "^0.0.3"));
-        assert!(formatter.version_satisfies_requirement("0.0.3", "^0.0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.3"), "^0.0.3"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.3"), "^0.0"));
 
         // ^0 should only allow 0.x.y (major is 0)
-        assert!(formatter.version_satisfies_requirement("0.0.0", "^0"));
-        assert!(formatter.version_satisfies_requirement("0.5.0", "^0"));
-        assert!(!formatter.version_satisfies_requirement("1.0.0", "^0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), "^0"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), "^0"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^0"));
     }
 
     #[test]
@@ -466,13 +467,13 @@ mod tests {
         let formatter = MockFormatter;
 
         // ^1.2 allows any 1.x.x
-        assert!(formatter.version_satisfies_requirement("1.0.0", "^1.2"));
-        assert!(formatter.version_satisfies_requirement("1.2.0", "^1.2"));
-        assert!(formatter.version_satisfies_requirement("1.9.9", "^1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "^1.2"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), "^1.2"));
 
         // ^1.2 should NOT allow 2.x.x
-        assert!(!formatter.version_satisfies_requirement("2.0.0", "^1.2"));
-        assert!(!formatter.version_satisfies_requirement("0.9.0", "^1.2"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.2"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "^1.2"));
     }
 
     #[test]
@@ -504,7 +505,7 @@ mod tests {
 
         // Lock file has the latest version
         let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.0.214".to_string());
+        resolved_versions.insert("serde".into(), "1.0.214".into());
 
         let hints = generate_inlay_hints(
             &parse_result,

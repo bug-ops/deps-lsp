@@ -2,7 +2,7 @@
 //! this module's per-feature test suites.
 
 use super::*;
-use crate::{PackageName, ParseResult, PublishTime, RemovalStatus, VersionReq};
+use crate::{ConcreteVersion, PackageName, ParseResult, PublishTime, RemovalStatus, VersionReq};
 use std::any::Any;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind};
 
@@ -13,7 +13,7 @@ pub(crate) fn pkg(s: &str) -> PackageName {
 pub(crate) struct MockFormatter;
 
 impl EcosystemFormatter for MockFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!("\"{}\"", version)
     }
 
@@ -27,7 +27,7 @@ impl EcosystemFormatter for MockFormatter {
 pub(crate) struct MockUnresolvedFormatter;
 
 impl EcosystemFormatter for MockUnresolvedFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
 
@@ -35,7 +35,11 @@ impl EcosystemFormatter for MockUnresolvedFormatter {
         format!("https://example.com/{}", name)
     }
 
-    fn requirement_status(&self, _requirement: &VersionReq, _latest: &str) -> RequirementStatus {
+    fn requirement_status(
+        &self,
+        _requirement: &VersionReq,
+        _latest: &ConcreteVersion,
+    ) -> RequirementStatus {
         RequirementStatus::Unresolved
     }
 }
@@ -46,7 +50,7 @@ impl EcosystemFormatter for MockUnresolvedFormatter {
 pub(crate) struct MockGoFormatter;
 
 impl EcosystemFormatter for MockGoFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
 
@@ -64,7 +68,7 @@ impl EcosystemFormatter for MockGoFormatter {
 pub(crate) struct RejectingFormatter;
 
 impl EcosystemFormatter for RejectingFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
 
@@ -298,7 +302,7 @@ impl crate::Registry for OutdatedRegistry {
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
         Box::pin(async move {
             Ok(vec![Box::new(MockVersionWithAge {
-                version: "2.0.0".to_string(),
+                version: "2.0.0".into(),
                 yanked: false,
                 published_at: None,
             }) as Box<dyn crate::Version>])
@@ -313,7 +317,7 @@ impl crate::Registry for OutdatedRegistry {
     {
         Box::pin(async move {
             Ok(Some(Box::new(MockVersionWithAge {
-                version: "1.0.0".to_string(),
+                version: "1.0.0".into(),
                 yanked: false,
                 published_at: None,
             }) as Box<dyn crate::Version>))
@@ -336,13 +340,13 @@ impl crate::Registry for OutdatedRegistry {
 /// A version with a configurable yanked flag and publish time, used for the
 /// "Recent versions" hover freshness tests below.
 pub(crate) struct MockVersionWithAge {
-    pub(crate) version: String,
+    pub(crate) version: ConcreteVersion,
     pub(crate) yanked: bool,
     pub(crate) published_at: Option<PublishTime>,
 }
 
 impl crate::Version for MockVersionWithAge {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &ConcreteVersion {
         &self.version
     }
 
@@ -360,12 +364,12 @@ impl crate::Version for MockVersionWithAge {
 }
 
 pub(crate) struct TestVersion {
-    pub(crate) version: String,
+    pub(crate) version: ConcreteVersion,
     pub(crate) yanked: bool,
 }
 
 impl crate::Version for TestVersion {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &ConcreteVersion {
         &self.version
     }
 
@@ -444,12 +448,12 @@ impl crate::Registry for MockRegistryWithVersions {
 /// `AdvisoryDeprecated` specifically — `MockVersionWithAge`'s `bool` field can only
 /// express `Available`/`Yanked` via [`RemovalStatus::from_yanked`].
 pub(crate) struct MockVersionWithStatus {
-    pub(crate) version: String,
+    pub(crate) version: ConcreteVersion,
     pub(crate) status: RemovalStatus,
 }
 
 impl crate::Version for MockVersionWithStatus {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &ConcreteVersion {
         &self.version
     }
 
@@ -615,7 +619,7 @@ impl crate::Registry for FixedVersionRegistry {
             .iter()
             .map(|(version, yanked)| {
                 Box::new(TestVersion {
-                    version: (*version).to_string(),
+                    version: (*version).into(),
                     yanked: *yanked,
                 }) as Box<dyn crate::Version>
             })
@@ -665,7 +669,7 @@ pub(crate) fn freshness_test_parse_result(name: &str) -> MockParseResult {
 pub(crate) struct IdentityFormatter;
 
 impl EcosystemFormatter for IdentityFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
 
@@ -681,7 +685,7 @@ impl EcosystemFormatter for IdentityFormatter {
 pub(crate) struct CaretWrappingFormatter;
 
 impl EcosystemFormatter for CaretWrappingFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!("^{version}")
     }
 
@@ -698,11 +702,11 @@ impl EcosystemFormatter for CaretWrappingFormatter {
 pub(crate) struct PinPreservingFormatter;
 
 impl EcosystemFormatter for PinPreservingFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!(">={version}")
     }
 
-    fn format_version_replacing(&self, version: &str, current: &str) -> String {
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
         if current.starts_with("==") {
             format!("=={version}")
         } else {
@@ -761,7 +765,7 @@ pub(crate) fn refactor_titles(actions: &[CodeAction]) -> Vec<&str> {
 pub(crate) struct TrailingSpaceFormatter;
 
 impl EcosystemFormatter for TrailingSpaceFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!("{version} ")
     }
 
@@ -779,12 +783,12 @@ impl EcosystemFormatter for TrailingSpaceFormatter {
 pub(crate) struct TruncatingFormatter;
 
 impl EcosystemFormatter for TruncatingFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
 
-    fn format_version_replacing(&self, version: &str, _current: &str) -> String {
-        let mut parts = version.split('.');
+    fn format_version_replacing(&self, version: &ConcreteVersion, _current: &str) -> String {
+        let mut parts = version.as_str().split('.');
         let major = parts.next().unwrap_or("0");
         let minor = parts.next().unwrap_or("0");
         format!("=={major}.{minor}")
@@ -878,13 +882,13 @@ pub(crate) struct ExactMatchFormatter;
 
 pub(crate) struct ExactMatcher(pub(crate) String);
 impl RequirementMatcher for ExactMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
-        Some(version == self.0)
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        Some(version.as_str() == self.0)
     }
 }
 
 impl EcosystemFormatter for ExactMatchFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
     fn package_url(&self, name: &PackageName) -> String {
@@ -897,8 +901,9 @@ impl EcosystemFormatter for ExactMatchFormatter {
 
 pub(crate) struct RealSemverMatcher(pub(crate) semver::VersionReq);
 impl RequirementMatcher for RealSemverMatcher {
-    fn matches(&self, version: &str) -> Option<bool> {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
         version
+            .as_str()
             .parse::<semver::Version>()
             .ok()
             .map(|v| self.0.matches(&v))
@@ -911,7 +916,7 @@ impl RequirementMatcher for RealSemverMatcher {
 /// `generate_diagnostics_from_cache` end-to-end coverage below (#299).
 pub(crate) struct StrictSemverFormatter;
 impl EcosystemFormatter for StrictSemverFormatter {
-    fn format_version_for_text_edit(&self, version: &str) -> String {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
     fn package_url(&self, name: &PackageName) -> String {

@@ -196,8 +196,8 @@ impl Backend {
         {
             Ok(packages) => packages
                 .iter()
-                .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone()))
-                .collect::<HashMap<PackageName, String>>(),
+                .map(|(name, pkg)| (PackageName::new(name.as_str()), pkg.version.clone().into()))
+                .collect::<HashMap<PackageName, deps_core::ConcreteVersion>>(),
             Err(e) => {
                 tracing::error!("Failed to reload lock file: {}", e);
                 self.client

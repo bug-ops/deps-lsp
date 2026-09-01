@@ -185,7 +185,7 @@ impl CratesIoRegistry {
             .map_err(|e| DepsError::InvalidVersionReq(e.to_string()))?;
 
         Ok(versions.into_iter().find(|v| {
-            let version = v.num.parse::<Version>().ok();
+            let version = v.num.as_str().parse::<Version>().ok();
             version.is_some_and(|ver| req.matches(&ver) && !v.yanked)
         }))
     }
@@ -333,7 +333,7 @@ fn parse_index_json(data: &[u8], _crate_name: &str) -> Result<Vec<CargoVersion>>
                 .and_then(deps_core::PublishTime::parse_rfc3339);
             Some((
                 CargoVersion {
-                    num: entry.version,
+                    num: entry.version.into(),
                     yanked: entry.yanked,
                     features: entry.features,
                     published_at,
@@ -381,7 +381,7 @@ fn parse_search_response(data: &[u8]) -> Result<Vec<CrateInfo>> {
             description: c.description,
             repository: c.repository,
             documentation: c.documentation,
-            max_version: c.max_version,
+            max_version: c.max_version.into(),
         })
         .collect())
 }
@@ -423,9 +423,12 @@ impl deps_core::Registry for CratesIoRegistry {
         }
         let parsed_req: VersionReq = req.as_str().parse().ok()?;
         versions.iter().position(|v| {
-            v.version_string().parse::<Version>().is_ok_and(|ver| {
-                parsed_req.matches(&ver) && !v.removal_status().blocks_resolution()
-            })
+            v.version_string()
+                .as_str()
+                .parse::<Version>()
+                .is_ok_and(|ver| {
+                    parsed_req.matches(&ver) && !v.removal_status().blocks_resolution()
+                })
         })
     }
 
@@ -597,7 +600,7 @@ mod tests {
         let versions = registry.get_versions("serde").await.unwrap();
 
         assert!(!versions.is_empty());
-        assert!(versions.iter().any(|v| v.num.starts_with("1.")));
+        assert!(versions.iter().any(|v| v.num.as_str().starts_with("1.")));
     }
 
     #[tokio::test]
@@ -620,7 +623,7 @@ mod tests {
 
         assert!(latest.is_some());
         let version = latest.unwrap();
-        assert!(version.num.starts_with("1."));
+        assert!(version.num.as_str().starts_with("1."));
         assert!(!version.yanked);
     }
 

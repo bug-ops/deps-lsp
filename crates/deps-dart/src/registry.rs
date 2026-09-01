@@ -92,7 +92,7 @@ impl PubDevRegistry {
     ) -> Result<Option<DartVersion>> {
         let versions = self.get_versions(name).await?;
         Ok(versions.into_iter().find(|v| {
-            crate::version::version_matches_constraint(&v.version, req_str) && !v.retracted
+            crate::version::version_matches_constraint(v.version.as_str(), req_str) && !v.retracted
         }))
     }
 
@@ -177,7 +177,7 @@ fn parse_versions_response(data: &[u8]) -> Result<Vec<DartVersion>> {
         .versions
         .into_iter()
         .map(|e| DartVersion {
-            version: e.version,
+            version: e.version.into(),
             retracted: e.retracted,
             published_at: e
                 .published
@@ -186,7 +186,7 @@ fn parse_versions_response(data: &[u8]) -> Result<Vec<DartVersion>> {
         })
         .collect();
 
-    versions.sort_by(|a, b| compare_versions(&b.version, &a.version));
+    versions.sort_by(|a, b| compare_versions(b.version.as_str(), a.version.as_str()));
 
     Ok(versions)
 }
@@ -207,13 +207,13 @@ fn parse_package_info(data: &[u8]) -> Result<PackageInfo> {
         homepage: pubspec.homepage,
         repository: pubspec.repository,
         documentation: pubspec.documentation,
-        version: response.latest.version,
+        version: response.latest.version.into(),
         license: None,
     })
 }
 
 impl deps_core::Version for DartVersion {
-    fn version_string(&self) -> &str {
+    fn version_string(&self) -> &deps_core::ConcreteVersion {
         &self.version
     }
 
@@ -222,7 +222,7 @@ impl deps_core::Version for DartVersion {
     }
 
     fn is_prerelease(&self) -> bool {
-        crate::version::is_prerelease(&self.version)
+        crate::version::is_prerelease(self.version.as_str())
     }
 
     fn published_at(&self) -> Option<deps_core::PublishTime> {
@@ -251,7 +251,7 @@ impl deps_core::Metadata for PackageInfo {
         self.documentation.as_deref()
     }
 
-    fn latest_version(&self) -> &str {
+    fn latest_version(&self) -> &deps_core::ConcreteVersion {
         &self.version
     }
 
@@ -311,7 +311,7 @@ impl deps_core::Registry for PubDevRegistry {
             return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
         }
         versions.iter().position(|v| {
-            crate::version::version_matches_constraint(v.version_string(), req.as_str())
+            crate::version::version_matches_constraint(v.version_string().as_str(), req.as_str())
                 && !v.removal_status().blocks_resolution()
         })
     }

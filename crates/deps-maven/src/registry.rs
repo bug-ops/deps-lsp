@@ -181,7 +181,7 @@ fn move_release_to_front(versions: &mut Vec<MavenVersion>, release: Option<&str>
         Some(release) => versions.iter().position(|v| v.version == release),
         None => versions
             .iter()
-            .position(|v| !crate::version::is_prerelease(&v.version)),
+            .position(|v| !crate::version::is_prerelease(v.version.as_str())),
     };
     let Some(pos) = target else { return };
     if pos != 0 {
@@ -226,13 +226,13 @@ fn pick_wildcard_latest(versions: &[MavenVersion], release: Option<&str>) -> Opt
             return None;
         }
         return Some(MavenVersion {
-            version: rel.to_string(),
+            version: rel.into(),
             published_at: None,
         });
     }
     versions
         .iter()
-        .find(|v| !crate::version::is_prerelease(&v.version))
+        .find(|v| !crate::version::is_prerelease(v.version.as_str()))
         .or_else(|| versions.first())
         .cloned()
 }
@@ -256,7 +256,7 @@ fn should_fetch_listing(base: &str) -> bool {
 /// before [`move_release_to_front`] so ordering stays governed by that function alone.
 fn attach_publish_times(versions: &mut [MavenVersion], times: &HashMap<String, PublishTime>) {
     for v in versions {
-        v.published_at = times.get(&v.version).copied();
+        v.published_at = times.get(v.version.as_str()).copied();
     }
 }
 
@@ -655,7 +655,7 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
                 }
                 if in_version {
                     versions.push(MavenVersion {
-                        version: s,
+                        version: s.into(),
                         published_at: None,
                     });
                 } else if in_release {
@@ -673,7 +673,7 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
         buf.clear();
     }
 
-    versions.sort_by(|a, b| compare_versions(&b.version, &a.version));
+    versions.sort_by(|a, b| compare_versions(b.version.as_str(), a.version.as_str()));
     Ok((versions, release))
 }
 
@@ -814,7 +814,7 @@ fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<ArtifactInfo>>
                 artifact_id: d.a,
                 name: name.into(),
                 description: None,
-                latest_version: d.latest_version.unwrap_or_default(),
+                latest_version: d.latest_version.unwrap_or_default().into(),
                 repository: None,
             }
         })
@@ -912,7 +912,10 @@ impl deps_core::Registry for MavenCentralRegistry {
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| {
-                    crate::version::compare_versions(a.version_string(), b.version_string())
+                    crate::version::compare_versions(
+                        a.version_string().as_str(),
+                        b.version_string().as_str(),
+                    )
                 })
                 .map(|(idx, _)| idx);
         }
@@ -1836,8 +1839,11 @@ mod tests {
             .expect("non-empty list must select an index");
 
         assert_eq!(
-            boxed[idx].version_string(),
-            wildcard_pick.expect("fixture always has a pick").version
+            boxed[idx].version_string().as_str(),
+            wildcard_pick
+                .expect("fixture always has a pick")
+                .version
+                .as_str()
         );
     }
 
