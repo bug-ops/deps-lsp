@@ -21,13 +21,23 @@
 //! alternate-index response. [`test_get_latest_matching_from_on_empty_list_routes_to_alternate_index`]
 //! covers exactly that case.
 
+use deps_cargo::config::{ConfigFileCache, IndexTrust};
 use deps_cargo::{CargoConfig, CargoRegistry, DependencySource};
 use deps_core::freshness::FreshnessSettings;
+use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{HttpCache, PackageName, Registry, VersionReq};
 use std::sync::Arc;
 
 const SPARSE_ENTRY: &str =
     r#"{"name":"internal-crate","vers":"1.2.3","yanked":false,"features":{},"deps":[]}"#;
+
+fn test_policy() -> RegistryAccessPolicy {
+    RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All)
+}
+
+fn test_index(raw: &str) -> deps_cargo::config::RegistryIndex {
+    deps_cargo::config::RegistryIndex::new(raw, IndexTrust::Trusted, &test_policy()).unwrap()
+}
 
 /// FR-001: `Registry::get_versions`/`get_versions_with`'s source-aware counterpart,
 /// `get_versions_from`, routes an `AlternateRegistry` source to the alternate index — the
@@ -45,11 +55,12 @@ async fn test_get_versions_from_routes_to_alternate_index() {
 
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
-    let index = deps_cargo::config::RegistryIndex::new(&server.url()).unwrap();
+    let index = test_index(&server.url());
     registry.register_alternate(index.clone(), None);
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
+        mirrors_crates_io: false,
     };
     let name = PackageName::new("internal-crate");
     let versions = registry
@@ -81,11 +92,12 @@ async fn test_get_latest_matching_from_routes_to_alternate_index() {
 
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
-    let index = deps_cargo::config::RegistryIndex::new(&server.url()).unwrap();
+    let index = test_index(&server.url());
     registry.register_alternate(index.clone(), None);
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
+        mirrors_crates_io: false,
     };
     let name = PackageName::new("internal-crate");
     let req = VersionReq::new("^1.0");
@@ -122,11 +134,12 @@ async fn test_get_latest_matching_from_on_empty_list_routes_to_alternate_index()
 
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
-    let index = deps_cargo::config::RegistryIndex::new(&server.url()).unwrap();
+    let index = test_index(&server.url());
     registry.register_alternate(index.clone(), None);
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
+        mirrors_crates_io: false,
     };
     let name = PackageName::new("internal-crate");
     let req = VersionReq::new("*");
@@ -159,7 +172,7 @@ async fn test_authenticated_alternate_registry_sends_authorization_header() {
 
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
-    let index = deps_cargo::config::RegistryIndex::new(&server.url()).unwrap();
+    let index = test_index(&server.url());
     // No public constructor for `AuthToken` outside `deps_cargo::config` (by design —
     // see that module's security-model docs), so this test resolves a real
     // `$CARGO_HOME/config.toml`-shaped fixture through the public `resolve` API instead
@@ -175,8 +188,15 @@ async fn test_authenticated_alternate_registry_sends_authorization_header() {
     .unwrap();
     let aliases: std::collections::HashSet<String> =
         std::iter::once("my-corp".to_string()).collect();
-    let config: CargoConfig =
-        deps_cargo::config::resolve(&aliases, &[], Some(&cargo_home.path().join("config.toml")));
+    let config_cache = ConfigFileCache::new();
+    let policy = test_policy();
+    let (config, _): (CargoConfig, _) = deps_cargo::config::resolve(
+        &aliases,
+        &[],
+        Some(&cargo_home.path().join("config.toml")),
+        &config_cache,
+        &policy,
+    );
     let entry = config
         .get("my-corp")
         .expect("cargo-home entry must resolve");
@@ -184,6 +204,7 @@ async fn test_authenticated_alternate_registry_sends_authorization_header() {
 
     let source = DependencySource::AlternateRegistry {
         index: index.as_str().to_string(),
+        mirrors_crates_io: false,
     };
     let name = PackageName::new("internal-crate");
     let versions = registry
@@ -223,7 +244,15 @@ async fn test_end_to_end_parse_register_and_fetch() {
     std::fs::write(&manifest_path, manifest_content).unwrap();
     let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
 
-    let parse_result = deps_cargo::parse_cargo_toml(manifest_content, &uri).unwrap();
+    // `All` policy: this test exercises the parse -> register -> fetch pipeline, not
+    // #443's policy gate (covered separately) — a mockito loopback URL is otherwise
+    // blocked under the default `PublicOnly` policy.
+    let ctx = deps_cargo::parser::CargoParseContext {
+        policy: Arc::new(test_policy()),
+        config_cache: Arc::new(ConfigFileCache::new()),
+    };
+    let parse_result =
+        deps_cargo::parser::parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
 
     let cache = Arc::new(HttpCache::new());
     let registry = CargoRegistry::new(cache);
@@ -232,11 +261,16 @@ async fn test_end_to_end_parse_register_and_fetch() {
     }
 
     let dep = &parse_result.dependencies[0];
-    let DependencySource::AlternateRegistry { index } = &dep.source else {
+    let DependencySource::AlternateRegistry {
+        index,
+        mirrors_crates_io,
+    } = &dep.source
+    else {
         panic!("expected AlternateRegistry, got {:?}", dep.source);
     };
     let source = DependencySource::AlternateRegistry {
         index: index.clone(),
+        mirrors_crates_io: *mirrors_crates_io,
     };
     let versions = registry
         .get_versions_from(&dep.name, &source, FreshnessSettings::default())
@@ -257,6 +291,7 @@ async fn test_unregistered_alternate_index_never_falls_back_to_crates_io() {
     let registry = CargoRegistry::new(cache);
     let source = DependencySource::AlternateRegistry {
         index: "https://index.never-registered.example".to_string(),
+        mirrors_crates_io: false,
     };
     let name = PackageName::new("internal-crate");
 

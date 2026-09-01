@@ -166,6 +166,28 @@ pub trait ParseResult: Send + Sync {
     /// Document URI
     fn uri(&self) -> &Uri;
 
+    /// Dependency lines whose registry-index resolution was blocked by a workspace-registry
+    /// reachability policy (spec `.local/specs/023-cargo-custom-registries/plan-1b.md` §1.7,
+    /// #443) — `(name_range, blocked host class, raw declared value)` triples, where the raw
+    /// value is the exact `registry`/`registry-index` alias or URL the dependency declared
+    /// (so two different blocked aliases render as two distinguishable messages, not one
+    /// byte-identical warning). Used by
+    /// [`crate::lsp_helpers::generate_diagnostics_from_cache`] to surface an
+    /// [`tower_lsp_server::ls_types::DiagnosticSeverity::INFORMATION`] diagnostic on the
+    /// blocked dependency's line so the block never degrades silently.
+    ///
+    /// Default empty — only `deps_cargo::parser::ParseResult` overrides this today;
+    /// every other ecosystem has no equivalent reachability policy to report.
+    fn blocked_registries(
+        &self,
+    ) -> Vec<(
+        tower_lsp_server::ls_types::Range,
+        crate::net_policy::HostClass,
+        String,
+    )> {
+        Vec::new()
+    }
+
     /// Downcast to concrete type for ecosystem-specific operations
     fn as_any(&self) -> &dyn Any;
 }

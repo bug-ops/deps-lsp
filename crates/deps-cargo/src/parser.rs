@@ -29,12 +29,16 @@
 //! assert_eq!(result.dependencies[0].name, "serde");
 //! ```
 
-use crate::config::{AuthToken, RegistryIndex};
+use crate::config::{
+    AuthToken, ConfigFileCache, IndexTrust, RegistryIndex, RegistryIndexError, SourceReplacement,
+};
 use crate::types::{DependencySection, DependencySource, ParsedDependency};
+use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{DepsError, Result};
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use toml_span::value::{Table, Value};
 use tower_lsp_server::ls_types::{Range, Uri};
 
@@ -59,9 +63,19 @@ pub struct ParseResult {
     /// shared `CargoRegistry` router immediately after parsing, so a later
     /// `Registry::get_versions_from` call for the matching
     /// `DependencySource::AlternateRegistry` source can find its (possibly authenticated)
-    /// client. Always empty when [`Self::dependencies`] contains no `CustomRegistry`
-    /// source (spec NFR-004's zero-extra-work lazy trigger).
+    /// client. Empty when [`Self::dependencies`] contains no `CustomRegistry` source *and*
+    /// no `[source.crates-io] replace-with` chain resolves to a sparse mirror — 1a's
+    /// zero-extra-work lazy trigger (spec NFR-004) no longer holds unconditionally once 1b's
+    /// `[source]` support is in play, since a mirror can rewrite every plain dependency (spec
+    /// NFR-005's corrected premise).
     pub resolved_registries: Vec<(RegistryIndex, Option<AuthToken>)>,
+    /// Dependency lines whose `registry`/`registry-index` resolution was blocked by the
+    /// current `cargo.workspace_registries` policy (spec #443, plan-1b §1.7) —
+    /// `(name_range, blocked host class, raw declared value)` triples. Surfaced by
+    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
+    /// block never degrades silently.
+    pub blocked_registries: Vec<(Range, deps_core::net_policy::HostClass, String)>,
 }
 
 /// Parses a Cargo.toml file and extracts all dependencies with positions.
@@ -89,6 +103,52 @@ pub struct ParseResult {
 /// assert_eq!(result.dependencies.len(), 2);
 /// ```
 pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
+    parse_cargo_toml_with_context(content, doc_uri, &CargoParseContext::default())
+}
+
+/// Carries the two pieces of process-wide state a Cargo parse needs beyond its own manifest
+/// content.
+///
+/// The live workspace-registry reachability policy (spec #443, `cargo.workspace_registries`)
+/// and the `.cargo/config.toml` memoization cache (spec NFR-005, plan-1b §1.5) — plumbed
+/// together so [`crate::ecosystem::CargoEcosystem::with_context`] has one thing to hold and
+/// pass through the sync parser (plan-1b §1.6), shared across every document this ecosystem
+/// parses.
+#[derive(Clone)]
+pub struct CargoParseContext {
+    /// Gates every `IndexTrust::WorkspaceDeclared` [`RegistryIndex`] this parse constructs.
+    pub policy: Arc<RegistryAccessPolicy>,
+    /// Memoizes each distinct `.cargo/config.toml`/`$CARGO_HOME/config.toml` file's raw,
+    /// unvalidated contents across every parse that reads it.
+    pub config_cache: Arc<ConfigFileCache>,
+}
+
+impl Default for CargoParseContext {
+    fn default() -> Self {
+        Self {
+            policy: Arc::new(RegistryAccessPolicy::default()),
+            config_cache: Arc::new(ConfigFileCache::new()),
+        }
+    }
+}
+
+/// [`parse_cargo_toml`], but threading `ctx` through to alternate-registry resolution.
+///
+/// The real entry point; [`parse_cargo_toml`] delegates here with a fresh, default context
+/// (mirrors this module's own `resolve`/`resolve_with_env` and
+/// `cargo_home_config_path`/`_with_env` pattern), so every pre-existing test/doctest call
+/// site keeps compiling unchanged.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - TOML syntax is invalid
+/// - File path cannot be converted from URL
+pub fn parse_cargo_toml_with_context(
+    content: &str,
+    doc_uri: &Uri,
+    ctx: &CargoParseContext,
+) -> Result<ParseResult> {
     if let Err(depth) =
         deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
     {
@@ -149,14 +209,16 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
         ));
     }
 
-    let workspace_root = find_workspace_root(doc_uri)?;
+    let discovery = discover_workspace(doc_uri)?;
 
-    let resolved_registries = resolve_alternate_registries(&mut dependencies, doc_uri);
+    let (resolved_registries, blocked_registries) =
+        resolve_alternate_registries(&mut dependencies, &discovery.config_paths, ctx);
 
     Ok(ParseResult {
         dependencies,
-        workspace_root,
+        workspace_root: discovery.workspace_root,
         uri: doc_uri.clone(),
+        blocked_registries,
         resolved_registries,
     })
 }
@@ -165,13 +227,23 @@ fn get_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
     table.get(key)
 }
 
+/// Return type of [`resolve_alternate_registries`]: the newly-resolved `(index, auth)`
+/// pairs to register into the shared `CargoRegistry` router, alongside every dependency
+/// line whose registry-index resolution was blocked by policy (spec #443, plan-1b §1.7).
+type AlternateRegistryResolution = (
+    Vec<(RegistryIndex, Option<AuthToken>)>,
+    Vec<(Range, deps_core::net_policy::HostClass, String)>,
+);
+
 /// Rewrites every `DependencySource::CustomRegistry` entry in `dependencies` into a
-/// resolved `DependencySource::AlternateRegistry` when possible (spec FR-002), returning
-/// the newly-resolved `(index, auth)` pairs for `crate::ecosystem::CargoEcosystem::parse_manifest`
-/// to register into the shared `CargoRegistry` router.
+/// resolved `DependencySource::AlternateRegistry` when possible (spec FR-002), and every
+/// plain `DependencySource::Registry` entry into a resolved `AlternateRegistry {
+/// mirrors_crates_io: true, .. }` when a `[source.crates-io] replace-with` chain resolves to
+/// a sparse mirror (spec FR-005/006/007, plan-1b §1.4). Returns the newly-resolved `(index,
+/// auth)` pairs for `crate::ecosystem::CargoEcosystem::parse_manifest` to register into the
+/// shared `CargoRegistry` router.
 ///
-/// Two distinct forms reach this function, both stored as `CustomRegistry { url }` by the
-/// caller above:
+/// Two distinct forms of `CustomRegistry` reach the alias-resolution half of this function:
 /// - `registry-index = "sparse+https://..."` — `url` is already a concrete index URL, so it
 ///   resolves directly via [`RegistryIndex::new`], with no `.cargo/config.toml` lookup and
 ///   no possible credential (a literal URL in `Cargo.toml` is workspace-declared by
@@ -181,12 +253,18 @@ fn get_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
 ///   `.cargo/config.toml` hierarchy plus `$CARGO_HOME/config.toml` (spec FR-003: an alias
 ///   with no matching entry stays `CustomRegistry`, unchanged, with a `tracing::warn!`).
 ///
-/// A no-op — zero additional filesystem reads (spec NFR-004) — when `dependencies` contains
-/// no `CustomRegistry` source at all.
+/// Unlike 1a, this is **not** skipped when `dependencies` contains no `CustomRegistry`
+/// source: a `[source]` replace-with chain can rewrite *every* plain dependency, so
+/// `crate::config::resolve` always runs (spec NFR-005's corrected premise — the zero-cost
+/// lazy trigger from 1a no longer holds once 1b's `[source]` support lands). The merged
+/// ancestor walk ([`discover_workspace`]) this function's `workspace_config_paths` comes
+/// from is unconditional regardless, so the only new unconditional cost here is the (cheap,
+/// memoized) config resolution itself.
 fn resolve_alternate_registries(
     dependencies: &mut [ParsedDependency],
-    doc_uri: &Uri,
-) -> Vec<(RegistryIndex, Option<AuthToken>)> {
+    workspace_config_paths: &[PathBuf],
+    ctx: &CargoParseContext,
+) -> AlternateRegistryResolution {
     let raw_values: HashSet<String> = dependencies
         .iter()
         .filter_map(|dep| match &dep.source {
@@ -195,21 +273,31 @@ fn resolve_alternate_registries(
         })
         .collect();
 
-    if raw_values.is_empty() {
-        return Vec::new();
-    }
-
     let mut aliases: HashSet<String> = HashSet::new();
     // Maps each raw `CustomRegistry.url` value that resolved to its concrete index, so the
     // rewrite pass below can look a dependency's exact declared value back up.
     let mut resolved_by_raw_value: HashMap<String, RegistryIndex> = HashMap::new();
+    // Raw values blocked specifically by policy (spec #443/plan-1b §1.7), so the rewrite
+    // pass below can surface an informational diagnostic on the exact dependency line.
+    let mut blocked_by_raw_value: HashMap<String, deps_core::net_policy::HostClass> =
+        HashMap::new();
     let mut newly_resolved: Vec<(RegistryIndex, Option<AuthToken>)> = Vec::new();
 
     for value in &raw_values {
-        match RegistryIndex::new(value) {
+        // A literal `registry-index` URL is workspace-declared by construction — it is a
+        // value written directly into the `Cargo.toml` being parsed. An `InvalidUrl`/
+        // `NotHttps`/`UserInfoPresent` error covers "not a URL at all" (the common case:
+        // `value` is actually an alias, not a literal index) and a genuinely-invalid literal
+        // URL alike — either way, falling through to alias resolution below is safe: an
+        // alias lookup for a URL-shaped string simply won't match any `[registries.*]` entry
+        // and stays unresolved, identical in outcome to failing here directly.
+        match RegistryIndex::new(value, IndexTrust::WorkspaceDeclared, &ctx.policy) {
             Ok(index) => {
                 resolved_by_raw_value.insert(value.clone(), index.clone());
                 newly_resolved.push((index, None));
+            }
+            Err(RegistryIndexError::BlockedHost { class }) => {
+                blocked_by_raw_value.insert(value.clone(), class);
             }
             Err(_) => {
                 aliases.insert(value.clone());
@@ -217,53 +305,61 @@ fn resolve_alternate_registries(
         }
     }
 
-    if !aliases.is_empty() {
-        match doc_uri.to_file_path() {
-            Some(manifest_path) => {
-                let start_dir = manifest_path
-                    .parent()
-                    .map_or_else(|| manifest_path.to_path_buf(), std::path::Path::to_path_buf);
-                let workspace_paths = crate::config::discover_workspace_config_paths(&start_dir);
-                let cargo_home_path = crate::config::cargo_home_config_path();
-                let config =
-                    crate::config::resolve(&aliases, &workspace_paths, cargo_home_path.as_deref());
+    let cargo_home_path = crate::config::cargo_home_config_path();
+    let (config, source_replacement) = crate::config::resolve(
+        &aliases,
+        workspace_config_paths,
+        cargo_home_path.as_deref(),
+        &ctx.config_cache,
+        &ctx.policy,
+    );
 
-                for alias in &aliases {
-                    if let Some(entry) = config.get(alias) {
-                        resolved_by_raw_value.insert(alias.clone(), entry.index.clone());
-                        newly_resolved.push((entry.index.clone(), entry.auth.clone()));
-                    } else {
-                        tracing::warn!(
-                            alias,
-                            "registry alias did not resolve via the .cargo/config.toml \
-                             hierarchy or $CARGO_HOME/config.toml; dependency stays unresolved"
-                        );
-                    }
-                }
-            }
-            None => {
-                for alias in &aliases {
-                    tracing::warn!(
-                        alias,
-                        "could not determine a directory to search for .cargo/config.toml; \
-                         alias stays unresolved"
-                    );
-                }
+    for alias in &aliases {
+        if let Some(entry) = config.get(alias) {
+            resolved_by_raw_value.insert(alias.clone(), entry.index.clone());
+            newly_resolved.push((entry.index.clone(), entry.auth.clone()));
+        } else if let Some(class) = config.blocked_class(alias) {
+            blocked_by_raw_value.insert(alias.clone(), class);
+        } else {
+            tracing::warn!(
+                alias,
+                "registry alias did not resolve via the .cargo/config.toml \
+                 hierarchy or $CARGO_HOME/config.toml; dependency stays unresolved"
+            );
+        }
+    }
+
+    // [source] replace-with mirror rewrite (FR-005/006/007): every plain `Registry`
+    // dependency reroutes to the resolved mirror. An alias-based `AlternateRegistry` a
+    // dependency may already carry from the loop above is left untouched — a `[registries]`
+    // alias is not crates.io, so `[source.crates-io]` replacement does not apply to it.
+    if let SourceReplacement::SparseMirror { index, auth } = source_replacement {
+        newly_resolved.push((index.clone(), auth));
+        for dep in dependencies.iter_mut() {
+            if dep.source == DependencySource::Registry {
+                dep.source = DependencySource::AlternateRegistry {
+                    index: index.as_str().to_string(),
+                    mirrors_crates_io: true,
+                };
             }
         }
     }
 
+    let mut blocked_registries = Vec::new();
     for dep in dependencies.iter_mut() {
-        if let DependencySource::CustomRegistry { url } = &dep.source
-            && let Some(index) = resolved_by_raw_value.get(url)
-        {
-            dep.source = DependencySource::AlternateRegistry {
-                index: index.as_str().to_string(),
-            };
+        if let DependencySource::CustomRegistry { url } = &dep.source {
+            if let Some(index) = resolved_by_raw_value.get(url) {
+                dep.source = DependencySource::AlternateRegistry {
+                    index: index.as_str().to_string(),
+                    mirrors_crates_io: false,
+                };
+            } else if let Some(class) = blocked_by_raw_value.get(url) {
+                blocked_registries.push((dep.name_range, *class, url.clone()));
+            }
         }
     }
 
-    newly_resolved
+    (newly_resolved, blocked_registries)
 }
 
 /// Parses the `dependencies`, `dev-dependencies`, and `build-dependencies` tables
@@ -467,43 +563,100 @@ fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::S
     Range::new(start, end)
 }
 
-/// Finds the workspace root by walking up the directory tree.
+/// Upper bound on how many ancestor directories [`discover_workspace`] climbs, independent
+/// of whether the filesystem root has been reached (spec NFR-005, plan-1b §1.5, critic N1).
 ///
-/// Looks for a Cargo.toml file with a [workspace] section.
-fn find_workspace_root(doc_uri: &Uri) -> Result<Option<PathBuf>> {
+/// Caps the previously-unbounded workspace-root search — today's manifest walk is unbounded
+/// and TOML-parses every ancestor `Cargo.toml` — and bounds the merged `.cargo/config.toml`
+/// discovery pass added alongside it. A workspace root or config file more than 64
+/// directories up is not a realistic layout; a hostile deeply-nested tree hits this cap
+/// instead of doing unbounded work per parse.
+pub(crate) const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
+
+/// Result of [`discover_workspace`]'s merged ancestor walk.
+struct WorkspaceDiscovery {
+    /// The workspace root, if any `[workspace]`-carrying `Cargo.toml` was found within
+    /// [`MAX_CONFIG_ANCESTOR_DEPTH`] — unchanged in meaning from the pre-1b
+    /// `find_workspace_root`, just capped.
+    workspace_root: Option<PathBuf>,
+    /// Every ancestor `.cargo/config.toml` found along the way, closest-first — independent
+    /// of the workspace-root search's own short-circuit (plan-1b §1.5: "only the
+    /// `[workspace]` search short-circuits; config discovery does not").
+    config_paths: Vec<PathBuf>,
+}
+
+/// Finds the workspace root by walking up the directory tree from `doc_uri`'s manifest,
+/// merged with collecting every ancestor `.cargo/config.toml` along the same walk (spec
+/// NFR-005, plan-1b §1.5) — one pass instead of two separate ancestor walks per parse.
+///
+/// The workspace-root search still stops at the first ancestor `Cargo.toml` carrying a
+/// `[workspace]` table (unchanged), but **config-path collection does not stop there**: a
+/// `.cargo/config.toml` above the workspace root (e.g. `~/projects/.cargo/config.toml` over
+/// `~/projects/myrepo/`) is exactly what Cargo itself still consults, and #440 already
+/// shipped that behavior for the alias-resolution path — a naive merge that stopped both
+/// searches at the workspace root would silently regress it (critic N1). Both searches share
+/// [`MAX_CONFIG_ANCESTOR_DEPTH`] as their only stopping bound beyond the filesystem root.
+///
+/// At most two `stat`s per ancestor directory: one for `.cargo/config.toml`'s existence,
+/// and — only while the workspace root is still unresolved — one for `Cargo.toml`'s
+/// existence (plus a read+parse on a hit). Once the workspace root is found, every further
+/// ancestor costs exactly one stat.
+fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
     let path = doc_uri
         .to_file_path()
         .ok_or_else(|| DepsError::InvalidUri(format!("{doc_uri:?}")))?;
 
+    let mut workspace_root = None;
+    let mut config_paths = Vec::new();
     let mut current = path.parent();
+    let mut depth = 0usize;
 
     while let Some(dir) = current {
-        let workspace_toml = dir.join("Cargo.toml");
+        if depth >= MAX_CONFIG_ANCESTOR_DEPTH {
+            break;
+        }
+        depth += 1;
 
-        if workspace_toml.exists()
-            && let Ok(content) = std::fs::read_to_string(&workspace_toml)
-        {
-            if deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
-                .is_err()
+        let config_candidate = dir.join(".cargo").join("config.toml");
+        #[cfg(test)]
+        crate::config::fs_probe::STAT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if config_candidate.is_file() {
+            config_paths.push(config_candidate);
+        }
+
+        if workspace_root.is_none() {
+            let workspace_toml = dir.join("Cargo.toml");
+
+            #[cfg(test)]
+            crate::config::fs_probe::STAT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if workspace_toml.exists()
+                && let Ok(content) = std::fs::read_to_string(&workspace_toml)
             {
-                tracing::warn!(
-                    path = %workspace_toml.display(),
-                    "skipping ancestor Cargo.toml during workspace root discovery: nesting depth exceeds maximum"
-                );
-            } else if let Ok(doc) = toml_span::parse(&content)
-                && doc
-                    .as_table()
-                    .and_then(|t| get_val(t, "workspace"))
-                    .is_some()
-            {
-                return Ok(Some(dir.to_path_buf()));
+                if deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
+                    .is_err()
+                {
+                    tracing::warn!(
+                        path = %workspace_toml.display(),
+                        "skipping ancestor Cargo.toml during workspace root discovery: nesting depth exceeds maximum"
+                    );
+                } else if let Ok(doc) = toml_span::parse(&content)
+                    && doc
+                        .as_table()
+                        .and_then(|t| get_val(t, "workspace"))
+                        .is_some()
+                {
+                    workspace_root = Some(dir.to_path_buf());
+                }
             }
         }
 
         current = dir.parent();
     }
 
-    Ok(None)
+    Ok(WorkspaceDiscovery {
+        workspace_root,
+        config_paths,
+    })
 }
 
 /// Parser for Cargo.toml manifests implementing the deps-core traits.
@@ -524,6 +677,10 @@ impl deps_core::ParseResult for ParseResult {
 
     fn uri(&self) -> &Uri {
         &self.uri
+    }
+
+    fn blocked_registries(&self) -> Vec<(Range, deps_core::net_policy::HostClass, String)> {
+        self.blocked_registries.clone()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -699,7 +856,7 @@ internal-crate = { version = "1.0", registry-index = "https://gitlab.mycorp.com/
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         match &result.dependencies[0].source {
-            DependencySource::AlternateRegistry { index } => {
+            DependencySource::AlternateRegistry { index, .. } => {
                 assert_eq!(index, "https://gitlab.mycorp.com/registry-index");
             }
             other => panic!("expected AlternateRegistry, got {other:?}"),
@@ -723,6 +880,61 @@ internal-crate = { version = "1.0", registry-index = "http://insecure.mycorp.com
             other => panic!("expected CustomRegistry, got {other:?}"),
         }
         assert!(result.resolved_registries.is_empty());
+    }
+
+    /// S3 (impl-critic): `ParseResult::blocked_registries` must actually be populated — for a
+    /// literal `registry-index` URL blocked by the default `public_only` policy — carrying
+    /// the dependency's own `name_range` and the raw declared value (so a diagnostic message
+    /// can name it), not just leaving the dependency unresolved with no trace.
+    #[test]
+    fn test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries() {
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/index" }"#;
+        let ctx = CargoParseContext::default(); // default policy is PublicOnly
+        let result = parse_cargo_toml_with_context(toml, &test_url(), &ctx).unwrap();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(
+            matches!(
+                &result.dependencies[0].source,
+                DependencySource::CustomRegistry { url } if url == "https://169.254.169.254/index"
+            ),
+            "a blocked index must stay unresolved, not silently become AlternateRegistry"
+        );
+        assert_eq!(result.blocked_registries.len(), 1);
+        let (range, class, raw_value) = &result.blocked_registries[0];
+        assert_eq!(*range, result.dependencies[0].name_range);
+        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
+        assert_eq!(raw_value, "https://169.254.169.254/index");
+    }
+
+    /// The alias path's `blocked_registries` counterpart: an alias resolving via
+    /// `.cargo/config.toml` to a blocked host must populate the same channel, keyed by the
+    /// alias name (not the resolved URL) since that is what the dependency itself declared.
+    #[test]
+    fn test_parse_custom_registry_alias_blocked_by_policy_populates_blocked_registries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[registries.my-corp]\nindex = \"https://169.254.169.254\"\n",
+        )
+        .unwrap();
+
+        let manifest_path = root.path().join("Cargo.toml");
+        let manifest_content =
+            "[dependencies]\ninternal-crate = { version = \"1.0\", registry = \"my-corp\" }\n";
+        std::fs::write(&manifest_path, manifest_content).unwrap();
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let ctx = CargoParseContext::default();
+        let result = parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
+
+        assert_eq!(result.blocked_registries.len(), 1);
+        let (range, class, raw_value) = &result.blocked_registries[0];
+        assert_eq!(*range, result.dependencies[0].name_range);
+        assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
+        assert_eq!(raw_value, "my-corp");
     }
 
     #[test]
@@ -761,7 +973,7 @@ internal-crate = { version = "1.0", registry = "my-corp" }"#;
         let result = parse_cargo_toml(toml, &uri).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         match &result.dependencies[0].source {
-            DependencySource::AlternateRegistry { index } => {
+            DependencySource::AlternateRegistry { index, .. } => {
                 assert_eq!(index, "https://index.mycorp.dev/");
             }
             other => panic!("expected AlternateRegistry, got {other:?}"),
@@ -775,12 +987,75 @@ internal-crate = { version = "1.0", registry = "my-corp" }"#;
 
     #[test]
     fn test_parse_no_custom_registry_dependency_resolves_nothing() {
-        // NFR-004: a manifest with no CustomRegistry source resolves nothing at all — the
-        // lazy trigger, asserted at the parser's own boundary rather than only inferred
-        // from behavior.
+        // With no CustomRegistry source and no `[source.crates-io] replace-with` chain
+        // anywhere in scope (no `.cargo/config.toml` exists above the fixture path, and
+        // `$CARGO_HOME` is either unset or has no such override), nothing resolves. Unlike
+        // 1a, this is no longer a zero-cost lazy trigger (spec NFR-005's corrected premise
+        // — `[source]` can affect every plain dependency) — `crate::config::resolve` still
+        // runs, it just finds nothing to resolve.
         let toml = r#"[dependencies]
 serde = "1.0""#;
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert!(result.resolved_registries.is_empty());
+    }
+
+    /// FR-005/plan-1b §1.4: a `[source.crates-io] replace-with` chain resolving to a sparse
+    /// mirror rewrites every plain `Registry` dependency into a resolved, `mirrors_crates_io:
+    /// true` `AlternateRegistry` — no `registry`/`registry-index` needed on the dependency
+    /// itself.
+    #[test]
+    fn test_parse_plain_dependency_rewritten_via_source_replace_with_mirror() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[source.crates-io]\nreplace-with = \"my-mirror\"\n\
+             [source.my-mirror]\nregistry = \"sparse+https://mirror.corp.example\"\n",
+        )
+        .unwrap();
+
+        let manifest_content = "[dependencies]\nserde = \"1.0\"\n";
+        let manifest_path = root.path().join("Cargo.toml");
+        std::fs::write(&manifest_path, manifest_content).unwrap();
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let result = parse_cargo_toml(manifest_content, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        match &result.dependencies[0].source {
+            DependencySource::AlternateRegistry {
+                index,
+                mirrors_crates_io,
+            } => {
+                assert_eq!(index, "https://mirror.corp.example/");
+                assert!(*mirrors_crates_io);
+            }
+            other => panic!("expected a resolved crates.io mirror, got {other:?}"),
+        }
+        assert_eq!(result.resolved_registries.len(), 1);
+    }
+
+    /// FR-006/US-003: a `[source]` replace-with chain terminating at a `directory`
+    /// (vendored) source must leave plain dependencies unchanged — the pre-1b, crates.io
+    /// fallback behavior, byte-identical.
+    #[test]
+    fn test_parse_plain_dependency_unchanged_when_source_replace_with_is_vendored() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[source.crates-io]\nreplace-with = \"vendored\"\n\
+             [source.vendored]\ndirectory = \"vendor\"\n",
+        )
+        .unwrap();
+
+        let manifest_content = "[dependencies]\nserde = \"1.0\"\n";
+        let manifest_path = root.path().join("Cargo.toml");
+        std::fs::write(&manifest_path, manifest_content).unwrap();
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let result = parse_cargo_toml(manifest_content, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].source, DependencySource::Registry);
         assert!(result.resolved_registries.is_empty());
     }
 
@@ -1090,5 +1365,132 @@ tokio = "1.0"
 
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.workspace_root, Some(workspace_dir));
+    }
+
+    /// N1 regression: the merged ancestor walk must **not** stop collecting
+    /// `.cargo/config.toml` paths once it finds the workspace root — a config file living
+    /// *above* the workspace root (e.g. `~/projects/.cargo/config.toml` over
+    /// `~/projects/myrepo/`) is exactly what Cargo itself still consults, and #440 already
+    /// shipped that for the alias-resolution path. A naive merge of the workspace-root
+    /// search with config discovery would silently regress this already-shipped behavior —
+    /// this is the regression gate for that merge, and it fails against a naive
+    /// stop-at-workspace-root implementation. The fixture places the config *outside* the
+    /// tmpdir workspace directory, since a config placed inside the workspace passes either
+    /// way (naive or correct).
+    #[test]
+    fn test_discover_workspace_config_above_workspace_root_still_resolves() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(
+            workspace_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"pkg\"]\n",
+        )
+        .unwrap();
+
+        // The config file lives at `root/.cargo/config.toml` — an ancestor of
+        // `workspace_dir`, but not itself inside it.
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[registries.above-root]\nindex = \"sparse+https://above-root.example\"\n",
+        )
+        .unwrap();
+
+        let pkg_dir = workspace_dir.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let manifest_content =
+            "[dependencies]\ninternal-crate = { version = \"1.0\", registry = \"above-root\" }\n";
+        let manifest_path = pkg_dir.join("Cargo.toml");
+        std::fs::write(&manifest_path, manifest_content).unwrap();
+
+        let doc_uri = Uri::from_file_path(&manifest_path).unwrap();
+        let result = parse_cargo_toml(manifest_content, &doc_uri).unwrap();
+
+        assert_eq!(result.workspace_root, Some(workspace_dir));
+        match &result.dependencies[0].source {
+            DependencySource::AlternateRegistry { index, .. } => {
+                assert_eq!(index, "https://above-root.example/");
+            }
+            other => panic!(
+                "expected the above-workspace-root config to resolve the alias, got {other:?}"
+            ),
+        }
+    }
+
+    /// The ancestor walk stops at [`MAX_CONFIG_ANCESTOR_DEPTH`], for both the workspace-root
+    /// search and config-path collection — a pathologically deep tree must not do unbounded
+    /// work per parse.
+    #[test]
+    fn test_discover_workspace_stops_at_max_ancestor_depth() {
+        let root = tempfile::tempdir().unwrap();
+
+        // Build a chain deeper than MAX_CONFIG_ANCESTOR_DEPTH, each level carrying its own
+        // `.cargo/config.toml` with a distinct alias, plus a `[workspace]`-carrying
+        // `Cargo.toml` at the very top (beyond the cap) that must never be found.
+        let mut current = root.path().to_path_buf();
+        for i in 0..(MAX_CONFIG_ANCESTOR_DEPTH + 5) {
+            current = current.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&current).unwrap();
+
+        // Place the far (unreachable) workspace root and a distinguishing config file at
+        // the very top of the tree.
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\n",
+        )
+        .unwrap();
+
+        let opened_content = "[dependencies]\nserde = \"1.0\"\n";
+        let opened_path = current.join("Cargo.toml");
+        std::fs::write(&opened_path, opened_content).unwrap();
+
+        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+        let result = parse_cargo_toml(opened_content, &doc_uri).unwrap();
+
+        assert_eq!(
+            result.workspace_root, None,
+            "a workspace root beyond MAX_CONFIG_ANCESTOR_DEPTH must not be found"
+        );
+    }
+
+    /// P1 (plan-1b §4 Performance/M4, flagged missing by the tester validator): the real
+    /// bound on the merged ancestor walk is "at most two stats per ancestor directory,
+    /// capped at MAX_CONFIG_ANCESTOR_DEPTH" — verified here by actually counting `stat`
+    /// calls (via `crate::config::fs_probe`), not merely asserting the depth cap holds.
+    /// Uses a purely synthetic chain deeper than the cap, with no `Cargo.toml`/
+    /// `.cargo/config.toml` anywhere in it, so neither search ever short-circuits before the
+    /// cap — pinning the count to exactly `2 * MAX_CONFIG_ANCESTOR_DEPTH` regardless of the
+    /// real filesystem's ancestry above the tempdir.
+    #[test]
+    fn test_discover_workspace_stats_at_most_two_per_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let mut current = root.path().to_path_buf();
+        for i in 0..(MAX_CONFIG_ANCESTOR_DEPTH + 5) {
+            current = current.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&current).unwrap();
+
+        let opened_content = "[dependencies]\nserde = \"1.0\"\n";
+        let opened_path = current.join("Cargo.toml");
+        std::fs::write(&opened_path, opened_content).unwrap();
+        let doc_uri = Uri::from_file_path(&opened_path).unwrap();
+
+        // Calls `discover_workspace` directly, not `parse_cargo_toml` — this bounds the
+        // merged ancestor walk itself (parser.rs's own two stat sites), independent of
+        // `resolve_alternate_registries`'s downstream config resolution, which may add its
+        // own (unrelated, already-bounded) `$CARGO_HOME/config.toml` stat if the test
+        // process happens to have a real `CARGO_HOME` set.
+        let (stats_before, _) = crate::config::fs_probe::snapshot();
+        let discovery = discover_workspace(&doc_uri).unwrap();
+        let (stats_after, _) = crate::config::fs_probe::snapshot();
+
+        assert_eq!(discovery.workspace_root, None);
+        assert_eq!(
+            stats_after - stats_before,
+            2 * MAX_CONFIG_ANCESTOR_DEPTH,
+            "expected exactly two stats per ancestor for all MAX_CONFIG_ANCESTOR_DEPTH levels"
+        );
     }
 }

@@ -126,19 +126,88 @@ impl EcosystemFormatter for CargoFormatter {
         )
     }
 
+    /// A verified crates.io mirror (`AlternateRegistry { mirrors_crates_io: true, .. }`,
+    /// spec plan-1b §1.3, F1/F1b) counts as public-registry content alongside plain
+    /// [`DependencySource::Registry`] — Cargo verifies per-version checksum equality
+    /// against crates.io for a `[source.crates-io] replace-with` mirror, so its content is
+    /// exactly as trustworthy as crates.io's own for OSV scanning and hover-link purposes,
+    /// even though the fetch itself goes to the mirror's index, not to crates.io.
+    fn source_is_public_registry_content(&self, source: &DependencySource) -> bool {
+        matches!(
+            source,
+            DependencySource::Registry
+                | DependencySource::AlternateRegistry {
+                    mirrors_crates_io: true,
+                    ..
+                }
+        )
+    }
+
     /// Suppresses the hover heading's crates.io link for any source other than plain
-    /// [`DependencySource::Registry`] (spec FR-014) — an `AlternateRegistry` dependency
-    /// resolves against a different index entirely, so [`Self::package_url`]'s crates.io
-    /// link would point at an unrelated (or simply nonexistent) public crate once live
-    /// version data from the real registry renders beside it.
+    /// [`DependencySource::Registry`] or a verified crates.io mirror (spec FR-014, F2) — a
+    /// genuinely different `AlternateRegistry` resolves against a different index entirely,
+    /// so [`Self::package_url`]'s crates.io link would point at an unrelated (or simply
+    /// nonexistent) public crate once live version data from the real registry renders
+    /// beside it. A mirror's crates.io link stays correct: it is crates.io content, just
+    /// fetched elsewhere.
     fn suppress_package_url(&self, source: &DependencySource) -> bool {
-        !matches!(source, DependencySource::Registry)
+        !self.source_is_public_registry_content(source)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_source_is_public_registry_content_plain_registry() {
+        let formatter = CargoFormatter;
+        assert!(formatter.source_is_public_registry_content(&DependencySource::Registry));
+    }
+
+    #[test]
+    fn test_source_is_public_registry_content_crates_io_mirror() {
+        let formatter = CargoFormatter;
+        assert!(formatter.source_is_public_registry_content(
+            &DependencySource::AlternateRegistry {
+                index: "https://mirror.example".into(),
+                mirrors_crates_io: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_source_is_public_registry_content_non_mirror_alternate_is_false() {
+        let formatter = CargoFormatter;
+        assert!(!formatter.source_is_public_registry_content(
+            &DependencySource::AlternateRegistry {
+                index: "https://index.mycorp.dev".into(),
+                mirrors_crates_io: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_suppress_package_url_mirror_not_suppressed() {
+        let formatter = CargoFormatter;
+        assert!(
+            !formatter.suppress_package_url(&DependencySource::AlternateRegistry {
+                index: "https://mirror.example".into(),
+                mirrors_crates_io: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_suppress_package_url_non_mirror_alternate_suppressed() {
+        let formatter = CargoFormatter;
+        assert!(
+            formatter.suppress_package_url(&DependencySource::AlternateRegistry {
+                index: "https://index.mycorp.dev".into(),
+                mirrors_crates_io: false,
+            })
+        );
+    }
 
     #[test]
     fn test_format_version() {

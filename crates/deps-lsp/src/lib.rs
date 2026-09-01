@@ -221,6 +221,13 @@ ecosystem!(
 
 /// Registers all enabled ecosystems.
 ///
+/// `cargo` is special-cased (spec #443/#441, plan-1b §1.6): unlike `register!`'s generic
+/// `Ecosystem::new(cache)` call, `CargoEcosystem` needs `policy` threaded through
+/// `CargoEcosystem::with_context` so `ServerState`'s live-updatable
+/// `Arc<RegistryAccessPolicy>` (see `document::state::ServerState::registry_policy`) is the
+/// exact same handle every Cargo parse reads — `initialize`/`did_change_configuration`
+/// updating it then takes effect immediately, with no need to reconstruct the ecosystem.
+///
 /// `npm` and `deno` are special-cased (#312): when both features are enabled, they share
 /// one `NpmRegistry` instance — built once here and handed to both `NpmEcosystem` and
 /// `DenoEcosystem`'s `npm:`-scheme half via `with_registry`/`with_npm` — instead of each
@@ -229,8 +236,25 @@ ecosystem!(
 /// freshness path's full-packument fetch and its publish-time cache for a package
 /// appearing in both `package.json` and a `deno.json` `npm:`-specifier dependency, on top
 /// of the plain cached GETs the shared `cache` already dedupes.
-pub fn register_ecosystems(registry: &EcosystemRegistry, cache: Arc<HttpCache>) {
-    register!("cargo", CargoEcosystem, registry, &cache);
+pub fn register_ecosystems(
+    registry: &EcosystemRegistry,
+    cache: Arc<HttpCache>,
+    policy: Arc<deps_core::net_policy::RegistryAccessPolicy>,
+) {
+    // Keeps `policy` used even when the `cargo` feature (its only consumer) is compiled out.
+    let _ = &policy;
+
+    #[cfg(feature = "cargo")]
+    {
+        let context = deps_cargo::parser::CargoParseContext {
+            policy,
+            config_cache: Arc::new(deps_cargo::config::ConfigFileCache::new()),
+        };
+        registry.register(Arc::new(CargoEcosystem::with_context(
+            Arc::clone(&cache),
+            context,
+        )));
+    }
 
     #[cfg(all(feature = "npm", feature = "deno"))]
     {
@@ -267,7 +291,11 @@ mod tests {
     fn test_register_ecosystems() {
         let registry = Arc::new(EcosystemRegistry::new());
         let cache = Arc::new(HttpCache::new());
-        register_ecosystems(&registry, Arc::clone(&cache));
+        register_ecosystems(
+            &registry,
+            Arc::clone(&cache),
+            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+        );
 
         #[cfg(feature = "cargo")]
         assert!(registry.get("cargo").is_some());
@@ -306,7 +334,11 @@ mod tests {
     fn test_ecosystem_id_matches_registered_ecosystems() {
         let registry = Arc::new(EcosystemRegistry::new());
         let cache = Arc::new(HttpCache::new());
-        register_ecosystems(&registry, Arc::clone(&cache));
+        register_ecosystems(
+            &registry,
+            Arc::clone(&cache),
+            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+        );
 
         for id in registry.ecosystem_ids() {
             let parsed: deps_core::EcosystemId = id.parse().unwrap_or_else(|_| {
@@ -435,7 +467,11 @@ mod tests {
 
         let registry = Arc::new(EcosystemRegistry::new());
         let cache = Arc::new(HttpCache::new());
-        register_ecosystems(&registry, Arc::clone(&cache));
+        register_ecosystems(
+            &registry,
+            Arc::clone(&cache),
+            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+        );
 
         let req = VersionReq::new("*");
         for id in registry.ecosystem_ids() {

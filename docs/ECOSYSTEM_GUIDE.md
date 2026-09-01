@@ -48,9 +48,46 @@ redirecting a familiar alias name (e.g. `"github"`) to an attacker-controlled ho
 and harvesting whatever token the user's real, differently-scoped registry of that
 name would have used.
 
+**Mirroring crates.io (`[source]` replace-with)**: a workspace's
+`[source.crates-io] replace-with = "<name>"` chain, terminating at a
+`[source.<name>] registry = "sparse+https://…"` entry, reroutes every plain
+(un-aliased) dependency to that mirror — hover/diagnostics/completion reflect the
+mirror's data, the crates.io hover link stays intact (Cargo verifies per-version
+checksum equality against crates.io for a mirror, so its content is exactly as
+trustworthy as crates.io's own), and OSV vulnerability scanning still runs against
+it. A chain terminating at a `directory` (vendored), `local-registry`, or
+git-index (non-sparse) source instead leaves plain dependencies resolving against
+crates.io unchanged — vendoring/mirroring through those mechanisms doesn't
+guarantee the same version *set* as crates.io, so degrading to no data would be
+worse than the pre-existing crates.io answer.
+
+**Reachability policy (`cargo.workspace_registries`, security)**: a
+workspace-declared registry index (the `registry`/`registry-index` alias path, or a
+`[source]` mirror) is checked against this setting before it is ever fetched — a
+hostile cloned repository can write both, and this LSP parses on file open, before
+any build runs. Three values:
+
+| Value | Behavior |
+|-------|----------|
+| `"public_only"` (default) | Only a publicly-routable host is fetched — blocks loopback, link-local, RFC1918/CGNAT, unique-local-v6, and cloud-metadata-range hosts (e.g. `169.254.169.254`) declared by a workspace file. A corporate `https://index.mycorp.dev`-style registry still works, since a DNS name cannot be classified as internal without resolving it — see the residual-risk note below. |
+| `"off"` | No workspace-declared index is ever fetched — the only complete boundary. Applies to the alias path as well as `[source]`. |
+| `"all"` | Every workspace-declared index is fetched, matching this LSP's behavior before this setting existed — the escape hatch for a workspace that legitimately points at an RFC1918/loopback registry. |
+
+`$CARGO_HOME/config.toml`-configured registries are **never** policy-checked, under
+any of the three values — that file is the user's own trusted configuration, not
+something a cloned repository controls. A blocked index is never silent: it is
+logged, and a `registry`/`registry-index` dependency line additionally gets an
+informational diagnostic naming the blocked host class (a `[source]`-chain block is
+log-only, since it is a property of `.cargo/config.toml`, not of any one
+dependency line).
+
+*Residual risk*: `public_only` classifies a candidate index by its URL alone, never
+by resolving it — a workspace file declaring `https://evil.example/`, where
+`evil.example` happens to resolve to a blocked address, still passes. Closing that
+needs a DNS-resolved-address filter, deferred as a follow-up; `"off"` is the only
+setting immune to it.
+
 **Known limitations**:
-- The `[source]` replace-with mechanism (mirroring crates.io through a corporate
-  proxy) is not yet supported — tracked as a follow-up.
 - Editing `.cargo/config.toml` does not take effect until the affected `Cargo.toml`
   is next reparsed (edited, or the document reopened) — there is no dedicated file
   watcher for it yet.

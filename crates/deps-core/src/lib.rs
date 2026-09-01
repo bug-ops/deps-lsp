@@ -19,6 +19,7 @@ pub mod freshness;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;
+pub mod net_policy;
 pub mod osv;
 pub mod package;
 pub mod parser;

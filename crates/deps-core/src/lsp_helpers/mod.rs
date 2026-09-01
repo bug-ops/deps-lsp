@@ -1221,10 +1221,57 @@ pub trait EcosystemFormatter: Send + Sync {
     /// assert!(DefaultFormatter.can_resolve_source(&DependencySource::Registry));
     /// assert!(!DefaultFormatter.can_resolve_source(&DependencySource::AlternateRegistry {
     ///     index: "https://index.mycorp.dev".into(),
+    ///     mirrors_crates_io: false,
     /// }));
     /// ```
     fn can_resolve_source(&self, source: &crate::parser::DependencySource) -> bool {
         source.is_version_resolvable()
+    }
+
+    /// Whether `source`'s content is exactly the default public registry's — safe to treat
+    /// as such for OSV vulnerability scanning, cache-key signature construction, and hover
+    /// heading links.
+    ///
+    /// Default `matches!(source, DependencySource::Registry)` — every ecosystem with only
+    /// one registry concept keeps its existing behavior. `deps-cargo`'s `CargoFormatter`
+    /// overrides this to also accept `AlternateRegistry { mirrors_crates_io: true, .. }`:
+    /// Cargo verifies per-version checksum equality against crates.io for a
+    /// `[source.crates-io] replace-with` mirror, so its content is exactly as trustworthy as
+    /// crates.io's own, even though the fetch itself goes to the mirror's index, not to
+    /// crates.io (plan `.local/specs/023-cargo-custom-registries/plan-1b.md` §1.3, F1/F1b/F2).
+    ///
+    /// Deliberately distinct from [`Self::can_resolve_source`]: an `AlternateRegistry` that
+    /// is *not* a crates.io mirror is resolvable (this LSP can fetch its version data) but is
+    /// not public-registry content (its data must not be treated as crates.io's own for
+    /// vulnerability-advisory or link purposes) — the two questions are orthogonal, and a
+    /// single hook conflating them would force every non-Cargo ecosystem to answer a
+    /// mirror-specific question it has no concept of.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::EcosystemFormatter;
+    /// use deps_core::parser::DependencySource;
+    /// use deps_core::{ConcreteVersion, PackageName};
+    ///
+    /// struct DefaultFormatter;
+    /// impl EcosystemFormatter for DefaultFormatter {
+    ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+    ///         version.to_string()
+    ///     }
+    ///     fn package_url(&self, name: &PackageName) -> String {
+    ///         name.to_string()
+    ///     }
+    /// }
+    ///
+    /// assert!(DefaultFormatter.source_is_public_registry_content(&DependencySource::Registry));
+    /// assert!(!DefaultFormatter.source_is_public_registry_content(&DependencySource::AlternateRegistry {
+    ///     index: "https://index.mycorp.dev".into(),
+    ///     mirrors_crates_io: true,
+    /// }));
+    /// ```
+    fn source_is_public_registry_content(&self, source: &crate::parser::DependencySource) -> bool {
+        matches!(source, crate::parser::DependencySource::Registry)
     }
 
     /// Whether hover should omit [`Self::package_url`]'s heading link for a dependency

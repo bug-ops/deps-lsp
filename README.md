@@ -272,6 +272,9 @@ Configure via LSP initialization options:
   },
   "code_lens": {
     "enabled": true
+  },
+  "cargo": {
+    "workspace_registries": "public_only"
   }
 }
 ```
@@ -294,6 +297,7 @@ Configure via LSP initialization options:
 | `code_lens` | `enabled` | `true` | Show the "Update N outdated dependencies" code lens |
 | `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
+| `cargo` | `workspace_registries` | `"public_only"` | Which workspace-declared Cargo registry index hosts are ever fetched — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#cargo-customprivate-registries) |
 
 > [!NOTE]
 > The release-freshness signal applies uniformly across all ecosystems — there is no per-ecosystem override. Coverage depth varies with what each registry exposes (e.g. Deno's `jsr:` specifiers get full coverage at no extra request cost; Swift and Maven/Gradle have partial coverage since their APIs don't expose per-version publish dates directly). See [Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#mavengradle-release-freshness-coverage) for per-ecosystem details.

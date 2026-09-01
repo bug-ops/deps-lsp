@@ -894,6 +894,18 @@ pub enum DependencySource {
     AlternateRegistry {
         /// The resolved index URL, validated and normalized by the originating parser.
         index: String,
+        /// `true` exactly when this source was reached via a `[source.crates-io]
+        /// replace-with` chain (Cargo `[source]` mirroring, spec
+        /// `.local/specs/023-cargo-custom-registries/plan-1b.md` §1.3) — as opposed to an
+        /// explicit `registry`/`registry-index` naming a genuinely different, private
+        /// registry.
+        ///
+        /// Affects **presentation and advisory gating only, never routing**: Cargo verifies
+        /// per-version checksum equality against crates.io for a mirror, so its content is
+        /// exactly as trustworthy as crates.io's own for vulnerability-scanning and hover-link
+        /// purposes, even though the fetch itself still goes to `index`, not to crates.io.
+        /// See [`crate::lsp_helpers::EcosystemFormatter::source_is_public_registry_content`].
+        mirrors_crates_io: bool,
     },
 }
 
@@ -1784,6 +1796,7 @@ dev_dependencies:
     fn test_dependency_source_alternate_registry() {
         let source = DependencySource::AlternateRegistry {
             index: "https://index.mycorp.dev".into(),
+            mirrors_crates_io: false,
         };
         // `is_registry()` is true (it is a registry, just not the default one), but
         // the generic `Registry` trait still can't resolve it — only an ecosystem

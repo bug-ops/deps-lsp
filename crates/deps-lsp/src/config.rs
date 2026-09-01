@@ -47,6 +47,8 @@ pub struct DepsConfig {
     pub code_lens: CodeLensConfig,
     #[serde(default)]
     pub freshness: FreshnessConfig,
+    #[serde(default)]
+    pub cargo: CargoConfig,
 }
 
 /// Configuration for inlay hints (inline version annotations).
@@ -583,6 +585,87 @@ where
     Ok(clamped)
 }
 
+/// Cargo ecosystem-specific settings (spec #443, plan-1b §1.7).
+///
+/// # Examples
+///
+/// ```
+/// use deps_lsp::config::{CargoConfig, WorkspaceRegistriesSetting};
+///
+/// let config = CargoConfig::default();
+/// assert_eq!(config.workspace_registries, WorkspaceRegistriesSetting::PublicOnly);
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CargoConfig {
+    #[serde(default)]
+    pub workspace_registries: WorkspaceRegistriesSetting,
+}
+
+/// Controls which workspace-declared Cargo registry index hosts this LSP will ever fetch
+/// (spec #443, plan-1b §1.1/§1.7).
+///
+/// Applies to both the `registry`/`registry-index` alias path (#440) and a
+/// `[source.crates-io] replace-with` chain (1b). Never affects a `$CARGO_HOME/config.toml`-
+/// configured registry, which is the user's own trusted configuration, not something a
+/// cloned repository controls.
+///
+/// # Defaults
+///
+/// `"public_only"` — blocking the observed attack shape (an IP literal in a metadata/RFC1918
+/// range) without breaking a legitimate corporate `https://index.mycorp.dev` registry (a DNS
+/// name cannot be classified as internal without resolving it — see
+/// [`deps_core::net_policy`]'s module docs for the residual risk this leaves and why `off`
+/// is the only complete boundary).
+///
+/// # Examples
+///
+/// ```
+/// use deps_lsp::config::WorkspaceRegistriesSetting;
+///
+/// let setting: WorkspaceRegistriesSetting = serde_json::from_str("\"off\"").unwrap();
+/// assert_eq!(setting, WorkspaceRegistriesSetting::Off);
+/// ```
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceRegistriesSetting {
+    /// Block every workspace-declared registry index — the only complete boundary. This
+    /// blocks the `registry`/`registry-index` alias path as well as `[source]`; it does
+    /// **not** affect `$CARGO_HOME`-configured registries, which keep working.
+    Off,
+    /// Allow only a host classified as public (spec `deps_core::net_policy::HostClass::Global`).
+    #[default]
+    PublicOnly,
+    /// Allow every workspace-declared index, including loopback/RFC1918/metadata-range
+    /// hosts — today's pre-#443 behavior, the escape hatch for a workspace that legitimately
+    /// points at one.
+    All,
+}
+
+impl WorkspaceRegistriesSetting {
+    /// Converts this LSP-facing setting into the `deps-core` policy value threaded through
+    /// `deps_cargo::config::RegistryIndex::new`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::WorkspaceRegistryAccess;
+    /// use deps_lsp::config::WorkspaceRegistriesSetting;
+    ///
+    /// assert_eq!(
+    ///     WorkspaceRegistriesSetting::Off.to_policy(),
+    ///     WorkspaceRegistryAccess::Off
+    /// );
+    /// ```
+    #[must_use]
+    pub const fn to_policy(self) -> deps_core::net_policy::WorkspaceRegistryAccess {
+        match self {
+            Self::Off => deps_core::net_policy::WorkspaceRegistryAccess::Off,
+            Self::PublicOnly => deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
+            Self::All => deps_core::net_policy::WorkspaceRegistryAccess::All,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +676,54 @@ mod tests {
         assert!(config.inlay_hints.enabled);
         assert_eq!(config.inlay_hints.up_to_date_text, "✅");
         assert_eq!(config.inlay_hints.needs_update_text, "❌ {}");
+        assert_eq!(
+            config.cargo.workspace_registries,
+            WorkspaceRegistriesSetting::PublicOnly
+        );
+    }
+
+    #[test]
+    fn test_workspace_registries_setting_deserializes_all_variants() {
+        assert_eq!(
+            serde_json::from_str::<WorkspaceRegistriesSetting>("\"off\"").unwrap(),
+            WorkspaceRegistriesSetting::Off
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkspaceRegistriesSetting>("\"public_only\"").unwrap(),
+            WorkspaceRegistriesSetting::PublicOnly
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkspaceRegistriesSetting>("\"all\"").unwrap(),
+            WorkspaceRegistriesSetting::All
+        );
+    }
+
+    #[test]
+    fn test_cargo_config_section_deserialization() {
+        let json = r#"{"cargo": {"workspace_registries": "off"}}"#;
+        let config: DepsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.cargo.workspace_registries,
+            WorkspaceRegistriesSetting::Off
+        );
+    }
+
+    #[test]
+    fn test_workspace_registries_setting_to_policy() {
+        use deps_core::net_policy::WorkspaceRegistryAccess;
+
+        assert_eq!(
+            WorkspaceRegistriesSetting::Off.to_policy(),
+            WorkspaceRegistryAccess::Off
+        );
+        assert_eq!(
+            WorkspaceRegistriesSetting::PublicOnly.to_policy(),
+            WorkspaceRegistryAccess::PublicOnly
+        );
+        assert_eq!(
+            WorkspaceRegistriesSetting::All.to_policy(),
+            WorkspaceRegistryAccess::All
+        );
     }
 
     #[test]

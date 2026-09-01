@@ -336,6 +336,9 @@ impl LanguageServer for Backend {
             && let Some(config) = parse_config(init_options)
         {
             tracing::debug!("loaded configuration: {:?}", config);
+            self.state
+                .registry_policy
+                .set(config.cargo.workspace_registries.to_policy());
             *self.config.write().await = config;
         }
 
@@ -432,6 +435,9 @@ impl LanguageServer for Backend {
         };
 
         tracing::info!("configuration updated via workspace/didChangeConfiguration");
+        self.state
+            .registry_policy
+            .set(config.cargo.workspace_registries.to_policy());
         *self.config.write().await = config;
 
         // Hover/completion/code actions are computed on demand and pick up the new
