@@ -117,9 +117,69 @@ fn has_short_stability_alias(s: &str) -> bool {
     false
 }
 
+/// Whether `s` contains a Composer stability keyword (`alpha`/`a`, `beta`/`b`, `RC`, `dev`)
+/// directly adjacent to a numeric run with no separator (e.g. `1.0.0RC1`, `1.0.0a1`,
+/// `1.0.0dev`) — `composer/semver`'s modifier grammar makes the `[._-]?` separator before the
+/// keyword optional for every recognized word (matching
+/// [`crate::formatter::composer_stability_rank`]'s full word list), not just `alpha`/`beta`/
+/// `rc`. The hyphenated forms are already caught by
+/// [`deps_core::has_default_prerelease_marker`]'s `-rc`/`-alpha`/`-beta`/`-dev` substring
+/// checks and [`has_short_stability_alias`]'s hyphenated `-a`/`-b`.
+///
+/// Covering only three of the six recognized words here left this classifier disagreeing with
+/// [`crate::formatter::composer_version_stability_rank`] on bare separator-less short-alias/
+/// `dev` forms (`1.0.0a1`, `1.0.0dev`): the rank function ranks them as prerelease (via the
+/// same word list `composer_stability_rank` uses), but this function said "not prerelease" —
+/// and since `registry.rs`'s `effective_minimum_stability_rank` uses this function for "does
+/// the requirement itself pin a prerelease" while the version-side filter uses the rank
+/// function, disagreement meant a pin like `1.0.0a1` could never match its own version — the
+/// exact #421 S1 failure mode, reintroduced by the original #424 S3 fix instead of being
+/// closed by it (critique S2).
+///
+/// Checked directly on the raw string rather than relying on a hyphen-inserting
+/// `version_normalized` to have expanded it: a requirement string has no `version_normalized`
+/// at all, and even for a real [`ComposerVersion`], Packagist supplying `version_normalized`
+/// is not guaranteed, so classification must not depend on which of the two happens to run
+/// first or be present (#424 S3).
+///
+/// The keyword may also sit directly after a `.`/`_` separator that is itself digit-adjacent
+/// (e.g. `2.6.3.alpha`, a live `api-platform/core` tag) — not just directly after a digit —
+/// since `composer_stability_rank`'s companion parser (`split_composer_core_and_suffix`)
+/// already strips a leading `.`/`_`/`-` separator before reading the qualifier word, so the
+/// rank function sees `2.6.3.alpha` as prerelease while this substring scan previously did
+/// not, the same #421 S1 failure mode S2 fixed for the hyphen-less case (#424 critique N3).
+/// Deliberately excludes `-`: a hyphen-separated qualifier is already covered by
+/// [`deps_core::has_default_prerelease_marker`]/[`has_short_stability_alias`] via a different
+/// algorithm, so including it here would only duplicate, not extend, coverage.
+fn has_separatorless_stability_keyword(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    let bytes = lower.as_bytes();
+    for keyword in ["alpha", "beta", "rc", "dev", "a", "b"] {
+        let mut start = 0;
+        while let Some(rel) = lower[start..].find(keyword) {
+            let idx = start + rel;
+            let preceded_ok = idx > 0
+                && (bytes[idx - 1].is_ascii_digit()
+                    || (matches!(bytes[idx - 1], b'.' | b'_')
+                        && idx > 1
+                        && bytes[idx - 2].is_ascii_digit()));
+            let after = idx + keyword.len();
+            let followed_by_digit_or_end = bytes.get(after).is_none_or(u8::is_ascii_digit);
+            let followed_by_dot_digit = bytes.get(after) == Some(&b'.')
+                && bytes.get(after + 1).is_some_and(u8::is_ascii_digit);
+            if preceded_ok && (followed_by_digit_or_end || followed_by_dot_digit) {
+                return true;
+            }
+            start = idx + 1;
+        }
+    }
+    false
+}
+
 /// Whether `s` carries any Composer stability marker: `deps-core`'s default hyphen-substring
-/// heuristic (`-alpha`, `-beta`, `-rc`, ...) or Composer's short `-a`/`-b` alias (see
-/// [`has_short_stability_alias`]).
+/// heuristic (`-alpha`, `-beta`, `-rc`, ...), Composer's short `-a`/`-b` alias (see
+/// [`has_short_stability_alias`]), or a separator-less keyword suffix (see
+/// [`has_separatorless_stability_keyword`]).
 ///
 /// Shared by [`ComposerVersion`]'s `is_prerelease()` (via `impl_version!` below, applied to a
 /// concrete version string) and `registry.rs`'s "is this requirement itself prerelease-bearing"
@@ -128,7 +188,9 @@ fn has_short_stability_alias(s: &str) -> bool {
 /// as stable while the version it pins is correctly classified as unstable, making it
 /// impossible to ever satisfy (#421 S1).
 pub(crate) fn is_prerelease_marker(s: &str) -> bool {
-    deps_core::has_default_prerelease_marker(s) || has_short_stability_alias(s)
+    deps_core::has_default_prerelease_marker(s)
+        || has_short_stability_alias(s)
+        || has_separatorless_stability_keyword(s)
 }
 
 // Packagist versions aren't strict semver, so this layers a Composer-specific
@@ -283,6 +345,125 @@ mod tests {
                 "{name} prerelease mismatch"
             );
         }
+    }
+
+    /// #424 S3: a separator-less stability keyword suffix (`1.0.0RC1`, no hyphen before
+    /// `RC`) must be classified as prerelease by the primary `is_prerelease_marker` path
+    /// alone — without relying on `version_normalized` to have expanded it.
+    #[test]
+    fn test_is_prerelease_marker_separatorless_suffix() {
+        for (s, expected) in [
+            ("1.0.0RC1", true),
+            ("2.0.0beta3", true),
+            ("2.0.0alpha1", true),
+            ("1.0.0-RC1", true), // hyphenated form still caught (existing heuristic)
+            ("1.0.0", false),
+            ("1.0.0-abandoned", false),
+        ] {
+            assert_eq!(
+                is_prerelease_marker(s),
+                expected,
+                "{s} prerelease-marker mismatch"
+            );
+        }
+    }
+
+    /// #424 critique S2: the short-alias (`a`/`b`) and `dev` separator-less forms must also
+    /// be recognized — not just `alpha`/`beta`/`rc` — or this classifier disagrees with
+    /// `composer_version_stability_rank` on exactly these forms (see that function's rank
+    /// test `test_is_prerelease_marker_separatorless_suffix_agrees_with_rank` below).
+    #[test]
+    fn test_is_prerelease_marker_separatorless_short_alias_and_dev() {
+        for (s, expected) in [
+            ("1.0.0a1", true),
+            ("1.0.0b1", true),
+            ("1.0.0dev", true),
+            ("2.0.0A1", true),
+            ("2.0.0B2", true),
+        ] {
+            assert_eq!(
+                is_prerelease_marker(s),
+                expected,
+                "{s} prerelease-marker mismatch"
+            );
+        }
+    }
+
+    /// #424 critique N3: a dot/underscore-separated qualifier (`2.6.3.alpha`, a live
+    /// `api-platform/core` tag; `version_normalized: "2.6.3.0-alpha"`) must also be recognized
+    /// — the separator before the keyword need not be a bare digit, since
+    /// `split_composer_core_and_suffix` (the rank function's own parser) already strips a
+    /// leading `.`/`_`/`-` before reading the qualifier word.
+    #[test]
+    fn test_is_prerelease_marker_dot_underscore_separated_suffix() {
+        for (s, expected) in [
+            ("2.6.3.alpha", true),
+            ("2.6.3_alpha", true),
+            ("2.6.3.beta1", true),
+            ("2.6.3_dev", true),
+            ("2.6.3.a1", true),
+            ("2.6.3_b2", true),
+            ("2.6.3.rc1", true),
+        ] {
+            assert_eq!(
+                is_prerelease_marker(s),
+                expected,
+                "{s} prerelease-marker mismatch"
+            );
+        }
+    }
+
+    /// #424 critique S2/N3: `is_prerelease_marker` (substring-scan classifier, used for
+    /// requirement strings) and `composer_version_stability_rank` (anchored-parse classifier,
+    /// used for candidate versions) must agree on every grammar-valid bare version-shaped
+    /// string — a real generated cross-product, not a hand-picked table, so a future addition
+    /// to either classifier's word/separator list that misses the other is actually caught,
+    /// not just the handful of shapes someone thought to write down.
+    ///
+    /// Cross product: word (Composer's full recognized set) × separator (the `[._-]?`
+    /// grammar's optional-separator axis, including no separator at all) × `v`/`V` prefix ×
+    /// numeric suffix shape = 216 grammar-valid forms. Critique N3's first pass covered only
+    /// the `-` and `""` separators (the two that already agreed); this covers all four,
+    /// closing the gap on the entire `.`/`_` axis (e.g. the live `api-platform/core` tag
+    /// `v2.6.3.alpha`) that the narrower table never exercised.
+    #[test]
+    fn test_is_prerelease_marker_agrees_with_rank_cross_product() {
+        let mut mismatches = Vec::new();
+        for word in ["alpha", "beta", "rc", "dev", "a", "b"] {
+            for sep in ["-", ".", "_", ""] {
+                for prefix in ["", "v", "V"] {
+                    for suffix in ["", "1", ".1"] {
+                        let s = format!("{prefix}2.6.3{sep}{word}{suffix}");
+                        let is_prerelease = is_prerelease_marker(&s);
+                        let is_stable_rank = crate::formatter::composer_version_stability_rank(&s)
+                            == crate::formatter::COMPOSER_STABLE_RANK;
+                        if is_prerelease == is_stable_rank {
+                            mismatches.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} / 216 grammar-valid forms disagree between is_prerelease_marker and \
+             composer_version_stability_rank: {mismatches:?}",
+            mismatches.len()
+        );
+    }
+
+    /// #424 S3: a `ComposerVersion` whose `version_normalized` was never hyphen-expanded
+    /// (mirrors a Packagist response that returns the separator-less form verbatim in both
+    /// fields) must still classify as prerelease via the raw `version` alone.
+    #[test]
+    fn test_composer_version_separatorless_rc_is_prerelease_without_normalized_expansion() {
+        let version = ComposerVersion {
+            version: "2.0.0RC1".into(),
+            version_normalized: "2.0.0RC1".into(),
+            abandoned: false,
+            published_at: None,
+        };
+        assert!(version.is_prerelease());
     }
 
     #[test]

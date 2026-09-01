@@ -108,12 +108,18 @@ prerelease-aware ordering:
   outdated diagnostics are both corrected.
 - **Composer** (`composer.json`): stability precedence `dev` < `alpha` < `beta` < `RC` <
   `stable`, applied both to requirement-satisfaction comparison and to "latest version"
-  selection. `select_latest_matching`/`get_latest_matching` now exclude alpha/beta/RC
-  releases by default (mirroring Composer's `minimum-stability: stable` default) unless the
-  requirement itself names an unstable version; a wildcard/existence-check requirement still
-  resolves a prerelease-only package instead of reporting no version found. Manifest-driven
-  `minimum-stability` overrides from `composer.json` are not yet threaded through — that
-  remains a follow-up.
+  selection. `select_latest_matching`/`get_latest_matching` exclude alpha/beta/RC releases by
+  default (mirroring Composer's `minimum-stability: stable` default) unless overridden; a
+  wildcard/existence-check requirement still resolves a prerelease-only package instead of
+  reporting no version found. The effective stability floor is now manifest- and
+  dependency-aware: a per-dependency `@stability` flag (`^1.0@beta`) or a directly-pinned
+  prerelease version overrides the manifest's own `composer.json` `minimum-stability` field,
+  which in turn overrides the `stable` default — reflected in the live "outdated" diagnostic,
+  not just available as a library-level API. Separator-less and dot/underscore-separated
+  prerelease suffixes (`1.0.0RC1`, `2.6.3.alpha`) classify consistently regardless of
+  `v`/`V` prefix. Known limitation: editing `minimum-stability` alone in an already-open
+  document does not refresh already-fetched dependencies' cached "latest" version until the
+  document is closed and reopened.
 
 ### Maven/Gradle Version Range Matching
 

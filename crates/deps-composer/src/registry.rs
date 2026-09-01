@@ -97,19 +97,27 @@ fn reject_dot_segment(name: &str) -> Result<()> {
 /// Reusing the shared ladder here would silently reintroduce npm's #338 NFR-002
 /// "prefer non-deprecated" preference for Composer, which #347 deliberately opted out of.
 ///
-/// So only rung 1 differs from the shared ladder (prerelease alone, not flagged-or-prerelease);
-/// rungs 2 and 3 are identical in effect since `RemovalStatus::blocks_resolution()` is never
-/// true for Composer's `AdvisoryDeprecated` status (see `reports_yanked` below).
+/// So only rung 1 differs from the shared ladder (a stability-rank floor, `minimum_rank`,
+/// rather than a flagged-or-prerelease boolean); rungs 2 and 3 are identical in effect since
+/// `RemovalStatus::blocks_resolution()` is never true for Composer's `AdvisoryDeprecated`
+/// status (see `reports_yanked` below).
 ///
 /// This divergence is load-bearing, not a style preference, and must not be collapsed back
 /// into a call to the shared ladder: for an abandoned package whose newest version is itself
-/// a prerelease, the shared ladder's rung 1 (flagged-or-prerelease) rejects every entry, and
-/// rung 2 (`blocks_resolution` only) then returns index 0 — the prerelease — since
-/// `AdvisoryDeprecated` never blocks resolution. That silently reopens #421 for exactly the
-/// case this function exists to fix.
+/// below `minimum_rank`, the shared ladder's rung 1 (flagged-or-prerelease) rejects every
+/// entry, and rung 2 (`blocks_resolution` only) then returns index 0 — the too-unstable
+/// version — since `AdvisoryDeprecated` never blocks resolution. That silently reopens #421
+/// for exactly the case this function exists to fix.
+///
+/// `minimum_rank` is the effective stability floor (see
+/// [`effective_minimum_stability_rank`]) — rung 1 keeps only versions ranking at or above it,
+/// rather than the fixed "must be fully stable" rule #421/#422 originally shipped, so a
+/// manifest's `minimum-stability` (#424) can loosen this ladder too, not just the
+/// concrete-requirement branch below.
 fn select_latest_for_existence_composer<T>(
     versions: &[T],
     as_version: impl Fn(&T) -> &dyn deps_core::Version,
+    minimum_rank: u8,
 ) -> Option<usize> {
     if versions.is_empty() {
         return None;
@@ -117,7 +125,10 @@ fn select_latest_for_existence_composer<T>(
     Some(
         versions
             .iter()
-            .position(|v| !as_version(v).is_prerelease())
+            .position(|v| {
+                crate::formatter::composer_version_stability_rank(as_version(v).version_string())
+                    >= minimum_rank
+            })
             .or_else(|| {
                 versions
                     .iter()
@@ -125,6 +136,68 @@ fn select_latest_for_existence_composer<T>(
             })
             .unwrap_or(0),
     )
+}
+
+/// The loosest (lowest-ranked) per-dependency `@stability` flag found anywhere in a compound
+/// `req_str` (#424 critique M1).
+///
+/// [`crate::formatter::strip_stability_flag`] applies `rfind('@')` to the *whole* string,
+/// which only works for a single unadorned constraint like `^1.0@beta`. A compound
+/// requirement splits into multiple constraint tokens — `||` (OR) and, within a
+/// space-separated range, individual tokens like `>=1.0@dev` — and each token may carry its
+/// own flag. `version_satisfies_requirement` already recurses per token to evaluate the
+/// version range correctly; this mirrors that same split (flattened, since only "is there a
+/// flag" is needed here, not per-branch matching) so `^1.0@beta || ^2.0` and
+/// `>=1.0@dev <2.0` are not silently treated as flag-less.
+///
+/// Returns the *loosest* rank among every token's flag (if more than one token carries one):
+/// this never wrongly excludes a version some branch's flag would admit — the final
+/// `version_satisfies_requirement` call still narrows down to which branch, if any, actually
+/// matches.
+fn compound_stability_flag_rank(req_str: &str) -> Option<u8> {
+    req_str
+        .split("||")
+        .flat_map(str::split_whitespace)
+        .filter_map(|token| {
+            let (_, flag) = crate::formatter::strip_stability_flag(token.trim());
+            flag.map(crate::formatter::composer_stability_rank)
+        })
+        .min()
+}
+
+/// The effective Composer stability floor for one dependency's "latest version" selection,
+/// ranked on [`crate::formatter::composer_stability_rank`]'s `dev < alpha < beta < RC <
+/// stable` scale (#424).
+///
+/// Priority, highest first:
+/// 1. An explicit per-dependency `@stability` flag anywhere in `req_str` (`^1.0@beta`, or
+///    within a compound requirement like `>=1.0@dev <2.0`, see
+///    [`compound_stability_flag_rank`]) — Composer lets a single dependency opt into a looser
+///    (or stricter) floor than the project default.
+/// 2. `req_str` itself naming an explicit prerelease version (an exact pin like
+///    `2.0.0-beta1`, or a range whose bound does, see
+///    [`crate::types::is_prerelease_marker`]) — kept from #421: an explicitly named unstable
+///    version must still resolve, so this returns the loosest rank (`0`, dev) rather than
+///    computing the pinned version's own rank, matching the pre-#424 "allow any prerelease"
+///    behavior for this case exactly.
+/// 3. `manifest_minimum` — the manifest's own `minimum-stability` field, when the caller has
+///    one (`select_latest_matching_for_manifest`/`get_latest_matching_for_manifest`).
+/// 4. [`crate::formatter::COMPOSER_STABLE_RANK`] — Composer's `minimum-stability: stable`
+///    default, unchanged from #421/#422 for every caller with no manifest context.
+pub(crate) fn effective_minimum_stability_rank(
+    req_str: &str,
+    manifest_minimum: Option<&str>,
+) -> u8 {
+    let trimmed = req_str.trim();
+    if let Some(rank) = compound_stability_flag_rank(trimmed) {
+        return rank;
+    }
+    if crate::types::is_prerelease_marker(trimmed) {
+        return 0;
+    }
+    manifest_minimum.map_or(crate::formatter::COMPOSER_STABLE_RANK, |s| {
+        crate::formatter::composer_stability_rank(s)
+    })
 }
 
 /// Client for interacting with the Packagist registry.
@@ -175,6 +248,11 @@ impl PackagistRegistry {
     /// matching `deps-cargo`/`deps-pypi`/`deps-dart`/`deps-npm` — rather than returning `None`
     /// for a package whose only releases so far are all prerelease.
     ///
+    /// Equivalent to
+    /// [`get_latest_matching_for_manifest`](Self::get_latest_matching_for_manifest) with no
+    /// manifest `minimum-stability` (`None`) — use that method instead when the caller has a
+    /// parsed `composer.json` available (#424).
+    ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails.
@@ -183,24 +261,100 @@ impl PackagistRegistry {
         name: &str,
         req_str: &str,
     ) -> Result<Option<ComposerVersion>> {
+        self.get_latest_matching_impl(name, req_str, None).await
+    }
+
+    /// `composer.json`-aware counterpart of
+    /// [`get_latest_matching`](Self::get_latest_matching): `minimum_stability` is the
+    /// manifest's own top-level `minimum-stability` field
+    /// ([`ComposerParseResult::minimum_stability`](crate::parser::ComposerParseResult::minimum_stability)),
+    /// used as the default stability floor whenever `req_str` carries neither an explicit
+    /// per-dependency `@stability` flag nor a directly pinned prerelease version — both of
+    /// which still take priority over the manifest default, exactly as they do for
+    /// [`get_latest_matching`](Self::get_latest_matching) (#424).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    pub async fn get_latest_matching_for_manifest(
+        &self,
+        name: &str,
+        req_str: &str,
+        minimum_stability: Option<&str>,
+    ) -> Result<Option<ComposerVersion>> {
+        self.get_latest_matching_impl(name, req_str, minimum_stability)
+            .await
+    }
+
+    async fn get_latest_matching_impl(
+        &self,
+        name: &str,
+        req_str: &str,
+        manifest_minimum: Option<&str>,
+    ) -> Result<Option<ComposerVersion>> {
         let versions = self.get_versions(name).await?;
-        use deps_core::Version;
+
+        let minimum_rank = effective_minimum_stability_rank(req_str, manifest_minimum);
 
         if deps_core::is_existence_wildcard_str(req_str) {
-            let idx =
-                select_latest_for_existence_composer(&versions, |v| v as &dyn deps_core::Version);
+            let idx = select_latest_for_existence_composer(
+                &versions,
+                |v| v as &dyn deps_core::Version,
+                minimum_rank,
+            );
             return Ok(idx.and_then(|idx| versions.into_iter().nth(idx)));
         }
 
         let formatter = crate::formatter::ComposerFormatter;
         use deps_core::lsp_helpers::EcosystemFormatter;
 
-        let req_is_prerelease_bearing = crate::types::is_prerelease_marker(req_str);
-
         Ok(versions.into_iter().find(|v| {
-            (req_is_prerelease_bearing || !v.is_prerelease())
+            crate::formatter::composer_version_stability_rank(&v.version) >= minimum_rank
                 && formatter.version_satisfies_requirement(&v.version, req_str)
         }))
+    }
+
+    /// `composer.json`-aware counterpart of
+    /// [`Registry::select_latest_matching`](deps_core::Registry::select_latest_matching):
+    /// `minimum_stability` is the manifest's own top-level `minimum-stability` field
+    /// ([`ComposerParseResult::minimum_stability`](crate::parser::ComposerParseResult::minimum_stability)),
+    /// used as the default stability floor whenever `req` carries neither an explicit
+    /// per-dependency `@stability` flag nor a directly pinned prerelease version — both of
+    /// which still take priority over the manifest default, exactly as they do for the plain
+    /// trait method (#424).
+    #[must_use]
+    pub fn select_latest_matching_for_manifest(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        req: &deps_core::VersionReq,
+        minimum_stability: Option<&str>,
+    ) -> Option<usize> {
+        self.select_latest_matching_impl(versions, req, minimum_stability)
+    }
+
+    fn select_latest_matching_impl(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        req: &deps_core::VersionReq,
+        manifest_minimum: Option<&str>,
+    ) -> Option<usize> {
+        let minimum_rank = effective_minimum_stability_rank(req.as_str(), manifest_minimum);
+
+        if deps_core::is_existence_wildcard(req) {
+            return select_latest_for_existence_composer(versions, |v| v.as_ref(), minimum_rank);
+        }
+
+        let formatter = crate::formatter::ComposerFormatter;
+        use deps_core::lsp_helpers::EcosystemFormatter;
+
+        versions.iter().position(|v| {
+            // Always true for Composer (`abandoned` maps to `AdvisoryDeprecated`, which
+            // never blocks resolution) — kept to document the contract (#347).
+            !v.removal_status().blocks_resolution()
+                && crate::formatter::composer_version_stability_rank(v.version_string())
+                    >= minimum_rank
+                && formatter.version_satisfies_requirement(v.version_string(), req.as_str())
+        })
     }
 
     /// Searches for packages by name/keywords.
@@ -384,6 +538,24 @@ impl deps_core::Registry for PackagistRegistry {
         })
     }
 
+    /// Routes to [`PackagistRegistry::get_latest_matching_for_manifest`] — see that method
+    /// for the full priority order. This is the trait-level hook a generic LSP fetch loop
+    /// downcasting `Arc<dyn Registry>` cannot bypass by calling
+    /// [`get_latest_matching`](Self::get_latest_matching) instead (#424 S1).
+    fn get_latest_matching_with_context<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        req: &'a deps_core::VersionReq,
+        minimum_stability: Option<&'a str>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let version = self
+                .get_latest_matching_for_manifest(name.as_str(), req.as_str(), minimum_stability)
+                .await?;
+            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
+    }
+
     fn search<'a>(
         &'a self,
         query: &'a str,
@@ -414,31 +586,28 @@ impl deps_core::Registry for PackagistRegistry {
     /// are all prerelease still resolves to its newest one rather than `None`), while keeping
     /// Composer's own #347 ranking rule that `abandoned` never demotes a version.
     ///
-    /// This does not read `composer.json`'s own `minimum-stability` field (unmodeled in this
-    /// crate today) — a manifest that sets a looser project-wide default (e.g.
-    /// `"minimum-stability": "beta"`) still has its unstable releases excluded here for a
-    /// concrete requirement, unless that specific requirement is itself prerelease-bearing.
+    /// Does not read `composer.json`'s own `minimum-stability` field — this trait method has
+    /// no manifest context to read it from. A caller with a parsed manifest available should
+    /// use [`PackagistRegistry::select_latest_matching_for_manifest`] instead, which this
+    /// method is equivalent to with no manifest `minimum-stability` (`None`) (#424).
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
     ) -> Option<usize> {
-        if deps_core::is_existence_wildcard(req) {
-            return select_latest_for_existence_composer(versions, |v| v.as_ref());
-        }
+        self.select_latest_matching_impl(versions, req, None)
+    }
 
-        let formatter = crate::formatter::ComposerFormatter;
-        use deps_core::lsp_helpers::EcosystemFormatter;
-
-        let req_is_prerelease_bearing = crate::types::is_prerelease_marker(req.as_str());
-
-        versions.iter().position(|v| {
-            // Always true for Composer (`abandoned` maps to `AdvisoryDeprecated`, which
-            // never blocks resolution) — kept to document the contract (#347).
-            !v.removal_status().blocks_resolution()
-                && (req_is_prerelease_bearing || !v.is_prerelease())
-                && formatter.version_satisfies_requirement(v.version_string(), req.as_str())
-        })
+    /// Routes to [`PackagistRegistry::select_latest_matching_for_manifest`] — the trait-level
+    /// hook a generic LSP fetch loop downcasting `Arc<dyn Registry>` cannot bypass by calling
+    /// the plain `select_latest_matching` instead (#424 S1).
+    fn select_latest_matching_with_context(
+        &self,
+        versions: &[Box<dyn deps_core::Version>],
+        req: &deps_core::VersionReq,
+        minimum_stability: Option<&str>,
+    ) -> Option<usize> {
+        self.select_latest_matching_for_manifest(versions, req, minimum_stability)
     }
 
     // Packagist's `abandoned` is package-level, not per-version: `removal_status`
@@ -1091,6 +1260,622 @@ mod tests {
 
         let version = latest.expect("a prerelease-only package still exists and resolves");
         assert_eq!(version.version, "2.0.0-beta2");
+    }
+
+    // --- #424 S1: manifest-level `minimum-stability` threading ---
+
+    fn stability_fixture() -> Vec<Box<dyn deps_core::Version>> {
+        vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0-alpha1".into(),
+                version_normalized: "2.0.0.0-alpha1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "2.0.0-beta1".into(),
+                version_normalized: "2.0.0.0-beta1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.5.0".into(),
+                version_normalized: "1.5.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ]
+    }
+
+    /// #424 S1: a manifest with `minimum-stability: beta` must resolve the newest release at
+    /// or above beta (excluding alpha) as "latest", not fall back to the hardcoded
+    /// `minimum-stability: stable` default that would exclude both prereleases.
+    #[test]
+    fn test_select_latest_matching_for_manifest_honors_looser_minimum_stability() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions = stability_fixture();
+        let req = deps_core::VersionReq::new("*");
+
+        assert_eq!(
+            registry.select_latest_matching_for_manifest(&versions, &req, Some("beta")),
+            Some(1),
+            "beta release should be latest under minimum-stability: beta"
+        );
+    }
+
+    /// #424 S1: `minimum-stability: alpha` loosens the floor further still, all the way to
+    /// the newest alpha.
+    #[test]
+    fn test_select_latest_matching_for_manifest_honors_alpha_minimum_stability() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions = stability_fixture();
+        let req = deps_core::VersionReq::new("*");
+
+        assert_eq!(
+            registry.select_latest_matching_for_manifest(&versions, &req, Some("alpha")),
+            Some(0),
+            "alpha release should be latest under minimum-stability: alpha"
+        );
+    }
+
+    /// #424 S1: with no manifest `minimum-stability` (`None`), behavior must be byte-identical
+    /// to the plain trait method — the hardcoded `stable` default from #421/#422.
+    #[test]
+    fn test_select_latest_matching_for_manifest_none_matches_default() {
+        use deps_core::Registry;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions = stability_fixture();
+        let req = deps_core::VersionReq::new("*");
+
+        assert_eq!(
+            registry.select_latest_matching_for_manifest(&versions, &req, None),
+            registry.select_latest_matching(&versions, &req),
+        );
+    }
+
+    /// #424 S1: `minimum-stability: stable` (explicit, not just absent) must behave exactly
+    /// like the hardcoded default — Composer's own default value, spelled out.
+    #[test]
+    fn test_select_latest_matching_for_manifest_explicit_stable_excludes_prerelease() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions = stability_fixture();
+        let req = deps_core::VersionReq::new("*");
+
+        assert_eq!(
+            registry.select_latest_matching_for_manifest(&versions, &req, Some("stable")),
+            Some(2),
+        );
+    }
+
+    /// #424 S1: the async `get_latest_matching_for_manifest` fetch-loop entry point must
+    /// apply the same manifest stability floor as the pure list-based
+    /// `select_latest_matching_for_manifest`.
+    #[tokio::test]
+    async fn test_get_latest_matching_for_manifest_honors_looser_minimum_stability() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = PackagistRegistry::with_registry_base(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/p2/vendor/pkg.json")
+            .with_status(200)
+            .with_body(
+                r#"{"packages": {"vendor/pkg": [
+                    {"version": "2.0.0-beta1", "version_normalized": "2.0.0.0-beta1"},
+                    {"version": "1.5.0", "version_normalized": "1.5.0.0"}
+                ]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = registry
+            .get_latest_matching_for_manifest("vendor/pkg", "*", Some("beta"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            latest.expect("beta release resolves").version,
+            "2.0.0-beta1"
+        );
+    }
+
+    // --- #424 S2: per-dependency `@stability` flags ---
+
+    /// #424 S2: `^1.0@beta` must be recognized as a prerelease-bearing opt-in — a beta
+    /// release satisfying the range must resolve as latest, not be excluded by the default
+    /// stable-only filter.
+    #[test]
+    fn test_select_latest_matching_at_beta_flag_allows_beta() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "1.5.0-beta1".into(),
+                version_normalized: "1.5.0.0-beta1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.0.0".into(),
+                version_normalized: "1.0.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("^1.0@beta");
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req),
+            Some(0),
+            "beta release matching the range must resolve under an @beta opt-in"
+        );
+    }
+
+    /// #424 S2: an `@beta` opt-in permits beta but not a *looser* alpha release — the flag
+    /// sets a floor, not "allow everything unstable".
+    #[test]
+    fn test_select_latest_matching_at_beta_flag_excludes_alpha() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "1.5.0-alpha1".into(),
+                version_normalized: "1.5.0.0-alpha1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.0.0".into(),
+                version_normalized: "1.0.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("^1.0@beta");
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req),
+            Some(1),
+            "alpha release must still be excluded under an @beta opt-in"
+        );
+    }
+
+    /// #424 S2: `@stable` is recognized (parses cleanly, does not corrupt range matching) but
+    /// is not itself a prerelease-bearing opt-in — it is Composer's own default spelled out
+    /// explicitly, so an alpha/beta release must still be excluded.
+    #[test]
+    fn test_select_latest_matching_at_stable_flag_still_excludes_prerelease() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "1.5.0-beta1".into(),
+                version_normalized: "1.5.0.0-beta1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.0.0".into(),
+                version_normalized: "1.0.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("^1.0@stable");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    /// #424 tester gap: `@RC` must be exercised end-to-end through `select_latest_matching`,
+    /// not just unit-tested on `strip_stability_flag`/`composer_stability_rank` in isolation.
+    /// An RC release matching the range must resolve, but a looser beta release must not.
+    #[test]
+    fn test_select_latest_matching_at_rc_flag_allows_rc_excludes_beta() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "1.5.0-beta1".into(),
+                version_normalized: "1.5.0.0-beta1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.4.0-RC1".into(),
+                version_normalized: "1.4.0.0-RC1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.0.0".into(),
+                version_normalized: "1.0.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("^1.0@RC");
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req),
+            Some(1),
+            "RC release must resolve, but a looser beta release must still be excluded"
+        );
+    }
+
+    /// #424 tester gap: `@alpha` end-to-end — the loosest non-dev flag, so it must admit an
+    /// alpha release too (dev-* branches are already filtered out of `get_versions` entirely,
+    /// so `@alpha` and `@dev` are equivalent in practice for real numbered versions).
+    #[test]
+    fn test_select_latest_matching_at_alpha_flag_allows_alpha() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "1.5.0-alpha1".into(),
+                version_normalized: "1.5.0.0-alpha1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.0.0".into(),
+                version_normalized: "1.0.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("^1.0@alpha");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// #424 tester gap: `@dev` end-to-end — admits a real numbered alpha/beta release too,
+    /// since `@dev` ranks loosest (rank 0) and `dev-*` branch versions never reach this list.
+    #[test]
+    fn test_select_latest_matching_at_dev_flag_allows_alpha() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "1.5.0-alpha1".into(),
+                version_normalized: "1.5.0.0-alpha1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.0.0".into(),
+                version_normalized: "1.0.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("^1.0@dev");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    // --- #424 critique M1: compound requirements must not drop the `@flag` opt-in ---
+
+    /// #424 critique M1: an `@flag` inside the first OR-branch of a compound requirement
+    /// (`^1.0@beta || ^2.0`) must still be recognized, admitting a beta release matching that
+    /// branch.
+    #[test]
+    fn test_select_latest_matching_at_flag_in_or_branch() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(ComposerVersion {
+            version: "1.5.0-beta1".into(),
+            version_normalized: "1.5.0.0-beta1".into(),
+            abandoned: false,
+            published_at: None,
+        })];
+        let req = VersionReq::new("^1.0@beta || ^2.0");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// #424 critique M1: an `@flag` inside one token of a space-separated AND range
+    /// (`>=1.0@dev <2.0`) must still be recognized.
+    #[test]
+    fn test_select_latest_matching_at_flag_in_and_range() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(ComposerVersion {
+            version: "1.5.0-alpha1".into(),
+            version_normalized: "1.5.0.0-alpha1".into(),
+            abandoned: false,
+            published_at: None,
+        })];
+        let req = VersionReq::new(">=1.0@dev <2.0");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// #424 critique M1: `compound_stability_flag_rank` unit-level — confirms the loosest
+    /// flag among multiple tokens wins, and that a flag-less compound requirement yields
+    /// `None` (falling through to the next priority tier).
+    #[test]
+    fn test_compound_stability_flag_rank() {
+        assert_eq!(
+            compound_stability_flag_rank("^1.0@beta || ^2.0"),
+            Some(crate::formatter::composer_stability_rank("beta"))
+        );
+        assert_eq!(
+            compound_stability_flag_rank(">=1.0@dev <2.0"),
+            Some(crate::formatter::composer_stability_rank("dev"))
+        );
+        assert_eq!(
+            compound_stability_flag_rank("^1.0@alpha || ^2.0@RC"),
+            Some(crate::formatter::composer_stability_rank("alpha")),
+            "the loosest flag among branches must win"
+        );
+        assert_eq!(compound_stability_flag_rank("^1.0 || ^2.0"), None);
+    }
+
+    // --- #424 critique S2: separator-less short-alias (a/b) and dev, end-to-end ---
+
+    /// #424 critique S2 gap: separator-less short alias `a1`/`b1` end-to-end through
+    /// `select_latest_matching`, mirroring the existing separator-less-RC coverage.
+    #[test]
+    fn test_select_latest_matching_excludes_separatorless_short_alias() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0a1".into(),
+                version_normalized: "2.0.0a1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.5.0".into(),
+                version_normalized: "1.5.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new(">=1.0");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    /// #424 critique S2 gap: an exact separator-less short-alias pin (`2.0.0a1`) must resolve
+    /// to itself — this is the exact case that was broken pre-fix (classifiers disagreed).
+    #[test]
+    fn test_select_latest_matching_allows_separatorless_short_alias_pin_when_requirement_names_it()
+    {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0a1".into(),
+                version_normalized: "2.0.0a1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.5.0".into(),
+                version_normalized: "1.5.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("2.0.0a1");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// #424 critique S2 gap: separator-less `dev` suffix end-to-end.
+    #[test]
+    fn test_select_latest_matching_excludes_separatorless_dev_suffix() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0dev".into(),
+                version_normalized: "2.0.0dev".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.5.0".into(),
+                version_normalized: "1.5.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new(">=1.0");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    // --- #424 critique C1: v-prefixed prereleases, end-to-end (CRITICAL regression) ---
+
+    /// #424 critique C1: reproduces the live `sylius/sylius` regression — a `v`-prefixed
+    /// alpha release must not be reported as "latest" ahead of an older `v`-prefixed stable
+    /// release. Before the fix, `composer_version_stability_rank` swallowed the leading `v`
+    /// as the qualifier word itself and ranked the alpha release as stable.
+    #[test]
+    fn test_select_latest_matching_v_prefixed_alpha_excluded_by_default() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "v2.3.0-alpha.1".into(),
+                version_normalized: "2.3.0.0-alpha1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "v2.2.8".into(),
+                version_normalized: "2.2.8.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("*");
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req),
+            Some(1),
+            "v2.2.8 (stable) must resolve as latest, not the v-prefixed alpha ahead of it"
+        );
+    }
+
+    /// #424 critique C1: `symfony/*`-style data — a `v`-prefixed RC release ordered ahead of
+    /// a `v`-prefixed stable release in the version list must still be excluded by the
+    /// default stable-only filter for a concrete requirement.
+    #[test]
+    fn test_select_latest_matching_v_prefixed_rc_excluded_for_concrete_requirement() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "V3.0.0-RC1".into(),
+                version_normalized: "3.0.0.0-RC1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "v2.9.0".into(),
+                version_normalized: "2.9.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new(">=2.0");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    // --- #424 S3: separator-less prerelease suffix consistency ---
+
+    /// #424 S3: `1.0.0RC1` (no separator before `RC`) must be excluded from "latest" by the
+    /// default stable-only filter exactly like its hyphenated form `1.0.0-RC1` — classified
+    /// via the primary `is_prerelease_marker` path, independent of `version_normalized`.
+    #[test]
+    fn test_select_latest_matching_excludes_separatorless_rc_suffix() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0RC1".into(),
+                // `version_normalized` deliberately left un-hyphenated (mirrors a Packagist
+                // response that never expanded it) so the primary path must catch this alone.
+                version_normalized: "2.0.0RC1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.5.0".into(),
+                version_normalized: "1.5.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new(">=1.0");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    /// #424 S3: an exact separator-less pin (`2.0.0RC1`) must still be recognized as a
+    /// prerelease-bearing requirement and resolve to itself — mirroring the hyphenated-pin
+    /// case `test_select_latest_matching_allows_prerelease_when_requirement_names_it`.
+    #[test]
+    fn test_select_latest_matching_allows_separatorless_rc_pin_when_requirement_names_it() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.0.0RC1".into(),
+                version_normalized: "2.0.0RC1".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "1.5.0".into(),
+                version_normalized: "1.5.0.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("2.0.0RC1");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+    }
+
+    /// #424 critique N3: a dot-separated qualifier (`2.6.3.alpha`, a live `api-platform/core`
+    /// tag) must be excluded from "latest" by the default stable-only filter, exactly like the
+    /// hyphenated/separator-less forms above.
+    #[test]
+    fn test_select_latest_matching_excludes_dot_separated_alpha_suffix() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.6.3.alpha".into(),
+                version_normalized: "2.6.3.0-alpha".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "2.6.2".into(),
+                version_normalized: "2.6.2.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new(">=2.0");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+    }
+
+    /// #424 critique N3: an exact pin naming the dot-separated prerelease form directly
+    /// (`2.6.3.alpha`) must still resolve to itself — before the fix, `is_prerelease_marker`
+    /// disagreed with `composer_version_stability_rank` on this exact shape, which is the
+    /// #421 S1 failure mode (a pin that can never match its own version).
+    #[test]
+    fn test_select_latest_matching_allows_dot_separated_alpha_pin_when_requirement_names_it() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![
+            Box::new(ComposerVersion {
+                version: "2.6.3.alpha".into(),
+                version_normalized: "2.6.3.0-alpha".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+            Box::new(ComposerVersion {
+                version: "2.6.2".into(),
+                version_normalized: "2.6.2.0".into(),
+                abandoned: false,
+                published_at: None,
+            }),
+        ];
+        let req = VersionReq::new("2.6.3.alpha");
+        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
     }
 
     #[tokio::test]

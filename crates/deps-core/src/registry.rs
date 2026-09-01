@@ -144,6 +144,31 @@ pub trait Registry: Send + Sync {
         req: &'a VersionReq,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>>;
 
+    /// Like [`get_latest_matching`](Self::get_latest_matching), but lets a registry whose
+    /// "latest matching" selection can be refined by ecosystem-specific manifest state (e.g.
+    /// Composer's `minimum-stability` field, #424) read it, alongside `req`.
+    ///
+    /// `minimum_stability` is an opaque, ecosystem-defined string (Composer's own stability
+    /// keyword: `"dev"`, `"alpha"`, `"beta"`, `"RC"`, or `"stable"`) rather than a shared type,
+    /// mirroring [`get_versions_with`](Self::get_versions_with)'s
+    /// [`FreshnessSettings`](crate::freshness::FreshnessSettings) precedent for "an optional
+    /// extra parameter most registries ignore" — except here even the *shape* of the extra
+    /// context is ecosystem-specific, so no shared DTO is introduced for it; only the one
+    /// registry that understands the string overrides this method.
+    ///
+    /// Default: forwards to [`get_latest_matching`](Self::get_latest_matching), ignoring
+    /// `minimum_stability`. This keeps every registry with no manifest-level stability
+    /// concept unchanged.
+    fn get_latest_matching_with_context<'a>(
+        &'a self,
+        name: &'a PackageName,
+        req: &'a VersionReq,
+        minimum_stability: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
+        let _ = minimum_stability;
+        self.get_latest_matching(name, req)
+    }
+
     /// Searches for packages by name or keywords.
     ///
     /// Returns up to `limit` results sorted by relevance/popularity.
@@ -184,6 +209,25 @@ pub trait Registry: Send + Sync {
         _req: &VersionReq,
     ) -> Option<usize> {
         None
+    }
+
+    /// Like [`select_latest_matching`](Self::select_latest_matching), but lets a registry
+    /// whose selection can be refined by ecosystem-specific manifest state (e.g. Composer's
+    /// `minimum-stability` field, #424) read it, alongside `versions` and `req`. See
+    /// [`get_latest_matching_with_context`](Self::get_latest_matching_with_context) for why
+    /// `minimum_stability` is an opaque per-ecosystem string rather than a shared type.
+    ///
+    /// Default: forwards to [`select_latest_matching`](Self::select_latest_matching), ignoring
+    /// `minimum_stability`. This keeps every registry with no manifest-level stability concept
+    /// unchanged.
+    fn select_latest_matching_with_context(
+        &self,
+        versions: &[Box<dyn Version>],
+        req: &VersionReq,
+        minimum_stability: Option<&str>,
+    ) -> Option<usize> {
+        let _ = minimum_stability;
+        self.select_latest_matching(versions, req)
     }
 
     /// Whether [`get_versions`](Self::get_versions) results carry meaningful
