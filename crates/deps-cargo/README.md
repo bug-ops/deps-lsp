@@ -17,6 +17,8 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **crates.io registry** — Sparse index client for version lookups and package metadata
 - **Semver resolution** — Resolve `^`, `~`, `*`, and range specifiers against available versions
 - **Workspace support** — Handle `workspace.dependencies` inheritance and `version.workspace = true`
+- **Target-specific dependencies** — Parse `[target.<cfg-expr-or-triple>.dependencies]`/`.dev-dependencies`/`.build-dependencies` tables, same as top-level ones
+- **Git dependency refs** — `tag`/`branch`/`rev` keys on a git dependency populate `DependencySource::Git.rev`
 
 ## Installation
 
