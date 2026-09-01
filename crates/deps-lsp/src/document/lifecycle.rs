@@ -27,6 +27,10 @@ use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{MessageType, Uri};
 
+/// A dependency name paired with the resolved source to route its registry fetch through
+/// (spec FR-001), as built by [`dedup_dependencies_by_source`].
+type DepSources = Vec<(PackageName, deps_core::parser::DependencySource)>;
+
 /// Resolves the typed `EcosystemId` for an ecosystem trait object.
 ///
 /// `ecosystem.id()` always originates from a statically registered ecosystem
@@ -37,6 +41,78 @@ fn resolve_ecosystem_id(ecosystem: &dyn Ecosystem) -> EcosystemId {
         .id()
         .parse()
         .expect("ecosystem.id() must be a registered EcosystemId")
+}
+
+/// Pairs each distinct dependency name in `parse_result` with the source its occurrence(s)
+/// resolve to, for the background registry fetch to route through
+/// `Registry::get_versions_from`/`get_latest_matching_from` (spec FR-001).
+///
+/// Two gates, applied in order:
+///
+/// 1. **Resolvability** (closes a review-flagged leak): a dependency whose source is not
+///    resolvable at all (`!formatter.can_resolve_source(source)` — Git, Path, an unresolved
+///    `CustomRegistry` alias, ...) is dropped from the result entirely, never reaching the
+///    fetch. Without this gate, `CargoRegistry`'s (and every other source-aware registry's)
+///    `_ =>` default-to-crates.io arm would silently look up a private/unresolvable name
+///    against the ecosystem's *public* registry — exactly the leak this feature's own
+///    hover/code-actions/diagnostics gating was built to close, just reached through the
+///    highest-traffic path (the background fetch feeding inlay hints and cached
+///    diagnostics) instead.
+/// 2. **Collision** (spec FR-011): when two occurrences of the same name both resolve
+///    (gate 1 passed for both) to two *different* sources — e.g. a genuine resolution bug
+///    producing two distinct index URLs for what should be one registry — both are dropped
+///    from the map and the name is added to the returned collision set instead of being
+///    fetched. The fetch result is shared across every occurrence of a name
+///    (`FetchResult::versions` is name-keyed), so silently picking a source here would
+///    silently apply it to occurrences whose author may have intended a different
+///    registry. A `tracing::warn!` names both resolved sources, using message text
+///    distinguishable from `deps-cargo`'s own FR-003 unresolved-alias warning.
+///
+/// Returns `(sources, collided)`: `sources` is ready to fetch as-is; `collided` must be
+/// merged into `DocumentState::fetch_failed` by the caller so
+/// `generate_diagnostics_from_cache` reports "lookup could not be determined" rather than
+/// a false "Unknown package" for a dependency that was never actually queried.
+fn dedup_dependencies_by_source(
+    parse_result: &dyn deps_core::ParseResult,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> (
+    HashMap<PackageName, deps_core::parser::DependencySource>,
+    HashSet<PackageName>,
+) {
+    use std::collections::hash_map::Entry;
+
+    let mut by_name: HashMap<PackageName, deps_core::parser::DependencySource> = HashMap::new();
+    let mut collided: HashSet<PackageName> = HashSet::new();
+
+    for dep in parse_result
+        .dependencies()
+        .into_iter()
+        .filter(|dep| formatter.can_resolve_source(&dep.source()))
+    {
+        let name = dep.name().clone();
+        let source = dep.source();
+        match by_name.entry(name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(source);
+            }
+            Entry::Occupied(entry) => {
+                if *entry.get() != source && collided.insert(name.clone()) {
+                    tracing::warn!(
+                        package = %name,
+                        source_a = ?entry.get(),
+                        source_b = ?source,
+                        "dependency declared against two different resolved registries; \
+                         skipping version resolution for all occurrences"
+                    );
+                }
+            }
+        }
+    }
+
+    for name in &collided {
+        by_name.remove(name);
+    }
+    (by_name, collided)
 }
 
 /// Composer's own `minimum-stability` manifest setting, when `parse_result` is a parsed
@@ -727,7 +803,7 @@ struct FetchResult {
 )]
 async fn fetch_latest_versions_parallel(
     registry: Arc<dyn Registry>,
-    package_names: Vec<PackageName>,
+    package_sources: DepSources,
     in_use: &HashMap<PackageName, Vec<String>>,
     progress_sender: Option<ProgressSender>,
     freshness: deps_core::freshness::FreshnessSettings,
@@ -745,8 +821,8 @@ async fn fetch_latest_versions_parallel(
     let wildcard_req = deps_core::VersionReq::new("*");
     let check_yanked = registry.reports_yanked();
 
-    let results: Vec<_> = stream::iter(package_names)
-        .map(|name| {
+    let results: Vec<_> = stream::iter(package_sources)
+        .map(|(name, source)| {
             let registry = Arc::clone(&registry);
             let fetched = Arc::clone(&fetched);
             let failed = Arc::clone(&failed);
@@ -758,13 +834,18 @@ async fn fetch_latest_versions_parallel(
                 // Single round trip: the full version list is fetched once, and "latest"
                 // is a pure in-memory pick over it (`Registry::select_latest_matching`) —
                 // no second registry call, so the retained full list costs nothing extra
-                // over the network (see `PackageVersions`). `get_versions_with` rather than
-                // `get_versions`: this populates `published_at` for registries that support
-                // it (#339), matching hover's existing freshness-aware call — registries with
-                // no override forward straight to `get_versions` at zero extra cost.
-                let result =
-                    tokio::time::timeout(timeout, registry.get_versions_with(&name, freshness))
-                        .await;
+                // over the network (see `PackageVersions`). `get_versions_from` (source-
+                // aware, spec FR-001) rather than `get_versions`: this populates
+                // `published_at` for registries that support it (#339), matching hover's
+                // existing freshness-aware call, AND routes a resolved
+                // `DependencySource::AlternateRegistry` to its own index instead of the
+                // ecosystem's default registry — registries with no override forward
+                // straight to `get_versions` at zero extra cost either way.
+                let result = tokio::time::timeout(
+                    timeout,
+                    registry.get_versions_from(&name, &source, freshness),
+                )
+                .await;
 
                 let mut yanked: Option<(PackageName, ConcreteVersion, RemovalStatus)> = None;
                 let mut failed_name: Option<PackageName> = None;
@@ -833,8 +914,9 @@ async fn fetch_latest_versions_parallel(
                             // "list-based pick failed" case, not the common path.
                             let fallback = tokio::time::timeout(
                                 timeout,
-                                registry.get_latest_matching_with_context(
+                                registry.get_latest_matching_from(
                                     &name,
+                                    &source,
                                     wildcard_req,
                                     minimum_stability,
                                 ),
@@ -1155,12 +1237,13 @@ pub async fn handle_document_open(
             ))
         });
 
-        // Collect dependency names and the in-use-version map (§4.6) in one
+        // Collect dependency names+sources and the in-use-version map (§4.6) in one
         // pass while holding the reference (can't hold across await).
-        let (dep_names, in_use, minimum_stability): (
-            Vec<PackageName>,
+        let (dep_sources, in_use, minimum_stability, collided_names): (
+            DepSources,
             HashMap<PackageName, Vec<String>>,
             Option<String>,
+            HashSet<PackageName>,
         ) = {
             let doc = match state_clone.get_document(&uri_clone) {
                 Some(d) => d,
@@ -1180,14 +1263,13 @@ pub async fn handle_document_open(
             // registry fetch across all its occurrences — the result is
             // name-keyed anyway (`FetchResult::versions`), so fetching it
             // more than once would only issue wasted extra registry calls
-            // and inflate `RegistryProgress`'s total.
-            let mut seen_names = HashSet::new();
-            let dep_names = parse_result
-                .dependencies()
-                .into_iter()
-                .map(|d| d.name().clone())
-                .filter(|name| seen_names.insert(name.clone()))
-                .collect();
+            // and inflate `RegistryProgress`'s total. A non-resolvable source is
+            // dropped entirely, and two occurrences of the same name resolving to
+            // *different* sources are dropped and recorded as collided instead
+            // (spec FR-011) — see `dedup_dependencies_by_source`.
+            let (sources_map, collided_names) =
+                dedup_dependencies_by_source(parse_result, ecosystem_clone.formatter());
+            let dep_sources: Vec<_> = sources_map.into_iter().collect();
             let in_use = collect_in_use_versions(
                 parse_result,
                 &resolved_versions,
@@ -1195,10 +1277,10 @@ pub async fn handle_document_open(
                 resolve_ecosystem_id(ecosystem_clone.as_ref()),
             );
             let minimum_stability = composer_minimum_stability(parse_result);
-            (dep_names, in_use, minimum_stability)
+            (dep_sources, in_use, minimum_stability, collided_names)
         };
 
-        tracing::debug!(count = dep_names.len(), "starting registry fetch");
+        tracing::debug!(count = dep_sources.len(), "starting registry fetch");
 
         // Mark as loading and start progress
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
@@ -1208,7 +1290,11 @@ pub async fn handle_document_open(
         let (progress, progress_sender) = if state_clone.supports_progress() {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                RegistryProgress::start(client_clone.clone(), uri_clone.as_str(), dep_names.len()),
+                RegistryProgress::start(
+                    client_clone.clone(),
+                    uri_clone.as_str(),
+                    dep_sources.len(),
+                ),
             )
             .await
             {
@@ -1225,7 +1311,7 @@ pub async fn handle_document_open(
         let registry = ecosystem_clone.registry();
         let fetch_result = fetch_latest_versions_parallel(
             registry,
-            dep_names,
+            dep_sources,
             &in_use,
             progress_sender,
             freshness_settings,
@@ -1263,10 +1349,15 @@ pub async fn handle_document_open(
                     .map(|(name, v)| (formatter.normalize_package_name(&name), v))
                     .collect(),
             );
+            // `collided_names` (spec FR-011) are merged in alongside genuine fetch
+            // failures so `generate_diagnostics_from_cache` reports "lookup could not
+            // be determined" rather than a false "Unknown package" for a name that
+            // was deliberately never queried, not one that doesn't exist.
             doc.update_fetch_failed(
                 fetch_result
                     .fetch_failed
                     .into_iter()
+                    .chain(collided_names)
                     .map(|name| formatter.normalize_package_name(&name))
                     .collect(),
             );
@@ -1595,12 +1686,24 @@ pub async fn handle_document_change(
             (None, None)
         };
 
-        // Build the in-use-version map (§4.6) from the freshly-committed parse
-        // result and the resolved versions just loaded above.
-        let (in_use, minimum_stability): (HashMap<PackageName, Vec<String>>, Option<String>) =
-            match state_clone.get_document(&uri_clone) {
-                Some(doc) => match doc.parse_result() {
-                    Some(pr) => (
+        // Build the in-use-version map (§4.6) and the added/changed dependencies' resolved
+        // sources (spec FR-001/FR-011) from the freshly-committed parse result and the
+        // resolved versions just loaded above.
+        let (in_use, minimum_stability, dep_sources, collided_names): (
+            HashMap<PackageName, Vec<String>>,
+            Option<String>,
+            DepSources,
+            HashSet<PackageName>,
+        ) = match state_clone.get_document(&uri_clone) {
+            Some(doc) => match doc.parse_result() {
+                Some(pr) => {
+                    let (sources, collided_names) =
+                        dedup_dependencies_by_source(pr, ecosystem_clone.formatter());
+                    let dep_sources = deps_to_fetch
+                        .iter()
+                        .filter_map(|name| sources.get(name).map(|s| (name.clone(), s.clone())))
+                        .collect();
+                    (
                         collect_in_use_versions(
                             pr,
                             &resolved_versions,
@@ -1608,17 +1711,20 @@ pub async fn handle_document_change(
                             resolve_ecosystem_id(ecosystem_clone.as_ref()),
                         ),
                         composer_minimum_stability(pr),
-                    ),
-                    None => (HashMap::new(), None),
-                },
-                None => (HashMap::new(), None),
-            };
+                        dep_sources,
+                        collided_names,
+                    )
+                }
+                None => (HashMap::new(), None, Vec::new(), HashSet::new()),
+            },
+            None => (HashMap::new(), None, Vec::new(), HashSet::new()),
+        };
 
         // Fetch latest versions only for NEW dependencies
         let registry = ecosystem_clone.registry();
         let fetch_result = fetch_latest_versions_parallel(
             registry,
-            deps_to_fetch,
+            dep_sources,
             &in_use,
             progress_sender,
             freshness_settings,
@@ -1646,7 +1752,7 @@ pub async fn handle_document_change(
                 doc.yanked_versions
                     .insert(formatter.normalize_package_name(&name), version);
             }
-            for name in fetch_result.fetch_failed {
+            for name in fetch_result.fetch_failed.into_iter().chain(collided_names) {
                 doc.fetch_failed
                     .insert(formatter.normalize_package_name(&name));
             }
@@ -1916,6 +2022,182 @@ pub async fn ensure_document_loaded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::parser::DependencySource;
+
+    /// Pairs every name with the plain `Registry` source — the shape every pre-existing
+    /// `fetch_latest_versions_parallel` test used before that function became source-aware
+    /// (spec FR-001). Production call sites build real `(name, source)` pairs from a
+    /// parsed manifest via `dedup_dependencies_by_source` instead.
+    fn with_registry_source(names: Vec<PackageName>) -> Vec<(PackageName, DependencySource)> {
+        names
+            .into_iter()
+            .map(|name| (name, DependencySource::Registry))
+            .collect()
+    }
+
+    /// FR-011's actual collision bail-out, exercised directly against
+    /// `dedup_dependencies_by_source` (review finding #6): two occurrences of the same
+    /// name resolving to two different, both-resolvable sources must be dropped from the
+    /// result and recorded in the returned collision set — not silently picked, and not
+    /// simply absent with no trace.
+    mod dedup_by_source_collision_tests {
+        use super::*;
+        use deps_core::Dependency;
+        use deps_core::lsp_helpers::EcosystemFormatter;
+        use std::any::Any;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        /// Unlike the real `CargoFormatter`, treats *both* `Registry` and
+        /// `AlternateRegistry` as resolvable — needed so two distinct source values can
+        /// both pass gate 1 (resolvability) and reach gate 2 (collision) in the same test.
+        struct AlternateAwareFormatter;
+        impl EcosystemFormatter for AlternateAwareFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+            fn can_resolve_source(&self, source: &DependencySource) -> bool {
+                matches!(
+                    source,
+                    DependencySource::Registry | DependencySource::AlternateRegistry { .. }
+                )
+            }
+        }
+
+        struct MockDep {
+            name: PackageName,
+            source: DependencySource,
+            addr_tag: u32,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::new(
+                    Position::new(0, self.addr_tag),
+                    Position::new(0, self.addr_tag + 1),
+                )
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                None
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> DependencySource {
+                self.source.clone()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult {
+            deps: Vec<MockDep>,
+        }
+
+        impl deps_core::ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                static URI: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
+                URI.get_or_init(|| deps_core::test_util::test_uri("/test/Cargo.toml"))
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        #[test]
+        fn test_two_different_resolvable_sources_collide_and_are_dropped() {
+            let parse_result = MockParseResult {
+                deps: vec![
+                    MockDep {
+                        name: PackageName::new("shared-name"),
+                        source: DependencySource::Registry,
+                        addr_tag: 0,
+                    },
+                    MockDep {
+                        name: PackageName::new("shared-name"),
+                        source: DependencySource::AlternateRegistry {
+                            index: "https://index.mycorp.dev".into(),
+                        },
+                        addr_tag: 1,
+                    },
+                ],
+            };
+
+            let (sources, collided) =
+                dedup_dependencies_by_source(&parse_result, &AlternateAwareFormatter);
+
+            assert!(
+                !sources.contains_key(&PackageName::new("shared-name")),
+                "a colliding name must not be fetched under either source"
+            );
+            assert!(
+                collided.contains(&PackageName::new("shared-name")),
+                "the collision must be recorded so the caller can mark it fetch_failed"
+            );
+        }
+
+        #[test]
+        fn test_identical_sources_do_not_collide() {
+            let parse_result = MockParseResult {
+                deps: vec![
+                    MockDep {
+                        name: PackageName::new("shared-name"),
+                        source: DependencySource::Registry,
+                        addr_tag: 0,
+                    },
+                    MockDep {
+                        name: PackageName::new("shared-name"),
+                        source: DependencySource::Registry,
+                        addr_tag: 1,
+                    },
+                ],
+            };
+
+            let (sources, collided) =
+                dedup_dependencies_by_source(&parse_result, &AlternateAwareFormatter);
+
+            assert!(collided.is_empty());
+            assert_eq!(
+                sources.get(&PackageName::new("shared-name")),
+                Some(&DependencySource::Registry)
+            );
+        }
+
+        /// Gate 1 (Critical review finding #1): a non-resolvable source is dropped
+        /// entirely, never reaching the fetch — this is what prevents a Git/Path
+        /// dependency's name from being looked up against the ecosystem's default
+        /// registry via the background fetch's routing default arm.
+        #[test]
+        fn test_non_resolvable_source_is_dropped_not_fetched() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("local-fork"),
+                    source: DependencySource::Path {
+                        path: "../local-fork".into(),
+                    },
+                    addr_tag: 0,
+                }],
+            };
+
+            let (sources, collided) =
+                dedup_dependencies_by_source(&parse_result, &AlternateAwareFormatter);
+
+            assert!(sources.is_empty());
+            assert!(collided.is_empty());
+        }
+    }
 
     // Generic tests (no feature flag required)
 
@@ -2070,7 +2352,7 @@ mod tests {
         // Use 1 second timeout for test speed
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -2156,7 +2438,7 @@ mod tests {
         let start = std::time::Instant::now();
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -2273,7 +2555,7 @@ mod tests {
 
         fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -2413,7 +2695,7 @@ mod tests {
         // Use 1 second timeout for test speed
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -2534,7 +2816,7 @@ mod tests {
 
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -2665,7 +2947,7 @@ mod tests {
 
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -2786,7 +3068,7 @@ mod tests {
 
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             FreshnessSettings::default(),
@@ -2900,7 +3182,7 @@ mod tests {
 
         let result = fetch_latest_versions_parallel(
             Arc::clone(&registry) as Arc<dyn Registry>,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -3013,7 +3295,7 @@ mod tests {
 
         let result = fetch_latest_versions_parallel(
             Arc::clone(&registry) as Arc<dyn Registry>,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -3110,7 +3392,7 @@ mod tests {
 
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -3190,7 +3472,7 @@ mod tests {
         // Should not panic, just return empty result
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -3284,7 +3566,7 @@ mod tests {
 
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -3361,7 +3643,7 @@ mod tests {
 
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -3440,7 +3722,7 @@ mod tests {
 
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -3515,7 +3797,7 @@ mod tests {
         // 1s timeout for test speed.
         let result = fetch_latest_versions_parallel(
             registry,
-            packages,
+            with_registry_source(packages),
             &HashMap::new(),
             None,
             deps_core::freshness::FreshnessSettings::default(),
@@ -4179,7 +4461,7 @@ dependencies = ["requests>=2.0.0"]
             let registry: Arc<dyn Registry> = Arc::new(MockYankedRegistry { pinned_version });
             let fetch_result = fetch_latest_versions_parallel(
                 registry,
-                dep_names,
+                with_registry_source(dep_names),
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6424,7 +6706,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6452,7 +6734,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6478,7 +6760,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6512,7 +6794,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6546,7 +6828,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6580,7 +6862,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6616,7 +6898,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6668,7 +6950,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6702,7 +6984,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6736,7 +7018,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6781,7 +7063,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6811,7 +7093,7 @@ tokio = "1.0"
             // 1 second timeout for test speed.
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &in_use,
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6919,7 +7201,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),
@@ -6944,7 +7226,7 @@ tokio = "1.0"
 
             let result = fetch_latest_versions_parallel(
                 registry,
-                vec![PackageName::new("pkg")],
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
                 &HashMap::new(),
                 None,
                 deps_core::freshness::FreshnessSettings::default(),

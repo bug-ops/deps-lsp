@@ -1,9 +1,10 @@
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 
 /// Maximum crate name length this diagnostic accepts.
 ///
-/// Deliberately stricter than `registry::is_safe_crate_name`'s 128-byte cap: that
+/// Deliberately stricter than `sparse::is_safe_crate_name`'s 128-byte cap: that
 /// predicate only needs to guarantee a name is safe to splice into a sparse-index
 /// URL, while this constant approximates crates.io's actual publish-time limit for
 /// the "Invalid package name" diagnostic below — a name between 65 and 128 bytes
@@ -42,8 +43,8 @@ impl EcosystemFormatter for CargoFormatter {
     /// crates.io accepts only non-empty names starting with an ASCII letter or `_`,
     /// followed by ASCII alphanumeric characters plus `-`/`_`, up to `MAX_NAME_LENGTH`
     /// characters. The base charset+non-empty check reuses
-    /// `registry::is_safe_crate_name_charset` — the same predicate
-    /// `registry::is_safe_crate_name` builds on for the sparse-index URL-injection
+    /// `sparse::is_safe_crate_name_charset` — the same predicate
+    /// `sparse::is_safe_crate_name` builds on for the sparse-index URL-injection
     /// gate — rather than duplicating it. This method deliberately calls the
     /// charset-only variant, not `is_safe_crate_name` itself: that function also
     /// bundles in a 128-byte URL-safety cap unrelated to crates.io's real naming
@@ -59,7 +60,7 @@ impl EcosystemFormatter for CargoFormatter {
     /// of the generic "Unknown package" a registry-side lookup failure produces
     /// (#382).
     ///
-    /// The charset check (via `registry::is_safe_crate_name_charset`) and the
+    /// The charset check (via `sparse::is_safe_crate_name_charset`) and the
     /// leading-character check both run before the length check, so a name that is
     /// both non-ASCII and longer than `MAX_NAME_LENGTH` chars (e.g. a repeated CJK
     /// name) reports the charset violation rather than a misleading "too long" —
@@ -76,7 +77,7 @@ impl EcosystemFormatter for CargoFormatter {
         if name.is_empty() {
             return Err(InvalidPackageName::new("name cannot be empty"));
         }
-        if !crate::registry::is_safe_crate_name_charset(name) {
+        if !crate::sparse::is_safe_crate_name_charset(name) {
             return Err(InvalidPackageName::new(
                 "name must contain only ASCII letters, digits, '-', or '_'",
             ));
@@ -110,6 +111,28 @@ impl EcosystemFormatter for CargoFormatter {
     /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
     fn strict_semver_prerelease_exclusion(&self) -> bool {
         true
+    }
+
+    /// Extends the default (crates.io-only) resolvability to a resolved
+    /// [`DependencySource::AlternateRegistry`] too — `CargoRegistry` (the value behind
+    /// `CargoEcosystem::registry()`) routes that source to the alternate index's own
+    /// [`crate::sparse::SparseIndexClient`], so it is exactly as resolvable as a plain
+    /// [`DependencySource::Registry`] dependency, just against a different index (spec
+    /// FR-016).
+    fn can_resolve_source(&self, source: &DependencySource) -> bool {
+        matches!(
+            source,
+            DependencySource::Registry | DependencySource::AlternateRegistry { .. }
+        )
+    }
+
+    /// Suppresses the hover heading's crates.io link for any source other than plain
+    /// [`DependencySource::Registry`] (spec FR-014) — an `AlternateRegistry` dependency
+    /// resolves against a different index entirely, so [`Self::package_url`]'s crates.io
+    /// link would point at an unrelated (or simply nonexistent) public crate once live
+    /// version data from the real registry renders beside it.
+    fn suppress_package_url(&self, source: &DependencySource) -> bool {
+        !matches!(source, DependencySource::Registry)
     }
 }
 
@@ -231,8 +254,8 @@ mod tests {
         );
     }
 
-    /// Regression: `validate_package_name` must use `registry::is_safe_crate_name_charset`
-    /// (charset only), not `registry::is_safe_crate_name` (charset + a 128-byte
+    /// Regression: `validate_package_name` must use `sparse::is_safe_crate_name_charset`
+    /// (charset only), not `sparse::is_safe_crate_name` (charset + a 128-byte
     /// URL-safety cap unrelated to this diagnostic) — a charset-valid name over 128
     /// bytes must reach this method's own `MAX_NAME_LENGTH` check and report "too
     /// long", not the wrong "invalid characters" reason from the bundled-length

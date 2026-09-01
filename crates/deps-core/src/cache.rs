@@ -486,6 +486,56 @@ impl HttpCache {
         self.get_cached_with_headers_via(url, &[], &client).await
     }
 
+    /// Like [`Self::get_cached_trusted_origin`], but additionally injects `extra_headers`
+    /// (e.g. an `Authorization` bearer token) into every request — the authenticated
+    /// counterpart to [`Self::get_cached_with_headers`], composed with the same
+    /// origin-pinned redirect policy [`Self::get_cached_trusted_origin`] uses.
+    ///
+    /// This exists specifically so a header carrying a credential can never survive a
+    /// cross-origin redirect hop: [`Self::get_cached_with_headers`] attaches
+    /// `extra_headers` to the *initial* request only and follows reqwest's default
+    /// (same-scheme, any-host) redirect policy for every hop after that, which is
+    /// exactly the shape a hostile or misconfigured redirect on the resolved index
+    /// itself could exploit to exfiltrate a bearer token to an attacker-controlled
+    /// host. Composing `Self::client_for_origin`'s pinned-origin client with header
+    /// injection closes that by construction — no empirical redirect test is needed
+    /// to prove the header cannot leak, since the client stops following before a
+    /// cross-origin hop would ever be sent.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached_trusted_origin`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use deps_core::cache::HttpCache;
+    /// use reqwest::header;
+    ///
+    /// # async fn example() -> deps_core::error::Result<()> {
+    /// let cache = HttpCache::new();
+    /// let data = cache
+    ///     .get_cached_trusted_origin_with_headers(
+    ///         "https://index.mycorp.dev/se/rd/serde",
+    ///         "https://index.mycorp.dev/",
+    ///         &[(header::AUTHORIZATION, "Bearer secret-token")],
+    ///     )
+    ///     .await?;
+    /// println!("Fetched {} bytes", data.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_cached_trusted_origin_with_headers(
+        &self,
+        url: &str,
+        trusted_origin: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+    ) -> Result<Bytes> {
+        let client = self.client_for_origin(trusted_origin);
+        self.get_cached_with_headers_via(url, extra_headers, &client)
+            .await
+    }
+
     async fn get_cached_with_headers_via(
         &self,
         url: &str,
@@ -1175,6 +1225,76 @@ mod tests {
         // Assert via `matches!` rather than debug-formatting `result` in a panic message:
         // on the `Ok` arm that value is the raw response body, which would otherwise be
         // written to the test log by the panic machinery.
+        assert!(
+            matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
+            "expected HttpStatus(302)"
+        );
+        escape.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_trusted_origin_with_headers_sends_extra_header() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+
+        let _m = server
+            .mock("GET", "/api/data")
+            .match_header("authorization", "Bearer secret-token")
+            .with_status(200)
+            .with_body("authenticated data")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let url = format!("{}/api/data", server.url());
+        let result: Bytes = cache
+            .get_cached_trusted_origin_with_headers(
+                &url,
+                &trusted_origin,
+                &[(header::AUTHORIZATION, "Bearer secret-token")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.as_ref(), b"authenticated data");
+    }
+
+    // The security property this method exists for: a credential header must never survive
+    // a cross-origin redirect hop, proven the same way the unauthenticated trusted-origin
+    // test proves it (the escape origin is never contacted at all) rather than by asserting
+    // the header was merely absent on a request that did land.
+    #[tokio::test]
+    async fn test_get_cached_trusted_origin_with_headers_stops_cross_origin_redirect() {
+        let mut trusted_server = mockito::Server::new_async().await;
+        let mut other_server = mockito::Server::new_async().await;
+
+        let trusted_origin = format!("{}/", trusted_server.url());
+        let escape_target = format!("{}/api/stolen", other_server.url());
+
+        let _redirect = trusted_server
+            .mock("GET", "/api/source")
+            .with_status(302)
+            .with_header("location", &escape_target)
+            .create_async()
+            .await;
+        let escape = other_server
+            .mock("GET", "/api/stolen")
+            .with_status(200)
+            .with_body("must not be returned")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let source_url = format!("{}/api/source", trusted_server.url());
+        let result: Result<Bytes> = cache
+            .get_cached_trusted_origin_with_headers(
+                &source_url,
+                &trusted_origin,
+                &[(header::AUTHORIZATION, "Bearer secret-token")],
+            )
+            .await;
+
         assert!(
             matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
             "expected HttpStatus(302)"

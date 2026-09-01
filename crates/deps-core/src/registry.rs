@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::parser::DependencySource;
 use crate::{ConcreteVersion, PackageName, VersionReq};
 use std::any::Any;
 use std::pin::Pin;
@@ -112,6 +113,32 @@ pub trait Registry: Send + Sync {
         self.get_versions(name)
     }
 
+    /// Like [`get_versions_with`](Self::get_versions_with), but additionally carries the
+    /// dependency's resolved [`DependencySource`], for a registry that routes a single
+    /// fetch across more than one underlying index (e.g. `deps-cargo`'s `CargoRegistry`,
+    /// which dispatches a `DependencySource::AlternateRegistry` to a private sparse index
+    /// instead of crates.io).
+    ///
+    /// Default: forwards to [`get_versions_with`](Self::get_versions_with), ignoring
+    /// `source` entirely. This keeps every registry with no per-dependency routing concept
+    /// — every ecosystem except Cargo today — bit-identical: `source` is accepted and
+    /// dropped, so a caller migrating to this method from `get_versions_with` changes no
+    /// observable behavior for them.
+    ///
+    /// Callers that know which source a dependency resolved to should call this rather
+    /// than [`get_versions_with`](Self::get_versions_with), even against a registry with no
+    /// override — the whole point is that call sites don't need to know which registries
+    /// route on source and which don't.
+    fn get_versions_from<'a>(
+        &'a self,
+        name: &'a PackageName,
+        source: &'a DependencySource,
+        freshness: crate::freshness::FreshnessSettings,
+    ) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
+        let _ = source;
+        self.get_versions_with(name, freshness)
+    }
+
     /// Finds the latest version matching a version requirement.
     ///
     /// Filter with [`RemovalStatus::blocks_resolution`], never with
@@ -167,6 +194,30 @@ pub trait Registry: Send + Sync {
     ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
         let _ = minimum_stability;
         self.get_latest_matching(name, req)
+    }
+
+    /// Like [`get_latest_matching_with_context`](Self::get_latest_matching_with_context),
+    /// but additionally carries the dependency's resolved [`DependencySource`] — the
+    /// `get_latest_matching`-shaped counterpart to
+    /// [`get_versions_from`](Self::get_versions_from), covering the fallback path a caller
+    /// takes when the list-based pick fails on a non-empty [`get_versions_from`](Self::get_versions_from)
+    /// result (see `deps_core::lsp_helpers::hover`'s `list_fallback_latest` and
+    /// `deps-lsp`'s background-fetch fallback for the two call sites this exists for).
+    ///
+    /// Default: forwards to
+    /// [`get_latest_matching_with_context`](Self::get_latest_matching_with_context),
+    /// ignoring `source` — every registry with no per-dependency routing concept stays
+    /// bit-identical, exactly as [`get_versions_from`](Self::get_versions_from) does for the
+    /// list-fetching side.
+    fn get_latest_matching_from<'a>(
+        &'a self,
+        name: &'a PackageName,
+        source: &'a DependencySource,
+        req: &'a VersionReq,
+        minimum_stability: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
+        let _ = source;
+        self.get_latest_matching_with_context(name, req, minimum_stability)
     }
 
     /// Searches for packages by name or keywords.
