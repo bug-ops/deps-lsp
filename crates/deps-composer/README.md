@@ -18,6 +18,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Version resolution** — Composer-specific version matching (`^`, `~`, `*`, `||`, ranges)
 - **Platform filtering** — Excludes `php`, `ext-*`, and `lib-*` pseudo-packages from registry lookups
 - **Case-insensitive names** — Package names normalized to lowercase (`vendor/package`)
+- **Stability-aware version selection** — "Latest version" excludes alpha/beta/RC releases by default (matching Composer's `minimum-stability: stable`), unless overridden by `composer.json`'s `minimum-stability` field or a per-dependency `@stability` flag (`^1.0@beta`); a wildcard requirement still resolves a prerelease-only package
 
 > [!NOTE]
 > Composer's tilde operator has different semantics from npm: `~1.2` means `>=1.2.0 <2.0.0` (not `>=1.2.0 <1.3.0`).
