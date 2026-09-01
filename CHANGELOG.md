@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Breaking (pre-1.0, public API)**: `PackageVersions::yanked` field type changed from `Arc<[ConcreteVersion]>` to `Arc<[(ConcreteVersion, RemovalStatus)]>`, carrying each yanked/deprecated version's `RemovalStatus` (resolves #437) (#438)
-- **deps-npm, deps-composer**: `AdvisoryDeprecated` no longer feeds the manifest-requirement yanked diagnostic; the #205 package-level deprecation diagnostic is now its sole signal (resolves #436)
+- **deps-npm, deps-composer**: `AdvisoryDeprecated` no longer feeds the manifest-requirement yanked diagnostic; the #205 package-level deprecation diagnostic is now its sole signal (resolves #436) (#439)
 
 ### Fixed
 - **deps-core, deps-lsp**: the "requirement satisfiable only by a yanked version" diagnostic no longer lets a co-occurring package-level deprecation finding hide a genuine hard yank (resolves #437) (#438)
