@@ -13,22 +13,22 @@ workspace = true
 
 [dependencies]
 deps-core = { workspace = true }
+regex.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tower-lsp-server.workspace = true
 tracing.workspace = true
-regex.workspace = true
-semver.workspace = true
 urlencoding.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 deps-core = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tokio-test.workspace = true
-tempfile.workspace = true
-criterion.workspace = true
 url.workspace = true
 
 [[bench]]

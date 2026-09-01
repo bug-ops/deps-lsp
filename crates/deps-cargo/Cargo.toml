@@ -36,9 +36,9 @@ url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true, features = ["html_reports"] }
 deps-cargo = { path = ".", features = ["test-util"] }
 deps-core = { workspace = true, features = ["test-util"] }
-criterion = { workspace = true, features = ["html_reports"] }
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }

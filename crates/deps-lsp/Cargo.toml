@@ -39,19 +39,19 @@ deno = ["dep:deps-deno"]
 
 [dependencies]
 # Internal crates
-deps-core = { workspace = true }
+deps-bundler = { workspace = true, optional = true }
 deps-cargo = { workspace = true, optional = true }
 deps-composer = { workspace = true, optional = true }
-deps-deno = { workspace = true, optional = true }
-deps-npm = { workspace = true, optional = true }
-deps-pypi = { workspace = true, optional = true }
-deps-go = { workspace = true, optional = true }
-deps-bundler = { workspace = true, optional = true }
+deps-core = { workspace = true }
 deps-dart = { workspace = true, optional = true }
-deps-maven = { workspace = true, optional = true }
+deps-deno = { workspace = true, optional = true }
+deps-go = { workspace = true, optional = true }
 deps-gradle = { workspace = true, optional = true }
-deps-swift = { workspace = true, optional = true }
+deps-maven = { workspace = true, optional = true }
+deps-npm = { workspace = true, optional = true }
 deps-nuget = { workspace = true, optional = true }
+deps-pypi = { workspace = true, optional = true }
+deps-swift = { workspace = true, optional = true }
 
 # External dependencies
 dashmap = { workspace = true }
@@ -65,8 +65,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
-deps-core = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
+deps-core = { workspace = true, features = ["test-util"] }
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }

@@ -15,15 +15,15 @@ workspace = true
 bytes = { workspace = true }
 dashmap = { workspace = true }
 deps-core = { workspace = true }
-reqwest = { workspace = true }
 regex = { workspace = true }
+reqwest = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread"] }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
