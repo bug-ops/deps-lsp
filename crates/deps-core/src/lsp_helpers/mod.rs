@@ -1024,17 +1024,26 @@ pub trait EcosystemFormatter: Send + Sync {
     /// at all for this ecosystem.
     ///
     /// Default `true` — no restriction, every requirement shape is checked. Override to
-    /// `false` for a requirement shape where this ecosystem's `Version::removal_status()` is
-    /// not a genuine per-version signal. `NpmFormatter` and `ComposerFormatter` restrict this to
-    /// exact-pin requirements: npm's yanked flag is sourced from `deprecated`
-    /// (`NpmVersion::deprecated`), and Composer's from `abandoned`
-    /// (`ComposerVersion::abandoned`) — both are commonly package-wide (a live-verified
-    /// npm package had 126/126 versions marked deprecated), so evaluating a range
-    /// requirement against them would flag every dependency on a deprecated/abandoned
-    /// package under this diagnostic's wording, conflating it with package-level
-    /// deprecation — a distinct diagnostic ([`Self::deprecated_message`], issue #205).
-    /// Restricting to an exact pin keeps this diagnostic scoped to #247's actual scenario:
-    /// "you are pinned to this one specific version, and it has been yanked."
+    /// `false` for a requirement shape (or, returning `false` unconditionally, for every
+    /// requirement) where this diagnostic would duplicate a more specific one, or where this
+    /// ecosystem's `Version::removal_status()` is not a reliable enough per-version signal.
+    /// This is independent of
+    /// [`Registry::reports_yanked`](crate::Registry::reports_yanked): that flag gates whether
+    /// `removal_status()` data is trusted at all (and thus whether the separate #263
+    /// in-use-version yanked check runs), while this hook only narrows *this* diagnostic.
+    ///
+    /// `DenoFormatter` restricts this to exact-pin requirements — its `jsr:`/`npm:`
+    /// specifiers share npm's package-wide deprecation semantics — see that formatter's docs.
+    /// `NpmFormatter` returns `false` unconditionally (#436): npm's `AdvisoryDeprecated` is
+    /// genuinely per-version but commonly applied package-wide, so even an exact pin would
+    /// often just duplicate the dedicated package-level deprecation diagnostic
+    /// ([`Self::deprecated_message`], issue #205); npm keeps `reports_yanked() == true`; so the
+    /// #263 in-use-version check stays live. `ComposerFormatter` does not override this hook
+    /// at all — it opts out at the registry level instead
+    /// ([`Registry::reports_yanked`](crate::Registry::reports_yanked) `== false`, pre-dating
+    /// #436, independently justified by #233 R2): Packagist's `abandoned` is package-level via
+    /// p2 minified inheritance, so its yanked map is never populated and this hook has nothing
+    /// to restrict.
     ///
     /// # Examples
     ///

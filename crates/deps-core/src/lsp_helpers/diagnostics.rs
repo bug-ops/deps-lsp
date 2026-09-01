@@ -681,9 +681,12 @@ pub fn generate_diagnostics_from_cache(
 
         // Same source-resolvability guard as `unsatisfiable` above — only meaningful once a
         // requirement is known to match *something* in `available` (see `requirement_is_unsatisfiable`).
-        // `yanked_diagnostic_applies_to` additionally opts an ecosystem out for a requirement
-        // shape where `removal_status()` is not a genuine per-version signal (npm/Composer
-        // restrict to exact pins — see that method's docs). Skipped entirely when the in-use-version
+        // `yanked_diagnostic_applies_to` additionally opts an ecosystem out of *this specific*
+        // diagnostic for a requirement shape (or, npm, unconditionally, #436) where it would
+        // duplicate a more specific one or where `removal_status()` isn't a reliable enough
+        // per-version signal — see that method's docs. Independent of the #263 in-use-version
+        // check just above, which reads `versions.yanked` directly and is unaffected by this
+        // hook. Skipped entirely when the in-use-version
         // check above already pushed a yanked diagnostic for this dependency (see
         // `yanked_263_diagnostic_pushed`), so the two checks never double-report — but,
         // critically (#437 S1), NOT skipped merely because the #263 check was D5-suppressed:

@@ -642,6 +642,7 @@ serde = "1.0.0"
     mod npm_tests {
         use super::*;
         use crate::document::DocumentState;
+        use deps_core::EcosystemFormatter;
 
         #[tokio::test]
         async fn test_handle_diagnostics() {
@@ -664,6 +665,142 @@ serde = "1.0.0"
             let (client, full_config) = create_test_client_and_config();
             let _result = handle_diagnostics(state, &uri, &config, client, full_config).await;
             // Test passes if no panic occurs
+        }
+
+        /// #436 S1 regression: after #436 narrowed npm's fix to only suppress the
+        /// manifest-requirement-level yanked diagnostic (`NpmFormatter::yanked_diagnostic_applies_to`
+        /// now unconditionally `false`), the independent #263 in-use-version yanked diagnostic
+        /// must still fire through the real `DocumentState` -> `Ecosystem::generate_diagnostics`
+        /// -> `generate_diagnostics_from_cache` path — the same live path the LSP server
+        /// actually calls, using the real `NpmFormatter`/`NpmRegistry`-backed npm ecosystem
+        /// (not a generic `MockRegistry`).
+        ///
+        /// Mirrors the canonical `npm deprecate left-pad@"<1.0.2" "..."` scenario: the
+        /// manifest declares a range (`^1.0.0`), `latest` (1.0.2) is clean, but the
+        /// lockfile-resolved in-use version (1.0.1) is flagged. This is exactly the coverage
+        /// the critic's S1 finding said `Registry::reports_yanked() == false` would have
+        /// silently killed had npm's first #436 pass gone unrevised.
+        #[tokio::test]
+        async fn test_handle_diagnostics_in_use_version_yanked_still_fires_post_436() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let content = r#"{"dependencies": {"left-pad": "^1.0.0"}}"#.to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
+
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                "left-pad".into(),
+                deps_core::PackageVersions {
+                    latest: "1.0.2".into(),
+                    available: std::sync::Arc::from(vec![
+                        "1.0.2".into(),
+                        "1.0.1".into(),
+                        "1.0.0".into(),
+                    ]),
+                    yanked: std::sync::Arc::from(Vec::new()),
+                    published_at: None,
+                },
+            );
+            doc_state.update_cached_versions(cached);
+
+            // Lockfile resolves the "^1.0.0" range to the old, flagged 1.0.1 — `latest`
+            // itself is clean, so this is only reachable via the lockfile-resolved
+            // in-use-version check (#263), not the manifest-requirement check (#247).
+            let mut resolved = std::collections::HashMap::new();
+            resolved.insert("left-pad".into(), "1.0.1".into());
+            doc_state.update_resolved_versions(resolved);
+
+            let mut yanked_versions = std::collections::HashMap::new();
+            yanked_versions.insert(
+                "left-pad".to_string(),
+                ("1.0.1".into(), deps_core::RemovalStatus::AdvisoryDeprecated),
+            );
+            doc_state.update_yanked_versions(yanked_versions);
+
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "expected exactly one diagnostic, got {result:?}"
+            );
+            assert_eq!(
+                result[0].severity,
+                Some(tower_lsp_server::ls_types::DiagnosticSeverity::WARNING)
+            );
+            assert_eq!(
+                result[0].message,
+                format!("{} (1.0.1)", deps_npm::NpmFormatter.yanked_message())
+            );
+        }
+
+        /// #436 S1 companion: the manifest-requirement-level yanked diagnostic (#247) must
+        /// stay suppressed for npm even for an exact-pin requirement — the one shape the
+        /// pre-#436 restriction still let through. Deliberately isolated from the #263 path
+        /// (no `resolved_versions`/`yanked_versions` set) so this proves
+        /// `NpmFormatter::yanked_diagnostic_applies_to`'s unconditional `false` is doing real
+        /// work here, not merely benefiting from the `yanked_263_diagnostic_pushed` dedup
+        /// guard the sibling test above would also satisfy on its own.
+        #[tokio::test]
+        async fn test_handle_diagnostics_manifest_requirement_yanked_stays_suppressed_for_exact_pin()
+         {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let config = DiagnosticsConfig::default();
+
+            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            // Bare exact pin (npm's ordinary package.json style, no `=` marker) — the
+            // shape `yanked_diagnostic_applies_to` still allowed through pre-#436.
+            let content = r#"{"dependencies": {"old-pkg": "1.0.1"}}"#.to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &uri)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
+
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                "old-pkg".into(),
+                deps_core::PackageVersions {
+                    // The pin is satisfiable only by a flagged version — pre-#436, this
+                    // exact shape fired the #247 "yanked" diagnostic.
+                    latest: "1.0.1".into(),
+                    available: std::sync::Arc::from(vec!["1.0.1".into()]),
+                    yanked: std::sync::Arc::from(vec![(
+                        "1.0.1".into(),
+                        deps_core::RemovalStatus::AdvisoryDeprecated,
+                    )]),
+                    published_at: None,
+                },
+            );
+            doc_state.update_cached_versions(cached);
+            // No `resolved_versions`/`yanked_versions` — the #263 in-use-version path has
+            // nothing to match against, isolating this assertion to the #247 path alone.
+            state.update_document(uri.clone(), doc_state);
+
+            let (client, full_config) = create_test_client_and_config();
+            let result = handle_diagnostics(state, &uri, &config, client, full_config).await;
+
+            assert!(
+                result.is_empty(),
+                "expected no diagnostics for an exact pin satisfiable only by a flagged \
+                 version — the #247 manifest-requirement diagnostic must stay suppressed for \
+                 npm regardless of requirement shape (#436), got {result:?}"
+            );
         }
     }
 

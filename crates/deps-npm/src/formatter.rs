@@ -153,20 +153,24 @@ impl EcosystemFormatter for NpmFormatter {
         true
     }
 
-    /// Restricts the yanked-only-match diagnostic to an exact-pin requirement.
+    /// Disables the manifest-requirement-level "requirement satisfiable only by a yanked
+    /// version" diagnostic entirely (#436, follow-up to #205's plan.md §6): unconditionally
+    /// `false`, for every requirement shape, not only ranges.
     ///
-    /// npm's `Version::removal_status()` is sourced from `deprecated` (`NpmVersion::deprecated`),
-    /// which `npm deprecate` sets per-version but is routinely applied to *every* published
+    /// npm's `Version::removal_status()` is genuinely per-version data (`npm deprecate` can
+    /// target one version), but `npm deprecate` is routinely applied to *every* published
     /// version of a package at once (live-verified: the `request` package has all 126/126
-    /// versions marked deprecated) — a package-level signal, not a true per-version yank.
-    /// Evaluating a range requirement (`^1.0`, `~2.3.0`) against it would flag every
-    /// dependency on such a package with this diagnostic's "yanked" wording, conflating it
-    /// with package-level deprecation, which is a distinct diagnostic
-    /// ([`EcosystemFormatter::deprecated_message`], issue #205). `node_semver::Version::parse`
-    /// succeeds only for a bare version string,
-    /// never a range/caret/tilde/wildcard, so it doubles as the exact-pin test.
-    fn yanked_diagnostic_applies_to(&self, requirement: &VersionReq) -> bool {
-        node_semver::Version::parse(requirement.as_str().trim()).is_ok()
+    /// versions marked deprecated) — common enough that this diagnostic would frequently
+    /// duplicate the dedicated package-level deprecation diagnostic
+    /// ([`EcosystemFormatter::deprecated_message`], issue #205), including for an exact-pin
+    /// requirement (the case this hook used to still allow through). This does not touch
+    /// [`Registry::reports_yanked`](deps_core::Registry::reports_yanked), which npm keeps at
+    /// its default `true`: the independent in-use-version yanked check (#263,
+    /// `crates/deps-core/src/lsp_helpers/diagnostics.rs`) reads real per-version data and
+    /// stays live — e.g. a lockfile-pinned old version flagged by `npm deprecate pkg@"<1.2.3"`
+    /// while `latest` is clean still surfaces its own "yanked" diagnostic.
+    fn yanked_diagnostic_applies_to(&self, _requirement: &VersionReq) -> bool {
+        false
     }
 }
 
@@ -412,24 +416,16 @@ mod tests {
         );
     }
 
+    /// #436: the manifest-requirement-level yanked diagnostic never applies to npm, for
+    /// any requirement shape — including an exact pin, which the pre-#436 exact-pin
+    /// restriction used to still allow through.
     #[test]
-    fn test_yanked_diagnostic_applies_to_exact_pin() {
+    fn test_yanked_diagnostic_applies_to_always_false() {
         let formatter = NpmFormatter;
-        assert!(formatter.yanked_diagnostic_applies_to(&VersionReq::new("1.2.3")));
-    }
-
-    /// S1 regression: a range/caret/tilde requirement must not trigger the yanked-only-match
-    /// diagnostic, since npm's `removal_status()` is sourced from `deprecated`, which is commonly
-    /// applied to every published version of a package at once — a range requirement would
-    /// flag every dependency on such a package, conflating this diagnostic with package-level
-    /// deprecation (issue #205).
-    #[test]
-    fn test_yanked_diagnostic_applies_to_rejects_ranges() {
-        let formatter = NpmFormatter;
-        for requirement in ["^1.2.3", "~1.2.3", ">=1.0.0 <2.0.0", "*", "1.x"] {
+        for requirement in ["1.2.3", "^1.2.3", "~1.2.3", ">=1.0.0 <2.0.0", "*", "1.x"] {
             assert!(
                 !formatter.yanked_diagnostic_applies_to(&VersionReq::new(requirement)),
-                "expected {requirement:?} to be rejected as not an exact pin"
+                "expected {requirement:?} to be rejected"
             );
         }
     }
