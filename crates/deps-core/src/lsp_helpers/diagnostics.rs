@@ -739,7 +739,7 @@ pub fn generate_diagnostics_from_cache(
             && formatter.can_resolve_source(&dep.source()))
         .then(|| dep.version_requirement())
         .flatten()
-        .filter(|version_req| formatter.yanked_diagnostic_applies_to(version_req))
+        .filter(|version_req| formatter.yanked_diagnostic_applies_to(dep, version_req))
         .and_then(|version_req| {
             requirement_matches_only_yanked(
                 formatter,

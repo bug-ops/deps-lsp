@@ -1,5 +1,5 @@
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
-use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Precise npm semver range matcher, compiled once per dependency by
 /// [`NpmFormatter::compile_requirement`].
@@ -169,7 +169,11 @@ impl EcosystemFormatter for NpmFormatter {
     /// `crates/deps-core/src/lsp_helpers/diagnostics.rs`) reads real per-version data and
     /// stays live — e.g. a lockfile-pinned old version flagged by `npm deprecate pkg@"<1.2.3"`
     /// while `latest` is clean still surfaces its own "yanked" diagnostic.
-    fn yanked_diagnostic_applies_to(&self, _requirement: &VersionReq) -> bool {
+    fn yanked_diagnostic_applies_to(
+        &self,
+        _dep: &dyn Dependency,
+        _requirement: &VersionReq,
+    ) -> bool {
         false
     }
 }
@@ -421,10 +425,21 @@ mod tests {
     /// restriction used to still allow through.
     #[test]
     fn test_yanked_diagnostic_applies_to_always_false() {
+        use crate::types::{NpmDependency, NpmDependencySection};
+
         let formatter = NpmFormatter;
         for requirement in ["1.2.3", "^1.2.3", "~1.2.3", ">=1.0.0 <2.0.0", "*", "1.x"] {
+            // Mirrors the sole call site (`crate::lsp_helpers::diagnostics::generate_diagnostics_from_cache`),
+            // where `requirement` is always `dep.version_requirement().unwrap()`.
+            let dep = NpmDependency {
+                name: PackageName::new("lodash"),
+                name_range: tower_lsp_server::ls_types::Range::default(),
+                version_req: Some(VersionReq::new(requirement)),
+                version_range: None,
+                section: NpmDependencySection::Dependencies,
+            };
             assert!(
-                !formatter.yanked_diagnostic_applies_to(&VersionReq::new(requirement)),
+                !formatter.yanked_diagnostic_applies_to(&dep, &VersionReq::new(requirement)),
                 "expected {requirement:?} to be rejected"
             );
         }

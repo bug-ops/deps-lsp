@@ -485,21 +485,25 @@ would independently find a yanked verdict, but `generate_diagnostics_from_cache`
 check once the in-use-version check has already emitted a diagnostic for the same
 dependency, so only one yanked diagnostic is ever shown per dependency.
 
-- **npm and Composer are restricted to exact-pin requirements.** Both source their yanked
-  flag from a package-wide signal — npm's from `deprecated` (live-verified: the `request`
-  package has 126/126 versions marked deprecated), Composer's from `abandoned` — not a true
-  per-version yank. Evaluating a range requirement against either would flag every dependency
-  on a deprecated/abandoned package under this diagnostic's wording, which is a distinct
-  diagnostic — see [Package Deprecation Diagnostics](#package-deprecation-diagnostics-issue-205)
-  below. A bare exact pin (`"1.2.3"`, not `"^1.2.3"`) is unaffected by that ambiguity, so the
-  check still applies there.
+- **npm is disabled entirely; Composer is restricted to exact-pin requirements.** Both source
+  their yanked flag from a package-wide signal — npm's from `deprecated` (live-verified: the
+  `request` package has 126/126 versions marked deprecated), Composer's from `abandoned` — not
+  a true per-version yank, which is why this is a distinct diagnostic from [Package
+  Deprecation Diagnostics](#package-deprecation-diagnostics-issue-205) below rather than the
+  same one. For npm, evaluating *any* requirement shape against that package-wide signal —
+  including a bare exact pin — would too often just duplicate the package-level deprecation
+  diagnostic, so this check is unconditionally off for npm (resolves #436); this also covers
+  Deno's `npm:` specifiers, which delegate to npm's own registry data (resolves #448). For
+  Composer, evaluating a range requirement against it would flag every dependency on an
+  abandoned package, so a bare exact pin (`"1.2.3"`, not `"^1.2.3"`) is unaffected by that
+  ambiguity and the check still applies there.
 
 **Ecosystem coverage, live-verified per registry rather than assumed from code:**
 
 | Ecosystem | Works today? | Source |
 | --------- | ------------- | ------ |
 | Cargo | Yes | sparse index `yanked` field |
-| npm | Yes, exact pins only | `deprecated` (see restriction above) |
+| npm | No | `deprecated` exists but the check is unconditionally off (see restriction above) |
 | PyPI | Yes | PEP 592 `yanked` |
 | Composer | Yes, exact pins only | `abandoned` (see restriction above) |
 | Dart | Yes | pub.dev `retracted` |
@@ -509,11 +513,12 @@ dependency, so only one yanked diagnostic is ever shown per dependency.
 | Gradle | No | reuses Maven Central's registry client, same hardcoded `false` |
 | NuGet | No | `NuGetVersion::is_yanked` is a hardcoded `false` constant |
 | Swift | No | `SwiftVersion.yanked` is a field that is always `false` for GitHub tags (no such concept in the source) |
-| Deno | Yes, exact pins only | JSR `meta.json` per-version `yanked` for `jsr:` specifiers; npm `deprecated` (see restriction above) for `npm:` specifiers |
+| Deno | `jsr:` yes, exact pins only; `npm:` no | JSR `meta.json` per-version `yanked` for `jsr:` specifiers; npm `deprecated` (unconditionally off, see restriction above) for `npm:` specifiers |
 
-6 of 12 ecosystems can produce this diagnostic today; the other 6 have no real yanked signal
-to source it from (three are architecturally impossible — no such registry concept exists —
-and Go's is a fixable but separate gap).
+5 of 12 ecosystems can produce this diagnostic today; npm is disabled by design rather than
+lacking a real signal (see restriction above), and that also covers Deno's `npm:` specifiers;
+the remaining 6 have no real yanked signal to source it from (three are architecturally
+impossible — no such registry concept exists — and Go's is a fixable but separate gap).
 
 ### Package Deprecation Diagnostics (issue #205)
 
