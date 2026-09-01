@@ -111,7 +111,7 @@ impl deps_core::ParseResult for NpmParseResult {
 /// assert_eq!(result.dependencies[0].name, "express");
 /// ```
 pub fn parse_package_json(content: &str, uri: &Uri) -> Result<NpmParseResult> {
-    let root: Value = serde_json::from_str(content)?;
+    let root: Value = deps_core::parse_json_checked(content.as_bytes())?;
 
     // Build line offset table once for O(log n) position lookups
     let line_table = LineOffsetTable::new(content);
@@ -394,6 +394,30 @@ mod tests {
         let json = "{ invalid json }";
         let result = parse_package_json(json, &test_uri());
         assert!(matches!(result, Err(deps_core::DepsError::Json(_))));
+    }
+
+    #[test]
+    fn test_parse_deeply_nested_json_rejected_before_parse() {
+        // #430: a deeply nested `package.json` must be rejected by the depth
+        // guard rather than handed to `serde_json::from_str`. Reported as
+        // `DepsError::Json`, the same variant a genuinely malformed
+        // `package.json` produces (unified via `deps_core::parse_json_checked`).
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        let result = parse_package_json(&json, &test_uri());
+        assert!(matches!(result, Err(deps_core::DepsError::Json(_))));
+    }
+
+    #[test]
+    fn test_parse_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"dependencies": {{}}, "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        let result = parse_package_json(&json, &test_uri());
+        assert!(result.is_ok());
     }
 
     #[test]

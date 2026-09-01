@@ -415,10 +415,10 @@ where
 /// GitHub returns an error object instead of array when rate-limited or on
 /// other errors. Detect this and return a descriptive error.
 fn parse_tags_page(data: &[u8]) -> Result<Vec<GithubTag>> {
-    match serde_json::from_slice(data) {
+    match deps_core::parse_json_checked(data) {
         Ok(tags) => Ok(tags),
         Err(_) => {
-            if let Ok(err) = serde_json::from_slice::<GithubErrorResponse>(data) {
+            if let Ok(err) = deps_core::parse_json_checked::<GithubErrorResponse>(data) {
                 Err(DepsError::CacheError(format!(
                     "GitHub API error: {}",
                     err.message
@@ -489,7 +489,7 @@ struct GithubRelease {
 /// (newest) release seen for a given normalized tag — the deterministic collision
 /// policy for the rare case of two releases pointing at the same tag (#223 M2).
 fn parse_releases_page(data: &[u8]) -> Option<HashMap<String, PublishTime>> {
-    let releases: Vec<GithubRelease> = serde_json::from_slice(data).ok()?;
+    let releases: Vec<GithubRelease> = deps_core::parse_json_checked(data).ok()?;
     let mut dates = HashMap::new();
     for release in releases {
         if release.draft {
@@ -568,7 +568,7 @@ struct SearchItem {
 
 /// Parses GitHub search API response into SwiftPackage list.
 fn parse_search_response(data: &[u8]) -> Result<Vec<SwiftPackage>> {
-    let response: SearchResponse = serde_json::from_slice(data)?;
+    let response: SearchResponse = deps_core::parse_json_checked(data)?;
     Ok(response
         .items
         .into_iter()

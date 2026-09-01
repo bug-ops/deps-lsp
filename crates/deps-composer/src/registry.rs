@@ -465,7 +465,8 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
 
 /// Parses Packagist v2 API response JSON.
 fn parse_package_metadata(name: &str, data: &[u8]) -> Result<Vec<ComposerVersion>> {
-    let response: PackagistResponse = serde_json::from_slice(data).map_err(DepsError::Json)?;
+    let response: PackagistResponse =
+        deps_core::parse_json_checked(data).map_err(DepsError::Json)?;
 
     // Packagist uses lowercase package names as keys
     let key = name.to_lowercase();
@@ -496,7 +497,7 @@ struct SearchResult {
 
 /// Parses Packagist search API response.
 fn parse_search_response(data: &[u8]) -> Result<Vec<ComposerPackage>> {
-    let response: SearchResponse = serde_json::from_slice(data).map_err(DepsError::Json)?;
+    let response: SearchResponse = deps_core::parse_json_checked(data).map_err(DepsError::Json)?;
 
     Ok(response
         .results
@@ -931,6 +932,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_search_response_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"results": [], "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_search_response(json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_search_response_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"results": [], "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_search_response(json.as_bytes()).is_err());
+    }
+
+    #[test]
     fn test_parse_package_metadata() {
         let json = r#"{
   "packages": {
@@ -951,6 +974,19 @@ mod tests {
         let versions = parse_package_metadata("monolog/monolog", json.as_bytes()).unwrap();
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].version, "3.0.0");
+    }
+
+    #[test]
+    fn test_parse_package_metadata_deeply_nested_json_rejected_before_parse() {
+        // #430: a deeply nested `abandoned` value must be rejected by the
+        // depth guard rather than handed to `serde_json::from_slice`.
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let deeply_nested = format!(
+            r#"{{"packages":{{"monolog/monolog":[{{"version":"3.0.0","abandoned":{}1{}}}]}}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_package_metadata("monolog/monolog", deeply_nested.as_bytes()).is_err());
     }
 
     #[test]

@@ -422,11 +422,12 @@ fn parse_sort_key(version: &str, is_pseudo: bool) -> Option<semver::Version> {
 
 /// Parses JSON version info from `/@v/{version}.info` or `/@latest` endpoint.
 fn parse_version_info(module_path: &str, data: &[u8]) -> Result<GoVersion> {
-    let info: VersionInfo = serde_json::from_slice(data).map_err(|e| DepsError::ApiResponse {
-        package: module_path.to_string(),
-        registry: REGISTRY,
-        source: e,
-    })?;
+    let info: VersionInfo =
+        deps_core::parse_json_checked(data).map_err(|e| DepsError::ApiResponse {
+            package: module_path.to_string(),
+            registry: REGISTRY,
+            source: e,
+        })?;
 
     let is_pseudo = is_pseudo_version(&info.version);
     Ok(GoVersion {
@@ -595,6 +596,28 @@ mod tests {
         let json = b"not json";
         let result = parse_version_info("github.com/gin-gonic/gin", json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_version_info_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"Version": "v1.0.0", "Time": "2024-01-01T00:00:00Z", "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_version_info("github.com/gin-gonic/gin", json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_version_info_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"Version": "v1.0.0", "Time": "2024-01-01T00:00:00Z", "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_version_info("github.com/gin-gonic/gin", json.as_bytes()).is_err());
     }
 
     #[test]

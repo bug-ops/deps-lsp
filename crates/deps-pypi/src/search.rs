@@ -480,11 +480,12 @@ where
 /// up to [`MAX_INDEX_ENTRIES`] names is CPU-bound work that must not sit on the
 /// async runtime.
 fn parse_index(body: &[u8]) -> Result<PackageIndex> {
-    let index: SimpleIndex = serde_json::from_slice(body).map_err(|e| DepsError::ApiResponse {
-        package: "<pypi-simple-index>".to_string(),
-        registry: REGISTRY,
-        source: e,
-    })?;
+    let index: SimpleIndex =
+        deps_core::parse_json_checked(body).map_err(|e| DepsError::ApiResponse {
+            package: "<pypi-simple-index>".to_string(),
+            registry: REGISTRY,
+            source: e,
+        })?;
 
     let mut names = index.projects;
     names.sort_unstable();
@@ -676,6 +677,28 @@ mod tests {
     #[test]
     fn test_parse_index_malformed_json() {
         assert!(parse_index(b"not json").is_err());
+    }
+
+    #[test]
+    fn test_parse_index_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"projects": [], "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_index(json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_index_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"projects": [], "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_index(json.as_bytes()).is_err());
     }
 
     #[test]

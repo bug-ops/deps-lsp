@@ -377,7 +377,7 @@ impl OsvClient {
             }
         };
 
-        let parsed: OsvBatchResponse = match serde_json::from_slice(&response_bytes) {
+        let parsed: OsvBatchResponse = match crate::parser::parse_json_checked(&response_bytes) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to parse OSV batch response");
@@ -579,7 +579,7 @@ impl OsvClient {
     async fn fetch_single_record(&self, id: &str) -> Option<OsvVulnRecord> {
         let url = self.vuln_record_url(id);
         match self.cache.get_transport_only(&url).await {
-            Ok(bytes) => match serde_json::from_slice::<OsvVulnRecord>(&bytes) {
+            Ok(bytes) => match crate::parser::parse_json_checked::<OsvVulnRecord>(&bytes) {
                 Ok(record) => Some(record),
                 Err(e) => {
                     tracing::warn!(id, error = %e, "failed to parse OSV vulnerability record");
@@ -614,7 +614,7 @@ impl OsvClient {
             }
         };
 
-        match serde_json::from_slice::<OsvSingleQueryResponse>(&bytes) {
+        match crate::parser::parse_json_checked::<OsvSingleQueryResponse>(&bytes) {
             Ok(resp) => Some(resp),
             Err(e) => {
                 tracing::warn!(dep = %target.key, error = %e, "failed to parse OSV single-package response");
@@ -805,6 +805,37 @@ mod tests {
 
         assert!(matches!(
             outcomes.get("a"),
+            Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn scan_deeply_nested_batch_json_skips_whole_chunk() {
+        // #430 hardening: a `database_specific`/`ecosystem_specific`-shaped
+        // deeply nested array must be rejected by the depth guard before
+        // `serde_json::from_slice` ever sees it, degrading like any other
+        // malformed response — an earlier, cheaper rejection than
+        // `serde_json`'s own built-in recursion limit would give.
+        let (mut server, client) = mock_client().await;
+        let deeply_nested = format!(
+            "{}1{}",
+            "[".repeat(crate::parser::MAX_JSON_NESTING_DEPTH + 1),
+            "]".repeat(crate::parser::MAX_JSON_NESTING_DEPTH + 1)
+        );
+        let _m = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"results":[{{"vulns":[{{"id":"ADV-1","modified":"2023-01-01T00:00:00Z","database_specific":{deeply_nested}}}]}}]}}"#
+            ))
+            .create_async()
+            .await;
+
+        let targets = vec![target("pkg", "1.0.0")];
+        let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
+
+        assert!(matches!(
+            outcomes.get("pkg"),
             Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
         ));
     }

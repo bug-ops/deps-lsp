@@ -51,9 +51,9 @@ pub use lsp_helpers::{
 };
 pub use package::{InvalidPackageName, PackageName, VersionReq};
 pub use parser::{
-    DependencySource, LoadingState, MAX_TOML_NESTING_DEPTH, MAX_YAML_EXPANDED_BYTES,
-    MAX_YAML_NESTING_DEPTH, check_toml_nesting_depth, check_yaml_expansion,
-    check_yaml_nesting_depth,
+    DependencySource, LoadingState, MAX_JSON_NESTING_DEPTH, MAX_TOML_NESTING_DEPTH,
+    MAX_YAML_EXPANDED_BYTES, MAX_YAML_NESTING_DEPTH, check_json_nesting_depth,
+    check_toml_nesting_depth, check_yaml_expansion, check_yaml_nesting_depth, parse_json_checked,
 };
 pub use registry::{
     Metadata, Registry, RemovalStatus, Version, find_latest_stable, has_default_prerelease_marker,

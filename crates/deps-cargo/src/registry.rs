@@ -325,7 +325,7 @@ fn parse_index_json(data: &[u8], _crate_name: &str) -> Result<Vec<CargoVersion>>
         .lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| {
-            let entry: IndexEntry = serde_json::from_str(line).ok()?;
+            let entry: IndexEntry = deps_core::parse_json_checked(line.as_bytes()).ok()?;
             let parsed = entry.version.parse::<Version>().ok()?;
             let published_at = entry
                 .pubtime
@@ -371,7 +371,7 @@ struct SearchCrate {
 
 /// Parses JSON response from crates.io search API.
 fn parse_search_response(data: &[u8]) -> Result<Vec<CrateInfo>> {
-    let response: SearchResponse = serde_json::from_slice(data)?;
+    let response: SearchResponse = deps_core::parse_json_checked(data)?;
 
     Ok(response
         .crates
@@ -702,6 +702,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_index_json_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"vers":"1.0.0","extra":{}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_index_json_nesting_over_max_depth_line_skipped() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"vers":"1.0.0","extra":{}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        let versions = parse_index_json(json.as_bytes(), "test").unwrap();
+        assert_eq!(versions.len(), 0);
+    }
+
+    #[test]
     fn test_parse_search_response_empty() {
         let json = r#"{"crates": []}"#;
         let results = parse_search_response(json.as_bytes()).unwrap();
@@ -724,6 +748,28 @@ mod tests {
         assert_eq!(results[0].name, "minimal");
         assert_eq!(results[0].description, None);
         assert_eq!(results[0].repository, None);
+    }
+
+    #[test]
+    fn test_parse_search_response_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"crates": [], "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_search_response(json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_search_response_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"crates": [], "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_search_response(json.as_bytes()).is_err());
     }
 
     #[test]

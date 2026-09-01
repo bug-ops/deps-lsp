@@ -225,7 +225,7 @@ impl NuGetRegistry {
         self.service_index
             .get_or_try_init(|| async {
                 let data = self.cache.get_cached(&self.service_index_url).await?;
-                let response: ServiceIndexResponse = serde_json::from_slice(&data)?;
+                let response: ServiceIndexResponse = deps_core::parse_json_checked(&data)?;
                 ServiceIndex::resolve(&response)
             })
             .await
@@ -337,7 +337,7 @@ impl NuGetRegistry {
         trusted_prefix: &str,
     ) -> HashMap<String, PublishTime> {
         let mut times = HashMap::new();
-        let Ok(index) = serde_json::from_slice::<RegistrationIndex>(index_body) else {
+        let Ok(index) = deps_core::parse_json_checked::<RegistrationIndex>(index_body) else {
             return times;
         };
 
@@ -370,7 +370,8 @@ impl NuGetRegistry {
                     else {
                         continue;
                     };
-                    let Ok(parsed) = serde_json::from_slice::<RegistrationPageBody>(&body) else {
+                    let Ok(parsed) = deps_core::parse_json_checked::<RegistrationPageBody>(&body)
+                    else {
                         continue;
                     };
                     accumulate_catalog_entries(&mut times, &mut collected, &parsed.items);
@@ -480,7 +481,7 @@ pub fn search_url(base: &str, query: &str, limit: usize) -> String {
 
 /// Parses a flat-container `index.json` response into descending-sorted versions.
 pub fn parse_flat_container(data: &[u8]) -> Result<Vec<NuGetVersion>> {
-    let parsed: FlatContainerIndex = serde_json::from_slice(data)?;
+    let parsed: FlatContainerIndex = deps_core::parse_json_checked(data)?;
 
     let mut versions = parsed.versions;
     // Sort locally, descending: the flat container's observed ascending order is not a
@@ -544,7 +545,7 @@ fn pick_latest_matching(versions: Vec<NuGetVersion>, req: &str) -> Option<NuGetV
 }
 
 fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<PackageInfo>> {
-    let response: SearchResponse = serde_json::from_slice(data)?;
+    let response: SearchResponse = deps_core::parse_json_checked(data)?;
 
     Ok(response
         .data

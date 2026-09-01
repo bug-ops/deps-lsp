@@ -99,7 +99,7 @@ impl PubDevRegistry {
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
         let url = format!("{}/search?q={}", self.base, urlencoding::encode(query));
         let data = self.cache.get_cached(&url).await?;
-        let search_result: SearchResponse = serde_json::from_slice(&data)?;
+        let search_result: SearchResponse = deps_core::parse_json_checked(&data)?;
 
         let mut results = Vec::new();
         for entry in search_result.packages.into_iter().take(limit) {
@@ -171,7 +171,7 @@ struct SearchEntry {
 }
 
 fn parse_versions_response(data: &[u8]) -> Result<Vec<DartVersion>> {
-    let response: PackageResponse = serde_json::from_slice(data)?;
+    let response: PackageResponse = deps_core::parse_json_checked(data)?;
 
     let mut versions: Vec<DartVersion> = response
         .versions
@@ -192,7 +192,7 @@ fn parse_versions_response(data: &[u8]) -> Result<Vec<DartVersion>> {
 }
 
 fn parse_package_info(data: &[u8]) -> Result<PackageInfo> {
-    let response: PackageResponse = serde_json::from_slice(data)?;
+    let response: PackageResponse = deps_core::parse_json_checked(data)?;
     let pubspec = response.latest.pubspec.unwrap_or(PubspecMeta {
         name: Some(response.name.clone()),
         description: None,

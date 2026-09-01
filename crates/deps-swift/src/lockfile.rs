@@ -79,8 +79,8 @@ impl LockFileProvider for SwiftLockParser {
 
             let content = read_lockfile_content(lockfile_path, "Package.resolved").await?;
 
-            let lock_data: PackageResolved =
-                serde_json::from_str(&content).map_err(|e| DepsError::ParseError {
+            let lock_data: PackageResolved = deps_core::parse_json_checked(content.as_bytes())
+                .map_err(|e| DepsError::ParseError {
                     file_type: "Package.resolved".into(),
                     source: Box::new(e),
                 })?;
@@ -285,6 +285,38 @@ mod tests {
         let parser = SwiftLockParser;
         let result = parser.parse_lockfile(&path).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let content = format!(
+            r#"{{"version": 1, "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Package.resolved");
+        tokio::fs::write(&path, &content).await.unwrap();
+
+        let parser = SwiftLockParser;
+        assert!(parser.parse_lockfile(&path).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let content = format!(
+            r#"{{"version": 1, "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Package.resolved");
+        tokio::fs::write(&path, &content).await.unwrap();
+
+        let parser = SwiftLockParser;
+        assert!(parser.parse_lockfile(&path).await.is_err());
     }
 
     #[tokio::test]
