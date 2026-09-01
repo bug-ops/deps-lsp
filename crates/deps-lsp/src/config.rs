@@ -104,6 +104,7 @@ impl Default for InlayHintsConfig {
 /// - `unknown_severity`: `WARNING` - Dependencies not found in registry
 /// - `yanked_severity`: `WARNING` - Dependencies using yanked versions
 /// - `unsatisfiable_severity`: `WARNING` - Dependencies whose requirement matches zero published versions
+/// - `deprecated_severity`: `WARNING` - Dependencies on a package the registry reports as deprecated/abandoned
 ///
 /// # Examples
 ///
@@ -116,6 +117,7 @@ impl Default for InlayHintsConfig {
 ///     unknown_severity: DiagnosticSeverity::ERROR,
 ///     yanked_severity: DiagnosticSeverity::ERROR,
 ///     unsatisfiable_severity: DiagnosticSeverity::ERROR,
+///     deprecated_severity: DiagnosticSeverity::ERROR,
 ///     vulnerabilities_enabled: true,
 /// };
 ///
@@ -131,6 +133,14 @@ pub struct DiagnosticsConfig {
     pub yanked_severity: DiagnosticSeverity,
     #[serde(default = "default_unsatisfiable_severity")]
     pub unsatisfiable_severity: DiagnosticSeverity,
+    /// Severity for a dependency on a package the registry reports as
+    /// deprecated/abandoned (issue #205). No corresponding `deprecated_enabled`
+    /// toggle: unlike `vulnerabilities_enabled`, this signal is derived from
+    /// already-fetched data (zero new registry requests — see #205's plan §1
+    /// D2), so a boolean would gate only string formatting, not a network
+    /// call. Matches the severity-only precedent set by the four fields above.
+    #[serde(default = "default_deprecated_severity")]
+    pub deprecated_severity: DiagnosticSeverity,
     /// Whether to run the OSV.dev vulnerability scan and render its
     /// diagnostics/hover content. Default `true` (opt-out): `cargo audit`/
     /// `npm audit` run by default, and an opt-in gate would undercut the
@@ -146,6 +156,7 @@ impl Default for DiagnosticsConfig {
             unknown_severity: default_unknown_severity(),
             yanked_severity: default_yanked_severity(),
             unsatisfiable_severity: default_unsatisfiable_severity(),
+            deprecated_severity: default_deprecated_severity(),
             vulnerabilities_enabled: true,
         }
     }
@@ -166,6 +177,7 @@ impl DiagnosticsConfig {
     /// assert_eq!(severities.unknown, config.unknown_severity);
     /// assert_eq!(severities.yanked, config.yanked_severity);
     /// assert_eq!(severities.unsatisfiable, config.unsatisfiable_severity);
+    /// assert_eq!(severities.deprecated, config.deprecated_severity);
     /// ```
     #[must_use]
     pub const fn to_severities(&self) -> deps_core::DiagnosticSeverities {
@@ -174,6 +186,7 @@ impl DiagnosticsConfig {
             unknown: self.unknown_severity,
             yanked: self.yanked_severity,
             unsatisfiable: self.unsatisfiable_severity,
+            deprecated: self.deprecated_severity,
         }
     }
 }
@@ -330,6 +343,10 @@ const fn default_yanked_severity() -> DiagnosticSeverity {
 }
 
 const fn default_unsatisfiable_severity() -> DiagnosticSeverity {
+    DiagnosticSeverity::WARNING
+}
+
+const fn default_deprecated_severity() -> DiagnosticSeverity {
     DiagnosticSeverity::WARNING
 }
 
@@ -598,7 +615,8 @@ mod tests {
             "outdated_severity": 1,
             "unknown_severity": 2,
             "yanked_severity": 2,
-            "unsatisfiable_severity": 1
+            "unsatisfiable_severity": 1,
+            "deprecated_severity": 1
         }"#;
 
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
@@ -606,6 +624,7 @@ mod tests {
         assert_eq!(config.unknown_severity, DiagnosticSeverity::WARNING);
         assert_eq!(config.yanked_severity, DiagnosticSeverity::WARNING);
         assert_eq!(config.unsatisfiable_severity, DiagnosticSeverity::ERROR);
+        assert_eq!(config.deprecated_severity, DiagnosticSeverity::ERROR);
     }
 
     #[test]
@@ -616,6 +635,18 @@ mod tests {
         let json = r"{}";
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.unsatisfiable_severity, DiagnosticSeverity::WARNING);
+    }
+
+    /// D8/O3: no `deprecated_enabled` toggle exists — severity is the only knob, matching
+    /// the other four fields' precedent (deprecation adds no network call).
+    #[test]
+    fn test_diagnostics_config_deprecated_severity_defaults_warning() {
+        let config = DiagnosticsConfig::default();
+        assert_eq!(config.deprecated_severity, DiagnosticSeverity::WARNING);
+
+        let json = r"{}";
+        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.deprecated_severity, DiagnosticSeverity::WARNING);
     }
 
     #[test]

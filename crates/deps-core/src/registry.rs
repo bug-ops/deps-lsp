@@ -403,6 +403,42 @@ impl RemovalStatus {
     }
 }
 
+/// Package-level deprecation/abandonment payload: why a package is deprecated, and what
+/// to use instead.
+///
+/// Distinct from [`RemovalStatus`], which answers *"may resolution select this
+/// version"*. `Deprecation` answers *"what should the user be told"* — the reason text
+/// and/or a registry-supplied replacement package name. Kept as a separate type rather
+/// than a payload-carrying `RemovalStatus` variant: `RemovalStatus` is `Copy`, returned
+/// from `const fn`s, and matched in every ecosystem crate, so widening it would ripple
+/// everywhere for a concept that only a couple of registries expose.
+///
+/// Both fields are `None` when the registry has nothing to say beyond "deprecated" —
+/// e.g. Packagist's bare `"abandoned": true`, with no replacement named.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::Deprecation;
+///
+/// let deprecation = Deprecation {
+///     reason: Some("no longer maintained".into()),
+///     replacement: Some("some-other/package".into()),
+/// };
+///
+/// assert_eq!(deprecation.reason.as_deref(), Some("no longer maintained"));
+/// assert_eq!(deprecation.replacement.as_deref(), Some("some-other/package"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deprecation {
+    /// Free-text reason the registry gives for the deprecation, if any.
+    pub reason: Option<String>,
+    /// Registry-supplied replacement package name, if any. Only ever populated from a
+    /// structured registry field (never regex-extracted from free text — see #205's
+    /// typosquatting rationale), so it is safe to offer as a rename target.
+    pub replacement: Option<String>,
+}
+
 /// Version information trait.
 ///
 /// All version types must implement this to work with generic handlers.
@@ -416,6 +452,15 @@ pub trait Version: Send + Sync {
     /// yank/deprecation signal need no override.
     fn removal_status(&self) -> RemovalStatus {
         RemovalStatus::Available
+    }
+
+    /// Package-level deprecation payload, when this version's registry data carries one.
+    ///
+    /// Default `None` — the `Option` is the capability gate: an ecosystem that never
+    /// overrides this produces no deprecation diagnostic/hover/quickfix at all, rather
+    /// than depending on a separate "does this ecosystem report deprecation" predicate.
+    fn deprecation(&self) -> Option<&Deprecation> {
+        None
     }
 
     /// Whether this version is a pre-release (alpha, beta, rc, etc.).

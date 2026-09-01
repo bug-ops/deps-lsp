@@ -70,6 +70,7 @@ pub enum ComposerSection {
 ///     version: "6.0.0".into(),
 ///     version_normalized: "6.0.0.0".into(),
 ///     abandoned: false,
+///     deprecation: None,
 ///     published_at: None,
 /// };
 ///
@@ -80,6 +81,11 @@ pub struct ComposerVersion {
     pub version: deps_core::ConcreteVersion,
     pub version_normalized: String,
     pub abandoned: bool,
+    /// Package-level deprecation payload (issue #205), derived from Packagist's
+    /// `abandoned` field. `Some(Deprecation { reason: None, replacement: None })` for a
+    /// bare `"abandoned": true`; `replacement` populated when `abandoned` names a
+    /// successor package. `None` only when `abandoned` is absent/`false`/`null`.
+    pub deprecation: Option<deps_core::Deprecation>,
     /// Publish timestamp, parsed from the p2 entry's own `time` field.
     ///
     /// Taken only from the entry itself, never inherited from a previous
@@ -210,6 +216,7 @@ deps_core::impl_version!(ComposerVersion {
         is_prerelease_marker(v.version.as_str())
             || deps_core::has_default_prerelease_marker(&v.version_normalized)
     },
+    deprecation: |v: &ComposerVersion| v.deprecation.as_ref(),
 });
 
 /// Package metadata from Packagist search.
@@ -285,6 +292,7 @@ mod tests {
             version: "2.0.0".into(),
             version_normalized: "2.0.0.0".into(),
             abandoned: true,
+            deprecation: None,
             published_at: None,
         };
 
@@ -296,6 +304,37 @@ mod tests {
         assert!(!version.removal_status().blocks_resolution());
     }
 
+    /// #205: `Version::deprecation()` reads the dedicated field, independent of the
+    /// `removal_status`-driving `abandoned` bool.
+    #[test]
+    fn test_composer_version_deprecation_accessor() {
+        let with_payload = ComposerVersion {
+            version: "2.0.0".into(),
+            version_normalized: "2.0.0.0".into(),
+            abandoned: true,
+            deprecation: Some(deps_core::Deprecation {
+                reason: None,
+                replacement: Some("other/package".to_string()),
+            }),
+            published_at: None,
+        };
+        assert_eq!(
+            with_payload
+                .deprecation()
+                .and_then(|d| d.replacement.as_deref()),
+            Some("other/package")
+        );
+
+        let without_payload = ComposerVersion {
+            version: "1.0.0".into(),
+            version_normalized: "1.0.0.0".into(),
+            abandoned: false,
+            deprecation: None,
+            published_at: None,
+        };
+        assert!(without_payload.deprecation().is_none());
+    }
+
     #[test]
     fn test_composer_version_short_stability_alias_is_prerelease() {
         // Regression test for #327 M2: Composer's short "-a"/"-b" stability
@@ -305,12 +344,14 @@ mod tests {
             version: "1.0.0-a1".into(),
             version_normalized: "1.0.0.0-alpha1".into(),
             abandoned: false,
+            deprecation: None,
             published_at: None,
         };
         let beta = ComposerVersion {
             version: "1.0.0-b1".into(),
             version_normalized: "1.0.0.0-beta1".into(),
             abandoned: false,
+            deprecation: None,
             published_at: None,
         };
         assert!(alpha.is_prerelease());
@@ -337,6 +378,7 @@ mod tests {
                 version: name.into(),
                 version_normalized: name.into(), // no expansion happened
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             };
             assert_eq!(
@@ -461,6 +503,7 @@ mod tests {
             version: "2.0.0RC1".into(),
             version_normalized: "2.0.0RC1".into(),
             abandoned: false,
+            deprecation: None,
             published_at: None,
         };
         assert!(version.is_prerelease());
@@ -472,6 +515,7 @@ mod tests {
             version: "6.0.0".into(),
             version_normalized: "6.0.0.0".into(),
             abandoned: false,
+            deprecation: None,
             published_at: None,
         };
         assert!(!version.is_prerelease());

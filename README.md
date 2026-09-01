@@ -17,7 +17,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Version hints** — Inlay hints showing latest available versions
 - **Loading indicators** — Visual feedback during registry fetches with LSP progress support
 - **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved, composer.lock
-- **Diagnostics** — Warnings for outdated, unknown, yanked, or unsatisfiable-requirement dependencies
+- **Diagnostics** — Warnings for outdated, unknown, yanked, unsatisfiable-requirement, or deprecated/abandoned dependencies
 - **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
 - **Release-freshness signal** — Flags a "latest" version still within a cooldown window in hover and completion, mirroring GitHub Dependabot's default 3-day package cooldown
 - **Hover information** — Package descriptions with resolved version from lock file
@@ -248,6 +248,7 @@ Configure via LSP initialization options:
     "unknown_severity": "warning",
     "yanked_severity": "warning",
     "unsatisfiable_severity": "warning",
+    "deprecated_severity": "warning",
     "vulnerabilities_enabled": true
   },
   "freshness": {
@@ -277,6 +278,9 @@ Configure via LSP initialization options:
 
 > [!NOTE]
 > `diagnostics.outdated_severity`, `diagnostics.unknown_severity`, `diagnostics.unsatisfiable_severity`, and `diagnostics.yanked_severity` are all honored end-to-end. The yanked diagnostic fires in two independent cases (never both at once for the same dependency): (1) the dependency's in-use version — lock-file-resolved, or an exact pin such as `requirements.txt`'s `==1.2.3` — is itself reported as yanked/deprecated/retracted, supported for **Cargo, npm, PyPI, Bundler, and Dart**; or (2) the dependency's declared version *requirement* (a range) is currently satisfiable only by yanked versions, even with no lock file at all. See [Yanked Version Diagnostic](docs/ECOSYSTEM_GUIDE.md#yanked-version-diagnostic) for exact semantics and per-ecosystem coverage of each case (RubyGems cannot be detected by either mechanism, since its registry omits yanked versions from the list entirely rather than flagging them).
+
+> [!NOTE]
+> `diagnostics.deprecated_severity` flags a dependency whose *package* — not a specific version — is reported as deprecated/abandoned (`This package is deprecated: <reason>`), with a matching hover section and, for Composer packages naming a successor, a "Replace with X" quick fix. Currently sourced from **npm**'s `deprecated` field and **Composer**'s `abandoned` field only. See [Package Deprecation Diagnostics](docs/ECOSYSTEM_GUIDE.md#package-deprecation-diagnostics-issue-205) for the full ecosystem coverage table and how this differs from the yanked diagnostic above.
 
 ### Configuration reference
 

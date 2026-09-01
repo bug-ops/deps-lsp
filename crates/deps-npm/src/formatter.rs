@@ -161,8 +161,9 @@ impl EcosystemFormatter for NpmFormatter {
     /// versions marked deprecated) — a package-level signal, not a true per-version yank.
     /// Evaluating a range requirement (`^1.0`, `~2.3.0`) against it would flag every
     /// dependency on such a package with this diagnostic's "yanked" wording, conflating it
-    /// with package-level deprecation, which is a distinct, separately-planned diagnostic
-    /// (issue #205). `node_semver::Version::parse` succeeds only for a bare version string,
+    /// with package-level deprecation, which is a distinct diagnostic
+    /// ([`EcosystemFormatter::deprecated_message`], issue #205). `node_semver::Version::parse`
+    /// succeeds only for a bare version string,
     /// never a range/caret/tilde/wildcard, so it doubles as the exact-pin test.
     fn yanked_diagnostic_applies_to(&self, requirement: &VersionReq) -> bool {
         node_semver::Version::parse(requirement.as_str().trim()).is_ok()
@@ -172,6 +173,24 @@ impl EcosystemFormatter for NpmFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// O2: npm never offers the #205 "Replace with X" rename action — its only
+    /// successor signal is free text (`deprecated`'s message), and regex-extracting a
+    /// package name from registry-controlled prose to rewrite a manifest is a
+    /// typosquatting vector. `supports_package_rename` stays the trait default (`false`).
+    #[test]
+    fn test_supports_package_rename_false() {
+        assert!(!NpmFormatter.supports_package_rename());
+    }
+
+    /// npm's deprecation wording reuses the trait default (only Composer overrides it,
+    /// to match Packagist's "abandoned" vocabulary).
+    #[test]
+    fn test_deprecated_message_and_label_use_defaults() {
+        let f = NpmFormatter;
+        assert_eq!(f.deprecated_message(), "This package is deprecated");
+        assert_eq!(f.deprecated_label(), "*(deprecated)*");
+    }
 
     #[test]
     fn test_validate_package_name_accepts_hostile_but_legitimate_names() {

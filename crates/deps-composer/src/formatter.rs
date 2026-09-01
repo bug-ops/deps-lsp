@@ -5,6 +5,7 @@ use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
 use deps_core::normalize_operator_spacing;
+use tower_lsp_server::ls_types::Position;
 
 /// Whether `segment` matches Packagist's vendor/package name-segment charset: starts and ends
 /// with an ASCII alphanumeric character, with only `.`, `_`, `-` allowed in between (Composer's
@@ -92,6 +93,58 @@ impl EcosystemFormatter for ComposerFormatter {
 
     fn yanked_label(&self) -> &'static str {
         "*(abandoned)*"
+    }
+
+    /// Reuses Packagist's own "abandoned" wording for #205's package-level diagnostic,
+    /// mirroring the yanked pair above rather than the trait default's generic
+    /// "deprecated" — pattern reuse, not a new ecosystem-specific branch.
+    fn deprecated_message(&self) -> &'static str {
+        "This package is abandoned"
+    }
+
+    fn deprecated_label(&self) -> &'static str {
+        "*(abandoned)*"
+    }
+
+    /// Packagist's `abandoned` replacement name is a structured, registry-validated
+    /// field (see `deprecation_from_abandoned` in `registry.rs`), unlike npm's free-text
+    /// `deprecated` message — safe to offer as a rename target.
+    fn supports_package_rename(&self) -> bool {
+        true
+    }
+
+    /// Widens the rename quickfix's discoverability: without this, only a cursor on
+    /// `version_range` (the default) reaches `generate_code_actions`, so a user reading
+    /// "this package is abandoned" and clicking the package *name* — the very token the
+    /// rename rewrites — would find no action offered.
+    ///
+    /// Rejects a degenerate (zero-width) `name_range` rather than reusing the default's
+    /// `version_range`-only check plus this: `find_positions` (`parser.rs`) falls back to
+    /// `Range::default()` — `(0,0)-(0,0)` — when its name-literal search misses (e.g. a
+    /// legal escaped-solidus `"vendor\/package"` key), and `position_in_range` is
+    /// inclusive on both ends, so an unguarded widen would make that sentinel
+    /// *selectable* by a cursor resting on the file's opening `{` — reopening the exact
+    /// `Range::default()` hazard `build_replacement_action`'s literal-span guard exists
+    /// to prevent, just through the position check instead of the edit itself.
+    ///
+    /// This is the shared entry point [`generate_code_actions`](deps_core::lsp_helpers::generate_code_actions)
+    /// uses to find "the dependency at this position" for *every* action kind, not only
+    /// the rename — a cursor on the package name in `composer.json` now also surfaces
+    /// the version-bump/vulnerability-fix actions it previously didn't (their edits still
+    /// target `version_range` regardless of where the cursor landed, so this only widens
+    /// where the actions are *offered from*, never what they write). Accepted, not scoped
+    /// narrower to the rename alone: a single shared boolean gate has no per-action-kind
+    /// dial, and a cursor on the name is exactly where a user reading "this package is
+    /// abandoned" is likely to click for *any* fix, not just the rename.
+    fn is_position_on_dependency(&self, dep: &dyn Dependency, position: Position) -> bool {
+        let name_range = dep.name_range();
+        if name_range.start != name_range.end
+            && deps_core::lsp_helpers::position_in_range(position, name_range)
+        {
+            return true;
+        }
+        dep.version_range()
+            .is_some_and(|r| deps_core::lsp_helpers::position_in_range(position, r))
     }
 
     /// Checks if a version satisfies a Composer version requirement.
@@ -264,8 +317,8 @@ impl EcosystemFormatter for ComposerFormatter {
     /// onto every version entry of an abandoned package — not a true per-version yank.
     /// Evaluating a range requirement (`^1.0`, `~2.3`) against it would flag every dependency
     /// on such a package with this diagnostic's "yanked" wording, conflating it with
-    /// package-level abandonment, which is a distinct, separately-planned diagnostic
-    /// (issue #205).
+    /// package-level abandonment, which is a distinct diagnostic
+    /// ([`EcosystemFormatter::deprecated_message`], issue #205).
     fn yanked_diagnostic_applies_to(&self, requirement: &VersionReq) -> bool {
         is_exact_pin(requirement.as_str())
     }
@@ -536,6 +589,9 @@ fn compare_versions(a: &str, b: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ComposerDependency, ComposerSection};
+    use std::collections::HashMap;
+    use tower_lsp_server::ls_types::Range;
 
     #[test]
     fn test_normalize_package_name() {
@@ -1059,6 +1115,241 @@ mod tests {
                 f.validate_package_name(name).is_err(),
                 "expected {name:?} to be rejected"
             );
+        }
+    }
+
+    // --- #205 package-level deprecation ---
+
+    #[test]
+    fn test_deprecated_message_and_label_reuse_abandoned_wording() {
+        let f = ComposerFormatter;
+        assert_eq!(f.deprecated_message(), "This package is abandoned");
+        assert_eq!(f.deprecated_label(), "*(abandoned)*");
+    }
+
+    #[test]
+    fn test_supports_package_rename_true() {
+        assert!(ComposerFormatter.supports_package_rename());
+    }
+
+    /// W1: the discoverability override must reject a degenerate (zero-width) name
+    /// range — `find_positions` (`parser.rs`) falls back to `Range::default()`
+    /// (`(0,0)-(0,0)`) on a name-locator miss, and `position_in_range` is inclusive on
+    /// both ends, so an unguarded widen would make that sentinel selectable by a cursor
+    /// resting on the file's opening `{`, reopening the C2 `Range::default()` hazard.
+    #[test]
+    fn test_is_position_on_dependency_rejects_zero_width_name_range() {
+        use tower_lsp_server::ls_types::Position;
+
+        let dep = ComposerDependency {
+            name: "vendor/package".into(),
+            name_range: Range::default(),
+            version_req: Some("^1.0".into()),
+            version_range: Some(Range::new(Position::new(1, 20), Position::new(1, 25))),
+            section: ComposerSection::Require,
+        };
+
+        let f = ComposerFormatter;
+        assert!(
+            !f.is_position_on_dependency(&dep, Position::new(0, 0)),
+            "a degenerate name_range must never be selectable, even at its own (0,0) span"
+        );
+        // The version range still works normally.
+        assert!(f.is_position_on_dependency(&dep, Position::new(1, 22)));
+    }
+
+    /// The override still widens discoverability for a real (non-degenerate) name
+    /// range — the whole point of overriding the shared default.
+    #[test]
+    fn test_is_position_on_dependency_accepts_real_name_range() {
+        use tower_lsp_server::ls_types::Position;
+
+        let dep = ComposerDependency {
+            name: "vendor/package".into(),
+            name_range: Range::new(Position::new(1, 4), Position::new(1, 20)),
+            version_req: Some("^1.0".into()),
+            version_range: Some(Range::new(Position::new(1, 23), Position::new(1, 28))),
+            section: ComposerSection::Require,
+        };
+
+        let f = ComposerFormatter;
+        assert!(f.is_position_on_dependency(&dep, Position::new(1, 10)));
+    }
+
+    /// T1 (D7(a)/C2): a Composer manifest whose name locator misses — a legal
+    /// escaped-solidus `"vendor\/package"` key, which `find_positions`'s literal search
+    /// for the serde-unescaped `"vendor/package"` never matches — must never offer a
+    /// "Replace with X" rename action, rather than emitting a corrupting edit at
+    /// `(0,0)`.
+    ///
+    /// Exercised two ways: end to end through the real parser (today's actual
+    /// behavior — safe only because `version_range` also stays `None`, an incidental
+    /// coupling, not a guarantee), and directly against `name_literal_guard`-shaped
+    /// input (`version_range: Some(..)`, `name_range: Range::default()`) so the test
+    /// still catches a regression if that coupling is ever broken by a parser change.
+    #[tokio::test]
+    async fn test_generate_code_actions_escaped_solidus_name_offers_no_rename_action() {
+        let json = r#"{"require": {"vendor\/package": "^1.0"}}"#;
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+        let parse_result = crate::parser::parse_composer_json(json, &uri).unwrap();
+        assert_eq!(parse_result.dependencies.len(), 1);
+        let dep = &parse_result.dependencies[0];
+        assert_eq!(
+            dep.name_range,
+            Range::default(),
+            "escaped-solidus key must miss the literal-text search"
+        );
+        assert!(
+            dep.version_range.is_none(),
+            "today's incidental coupling: the version search never runs either"
+        );
+
+        let mut deprecations = HashMap::new();
+        deprecations.insert(
+            "vendor/package".to_string(),
+            deps_core::Deprecation {
+                reason: None,
+                replacement: Some("other/package".to_string()),
+            },
+        );
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions =
+            deps_core::VersionData::new(&cached, &resolved).with_deprecations(&deprecations);
+
+        let actions = deps_core::lsp_helpers::generate_code_actions(
+            &parse_result,
+            Position::new(0, 0),
+            &uri,
+            versions,
+            json,
+            &NoNetworkRegistry,
+            &ComposerFormatter,
+        )
+        .await;
+        assert!(
+            actions.iter().all(|a| !a.title.starts_with("Replace with")),
+            "no rename action may be offered when the name locator missed: {actions:?}"
+        );
+
+        // Direct regression guard for the guard mechanism itself (not just today's
+        // incidental version_range coupling): a hand-built dependency with a valid
+        // version_range but a degenerate name_range must still be rejected.
+        let corrupted_dep = ComposerDependency {
+            name: "vendor/package".into(),
+            name_range: Range::default(),
+            version_req: Some("^1.0".into()),
+            version_range: Some(Range::new(Position::new(0, 33), Position::new(0, 37))),
+            section: ComposerSection::Require,
+        };
+        let corrupted_result = crate::parser::ComposerParseResult {
+            dependencies: vec![corrupted_dep],
+            uri: uri.clone(),
+            minimum_stability: None,
+        };
+        let actions = deps_core::lsp_helpers::generate_code_actions(
+            &corrupted_result,
+            Position::new(0, 34),
+            &uri,
+            versions,
+            json,
+            &NoNetworkRegistry,
+            &ComposerFormatter,
+        )
+        .await;
+        assert!(
+            actions.iter().all(|a| !a.title.starts_with("Replace with")),
+            "the name-literal guard must reject a degenerate name_range independent of \
+             version_range: {actions:?}"
+        );
+    }
+
+    /// Positive path (D7): a well-formed manifest with a real replacement name offers
+    /// the "Replace with X" rename quickfix, targeting `name_range` with `replacement`.
+    #[tokio::test]
+    async fn test_generate_code_actions_offers_rename_action_for_well_formed_manifest() {
+        let json = r#"{"require": {"vendor/package": "^1.0"}}"#;
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+        let parse_result = crate::parser::parse_composer_json(json, &uri).unwrap();
+        let dep = &parse_result.dependencies[0];
+        assert_ne!(dep.name_range, Range::default());
+        let version_range = dep.version_range.expect("version_range must be present");
+
+        let mut deprecations = HashMap::new();
+        deprecations.insert(
+            "vendor/package".to_string(),
+            deps_core::Deprecation {
+                reason: None,
+                replacement: Some("other/package".to_string()),
+            },
+        );
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions =
+            deps_core::VersionData::new(&cached, &resolved).with_deprecations(&deprecations);
+
+        let actions = deps_core::lsp_helpers::generate_code_actions(
+            &parse_result,
+            version_range.start,
+            &uri,
+            versions,
+            json,
+            &NoNetworkRegistry,
+            &ComposerFormatter,
+        )
+        .await;
+
+        let rename = actions
+            .iter()
+            .find(|a| a.title == "Replace with other/package")
+            .unwrap_or_else(|| panic!("expected a rename action, got: {actions:?}"));
+        let edits = rename
+            .edit
+            .as_ref()
+            .and_then(|e| e.changes.as_ref())
+            .and_then(|c| c.get(&uri))
+            .expect("rename action must carry a WorkspaceEdit for this URI");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range, dep.name_range);
+        assert_eq!(edits[0].new_text, "other/package");
+    }
+
+    /// No-op [`deps_core::Registry`] so #205 code-action tests never hit the network —
+    /// `generate_code_actions` calls `registry.get_versions` unconditionally after the
+    /// registry-independent fix/rename actions are built.
+    struct NoNetworkRegistry;
+
+    impl deps_core::Registry for NoNetworkRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a PackageName,
+        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Version>>>>
+        {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
+        ) -> deps_core::ecosystem::BoxFuture<
+            'a,
+            deps_core::Result<Option<Box<dyn deps_core::Version>>>,
+        > {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>>
+        {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 }

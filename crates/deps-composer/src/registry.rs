@@ -9,7 +9,9 @@
 //! by inheriting from the previous complete entry.
 
 use crate::types::{ComposerPackage, ComposerVersion};
-use deps_core::{DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value};
+use deps_core::{
+    Deprecation, DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value,
+};
 use serde::Deserialize;
 use std::any::Any;
 use std::sync::Arc;
@@ -449,6 +451,7 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
             .abandoned
             .as_ref()
             .is_some_and(|v| v.as_bool() == Some(true) || v.is_string());
+        let deprecation = deprecation_from_abandoned(current.abandoned.as_ref());
 
         result.push(ComposerVersion {
             version: version.clone().into(),
@@ -457,11 +460,41 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
                 .clone()
                 .unwrap_or_else(|| version.clone()),
             abandoned,
+            deprecation,
             published_at,
         });
     }
 
     result
+}
+
+/// Derives a #205 [`Deprecation`](deps_core::Deprecation) payload from Packagist's
+/// `abandoned` field.
+///
+/// Packagist's `abandoned` is either absent/`false`/`null` (not abandoned), bare `true`
+/// (abandoned, no known successor), or a string naming a replacement package — a
+/// structured, registry-validated field, unlike npm's free-text `deprecated` message,
+/// which is what makes Composer (and only Composer) safe to offer a rename quickfix for
+/// (see `ComposerFormatter::supports_package_rename`).
+///
+/// M2: an all-whitespace replacement string produces a bare `Deprecation` (both fields
+/// `None`) rather than one with an empty `replacement`, mirroring
+/// `deps_npm::deprecation_from_message`'s empty-payload guard — though for Composer this
+/// is defense-in-depth rather than an observed real-world case, since a real
+/// `abandoned: true` already takes the same path.
+fn deprecation_from_abandoned(abandoned: Option<&serde_json::Value>) -> Option<Deprecation> {
+    let value = abandoned?;
+    if value.as_bool() == Some(true) {
+        return Some(Deprecation {
+            reason: None,
+            replacement: None,
+        });
+    }
+    let replacement = value.as_str()?;
+    Some(Deprecation {
+        reason: None,
+        replacement: (!replacement.trim().is_empty()).then(|| replacement.trim().to_string()),
+    })
 }
 
 /// Parses Packagist v2 API response JSON.
@@ -829,6 +862,69 @@ mod tests {
         let versions = expand_minified_versions(entries);
         assert_eq!(versions.len(), 1);
         assert!(versions[0].abandoned);
+        assert_eq!(
+            versions[0].deprecation,
+            Some(Deprecation {
+                reason: None,
+                replacement: Some("Use other/package".to_string()),
+            })
+        );
+    }
+
+    /// #205: a bare `"abandoned": true` still fires — both `Deprecation` fields `None`
+    /// (no known successor) — distinct from `Some` with an empty payload.
+    #[test]
+    fn test_expand_minified_versions_abandoned_true_has_no_replacement() {
+        let entries = vec![MinifiedVersion {
+            version: Some("3.0.0".into()),
+            version_normalized: Some("3.0.0.0".into()),
+            abandoned: Some(serde_json::Value::Bool(true)),
+            time: None,
+        }];
+
+        let versions = expand_minified_versions(entries);
+        assert_eq!(
+            versions[0].deprecation,
+            Some(Deprecation {
+                reason: None,
+                replacement: None,
+            })
+        );
+    }
+
+    /// #205 M2: an all-whitespace replacement string must not leak through as an empty,
+    /// dangling `replacement` — the package is still abandoned (mirrors bare `true`).
+    #[test]
+    fn test_expand_minified_versions_abandoned_whitespace_replacement_is_none() {
+        let entries = vec![MinifiedVersion {
+            version: Some("3.0.0".into()),
+            version_normalized: Some("3.0.0.0".into()),
+            abandoned: Some(serde_json::Value::String("   ".into())),
+            time: None,
+        }];
+
+        let versions = expand_minified_versions(entries);
+        assert_eq!(
+            versions[0].deprecation,
+            Some(Deprecation {
+                reason: None,
+                replacement: None,
+            })
+        );
+    }
+
+    /// Not abandoned at all: no `Deprecation` payload.
+    #[test]
+    fn test_expand_minified_versions_not_abandoned_has_no_deprecation() {
+        let entries = vec![MinifiedVersion {
+            version: Some("3.0.0".into()),
+            version_normalized: Some("3.0.0.0".into()),
+            abandoned: None,
+            time: None,
+        }];
+
+        let versions = expand_minified_versions(entries);
+        assert_eq!(versions[0].deprecation, None);
     }
 
     #[test]
@@ -1006,12 +1102,14 @@ mod tests {
                 version: "2.0.0".into(),
                 version_normalized: "2.0.0.0".into(),
                 abandoned: true,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1033,12 +1131,14 @@ mod tests {
                 version: "2.0.0".into(),
                 version_normalized: "2.0.0.0".into(),
                 abandoned: true,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
                 abandoned: true,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1093,12 +1193,14 @@ mod tests {
                 version: "2.0.0-beta1".into(),
                 version_normalized: "2.0.0.0-beta1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1120,12 +1222,14 @@ mod tests {
                 version: "2.0.0-beta1".into(),
                 version_normalized: "2.0.0.0-beta1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1179,12 +1283,14 @@ mod tests {
                 version: "2.0.0-a1".into(),
                 version_normalized: "2.0.0.0-alpha1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1205,6 +1311,7 @@ mod tests {
             version: "1.0.0-a1".into(),
             version_normalized: "1.0.0.0-alpha1".into(),
             abandoned: false,
+            deprecation: None,
             published_at: None,
         })];
         let req = VersionReq::new("^1.0.0-a1");
@@ -1256,12 +1363,14 @@ mod tests {
                 version: "2.0.0-beta2".into(),
                 version_normalized: "2.0.0.0-beta2".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "2.0.0-beta1".into(),
                 version_normalized: "2.0.0.0-beta1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1307,18 +1416,21 @@ mod tests {
                 version: "2.0.0-alpha1".into(),
                 version_normalized: "2.0.0.0-alpha1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "2.0.0-beta1".into(),
                 version_normalized: "2.0.0.0-beta1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ]
@@ -1437,12 +1549,14 @@ mod tests {
                 version: "1.5.0-beta1".into(),
                 version_normalized: "1.5.0.0-beta1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1467,12 +1581,14 @@ mod tests {
                 version: "1.5.0-alpha1".into(),
                 version_normalized: "1.5.0.0-alpha1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1498,12 +1614,14 @@ mod tests {
                 version: "1.5.0-beta1".into(),
                 version_normalized: "1.5.0.0-beta1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1525,18 +1643,21 @@ mod tests {
                 version: "1.5.0-beta1".into(),
                 version_normalized: "1.5.0.0-beta1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.4.0-RC1".into(),
                 version_normalized: "1.4.0.0-RC1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1562,12 +1683,14 @@ mod tests {
                 version: "1.5.0-alpha1".into(),
                 version_normalized: "1.5.0.0-alpha1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1588,12 +1711,14 @@ mod tests {
                 version: "1.5.0-alpha1".into(),
                 version_normalized: "1.5.0.0-alpha1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1616,6 +1741,7 @@ mod tests {
             version: "1.5.0-beta1".into(),
             version_normalized: "1.5.0.0-beta1".into(),
             abandoned: false,
+            deprecation: None,
             published_at: None,
         })];
         let req = VersionReq::new("^1.0@beta || ^2.0");
@@ -1634,6 +1760,7 @@ mod tests {
             version: "1.5.0-alpha1".into(),
             version_normalized: "1.5.0.0-alpha1".into(),
             abandoned: false,
+            deprecation: None,
             published_at: None,
         })];
         let req = VersionReq::new(">=1.0@dev <2.0");
@@ -1676,12 +1803,14 @@ mod tests {
                 version: "2.0.0a1".into(),
                 version_normalized: "2.0.0a1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1703,12 +1832,14 @@ mod tests {
                 version: "2.0.0a1".into(),
                 version_normalized: "2.0.0a1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1728,12 +1859,14 @@ mod tests {
                 version: "2.0.0dev".into(),
                 version_normalized: "2.0.0dev".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1758,12 +1891,14 @@ mod tests {
                 version: "v2.3.0-alpha.1".into(),
                 version_normalized: "2.3.0.0-alpha1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "v2.2.8".into(),
                 version_normalized: "2.2.8.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1789,12 +1924,14 @@ mod tests {
                 version: "V3.0.0-RC1".into(),
                 version_normalized: "3.0.0.0-RC1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "v2.9.0".into(),
                 version_normalized: "2.9.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1820,12 +1957,14 @@ mod tests {
                 // response that never expanded it) so the primary path must catch this alone.
                 version_normalized: "2.0.0RC1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1847,12 +1986,14 @@ mod tests {
                 version: "2.0.0RC1".into(),
                 version_normalized: "2.0.0RC1".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1874,12 +2015,14 @@ mod tests {
                 version: "2.6.3.alpha".into(),
                 version_normalized: "2.6.3.0-alpha".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "2.6.2".into(),
                 version_normalized: "2.6.2.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1902,12 +2045,14 @@ mod tests {
                 version: "2.6.3.alpha".into(),
                 version_normalized: "2.6.3.0-alpha".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(ComposerVersion {
                 version: "2.6.2".into(),
                 version_normalized: "2.6.2.0".into(),
                 abandoned: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];

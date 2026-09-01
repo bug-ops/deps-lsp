@@ -5,9 +5,9 @@ use crate::osv::ScanOutcome;
 use crate::{ConcreteVersion, Dependency, ParseResult, Registry, VersionReq};
 
 use super::{
-    EcosystemFormatter, LineOffsetTable, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData,
-    is_safe_version_string, literal_span_matches, requirement_is_unsatisfiable, single_file_edit,
-    slice_for_range, strip_whitespace, warn_rejected_value,
+    DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, LineOffsetTable, UNSATISFIABLE_DIAGNOSTIC_CODE,
+    VersionData, is_safe_version_string, literal_span_matches, requirement_is_unsatisfiable,
+    single_file_edit, slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
@@ -263,6 +263,78 @@ fn build_unsatisfiable_fix_action(
     })
 }
 
+/// Builds the "Replace with X" package-rename quickfix for `dep` (issue #205), if this
+/// ecosystem opts in via [`EcosystemFormatter::supports_package_rename`] and a
+/// registry-supplied replacement name is on record.
+///
+/// **Composer-only in Phase 1** — see `EcosystemFormatter::supports_package_rename`'s
+/// docs for why this must not be enabled for an ecosystem whose replacement name is
+/// regex-extracted free text (a typosquatting vector).
+///
+/// D7(a): guarded by the same literal-span discipline `generate_code_actions` applies to
+/// `version_range` — several parsers (Composer's `find_positions` included, when a
+/// legal escaped-solidus key like `"vendor\/package"` never matches the raw-text search)
+/// fall back to `Range::default()` for `name_range` on a lookup miss. Comparing the
+/// slice at `name_range` against `dep.name()` rejects that sentinel automatically: an
+/// empty (or wrong) slice never equals the declared name, so no edit is ever written at
+/// `(0,0)`.
+fn build_replacement_action(
+    dep: &dyn Dependency,
+    uri: &Uri,
+    version_range: Range,
+    versions: VersionData<'_>,
+    content: &str,
+    line_offsets: &LineOffsetTable,
+    formatter: &dyn EcosystemFormatter,
+) -> Option<CodeAction> {
+    if !formatter.supports_package_rename() {
+        return None;
+    }
+
+    let normalized_name = formatter.normalize_package_name(dep.name());
+    let replacement = versions
+        .deprecations
+        .and_then(|d| d.get(&normalized_name))
+        .and_then(|dep_info| dep_info.replacement.as_deref())
+        .filter(|r| !r.is_empty())?;
+
+    if formatter.validate_package_name(replacement).is_err() {
+        return None;
+    }
+
+    let name_range = dep.name_range();
+    let name_slice = slice_for_range(content, line_offsets, name_range);
+    // I7: reuses `literal_span_matches` rather than a name-specific equality check purely
+    // for the sentinel-rejecting behavior its whitespace-insensitive comparison already
+    // gives (see D7(a)'s doc above). Its `[{slice}] == requirement` NuGet-bracket branch
+    // is inert here — a package name never contains `[`/`]` (rejected by every
+    // ecosystem's `validate_package_name`) — so it never changes this call's outcome.
+    if !literal_span_matches(name_slice, dep.name().as_str()) {
+        return None;
+    }
+
+    let edits = single_file_edit(uri, name_range, replacement.to_string());
+
+    Some(CodeAction {
+        title: format!("Replace with {replacement}"),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(edits),
+            ..Default::default()
+        }),
+        is_preferred: None,
+        // Same binding mechanism `build_vulnerability_fix_action`/`build_unsatisfiable_fix_action`
+        // use: `diagnostic_range` names D4's deprecation-diagnostic range (`version_range`,
+        // not `name_range`) so `bind_diagnostics` attaches this action to the diagnostic the
+        // client's lightbulb gesture actually surfaces.
+        data: Some(serde_json::json!({
+            "diagnostic_codes": [DEPRECATED_DIAGNOSTIC_CODE],
+            "diagnostic_range": version_range,
+        })),
+        ..Default::default()
+    })
+}
+
 /// Generates the code actions offered for the dependency at `position`.
 ///
 /// Finds the dependency whose declared version `position` falls on
@@ -411,6 +483,17 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     );
     let unsat_fix =
         build_unsatisfiable_fix_action(dep, uri, version_range, versions, version_req, formatter);
+    // Registry-independent for the same FR-007 reason as the two fix actions above —
+    // `versions.deprecations` is cache-derived, not a fresh registry call.
+    let replacement_action = build_replacement_action(
+        dep,
+        uri,
+        version_range,
+        versions,
+        content,
+        &line_offsets,
+        formatter,
+    );
 
     let registry_versions = registry.get_versions(dep.name()).await.ok();
 
@@ -456,6 +539,9 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     if let Some(unsat_fix) = unsat_fix {
         unsat_idx = Some(actions.len());
         actions.push(unsat_fix.action);
+    }
+    if let Some(replacement_action) = replacement_action {
+        actions.push(replacement_action);
     }
 
     // De-duplicates every REFACTOR action's formatted edit text against the declared

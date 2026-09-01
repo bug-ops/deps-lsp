@@ -56,8 +56,9 @@ pub use parser::{
     check_toml_nesting_depth, check_yaml_expansion, check_yaml_nesting_depth, parse_json_checked,
 };
 pub use registry::{
-    Metadata, Registry, RemovalStatus, Version, find_latest_stable, has_default_prerelease_marker,
-    is_existence_wildcard, is_existence_wildcard_str, select_latest_for_existence,
+    Deprecation, Metadata, Registry, RemovalStatus, Version, find_latest_stable,
+    has_default_prerelease_marker, is_existence_wildcard, is_existence_wildcard_str,
+    select_latest_for_existence,
 };
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,
