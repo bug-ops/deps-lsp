@@ -267,7 +267,7 @@ fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
                 name_range: Range::new(Position::new(3, 0), Position::new(3, 4)),
             },
         ],
-        uri: Uri::from_file_path("/test/Cargo.toml").unwrap(),
+        uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
     };
 
     // No lockfile-resolved versions; `in_use_version` falls back to the manifest

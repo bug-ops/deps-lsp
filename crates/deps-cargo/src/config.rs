@@ -1669,7 +1669,9 @@ token = "secret-token"
             "[registries.a]\nindex = \"sparse+https://b.example\"\n",
         )
         .unwrap();
-        let file = std::fs::File::open(&path).unwrap();
+        // `File::open` is read-only, which lacks `FILE_WRITE_ATTRIBUTES` on Windows and
+        // makes `set_modified` fail with `PermissionDenied`; open for write instead.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_modified(future).unwrap();
 
         let second = cache.get_or_parse_workspace(&path).unwrap();
@@ -1699,8 +1701,12 @@ token = "secret-token"
             "[registries.a]\nindex = \"sparse+https://a.example\"\n",
         )
         .unwrap();
+        // `File::open` is read-only, which lacks `FILE_WRITE_ATTRIBUTES` on Windows and
+        // makes `set_modified` fail with `PermissionDenied`; open for write instead.
         let future = SystemTime::now() + std::time::Duration::from_secs(10);
-        std::fs::File::open(&path)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(future)
             .unwrap();
@@ -1715,7 +1721,9 @@ token = "secret-token"
         )
         .unwrap();
         let past = SystemTime::now();
-        std::fs::File::open(&path)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_modified(past)
             .unwrap();
