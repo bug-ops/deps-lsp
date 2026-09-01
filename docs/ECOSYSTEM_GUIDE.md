@@ -458,12 +458,23 @@ regular version fetch already retrieves — no extra registry request.
 **Suppression against the yanked diagnostics above.** npm's yanked signal is itself sourced
 from the same `deprecated` field this diagnostic reads, so a dependency pinned to an exact,
 deprecated version would otherwise show two near-duplicate diagnostics. When this diagnostic
-fires, it suppresses the in-use-version yanked check for the same dependency — but only when
-the yanked finding's underlying signal is an advisory (`AdvisoryDeprecated`), never a genuine
-hard yank/retraction. A package that is both deprecated *and* has a specific version really
-withdrawn from resolution still shows both diagnostics; "the exact version you have was
+fires, it suppresses *both* yanked checks above for the same dependency — the in-use-version
+check and the range-requirement-only-satisfiable-by-a-flagged-version check — but only when
+the matched yanked finding's underlying signal is an advisory (`AdvisoryDeprecated`), never a
+genuine hard yank/retraction. A package that is both deprecated *and* has a specific version
+really withdrawn from resolution still shows both diagnostics; "the exact version you have was
 pulled" is strictly more actionable than "the project is archived," and one must never hide
 the other.
+
+Each of the two yanked checks decides this independently from its own matched version's
+`RemovalStatus` (issue #437) — the range check does not defer to, or require, the
+in-use-version check's own finding. This matters once an ecosystem's per-version status can be
+`AdvisoryDeprecated` for one version and `Yanked` for another within the same package (not
+possible for npm/Composer today, since npm never reports a real yank and Composer's range
+check never runs, but expected once PyPI's PEP 592 yanks and PEP 792 `project-status` coexist):
+a range requirement satisfiable only by a genuinely yanked version still fires even when the
+package's separately-tracked in-use/latest version is merely deprecated and its own diagnostic
+was suppressed.
 
 **Composer-only "Replace with X" code action.** When Packagist's `abandoned` field names a
 successor package, a `QUICKFIX` titled `Replace with <package>` rewrites the dependency's name

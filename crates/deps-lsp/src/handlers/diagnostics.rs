@@ -612,7 +612,10 @@ serde = "1.0.0"
                 deps_core::PackageVersions {
                     latest: "1.0.214".into(),
                     available: std::sync::Arc::from(vec!["1.0.214".into(), "1.0.213".into()]),
-                    yanked: std::sync::Arc::from(vec!["1.0.213".into()]),
+                    yanked: std::sync::Arc::from(vec![(
+                        "1.0.213".into(),
+                        deps_core::RemovalStatus::Yanked,
+                    )]),
                     published_at: None,
                 },
             );

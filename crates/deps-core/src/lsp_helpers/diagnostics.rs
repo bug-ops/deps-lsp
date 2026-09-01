@@ -297,7 +297,7 @@ fn matching_prerelease_would_satisfy(
     formatter: &dyn EcosystemFormatter,
     requirement: &VersionReq,
     available: &[ConcreteVersion],
-    yanked: &[ConcreteVersion],
+    yanked: &[(ConcreteVersion, RemovalStatus)],
 ) -> Option<String> {
     if !formatter.strict_semver_prerelease_exclusion() {
         return None;
@@ -308,68 +308,103 @@ fn matching_prerelease_would_satisfy(
     let matcher = formatter.compile_requirement(requirement)?;
     available.iter().find_map(|candidate| {
         let base = semver_prerelease_base(candidate.as_str())?;
-        (!yanked.iter().any(|y| y == candidate)
+        (!yanked.iter().any(|(y, _)| y == candidate)
             && matcher.matches(&ConcreteVersion::new(base)) == Some(true))
         .then(|| candidate.to_string())
     })
 }
 
-/// Returns `true` when `requirement` is satisfied by at least one entry in `available`, but
-/// every matching entry is yanked — i.e. the dependency is currently satisfiable only by a
-/// yanked/deprecated version.
+/// Looks up `candidate`'s [`RemovalStatus`] in `yanked`, preferring `Yanked` over
+/// `AdvisoryDeprecated` when more than one entry shares `candidate`'s version string.
+///
+/// A registry response can carry duplicate entries for the same version string (see
+/// `lifecycle.rs`'s in-use-version scan, which guards against exactly this by not stopping
+/// at the first same-string match). `RemovalStatus` derives no `Ord`, so this can't be a
+/// `.max()` — `Yanked` is explicitly preferred so a mixed-status duplicate never hides a
+/// genuine hard yank behind a merely-deprecated entry for the same version (#437 M2).
+fn status_for_version(
+    yanked: &[(ConcreteVersion, RemovalStatus)],
+    candidate: &ConcreteVersion,
+) -> Option<RemovalStatus> {
+    let mut found: Option<RemovalStatus> = None;
+    for (y, status) in yanked {
+        if y == candidate {
+            if *status == RemovalStatus::Yanked {
+                return Some(RemovalStatus::Yanked);
+            }
+            found = Some(*status);
+        }
+    }
+    found
+}
+
+/// Returns the aggregate [`RemovalStatus`] when `requirement` is satisfied by at least one
+/// entry in `available`, but every matching entry is yanked/deprecated — i.e. the dependency
+/// is currently satisfiable only by a flagged version — and `None` otherwise.
+///
+/// The aggregate is `Yanked` if any matching entry's status is `Yanked`, else
+/// `AdvisoryDeprecated` (the only other status `yanked` entries carry — see
+/// [`PackageVersions::yanked`]). This lets the caller apply the same D5 gate #263 uses
+/// (see [`VersionData::yanked`]'s docs): suppress the diagnostic for an `AdvisoryDeprecated`
+/// aggregate when a package-level deprecation finding co-occurs, but never for a `Yanked`
+/// one, even if one of several matching entries is merely deprecated (#437).
 ///
 /// Mutually exclusive with [`requirement_is_unsatisfiable`]: both scan `available` through the
 /// same `formatter.compile_requirement` matcher, but this one additionally cross-references
-/// `yanked` (see [`PackageVersions::yanked`]) to distinguish "satisfied, but only by a yanked
-/// version" from "satisfied by an ordinary version" or "not satisfied at all". Callers should
-/// only invoke this once `requirement_is_unsatisfiable` has returned `false` for the same
-/// `requirement`/`available` pair, so a match is already known to exist.
+/// `yanked` to distinguish "satisfied, but only by a flagged version" from "satisfied by an
+/// ordinary version" or "not satisfied at all". Callers should only invoke this once
+/// `requirement_is_unsatisfiable` has returned `false` for the same `requirement`/`available`
+/// pair, so a match is already known to exist.
 ///
 /// Shares `requirement_is_unsatisfiable`'s guard cascade (empty `available`/`requirement`,
 /// oversized `requirement`, unresolved placeholder `requirement`, uncompilable `requirement`)
-/// — each returns `false` here for the identical reason it does there.
+/// — each returns `None` here for the identical reason it does there.
 ///
 /// Unlike `requirement_is_unsatisfiable`, an undecided candidate (`matcher.matches` returns
 /// `None` — an unparseable candidate string) does not just get skipped: it disqualifies a
-/// `true` verdict entirely. That candidate might have been a genuine non-yanked match this
-/// scan simply could not evaluate, so claiming "every match is yanked" without accounting for
-/// it would be a false positive — the same #206 conservatism (nothing decided means no
+/// verdict entirely. That candidate might have been a genuine non-yanked match this scan
+/// simply could not evaluate, so claiming "every match is flagged" without accounting for it
+/// would be a false positive — the same #206 conservatism (nothing decided means no
 /// diagnostic, not a guess) applied to a different question than `requirement_is_unsatisfiable`
 /// asks.
 fn requirement_matches_only_yanked(
     formatter: &dyn EcosystemFormatter,
     requirement: &VersionReq,
     available: &[ConcreteVersion],
-    yanked: &[ConcreteVersion],
-) -> bool {
+    yanked: &[(ConcreteVersion, RemovalStatus)],
+) -> Option<RemovalStatus> {
     if available.is_empty() || yanked.is_empty() || requirement.as_str().trim().is_empty() {
-        return false;
+        return None;
     }
     if requirement.as_str().len() > MAX_REQUIREMENT_LEN {
-        return false;
+        return None;
     }
     if formatter.requirement_is_unresolved(requirement) {
-        return false;
+        return None;
     }
-    let Some(matcher) = formatter.compile_requirement(requirement) else {
-        return false;
-    };
+    let matcher = formatter.compile_requirement(requirement)?;
 
     let mut saw_match = false;
     let mut saw_undecided = false;
+    let mut aggregate: Option<RemovalStatus> = None;
     for candidate in available {
         match matcher.matches(candidate) {
             Some(true) => {
                 saw_match = true;
-                if !yanked.iter().any(|y| y == candidate) {
-                    return false;
+                let status = status_for_version(yanked, candidate)?;
+                if aggregate != Some(RemovalStatus::Yanked) {
+                    aggregate = Some(status);
                 }
             }
             Some(false) => {}
             None => saw_undecided = true,
         }
     }
-    saw_match && !saw_undecided
+    if saw_match && !saw_undecided {
+        aggregate
+    } else {
+        None
+    }
 }
 
 /// Generates diagnostics using cached versions (no network calls).
@@ -440,7 +475,7 @@ pub fn generate_diagnostics_from_cache(
         // different questions and neither subsumes the other, but for a dependency
         // pinned to the one version that also happens to be the only version
         // satisfying its own requirement, both would fire on the same dependency.
-        // `yanked_diagnostic_pushed` suppresses the second (#247) check once the
+        // `yanked_263_diagnostic_pushed` suppresses the second (#247) check once the
         // first (#263) already emitted a diagnostic for this dependency, so a
         // single dependency never gets two yanked diagnostics.
         //
@@ -485,29 +520,40 @@ pub fn generate_diagnostics_from_cache(
         }
 
         // D5: a package-level deprecation finding suppresses the in-use-version yanked
-        // check (#263) below and, transitively via `yanked_diagnostic_pushed`, the
-        // yanked-only-match check (#247) further down — but only when the underlying
-        // yanked finding's status is `AdvisoryDeprecated`, never when it is `Yanked`. A
-        // genuine hard yank ("the exact version you pinned was withdrawn") is strictly
-        // more actionable than a package-level deprecation notice ("the project is
-        // archived"), so it must never be hidden behind one.
+        // check (#263) below — but only when the underlying yanked finding's status is
+        // `AdvisoryDeprecated`, never when it is `Yanked`. A genuine hard yank ("the exact
+        // version you pinned was withdrawn") is strictly more actionable than a
+        // package-level deprecation notice ("the project is archived"), so it must never be
+        // hidden behind one.
         //
         // Requires an *actual* `versions.yanked` (#263) entry with that status — a
         // vacuous `None` (`is_none_or` would default to "suppress") must NOT suppress.
-        // #247 reads a different data source (`package_versions.yanked`, a bare
-        // `Arc<[ConcreteVersion]>` with no `RemovalStatus` attached, built independently of the
-        // #263 map — see lifecycle.rs), so "no #263 finding for this name" is not
-        // evidence that #247's finding (if any) is safe to hide: #247 can fire for a
-        // range requirement satisfiable only by a yanked version even when no specific
-        // in-use/latest version was itself flagged (impl-critic I1).
+        // #247 reads a different data source (`package_versions.yanked`, now carrying its
+        // own `RemovalStatus` per entry — see `PackageVersions::yanked`) and, as of #437,
+        // applies this identical D5 polarity *independently* from its own matched entry's
+        // status, regardless of what this #263 check decided — see `yanked_only_status`
+        // further down. This is deliberately NOT folded into `yanked_263_diagnostic_pushed`
+        // below (an earlier version of this fix did that, via a `deprecation_suppresses_yanked
+        // -> true` sentinel, and thereby let a suppressed-AdvisoryDeprecated #263 entry also
+        // silently gate off a same-dependency #247 match whose own aggregate was `Yanked` —
+        // reintroducing the exact bug #437 exists to close, just through the other branch).
+        // So "no #263 finding for this name", or "the #263 finding was itself suppressed", is
+        // not evidence that #247's finding (if any) is safe to hide: #247 can fire for a range
+        // requirement satisfiable only by a yanked version even when no specific
+        // in-use/latest version was itself flagged (impl-critic I1), and now always decides
+        // for itself from its own matched entry's status.
         let deprecation_suppresses_yanked = deprecation.is_some()
             && versions
                 .yanked
                 .and_then(|y| y.get(&normalized_name))
                 .is_some_and(|(_, status)| *status != RemovalStatus::Yanked);
 
-        let yanked_diagnostic_pushed = if deprecation_suppresses_yanked {
-            true
+        // Tracks only whether #263 actually pushed a `Diagnostic` — NOT whether it was
+        // suppressed by D5. #247's dedup guard (`yanked_only_status` below) keys on this:
+        // it must skip re-reporting a version #263 already emitted a diagnostic for, but a
+        // D5-suppressed #263 entry emitted nothing, so it must not gate #247 off too.
+        let yanked_263_diagnostic_pushed = if deprecation_suppresses_yanked {
+            false
         } else if let Some((yanked_version, _status)) =
             versions.yanked.and_then(|y| y.get(&normalized_name))
             && versions.ecosystem.is_none_or(|ecosystem| {
@@ -639,18 +685,34 @@ pub fn generate_diagnostics_from_cache(
         // shape where `removal_status()` is not a genuine per-version signal (npm/Composer
         // restrict to exact pins — see that method's docs). Skipped entirely when the in-use-version
         // check above already pushed a yanked diagnostic for this dependency (see
-        // `yanked_diagnostic_pushed`), so the two checks never double-report.
-        let yanked_only = !yanked_diagnostic_pushed
-            && dep.source().is_version_resolvable()
-            && dep.version_requirement().is_some_and(|version_req| {
-                formatter.yanked_diagnostic_applies_to(version_req)
-                    && requirement_matches_only_yanked(
-                        formatter,
-                        version_req,
-                        &package_versions.available,
-                        &package_versions.yanked,
-                    )
-            });
+        // `yanked_263_diagnostic_pushed`), so the two checks never double-report — but,
+        // critically (#437 S1), NOT skipped merely because the #263 check was D5-suppressed:
+        // that suppression pushed nothing, so #247 must still be free to decide for itself.
+        let yanked_only_status = (!yanked_263_diagnostic_pushed
+            && dep.source().is_version_resolvable())
+        .then(|| dep.version_requirement())
+        .flatten()
+        .filter(|version_req| formatter.yanked_diagnostic_applies_to(version_req))
+        .and_then(|version_req| {
+            requirement_matches_only_yanked(
+                formatter,
+                version_req,
+                &package_versions.available,
+                &package_versions.yanked,
+            )
+        });
+
+        // #437: mirrors D5's polarity above (see `deprecation_suppresses_yanked`), applied
+        // independently of the #263 `versions.yanked` map and of whatever that check decided
+        // — a matched entry whose own status is `AdvisoryDeprecated` yields to a co-occurring
+        // package-level deprecation finding, but a matched `Yanked` status always fires
+        // regardless, whether or not a #263 entry exists for this package, and whether or not
+        // that #263 entry (if any) was itself suppressed (the PyPI
+        // range-satisfiable-only-by-yanked-with-no-exact-pin case this fixes, plus the
+        // mixed-status-within-one-package case S1 closes).
+        let yanked_only = yanked_only_status.is_some_and(|status| {
+            status != RemovalStatus::AdvisoryDeprecated || deprecation.is_none()
+        });
 
         if yanked_only {
             diagnostics.push(Diagnostic {
@@ -3051,6 +3113,12 @@ mod tests {
             strs.iter().map(|s| (*s).into()).collect()
         }
 
+        fn yanked_versions(strs: &[&str]) -> Vec<(ConcreteVersion, RemovalStatus)> {
+            strs.iter()
+                .map(|s| ((*s).into(), RemovalStatus::Yanked))
+                .collect()
+        }
+
         #[test]
         fn test_semver_prerelease_base() {
             assert_eq!(semver_prerelease_base("2.0.0-rc.1"), Some("2.0.0"));
@@ -3204,7 +3272,7 @@ mod tests {
                     &StrictSemverFormatter,
                     &VersionReq::new("^2.0.0"),
                     &versions(&["2.0.0-rc.1", "1.5.0"]),
-                    &versions(&["2.0.0-rc.1"]),
+                    &yanked_versions(&["2.0.0-rc.1"]),
                 ),
                 None
             );
@@ -3218,7 +3286,7 @@ mod tests {
                     &StrictSemverFormatter,
                     &VersionReq::new("^2.0.0"),
                     &versions(&["2.0.0-rc.2", "2.0.0-rc.1", "1.5.0"]),
-                    &versions(&["2.0.0-rc.2"]),
+                    &yanked_versions(&["2.0.0-rc.2"]),
                 ),
                 Some("2.0.0-rc.1".to_string())
             );
@@ -3300,26 +3368,77 @@ mod tests {
             strs.iter().map(|s| (*s).into()).collect()
         }
 
+        fn yanked_versions(strs: &[&str]) -> Vec<(ConcreteVersion, RemovalStatus)> {
+            strs.iter()
+                .map(|s| ((*s).into(), RemovalStatus::Yanked))
+                .collect()
+        }
+
         #[test]
         fn test_yanked_only_match_is_true() {
             let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
-            assert!(requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("modelled"),
-                &versions(&["1.2.1"]),
-                &versions(&["1.2.1"]),
-            ));
+            assert_eq!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &versions(&["1.2.1"]),
+                    &yanked_versions(&["1.2.1"]),
+                ),
+                Some(RemovalStatus::Yanked)
+            );
+        }
+
+        /// #437 M2 regression: a registry response can carry duplicate entries sharing the
+        /// same version string (see `lifecycle.rs`'s in-use-version scan, which guards
+        /// against exactly this). If such a pair has mixed statuses, the aggregate must
+        /// prefer `Yanked`, not just take whichever entry happens to come first.
+        #[test]
+        fn test_duplicate_version_prefers_yanked_status_regardless_of_order() {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+
+            let advisory_then_yanked = vec![
+                ("1.2.1".into(), RemovalStatus::AdvisoryDeprecated),
+                ("1.2.1".into(), RemovalStatus::Yanked),
+            ];
+            assert_eq!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &versions(&["1.2.1"]),
+                    &advisory_then_yanked,
+                ),
+                Some(RemovalStatus::Yanked),
+                "Yanked must win when it comes after AdvisoryDeprecated in the duplicate list"
+            );
+
+            let yanked_then_advisory = vec![
+                ("1.2.1".into(), RemovalStatus::Yanked),
+                ("1.2.1".into(), RemovalStatus::AdvisoryDeprecated),
+            ];
+            assert_eq!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &versions(&["1.2.1"]),
+                    &yanked_then_advisory,
+                ),
+                Some(RemovalStatus::Yanked),
+                "Yanked must win when it comes before AdvisoryDeprecated in the duplicate list"
+            );
         }
 
         #[test]
         fn test_no_match_is_false() {
             let formatter = TableFormatter::new(|_v| Some(false));
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("modelled"),
-                &versions(&["1.2.1"]),
-                &versions(&["1.2.1"]),
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &versions(&["1.2.1"]),
+                    &yanked_versions(&["1.2.1"]),
+                )
+                .is_none()
+            );
         }
 
         #[test]
@@ -3327,12 +3446,15 @@ mod tests {
             // "^1.0" matches both a yanked 1.0.0 and a non-yanked 1.0.1 — a non-yanked
             // alternative exists, so this must not be reported as "yanked-only".
             let formatter = TableFormatter::new(|v| Some(v == "1.0.0" || v == "1.0.1"));
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("modelled"),
-                &versions(&["1.0.1", "1.0.0"]),
-                &versions(&["1.0.0"]),
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &versions(&["1.0.1", "1.0.0"]),
+                    &yanked_versions(&["1.0.0"]),
+                )
+                .is_none()
+            );
         }
 
         #[test]
@@ -3341,57 +3463,72 @@ mod tests {
             // stopped at the first `Some(true)` (as `requirement_is_unsatisfiable` does) would
             // wrongly report "yanked-only" here.
             let formatter = TableFormatter::new(|v| Some(v == "1.0.0" || v == "1.0.1"));
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("modelled"),
-                &versions(&["1.0.0", "1.0.1"]),
-                &versions(&["1.0.0"]),
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &versions(&["1.0.0", "1.0.1"]),
+                    &yanked_versions(&["1.0.0"]),
+                )
+                .is_none()
+            );
         }
 
         #[test]
         fn test_empty_yanked_list_is_false_without_compiling() {
             let formatter =
                 TableFormatter::new(|_v| panic!("must not compile/scan when yanked is empty"));
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("modelled"),
-                &versions(&["1.0.0"]),
-                &[],
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &versions(&["1.0.0"]),
+                    &[],
+                )
+                .is_none()
+            );
         }
 
         #[test]
         fn test_empty_available_list_is_false() {
             let formatter = TableFormatter::new(|_v| Some(true));
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("modelled"),
-                &[],
-                &versions(&["1.0.0"]),
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &[],
+                    &yanked_versions(&["1.0.0"]),
+                )
+                .is_none()
+            );
         }
 
         #[test]
         fn test_unresolved_requirement_is_false() {
             let formatter = TableFormatter::new(|_v| Some(true));
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("unresolved"),
-                &versions(&["1.0.0"]),
-                &versions(&["1.0.0"]),
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("unresolved"),
+                    &versions(&["1.0.0"]),
+                    &yanked_versions(&["1.0.0"]),
+                )
+                .is_none()
+            );
         }
 
         #[test]
         fn test_compile_requirement_none_is_false() {
             let formatter = TableFormatter::new(|_v| Some(true));
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("not-modelled"),
-                &versions(&["1.0.0"]),
-                &versions(&["1.0.0"]),
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("not-modelled"),
+                    &versions(&["1.0.0"]),
+                    &yanked_versions(&["1.0.0"]),
+                )
+                .is_none()
+            );
         }
 
         /// End-to-end: `generate_diagnostics_from_cache` emits the yanked diagnostic (default
@@ -3418,7 +3555,7 @@ mod tests {
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
-                    yanked: Arc::from(vec!["1.2.1".into()]),
+                    yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                 },
             );
@@ -3441,15 +3578,17 @@ mod tests {
             );
         }
 
-        /// I1 (D5 gate regression): a package-level deprecation finding must NOT suppress
-        /// the #247 `requirement_matches_only_yanked` check when there is no corresponding
-        /// #263 (`versions.yanked`) entry to justify it. #247 reads a different data source
-        /// (`package_versions.yanked`, no `RemovalStatus` attached) than #263 does, so "no
-        /// #263 finding for this name" is not evidence the #247 finding (if any) is safe to
-        /// hide — an earlier version of the gate suppressed #247 unconditionally in exactly
-        /// this case (vacuous `is_none_or` on a missing #263 entry).
+        /// #437 (formerly I1, D5 gate regression): a package-level deprecation finding must
+        /// NOT suppress the #247 `requirement_matches_only_yanked` check when there is no
+        /// corresponding #263 (`versions.yanked`) entry to justify it AND the #247 match's own
+        /// status is `Yanked` — a genuine hard yank must never be hidden behind a deprecation
+        /// notice, exactly like D5 guards for #263. #247 now reads its own `RemovalStatus` per
+        /// entry from `package_versions.yanked` (see `PackageVersions::yanked`), so "no #263
+        /// finding for this name" is no longer a reason to fire unconditionally — it's simply
+        /// evidence that #247 must decide for itself, from its own matched entry's status
+        /// (the PyPI range-satisfiable-only-by-a-real-yank-with-no-exact-pin case).
         #[test]
-        fn test_generate_diagnostics_from_cache_deprecation_does_not_suppress_yanked_only_match_without_263_entry()
+        fn test_generate_diagnostics_from_cache_deprecation_never_suppresses_yanked_only_match_without_263_entry()
          {
             let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
 
@@ -3469,7 +3608,7 @@ mod tests {
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
-                    yanked: Arc::from(vec!["1.2.1".into()]),
+                    yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                 },
             );
@@ -3501,13 +3640,164 @@ mod tests {
                 diagnostics
                     .iter()
                     .any(|d| d.message.starts_with(formatter.yanked_message())),
-                "the #247 yanked-only-match finding must still fire: {diagnostics:?}"
+                "a genuine Yanked #247 match must still fire, without a #263 entry: {diagnostics:?}"
             );
             assert!(
                 diagnostics
                     .iter()
                     .any(|d| d.message.starts_with(formatter.deprecated_message())),
                 "the deprecation finding must also still fire: {diagnostics:?}"
+            );
+        }
+
+        /// #437 companion: unlike the `Yanked` case above, a #247 match whose own status is
+        /// `AdvisoryDeprecated` DOES yield to a co-occurring package-level deprecation
+        /// finding, even with no #263 entry — mirroring D5's exact polarity for the #263
+        /// check, now applied independently by #247 from its own matched entry's status.
+        #[test]
+        fn test_generate_diagnostics_from_cache_deprecation_suppresses_yanked_only_match_without_263_entry()
+         {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "modelled".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "serde".into(),
+                PackageVersions {
+                    latest: "2.0.0".into(),
+                    available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
+                    yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::AdvisoryDeprecated)]),
+                    published_at: None,
+                },
+            );
+            let resolved_versions = HashMap::new();
+            // Deliberately empty: no #263 (in-use-version) finding for "serde" — proves the
+            // suppression decision comes from #247's own matched-entry status, not the #263 map.
+            let yanked: HashMap<String, (ConcreteVersion, RemovalStatus)> = HashMap::new();
+            let mut deprecations = HashMap::new();
+            deprecations.insert(
+                "serde".to_string(),
+                Deprecation {
+                    reason: Some("archived".to_string()),
+                    replacement: None,
+                },
+            );
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_yanked(&yanked)
+                    .with_deprecations(&deprecations),
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|d| !d.message.starts_with(formatter.yanked_message())),
+                "an AdvisoryDeprecated #247 match must yield to the co-occurring deprecation \
+                 finding, got: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.starts_with(formatter.deprecated_message())),
+                "the deprecation finding must still fire: {diagnostics:?}"
+            );
+        }
+
+        /// #437 S1 regression: a D5-suppressed #263 finding (in-use version is
+        /// `AdvisoryDeprecated`, deprecation co-occurs, so #263 pushes nothing) must NOT gate
+        /// off a same-dependency #247 finding whose own matched entry is genuinely `Yanked`.
+        /// An earlier version of this fix folded `deprecation_suppresses_yanked` into the same
+        /// sentinel used for #247's dedup guard, which reintroduced #437's exact failure mode
+        /// through this branch: the in-use version ("2.0.0") is merely deprecated and its own
+        /// diagnostic is correctly suppressed, but the requirement ("modelled") is separately
+        /// satisfiable only by a different, genuinely yanked version ("1.2.1") — that must
+        /// still fire.
+        #[test]
+        fn test_generate_diagnostics_from_cache_suppressed_263_entry_does_not_gate_off_yanked_247_match()
+         {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "modelled".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "serde".into(),
+                PackageVersions {
+                    latest: "2.0.0".into(),
+                    available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
+                    yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
+                    published_at: None,
+                },
+            );
+            let resolved_versions = HashMap::new();
+            // #263 entry for a *different* version ("2.0.0") than the one #247 matches
+            // ("1.2.1"), with status `AdvisoryDeprecated` — this is the D5-suppressed case.
+            let mut in_use_yanked = HashMap::new();
+            in_use_yanked.insert(
+                "serde".to_string(),
+                ("2.0.0".into(), RemovalStatus::AdvisoryDeprecated),
+            );
+            let mut deprecations = HashMap::new();
+            deprecations.insert(
+                "serde".to_string(),
+                Deprecation {
+                    reason: Some("archived".to_string()),
+                    replacement: None,
+                },
+            );
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_yanked(&in_use_yanked)
+                    .with_deprecations(&deprecations),
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.starts_with(formatter.yanked_message())
+                        && d.message.contains("; latest is")),
+                "the #247 match against the genuinely Yanked 1.2.1 must still fire even though \
+                 the unrelated #263 in-use-version finding was D5-suppressed, got: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics.iter().all(|d| !d.message.contains("(2.0.0)")),
+                "the #263 in-use-version diagnostic (for the deprecated 2.0.0) must stay \
+                 suppressed, got: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.starts_with(formatter.deprecated_message())),
+                "the package-level deprecation finding must still fire: {diagnostics:?}"
             );
         }
 
@@ -3536,7 +3826,7 @@ mod tests {
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
-                    yanked: Arc::from(vec!["1.2.1".into()]),
+                    yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                 },
             );
@@ -3611,7 +3901,7 @@ mod tests {
                 PackageVersions {
                     latest: "1.2.1".into(),
                     available: Arc::from(vec!["1.2.1".into()]),
-                    yanked: Arc::from(vec!["1.2.1".into()]),
+                    yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                 },
             );
@@ -3658,7 +3948,7 @@ mod tests {
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.0.1".into(), "1.0.0".into()]),
-                    yanked: Arc::from(vec!["1.0.0".into()]),
+                    yanked: Arc::from(vec![("1.0.0".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                 },
             );
@@ -3691,12 +3981,15 @@ mod tests {
                 "unparseable" => None,
                 _ => Some(false),
             });
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("modelled"),
-                &versions(&["1.2.1", "unparseable"]),
-                &versions(&["1.2.1"]),
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &versions(&["1.2.1", "unparseable"]),
+                    &yanked_versions(&["1.2.1"]),
+                )
+                .is_none()
+            );
         }
 
         /// Same scenario, but the undecided candidate is scanned before the yanked match —
@@ -3709,12 +4002,15 @@ mod tests {
                 "unparseable" => None,
                 _ => Some(false),
             });
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new("modelled"),
-                &versions(&["unparseable", "1.2.1"]),
-                &versions(&["1.2.1"]),
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new("modelled"),
+                    &versions(&["unparseable", "1.2.1"]),
+                    &yanked_versions(&["1.2.1"]),
+                )
+                .is_none()
+            );
         }
 
         #[test]
@@ -3722,12 +4018,15 @@ mod tests {
             let formatter =
                 TableFormatter::new(|_v| panic!("must not compile/scan an oversized requirement"));
             let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
-            assert!(!requirement_matches_only_yanked(
-                &formatter,
-                &VersionReq::new(oversized),
-                &versions(&["1.0.0"]),
-                &versions(&["1.0.0"]),
-            ));
+            assert!(
+                requirement_matches_only_yanked(
+                    &formatter,
+                    &VersionReq::new(oversized),
+                    &versions(&["1.0.0"]),
+                    &yanked_versions(&["1.0.0"]),
+                )
+                .is_none()
+            );
         }
 
         /// The yanked-only-match diagnostic must never fire for a non-registry-resolvable
@@ -3745,7 +4044,7 @@ mod tests {
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
-                    yanked: Arc::from(vec!["1.2.1".into()]),
+                    yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                 },
             );
@@ -3807,7 +4106,7 @@ mod tests {
                 PackageVersions {
                     latest: "2.0.0".into(),
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
-                    yanked: Arc::from(vec!["1.2.1".into()]),
+                    yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                 },
             );

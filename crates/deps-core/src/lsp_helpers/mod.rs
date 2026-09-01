@@ -52,20 +52,28 @@ pub const HOVER_RECENT_VERSIONS: usize = 8;
 /// `latest` is filtered would produce false "no published version satisfies" warnings.
 ///
 /// `yanked` is the subset of `available` (same version-string encoding) that the registry
-/// reported as yanked/deprecated. It exists because `Registry::get_latest_matching` — the
-/// call that used to populate this cache — filters yanked entries out by contract on every
-/// current registry implementation, so a per-version yanked flag threaded through *that*
-/// call would always read `false` (see #233). `available` now comes from the unfiltered
-/// `get_versions` instead, which does observe yanked entries, so `yanked` is derived from
-/// that same fetch rather than discarded.
+/// reported as yanked/deprecated, paired with each entry's [`RemovalStatus`]. It exists
+/// because `Registry::get_latest_matching` — the call that used to populate this cache —
+/// filters yanked entries out by contract on every current registry implementation, so a
+/// per-version yanked flag threaded through *that* call would always read `false` (see
+/// #233). `available` now comes from the unfiltered `get_versions` instead, which does
+/// observe yanked entries, so `yanked` is derived from that same fetch rather than
+/// discarded.
+///
+/// The status rides alongside each version (rather than a bare membership list) so
+/// [`crate::lsp_helpers::generate_diagnostics_from_cache`]'s #247 "requirement satisfiable
+/// only by a yanked version" check can gate its own package-level-deprecation suppression
+/// on `AdvisoryDeprecated` specifically, never on a genuine `Yanked` finding — mirroring
+/// [`VersionData::yanked`]'s D5 gate for the #263 in-use-version check (see #437).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageVersions {
     /// Latest usable version for this package.
     pub latest: ConcreteVersion,
     /// Every published version, newest-first, unfiltered.
     pub available: Arc<[ConcreteVersion]>,
-    /// Subset of `available` reported as yanked/deprecated by the registry.
-    pub yanked: Arc<[ConcreteVersion]>,
+    /// Subset of `available` reported as yanked/deprecated by the registry, each paired
+    /// with its [`RemovalStatus`].
+    pub yanked: Arc<[(ConcreteVersion, RemovalStatus)]>,
     /// When `latest` was published, if the registry exposes it. `None` when
     /// the ecosystem doesn't wire [`crate::Version::published_at`] or the fetch
     /// never ran.

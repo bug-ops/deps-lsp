@@ -779,12 +779,19 @@ async fn fetch_latest_versions_parallel(
                         // can flag a requirement satisfiable only by a yanked version — see
                         // `PackageVersions::yanked`. Gated on `check_yanked`: a registry that
                         // cannot answer `removal_status()` (§#298) must not populate this list
-                        // with an untrustworthy always-`Available` signal.
-                        let yanked_list: Arc<[ConcreteVersion]> = if check_yanked {
+                        // with an untrustworthy always-`Available` signal. Carries each
+                        // entry's own `RemovalStatus` (#437) so the #247 diagnostic path can
+                        // gate its package-level-deprecation suppression on `AdvisoryDeprecated`
+                        // specifically, never on a genuine `Yanked` finding.
+                        let yanked_list: Arc<[(ConcreteVersion, RemovalStatus)]> = if check_yanked {
                             versions
                                 .iter()
-                                .filter(|v| v.removal_status().is_flagged())
-                                .map(|v| v.version_string().clone())
+                                .filter_map(|v| {
+                                    let status = v.removal_status();
+                                    status
+                                        .is_flagged()
+                                        .then(|| (v.version_string().clone(), status))
+                                })
                                 .collect()
                         } else {
                             Arc::from([])
@@ -2552,8 +2559,11 @@ mod tests {
         );
         assert_eq!(
             &*serde.yanked,
-            &[ConcreteVersion::new("1.0.213")],
-            "yanked must carry only the entries reported as yanked"
+            &[(
+                ConcreteVersion::new("1.0.213"),
+                deps_core::RemovalStatus::Yanked
+            )],
+            "yanked must carry only the entries reported as yanked, paired with their status"
         );
     }
 
