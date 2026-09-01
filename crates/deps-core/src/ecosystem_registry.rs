@@ -387,9 +387,12 @@ impl Default for EcosystemRegistry {
 mod tests {
     use super::*;
     use std::any::Any;
-    use tower_lsp_server::ls_types::{CompletionItem, Position};
+    use tower_lsp_server::ls_types::Position;
 
-    use crate::{PackageName, ParseResult, Registry, lsp_helpers::EcosystemFormatter};
+    use crate::{
+        PackageName, ParseResult, Registry, completion::Completions,
+        lsp_helpers::EcosystemFormatter,
+    };
 
     struct MockFormatter;
     impl EcosystemFormatter for MockFormatter {
@@ -450,8 +453,8 @@ mod tests {
             _position: Position,
             _content: &'a str,
             _freshness: crate::FreshnessSettings,
-        ) -> crate::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
-            Box::pin(async move { vec![] })
+        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
+            Box::pin(async move { Completions::default() })
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -507,8 +510,8 @@ mod tests {
             _position: Position,
             _content: &'a str,
             _freshness: crate::FreshnessSettings,
-        ) -> crate::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
-            Box::pin(async move { vec![] })
+        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
+            Box::pin(async move { Completions::default() })
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -563,8 +566,8 @@ mod tests {
             _position: Position,
             _content: &'a str,
             _freshness: crate::FreshnessSettings,
-        ) -> crate::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
-            Box::pin(async move { vec![] })
+        ) -> crate::ecosystem::BoxFuture<'a, Completions> {
+            Box::pin(async move { Completions::default() })
         }
 
         fn as_any(&self) -> &dyn Any {

@@ -54,22 +54,23 @@ pub async fn handle_completion(
     // Resolved once, from the URI alone via `get_for_uri` (the same routing
     // `handle_document_open` uses), rather than from the loaded document's
     // `ecosystem_id` — that would only be available *after* the document-load and
-    // document-lookup early returns below, and both of those used to unconditionally
-    // report `isIncomplete: false`/`null` regardless of ecosystem. That was the exact
-    // C1 defect (#419 S1): the very first completion request against a not-yet-loaded
-    // manifest is also the coldest point for a search-index-backed ecosystem like
-    // PyPI. `is_some_and` (not `?`) so an unrecognized URI falls through to `false`
-    // (matching every ecosystem's default) rather than short-circuiting this function.
-    let is_incomplete = state
+    // document-lookup early returns below. `is_some_and` (not `?`) so an
+    // unrecognized URI falls through to `false` (matching every ecosystem's
+    // default) rather than short-circuiting this function.
+    let package_search_is_incomplete = state
         .ecosystem_registry
         .get_for_uri(uri)
-        .is_some_and(|e| e.completions_are_incomplete());
+        .is_some_and(|e| e.package_search_is_incomplete());
 
-    // Shared by every early-return path below and the final response, so all of
-    // them report `isIncomplete` consistently instead of only the paths that reach
-    // the bottom of the function.
-    let empty_response = || {
-        if is_incomplete {
+    // Shared by the document-load and document-lookup early returns below, so
+    // both report `isIncomplete` consistently for an ecosystem whose package-name
+    // search (the only kind of completion either path could otherwise have
+    // produced, via `fallback_completion`) may be a truncated view of a larger
+    // candidate set (#419 S1) — `None` would serialize as LSP `null`, which
+    // carries no `isIncomplete` and leaves the client with nothing to invalidate
+    // on the next keystroke.
+    let context_less_response = || {
+        if package_search_is_incomplete {
             Some(CompletionResponse::List(CompletionList {
                 is_incomplete: true,
                 items: vec![],
@@ -99,7 +100,7 @@ pub async fn handle_completion(
             Ok(false) | Err(_) => {
                 // Load failed or timed out, return empty completions
                 tracing::warn!("completion: document load failed or timed out");
-                return empty_response();
+                return context_less_response();
             }
         }
     }
@@ -124,7 +125,7 @@ pub async fn handle_completion(
         })
     else {
         tracing::warn!("completion: document not found: {:?}", uri);
-        return empty_response();
+        return context_less_response();
     };
 
     tracing::info!(
@@ -133,14 +134,16 @@ pub async fn handle_completion(
         parse_result.is_some()
     );
 
-    // Try parse_result first, fallback to text-based detection
-    let items = if let Some(parse_result) = parse_result {
-        // `get_for_uri` above already confirmed an ecosystem exists for this URI, so
-        // this `get(ecosystem_id)` realistically cannot miss (ecosystems are
-        // registered once at startup and never removed) — but falls through to an
-        // empty result rather than an unconditional `None` early-return (the
-        // original shape here) so a hypothetical miss still respects `is_incomplete`
-        // instead of silently reverting to the pre-#419 bug class.
+    // Try parse_result first, fallback to text-based detection. `is_incomplete` is
+    // the per-call signal `generate_completions` computed for the actual completion
+    // context it served (#427). Whenever `fallback_completion` actually runs — the
+    // primary result was empty, or there was no `parse_result` to call
+    // `generate_completions` with at all — it is OR'd with
+    // `ecosystem.package_search_is_incomplete()`: `fallback_completion` always
+    // performs a raw package-name search via `Registry::search` regardless of the
+    // primary context, so it inherits the primary's `is_incomplete` only by
+    // coincidence, not because the two searches share a completeness signal.
+    let (items, is_incomplete) = if let Some(parse_result) = parse_result {
         match state.ecosystem_registry.get(ecosystem_id) {
             Some(ecosystem) => {
                 // The DashMap shard `Ref` was already dropped above, before this
@@ -162,11 +165,16 @@ pub async fn handle_completion(
                 match completion_result {
                     // Ecosystem returned no completions: try fallback, since this
                     // handles the case where the user is typing a NEW package name.
-                    Ok(completions) if completions.is_empty() => {
+                    Ok(completions) if completions.items.is_empty() => {
                         tracing::info!("completion: ecosystem returned empty, trying fallback");
-                        fallback_completion(&state, ecosystem_kind, position, &content).await
+                        let fallback_items =
+                            fallback_completion(&state, ecosystem_kind, position, &content).await;
+                        (
+                            fallback_items,
+                            completions.is_incomplete || ecosystem.package_search_is_incomplete(),
+                        )
                     }
-                    Ok(completions) => completions,
+                    Ok(completions) => (completions.items, completions.is_incomplete),
                     // Timed out, not genuinely empty: the registry is slow right now,
                     // so a fallback search against the same registry would likely
                     // time out too. Skip it instead of doubling the worst-case
@@ -177,18 +185,26 @@ pub async fn handle_completion(
                              {}s, skipping fallback search",
                             COMPLETION_SEARCH_TIMEOUT.as_secs()
                         );
-                        vec![]
+                        (vec![], false)
                     }
                 }
             }
             None => {
                 tracing::warn!("completion: ecosystem not found for id: {ecosystem_id}");
-                vec![]
+                (vec![], false)
             }
         }
     } else {
-        // Fallback: detect context from raw text
-        fallback_completion(&state, ecosystem_kind, position, &content).await
+        // Fallback: detect context from raw text. No `parse_result` means
+        // `generate_completions` was never called, so `package_search_is_incomplete`
+        // (already resolved for this URI's ecosystem above) is the only signal
+        // available — matches the every-`didChange`-with-a-parse-failure case
+        // (`document/lifecycle.rs`'s `new_without_parse_result`), exactly the
+        // mid-typing state for a new package name.
+        (
+            fallback_completion(&state, ecosystem_kind, position, &content).await,
+            package_search_is_incomplete,
+        )
     };
 
     tracing::info!("completion: returning {} items", items.len());
@@ -1023,7 +1039,8 @@ mod tests {
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
                 _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
+            {
                 Box::pin(async move { unimplemented!() })
             }
             fn as_any(&self) -> &dyn Any {
@@ -1075,23 +1092,22 @@ mod tests {
         let (client, config) = create_test_client_and_config();
         let result = handle_completion(state, params, client, config).await;
         // With cold start support, missing documents trigger background load and
-        // return empty completions for the first request. Cargo does not override
-        // `completions_are_incomplete`, so empty items collapse to `None` here —
-        // matching the same-shaped tail-of-function branch (`items.is_empty() =>
-        // None`), not the pre-#419-fix `Array(vec![])` this path used to return
-        // unconditionally regardless of ecosystem.
+        // return empty completions for the first request, collapsing to `None`.
         assert!(result.is_none());
     }
 
-    /// #419 S1 regression: the document-not-loaded/load-failed early return (the
-    /// branch `test_completion_returns_empty_for_missing_document` exercises for a
-    /// non-flagged ecosystem) is also the *coldest* path for a search-index-backed
-    /// ecosystem like PyPI — the very first completion request against a
-    /// not-yet-loaded manifest. It must still report `isIncomplete: true` rather
-    /// than silently reverting to `Array`/`None`, which the client would cache as
-    /// "no completions, don't ask again".
+    /// #419 S1 regression, still required after #427: the document-not-loaded/
+    /// load-failed early return never reaches `generate_completions` — there is no
+    /// completion context yet to compute a precise per-call `is_incomplete` from
+    /// (see [`Completions`](deps_core::completion::Completions)) — but it must still
+    /// report `isIncomplete: true` for an ecosystem whose package-name search (the
+    /// only kind `fallback_completion` could otherwise have produced) is truncated,
+    /// via [`Ecosystem::package_search_is_incomplete`]. `None` serializes as LSP
+    /// `null`, which carries no `isIncomplete` and would leave the client with
+    /// nothing to invalidate on the next keystroke.
     #[tokio::test]
     async fn test_completion_missing_document_reports_incomplete_for_flagged_ecosystem() {
+        use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version};
         use std::any::Any;
@@ -1137,8 +1153,9 @@ mod tests {
             }
         }
 
-        /// Stands in for `PypiEcosystem`: only `completions_are_incomplete` and
-        /// routing matter for this test, since the document never loads.
+        /// Stands in for `PypiEcosystem`: overrides `package_search_is_incomplete`
+        /// the same way, and `generate_completions` is deliberately `unimplemented!()`
+        /// since this test never lets it run.
         struct IncompleteEcosystem;
         impl Sealed for IncompleteEcosystem {}
         impl Ecosystem for IncompleteEcosystem {
@@ -1165,7 +1182,7 @@ mod tests {
             fn formatter(&self) -> &dyn EcosystemFormatter {
                 &NoopFormatter
             }
-            fn completions_are_incomplete(&self) -> bool {
+            fn package_search_is_incomplete(&self) -> bool {
                 true
             }
             fn generate_completions<'a>(
@@ -1174,7 +1191,7 @@ mod tests {
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
                 _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
                 Box::pin(async move { unimplemented!() })
             }
             fn as_any(&self) -> &dyn Any {
@@ -1428,7 +1445,8 @@ mod tests {
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
                 freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
+            {
                 Box::pin(async move {
                     vec![CompletionItem {
                         label: "1.0.0".to_string(),
@@ -1439,6 +1457,7 @@ mod tests {
                         }),
                         ..Default::default()
                     }]
+                    .into()
                 })
             }
             fn as_any(&self) -> &dyn Any {
@@ -3233,12 +3252,13 @@ serde
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
                 _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::completion::Completions>
+            {
                 Box::pin(async move {
                     // Well beyond COMPLETION_SEARCH_TIMEOUT; paused time resolves
                     // this instantly instead of actually waiting.
                     tokio::time::sleep(Duration::from_mins(1)).await;
-                    vec![]
+                    deps_core::completion::Completions::default()
                 })
             }
             fn as_any(&self) -> &dyn Any {
@@ -3293,17 +3313,20 @@ serde
         assert!(result.is_none());
     }
 
-    /// #419 C1 regression: an ecosystem whose `completions_are_incomplete()`
-    /// returns `true` (PyPI's package-search-index-backed completion) must always
-    /// get back `CompletionResponse::List { is_incomplete: true, .. }` — on the
-    /// empty-items branch (the cold-start case rev 4's fix missed, since `None`
-    /// serializes as LSP `null` and carries no `isIncomplete`) as well as the
-    /// non-empty branch. An ecosystem that does not override the flag (the
+    /// #419 C1 regression, now driven by a per-call [`Completions::is_incomplete`]
+    /// (#427) rather than a static per-ecosystem flag: an ecosystem whose
+    /// `generate_completions` reports `is_incomplete: true` for the served context
+    /// (PyPI's package-search-index-backed completion) must always get back
+    /// `CompletionResponse::List { is_incomplete: true, .. }` — on the empty-items
+    /// branch (the cold-start case rev 4's fix missed, since `None` serializes as
+    /// LSP `null` and carries no `isIncomplete`) as well as the non-empty branch.
+    /// An ecosystem that always reports `is_incomplete: false` (the
     /// `test_concurrent_document_write_not_blocked_by_in_flight_completion_search`
     /// test just above proves the empty case) keeps returning `None`/`Array`
     /// unchanged.
     #[tokio::test]
-    async fn test_completions_are_incomplete_flag_shapes_response_both_branches() {
+    async fn test_generate_completions_is_incomplete_flows_into_response_both_branches() {
+        use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
             Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
@@ -3381,16 +3404,13 @@ serde
             fn formatter(&self) -> &dyn EcosystemFormatter {
                 &NoopFormatter
             }
-            fn completions_are_incomplete(&self) -> bool {
-                true
-            }
             fn generate_completions<'a>(
                 &'a self,
                 _parse_result: &'a dyn ParseResult,
                 _position: tower_lsp_server::ls_types::Position,
                 _content: &'a str,
                 _freshness: deps_core::FreshnessSettings,
-            ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
                 let items = if self.has_item {
                     vec![CompletionItem {
                         label: "requests".to_string(),
@@ -3399,7 +3419,12 @@ serde
                 } else {
                     vec![]
                 };
-                Box::pin(async move { items })
+                Box::pin(async move {
+                    Completions {
+                        items,
+                        is_incomplete: true,
+                    }
+                })
             }
             fn as_any(&self) -> &dyn Any {
                 self

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, Version,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, Version, completion::Completions,
     lsp_helpers::EcosystemFormatter,
 };
 
@@ -149,7 +149,7 @@ impl Ecosystem for CargoEcosystem {
         position: Position,
         content: &'a str,
         freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
 
@@ -172,6 +172,7 @@ impl Ecosystem for CargoEcosystem {
                 } => self.complete_features(&package_name, &prefix).await,
                 CompletionContext::None => vec![],
             }
+            .into()
         })
     }
 

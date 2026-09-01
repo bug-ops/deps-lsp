@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
+    lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::DenoFormatter;
@@ -134,7 +135,7 @@ impl Ecosystem for DenoEcosystem {
         position: Position,
         content: &'a str,
         freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
 
@@ -154,6 +155,7 @@ impl Ecosystem for DenoEcosystem {
                 CompletionContext::Feature { .. } => vec![],
                 CompletionContext::None => vec![],
             }
+            .into()
         })
     }
 
@@ -252,7 +254,7 @@ mod tests {
             )
             .await;
 
-        assert!(completions.is_empty());
+        assert!(completions.items.is_empty());
     }
 
     #[tokio::test]

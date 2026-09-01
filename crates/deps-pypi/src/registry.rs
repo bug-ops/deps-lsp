@@ -268,8 +268,10 @@ impl PypiRegistry {
     /// triggers a background build. Once built, the index is never rebuilt for the
     /// life of the process — there is no TTL (see `crate::search`'s module doc for
     /// why). Because the result set can be a truncated view of a much larger match
-    /// set, callers should treat every non-empty result as incomplete; `deps-lsp`
-    /// does this via [`deps_core::Ecosystem::completions_are_incomplete`].
+    /// set, callers should treat every result (empty or not) as incomplete;
+    /// `PypiEcosystem::generate_completions` does this by reporting
+    /// [`deps_core::completion::Completions::is_incomplete`] for the `PackageName`
+    /// completion context this method backs.
     ///
     /// # Errors
     ///

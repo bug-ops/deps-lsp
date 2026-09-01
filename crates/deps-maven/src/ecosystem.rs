@@ -7,7 +7,9 @@ use tower_lsp_server::ls_types::{
 };
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_maven_coordinate_segment,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
+    completion::Completions,
+    is_safe_maven_coordinate_segment,
     lsp_helpers::{EcosystemFormatter, warn_rejected_value},
     position_in_range,
 };
@@ -269,7 +271,7 @@ impl Ecosystem for MavenEcosystem {
         position: Position,
         content: &'a str,
         freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
             let (ctx_type, value, value_range) =
                 Self::detect_xml_context(content, position, parse_result);
@@ -305,6 +307,7 @@ impl Ecosystem for MavenEcosystem {
                 }
                 _ => vec![],
             }
+            .into()
         })
     }
 

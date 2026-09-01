@@ -84,6 +84,13 @@ Two behaviors worth knowing:
   known, common PyPI-specific expectation gap; a substring/import-name-aware search
   is tracked as a possible follow-up, not implemented here.
 
+Because the index is capped and alphabetically sorted rather than ranked, the LSP
+response for a package-name completion request sets `isIncomplete: true` so editors
+re-query as the user keeps typing (`resolves #427`). This is scoped to the
+package-name search itself — other completions in a Python manifest (versions,
+comments, `[build-system]` positions) report `isIncomplete: false` like every other
+ecosystem, since their result sets are already exhaustive.
+
 ### Maven/Gradle Version Comparison
 
 Versions are now ranked with correct Maven semantics:
@@ -826,10 +833,11 @@ Create the main ecosystem implementation in `ecosystem.rs`:
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{CompletionItem, Position, Uri};
+use tower_lsp_server::ls_types::{Position, Uri};
 
 use deps_core::{
     Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
+    completion::Completions,
     ecosystem::BoxFuture,
     lockfile::LockFileProvider,
     lsp_helpers::EcosystemFormatter,
@@ -907,8 +915,11 @@ impl Ecosystem for {Ecosystem}Ecosystem {
         _parse_result: &'a dyn ParseResultTrait,
         _position: Position,
         _content: &'a str,
-    ) -> BoxFuture<'a, Vec<CompletionItem>> {
-        Box::pin(async move { vec![] })
+    ) -> BoxFuture<'a, Completions> {
+        // `is_incomplete` should stay `false` unless this ecosystem serves
+        // completions from a capped/unranked index (see PyPI below) —
+        // `Vec<CompletionItem>::into()` covers the common exhaustive-results case.
+        Box::pin(async move { Vec::new().into() })
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -7,7 +7,9 @@ use tower_lsp_server::ls_types::{
 };
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_registry_url,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
+    completion::Completions,
+    is_safe_registry_url,
     lsp_helpers::{EcosystemFormatter, warn_rejected_value},
 };
 
@@ -184,7 +186,7 @@ impl Ecosystem for SwiftEcosystem {
         position: Position,
         content: &'a str,
         freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
 
@@ -209,6 +211,7 @@ impl Ecosystem for SwiftEcosystem {
                 CompletionContext::Feature { .. } => vec![],
                 CompletionContext::None => vec![],
             }
+            .into()
         })
     }
 

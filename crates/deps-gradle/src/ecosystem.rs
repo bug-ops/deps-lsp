@@ -5,8 +5,8 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-    position_in_range,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
+    lsp_helpers::EcosystemFormatter, position_in_range,
 };
 use deps_maven::MavenCentralRegistry;
 
@@ -307,7 +307,7 @@ impl Ecosystem for GradleEcosystem {
         position: Position,
         content: &'a str,
         freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
             let uri = parse_result.uri();
             let (ctx_type, value, range) = Self::detect_completion_context(content, position, uri);
@@ -328,6 +328,7 @@ impl Ecosystem for GradleEcosystem {
                 "package" => self.complete_package_names(value, range).await,
                 _ => vec![],
             }
+            .into()
         })
     }
 

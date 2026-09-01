@@ -34,14 +34,13 @@ pub(crate) mod blocking_ecosystem {
     use deps_core::{
         Dependency, DiagnosticSeverities, Ecosystem, EcosystemConfig, EcosystemFormatter,
         FreshnessSettings, Metadata, ParseResult, Registry, Version, VersionData,
+        completion::Completions,
     };
     use std::any::Any;
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::Barrier;
-    use tower_lsp_server::ls_types::{
-        CodeLens, CompletionItem, Diagnostic, InlayHint, Position, Uri,
-    };
+    use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position, Uri};
 
     pub(crate) struct NoopRegistry;
     impl Registry for NoopRegistry {
@@ -192,14 +191,14 @@ pub(crate) mod blocking_ecosystem {
             _position: Position,
             _content: &'a str,
             _freshness: FreshnessSettings,
-        ) -> BoxFuture<'a, Vec<CompletionItem>> {
+        ) -> BoxFuture<'a, Completions> {
             Box::pin(async move {
                 if matches!(self.hook, BlockingHook::Completions) {
                     self.started.wait().await;
                     std::future::pending::<()>().await;
                     unreachable!("test aborts the handler task before this future resolves")
                 }
-                vec![]
+                Completions::default()
             })
         }
         fn as_any(&self) -> &dyn Any {
