@@ -66,6 +66,37 @@ use tower_lsp_server::ls_types::{
 /// fail) fallback search rather than the handler's existing skip-on-timeout path.
 pub const COMPLETION_SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Result of [`Ecosystem::generate_completions`](crate::Ecosystem::generate_completions).
+///
+/// Carries the completion items produced for this specific call, plus whether they are
+/// a possibly-truncated view of a larger candidate set that the LSP client should
+/// re-query for as the user keeps typing.
+///
+/// Supersedes the ecosystem-wide `Ecosystem::completions_are_incomplete()` flag (#419):
+/// `is_incomplete` is computed per call from the actual completion context and result
+/// set, so only the specific context that is genuinely truncated (e.g. PyPI's unranked,
+/// index-backed package-name search) is flagged — a version completion, a comment
+/// position, or any other exhaustive context in the same manifest correctly reports
+/// `is_incomplete: false` instead of inheriting the worst case across the whole
+/// ecosystem (#427).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Completions {
+    /// The completion items for this call.
+    pub items: Vec<CompletionItem>,
+    /// Whether `items` is a possibly-truncated view of a larger candidate set.
+    pub is_incomplete: bool,
+}
+
+impl From<Vec<CompletionItem>> for Completions {
+    /// Wraps an always-exhaustive result set, i.e. `is_incomplete: false`.
+    fn from(items: Vec<CompletionItem>) -> Self {
+        Self {
+            items,
+            is_incomplete: false,
+        }
+    }
+}
+
 /// Context for completion request based on cursor position.
 ///
 /// This enum represents what type of completion is appropriate at the

@@ -2,11 +2,12 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeLens, CompletionItem, Diagnostic, Hover, InlayHint, Position, Uri,
+    CodeAction, CodeLens, Diagnostic, Hover, InlayHint, Position, Uri,
 };
 
 use crate::{
     Registry,
+    completion::Completions,
     lsp_helpers::{EcosystemFormatter, VersionData},
 };
 
@@ -289,6 +290,7 @@ impl Default for EcosystemConfig {
 ///
 /// ```no_run
 /// use deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig, PackageName};
+/// use deps_core::completion::Completions;
 /// use deps_core::lsp_helpers::EcosystemFormatter;
 /// use std::sync::Arc;
 /// use std::any::Any;
@@ -330,8 +332,8 @@ impl Default for EcosystemConfig {
 ///         _position: Position,
 ///         _content: &'a str,
 ///         _freshness: deps_core::FreshnessSettings,
-///     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
-///         Box::pin(async move { vec![] })
+///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+///         Box::pin(async move { Completions::default() })
 ///     }
 ///
 ///     fn as_any(&self) -> &dyn Any { self }
@@ -568,30 +570,42 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// relative-age `label_details` suffix (issue #145); implementations that
     /// delegate to [`crate::completion::complete_versions_generic`] get this for
     /// free by threading `freshness` through.
+    ///
+    /// The returned [`Completions::is_incomplete`] must reflect *this specific call*
+    /// (the completion context actually served), not a static worst case for the
+    /// ecosystem as a whole (#427): a package-name search over an unranked,
+    /// truncated index should report `true`, while a version completion or any
+    /// other exhaustive context in the same manifest must report `false`, even for
+    /// an ecosystem where some contexts are incomplete and others are not.
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,
         position: Position,
         content: &'a str,
         freshness: crate::FreshnessSettings,
-    ) -> BoxFuture<'a, Vec<CompletionItem>>;
+    ) -> BoxFuture<'a, Completions>;
 
-    /// Whether this ecosystem's completions may be a truncated view of a larger
-    /// candidate set, so the LSP client must re-query as the user keeps typing rather
-    /// than filter the (possibly empty) list it already has client-side.
+    /// Whether this ecosystem's package-name search may return a truncated view of
+    /// a larger candidate set (see e.g. `PypiRegistry::search`'s doc comment).
     ///
-    /// This is the ecosystem's *worst case across every completion context it
-    /// serves* — not a per-result property — since [`generate_completions`]'s single
-    /// return type gives the handler no way to flag one context (e.g. package-name
-    /// search over an unranked, alphabetically-truncated index) without also
-    /// flagging every other context the same call could have produced (e.g. version
-    /// completion, which is already complete). Over-reporting only costs a redundant
-    /// re-query; under-reporting lets the client silently drop results it should
-    /// have asked for again. Default `false` preserves existing behavior for every
-    /// ecosystem whose completions are always exhaustive.
+    /// [`generate_completions`](Ecosystem::generate_completions) already reports
+    /// this precisely per call via [`Completions::is_incomplete`] whenever a real
+    /// completion context is available. This method exists only for the two
+    /// `deps-lsp` code paths that cannot compute that precise per-call signal
+    /// because no context has been resolved yet:
     ///
-    /// [`generate_completions`]: Ecosystem::generate_completions
-    fn completions_are_incomplete(&self) -> bool {
+    /// - the raw-text fallback search (`fallback_completion`), which always
+    ///   performs a package-name lookup via [`crate::Registry::search`] regardless
+    ///   of what completion context (or lack thereof) triggered it;
+    /// - the document-not-loaded early return, before any `ParseResult` — and so
+    ///   any completion context — exists to call `generate_completions` with.
+    ///
+    /// Unlike the ecosystem-wide `completions_are_incomplete()` flag this method
+    /// superseded (#419, removed in #427), it never gates the *primary*
+    /// `generate_completions` response — only these two context-less fallbacks.
+    /// Default `false` preserves existing behavior for every ecosystem whose
+    /// package-name search is always exhaustive.
+    fn package_search_is_incomplete(&self) -> bool {
         false
     }
 

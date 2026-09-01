@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{CompletionItem, Position, Range, Uri};
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
+    lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::PypiFormatter;
@@ -88,10 +89,11 @@ impl PypiEcosystem {
         // found. Rewriting `filter_text` to the raw, as-typed `prefix` makes every
         // returned item trivially self-matching against what's already on screen.
         // Safe to do unconditionally (rather than something that must also match
-        // characters not yet typed): PyPI's completions are always
-        // `isIncomplete: true` (see `completions_are_incomplete`), so the client
-        // re-queries — and receives a fresh `filter_text` — on the very next
-        // keystroke rather than continuing to filter this same list locally.
+        // characters not yet typed): this method's caller always reports
+        // `is_incomplete: true` for the `PackageName` context (see
+        // `generate_completions`), so the client re-queries — and receives a
+        // fresh `filter_text` — on the very next keystroke rather than continuing
+        // to filter this same list locally.
         for item in &mut items {
             item.filter_text = Some(prefix.to_string());
         }
@@ -175,24 +177,13 @@ impl Ecosystem for PypiEcosystem {
         &self.formatter
     }
 
-    fn completions_are_incomplete(&self) -> bool {
-        // Package-name completion serves unranked, alphabetically-truncated prefix
-        // matches from `PypiRegistry::search`'s local index (issue #419): the
-        // client must re-query as the user keeps typing rather than filter its
-        // existing (possibly cold-start-empty) list. See
-        // `Ecosystem::completions_are_incomplete`'s doc for why this also covers
-        // this ecosystem's other completion contexts (version completion, and
-        // `CompletionContext::None`/`Feature`), not just package-name search.
-        true
-    }
-
     fn generate_completions<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
         position: Position,
         content: &'a str,
         freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CompletionItem>> {
+    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
             use deps_core::completion::{CompletionContext, detect_completion_context};
 
@@ -207,20 +198,36 @@ impl Ecosystem for PypiEcosystem {
             let context = detect_completion_context(parse_result, position, content);
 
             match context {
-                CompletionContext::PackageName { prefix, range } => {
-                    self.complete_package_names(&prefix, range).await
-                }
+                // Serves unranked, alphabetically-truncated prefix matches from
+                // `PypiRegistry::search`'s local index (issue #419): the client must
+                // re-query as the user keeps typing rather than filter its existing
+                // (possibly cold-start-empty) list — so this is the one context that
+                // reports `is_incomplete: true`, regardless of whether it currently
+                // has any items (#427).
+                CompletionContext::PackageName { prefix, range } => Completions {
+                    items: self.complete_package_names(&prefix, range).await,
+                    is_incomplete: true,
+                },
                 CompletionContext::Version {
                     package_name,
                     prefix,
-                } => {
-                    self.complete_versions(&package_name, &prefix, freshness)
-                        .await
+                } => self
+                    .complete_versions(&package_name, &prefix, freshness)
+                    .await
+                    .into(),
+                CompletionContext::Feature { .. } | CompletionContext::None => {
+                    Completions::default()
                 }
-                CompletionContext::Feature { .. } => vec![],
-                CompletionContext::None => vec![],
             }
         })
+    }
+
+    fn package_search_is_incomplete(&self) -> bool {
+        // Same unranked, alphabetically-truncated index `PackageName`'s
+        // `is_incomplete: true` above covers for the primary path — see
+        // `Ecosystem::package_search_is_incomplete`'s doc for why this only
+        // matters for `deps-lsp`'s context-less fallback paths.
+        true
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -378,6 +385,40 @@ mod tests {
             }
             other => panic!("Expected PackageName context, got {other:?}"),
         }
+    }
+
+    /// #427 coverage gap: the actual bugfix — `generate_completions`'s
+    /// `PackageName` arm reporting `is_incomplete: true` for the truncated
+    /// package-name search index — was previously only verified via a hand-rolled
+    /// mock `Ecosystem` in `deps-lsp`'s handler tests, never on the real
+    /// `PypiEcosystem` dispatch. Same fixture/cursor as
+    /// `test_package_name_completion_context_has_real_range`, but calling
+    /// `generate_completions` directly (not `detect_completion_context`) so a
+    /// reversed condition or wrong-arm bug in the real dispatch would be caught.
+    #[tokio::test]
+    async fn test_generate_completions_package_name_context_is_incomplete() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let content = "[dependency-groups]\ndev = [\"pytest>=8.0\", \"mypy>=1.0\"]\n";
+        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        let position = Position::new(1, 11); // cursor after "pyt" in "pytest"
+
+        let completions = ecosystem
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+
+        assert!(
+            completions.is_incomplete,
+            "PackageName context must report is_incomplete: true, even with zero \
+             items on a cold-start index"
+        );
     }
 
     #[tokio::test]
@@ -543,16 +584,26 @@ mod tests {
             })
             .expect("fixture line must contain a Version completion context");
 
+        let mut last_completions = None;
         for _ in 0..3 {
-            let _ = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
-                    version_position,
-                    content,
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await;
+            last_completions = Some(
+                ecosystem
+                    .generate_completions(
+                        parse_result.as_ref(),
+                        version_position,
+                        content,
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await,
+            );
         }
+        assert!(
+            !last_completions
+                .expect("loop ran at least once")
+                .is_incomplete,
+            "a Version completion context is always exhaustive, unlike PackageName's \
+             truncated index search"
+        );
 
         // Give the (single-flight) background build a chance to finish.
         let ready = poll_until_nonempty(
@@ -799,7 +850,8 @@ name = "test"
             )
             .await;
 
-        assert!(completions.is_empty());
+        assert!(completions.items.is_empty());
+        assert!(!completions.is_incomplete);
     }
 
     #[tokio::test]
@@ -832,7 +884,7 @@ dependencies = ["requests"]
             .await;
 
         // Should not crash, returns empty or package/version completions
-        assert!(completions.is_empty() || !completions.is_empty());
+        assert!(completions.items.is_empty() || !completions.items.is_empty());
     }
 
     #[tokio::test]
