@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-01
+
 ### Fixed
 - **deps-pypi, deps-core, deps-lsp**: PyPI package-name completion, previously a permanent zero-results stub, now serves matches from a live PyPI package-name index (resolves #419) (#426)
 - **docs**: `ECOSYSTEM_GUIDE.md`'s Deno row now lists code lens support, matching the shared `deps-core` default it already receives (resolves #410) (#416)
@@ -644,7 +646,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/bug-ops/deps-lsp/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/bug-ops/deps-lsp/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/bug-ops/deps-lsp/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/bug-ops/deps-lsp/compare/v0.9.5...v0.10.0
