@@ -304,7 +304,7 @@ impl JsrRegistry {
 
 /// Parses `meta.json`'s `versions` object into a newest-first `Vec<JsrVersion>` (C2).
 fn parse_meta_json(data: &[u8]) -> Result<Vec<JsrVersion>> {
-    let meta: MetaJson = serde_json::from_slice(data)?;
+    let meta: MetaJson = deps_core::parse_json_checked(data)?;
 
     let mut versions_with_parsed: Vec<(JsrVersion, node_semver::Version)> = meta
         .versions
@@ -333,7 +333,7 @@ fn parse_meta_json(data: &[u8]) -> Result<Vec<JsrVersion>> {
 /// Parses `api.jsr.io/packages`'s search response into `JsrPackage`s, each already
 /// scheme-qualified as `"jsr:@scope/name"` (D3).
 fn parse_search_response(data: &[u8]) -> Result<Vec<JsrPackage>> {
-    let response: SearchResponse = serde_json::from_slice(data)?;
+    let response: SearchResponse = deps_core::parse_json_checked(data)?;
 
     Ok(response
         .items
@@ -665,6 +665,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_meta_json_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"versions": {{}}, "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_meta_json(json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_meta_json_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"versions": {{}}, "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_meta_json(json.as_bytes()).is_err());
+    }
+
+    #[test]
     fn test_parse_search_response_prefixes_name_with_scheme_and_maps_github_repo() {
         let json = r#"{
   "items": [
@@ -690,6 +712,28 @@ mod tests {
             Some("https://github.com/denoland/std".to_string())
         );
         assert_eq!(packages[0].latest_version, "1.0.24");
+    }
+
+    #[test]
+    fn test_parse_search_response_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"items": [], "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_search_response(json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_search_response_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"items": [], "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_search_response(json.as_bytes()).is_err());
     }
 
     #[test]

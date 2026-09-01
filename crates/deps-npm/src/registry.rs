@@ -493,7 +493,7 @@ struct VersionMetadata {
 
 /// Parses JSON response from npm package metadata API.
 fn parse_package_metadata(data: &[u8]) -> Result<Vec<NpmVersion>> {
-    let metadata: PackageMetadata = serde_json::from_slice(data)?;
+    let metadata: PackageMetadata = deps_core::parse_json_checked(data)?;
 
     // Parse versions once and cache the parsed Version for sorting
     let mut versions_with_parsed: Vec<(NpmVersion, node_semver::Version)> = metadata
@@ -585,13 +585,13 @@ fn publish_times_stale(cached: &CachedTimes, now: Instant, current_top8: &[Strin
 ///
 /// # Errors
 ///
-/// Returns a `DepsError::JsonError`-wrapping error if `data` is not valid JSON matching
-/// [`PackageTimes`]'s shape.
+/// Returns a [`DepsError::Json`]-wrapping error if `data` is not valid JSON matching
+/// [`PackageTimes`]'s shape, or nests deeper than [`deps_core::MAX_JSON_NESTING_DEPTH`].
 fn parse_package_times(
     data: &[u8],
     known_versions: &[String],
 ) -> Result<HashMap<String, PublishTime>> {
-    let parsed: PackageTimes = serde_json::from_slice(data)?;
+    let parsed: PackageTimes = deps_core::parse_json_checked(data)?;
     let known: std::collections::HashSet<&str> =
         known_versions.iter().map(String::as_str).collect();
     Ok(parsed
@@ -617,7 +617,7 @@ fn attach_publish_times(versions: &mut [NpmVersion], times: &HashMap<String, Pub
 
 /// Parses JSON response from npm search API.
 fn parse_search_response(data: &[u8]) -> Result<Vec<NpmPackage>> {
-    let response: SearchResponse = serde_json::from_slice(data)?;
+    let response: SearchResponse = deps_core::parse_json_checked(data)?;
 
     Ok(response
         .objects
@@ -937,6 +937,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_package_metadata_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"versions": {{}}, "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_package_metadata(json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_package_metadata_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"versions": {{}}, "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_package_metadata(json.as_bytes()).is_err());
+    }
+
+    #[test]
     fn test_parse_search_response() {
         let json = r#"{
   "objects": [
@@ -984,6 +1006,28 @@ mod tests {
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].name, "minimal-pkg");
         assert_eq!(packages[0].description, None);
+    }
+
+    #[test]
+    fn test_parse_search_response_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"objects": [], "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_search_response(json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_search_response_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"objects": [], "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_search_response(json.as_bytes()).is_err());
     }
 
     #[test]
@@ -1582,6 +1626,15 @@ mod tests {
     #[test]
     fn test_parse_package_times_invalid_json_errors() {
         assert!(parse_package_times(b"not json", &[]).is_err());
+    }
+
+    #[test]
+    fn test_parse_package_times_deeply_nested_json_rejected_before_parse() {
+        // #430: a deeply nested `time` value must be rejected by the depth
+        // guard rather than handed to `serde_json::from_slice`.
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let deeply_nested = format!(r#"{{"time":{}1{}}}"#, "[".repeat(depth), "]".repeat(depth));
+        assert!(parse_package_times(deeply_nested.as_bytes(), &[]).is_err());
     }
 
     // --- publish_times_stale: the S1 regression this predicate must never reintroduce ---

@@ -644,7 +644,7 @@ fn build_version_metadata(
 /// Parse the version list from a PyPI Simple API (PEP 691) JSON response.
 fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<PypiVersion>> {
     let response: SimpleApiResponse =
-        serde_json::from_slice(data).map_err(|e| DepsError::ApiResponse {
+        deps_core::parse_json_checked(data).map_err(|e| DepsError::ApiResponse {
             package: package_name.to_string(),
             registry: REGISTRY,
             source: e,
@@ -682,7 +682,7 @@ fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<Pypi
 /// Parse package info from PyPI JSON response.
 fn parse_package_info(package_name: &str, data: &[u8]) -> Result<PypiPackage> {
     let response: PypiResponse =
-        serde_json::from_slice(data).map_err(|e| DepsError::ApiResponse {
+        deps_core::parse_json_checked(data).map_err(|e| DepsError::ApiResponse {
             package: package_name.to_string(),
             registry: REGISTRY,
             source: e,
@@ -793,6 +793,28 @@ mod tests {
                 .unwrap()
                 .yanked
         );
+    }
+
+    #[test]
+    fn test_parse_simple_api_response_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"versions": [], "files": [], "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_simple_api_response("pkg", json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_simple_api_response_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"versions": [], "files": [], "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_simple_api_response("pkg", json.as_bytes()).is_err());
     }
 
     #[test]
@@ -1246,6 +1268,28 @@ mod tests {
         assert_eq!(pkg.summary, Some("A micro web framework".to_string()));
         assert_eq!(pkg.latest_version, "3.0.0");
         assert_eq!(pkg.project_urls.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_package_info_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"info": {{"name": "pkg", "version": "1.0.0"}}, "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_package_info("pkg", json.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_parse_package_info_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"info": {{"name": "pkg", "version": "1.0.0"}}, "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_package_info("pkg", json.as_bytes()).is_err());
     }
 
     #[test]

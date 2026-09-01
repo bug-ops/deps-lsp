@@ -800,7 +800,7 @@ struct SearchDoc {
 }
 
 fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<ArtifactInfo>> {
-    let response: SolrSearchResponse = serde_json::from_slice(data)?;
+    let response: SolrSearchResponse = deps_core::parse_json_checked(data)?;
 
     let results = response
         .response
@@ -1275,6 +1275,28 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].name, "org.apache.commons:commons-lang3");
         assert_eq!(results[0].latest_version, "3.14.0");
+    }
+
+    #[test]
+    fn test_parse_search_response_nesting_at_max_depth_accepted() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH;
+        let json = format!(
+            r#"{{"response": {{"docs": []}}, "extra": {}1{}}}"#,
+            "[".repeat(depth - 1),
+            "]".repeat(depth - 1)
+        );
+        assert!(parse_search_response(json.as_bytes(), 10).is_ok());
+    }
+
+    #[test]
+    fn test_parse_search_response_nesting_over_max_depth_rejected() {
+        let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
+        let json = format!(
+            r#"{{"response": {{"docs": []}}, "extra": {}1{}}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(parse_search_response(json.as_bytes(), 10).is_err());
     }
 
     /// Manual live probe against the real endpoint (#274) — NOT deterministic

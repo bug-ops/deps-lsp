@@ -117,7 +117,7 @@ fn default_platform() -> String {
 }
 
 fn parse_versions_response(data: &[u8], _gem_name: &str) -> Result<Vec<BundlerVersion>> {
-    let entries: Vec<VersionEntry> = serde_json::from_slice(data)?;
+    let entries: Vec<VersionEntry> = deps_core::parse_json_checked(data)?;
 
     // RubyGems' `versions.json` returns one entry per (version, platform) pair, so a gem
     // shipping platform-specific prebuilt gems (nokogiri, ffi, sassc, ...) has multiple
@@ -167,7 +167,7 @@ struct SearchEntry {
 }
 
 fn parse_search_response(data: &[u8]) -> Result<Vec<GemInfo>> {
-    let entries: Vec<SearchEntry> = serde_json::from_slice(data)?;
+    let entries: Vec<SearchEntry> = deps_core::parse_json_checked(data)?;
 
     Ok(entries
         .into_iter()
@@ -201,7 +201,7 @@ struct GemInfoResponse {
 }
 
 fn parse_gem_info(data: &[u8]) -> Result<GemInfo> {
-    let response: GemInfoResponse = serde_json::from_slice(data)?;
+    let response: GemInfoResponse = deps_core::parse_json_checked(data)?;
 
     Ok(GemInfo {
         name: response.name.into(),

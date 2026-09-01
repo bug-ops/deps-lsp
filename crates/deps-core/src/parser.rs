@@ -702,6 +702,146 @@ pub fn check_yaml_expansion(content: &str, max_bytes: usize) -> std::result::Res
     }
 }
 
+/// Maximum allowed nesting depth for JSON array/object recursion before
+/// [`check_json_nesting_depth`] rejects the input.
+///
+/// `serde_json` itself already caps recursion at a default depth of 128 for
+/// every container it enters — `deserialize_any`/`Value`, but equally
+/// `deserialize_seq`/`deserialize_map` (`check_recursion!` in its `de.rs`,
+/// guarding all three), so ordinary typed struct/`Vec` deserialization is
+/// covered exactly the same as parsing into a bare `Value`. This workspace
+/// never enables the `unbounded_depth` feature or calls
+/// `disable_recursion_limit`, so pathologically nested JSON cannot crash
+/// this workspace via stack overflow regardless of which of these paths a
+/// given call site uses. This guard is defense-in-depth, not a
+/// vulnerability fix: an early, cheap, byte-level rejection that fails
+/// faster and with a repo-specific error type than waiting for
+/// `serde_json`'s own limit, and keeps every untrusted-JSON parse site
+/// consistent with the [`MAX_TOML_NESTING_DEPTH`]/[`MAX_YAML_NESTING_DEPTH`]
+/// guards already applied to manifests of those formats. The depth is
+/// intentionally set narrower than `serde_json`'s built-in 128 — real
+/// payloads (OSV `database_specific`/`ecosystem_specific`, npm's `time` map,
+/// Packagist's `abandoned` field, ordinary `package.json`/`composer.json`
+/// manifests and lockfiles) never approach double digits of nesting, so 64
+/// is an arbitrary but generous ceiling chosen to match the existing
+/// TOML/YAML constants' value, not a stack-size bisection.
+pub const MAX_JSON_NESTING_DEPTH: usize = 64;
+
+/// Scans raw JSON bytes for `[`/`{` nesting deeper than `max_depth`, before
+/// handing the bytes to `serde_json::from_slice`/`from_str`.
+///
+/// A single-pass structural scan — no actual parsing, so it cannot itself
+/// recurse or overflow. String contents (JSON's only escaping construct) are
+/// tracked so bracket characters inside string literals are never
+/// miscounted as structural nesting. Multi-byte UTF-8 sequences are safe to
+/// scan byte-by-byte here: none of their continuation bytes collide with the
+/// ASCII structural characters this function looks for.
+///
+/// An unterminated (or truncated) string literal makes the scanner treat the
+/// rest of the buffer as string content and return `Ok`, undercounting any
+/// nesting that follows. This is safe: `serde_json` tokenizes the same bytes
+/// and will independently reject the identical malformed/truncated string
+/// (an EOF-while-parsing-string or similar syntax error) before its own
+/// recursive descent could ever reach nesting beyond what this scanner
+/// already counted up to the unterminated quote.
+///
+/// # Errors
+///
+/// Returns `Err(depth)` with the depth reached the instant nesting exceeds
+/// `max_depth`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::parser::check_json_nesting_depth;
+///
+/// assert!(check_json_nesting_depth(br#"{"a":[1,2,{"b":3}]}"#, 4).is_ok());
+///
+/// let deeply_nested = format!("{}1{}", "[".repeat(10), "]".repeat(10));
+/// assert_eq!(check_json_nesting_depth(deeply_nested.as_bytes(), 4), Err(5));
+/// ```
+pub fn check_json_nesting_depth(
+    content: &[u8],
+    max_depth: usize,
+) -> std::result::Result<(), usize> {
+    let mut depth: usize = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for &b in content {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > max_depth {
+                    return Err(depth);
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Builds the `serde_json::Error` reporting a too-deep payload.
+///
+/// Shared internally by [`parse_json_checked`]'s two failure paths (too-deep vs. genuinely
+/// malformed) so both produce the exact same error type. Synthesized via
+/// `serde::de::Error::custom` so it is indistinguishable, to a caller's existing
+/// malformed-JSON handling, from an error `serde_json` itself would have produced.
+#[must_use]
+fn json_depth_error(depth: usize) -> serde_json::Error {
+    serde::de::Error::custom(format!(
+        "JSON nesting depth {depth} exceeds maximum of {MAX_JSON_NESTING_DEPTH}"
+    ))
+}
+
+/// Deserializes `bytes` into `T`, first rejecting payloads whose JSON nesting exceeds
+/// [`MAX_JSON_NESTING_DEPTH`] (see that constant's doc for why).
+///
+/// The single shared entry point for every untrusted-JSON parse site in this workspace —
+/// collapses what would otherwise be a per-crate copy of [`check_json_nesting_depth`] +
+/// [`serde_json::from_slice`] into one call, and returns a `serde_json::Error` so a
+/// too-deep payload converts into a caller's `DepsError` exactly like any other
+/// malformed-JSON failure (via `?`, `.map_err(..)`, or `.ok()`).
+///
+/// # Errors
+///
+/// Returns an error if `bytes` nests deeper than [`MAX_JSON_NESTING_DEPTH`], or
+/// `serde_json`'s own error if `bytes` is not valid JSON matching `T`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::parser::parse_json_checked;
+///
+/// let value: serde_json::Value = parse_json_checked(br#"{"a":1}"#).unwrap();
+/// assert_eq!(value["a"], 1);
+///
+/// let deeply_nested = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+/// assert!(parse_json_checked::<serde_json::Value>(deeply_nested.as_bytes()).is_err());
+/// ```
+pub fn parse_json_checked<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> std::result::Result<T, serde_json::Error> {
+    if let Err(depth) = check_json_nesting_depth(bytes, MAX_JSON_NESTING_DEPTH) {
+        return Err(json_depth_error(depth));
+    }
+    serde_json::from_slice(bytes)
+}
+
 /// Dependency source location (shared across all ecosystems).
 ///
 /// Covers the union of all source types across Cargo, npm, PyPI, Go,
@@ -1640,6 +1780,69 @@ dev_dependencies:
             rev: None,
         };
         assert_ne!(git1, git3);
+    }
+
+    #[test]
+    fn test_check_json_nesting_depth_shallow_accepted() {
+        let content = br#"{"a":[1,2,{"b":3}],"c":"[not{real}nesting]"}"#;
+        assert_eq!(check_json_nesting_depth(content, 4), Ok(()));
+    }
+
+    #[test]
+    fn test_check_json_nesting_depth_string_brackets_ignored() {
+        // Brackets inside a string literal (including an escaped quote) must
+        // never be counted as structural nesting.
+        let content = br#"{"a":"[[[[[\"]]]]]"}"#;
+        assert_eq!(check_json_nesting_depth(content, 1), Ok(()));
+    }
+
+    #[test]
+    fn test_check_json_nesting_depth_mixed_array_and_object_nesting() {
+        let content = br#"[{"a":[{"b":1}]}]"#;
+        assert_eq!(check_json_nesting_depth(content, 4), Ok(()));
+        assert_eq!(check_json_nesting_depth(content, 3), Err(4));
+    }
+
+    #[test]
+    fn test_check_json_nesting_depth_deeply_nested_array_rejected() {
+        // The #430 attack shape: without this guard, `serde_json::from_slice`
+        // would still not crash — it independently halts at its own default
+        // recursion limit (128) with a clean `Err`. This guard rejects the
+        // same shape earlier, at a stricter depth (64), with a repo-specific
+        // `check_json_nesting_depth` error rather than a `serde_json::Error`.
+        let deeply_nested = format!("{}1{}", "[".repeat(10), "]".repeat(10));
+        assert_eq!(
+            check_json_nesting_depth(deeply_nested.as_bytes(), 4),
+            Err(5)
+        );
+    }
+
+    #[test]
+    fn test_check_json_nesting_depth_unterminated_string_blinds_scanner_but_serde_json_still_rejects()
+     {
+        // An unterminated `"` makes the scanner treat everything after it as
+        // string content, so it returns `Ok` even with deep nesting past the
+        // quote. This is safe only because `serde_json` independently halts
+        // on the same malformed input via its own tokenizer.
+        let payload = format!("\"unterminated{}1", "[".repeat(MAX_JSON_NESTING_DEPTH + 1));
+        assert_eq!(
+            check_json_nesting_depth(payload.as_bytes(), MAX_JSON_NESTING_DEPTH),
+            Ok(())
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&payload).is_err());
+    }
+
+    #[test]
+    fn test_check_json_nesting_depth_at_production_boundary() {
+        let depth = MAX_JSON_NESTING_DEPTH;
+        let at_max = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        assert_eq!(check_json_nesting_depth(at_max.as_bytes(), depth), Ok(()));
+
+        let over_max = format!("{}1{}", "[".repeat(depth + 1), "]".repeat(depth + 1));
+        assert_eq!(
+            check_json_nesting_depth(over_max.as_bytes(), depth),
+            Err(depth + 1)
+        );
     }
 
     #[test]
