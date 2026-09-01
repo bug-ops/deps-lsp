@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **deps-core, deps-npm, deps-composer, deps-lsp**: package-level deprecation/abandoned diagnostic and hover section (npm `deprecated`, Composer `abandoned`), plus a Composer-only "Replace with X" code action when a successor package is named (resolves #205) (#435)
 
+### Changed
+- **Breaking (pre-1.0, public API)**: `PackageVersions::yanked` field type changed from `Arc<[ConcreteVersion]>` to `Arc<[(ConcreteVersion, RemovalStatus)]>`, carrying each yanked/deprecated version's `RemovalStatus` (resolves #437) (#437)
+
+### Fixed
+- **deps-core, deps-lsp**: the "requirement satisfiable only by a yanked version" diagnostic no longer lets a co-occurring package-level deprecation finding hide a genuine hard yank (resolves #437) (#437)
+
 ## [0.11.1] - 2026-09-01
 
 ### Fixed
