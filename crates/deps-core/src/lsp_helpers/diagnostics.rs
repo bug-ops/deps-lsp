@@ -4,8 +4,8 @@ use tower_lsp_server::ls_types::{
 
 use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome, diagnostic_severity_for};
 use crate::{
-    Dependency, ParseResult, PublishTime, Registry, VersionReq, format_relative_age,
-    is_within_cooldown,
+    Dependency, Deprecation, ParseResult, PublishTime, Registry, RemovalStatus, VersionReq,
+    format_relative_age, is_within_cooldown,
 };
 
 use super::{EcosystemFormatter, RequirementMatcher, RequirementStatus, VersionData};
@@ -18,6 +18,13 @@ use super::{EcosystemFormatter, RequirementMatcher, RequirementStatus, VersionDa
 /// advisory id, generalized to a constant since this diagnostic has no per-instance
 /// identifier.
 pub const UNSATISFIABLE_DIAGNOSTIC_CODE: &str = "unsatisfiable-requirement";
+
+/// Stable [`Diagnostic::code`] set on the package-level deprecation diagnostic (issue #205).
+///
+/// Mirrors [`UNSATISFIABLE_DIAGNOSTIC_CODE`] — lets `build_replacement_action`'s stashed
+/// `CodeAction::data` name it so the `deps-lsp` handler's diagnostic-binding step can
+/// attach the "Replace with X" quickfix to the diagnostic it resolves.
+pub const DEPRECATED_DIAGNOSTIC_CODE: &str = "deprecated-package";
 
 /// Diagnostic severity levels for the four per-dependency issue categories.
 ///
@@ -36,6 +43,7 @@ pub const UNSATISFIABLE_DIAGNOSTIC_CODE: &str = "unsatisfiable-requirement";
 /// assert_eq!(severities.unknown, DiagnosticSeverity::WARNING);
 /// assert_eq!(severities.yanked, DiagnosticSeverity::WARNING);
 /// assert_eq!(severities.unsatisfiable, DiagnosticSeverity::WARNING);
+/// assert_eq!(severities.deprecated, DiagnosticSeverity::WARNING);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiagnosticSeverities {
@@ -47,6 +55,9 @@ pub struct DiagnosticSeverities {
     pub yanked: DiagnosticSeverity,
     /// Severity for a dependency whose requirement matches zero published versions.
     pub unsatisfiable: DiagnosticSeverity,
+    /// Severity for a dependency on a package the registry reports as
+    /// deprecated/abandoned (issue #205).
+    pub deprecated: DiagnosticSeverity,
 }
 
 impl Default for DiagnosticSeverities {
@@ -56,6 +67,7 @@ impl Default for DiagnosticSeverities {
             unknown: DiagnosticSeverity::WARNING,
             yanked: DiagnosticSeverity::WARNING,
             unsatisfiable: DiagnosticSeverity::WARNING,
+            deprecated: DiagnosticSeverity::WARNING,
         }
     }
 }
@@ -449,7 +461,52 @@ pub fn generate_diagnostics_from_cache(
         // `versions.ecosystem` being set (production always sets it; the
         // check is skipped, matching pre-#394 behavior, for the test
         // fixtures that do not).
-        let yanked_diagnostic_pushed = if let Some(yanked_version) =
+        // #205: a package-level deprecation finding is derived and pushed independently
+        // of the yanked check below, for the same FR-007-style reason as the
+        // vulnerability push above — a registry-reported deprecation must never be
+        // suppressed by an unrelated "latest" lookup failure.
+        //
+        // I4: gated on `is_version_resolvable()`, same guard `unsatisfiable`/`yanked_only`
+        // apply further down — `versions.deprecations` is name-keyed, so a git/path/SDK
+        // occurrence sharing a name with an unrelated registry-resolved package (the same
+        // #248 coincidental-namesake hazard) must not surface a diagnostic for a package
+        // it doesn't actually resolve against. Folded into `deprecation` itself (rather
+        // than only guarding the `push` call) so the D5 suppression gate below — which
+        // reads `deprecation.is_some()` — sees the same answer.
+        let deprecation = dep
+            .source()
+            .is_version_resolvable()
+            .then(|| versions.deprecations.and_then(|d| d.get(&normalized_name)))
+            .flatten();
+        if let Some(dep_info) = deprecation {
+            push_deprecation_diagnostic(&mut diagnostics, dep, formatter, dep_info, severities);
+        }
+
+        // D5: a package-level deprecation finding suppresses the in-use-version yanked
+        // check (#263) below and, transitively via `yanked_diagnostic_pushed`, the
+        // yanked-only-match check (#247) further down — but only when the underlying
+        // yanked finding's status is `AdvisoryDeprecated`, never when it is `Yanked`. A
+        // genuine hard yank ("the exact version you pinned was withdrawn") is strictly
+        // more actionable than a package-level deprecation notice ("the project is
+        // archived"), so it must never be hidden behind one.
+        //
+        // Requires an *actual* `versions.yanked` (#263) entry with that status — a
+        // vacuous `None` (`is_none_or` would default to "suppress") must NOT suppress.
+        // #247 reads a different data source (`package_versions.yanked`, a bare
+        // `Arc<[String]>` with no `RemovalStatus` attached, built independently of the
+        // #263 map — see lifecycle.rs), so "no #263 finding for this name" is not
+        // evidence that #247's finding (if any) is safe to hide: #247 can fire for a
+        // range requirement satisfiable only by a yanked version even when no specific
+        // in-use/latest version was itself flagged (impl-critic I1).
+        let deprecation_suppresses_yanked = deprecation.is_some()
+            && versions
+                .yanked
+                .and_then(|y| y.get(&normalized_name))
+                .is_some_and(|(_, status)| *status != RemovalStatus::Yanked);
+
+        let yanked_diagnostic_pushed = if deprecation_suppresses_yanked {
+            true
+        } else if let Some((yanked_version, _status)) =
             versions.yanked.and_then(|y| y.get(&normalized_name))
             && versions.ecosystem.is_none_or(|ecosystem| {
                 super::in_use_version(
@@ -461,7 +518,8 @@ pub fn generate_diagnostics_from_cache(
                 )
                 .as_deref()
                     == Some(yanked_version.as_str())
-            }) {
+            })
+        {
             diagnostics.push(Diagnostic {
                 range: dep.version_range().unwrap_or_else(|| dep.name_range()),
                 severity: Some(severities.yanked),
@@ -648,6 +706,41 @@ pub fn generate_diagnostics_from_cache(
     }
 
     diagnostics
+}
+
+/// Pushes the package-level deprecation [`Diagnostic`] for `dep` (issue #205).
+///
+/// Modeled on `push_vulnerability_diagnostics`: anchored on `dep.version_range()`,
+/// falling back to `dep.name_range()` — the same range D4 requires so the client's
+/// lightbulb gesture lands where `generate_code_actions`' quickfixes already work (see
+/// `EcosystemFormatter::is_position_on_dependency`'s default).
+fn push_deprecation_diagnostic(
+    diagnostics: &mut Vec<Diagnostic>,
+    dep: &dyn Dependency,
+    formatter: &dyn EcosystemFormatter,
+    deprecation: &Deprecation,
+    severities: DiagnosticSeverities,
+) {
+    use std::fmt::Write as _;
+
+    let range = dep.version_range().unwrap_or_else(|| dep.name_range());
+
+    let mut message = formatter.deprecated_message().to_string();
+    if let Some(reason) = deprecation.reason.as_deref().filter(|r| !r.is_empty()) {
+        let _ = write!(message, ": {reason}");
+    }
+    if let Some(replacement) = deprecation.replacement.as_deref().filter(|r| !r.is_empty()) {
+        let _ = write!(message, " (replacement: {replacement})");
+    }
+
+    diagnostics.push(Diagnostic {
+        range,
+        severity: Some(severities.deprecated),
+        message,
+        source: Some("deps-lsp".into()),
+        code: Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into())),
+        ..Default::default()
+    });
 }
 
 /// Pushes one [`Diagnostic`] per advisory (each with its own severity, code,
@@ -1545,7 +1638,10 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), "1.0.5".to_string());
+        yanked.insert(
+            "serde".to_string(),
+            ("1.0.5".to_string(), RemovalStatus::Yanked),
+        );
 
         let severities = DiagnosticSeverities {
             yanked: DiagnosticSeverity::ERROR,
@@ -1589,7 +1685,10 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), "1.0.5".to_string());
+        yanked.insert(
+            "serde".to_string(),
+            ("1.0.5".to_string(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1672,7 +1771,10 @@ mod tests {
         cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), "1.0.5".to_string());
+        yanked.insert(
+            "serde".to_string(),
+            ("1.0.5".to_string(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1700,6 +1802,283 @@ mod tests {
         );
     }
 
+    /// T2 (D5 collision): an exact-pin dependency whose package is both package-level
+    /// deprecated and whose in-use-version yanked finding carries `AdvisoryDeprecated`
+    /// (npm's real shape — its yanked map is always sourced from `from_advisory`, never
+    /// `from_yanked`) must produce **exactly one** diagnostic: the deprecation
+    /// diagnostic suppresses the yanked one, since the two are one signal.
+    #[test]
+    fn test_generate_diagnostics_from_cache_deprecation_suppresses_advisory_deprecated_yanked_finding()
+     {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "left-pad".into(),
+                version_req: "1.3.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("left-pad".into(), PackageVersions::latest_only("1.3.0"));
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        yanked.insert(
+            "left-pad".to_string(),
+            ("1.3.0".to_string(), RemovalStatus::AdvisoryDeprecated),
+        );
+        let mut deprecations = HashMap::new();
+        deprecations.insert(
+            "left-pad".to_string(),
+            Deprecation {
+                reason: Some("use String.prototype.padStart()".to_string()),
+                replacement: None,
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_yanked(&yanked)
+                .with_deprecations(&deprecations),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "the deprecation diagnostic must suppress the AdvisoryDeprecated yanked \
+             finding, not double-report: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0]
+                .message
+                .starts_with(formatter.deprecated_message())
+        );
+    }
+
+    /// T6 (D5 gate): a synthetic `Yanked` finding — unreachable for any Phase-1
+    /// ecosystem, but the guard for the PyPI fast-follow, the first ecosystem with both
+    /// real yanks and package deprecation — must **never** be suppressed by a
+    /// package-level deprecation finding on the same dependency. Both diagnostics fire.
+    #[test]
+    fn test_generate_diagnostics_from_cache_deprecation_never_suppresses_real_yanked_finding() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/pyproject.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.0.0"));
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        yanked.insert(
+            "pkg".to_string(),
+            ("1.0.0".to_string(), RemovalStatus::Yanked),
+        );
+        let mut deprecations = HashMap::new();
+        deprecations.insert(
+            "pkg".to_string(),
+            Deprecation {
+                reason: Some("project archived".to_string()),
+                replacement: None,
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_yanked(&yanked)
+                .with_deprecations(&deprecations),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "a genuine Yanked finding must never be hidden behind a package-level \
+             deprecation notice: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.starts_with(formatter.yanked_message()))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.starts_with(formatter.deprecated_message()))
+        );
+    }
+
+    /// T6b (D5 gate, severity independence): on an npm-shaped fixture where the two
+    /// signals genuinely are one (`AdvisoryDeprecated`), suppression must be identical
+    /// regardless of the configured severities — a user setting `deprecated_severity:
+    /// hint` cannot thereby silence a `yanked_severity: error` finding, because severity
+    /// is not an input to the suppression decision at all.
+    #[test]
+    fn test_generate_diagnostics_from_cache_deprecation_suppression_is_severity_independent() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "left-pad".into(),
+                version_req: "1.3.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("left-pad".into(), PackageVersions::latest_only("1.3.0"));
+        let resolved_versions = HashMap::new();
+        let mut yanked = HashMap::new();
+        yanked.insert(
+            "left-pad".to_string(),
+            ("1.3.0".to_string(), RemovalStatus::AdvisoryDeprecated),
+        );
+        let mut deprecations = HashMap::new();
+        deprecations.insert(
+            "left-pad".to_string(),
+            Deprecation {
+                reason: Some("use String.prototype.padStart()".to_string()),
+                replacement: None,
+            },
+        );
+        let versions = VersionData::new(&cached_versions, &resolved_versions)
+            .with_yanked(&yanked)
+            .with_deprecations(&deprecations);
+
+        let default_severities = DiagnosticSeverities::default();
+        let inverted_severities = DiagnosticSeverities {
+            deprecated: DiagnosticSeverity::HINT,
+            yanked: DiagnosticSeverity::ERROR,
+            ..DiagnosticSeverities::default()
+        };
+
+        for severities in [default_severities, inverted_severities] {
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                versions,
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                severities,
+                PublishTime::now(),
+            );
+            assert_eq!(
+                diagnostics.len(),
+                1,
+                "suppression must not depend on severity configuration: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics[0]
+                    .message
+                    .starts_with(formatter.deprecated_message())
+            );
+        }
+    }
+
+    /// I4: `versions.deprecations` is name-keyed, so a git/path/SDK/workspace dependency
+    /// whose name coincidentally matches an unrelated registry-resolved package's
+    /// deprecation finding must not surface that diagnostic — the same #248 hazard
+    /// `unsatisfiable`/`unknown`/`yanked_only` already guard against.
+    #[test]
+    fn test_generate_diagnostics_from_cache_deprecation_skipped_for_non_registry_sources() {
+        use crate::parser::DependencySource;
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("dep".into(), PackageVersions::latest_only("1.0.0"));
+        let resolved_versions = HashMap::new();
+        let mut deprecations = HashMap::new();
+        deprecations.insert(
+            "dep".to_string(),
+            Deprecation {
+                reason: Some("archived".to_string()),
+                replacement: None,
+            },
+        );
+        let uri = crate::test_util::test_uri("/test/Cargo.toml");
+
+        for source in [
+            DependencySource::Path {
+                path: "../local".into(),
+            },
+            DependencySource::Git {
+                url: "https://example.com/repo.git".into(),
+                rev: None,
+            },
+            DependencySource::Sdk {
+                sdk: "flutter".into(),
+            },
+            DependencySource::Workspace,
+        ] {
+            let parse_result = SingleDepParseResult {
+                dep: NonRegistryDep(dep_at("dep"), source.clone()),
+                uri: uri.clone(),
+            };
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_deprecations(&deprecations),
+                &MockFormatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|d| !d.message.starts_with(MockFormatter.deprecated_message())),
+                "source {source:?} must never surface the deprecation diagnostic for a \
+                 coincidentally-named registry package: {diagnostics:?}"
+            );
+        }
+
+        // Control: the same fixture on a Registry-source dependency DOES produce the
+        // diagnostic, proving the loop above isn't vacuously passing.
+        let registry_parse_result = SingleDepParseResult {
+            dep: dep_at("dep"),
+            uri,
+        };
+        let diagnostics = generate_diagnostics_from_cache(
+            &registry_parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_deprecations(&deprecations),
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.starts_with(MockFormatter.deprecated_message())),
+            "control case: a Registry-source dependency must still produce the diagnostic"
+        );
+    }
+
     #[test]
     fn test_generate_diagnostics_from_cache_yanked_no_version_range_uses_name_range() {
         use std::collections::HashMap;
@@ -1720,7 +2099,10 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), "1.0.5".to_string());
+        yanked.insert(
+            "serde".to_string(),
+            ("1.0.5".to_string(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1774,7 +2156,10 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
         // Keyed by the *normalized* (lowercase) name, not the raw manifest name.
-        yanked.insert("newtonsoft.json".to_string(), "13.0.1".to_string());
+        yanked.insert(
+            "newtonsoft.json".to_string(),
+            ("13.0.1".to_string(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1827,7 +2212,10 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("time".to_string(), "0.1.43".to_string());
+        yanked.insert(
+            "time".to_string(),
+            ("0.1.43".to_string(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1889,7 +2277,10 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
         let mut yanked = HashMap::new();
-        yanked.insert("time".to_string(), "0.1.43".to_string());
+        yanked.insert(
+            "time".to_string(),
+            ("0.1.43".to_string(), RemovalStatus::Yanked),
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -3073,6 +3464,76 @@ mod tests {
             );
         }
 
+        /// I1 (D5 gate regression): a package-level deprecation finding must NOT suppress
+        /// the #247 `requirement_matches_only_yanked` check when there is no corresponding
+        /// #263 (`versions.yanked`) entry to justify it. #247 reads a different data source
+        /// (`package_versions.yanked`, no `RemovalStatus` attached) than #263 does, so "no
+        /// #263 finding for this name" is not evidence the #247 finding (if any) is safe to
+        /// hide — an earlier version of the gate suppressed #247 unconditionally in exactly
+        /// this case (vacuous `is_none_or` on a missing #263 entry).
+        #[test]
+        fn test_generate_diagnostics_from_cache_deprecation_does_not_suppress_yanked_only_match_without_263_entry()
+         {
+            let formatter = TableFormatter::new(|v| Some(v == "1.2.1"));
+
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: "serde".into(),
+                    version_req: "modelled".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "serde".into(),
+                PackageVersions {
+                    latest: "2.0.0".to_string(),
+                    available: Arc::from(vec!["2.0.0".to_string(), "1.2.1".to_string()]),
+                    yanked: Arc::from(vec!["1.2.1".to_string()]),
+                    published_at: None,
+                },
+            );
+            let resolved_versions = HashMap::new();
+            // Deliberately empty: no #263 (in-use-version) finding for "serde" — the bug
+            // this test guards against is suppression that vacuously fires on this case.
+            let yanked: HashMap<String, (String, RemovalStatus)> = HashMap::new();
+            let mut deprecations = HashMap::new();
+            deprecations.insert(
+                "serde".to_string(),
+                Deprecation {
+                    reason: Some("archived".to_string()),
+                    replacement: None,
+                },
+            );
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_yanked(&yanked)
+                    .with_deprecations(&deprecations),
+                &formatter,
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.starts_with(formatter.yanked_message())),
+                "the #247 yanked-only-match finding must still fire: {diagnostics:?}"
+            );
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|d| d.message.starts_with(formatter.deprecated_message())),
+                "the deprecation finding must also still fire: {diagnostics:?}"
+            );
+        }
+
         /// #247 vs. #263 dedup: a dependency whose in-use version (lock-file-resolved, or an
         /// exact pin) is yanked *and* is the only version satisfying its own requirement
         /// triggers both the in-use-version check (`versions.yanked`, #263) and the
@@ -3104,7 +3565,10 @@ mod tests {
             );
             let resolved_versions = HashMap::new();
             let mut in_use_yanked = HashMap::new();
-            in_use_yanked.insert("serde".to_string(), "1.2.1".to_string());
+            in_use_yanked.insert(
+                "serde".to_string(),
+                ("1.2.1".to_string(), RemovalStatus::Yanked),
+            );
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,

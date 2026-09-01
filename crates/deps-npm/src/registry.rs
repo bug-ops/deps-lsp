@@ -491,6 +491,23 @@ struct VersionMetadata {
     deprecated: Option<String>,
 }
 
+/// Derives a #205 [`Deprecation`](deps_core::Deprecation) payload from npm's free-text
+/// `deprecated` field, or `None` if there is nothing worth telling the user.
+///
+/// M2: an all-whitespace `deprecated` string (`"deprecated": ""` is how a package is
+/// *un*-deprecated in practice) must produce `None`, not a `Deprecation` with a
+/// dangling, empty reason — `removal_status()` above is unaffected (it still treats
+/// `Some("")` as flagged, matching pre-#205 behavior; this is only about the payload
+/// shown to the user). Never populates `replacement`: npm has no structured successor
+/// field, only free text (see [`NpmVersion::deprecation`]'s docs).
+fn deprecation_from_message(message: Option<&str>) -> Option<deps_core::Deprecation> {
+    let reason = message.map(str::trim).filter(|s| !s.is_empty())?;
+    Some(deps_core::Deprecation {
+        reason: Some(reason.to_string()),
+        replacement: None,
+    })
+}
+
 /// Parses JSON response from npm package metadata API.
 fn parse_package_metadata(data: &[u8]) -> Result<Vec<NpmVersion>> {
     let metadata: PackageMetadata = deps_core::parse_json_checked(data)?;
@@ -505,6 +522,7 @@ fn parse_package_metadata(data: &[u8]) -> Result<Vec<NpmVersion>> {
                 NpmVersion {
                     version,
                     deprecated: meta.deprecated.is_some(),
+                    deprecation: deprecation_from_message(meta.deprecated.as_deref()),
                     published_at: None,
                 },
                 parsed,
@@ -1066,8 +1084,51 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].version, "1.3.0");
         assert!(versions[0].deprecated);
+        assert_eq!(
+            versions[0]
+                .deprecation
+                .as_ref()
+                .and_then(|d| d.reason.as_deref()),
+            Some("use String.prototype.padStart()")
+        );
         assert_eq!(versions[1].version, "1.2.0");
         assert!(!versions[1].deprecated);
+        assert!(versions[1].deprecation.is_none());
+    }
+
+    /// #205 M2: `"deprecated": ""` is npm's own convention for *un*-deprecating a
+    /// package — the `Deprecation` payload must be `None`, not `Some` with a dangling
+    /// empty reason, even though `removal_status()` (unaffected, pre-existing behavior)
+    /// still treats `Some("")` as flagged.
+    #[test]
+    fn test_parse_abbreviated_packument_empty_string_deprecated_has_no_payload() {
+        let json = r#"{
+  "name": "pkg",
+  "versions": {
+    "1.0.0": {"deprecated": ""}
+  }
+}"#;
+        let versions = parse_package_metadata(json.as_bytes()).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(
+            versions[0].deprecated,
+            "removal_status derivation is unaffected"
+        );
+        assert!(versions[0].deprecation.is_none());
+    }
+
+    #[test]
+    fn test_deprecation_from_message_trims_and_rejects_empty() {
+        assert_eq!(deprecation_from_message(None), None);
+        assert_eq!(deprecation_from_message(Some("")), None);
+        assert_eq!(deprecation_from_message(Some("   ")), None);
+        assert_eq!(
+            deprecation_from_message(Some("  use foo instead  ")),
+            Some(deps_core::Deprecation {
+                reason: Some("use foo instead".to_string()),
+                replacement: None,
+            })
+        );
     }
 
     #[test]
@@ -1183,11 +1244,13 @@ mod tests {
             Box::new(NpmVersion {
                 version: "2.0.0".into(),
                 deprecated: true,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(NpmVersion {
                 version: "1.0.0".into(),
                 deprecated: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1208,11 +1271,13 @@ mod tests {
             Box::new(NpmVersion {
                 version: "1.3.0".into(),
                 deprecated: true,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(NpmVersion {
                 version: "1.2.0".into(),
                 deprecated: true,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1231,6 +1296,7 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(NpmVersion {
             version: "1.0.0".into(),
             deprecated: true,
+            deprecation: None,
             published_at: None,
         })];
         let req = VersionReq::new("");
@@ -1253,11 +1319,13 @@ mod tests {
             Box::new(NpmVersion {
                 version: "19.2.0-canary.1".into(),
                 deprecated: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(NpmVersion {
                 version: "19.1.0".into(),
                 deprecated: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1278,11 +1346,13 @@ mod tests {
             Box::new(NpmVersion {
                 version: "2.0.0-alpha".into(),
                 deprecated: false,
+                deprecation: None,
                 published_at: None,
             }),
             Box::new(NpmVersion {
                 version: "1.0.0-beta".into(),
                 deprecated: false,
+                deprecation: None,
                 published_at: None,
             }),
         ];
@@ -1366,6 +1436,7 @@ mod tests {
                 Box::new(NpmVersion {
                     version: (*version).to_string(),
                     deprecated: *deprecated,
+                    deprecation: None,
                     published_at: None,
                 }) as Box<dyn deps_core::Version>
             })
@@ -1481,6 +1552,11 @@ mod tests {
         let version = latest.expect("an all-deprecated package must still resolve a latest");
         assert_eq!(version.version, "1.3.0");
         assert!(version.deprecated);
+        assert!(
+            version.deprecation.is_some(),
+            "T3/C1: when every non-prerelease version is deprecated, rung 1 finds \
+             nothing and rung 2 returns a deprecated pick — the #205 finding must fire"
+        );
     }
 
     /// #338 NFR-002 (regression): a mix of deprecated and non-deprecated versions under a
@@ -1509,12 +1585,20 @@ mod tests {
         let version = latest.expect("widget has a non-deprecated version");
         assert_eq!(version.version, "1.0.0");
         assert!(!version.deprecated);
+        assert!(
+            version.deprecation.is_none(),
+            "T3/C1: a partially-deprecated version list must yield no #205 finding — \
+             rung 1 finds the clean 1.0.0 before rung 2 (the all-deprecated fallback) \
+             ever runs; a developer expecting 'latest is deprecated' semantics here \
+             would wrongly conclude the plumbing is broken"
+        );
     }
 
     fn npm_v(s: &str) -> NpmVersion {
         NpmVersion {
             version: s.to_string(),
             deprecated: false,
+            deprecation: None,
             published_at: None,
         }
     }

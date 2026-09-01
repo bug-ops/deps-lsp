@@ -65,6 +65,7 @@ pub(crate) async fn generate_diagnostics_internal(
             doc.resolved_versions.clone(),
             doc.vulnerabilities.clone(),
             doc.yanked_versions.clone(),
+            doc.deprecations.clone(),
             doc.fetch_failed.clone(),
         ))
     }) else {
@@ -80,6 +81,7 @@ pub(crate) async fn generate_diagnostics_internal(
         resolved_versions,
         vulnerabilities,
         yanked_versions,
+        deprecations,
         fetch_failed,
     )) = extracted
     else {
@@ -92,6 +94,7 @@ pub(crate) async fn generate_diagnostics_internal(
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_vulnerabilities(&vulnerabilities)
                 .with_yanked(&yanked_versions)
+                .with_deprecations(&deprecations)
                 .with_fetch_failed(&fetch_failed)
                 .with_ecosystem(ecosystem_id),
             uri,
