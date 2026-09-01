@@ -240,10 +240,7 @@ impl EcosystemRegistry {
         let mut best: Option<(usize, &'static str, &'static str)> = None; // (specificity, pattern, id)
         for e in self.patterns.iter() {
             let (prefix, suffix, id) = *e.value();
-            if filename.len() >= prefix.len() + suffix.len()
-                && filename.starts_with(prefix)
-                && filename.ends_with(suffix)
-            {
+            if prefix_suffix_matches(filename, prefix, suffix) {
                 let score = prefix.len() + suffix.len();
                 let pattern = *e.key();
                 if best.is_none_or(|(s, p, _)| (score, pattern) > (s, p)) {
@@ -281,11 +278,41 @@ impl EcosystemRegistry {
     ///     println!("File handled by: {}", ecosystem.display_name());
     /// }
     /// ```
-    // TODO(critic): support requirements/*.txt layout (needs path, not basename)
     pub fn get_for_uri(&self, uri: &Uri) -> Option<Arc<dyn Ecosystem>> {
         let path = uri.path().as_str();
         let filename = path.rsplit('/').next()?;
-        self.get_for_filename(filename)
+        if let Some(ecosystem) = self.get_for_filename(filename) {
+            return Some(ecosystem);
+        }
+        self.get_for_directory_pattern(path, filename)
+    }
+
+    /// Matches a file directly inside a directory whose name and file suffix
+    /// are declared by an ecosystem's
+    /// [`manifest_directory_patterns`](Ecosystem::manifest_directory_patterns)
+    /// (e.g. Python's `requirements/base.txt` layout, where the basename alone —
+    /// `base.txt` — carries no signal). This needs the full path, not just the
+    /// basename, so unlike [`manifest_patterns`](Ecosystem::manifest_patterns) it
+    /// is consulted only from [`get_for_uri`](Self::get_for_uri), never from
+    /// [`get_for_filename`](Self::get_for_filename). Mirrors
+    /// [`get_for_lockfile`](Self::get_for_lockfile)'s linear scan rather than
+    /// building a dedicated map — the pattern count per ecosystem is tiny.
+    fn get_for_directory_pattern(&self, path: &str, filename: &str) -> Option<Arc<dyn Ecosystem>> {
+        let mut segments = path.rsplit('/');
+        segments.next()?; // the filename itself
+        let dir = segments.next()?;
+
+        for entry in self.ecosystems.iter() {
+            let ecosystem = entry.value();
+            let matches = ecosystem
+                .manifest_directory_patterns()
+                .iter()
+                .any(|(dir_name, suffix)| *dir_name == dir && filename.ends_with(suffix));
+            if matches {
+                return Some(Arc::clone(ecosystem));
+            }
+        }
+        None
     }
 
     /// Get all registered ecosystem IDs
@@ -316,6 +343,13 @@ impl EcosystemRegistry {
 
     /// Get ecosystem for a lock file name
     ///
+    /// An entry in [`Ecosystem::lockfile_filenames`] is either an exact name
+    /// (`"Cargo.lock"`) or a single-`*`-wildcard pattern
+    /// (`"packages.*.lock.json"`, NuGet's per-project lock files) — the same
+    /// prefix/suffix scheme [`Ecosystem::manifest_patterns`] uses, applied
+    /// here via a linear scan (mirroring `get_for_directory_pattern`'s own linear scan)
+    /// rather than a dedicated map, since the pattern count per ecosystem is tiny.
+    ///
     /// # Arguments
     ///
     /// * `filename` - Lock file name (e.g., "Cargo.lock", "package-lock.json")
@@ -340,7 +374,11 @@ impl EcosystemRegistry {
     pub fn get_for_lockfile(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
-            if ecosystem.lockfile_filenames().contains(&filename) {
+            let matches = ecosystem
+                .lockfile_filenames()
+                .iter()
+                .any(|pattern| lockfile_pattern_matches(pattern, filename));
+            if matches {
                 return Some(Arc::clone(ecosystem));
             }
         }
@@ -380,6 +418,62 @@ impl EcosystemRegistry {
 impl Default for EcosystemRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Matches a lock file `filename` against one [`Ecosystem::lockfile_filenames`] entry: an
+/// exact name, or — for a NuGet-style `packages.*.lock.json` entry — a single-`*`
+/// prefix/suffix pattern, the same scheme [`EcosystemRegistry::register`] uses to split
+/// `manifest_patterns` (S2, #451 follow-up).
+fn lockfile_pattern_matches(pattern: &str, filename: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => prefix_suffix_matches(filename, prefix, suffix),
+        None => pattern == filename,
+    }
+}
+
+/// Core single-`*`-wildcard glob check shared by every basename-pattern matcher in this
+/// module: `filename` matches when it is at least as long as `prefix` and `suffix`
+/// combined, starts with `prefix`, and ends with `suffix`.
+fn prefix_suffix_matches(filename: &str, prefix: &str, suffix: &str) -> bool {
+    filename.len() >= prefix.len() + suffix.len()
+        && filename.starts_with(prefix)
+        && filename.ends_with(suffix)
+}
+
+/// Whether `filename` matches a raw [`Ecosystem::manifest_patterns`] entry (e.g.
+/// `"requirements*.txt"`).
+///
+/// Applies the same single-`*`-wildcard semantics
+/// [`EcosystemRegistry::register`]/[`EcosystemRegistry::get_for_filename`] use
+/// internally — but as a stateless, registry-free check.
+///
+/// Exposed so an ecosystem can ask "would my own `manifest_patterns` have matched this
+/// basename?" independently of an `EcosystemRegistry` instance — e.g. to gate a
+/// [`Ecosystem::manifest_directory_patterns`]-only match more strictly than a primary
+/// basename match (#452 S6): a file routed to an ecosystem purely by directory-name
+/// convention carries far weaker "this really is a manifest" evidence than one that
+/// also matches a basename pattern.
+///
+/// Returns `false` for a malformed `pattern` (no `*`, or more than one) rather than
+/// panicking — callers pass a `&'static str` they authored themselves, so this is a
+/// defensive fallback, not an expected runtime path.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ecosystem_registry::manifest_pattern_matches;
+///
+/// assert!(manifest_pattern_matches("requirements-dev.txt", "requirements*.txt"));
+/// assert!(!manifest_pattern_matches("base.txt", "requirements*.txt"));
+/// ```
+#[must_use]
+pub fn manifest_pattern_matches(filename: &str, pattern: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) if !suffix.contains('*') => {
+            prefix_suffix_matches(filename, prefix, suffix)
+        }
+        _ => false,
     }
 }
 
@@ -523,6 +617,7 @@ mod tests {
     struct MockPatternEcosystem {
         id: &'static str,
         patterns: &'static [&'static str],
+        dir_patterns: &'static [(&'static str, &'static str)],
     }
 
     impl crate::ecosystem::private::Sealed for MockPatternEcosystem {}
@@ -542,6 +637,10 @@ mod tests {
 
         fn manifest_patterns(&self) -> &[&'static str] {
             self.patterns
+        }
+
+        fn manifest_directory_patterns(&self) -> &[(&'static str, &'static str)] {
+            self.dir_patterns
         }
 
         fn parse_manifest<'a>(
@@ -585,6 +684,7 @@ mod tests {
                 "*.requirements.txt",
                 "constraints*.txt",
             ],
+            dir_patterns: &[("requirements", ".txt")],
         }));
         registry
     }
@@ -640,6 +740,7 @@ mod tests {
         registry.register(Arc::new(MockPatternEcosystem {
             id: "pattern",
             patterns: &["requirements*.txt"],
+            dir_patterns: &[],
         }));
 
         assert_eq!(
@@ -659,6 +760,7 @@ mod tests {
         registry.register(Arc::new(MockPatternEcosystem {
             id: "pattern",
             patterns: &["requirements*.txt"],
+            dir_patterns: &[],
         }));
 
         assert_eq!(
@@ -762,6 +864,79 @@ mod tests {
     }
 
     #[test]
+    fn test_get_for_uri_directory_pattern_matches_split_requirements_layout() {
+        let registry = pypi_pattern_registry();
+        for path in [
+            "/home/user/project/requirements/base.txt",
+            "/home/user/project/requirements/dev.txt",
+            "/home/user/project/sub/requirements/prod.txt",
+        ] {
+            let uri = crate::test_util::test_uri(path);
+            assert_eq!(
+                registry.get_for_uri(&uri).map(|e| e.id()),
+                Some("pypi"),
+                "{path} should match the requirements/*.txt directory pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_for_uri_directory_pattern_requires_matching_directory_and_suffix() {
+        let registry = pypi_pattern_registry();
+        for path in [
+            // Wrong directory name.
+            "/home/user/project/reqs/base.txt",
+            // Right directory, wrong suffix.
+            "/home/user/project/requirements/base.cfg",
+            // Bare `requirements.txt` at the top level is not a directory match
+            // (it's already handled by the basename pattern stage).
+            "/home/user/project/requirements.txt",
+        ] {
+            let uri = crate::test_util::test_uri(path);
+            if path.ends_with("requirements.txt") {
+                assert_eq!(registry.get_for_uri(&uri).map(|e| e.id()), Some("pypi"));
+            } else {
+                assert!(
+                    registry.get_for_uri(&uri).is_none(),
+                    "{path} should not match the requirements/*.txt directory pattern"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_for_uri_directory_pattern_requires_exact_directory_segment() {
+        // Only a path segment that is *exactly* "requirements" counts — a
+        // directory that merely contains that string as a substring must not
+        // match (#452 S6 follow-up, confirmed by impl-critic).
+        for path in [
+            // The parent "directory" here is itself a file named
+            // `requirements.txt`, not a directory literally named `requirements`.
+            "/home/user/project/requirements.txt/base.txt",
+            // "myrequirements" contains "requirements" as a substring but is not
+            // an exact match.
+            "/home/user/project/myrequirements/base.txt",
+        ] {
+            let uri = crate::test_util::test_uri(path);
+            assert!(
+                pypi_pattern_registry().get_for_uri(&uri).is_none(),
+                "{path} should not match the requirements/*.txt directory pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_for_uri_basename_pattern_wins_over_directory_pattern() {
+        // `requirements/dev-requirements.txt` matches the basename pattern stage
+        // (`*-requirements.txt`) — the directory-pattern fallback must never be
+        // reached, let alone override it.
+        let registry = pypi_pattern_registry();
+        let uri =
+            crate::test_util::test_uri("/home/user/project/requirements/dev-requirements.txt");
+        assert_eq!(registry.get_for_uri(&uri).map(|e| e.id()), Some("pypi"));
+    }
+
+    #[test]
     fn test_multiple_ecosystems() {
         let registry = EcosystemRegistry::new();
 
@@ -831,6 +1006,40 @@ mod tests {
 
         let retrieved2 = registry.get_for_lockfile("uv.lock").unwrap();
         assert_eq!(retrieved2.id(), "pypi");
+    }
+
+    /// S2 regression (#451 follow-up): a single-`*`-wildcard `lockfile_filenames()` entry
+    /// (NuGet's `"packages.*.lock.json"`, registered only so `all_lockfile_patterns()` sets
+    /// up a file watcher) must actually route a real multi-project lock filename through
+    /// `get_for_lockfile` — this is what `did_change_watched_files` calls to find the owning
+    /// ecosystem for a changed lock file.
+    #[test]
+    fn test_get_for_lockfile_matches_wildcard_pattern() {
+        let registry = EcosystemRegistry::new();
+        let ecosystem = Arc::new(MockEcosystem {
+            id: "nuget",
+            display_name: "NuGet",
+            filenames: &["Directory.Packages.props"],
+            lockfiles: &["packages.lock.json", "packages.*.lock.json"],
+        });
+
+        registry.register(ecosystem);
+
+        assert_eq!(
+            registry
+                .get_for_lockfile("packages.App1.lock.json")
+                .map(|e| e.id()),
+            Some("nuget")
+        );
+        assert_eq!(
+            registry
+                .get_for_lockfile("packages.lock.json")
+                .map(|e| e.id()),
+            Some("nuget")
+        );
+        assert!(registry.get_for_lockfile("other.lock.json").is_none());
+        // Too short to contain both the prefix and the suffix.
+        assert!(registry.get_for_lockfile("packages.lock").is_none());
     }
 
     #[test]

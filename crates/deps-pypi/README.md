@@ -15,7 +15,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **PEP 621** — Parse `[project.dependencies]` and `[project.optional-dependencies]`
 - **PEP 735** — Parse `[dependency-groups]` (new standard)
 - **Poetry** — Parse `[tool.poetry.dependencies]` and dependency groups
-- **requirements.txt / constraints.txt** — Parse pip's line-oriented requirements file format (comments, continuations, per-requirement options, recognized pip options), reusing the same PEP 508 machinery as the TOML paths
+- **requirements.txt / constraints.txt** — Parse pip's line-oriented requirements file format (comments, continuations, per-requirement options, recognized pip options), reusing the same PEP 508 machinery as the TOML paths; also recognized under a `requirements/` directory (e.g. `requirements/base.txt`), and `-r`/`-c`/`--requirement`/`--constraint` targets are surfaced as clickable `documentLink`s
 - **Lock file parsing** — Extract resolved versions from `poetry.lock` and `uv.lock`
 - **PEP 508 parsing** — Handle complex dependency specifications with extras and environment markers, normalized consistently across PEP 621, PEP 735, Poetry table/string syntaxes, and requirements.txt lines, and surfaced on `PypiDependency.markers`
 - **PEP 440 versions** — Validate and compare Python version specifiers
@@ -91,7 +91,7 @@ numpy>=1.24; python_version >= '3.9'
 --index-url https://pypi.example.com/simple
 ```
 
-Files matching `requirements*.txt`, `*-requirements.txt`, `*.requirements.txt`, or `constraints*.txt` are routed here by filename pattern rather than a fixed name; a content heuristic keeps a prose file that happens to match (e.g. `product-requirements.txt`) from being treated as a manifest.
+Files matching `requirements*.txt`, `*-requirements.txt`, `*.requirements.txt`, or `constraints*.txt` — or any `.txt` file directly inside a `requirements/` directory — are routed here by filename pattern rather than a fixed name; a content heuristic keeps a prose file that happens to match (e.g. `product-requirements.txt`, or a docs file under an unrelated `requirements/` folder) from being treated as a manifest, with a stricter version of that heuristic for the directory-only match.
 
 ## Benchmarks
 

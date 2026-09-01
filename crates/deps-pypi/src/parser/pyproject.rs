@@ -56,6 +56,7 @@ impl PypiParser {
                     dependencies,
                     workspace_root: None,
                     uri: uri.clone(),
+                    document_links: Vec::new(),
                 });
             }
         };
@@ -96,6 +97,7 @@ impl PypiParser {
             dependencies,
             workspace_root: None,
             uri: uri.clone(),
+            document_links: Vec::new(),
         })
     }
 

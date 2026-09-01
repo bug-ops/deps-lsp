@@ -2,15 +2,16 @@
 //!
 //! NuGet base URLs are not hardcodable: the service index
 //! (`https://api.nuget.org/v3/index.json`) must be resolved first, then consulted for the
-//! flat-container ("PackageBaseAddress"), search ("SearchQueryService"), and (future,
-//! see D1 below) registration ("RegistrationsBaseUrl") resource URLs.
+//! flat-container ("PackageBaseAddress"), search ("SearchQueryService"), and registration
+//! ("RegistrationsBaseUrl") resource URLs — the last one backs both publish-time freshness
+//! and [`NuGetRegistry::unlisted_versions_for_hover`]'s hover-only unlisted enrichment (D1).
 
 use crate::types::{NuGetVersion, PackageInfo};
 use crate::version::compare_versions;
 use deps_core::{HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result};
 use serde::Deserialize;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
@@ -136,6 +137,11 @@ struct CatalogEntry {
     /// out by [`accumulate_catalog_entries`] rather than rendered as a bogus 126-year age.
     #[serde(default)]
     published: Option<String>,
+    /// Explicit unlist flag on current registrations. Absent on registrations predating this
+    /// field, which instead used `published`'s epoch sentinel to signal unlisted — see
+    /// [`accumulate_catalog_entries`] for how both signals are combined (D1, #451).
+    #[serde(default)]
+    listed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,7 +214,7 @@ impl NuGetRegistry {
         Self::with_service_index_url(cache, SERVICE_INDEX_URL.to_string())
     }
 
-    fn with_service_index_url(cache: Arc<HttpCache>, service_index_url: String) -> Self {
+    pub(crate) fn with_service_index_url(cache: Arc<HttpCache>, service_index_url: String) -> Self {
         Self {
             cache,
             service_index_url,
@@ -300,10 +306,13 @@ impl NuGetRegistry {
             let mut versions = parse_flat_container(&flat_result?)?;
             match registration_result {
                 Ok(registration_body) => {
-                    let times = self
-                        .publish_times_from_index(&registration_body, &registration_trusted_prefix)
+                    let enrichment = self
+                        .registration_enrichment_from_index(
+                            &registration_body,
+                            &registration_trusted_prefix,
+                        )
                         .await;
-                    attach_publish_times(&mut versions, &times);
+                    attach_publish_times(&mut versions, &enrichment.published);
                 }
                 Err(e) => {
                     tracing::debug!(package = %name, error = %e, "registration index fetch failed, publish times unavailable");
@@ -320,7 +329,8 @@ impl NuGetRegistry {
     }
 
     /// Walks the registration hive backwards from the last page, collecting `published`
-    /// dates until at least [`HOVER_RECENT_VERSIONS`] entries have been examined.
+    /// dates and unlisted markers until at least [`HOVER_RECENT_VERSIONS`] entries have been
+    /// examined.
     ///
     /// Pages are ordered ascending by version (mirroring the flat container's descending
     /// order in reverse), so the tail of `index.items` holds the most recent versions —
@@ -330,15 +340,16 @@ impl NuGetRegistry {
     /// packages need at most one, per the live measurements this plan is based on).
     ///
     /// Never fails the caller: a malformed index, an unreachable page, or a page `@id`
-    /// outside `trusted_prefix` all degrade to fewer (or zero) entries in the returned map.
-    async fn publish_times_from_index(
+    /// outside `trusted_prefix` all degrade to fewer (or zero) entries in the returned
+    /// [`RegistrationEnrichment`].
+    async fn registration_enrichment_from_index(
         &self,
         index_body: &[u8],
         trusted_prefix: &str,
-    ) -> HashMap<String, PublishTime> {
-        let mut times = HashMap::new();
+    ) -> RegistrationEnrichment {
+        let mut enrichment = RegistrationEnrichment::default();
         let Ok(index) = deps_core::parse_json_checked::<RegistrationIndex>(index_body) else {
-            return times;
+            return enrichment;
         };
 
         let mut collected = 0usize;
@@ -350,7 +361,9 @@ impl NuGetRegistry {
             }
 
             match &page.items {
-                Some(inline) => accumulate_catalog_entries(&mut times, &mut collected, inline),
+                Some(inline) => {
+                    accumulate_catalog_entries(&mut enrichment, &mut collected, inline);
+                }
                 None => {
                     // A page `@id` outside the resolved registration base is skipped, not
                     // trusted — the feed chooses `@id` values. `get_cached_trusted_origin`
@@ -374,12 +387,57 @@ impl NuGetRegistry {
                     else {
                         continue;
                     };
-                    accumulate_catalog_entries(&mut times, &mut collected, &parsed.items);
+                    accumulate_catalog_entries(&mut enrichment, &mut collected, &parsed.items);
                 }
             }
         }
 
-        times
+        enrichment
+    }
+
+    /// Hover-only enrichment (D1, #451): returns the subset of `name`'s recent versions
+    /// (the same [`HOVER_RECENT_VERSIONS`]-bounded window `registration_enrichment_from_index`
+    /// walks) that the registry currently reports as unlisted.
+    ///
+    /// Deliberately **not** wired into [`Self::get_versions_typed_with`]/[`NuGetVersion`]:
+    /// that shared path backs `get_versions_with`, which both hover *and*
+    /// `complete_versions_generic` (completion) call, and its results also feed the
+    /// per-document version cache that inlay hints and diagnostics render from. Threading
+    /// `listed` through [`deps_core::Version::removal_status`] there would make an unlisted
+    /// version silently vanish from completion suggestions too
+    /// (`prepare_version_display_items` filters on `removal_status().blocks_resolution()`
+    /// unconditionally) — the wrong tradeoff the spec calls out. This method is instead
+    /// called only from [`crate::ecosystem::NuGetEcosystem`]'s `generate_hover` override,
+    /// so only a hover request ever pays for it.
+    ///
+    /// Degrades to an empty set (never an error) on any fetch/parse failure, or when the
+    /// feed has no `RegistrationsBaseUrl` resource at all — hover must still render the
+    /// ordinary version list rather than disappear because this optional decoration failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if `name` is rejected as a dot-segment or the service index
+    /// itself cannot be resolved — both of which also fail the hover response's main
+    /// version fetch, so this never surfaces a *distinct* failure mode to the caller.
+    pub async fn unlisted_versions_for_hover(&self, name: &str) -> Result<HashSet<String>> {
+        reject_dot_segment(name)?;
+        let index = self.service_index().await?;
+        let Some(base) = index.registrations_base_url.clone() else {
+            return Ok(HashSet::new());
+        };
+        let registration_url = registration_index_url(&base, name);
+        let trusted_prefix = format!("{base}/");
+        let Ok(body) = self
+            .cache
+            .get_cached_trusted_origin(&registration_url, &trusted_prefix)
+            .await
+        else {
+            return Ok(HashSet::new());
+        };
+        Ok(self
+            .registration_enrichment_from_index(&body, &trusted_prefix)
+            .await
+            .unlisted)
     }
 
     /// Finds the highest version of `name` matching `req` (exact pin, interval notation,
@@ -444,26 +502,42 @@ fn attach_publish_times(versions: &mut [NuGetVersion], times: &HashMap<String, P
     }
 }
 
-/// Extracts `(version, published)` pairs from a page's catalog entries into `times`,
-/// filtering the unlisted sentinel (`published <= epoch`) and any unparseable timestamp.
-/// Advances `collected` by the entry count regardless of whether a time was extracted, since
-/// the walk target in [`NuGetRegistry::publish_times_from_index`] is "entries examined", not
-/// "entries successfully timed".
+/// Per-package result of walking a slice of the registration hive: publish timestamps
+/// keyed by version string, and the subset of examined versions the registry reports as
+/// unlisted. See [`NuGetRegistry::registration_enrichment_from_index`].
+#[derive(Debug, Default)]
+struct RegistrationEnrichment {
+    published: HashMap<String, PublishTime>,
+    unlisted: HashSet<String>,
+}
+
+/// Extracts publish times and unlisted markers from a page's catalog entries into
+/// `enrichment`. A version is unlisted when the entry carries an explicit `"listed": false`,
+/// or — for registrations that predate that field — when `published` is the unlisted
+/// sentinel epoch (`<= 1970-01-01T00:00:00Z`); `published` itself still filters that same
+/// sentinel out (and any unparseable timestamp) so it's never rendered as a bogus 126-year
+/// age. Advances `collected` by the entry count regardless of what was extracted, since the
+/// walk target in [`NuGetRegistry::registration_enrichment_from_index`] is "entries
+/// examined", not "entries successfully timed".
 fn accumulate_catalog_entries(
-    times: &mut HashMap<String, PublishTime>,
+    enrichment: &mut RegistrationEnrichment,
     collected: &mut usize,
     entries: &[CatalogEntryWrapper],
 ) {
     for entry in entries {
-        let published = entry
-            .catalog_entry
-            .published
-            .as_deref()
-            .and_then(PublishTime::parse_rfc3339)
-            .filter(|t| t.as_unix_secs() > 0);
-        if let Some(published) = published {
-            times.insert(entry.catalog_entry.version.clone(), published);
+        let ce = &entry.catalog_entry;
+        let parsed_published = ce.published.as_deref().and_then(PublishTime::parse_rfc3339);
+        let is_sentinel = parsed_published.is_some_and(|t| t.as_unix_secs() <= 0);
+
+        if let Some(published) = parsed_published.filter(|t| t.as_unix_secs() > 0) {
+            enrichment.published.insert(ce.version.clone(), published);
         }
+
+        let unlisted = ce.listed == Some(false) || (ce.listed.is_none() && is_sentinel);
+        if unlisted {
+            enrichment.unlisted.insert(ce.version.clone());
+        }
+
         *collected += 1;
     }
 }
@@ -562,11 +636,6 @@ fn parse_search_response(data: &[u8], limit: usize) -> Result<Vec<PackageInfo>> 
         .collect())
 }
 
-// TODO(critic): unlisted versions are reported as listed; enrich from
-// RegistrationsBaseUrl/3.6.0 on hover only (D1). The flat container used by get_versions
-// carries no `listed` flag, and paying the extra registration-hive hop on every dependency
-// in an open file is the wrong trade for the inlay-hint path.
-
 impl deps_core::Registry for NuGetRegistry {
     fn get_versions<'a>(
         &'a self,
@@ -658,9 +727,13 @@ impl deps_core::Registry for NuGetRegistry {
         })
     }
 
-    // `Version::removal_status` uses the trait's default `Available` (no override
-    // in `types.rs`) — the flat versions container `get_versions` reads has no
-    // `listed` flag (see the TODO above at `registry.rs:274`) (#233).
+    // `Version::removal_status` uses the trait's default `Available` (no override in
+    // `types.rs`) — `get_versions`/`get_latest_matching` (this trait's freshness-blind
+    // entry points, per `reports_yanked`'s own contract) always resolve through the flat
+    // container, which carries no `listed` flag, so `removal_status()` can never reflect
+    // real registry data there (#233). `Self::unlisted_versions_for_hover` (D1, #451) is a
+    // separate, hover-only enrichment that deliberately bypasses `Version` entirely —
+    // see its doc comment — so it does not change this answer.
     fn reports_yanked(&self) -> bool {
         false
     }
@@ -1253,16 +1326,34 @@ mod tests {
         assert!(versions.iter().all(|ver| ver.published_at.is_none()));
     }
 
-    // --- publish_times_from_index: pure fixtures, no network for inline pages ---
+    // --- registration_enrichment_from_index: pure fixtures, no network for inline pages ---
 
     fn inline_registration_index(base: &str, entries: &[(&str, Option<&str>)]) -> String {
+        inline_registration_index_with_listed(
+            base,
+            &entries
+                .iter()
+                .map(|(v, p)| (*v, *p, None))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn inline_registration_index_with_listed(
+        base: &str,
+        entries: &[(&str, Option<&str>, Option<bool>)],
+    ) -> String {
         let items: Vec<String> = entries
             .iter()
-            .map(|(version, published)| match published {
-                Some(p) => {
-                    format!(r#"{{"catalogEntry": {{"version": "{version}", "published": "{p}"}}}}"#)
-                }
-                None => format!(r#"{{"catalogEntry": {{"version": "{version}"}}}}"#),
+            .map(|(version, published, listed)| {
+                let published_field = published
+                    .map(|p| format!(r#", "published": "{p}""#))
+                    .unwrap_or_default();
+                let listed_field = listed
+                    .map(|l| format!(r#", "listed": {l}"#))
+                    .unwrap_or_default();
+                format!(
+                    r#"{{"catalogEntry": {{"version": "{version}"{published_field}{listed_field}}}}}"#
+                )
             })
             .collect();
         format!(
@@ -1273,7 +1364,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_publish_times_from_index_inline_happy_path() {
+    async fn test_registration_enrichment_from_index_inline_happy_path() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
         let body = inline_registration_index(
             "https://api.nuget.org/v3/reg",
@@ -1282,18 +1373,19 @@ mod tests {
                 ("2.0.0", Some("2021-01-01T00:00:00Z")),
             ],
         );
-        let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+        let enrichment = registry
+            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
         assert_eq!(
-            times.get("2.0.0").copied(),
+            enrichment.published.get("2.0.0").copied(),
             PublishTime::parse_rfc3339("2021-01-01T00:00:00Z")
         );
-        assert_eq!(times.len(), 2);
+        assert_eq!(enrichment.published.len(), 2);
+        assert!(enrichment.unlisted.is_empty());
     }
 
     #[tokio::test]
-    async fn test_publish_times_from_index_sentinel_filtered() {
+    async fn test_registration_enrichment_from_index_sentinel_filtered() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
         let body = inline_registration_index(
             "https://api.nuget.org/v3/reg",
@@ -1302,38 +1394,82 @@ mod tests {
                 ("2.0.0", Some("2021-01-01T00:00:00Z")),
             ],
         );
-        let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+        let enrichment = registry
+            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
-        assert!(!times.contains_key("1.0.0"));
-        assert!(times.contains_key("2.0.0"));
+        assert!(!enrichment.published.contains_key("1.0.0"));
+        assert!(enrichment.published.contains_key("2.0.0"));
+    }
+
+    /// D1/#451: a registration predating the `listed` field signals unlisted solely via the
+    /// sentinel `published` epoch — the same entry `test_registration_enrichment_from_index_sentinel_filtered`
+    /// already proves is excluded from `published`, but it must still land in `unlisted`.
+    #[tokio::test]
+    async fn test_registration_enrichment_from_index_legacy_sentinel_marks_unlisted() {
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let body = inline_registration_index(
+            "https://api.nuget.org/v3/reg",
+            &[
+                ("1.0.0", Some("1900-01-01T00:00:00+00:00")),
+                ("2.0.0", Some("2021-01-01T00:00:00Z")),
+            ],
+        );
+        let enrichment = registry
+            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+            .await;
+        assert!(enrichment.unlisted.contains("1.0.0"));
+        assert!(!enrichment.unlisted.contains("2.0.0"));
+    }
+
+    /// D1/#451: a current registration signals unlisted via an explicit `"listed": false`,
+    /// independent of `published` (which can be a perfectly ordinary, non-sentinel date).
+    #[tokio::test]
+    async fn test_registration_enrichment_from_index_explicit_listed_false_marks_unlisted() {
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let body = inline_registration_index_with_listed(
+            "https://api.nuget.org/v3/reg",
+            &[
+                ("1.0.0", Some("2020-01-01T00:00:00Z"), Some(false)),
+                ("2.0.0", Some("2021-01-01T00:00:00Z"), Some(true)),
+            ],
+        );
+        let enrichment = registry
+            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+            .await;
+        assert!(enrichment.unlisted.contains("1.0.0"));
+        assert!(!enrichment.unlisted.contains("2.0.0"));
+        // `listed: false` doesn't suppress an otherwise-valid publish date.
+        assert!(enrichment.published.contains_key("1.0.0"));
     }
 
     #[tokio::test]
-    async fn test_publish_times_from_index_missing_published_is_absent_rest_intact() {
+    async fn test_registration_enrichment_from_index_missing_published_is_absent_rest_intact() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
         let body = inline_registration_index(
             "https://api.nuget.org/v3/reg",
             &[("1.0.0", None), ("2.0.0", Some("2021-01-01T00:00:00Z"))],
         );
-        let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+        let enrichment = registry
+            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
-        assert!(!times.contains_key("1.0.0"));
-        assert!(times.contains_key("2.0.0"));
+        assert!(!enrichment.published.contains_key("1.0.0"));
+        assert!(enrichment.published.contains_key("2.0.0"));
+        // No `published` and no explicit `listed` is not itself an unlisted signal.
+        assert!(!enrichment.unlisted.contains("1.0.0"));
     }
 
     #[tokio::test]
-    async fn test_publish_times_from_index_malformed_json_returns_empty_map() {
+    async fn test_registration_enrichment_from_index_malformed_json_returns_empty() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
-        let times = registry
-            .publish_times_from_index(b"not json", "https://api.nuget.org/v3/reg/")
+        let enrichment = registry
+            .registration_enrichment_from_index(b"not json", "https://api.nuget.org/v3/reg/")
             .await;
-        assert!(times.is_empty());
+        assert!(enrichment.published.is_empty());
+        assert!(enrichment.unlisted.is_empty());
     }
 
     #[tokio::test]
-    async fn test_publish_times_from_index_foreign_origin_page_skipped_no_request() {
+    async fn test_registration_enrichment_from_index_foreign_origin_page_skipped_no_request() {
         // A page @id outside `base`'s origin must be skipped without ever being fetched —
         // if the implementation issued a real request here, this test would hang/fail on
         // network access rather than complete instantly.
@@ -1341,24 +1477,140 @@ mod tests {
         let body = r#"{"count": 1, "items": [
             {"@id": "https://evil.example/pkg/page/0.json", "count": 1}
         ]}"#;
-        let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+        let enrichment = registry
+            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
-        assert!(times.is_empty());
+        assert!(enrichment.published.is_empty());
+        assert!(enrichment.unlisted.is_empty());
     }
 
     #[tokio::test]
-    async fn test_publish_times_from_index_lookalike_origin_page_skipped_no_request() {
+    async fn test_registration_enrichment_from_index_lookalike_origin_page_skipped_no_request() {
         // A prefix-lookalike host (`…nuget.org.evil.test`) must also be rejected — the
         // trailing-slash check in the trust boundary is what catches this.
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
         let body = r#"{"count": 1, "items": [
             {"@id": "https://api.nuget.org.evil.test/v3/reg/pkg/page/0.json", "count": 1}
         ]}"#;
-        let times = registry
-            .publish_times_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
+        let enrichment = registry
+            .registration_enrichment_from_index(body.as_bytes(), "https://api.nuget.org/v3/reg/")
             .await;
-        assert!(times.is_empty());
+        assert!(enrichment.published.is_empty());
+        assert!(enrichment.unlisted.is_empty());
+    }
+
+    // --- unlisted_versions_for_hover: end-to-end (mockito) ---
+
+    #[tokio::test]
+    async fn test_unlisted_versions_for_hover_reports_explicit_and_legacy_unlisted() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _service_index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body_with_registrations(
+                &format!("{base}/flatcontainer"),
+                &format!("{base}/query"),
+                &format!("{base}/registrations"),
+            ))
+            .create_async()
+            .await;
+        let registration_body = inline_registration_index_with_listed(
+            &format!("{base}/registrations"),
+            &[
+                ("1.0.0", Some("1900-01-01T00:00:00+00:00"), None),
+                ("2.0.0", Some("2021-01-01T00:00:00Z"), Some(false)),
+                ("3.0.0", Some("2022-01-01T00:00:00Z"), Some(true)),
+            ],
+        );
+        let _reg_mock = server
+            .mock("GET", "/registrations/widget/index.json")
+            .with_status(200)
+            .with_body(registration_body)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let unlisted = registry
+            .unlisted_versions_for_hover("widget")
+            .await
+            .unwrap();
+
+        assert!(unlisted.contains("1.0.0"));
+        assert!(unlisted.contains("2.0.0"));
+        assert!(!unlisted.contains("3.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_unlisted_versions_for_hover_no_registrations_base_url_degrades_to_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _service_index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{base}/flatcontainer"),
+                &format!("{base}/query"),
+            ))
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let unlisted = registry
+            .unlisted_versions_for_hover("widget")
+            .await
+            .unwrap();
+        assert!(unlisted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unlisted_versions_for_hover_fetch_failure_degrades_to_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _service_index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body_with_registrations(
+                &format!("{base}/flatcontainer"),
+                &format!("{base}/query"),
+                &format!("{base}/registrations"),
+            ))
+            .create_async()
+            .await;
+        let _reg_mock = server
+            .mock("GET", "/registrations/widget/index.json")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let unlisted = registry
+            .unlisted_versions_for_hover("widget")
+            .await
+            .unwrap();
+        assert!(unlisted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unlisted_versions_for_hover_rejects_bare_dot_dot_as_not_found() {
+        let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
+        let err = registry
+            .unlisted_versions_for_hover("..")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, deps_core::DepsError::PackageNotFound { .. }));
     }
 
     // --- get_versions_typed_with: end-to-end gating and registration-hive walk (mockito) ---

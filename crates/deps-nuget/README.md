@@ -16,8 +16,9 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **NuGet V3 registry** — Service index resolution, flat-container version listing, and `SearchQueryService` search (`semVerLevel=2.0.0`)
 - **Version comparison** — 4-component NuGet versioning (`Major.Minor.Patch.Revision`), structural prerelease detection, interval range notation (`[1.0,2.0)`), and floating versions (`1.1.*`)
 - **Central Package Management** — `Directory.Packages.props`-managed dependencies parse with no inline version, so hover/completion on the package name still work
-- **Lock file support** — `packages.lock.json`, merged across target framework monikers
+- **Lock file support** — `packages.lock.json`, merged across target framework monikers, plus multi-project `packages.<project>.lock.json` resolved by the manifest's own project name
 - **Release-freshness signal** — Per-version ages in hover/completion from the V3 registration hive, covering the newest ~8 versions of a package (see `ECOSYSTEM_GUIDE.md`)
+- **Unlisted-version marker** — Hover flags a delisted/pulled version with `*(unlisted)*` in "Recent versions", enriched from the V3 registration hive on the hover path only
 
 > [!IMPORTANT]
 > Requires Rust 1.91 or later.

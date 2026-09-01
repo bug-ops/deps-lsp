@@ -2,7 +2,7 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeLens, Diagnostic, Hover, InlayHint, Position, Uri,
+    CodeAction, CodeLens, Diagnostic, DocumentLink, Hover, InlayHint, Position, Uri,
 };
 
 use crate::{
@@ -407,6 +407,20 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &[]
     }
 
+    /// `(directory_name, file_suffix)` pairs identifying a file solely by its
+    /// immediate parent directory and suffix (e.g. `[("requirements", ".txt")]`
+    /// for Python's `requirements/base.txt` split-file layout, where the
+    /// basename alone carries no ecosystem signal).
+    ///
+    /// Consulted by [`crate::EcosystemRegistry::get_for_uri`] only, after both
+    /// [`manifest_patterns`](Ecosystem::manifest_patterns) and
+    /// [`manifest_extensions`](Ecosystem::manifest_extensions) miss on the
+    /// basename — it needs the full path, so it is never reachable from
+    /// [`crate::EcosystemRegistry::get_for_filename`]. Empty by default.
+    fn manifest_directory_patterns(&self) -> &[(&'static str, &'static str)] {
+        &[]
+    }
+
     /// Lock file filenames this ecosystem uses (e.g., ["Cargo.lock"])
     ///
     /// Used for file watching - LSP will monitor changes to these files
@@ -558,6 +572,23 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 crate::freshness::PublishTime::now(),
             )
         })
+    }
+
+    /// Generate `textDocument/documentLink` targets for the document.
+    ///
+    /// A document link is a clickable reference from a byte range in this
+    /// manifest to another resource — e.g. a `-r other.txt` / `-c
+    /// constraints.txt` reference inside a pip requirements file, resolved
+    /// to the absolute file it points at. Purely local (no registry access),
+    /// so unlike the other `generate_*` methods this is synchronous rather
+    /// than a [`BoxFuture`]. Empty by default: most ecosystems' manifest
+    /// formats have no such intra-file-graph references.
+    fn generate_document_links(
+        &self,
+        _parse_result: &dyn ParseResult,
+        _uri: &Uri,
+    ) -> Vec<DocumentLink> {
+        Vec::new()
     }
 
     /// Generate the "Update N outdated dependencies" code lens for the document.

@@ -335,6 +335,22 @@ fn truncate_for_log(s: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{}... ({} bytes total)", &s[..boundary], s.len()))
 }
 
+/// A `-r`/`-c` reference to another requirements/constraints file.
+///
+/// Surfaced as a `textDocument/documentLink` so it can be ctrl/cmd-clicked
+/// open. Only produced by [`PypiParser::parse_requirements`] —
+/// `pyproject.toml` has no equivalent file-to-file reference.
+#[derive(Debug, Clone)]
+pub struct RequirementRef {
+    /// Source range of the referenced path text on the option line.
+    pub range: tower_lsp_server::ls_types::Range,
+    /// The target as written in the file (e.g. `"constraints.txt"`), not yet
+    /// resolved to an absolute URI — resolution happens against the
+    /// containing document's URI in `PypiEcosystem`'s
+    /// [`Ecosystem::generate_document_links`](deps_core::Ecosystem::generate_document_links) override.
+    pub target: String,
+}
+
 /// Parse result containing all dependencies from a Python dependency manifest.
 ///
 /// Stores dependencies and optional workspace information for LSP operations.
@@ -346,6 +362,9 @@ pub struct ParseResult {
     pub workspace_root: Option<std::path::PathBuf>,
     /// URI of the parsed file
     pub uri: Uri,
+    /// `-r`/`-c` file references found in a requirements file (always empty
+    /// for `pyproject.toml`).
+    pub document_links: Vec<RequirementRef>,
 }
 
 impl deps_core::ParseResult for ParseResult {
