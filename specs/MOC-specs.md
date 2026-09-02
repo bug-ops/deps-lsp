@@ -55,6 +55,7 @@ status: moc
 | 031 | [[031-github-actions-sha-pin-diagnostic/spec\|GitHub Actions mutable-ref-pin security diagnostic (SHA-pin recommendation)]] | tasks | implemented — research/parity, P2, awaiting merge (PR #477, issue #473) |
 | 032 | [[032-npm-npmrc-registry-support/spec\|npm .npmrc custom/private registry support (scoped registries + top-level registry=)]] | plan | implemented — research/enhancement, P3, awaiting merge (PR #510, issue #502) |
 | 033 | [[033-pypi-private-index-support/spec\|PyPI private/custom index resolution (--index-url / --extra-index-url / Poetry source / uv index)]] | tasks | shipped — research/enhancement, P3 (PR #516, issue #513) |
+| 034 | [[034-go-goproxy-private-registry/spec\|Go GOPROXY/GOPRIVATE module proxy resolution]] | specify | draft — research/enhancement, P3 |
 
 ## Completed Specs
 
