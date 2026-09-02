@@ -228,7 +228,6 @@ impl DiagnosticsConfig {
 /// # Defaults
 ///
 /// - `enabled`: `true`
-/// - `refresh_interval_secs`: `300` (5 minutes)
 /// - `fetch_timeout_secs`: `10` (10 seconds per package)
 /// - `max_concurrent_fetches`: `20` (20 concurrent requests)
 ///
@@ -238,19 +237,15 @@ impl DiagnosticsConfig {
 /// use deps_lsp::config::CacheConfig;
 ///
 /// let config = CacheConfig {
-///     refresh_interval_secs: 600, // 10 minutes
 ///     enabled: true,
 ///     fetch_timeout_secs: 5,
 ///     max_concurrent_fetches: 20,
 /// };
 ///
-/// assert_eq!(config.refresh_interval_secs, 600);
+/// assert_eq!(config.fetch_timeout_secs, 5);
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
-    // TODO(critic): refresh_interval_secs is parsed but never read (see #482 follow-up)
-    #[serde(default = "default_refresh_interval")]
-    pub refresh_interval_secs: u64,
     /// Whether `deps_core::cache::HttpCache`'s entry map is used at all (issue #482):
     /// `false` bypasses it entirely (fetch fresh every time, never store).
     ///
@@ -285,7 +280,6 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            refresh_interval_secs: default_refresh_interval(),
             enabled: true,
             fetch_timeout_secs: default_fetch_timeout_secs(),
             max_concurrent_fetches: default_max_concurrent_fetches(),
@@ -397,10 +391,6 @@ const fn default_deprecated_severity() -> DiagnosticSeverity {
 
 const fn default_mutable_ref_pin_severity() -> DiagnosticSeverity {
     DiagnosticSeverity::HINT
-}
-
-const fn default_refresh_interval() -> u64 {
-    300 // 5 minutes
 }
 
 const fn default_fetch_timeout_secs() -> u64 {
@@ -909,12 +899,10 @@ mod tests {
     #[test]
     fn test_cache_config_deserialization() {
         let json = r#"{
-            "refresh_interval_secs": 600,
             "enabled": false
         }"#;
 
         let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.refresh_interval_secs, 600);
         assert!(!config.enabled);
     }
 
@@ -922,7 +910,6 @@ mod tests {
     fn test_cache_config_defaults() {
         let config = CacheConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.refresh_interval_secs, 300);
         assert_eq!(config.fetch_timeout_secs, 5);
         assert_eq!(config.max_concurrent_fetches, 20);
     }
@@ -930,14 +917,12 @@ mod tests {
     #[test]
     fn test_cache_config_with_timeout_and_concurrency() {
         let json = r#"{
-            "refresh_interval_secs": 600,
             "enabled": true,
             "fetch_timeout_secs": 10,
             "max_concurrent_fetches": 50
         }"#;
 
         let config: CacheConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.refresh_interval_secs, 600);
         assert!(config.enabled);
         assert_eq!(config.fetch_timeout_secs, 10);
         assert_eq!(config.max_concurrent_fetches, 50);
@@ -957,7 +942,6 @@ mod tests {
                 "yanked_severity": 2
             },
             "cache": {
-                "refresh_interval_secs": 300,
                 "enabled": true
             }
         }"#;
@@ -968,7 +952,7 @@ mod tests {
             config.diagnostics.outdated_severity,
             DiagnosticSeverity::HINT
         );
-        assert_eq!(config.cache.refresh_interval_secs, 300);
+        assert!(config.cache.enabled);
     }
 
     #[test]

@@ -262,7 +262,6 @@ Configure via LSP initialization options:
   },
   "cache": {
     "enabled": true,
-    "refresh_interval_secs": 300,
     "fetch_timeout_secs": 5,
     "max_concurrent_fetches": 20
   },
