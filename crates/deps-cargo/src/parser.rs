@@ -70,7 +70,7 @@ pub struct ParseResult {
     /// NFR-005's corrected premise).
     pub resolved_registries: Vec<(RegistryIndex, Option<AuthToken>)>,
     /// Dependency lines whose `registry`/`registry-index` resolution was blocked by the
-    /// current `cargo.workspace_registries` policy (spec #443, plan-1b §1.7) —
+    /// current `registries.workspace_registries` policy (spec #443, plan-1b §1.7) —
     /// `(name_range, blocked host class, raw declared value)` triples. Surfaced by
     /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
     /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
@@ -109,7 +109,7 @@ pub fn parse_cargo_toml(content: &str, doc_uri: &Uri) -> Result<ParseResult> {
 /// Carries the two pieces of process-wide state a Cargo parse needs beyond its own manifest
 /// content.
 ///
-/// The live workspace-registry reachability policy (spec #443, `cargo.workspace_registries`)
+/// The live workspace-registry reachability policy (spec #443, `registries.workspace_registries`)
 /// and the `.cargo/config.toml` memoization cache (spec NFR-005, plan-1b §1.5) — plumbed
 /// together so [`crate::ecosystem::CargoEcosystem::with_context`] has one thing to hold and
 /// pass through the sync parser (plan-1b §1.6), shared across every document this ecosystem

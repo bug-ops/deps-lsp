@@ -182,8 +182,8 @@ crates/deps-lsp/
                               #   from the macro path and written out explicitly.
 Cargo.toml                    # MODIFIED: add `dirs = "6"` to [workspace.dependencies]
 crates/deps-npm/Cargo.toml    # MODIFIED: dirs dependency
-.github/workflows/            # MODIFIED (M5): SC-003's grep gate, scoped to non-test
-                              #   sources only — see §7
+.github/workflows/            # No longer modified: the SC-003 grep gate (M5) was added
+                              #   then removed post-review as unreliable — see §7, §12 M5
 ```
 
 **A1 doc requirement (N-M1).** `get_cached_workspace_with_headers`'s rustdoc must
@@ -624,7 +624,7 @@ fields (`deps-lsp/src/config.rs:667,697`).
 | Integration | `mockito` | The alternate client's requests go through the workspace transport: a mocked index that 302s to a private-range host is not followed (S1) | FR-008 |
 | Integration | `mockito` | **N-S1 fetch-path fail-closed**: `get_versions_from` **and** `get_latest_matching_from`, each asserted independently, return `PackageNotFound` for an `AlternateRegistry` whose index was never registered — with a `registry.npmjs.org`-shaped mock in place asserting **zero** hits, so a silent public fallback fails the test rather than passing it. Cargo's own comment (`deps-cargo/src/registry.rs:529-532`) records that this exact arm enumeration "has been wrong twice during design review", which is why both sites get their own assertion | FR-010 |
 | Unit | `cargo nextest` | **N-M3**: `NpmRegistry::search` on an instance with `tier == WorkspaceDeclared` returns an empty `Vec` and issues no request — the enforcement of §3's "an alternate never performs a name search" invariant | FR-011 |
-| CI gate | `.github/workflows` (M5) | SC-003's grep for `_authToken`/`_auth`/`_password`/`_authIdent` **restricted to non-test sources** — the NFR-001 fixtures deliberately *contain* those strings to prove they are skipped, so a naive repo-wide grep fails on its own evidence. Scope: `crates/deps-npm/src/**` excluding `#[cfg(test)]` modules and `crates/deps-npm/tests/**`. Simplest workable rule: grep only files under `crates/deps-npm/src/` and exclude any line inside a `mod tests` block; if that proves brittle, move the fixtures to `crates/deps-npm/tests/fixtures/` and exclude that directory wholesale | SC-003 |
+| ~~CI gate~~ | ~~`.github/workflows` (M5)~~ | **Removed post-review** (see §12 M5) — the grep-based gate had real false positives with no escape hatch and added no coverage beyond the NFR-001 structural test above (line 618), which already fully satisfies SC-003 on its own | SC-003 |
 | Live (Registry Integration Gate) | manual, before filing the PR | Real or mocked Verdaccio: scoped-registry hover, diagnostics **and completion** end-to-end | SC-001 |
 
 **M4 — SC-002 cannot hold literally.** `NpmEcosystem::complete_versions` gains a
@@ -742,7 +742,7 @@ source itself — with the one exception of **S6**, whose disposition r3 rejects
 | **M2** `alternates` must be `Arc<DashMap>` | **Accepted.** Verified `#[derive(Clone)]` on `NpmRegistry` and the clone at `lib.rs:281`. Also added: each alternate needs its **own** `publish_times`, since that map is keyed by bare package name and would otherwise collide across registries | §3 |
 | **M3** name the hover-link hook; note the OSV side effect | **Accepted.** Verified `suppress_package_url` at `lsp_helpers/mod.rs:1531` and `source_is_public_registry_content`'s default just above at `:1449`. Both named; the OSV drop-out is documented as deliberate and routed to `ECOSYSTEM_GUIDE.md` | §3 entity summary, §11 |
 | **M4** SC-002 cannot hold literally | **Accepted.** Verified ~10 direct `complete_versions` call sites in `deps-npm/src/ecosystem.rs`'s tests and Cargo's `empty_parse_result()` helper at `deps-cargo/src/ecosystem.rs:374-377`. Spec SC-002 reworded; the expected fixture churn is stated | §7 M4 note; spec SC-002 |
-| **M5** SC-003's grep will match its own test fixtures | **Accepted.** Gate scoped to non-test sources, with a fallback (move fixtures to `tests/fixtures/`) if the `mod tests` exclusion proves brittle; `.github/workflows` added to §2 | §2, §7 |
+| **M5** SC-003's grep will match its own test fixtures | **Accepted, then removed post-review.** Initially scoped to non-test sources as planned; code review (security + impl-critic) confirmed real false positives with no escape hatch (`let has_auth`, `let registry_password`, a plain `// always-auth` comment) and a silent-no-op risk from its `sed`-based test-block truncation. Since NFR-001's guarantee is already independently structurally enforced (the parser recognizes only two key shapes, no catch-all field), the gate added no coverage the structural test didn't already provide — removed from `.github/workflows/ci.yml` rather than hardened. SC-003 in spec.md reworded accordingly | §2, §7, spec SC-003 |
 | **M6** scope key format and case-folding unspecified | **Accepted.** Key is `@scope` **with** the `@`, byte-exact, no case folding — matching npm's own literal `@${scope}:registry` concatenation against byte-exact ini keys. Folding would resolve a registry npm itself would not, which is the FR-006 divergence direction the spec forbids | §3 `NpmConfig` doc, §7 |
 | **M7** missing test rows for FR-003/008/009/015 | **Accepted.** Four rows added, plus new rows for FR-017, S5, M6 and M9 | §7 |
 | **M8** "Where unresolved lives" row is broken | **Accepted.** Row rewritten from scratch, not patched — it is C1's carrier | §1 |

@@ -108,27 +108,6 @@ jobs:
           grep -q 'feature "test-util"' <<<"$tree" && { echo "::error::deps-core's test-util feature is reachable from deps-lsp's non-dev dependency tree"; exit 1; }
           exit 0
 
-      - name: Guard against parsed npm auth-shaped .npmrc keys (spec 032-npm-npmrc-registry-support, SC-003)
-        # deps-npm's `.npmrc` parser (crates/deps-npm/src/config.rs) must never hold an
-        # auth-shaped key (_authToken/_auth/_password/_authIdent/always-auth, or a scoped
-        # //host/:_* credential) in any struct field or match arm outside its own test
-        # fixtures, which deliberately contain these strings as string literals to prove
-        # they are skipped (NFR-001). Scoped to non-test sources under crates/deps-npm/src/:
-        # each file's doc comments (which legitimately name these keys in prose) and its
-        # own #[cfg(test)] mod tests { ... } block (always the trailing block in every file
-        # in this crate) are stripped before grepping, so this doesn't fail on its own
-        # evidence.
-        run: |
-          fail=0
-          for f in crates/deps-npm/src/*.rs; do
-            code=$(sed -e '/^[[:space:]]*\/\/\//d' -e '/^[[:space:]]*\/\/!/d' "$f" | sed '/#\[cfg(test)\]/,$d')
-            if grep -nE '_authToken|_auth\b|_password|_authIdent|always-auth' <<<"$code"; then
-              echo "::error file=$f::possible auth-shaped .npmrc key parsed outside test code (spec 032 NFR-001/SC-003)"
-              fail=1
-            fi
-          done
-          exit $fail
-
   security:
     name: Security Audit
     needs: changes
