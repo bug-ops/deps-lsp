@@ -16,7 +16,7 @@ dashmap = { workspace = true }
 deps-core = { workspace = true }
 semver = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "sync"] }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 yaml-rust2 = { workspace = true }

@@ -4,8 +4,11 @@
 //! rejected before any request is made (`validate_owner_repo`).
 
 use dashmap::DashMap;
-use deps_core::github::{GithubTag, GithubTagsClient, paginate_tags, validate_owner_repo};
-use deps_core::{DepsError, HttpCache, PackageName, Result};
+use deps_core::github::{
+    GithubTag, GithubTagsClient, ReleaseDatesCache, normalize_tag, paginate_tags,
+    validate_owner_repo,
+};
+use deps_core::{DepsError, HttpCache, PackageName, PublishTime, Result};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,6 +149,11 @@ pub struct GithubActionsRegistry {
     tag_index: Arc<DashMap<PackageName, Arc<TagIndex>>>,
     in_flight: Arc<DashMap<PackageName, Arc<tokio::sync::Mutex<()>>>>,
     rate_limit: Arc<RateLimitGate>,
+    /// Per-repository memoized GitHub Release publish times (#486, mirroring
+    /// `deps-swift`'s identical need — see [`ReleaseDatesCache`]). `Arc` because
+    /// `GithubActionsRegistry` is `Clone` and clones must share one memo, the same
+    /// reason `github`'s cache is an `Arc`.
+    release_dates: Arc<ReleaseDatesCache>,
 }
 
 impl GithubActionsRegistry {
@@ -162,6 +170,7 @@ impl GithubActionsRegistry {
             tag_index: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
             rate_limit: Arc::new(RateLimitGate::default()),
+            release_dates: Arc::new(ReleaseDatesCache::new()),
         }
     }
 
@@ -272,6 +281,39 @@ impl GithubActionsRegistry {
         Ok(versions)
     }
 
+    /// Like [`GithubActionsRegistry::get_versions`], but also attaches GitHub Release
+    /// publish times, joined by normalized tag name (#486, mirroring
+    /// `deps_swift::registry::SwiftRegistry::get_versions_with_release_dates`).
+    ///
+    /// Runs the tags fetch and the release-dates fetch concurrently (`tokio::join!`) —
+    /// the release-dates fetch is infallible (empty map on any failure), so it can
+    /// never perturb `get_versions`'s error propagation, rate-limit gate, or in-flight
+    /// coalescing.
+    ///
+    /// Known limitation (#486 critic M2): the release-dates fetch does not consult the
+    /// rate-limit gate. This is harmless in the untokened case (`ReleaseDatesCache::
+    /// fetch` already short-circuits on a missing `GITHUB_TOKEN` before issuing any
+    /// request), but a *tokened* client exhausting its 5000/h quota keeps retrying
+    /// `/releases` every error TTL (90s) per repository rather than backing off —
+    /// gating this call on `RateLimitGate::is_tripped` would not help: `map_tags_error`
+    /// deliberately never trips the gate for a tokened 403 (that case is scoped to one
+    /// repository, not treated as a workspace-wide outage), so the gate never becomes
+    /// tripped while a token is present. Left unfixed rather than adding a check that
+    /// would never fire in the tokened case it targets.
+    pub async fn get_versions_with_release_dates(
+        &self,
+        name: &str,
+    ) -> Result<Vec<GithubActionsVersion>> {
+        let (versions, dates) = tokio::join!(
+            self.get_versions(name),
+            self.release_dates
+                .fetch(&self.github, name, "GitHub Actions")
+        );
+        let mut versions = versions?;
+        attach_publish_times(&mut versions, &dates);
+        Ok(versions)
+    }
+
     /// Finds the latest version satisfying the given semver requirement.
     pub async fn get_latest_matching(
         &self,
@@ -279,7 +321,7 @@ impl GithubActionsRegistry {
         req_str: &str,
     ) -> Result<Option<GithubActionsVersion>> {
         let versions = self.get_versions(name).await?;
-        let req = match semver::VersionReq::parse(normalize_semver_input(req_str).as_str()) {
+        let req = match semver::VersionReq::parse(normalize_tag(req_str)) {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("Failed to parse version req '{}': {}", req_str, e);
@@ -287,17 +329,10 @@ impl GithubActionsRegistry {
             }
         };
         Ok(versions.into_iter().find(|v| {
-            semver::Version::parse(normalize_semver_input(v.version.as_str()).as_str())
+            semver::Version::parse(normalize_tag(v.version.as_str()))
                 .is_ok_and(|ver| req.matches(&ver))
         }))
     }
-}
-
-/// Strips a leading `v`/`V` tag prefix for semver parsing only — the returned
-/// `GithubActionsVersion::version` keeps the tag exactly as published (the pin contract's
-/// "tag as published" rule).
-fn normalize_semver_input(name: &str) -> String {
-    name.strip_prefix(['v', 'V']).unwrap_or(name).to_string()
 }
 
 /// Converts raw tags (possibly accumulated across pages) into a newest-first
@@ -316,7 +351,7 @@ fn tags_to_versions(tags: Vec<GithubTag>) -> Vec<GithubActionsVersion> {
     let mut versions_with_parsed: Vec<(GithubActionsVersion, semver::Version)> = tags
         .into_iter()
         .filter_map(|tag| {
-            let normalized = normalize_semver_input(&tag.name);
+            let normalized = normalize_tag(&tag.name).to_string();
             let parsed = semver::Version::parse(&normalized).ok()?;
             if !seen.insert(normalized) {
                 return None;
@@ -330,6 +365,7 @@ fn tags_to_versions(tags: Vec<GithubTag>) -> Vec<GithubActionsVersion> {
                     version: tag.name.into(),
                     sha: tag.commit.sha,
                     prerelease,
+                    published_at: None,
                 },
                 parsed,
             ))
@@ -340,6 +376,22 @@ fn tags_to_versions(tags: Vec<GithubTag>) -> Vec<GithubActionsVersion> {
     versions_with_parsed.into_iter().map(|(v, _)| v).collect()
 }
 
+/// Attaches release publish times onto an already-fetched version list, in place.
+///
+/// Pure and network-free: `versions` came from [`GithubActionsRegistry::get_versions`],
+/// `dates` from [`ReleaseDatesCache::fetch`]. Joins by [`normalize_tag`] since
+/// `version.version` keeps the tag exactly as published (possibly `v`-prefixed) while
+/// `dates`'s keys are normalized. A version with no matching entry in `dates` keeps
+/// `published_at: None` — exactly the pre-#486 rendering.
+fn attach_publish_times(
+    versions: &mut [GithubActionsVersion],
+    dates: &HashMap<String, PublishTime>,
+) {
+    for version in versions {
+        version.published_at = dates.get(normalize_tag(version.version.as_str())).copied();
+    }
+}
+
 impl deps_core::Registry for GithubActionsRegistry {
     fn get_versions<'a>(
         &'a self,
@@ -347,6 +399,24 @@ impl deps_core::Registry for GithubActionsRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let versions = self.get_versions(name.as_str()).await?;
+            Ok(versions
+                .into_iter()
+                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                .collect())
+        })
+    }
+
+    fn get_versions_with<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        freshness: deps_core::FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            let versions = if freshness.enabled {
+                self.get_versions_with_release_dates(name.as_str()).await?
+            } else {
+                self.get_versions(name.as_str()).await?
+            };
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -386,10 +456,9 @@ impl deps_core::Registry for GithubActionsRegistry {
         if deps_core::is_existence_wildcard(req) {
             return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
         }
-        let parsed_req =
-            semver::VersionReq::parse(normalize_semver_input(req.as_str()).as_str()).ok()?;
+        let parsed_req = semver::VersionReq::parse(normalize_tag(req.as_str())).ok()?;
         versions.iter().position(|v| {
-            semver::Version::parse(normalize_semver_input(v.version_string().as_str()).as_str())
+            semver::Version::parse(normalize_tag(v.version_string().as_str()))
                 .is_ok_and(|ver| parsed_req.matches(&ver))
         })
     }
@@ -530,6 +599,7 @@ mod tests {
             tag_index: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
             rate_limit: Arc::new(RateLimitGate::default()),
+            release_dates: Arc::new(ReleaseDatesCache::new()),
         }
     }
 
@@ -704,6 +774,7 @@ mod tests {
             version: "v2.0.0-beta.1".into(),
             sha: "a".repeat(40),
             prerelease: true,
+            published_at: None,
         })];
         let registry = mock_registry("http://127.0.0.1:1", false);
         let req = VersionReq::new("*");
@@ -846,5 +917,192 @@ mod tests {
 
         assert!(output.contains("GitHub Actions"), "output was: {output}");
         assert!(output.contains("cap"), "output was: {output}");
+    }
+
+    // --- attach_publish_times (#486) ---
+
+    #[test]
+    fn test_attach_publish_times_match_strips_v_prefix() {
+        // `version` keeps the `v` prefix as published, but `dates`'s keys are
+        // normalized (mirrors `ReleaseDatesCache`'s release-tag_name join key) — the
+        // join must strip it before looking up.
+        let mut versions = vec![GithubActionsVersion {
+            version: "v4.2.0".into(),
+            sha: "a".repeat(40),
+            prerelease: false,
+            published_at: None,
+        }];
+        let published = PublishTime::parse_rfc3339("2026-01-02T08:56:05Z").unwrap();
+        let dates = HashMap::from([("4.2.0".to_string(), published)]);
+        attach_publish_times(&mut versions, &dates);
+        assert_eq!(versions[0].published_at, Some(published));
+    }
+
+    #[test]
+    fn test_attach_publish_times_missing_release_stays_none() {
+        let mut versions = vec![GithubActionsVersion {
+            version: "v4.2.0".into(),
+            sha: "a".repeat(40),
+            prerelease: false,
+            published_at: None,
+        }];
+        attach_publish_times(&mut versions, &HashMap::new());
+        assert_eq!(versions[0].published_at, None);
+    }
+
+    // --- Registry::get_versions_with: freshness.enabled gate (#486) ---
+
+    #[tokio::test]
+    async fn test_get_versions_with_disabled_freshness_skips_release_dates_fetch() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        let _tags_mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v1.0.0", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+        // Asserted at the end: the disabled path must never touch the releases
+        // endpoint at all, not merely tolerate it failing.
+        let releases_mock = server
+            .mock("GET", "/repos/owner/repo/releases")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("[]")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), true);
+        let name = PackageName::new("owner/repo");
+        let freshness = FreshnessSettings {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert!(versions.iter().all(|v| v.published_at().is_none()));
+        releases_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_with_enabled_freshness_attaches_publish_dates() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        let _tags_mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v1.0.0", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+        let _releases_mock = server
+            .mock("GET", "/repos/owner/repo/releases")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{"tag_name": "v1.0.0", "published_at": "2026-01-02T08:56:05Z", "draft": false}]"#,
+            )
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), true);
+        let name = PackageName::new("owner/repo");
+        let freshness = FreshnessSettings {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert!(versions.iter().all(|v| v.published_at().is_some()));
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_with_enabled_freshness_missing_release_stays_none() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        let _tags_mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v1.0.0", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+        // The repo has releases, but none for this tag.
+        let _releases_mock = server
+            .mock("GET", "/repos/owner/repo/releases")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(
+                r#"[{"tag_name": "v0.9.0", "published_at": "2025-01-01T00:00:00Z", "draft": false}]"#,
+            )
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), true);
+        let name = PackageName::new("owner/repo");
+        let freshness = FreshnessSettings {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert!(versions.iter().all(|v| v.published_at().is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_with_enabled_freshness_releases_fetch_error_falls_back_to_none() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        let _tags_mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v1.0.0", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+        let _releases_mock = server
+            .mock("GET", "/repos/owner/repo/releases")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .create_async()
+            .await;
+        // The tags fetch must still succeed even though the releases fetch errors:
+        // `ReleaseDatesCache::fetch` treats any fetch failure as an empty map, never
+        // propagated into the tags fetch's own success.
+        let registry = mock_registry(&server.url(), true);
+        let name = PackageName::new("owner/repo");
+        let freshness = FreshnessSettings {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let versions = registry.get_versions_with(&name, freshness).await.unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert!(versions.iter().all(|v| v.published_at().is_none()));
     }
 }
