@@ -1,4 +1,7 @@
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy,
+};
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 
@@ -28,16 +31,7 @@ impl RequirementMatcher for SemverMatcher {
 
 pub struct CargoFormatter;
 
-impl EcosystemFormatter for CargoFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        crate::registry::crate_url(name.as_str())
-    }
-
+impl PackageNaming for CargoFormatter {
     /// Validates a crate name against crates.io's naming rules.
     ///
     /// crates.io accepts only non-empty names starting with an ASCII letter or `_`,
@@ -94,7 +88,31 @@ impl EcosystemFormatter for CargoFormatter {
         }
         Ok(())
     }
+}
 
+impl PackageRendering for CargoFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::crate_url(name.as_str())
+    }
+
+    /// Suppresses the hover heading's crates.io link for any source other than plain
+    /// [`DependencySource::Registry`] or a verified crates.io mirror (spec FR-014, F2) — a
+    /// genuinely different `AlternateRegistry` resolves against a different index entirely,
+    /// so [`Self::package_url`]'s crates.io link would point at an unrelated (or simply
+    /// nonexistent) public crate once live version data from the real registry renders
+    /// beside it. A mirror's crates.io link stays correct: it is crates.io content, just
+    /// fetched elsewhere.
+    fn suppress_package_url(&self, source: &DependencySource) -> bool {
+        !self.source_is_public_registry_content(source)
+    }
+}
+
+impl RequirementResolution for CargoFormatter {
     /// Compiles `requirement` via `semver::VersionReq`, the same crate `deps-cargo`'s
     /// registry uses for matching — precise range semantics (`^`, `~`, comparator lists),
     /// unlike the default `version_satisfies_requirement` heuristic this method
@@ -106,13 +124,19 @@ impl EcosystemFormatter for CargoFormatter {
             .ok()
             .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
+}
 
+impl DiagnosticMessages for CargoFormatter {}
+
+impl DiagnosticPolicy for CargoFormatter {
     /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins
     /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
     fn strict_semver_prerelease_exclusion(&self) -> bool {
         true
     }
+}
 
+impl SourcePolicy for CargoFormatter {
     /// Extends the default (crates.io-only) resolvability to a resolved
     /// [`DependencySource::AlternateRegistry`] too — `CargoRegistry` (the value behind
     /// `CargoEcosystem::registry()`) routes that source to the alternate index's own
@@ -142,18 +166,9 @@ impl EcosystemFormatter for CargoFormatter {
                 }
         )
     }
-
-    /// Suppresses the hover heading's crates.io link for any source other than plain
-    /// [`DependencySource::Registry`] or a verified crates.io mirror (spec FR-014, F2) — a
-    /// genuinely different `AlternateRegistry` resolves against a different index entirely,
-    /// so [`Self::package_url`]'s crates.io link would point at an unrelated (or simply
-    /// nonexistent) public crate once live version data from the real registry renders
-    /// beside it. A mirror's crates.io link stays correct: it is crates.io content, just
-    /// fetched elsewhere.
-    fn suppress_package_url(&self, source: &DependencySource) -> bool {
-        !self.source_is_public_registry_content(source)
-    }
 }
+
+impl OsvNaming for CargoFormatter {}
 
 #[cfg(test)]
 mod tests {

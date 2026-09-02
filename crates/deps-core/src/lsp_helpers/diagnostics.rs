@@ -131,13 +131,13 @@ impl Default for DiagnosticSeverities {
     }
 }
 
-/// Shared shape for a [`EcosystemFormatter::compile_requirement`] guarded by one predicate.
+/// Shared shape for a [`crate::lsp_helpers::RequirementResolution::compile_requirement`] guarded by one predicate.
 ///
 /// This is the pattern several ecosystems' guards independently re-implemented
 /// (`deps-go`'s pseudo-version check, `deps-composer`'s dev-branch/`@dev` check,
 /// `deps-bundler`'s exact-pin check, `deps-maven`/`deps-gradle`'s malformed-range check,
 /// `deps-nuget`'s malformed-requirement check). See
-/// [`EcosystemFormatter::compile_requirement`]'s docs for why `None` is correct in exactly
+/// [`crate::lsp_helpers::RequirementResolution::compile_requirement`]'s docs for why `None` is correct in exactly
 /// this case: `is_undecidable(requirement)` true means the fetched `available` list
 /// structurally cannot contain a version that would decide the match either way, so scanning
 /// it would always report `Some(false)` and produce a false "no published version satisfies
@@ -145,7 +145,7 @@ impl Default for DiagnosticSeverities {
 ///
 /// Returns `None` when `is_undecidable(requirement)` is `true`. Otherwise builds `matcher`
 /// from `requirement`'s owned `String` and boxes it as the trait object
-/// [`EcosystemFormatter::compile_requirement`] returns.
+/// [`crate::lsp_helpers::RequirementResolution::compile_requirement`] returns.
 ///
 /// Ecosystems whose guard is a fallible parse rather than a named predicate over the
 /// requirement string (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-swift`) don't fit this
@@ -236,7 +236,10 @@ const MAX_REQUIREMENT_LEN: usize = 256;
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{requirement_is_unsatisfiable, EcosystemFormatter, RequirementMatcher};
+/// use deps_core::lsp_helpers::{
+///     requirement_is_unsatisfiable, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+///     PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+/// };
 /// use deps_core::{ConcreteVersion, PackageName, VersionReq};
 ///
 /// struct ExactMatcher(String);
@@ -247,13 +250,16 @@ const MAX_REQUIREMENT_LEN: usize = 256;
 /// }
 ///
 /// struct ExactFormatter;
-/// impl EcosystemFormatter for ExactFormatter {
+/// impl PackageNaming for ExactFormatter {}
+/// impl PackageRendering for ExactFormatter {
 ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
 ///         name.to_string()
 ///     }
+/// }
+/// impl RequirementResolution for ExactFormatter {
 ///     fn compile_requirement(
 ///         &self,
 ///         requirement: &VersionReq,
@@ -261,6 +267,10 @@ const MAX_REQUIREMENT_LEN: usize = 256;
 ///         Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
 ///     }
 /// }
+/// impl DiagnosticMessages for ExactFormatter {}
+/// impl DiagnosticPolicy for ExactFormatter {}
+/// impl SourcePolicy for ExactFormatter {}
+/// impl OsvNaming for ExactFormatter {}
 ///
 /// let available = vec![ConcreteVersion::new("1.0.0"), ConcreteVersion::new("0.9.0")];
 /// assert!(requirement_is_unsatisfiable(
@@ -3134,17 +3144,31 @@ mod tests {
         /// Mirrors a Composer/NuGet/Swift-shaped formatter whose normalized
         /// name differs from the manifest-declared raw name.
         struct MockLowercaseFormatter;
-        impl EcosystemFormatter for MockLowercaseFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
-            }
+        impl PackageNaming for MockLowercaseFormatter {
             fn normalize_package_name(&self, name: &PackageName) -> String {
                 name.to_string().to_lowercase()
             }
         }
+
+        impl PackageRendering for MockLowercaseFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+
+        impl RequirementResolution for MockLowercaseFormatter {}
+
+        impl DiagnosticMessages for MockLowercaseFormatter {}
+
+        impl DiagnosticPolicy for MockLowercaseFormatter {}
+
+        impl SourcePolicy for MockLowercaseFormatter {}
+
+        impl OsvNaming for MockLowercaseFormatter {}
 
         let formatter = MockLowercaseFormatter;
 
@@ -3886,16 +3910,23 @@ mod tests {
             }
         }
 
-        impl EcosystemFormatter for TableFormatter {
+        impl PackageNaming for TableFormatter {}
+
+        impl PackageRendering for TableFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 name.to_string()
             }
+        }
+
+        impl RequirementResolution for TableFormatter {
             fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
                 requirement.as_str() == "unresolved"
             }
+
             fn compile_requirement(
                 &self,
                 requirement: &VersionReq,
@@ -3907,6 +3938,14 @@ mod tests {
                     as Box<dyn RequirementMatcher>)
             }
         }
+
+        impl DiagnosticMessages for TableFormatter {}
+
+        impl DiagnosticPolicy for TableFormatter {}
+
+        impl SourcePolicy for TableFormatter {}
+
+        impl OsvNaming for TableFormatter {}
 
         fn versions(strs: &[&str]) -> Vec<ConcreteVersion> {
             strs.iter().map(|s| (*s).into()).collect()
@@ -4068,13 +4107,19 @@ mod tests {
         /// opted into `strict_semver_prerelease_exclusion` — mirrors Maven/NuGet/Composer/
         /// Gradle, which must never get the enrichment.
         struct NonStrictFormatter;
-        impl EcosystemFormatter for NonStrictFormatter {
+        impl PackageNaming for NonStrictFormatter {}
+
+        impl PackageRendering for NonStrictFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 name.to_string()
             }
+        }
+
+        impl RequirementResolution for NonStrictFormatter {
             fn compile_requirement(
                 &self,
                 requirement: &VersionReq,
@@ -4086,6 +4131,14 @@ mod tests {
                     .map(|req| Box::new(RealSemverMatcher(req)) as Box<dyn RequirementMatcher>)
             }
         }
+
+        impl DiagnosticMessages for NonStrictFormatter {}
+
+        impl DiagnosticPolicy for NonStrictFormatter {}
+
+        impl SourcePolicy for NonStrictFormatter {}
+
+        impl OsvNaming for NonStrictFormatter {}
 
         fn versions(strs: &[&str]) -> Vec<ConcreteVersion> {
             strs.iter().map(|s| (*s).into()).collect()
@@ -4320,16 +4373,23 @@ mod tests {
             }
         }
 
-        impl EcosystemFormatter for TableFormatter {
+        impl PackageNaming for TableFormatter {}
+
+        impl PackageRendering for TableFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 name.to_string()
             }
+        }
+
+        impl RequirementResolution for TableFormatter {
             fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
                 requirement.as_str() == "unresolved"
             }
+
             fn compile_requirement(
                 &self,
                 requirement: &VersionReq,
@@ -4341,6 +4401,14 @@ mod tests {
                     as Box<dyn RequirementMatcher>)
             }
         }
+
+        impl DiagnosticMessages for TableFormatter {}
+
+        impl DiagnosticPolicy for TableFormatter {}
+
+        impl SourcePolicy for TableFormatter {}
+
+        impl OsvNaming for TableFormatter {}
 
         fn versions(strs: &[&str]) -> Vec<ConcreteVersion> {
             strs.iter().map(|s| (*s).into()).collect()

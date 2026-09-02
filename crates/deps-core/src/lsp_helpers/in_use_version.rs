@@ -212,7 +212,7 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// already concrete ([`concrete_pin_version`]). `None` when neither applies.
 ///
 /// A dependency whose manifest requirement is itself the resolved version
-/// ([`EcosystemFormatter::manifest_requirement_is_resolved_version`] — a Go
+/// ([`crate::lsp_helpers::RequirementResolution::manifest_requirement_is_resolved_version`] — a Go
 /// `require`-directive dependency) skips the lockfile step entirely, going
 /// straight to the declared requirement (go.sum is unreliable there — a
 /// checksum ledger that `go get`/`go build` only ever append to, so its
@@ -227,7 +227,10 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{EcosystemFormatter, in_use_version};
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy, in_use_version,
+/// };
 /// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, VersionReq};
 /// use std::any::Any;
 /// use std::collections::HashMap;
@@ -260,7 +263,8 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 /// }
 ///
 /// struct SimpleFormatter;
-/// impl EcosystemFormatter for SimpleFormatter {
+/// impl PackageNaming for SimpleFormatter {}
+/// impl PackageRendering for SimpleFormatter {
 ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
@@ -268,6 +272,11 @@ fn is_concrete_version(requirement: &str, ecosystem: EcosystemId) -> bool {
 ///         name.to_string()
 ///     }
 /// }
+/// impl RequirementResolution for SimpleFormatter {}
+/// impl DiagnosticMessages for SimpleFormatter {}
+/// impl DiagnosticPolicy for SimpleFormatter {}
+/// impl SourcePolicy for SimpleFormatter {}
+/// impl OsvNaming for SimpleFormatter {}
 ///
 /// let dep = SimpleDep {
 ///     name: PackageName::new("time"),

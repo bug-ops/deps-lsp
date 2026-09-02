@@ -448,7 +448,7 @@ fn build_replacement_action(
 /// 3. Up to five plain `REFACTOR` "update to `<version>`" actions, one per
 ///    non-yanked version [`crate::completion::prepare_version_display_items`]
 ///    selects from the registry response. Each action's edit text
-///    comes from [`EcosystemFormatter::format_version_replacing`], which
+///    comes from [`crate::lsp_helpers::PackageRendering::format_version_replacing`], which
 ///    preserves the manifest's existing pin/operator style where an
 ///    ecosystem overrides it (e.g. PyPI's `==1.0.1` stays `==1.0.2` rather
 ///    than expanding to a `>=,<` range). Every entry's formatted edit text is
@@ -2638,13 +2638,17 @@ mod tests {
         /// into a still-broken range (plan §1.2.5 / critic M4).
         struct NonFixingFormatter;
 
-        impl EcosystemFormatter for NonFixingFormatter {
+        impl PackageNaming for NonFixingFormatter {}
+
+        impl PackageRendering for NonFixingFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
+
             fn format_version_replacing(
                 &self,
                 _version: &ConcreteVersion,
@@ -2652,6 +2656,9 @@ mod tests {
             ) -> String {
                 "still-bad".to_string()
             }
+        }
+
+        impl RequirementResolution for NonFixingFormatter {
             fn compile_requirement(
                 &self,
                 requirement: &VersionReq,
@@ -2659,6 +2666,14 @@ mod tests {
                 Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
             }
         }
+
+        impl DiagnosticMessages for NonFixingFormatter {}
+
+        impl DiagnosticPolicy for NonFixingFormatter {}
+
+        impl SourcePolicy for NonFixingFormatter {}
+
+        impl OsvNaming for NonFixingFormatter {}
 
         /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`], but
         /// `format_version_replacing` always returns the same fixed text regardless of
@@ -2669,13 +2684,17 @@ mod tests {
         /// nonetheless collide.
         struct CollidingTextFormatter;
 
-        impl EcosystemFormatter for CollidingTextFormatter {
+        impl PackageNaming for CollidingTextFormatter {}
+
+        impl PackageRendering for CollidingTextFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
+
             fn format_version_replacing(
                 &self,
                 _version: &ConcreteVersion,
@@ -2683,6 +2702,9 @@ mod tests {
             ) -> String {
                 "9.9.9".to_string()
             }
+        }
+
+        impl RequirementResolution for CollidingTextFormatter {
             fn compile_requirement(
                 &self,
                 requirement: &VersionReq,
@@ -2690,21 +2712,36 @@ mod tests {
                 Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
             }
         }
+
+        impl DiagnosticMessages for CollidingTextFormatter {}
+
+        impl DiagnosticPolicy for CollidingTextFormatter {}
+
+        impl SourcePolicy for CollidingTextFormatter {}
+
+        impl OsvNaming for CollidingTextFormatter {}
 
         /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`], but with a
         /// non-identity `normalize_package_name`, for the M1 lookup-fallback test.
         struct NormalizingExactFormatter;
 
-        impl EcosystemFormatter for NormalizingExactFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
-            }
+        impl PackageNaming for NormalizingExactFormatter {
             fn normalize_package_name(&self, name: &PackageName) -> String {
                 format!("normalized-{name}")
             }
+        }
+
+        impl PackageRendering for NormalizingExactFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+
+        impl RequirementResolution for NormalizingExactFormatter {
             fn compile_requirement(
                 &self,
                 requirement: &VersionReq,
@@ -2712,6 +2749,14 @@ mod tests {
                 Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
             }
         }
+
+        impl DiagnosticMessages for NormalizingExactFormatter {}
+
+        impl DiagnosticPolicy for NormalizingExactFormatter {}
+
+        impl SourcePolicy for NormalizingExactFormatter {}
+
+        impl OsvNaming for NormalizingExactFormatter {}
 
         struct UnsatDep {
             name: PackageName,

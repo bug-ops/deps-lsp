@@ -309,7 +309,7 @@ impl PackagistRegistry {
         }
 
         let formatter = crate::formatter::ComposerFormatter;
-        use deps_core::lsp_helpers::EcosystemFormatter;
+        use deps_core::lsp_helpers::RequirementResolution;
 
         Ok(versions.into_iter().find(|v| {
             crate::formatter::composer_version_stability_rank(v.version.as_str()) >= minimum_rank
@@ -348,7 +348,7 @@ impl PackagistRegistry {
         }
 
         let formatter = crate::formatter::ComposerFormatter;
-        use deps_core::lsp_helpers::EcosystemFormatter;
+        use deps_core::lsp_helpers::RequirementResolution;
 
         versions.iter().position(|v| {
             // Always true for Composer (`abandoned` maps to `AdvisoryDeprecated`, which

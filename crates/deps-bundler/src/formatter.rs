@@ -5,7 +5,10 @@ use deps_core::ConcreteVersion;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+};
 
 /// Whether every character of `name` is in RubyGems' gem-name charset
 /// (`Gem::Specification::VALID_NAME_PATTERN`): ASCII letters, digits, `.`, `-`, `_`.
@@ -127,16 +130,7 @@ fn exact_pin_could_be_yanked(requirement: &str, available: &[ConcreteVersion]) -
 /// Formatter for Bundler/Ruby gem versions.
 pub struct BundlerFormatter;
 
-impl EcosystemFormatter for BundlerFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        crate::registry::gem_url(name.as_str())
-    }
-
+impl PackageNaming for BundlerFormatter {
     /// Lints `name` against RubyGems' own gem-name rule (see `is_rubygems_name_charset` plus
     /// its "must include at least one letter" check), so a structurally invalid gem name is
     /// reported as "Invalid package name" instead of falling through to a registry lookup and
@@ -165,7 +159,20 @@ impl EcosystemFormatter for BundlerFormatter {
         }
         Ok(())
     }
+}
 
+impl PackageRendering for BundlerFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::gem_url(name.as_str())
+    }
+}
+
+impl RequirementResolution for BundlerFormatter {
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
         version_matches_requirement(version, requirement)
@@ -203,6 +210,14 @@ impl EcosystemFormatter for BundlerFormatter {
         exact_pin_could_be_yanked(requirement.as_str(), available)
     }
 }
+
+impl DiagnosticMessages for BundlerFormatter {}
+
+impl DiagnosticPolicy for BundlerFormatter {}
+
+impl SourcePolicy for BundlerFormatter {}
+
+impl OsvNaming for BundlerFormatter {}
 
 #[cfg(test)]
 mod tests {

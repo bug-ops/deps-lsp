@@ -43,7 +43,8 @@ use super::{
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     collect_update_all_edits, EcosystemFormatter, PackageVersions, VersionData,
+///     collect_update_all_edits, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+///     PackageRendering, PackageVersions, RequirementResolution, SourcePolicy, VersionData,
 /// };
 /// use deps_core::{ConcreteVersion, Dependency, ParseResult, PackageName, VersionReq};
 /// use std::any::Any;
@@ -51,7 +52,8 @@ use super::{
 /// use tower_lsp_server::ls_types::{Position, Range, Uri};
 ///
 /// struct MockFormatter;
-/// impl EcosystemFormatter for MockFormatter {
+/// impl PackageNaming for MockFormatter {}
+/// impl PackageRendering for MockFormatter {
 ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
@@ -59,6 +61,11 @@ use super::{
 ///         format!("https://example.com/{name}")
 ///     }
 /// }
+/// impl RequirementResolution for MockFormatter {}
+/// impl DiagnosticMessages for MockFormatter {}
+/// impl DiagnosticPolicy for MockFormatter {}
+/// impl SourcePolicy for MockFormatter {}
+/// impl OsvNaming for MockFormatter {}
 ///
 /// struct MockDep {
 ///     name: PackageName,
@@ -223,12 +230,16 @@ pub fn collect_update_all_edits(
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::{generate_code_lenses, EcosystemFormatter, VersionData};
+/// use deps_core::lsp_helpers::{
+///     generate_code_lenses, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+///     PackageRendering, RequirementResolution, SourcePolicy, VersionData,
+/// };
 /// use deps_core::{ConcreteVersion, PackageName, ParseResult};
 /// use std::collections::HashMap;
 ///
 /// struct MockFormatter;
-/// impl EcosystemFormatter for MockFormatter {
+/// impl PackageNaming for MockFormatter {}
+/// impl PackageRendering for MockFormatter {
 ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
@@ -236,6 +247,11 @@ pub fn collect_update_all_edits(
 ///         format!("https://example.com/{name}")
 ///     }
 /// }
+/// impl RequirementResolution for MockFormatter {}
+/// impl DiagnosticMessages for MockFormatter {}
+/// impl DiagnosticPolicy for MockFormatter {}
+/// impl SourcePolicy for MockFormatter {}
+/// impl OsvNaming for MockFormatter {}
 ///
 /// // An empty parse result yields no outdated dependencies, so no lens is generated.
 /// # struct EmptyParseResult { uri: tower_lsp_server::ls_types::Uri }
@@ -296,7 +312,7 @@ mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::*;
-    use crate::{ConcreteVersion, PackageName, VersionReq};
+    use crate::{ConcreteVersion, Dependency, PackageName, VersionReq};
     use std::any::Any;
     use std::collections::HashMap;
 
@@ -381,13 +397,19 @@ mod tests {
         /// real no-op and get filtered by `collect_update_all_edits`'s no-op guard.
         struct FloorFormatter;
 
-        impl EcosystemFormatter for FloorFormatter {
+        impl PackageNaming for FloorFormatter {}
+
+        impl PackageRendering for FloorFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 format!("{version}-forced")
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
+        }
+
+        impl RequirementResolution for FloorFormatter {
             fn is_requirement_up_to_date(
                 &self,
                 _requirement: &VersionReq,
@@ -396,6 +418,14 @@ mod tests {
                 false
             }
         }
+
+        impl DiagnosticMessages for FloorFormatter {}
+
+        impl DiagnosticPolicy for FloorFormatter {}
+
+        impl SourcePolicy for FloorFormatter {}
+
+        impl OsvNaming for FloorFormatter {}
 
         #[test]
         fn test_zero_outdated_returns_empty_edits_and_no_lens() {
@@ -656,13 +686,17 @@ mod tests {
             // dependency would still count toward, and be "fixed" by, the "Update N
             // outdated dependencies" lens while applying nothing.
             struct NoOpFormatter;
-            impl EcosystemFormatter for NoOpFormatter {
+            impl PackageNaming for NoOpFormatter {}
+
+            impl PackageRendering for NoOpFormatter {
                 fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                     version.to_string()
                 }
+
                 fn package_url(&self, name: &PackageName) -> String {
                     format!("https://example.com/{name}")
                 }
+
                 fn format_version_replacing(
                     &self,
                     _version: &ConcreteVersion,
@@ -670,6 +704,9 @@ mod tests {
                 ) -> String {
                     current.to_string()
                 }
+            }
+
+            impl RequirementResolution for NoOpFormatter {
                 fn is_requirement_up_to_date(
                     &self,
                     _requirement: &VersionReq,
@@ -678,6 +715,14 @@ mod tests {
                     false
                 }
             }
+
+            impl DiagnosticMessages for NoOpFormatter {}
+
+            impl DiagnosticPolicy for NoOpFormatter {}
+
+            impl SourcePolicy for NoOpFormatter {}
+
+            impl OsvNaming for NoOpFormatter {}
 
             let content = r#"pkg = "1.0.0""#;
             let pr = parse_result(vec![dep("pkg", Some("1.0.0"), Some(range(0, 7, 0, 12)))]);

@@ -519,19 +519,36 @@ mod tests {
     use tower_lsp_server::ls_types::Position;
 
     use crate::{
-        ConcreteVersion, PackageName, ParseResult, Registry, completion::Completions,
-        lsp_helpers::EcosystemFormatter,
+        ConcreteVersion, PackageName, ParseResult, Registry,
+        completion::Completions,
+        lsp_helpers::{
+            DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
+            PackageRendering, RequirementResolution, SourcePolicy,
+        },
     };
 
     struct MockFormatter;
-    impl EcosystemFormatter for MockFormatter {
+    impl PackageNaming for MockFormatter {}
+
+    impl PackageRendering for MockFormatter {
         fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
             version.to_string()
         }
+
         fn package_url(&self, name: &PackageName) -> String {
             format!("https://example.com/{name}")
         }
     }
+
+    impl RequirementResolution for MockFormatter {}
+
+    impl DiagnosticMessages for MockFormatter {}
+
+    impl DiagnosticPolicy for MockFormatter {}
+
+    impl SourcePolicy for MockFormatter {}
+
+    impl OsvNaming for MockFormatter {}
 
     // Mock ecosystem for testing
     struct MockEcosystem {

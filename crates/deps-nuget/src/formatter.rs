@@ -1,6 +1,9 @@
 //! Version formatting for the NuGet ecosystem.
 
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+};
 use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 
 /// Maximum package ID length NuGet's client-side `PackageIdValidator` accepts.
@@ -45,17 +48,7 @@ impl RequirementMatcher for NuGetMatcher {
 
 pub struct NuGetFormatter;
 
-impl EcosystemFormatter for NuGetFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        // NuGet manifests store plain version text; no prefix/wrapping on insert.
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        crate::registry::package_url(name.as_str())
-    }
-
+impl PackageNaming for NuGetFormatter {
     /// Lints `name` against NuGet's own `PackageIdValidator` rule (see
     /// `is_valid_nuget_id`), so a structurally invalid package ID is reported as "Invalid
     /// package name" instead of falling through to a registry lookup and rendering the
@@ -92,6 +85,25 @@ impl EcosystemFormatter for NuGetFormatter {
         Ok(())
     }
 
+    /// NuGet package ids are case-insensitive and every V3 API path segment is lowercased.
+    fn normalize_package_name(&self, name: &PackageName) -> String {
+        name.as_str().to_lowercase()
+    }
+}
+
+impl PackageRendering for NuGetFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        // NuGet manifests store plain version text; no prefix/wrapping on insert.
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
+    }
+}
+
+impl RequirementResolution for NuGetFormatter {
     /// Overridden because the default npm caret/tilde semantics do not apply to NuGet's
     /// interval-notation ranges (`[1.0,2.0)`) and floating patterns (`1.1.*`).
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
@@ -101,11 +113,6 @@ impl EcosystemFormatter for NuGetFormatter {
             return crate::version::resolve_float(&versions, requirement).is_some();
         }
         crate::version::satisfies(version, requirement)
-    }
-
-    /// NuGet package ids are case-insensitive and every V3 API path segment is lowercased.
-    fn normalize_package_name(&self, name: &PackageName) -> String {
-        name.as_str().to_lowercase()
     }
 
     /// Overridden because a minimum-only range (a bare `Version="1.0.0"`, or its explicit
@@ -144,7 +151,7 @@ impl EcosystemFormatter for NuGetFormatter {
     }
 
     /// Uses [`compile_requirement_unless`] (see that function and
-    /// [`EcosystemFormatter::compile_requirement`] for the shared "undecidable" contract).
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate rejects a syntactically malformed range or floating pattern
     /// (parsing fails) — without this guard, a malformed requirement string would make
@@ -175,6 +182,14 @@ impl EcosystemFormatter for NuGetFormatter {
         }
     }
 }
+
+impl DiagnosticMessages for NuGetFormatter {}
+
+impl DiagnosticPolicy for NuGetFormatter {}
+
+impl SourcePolicy for NuGetFormatter {}
+
+impl OsvNaming for NuGetFormatter {}
 
 #[cfg(test)]
 mod tests {

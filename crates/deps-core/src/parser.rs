@@ -904,7 +904,7 @@ pub enum DependencySource {
         /// per-version checksum equality against crates.io for a mirror, so its content is
         /// exactly as trustworthy as crates.io's own for vulnerability-scanning and hover-link
         /// purposes, even though the fetch itself still goes to `index`, not to crates.io.
-        /// See [`crate::lsp_helpers::EcosystemFormatter::source_is_public_registry_content`].
+        /// See [`crate::lsp_helpers::SourcePolicy::source_is_public_registry_content`].
         mirrors_crates_io: bool,
     },
 }
@@ -939,7 +939,7 @@ impl DependencySource {
     /// "does the generic `Registry` trait (crates.io-shaped, one client per ecosystem)
     /// resolve this", not "is version data reachable at all". An ecosystem whose registry
     /// implements per-source routing (`deps-cargo`'s `CargoRegistry`) must use
-    /// [`crate::lsp_helpers::EcosystemFormatter::can_resolve_source`] instead, which defaults
+    /// [`crate::lsp_helpers::SourcePolicy::can_resolve_source`] instead, which defaults
     /// to this method and is the only override point — see that method's docs.
     pub fn is_version_resolvable(&self) -> bool {
         matches!(self, Self::Registry)

@@ -3,7 +3,10 @@ use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+};
 use deps_core::normalize_operator_spacing;
 use tower_lsp_server::ls_types::Position;
 
@@ -45,18 +48,9 @@ impl RequirementMatcher for ComposerMatcher {
 /// - `~1.2` means `>=1.2.0 <2.0.0` (DIFFERENT from npm where ~1.2 = >=1.2.0 <1.3.0)
 pub struct ComposerFormatter;
 
-impl EcosystemFormatter for ComposerFormatter {
+impl PackageNaming for ComposerFormatter {
     fn normalize_package_name(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()
-    }
-
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        crate::registry::package_url(name.as_str())
     }
 
     /// Lints `name` against Packagist's `vendor/package` coordinate shape (see
@@ -86,31 +80,16 @@ impl EcosystemFormatter for ComposerFormatter {
         }
         Ok(())
     }
+}
 
-    fn yanked_message(&self) -> &'static str {
-        "This package is abandoned"
+impl PackageRendering for ComposerFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        version.to_string()
     }
 
-    fn yanked_label(&self) -> &'static str {
-        "*(abandoned)*"
-    }
-
-    /// Reuses Packagist's own "abandoned" wording for #205's package-level diagnostic,
-    /// mirroring the yanked pair above rather than the trait default's generic
-    /// "deprecated" — pattern reuse, not a new ecosystem-specific branch.
-    fn deprecated_message(&self) -> &'static str {
-        "This package is abandoned"
-    }
-
-    fn deprecated_label(&self) -> &'static str {
-        "*(abandoned)*"
-    }
-
-    /// Packagist's `abandoned` replacement name is a structured, registry-validated
-    /// field (see `deprecation_from_abandoned` in `registry.rs`), unlike npm's free-text
-    /// `deprecated` message — safe to offer as a rename target.
-    fn supports_package_rename(&self) -> bool {
-        true
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
     }
 
     /// Widens the rename quickfix's discoverability: without this, only a cursor on
@@ -146,7 +125,9 @@ impl EcosystemFormatter for ComposerFormatter {
         dep.version_range()
             .is_some_and(|r| deps_core::lsp_helpers::position_in_range(position, r))
     }
+}
 
+impl RequirementResolution for ComposerFormatter {
     /// Checks if a version satisfies a Composer version requirement.
     ///
     /// Handles Composer-specific operators:
@@ -280,19 +261,10 @@ impl EcosystemFormatter for ComposerFormatter {
         false
     }
 
-    /// Packagist's canonical form is lowercase, and `composer.json` files
-    /// legitimately carry mixed case (Composer resolves case-insensitively).
-    /// This is the mirror image of NuGet: there, lowercasing kills the
-    /// ecosystem; here, *not* lowercasing does (OSV is case-sensitive for
-    /// every ecosystem except PyPI).
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
-        Some(self.normalize_package_name(dep.name()))
-    }
-
     /// Compiles `requirement` into a `ComposerMatcher` using the same
     /// `version_satisfies_requirement` comparator — Composer requirements have no separate
     /// "loose" vs. "precise" form to distinguish. Uses [`compile_requirement_unless`] (see
-    /// that function and [`EcosystemFormatter::compile_requirement`] for the shared
+    /// that function and [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared
     /// "undecidable" contract).
     ///
     /// The undecidable predicate rejects a `dev-*`/`*-dev` branch requirement (e.g.
@@ -308,6 +280,49 @@ impl EcosystemFormatter for ComposerFormatter {
             |r| r.starts_with("dev-") || r.ends_with("-dev") || r.contains("@dev"),
             ComposerMatcher,
         )
+    }
+}
+
+impl DiagnosticMessages for ComposerFormatter {
+    fn yanked_message(&self) -> &'static str {
+        "This package is abandoned"
+    }
+
+    fn yanked_label(&self) -> &'static str {
+        "*(abandoned)*"
+    }
+
+    /// Reuses Packagist's own "abandoned" wording for #205's package-level diagnostic,
+    /// mirroring the yanked pair above rather than the trait default's generic
+    /// "deprecated" — pattern reuse, not a new ecosystem-specific branch.
+    fn deprecated_message(&self) -> &'static str {
+        "This package is abandoned"
+    }
+
+    fn deprecated_label(&self) -> &'static str {
+        "*(abandoned)*"
+    }
+}
+
+impl DiagnosticPolicy for ComposerFormatter {
+    /// Packagist's `abandoned` replacement name is a structured, registry-validated
+    /// field (see `deprecation_from_abandoned` in `registry.rs`), unlike npm's free-text
+    /// `deprecated` message — safe to offer as a rename target.
+    fn supports_package_rename(&self) -> bool {
+        true
+    }
+}
+
+impl SourcePolicy for ComposerFormatter {}
+
+impl OsvNaming for ComposerFormatter {
+    /// Packagist's canonical form is lowercase, and `composer.json` files
+    /// legitimately carry mixed case (Composer resolves case-insensitively).
+    /// This is the mirror image of NuGet: there, lowercasing kills the
+    /// ecosystem; here, *not* lowercasing does (OSV is case-sensitive for
+    /// every ecosystem except PyPI).
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
+        Some(self.normalize_package_name(dep.name()))
     }
 }
 

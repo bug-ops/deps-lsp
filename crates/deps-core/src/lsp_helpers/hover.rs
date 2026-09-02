@@ -1690,7 +1690,9 @@ mod tests {
     /// `"*(deprecated)*"` wording (`deps-npm/src/formatter.rs`), everything else default.
     struct NpmLikeFormatter;
 
-    impl EcosystemFormatter for NpmLikeFormatter {
+    impl PackageNaming for NpmLikeFormatter {}
+
+    impl PackageRendering for NpmLikeFormatter {
         fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
             version.to_string()
         }
@@ -1698,11 +1700,21 @@ mod tests {
         fn package_url(&self, name: &crate::PackageName) -> String {
             format!("https://example.com/{name}")
         }
+    }
 
+    impl RequirementResolution for NpmLikeFormatter {}
+
+    impl DiagnosticMessages for NpmLikeFormatter {
         fn yanked_label(&self) -> &'static str {
             "*(deprecated)*"
         }
     }
+
+    impl DiagnosticPolicy for NpmLikeFormatter {}
+
+    impl SourcePolicy for NpmLikeFormatter {}
+
+    impl OsvNaming for NpmLikeFormatter {}
 
     /// T7 (S4, accepted redundancy): hover for a deprecated npm-shaped package renders
     /// **both** the new `### Deprecated` section (D6) and the pre-existing per-row

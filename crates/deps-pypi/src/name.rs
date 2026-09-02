@@ -1,7 +1,7 @@
 //! Canonical PyPI package name normalization (PEP 503).
 //!
 //! This is the single normalization used across deps-pypi — registry lookups,
-//! `PypiFormatter`'s [`normalize_package_name`](deps_core::lsp_helpers::EcosystemFormatter::normalize_package_name)
+//! `PypiFormatter`'s [`normalize_package_name`](deps_core::lsp_helpers::PackageNaming::normalize_package_name)
 //! override, and lock file parsing — so a name declared any of several ways
 //! (`Zope.Interface`, `zope_interface`, `zope-interface`) resolves to the
 //! same lookup key everywhere. See [`crate::types::PypiDependency::name`] for

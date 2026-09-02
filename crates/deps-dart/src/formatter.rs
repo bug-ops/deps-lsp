@@ -5,7 +5,10 @@ use deps_core::ConcreteVersion;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy,
+};
 use deps_core::normalize_operator_spacing;
 
 /// Whether `name` is a valid Dart identifier: pub.dev requires every package name to be one,
@@ -35,16 +38,7 @@ impl RequirementMatcher for PubDevMatcher {
 
 pub struct DartFormatter;
 
-impl EcosystemFormatter for DartFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        format!("^{version}")
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        crate::registry::package_url(name.as_str())
-    }
-
+impl PackageNaming for DartFormatter {
     /// Lints `name` against pub.dev's rule that every package name must be a valid Dart
     /// identifier (see `is_valid_dart_identifier`), so a structurally invalid name is
     /// reported as "Invalid package name" instead of falling through to a registry lookup
@@ -65,7 +59,20 @@ impl EcosystemFormatter for DartFormatter {
         }
         Ok(())
     }
+}
 
+impl PackageRendering for DartFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        format!("^{version}")
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
+    }
+}
+
+impl RequirementResolution for DartFormatter {
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
         version_matches_constraint(version, requirement)
@@ -80,6 +87,14 @@ impl EcosystemFormatter for DartFormatter {
         Some(Box::new(PubDevMatcher(normalized)))
     }
 }
+
+impl DiagnosticMessages for DartFormatter {}
+
+impl DiagnosticPolicy for DartFormatter {}
+
+impl SourcePolicy for DartFormatter {}
+
+impl OsvNaming for DartFormatter {}
 
 #[cfg(test)]
 mod tests {

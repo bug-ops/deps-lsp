@@ -32,9 +32,10 @@ pub(crate) mod blocking_ecosystem {
     use deps_core::ecosystem::BoxFuture;
     use deps_core::ecosystem::private::Sealed;
     use deps_core::{
-        Dependency, DiagnosticSeverities, Ecosystem, EcosystemConfig, EcosystemFormatter,
-        FreshnessSettings, Metadata, ParseResult, Registry, Version, VersionData,
-        completion::Completions,
+        Dependency, DiagnosticMessages, DiagnosticPolicy, DiagnosticSeverities, Ecosystem,
+        EcosystemConfig, EcosystemFormatter, FreshnessSettings, Metadata, OsvNaming, PackageNaming,
+        PackageRendering, ParseResult, Registry, RequirementResolution, SourcePolicy, Version,
+        VersionData, completion::Completions,
     };
     use std::any::Any;
     use std::path::Path;
@@ -70,14 +71,27 @@ pub(crate) mod blocking_ecosystem {
     }
 
     pub(crate) struct NoopFormatter;
-    impl EcosystemFormatter for NoopFormatter {
+    impl PackageNaming for NoopFormatter {}
+
+    impl PackageRendering for NoopFormatter {
         fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
             version.to_string()
         }
+
         fn package_url(&self, name: &deps_core::PackageName) -> String {
             format!("https://example.com/{name}")
         }
     }
+
+    impl RequirementResolution for NoopFormatter {}
+
+    impl DiagnosticMessages for NoopFormatter {}
+
+    impl DiagnosticPolicy for NoopFormatter {}
+
+    impl SourcePolicy for NoopFormatter {}
+
+    impl OsvNaming for NoopFormatter {}
 
     pub(crate) struct MockParseResult {
         pub(crate) uri: Uri,

@@ -1,6 +1,9 @@
 //! Version formatting for Maven ecosystem.
 
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+};
 use deps_core::{
     ConcreteVersion, InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment,
 };
@@ -93,17 +96,7 @@ impl RequirementMatcher for MavenMatcher {
     }
 }
 
-impl EcosystemFormatter for MavenFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        // Maven uses exact versions, no prefix
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        crate::registry::package_url(name.as_str())
-    }
-
+impl PackageNaming for MavenFormatter {
     /// Validates a Maven coordinate's `groupId:artifactId` shape and character set.
     ///
     /// Mirrors the gate `crate::registry::metadata_urls` applies before building a
@@ -150,7 +143,21 @@ impl EcosystemFormatter for MavenFormatter {
         }
         Ok(())
     }
+}
 
+impl PackageRendering for MavenFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        // Maven uses exact versions, no prefix
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
+    }
+}
+
+impl RequirementResolution for MavenFormatter {
     // #249 review (M4): this branch order (unresolved → range → exact) is a separate copy
     // from `compile_requirement`'s below — kept apart deliberately (see `MavenMatcher`'s
     // docs for the two precision differences), but any reordering here must be checked
@@ -173,7 +180,7 @@ impl EcosystemFormatter for MavenFormatter {
     }
 
     /// Uses [`compile_requirement_unless`] (see that function and
-    /// [`EcosystemFormatter::compile_requirement`] for the shared "undecidable" contract).
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate rejects a malformed range (`is_range` true but
     /// `crate::range::parse_range` fails) — checked unconditionally, first, before any other
@@ -208,6 +215,14 @@ impl EcosystemFormatter for MavenFormatter {
         )
     }
 }
+
+impl DiagnosticMessages for MavenFormatter {}
+
+impl DiagnosticPolicy for MavenFormatter {}
+
+impl SourcePolicy for MavenFormatter {}
+
+impl OsvNaming for MavenFormatter {}
 
 #[cfg(test)]
 mod tests {
