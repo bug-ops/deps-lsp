@@ -31,47 +31,51 @@ struct VulnerabilityFixAction {
 /// FR-003).
 ///
 /// `CandidateClean { version: F }` always clears it. A `CandidateVulnerable { version: F,
-/// advisory_ids, total_known }` result can *also* clear it — F may legitimately still be
-/// affected by advisories `recommended_fix()` never claimed to resolve in the first place
-/// (excluded via `upgrade_status`'s `still_applying` subtraction, or never had a known fix at
-/// all): that is #216's original honest "partial fix" contract, not a gap this verification
-/// introduces. It is suppressed the moment `advisory_ids` names either a *claimed* advisory
-/// (`fix`'s own `advisory_ids` — the fix doesn't do what its title says) or an advisory this
-/// dependency's `advisories` never recorded at all: a brand-new advisory only visible by
-/// live-checking F itself, since phase A only ever queries the dependency's *declared*
-/// version, not F (the #462 repro: an advisory affecting some version strictly between
-/// declared and F, invisible until F is checked directly). Any other state (`None`,
-/// `NotChecked`, or a `version` mismatch) means F was never actually verified, so it is
-/// rejected too.
+/// advisory_ids }` result can *also* clear it — F may legitimately still be affected by
+/// advisories `recommended_fix()` never claimed to resolve in the first place (excluded via
+/// `upgrade_status`'s `still_applying` subtraction, or never had a known fix at all): that is
+/// #216's original honest "partial fix" contract, not a gap this verification introduces. It is
+/// suppressed the moment `advisory_ids` names either a *claimed* advisory (`fix`'s own
+/// `advisory_ids` — the fix doesn't do what its title says) or an advisory this dependency's
+/// `advisories` never recorded at all: a brand-new advisory only visible by live-checking F
+/// itself, since phase A only ever queries the dependency's *declared* version, not F (the #462
+/// repro: an advisory affecting some version strictly between declared and F, invisible until F
+/// is checked directly). Any other state ([`UpgradeStatus::NotChecked`] or a `version`
+/// mismatch) means F was never actually verified, so it is rejected too.
 ///
 /// `advisory_ids` is itself capped at [`crate::osv::ADVISORY_DISPLAY_CAP`] the same way
 /// [`crate::osv::DependencyVulnerabilities::advisories`] is (#462 critic M1) — a truncated
 /// list can never be read as exhaustive, since the ids it dropped could just as easily be the
-/// claimed or unknown one that should have suppressed this fix. `advisory_ids.len() <
-/// total_known` is rejected unconditionally before the known/unclaimed check even runs, so a
-/// dependency with more affecting advisories than the cap never gets a false "verified clean"
-/// reading from a partial list.
+/// claimed or unknown one that should have suppressed this fix. `!advisory_ids.is_complete()`
+/// is rejected unconditionally before the known/unclaimed check even runs, so a dependency with
+/// more affecting advisories than the cap never gets a false "verified clean" reading from a
+/// partial list.
 fn fix_target_is_verified(
     dv: &crate::osv::DependencyVulnerabilities,
     fix: &crate::osv::FixRecommendation,
     version_native: &str,
 ) -> bool {
     match &dv.fix_target_status {
-        Some(UpgradeStatus::CandidateClean { version }) => version == version_native,
-        Some(UpgradeStatus::CandidateVulnerable {
+        UpgradeStatus::CandidateClean { version } => version == version_native,
+        UpgradeStatus::CandidateVulnerable {
             version,
             advisory_ids,
-            total_known,
-        }) if version == version_native => {
-            if advisory_ids.len() < *total_known {
+        } => {
+            if version != version_native || !advisory_ids.is_complete() {
                 return false;
             }
-            let known_ids: HashSet<&str> = dv.advisories.iter().map(|a| a.id.as_str()).collect();
+            let known_ids: HashSet<&str> = dv
+                .advisories
+                .items()
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect();
             advisory_ids
+                .items()
                 .iter()
                 .all(|id| known_ids.contains(id.as_str()) && !fix.advisory_ids.contains(id))
         }
-        _ => false,
+        UpgradeStatus::NotChecked => false,
     }
 }
 
@@ -718,7 +722,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_combines_advisories_sharing_the_highest_fix() {
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -731,32 +737,34 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![
-                    std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.1.0".to_string()],
-                        url: String::new(),
-                    }),
-                    std::sync::Arc::new(Advisory {
-                        id: "A2".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::Critical,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    }),
-                ],
-                total_known: 2,
-                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                advisories: Capped::new(
+                    vec![
+                        std::sync::Arc::new(Advisory {
+                            id: "A1".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            fixed_versions: vec!["1.1.0".to_string()],
+                            url: String::new(),
+                        }),
+                        std::sync::Arc::new(Advisory {
+                            id: "A2".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::Critical,
+                            cvss_vector: None,
+                            fixed_versions: vec!["1.2.0".to_string()],
+                            url: String::new(),
+                        }),
+                    ],
+                    2,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.2.0".to_string(),
-                }),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -807,7 +815,9 @@ mod tests {
         // applies. Because A1 was already excluded from `claimed` (it is not in
         // `fix.advisory_ids`), this must still be presented as a fix for A2 — the honest
         // #216 partial-fix contract `fix_target_is_verified` preserves.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -820,38 +830,38 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![
-                    std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["3.0.0".to_string()],
-                        url: String::new(),
-                    }),
-                    std::sync::Arc::new(Advisory {
-                        id: "A2".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::Medium,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    }),
-                ],
-                total_known: 2,
-                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                advisories: Capped::new(
+                    vec![
+                        std::sync::Arc::new(Advisory {
+                            id: "A1".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            fixed_versions: vec!["3.0.0".to_string()],
+                            url: String::new(),
+                        }),
+                        std::sync::Arc::new(Advisory {
+                            id: "A2".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::Medium,
+                            cvss_vector: None,
+                            fixed_versions: vec!["1.2.0".to_string()],
+                            url: String::new(),
+                        }),
+                    ],
+                    2,
+                ),
+                fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
-                    advisory_ids: vec!["A1".to_string()],
-                    total_known: 1,
-                }),
+                    advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                },
                 upgrade_status: UpgradeStatus::CandidateVulnerable {
                     version: "3.0.0".to_string(),
-                    advisory_ids: vec!["A1".to_string()],
-                    total_known: 1,
+                    advisory_ids: Capped::new(vec!["A1".to_string()], 1),
                 },
             }),
         );
@@ -885,7 +895,9 @@ mod tests {
         // from A2 alone (1.2.0) and `fix.advisory_ids = ["A2"]`. The live check of F=1.2.0
         // correctly reports A1 still applies (it was never fixed) — A1 is known and unclaimed,
         // so this must still be presented as a fix for A2, the honest #216 partial-fix contract.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -898,34 +910,35 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![
-                    std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec![],
-                        url: String::new(),
-                    }),
-                    std::sync::Arc::new(Advisory {
-                        id: "A2".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::Medium,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    }),
-                ],
-                total_known: 2,
-                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                advisories: Capped::new(
+                    vec![
+                        std::sync::Arc::new(Advisory {
+                            id: "A1".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            fixed_versions: vec![],
+                            url: String::new(),
+                        }),
+                        std::sync::Arc::new(Advisory {
+                            id: "A2".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::Medium,
+                            cvss_vector: None,
+                            fixed_versions: vec!["1.2.0".to_string()],
+                            url: String::new(),
+                        }),
+                    ],
+                    2,
+                ),
+                fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
-                    advisory_ids: vec!["A1".to_string()],
-                    total_known: 1,
-                }),
+                    advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -961,7 +974,9 @@ mod tests {
         // `..._subtracted_advisory` test above), a brand-new unknown advisory must always
         // suppress the fix: it is not the honest #216 partial-fix case, it is exactly the
         // gap #462 exists to close.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -974,22 +989,23 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.2.0".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
-                    advisory_ids: vec!["A2".to_string()],
-                    total_known: 1,
-                }),
+                    advisory_ids: Capped::new(vec!["A2".to_string()], 1),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1023,7 +1039,9 @@ mod tests {
         // actually names) still applies to F means the fix doesn't do what its own title
         // says — this must suppress the action even though the id is known, distinguishing
         // it from the `..._subtracted_advisory` test's honest-partial-fix case.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -1036,25 +1054,26 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.2.0".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
                 // A1 is claimed (it's the only advisory, with a known fix, and nothing
                 // excludes it), yet the live check of F=1.2.0 reports A1 itself still
                 // applies — a claim the verification actually contradicts.
-                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
-                    advisory_ids: vec!["A1".to_string()],
-                    total_known: 1,
-                }),
+                    advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1091,7 +1110,9 @@ mod tests {
         // and unclaimed — which the pre-M1-fix gate would have accepted — but `total_known: 2`
         // proves a second, unreported advisory exists, so this must still be rejected rather
         // than trusting a partial list as if it were exhaustive.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -1104,38 +1125,39 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![
-                    std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    }),
-                    std::sync::Arc::new(Advisory {
-                        id: "A2".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::Medium,
-                        cvss_vector: None,
-                        fixed_versions: vec![],
-                        url: String::new(),
-                    }),
-                ],
-                total_known: 2,
+                advisories: Capped::new(
+                    vec![
+                        std::sync::Arc::new(Advisory {
+                            id: "A1".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            fixed_versions: vec!["1.2.0".to_string()],
+                            url: String::new(),
+                        }),
+                        std::sync::Arc::new(Advisory {
+                            id: "A2".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::Medium,
+                            cvss_vector: None,
+                            fixed_versions: vec![],
+                            url: String::new(),
+                        }),
+                    ],
+                    2,
+                ),
                 // Only A2 is reported (known, unclaimed — A1 is the sole claimed advisory),
                 // but `total_known: 2` says the live check actually found 2 advisories still
                 // affecting F; the second one was truncated out of `advisory_ids` and could be
                 // anything, including the still-applying A1 itself.
-                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
-                    advisory_ids: vec!["A2".to_string()],
-                    total_known: 2,
-                }),
+                    advisory_ids: Capped::new(vec!["A2".to_string()], 2),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1163,10 +1185,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_omits_fix_when_fix_target_status_is_unresolved() {
-        // #462 FR-004/NFR-002: `fix_target_status: None` covers both "verification never ran
-        // yet" and "verification timed out" — either way, an unverified F must never be
+        // #462 FR-004/NFR-002: `fix_target_status: NotChecked` covers both "verification never
+        // ran yet" and "verification timed out" — either way, an unverified F must never be
         // offered as a fix, the fail-safe default (no "unverified" qualifier, just omission).
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -1179,18 +1203,20 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.2.0".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: None,
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1218,7 +1244,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_drops_yanked_fix_target() {
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -1231,20 +1259,22 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["2.0.0".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["2.0.0".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
                     version: "2.0.0".to_string(),
-                }),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1277,7 +1307,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_no_op_edit_is_skipped() {
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         // Manifest already declares exactly the fixed version.
@@ -1291,18 +1323,20 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.2.0".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: None,
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1333,7 +1367,9 @@ mod tests {
         // wrap). A guard comparing the bare version ("1.2.0" != "^1.2.0")
         // would miss this and offer a no-op edit; the guard must compare
         // against the formatted text instead.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("^1.2.0");
@@ -1346,18 +1382,20 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.2.0".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: None,
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1505,7 +1543,9 @@ mod tests {
         // Regression for #302: an OSV advisory's `fixed_versions` entry is
         // external, untrusted data — a manifest-structural character in it must
         // never reach a `TextEdit` via the vulnerability quickfix.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -1518,18 +1558,20 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.2.0\", \"evil\": \"true".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: None,
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0\", \"evil\": \"true".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1566,7 +1608,9 @@ mod tests {
         // vulnerable occurrence's position, never at the patched one's,
         // regardless of which occurrence's OSV result happened to be
         // inserted into the shared map last.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use tower_lsp_server::ls_types::{Position, Range};
 
         let vulnerable_line = "log4j-core = \"=2.14.1\"";
@@ -1618,20 +1662,22 @@ mod tests {
         vulnerabilities.insert(
             vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "GHSA-log4j".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::Critical,
-                    cvss_vector: None,
-                    fixed_versions: vec!["2.17.1".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "GHSA-log4j".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::Critical,
+                        cvss_vector: None,
+                        fixed_versions: vec!["2.17.1".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
                     version: "2.17.1".to_string(),
-                }),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1683,7 +1729,9 @@ mod tests {
         // through undeduped. Here the fix targets "1.2.5" (formatted "==1.2") and the
         // registry also offers "1.2.9" — a different raw version that formats to the
         // same "==1.2" text — which must be skipped.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("==1.0.0");
@@ -1696,20 +1744,22 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.2.5".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.5".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.2.5".to_string(),
-                }),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1807,7 +1857,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_code_actions_lockfile_hit_gets_title_suffix() {
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("^1.0");
@@ -1820,20 +1872,22 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.0.2".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.0.2".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.0.2".to_string(),
-                }),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1867,7 +1921,9 @@ mod tests {
         // suppress an OSV-derived fix. The fix action is computed before the
         // `registry.get_versions` call, but this test exercises the early
         // return on `Err` specifically, which no prior test reached.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -1880,20 +1936,22 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.2.0".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.2.0".to_string(),
-                }),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1930,7 +1988,9 @@ mod tests {
         // versions: the display item for that exact version must not be
         // duplicated, and no plain item may claim `is_preferred` once a fix
         // action exists.
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -1943,20 +2003,22 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.2.0".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.2.0".to_string(),
-                }),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -2077,7 +2139,9 @@ mod tests {
         // `format_version_for_text_edit` — the same bug class the original
         // #216 critique caught (a guard/edit comparing the wrong string,
         // silently bypassed per-ecosystem).
-        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
         use std::collections::HashMap;
 
         let (dep, version_range, content) = vulnerable_dep("==1.0.0");
@@ -2091,20 +2155,22 @@ mod tests {
         vulnerabilities.insert(
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![std::sync::Arc::new(Advisory {
-                    id: "A1".to_string(),
-                    modified: "2023-01-01T00:00:00Z".to_string(),
-                    summary: None,
-                    aliases: vec![],
-                    severity: VulnSeverity::High,
-                    cvss_vector: None,
-                    fixed_versions: vec!["1.0.2".to_string()],
-                    url: String::new(),
-                })],
-                total_known: 1,
-                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.0.2".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.0.2".to_string(),
-                }),
+                },
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -2360,7 +2426,9 @@ mod tests {
             // which would pass even if the guard only gated the plain
             // action; this one carries a real OSV hit so a regression that
             // reorders the two checks fails here.
-            use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+            use crate::osv::{
+                Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            };
 
             let content = "1.0.0 extra";
             let dep = CaDep {
@@ -2378,18 +2446,20 @@ mod tests {
             vulnerabilities.insert(
                 "serde".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                    advisories: vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["2.0.0".to_string()],
-                        url: String::new(),
-                    })],
-                    total_known: 1,
-                    fix_target_status: None,
+                    advisories: Capped::new(
+                        vec![std::sync::Arc::new(Advisory {
+                            id: "A1".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            fixed_versions: vec!["2.0.0".to_string()],
+                            url: String::new(),
+                        })],
+                        1,
+                    ),
+                    fix_target_status: UpgradeStatus::NotChecked,
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
@@ -3003,7 +3073,9 @@ mod tests {
 
         #[tokio::test]
         async fn test_vuln_and_unsat_fix_coexist_with_vuln_preferred() {
-            use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+            use crate::osv::{
+                Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            };
 
             let (dep, version_range, content) = vulnerable_dep("1.0.0");
             let parse_result = MockParseResult {
@@ -3015,20 +3087,22 @@ mod tests {
             vulnerabilities.insert(
                 "pkg".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                    advisories: vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["5.5.5".to_string()],
-                        url: String::new(),
-                    })],
-                    total_known: 1,
-                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    advisories: Capped::new(
+                        vec![std::sync::Arc::new(Advisory {
+                            id: "A1".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            fixed_versions: vec!["5.5.5".to_string()],
+                            url: String::new(),
+                        })],
+                        1,
+                    ),
+                    fix_target_status: UpgradeStatus::CandidateClean {
                         version: "5.5.5".to_string(),
-                    }),
+                    },
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
@@ -3082,7 +3156,9 @@ mod tests {
         async fn test_unsat_fix_dropped_when_it_collides_with_vuln_fix_text() {
             // Plan §1.4: when both fixes would write byte-identical text, the vuln
             // fix (richer title) wins and the unsat fix is dropped.
-            use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+            use crate::osv::{
+                Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            };
 
             let (dep, version_range, content) = vulnerable_dep("1.0.0");
             let parse_result = MockParseResult {
@@ -3094,21 +3170,23 @@ mod tests {
             vulnerabilities.insert(
                 "pkg".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                    advisories: vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        // Same target as the unsat fix's cached `latest` below.
-                        fixed_versions: vec!["9.9.9".to_string()],
-                        url: String::new(),
-                    })],
-                    total_known: 1,
-                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    advisories: Capped::new(
+                        vec![std::sync::Arc::new(Advisory {
+                            id: "A1".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            // Same target as the unsat fix's cached `latest` below.
+                            fixed_versions: vec!["9.9.9".to_string()],
+                            url: String::new(),
+                        })],
+                        1,
+                    ),
+                    fix_target_status: UpgradeStatus::CandidateClean {
                         version: "9.9.9".to_string(),
-                    }),
+                    },
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
@@ -3143,7 +3221,9 @@ mod tests {
             // The wrong order (collision-first) would drop the unsat action for
             // "colliding" with a vuln fix that the yank filter was about to drop
             // anyway, leaving the user with neither action.
-            use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+            use crate::osv::{
+                Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            };
 
             let (dep, version_range, content) = vulnerable_dep("1.0.0");
             let parse_result = MockParseResult {
@@ -3155,23 +3235,25 @@ mod tests {
             vulnerabilities.insert(
                 "pkg".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                    advisories: vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        // Different raw version than the unsat fix's cached
-                        // `latest` ("9.9.9") below, but `CollidingTextFormatter`
-                        // rewrites both to the same "9.9.9" text.
-                        fixed_versions: vec!["9.9.5".to_string()],
-                        url: String::new(),
-                    })],
-                    total_known: 1,
-                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    advisories: Capped::new(
+                        vec![std::sync::Arc::new(Advisory {
+                            id: "A1".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            // Different raw version than the unsat fix's cached
+                            // `latest` ("9.9.9") below, but `CollidingTextFormatter`
+                            // rewrites both to the same "9.9.9" text.
+                            fixed_versions: vec!["9.9.5".to_string()],
+                            url: String::new(),
+                        })],
+                        1,
+                    ),
+                    fix_target_status: UpgradeStatus::CandidateClean {
                         version: "9.9.5".to_string(),
-                    }),
+                    },
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );

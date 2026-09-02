@@ -122,6 +122,112 @@ pub struct Advisory {
     pub url: String,
 }
 
+/// A list that may have been truncated when it was produced, paired with the
+/// true count of items that existed at the source.
+///
+/// Exists so a truncated list can never be silently read as complete: items are
+/// only reachable through [`Capped::items`] and the real count only through
+/// [`Capped::total`], so `items().len()` is never mistaken for "everything there
+/// is". Both OSV lists capped at [`crate::osv::ADVISORY_DISPLAY_CAP`] use it —
+/// [`DependencyVulnerabilities::advisories`] and [`UpgradeStatus::CandidateVulnerable`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::Capped;
+///
+/// let truncated = Capped::new(vec!["A1".to_string(), "A2".to_string()], 5);
+/// assert_eq!(truncated.items().len(), 2);
+/// assert_eq!(truncated.total(), 5);
+/// assert!(!truncated.is_complete());
+/// assert_eq!(truncated.remaining(), 3);
+///
+/// let complete = Capped::new(vec!["A1".to_string()], 1);
+/// assert!(complete.is_complete());
+/// assert_eq!(complete.remaining(), 0);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capped<T> {
+    items: Vec<T>,
+    total: usize,
+}
+
+impl<T> Capped<T> {
+    /// Pairs an already-truncated `items` list with the `total` the source
+    /// reported, which may exceed `items.len()`.
+    #[must_use]
+    pub fn new(items: Vec<T>, total: usize) -> Self {
+        Self { items, total }
+    }
+
+    /// The items actually retained — **not necessarily all [`Self::total`] of them**.
+    #[must_use]
+    pub fn items(&self) -> &[T] {
+        &self.items
+    }
+
+    /// The count the source reported, independent of how many items were retained.
+    #[must_use]
+    pub const fn total(&self) -> usize {
+        self.total
+    }
+
+    /// Whether [`Self::items`] holds everything the source reported.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.items.len() >= self.total
+    }
+
+    /// How many items were dropped — the render layer's "+N more" count.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.total.saturating_sub(self.items.len())
+    }
+}
+
+#[cfg(test)]
+mod capped_tests {
+    use super::Capped;
+
+    #[test]
+    fn new_exposes_items_and_total_as_given() {
+        let capped = Capped::new(vec!["A1", "A2"], 5);
+        assert_eq!(capped.items(), ["A1", "A2"]);
+        assert_eq!(capped.total(), 5);
+    }
+
+    #[test]
+    fn is_complete_true_when_items_cover_total() {
+        let capped = Capped::new(vec!["A1"], 1);
+        assert!(capped.is_complete());
+    }
+
+    #[test]
+    fn is_complete_false_when_truncated() {
+        let capped = Capped::new(vec!["A1"], 2);
+        assert!(!capped.is_complete());
+    }
+
+    #[test]
+    fn remaining_reports_truncated_count() {
+        let capped = Capped::new(vec!["A1", "A2"], 5);
+        assert_eq!(capped.remaining(), 3);
+    }
+
+    #[test]
+    fn remaining_is_zero_when_not_truncated() {
+        let capped = Capped::new(vec!["A1"], 1);
+        assert_eq!(capped.remaining(), 0);
+    }
+
+    #[test]
+    fn empty_items_with_zero_total_is_complete() {
+        let capped: Capped<&str> = Capped::new(vec![], 0);
+        assert!(capped.is_complete());
+        assert_eq!(capped.remaining(), 0);
+    }
+}
+
 /// Result of checking whether a recommended upgrade target is itself affected.
 ///
 /// Populated by [`crate::osv::OsvClient::check_candidates`] (phase B), which only runs for
@@ -146,17 +252,11 @@ pub enum UpgradeStatus {
         /// Advisory IDs that still apply to the candidate version, capped at
         /// [`crate::osv::ADVISORY_DISPLAY_CAP`] the same way
         /// [`DependencyVulnerabilities::advisories`] is (#462 critic M1) —
-        /// **not necessarily exhaustive**. Compare its length against
-        /// `total_known` before treating it as the complete set of advisories
-        /// still affecting this candidate; a shorter list means some are
-        /// missing, not that none exist.
-        advisory_ids: Vec<String>,
-        /// The true count of advisories OSV reported as still affecting this
-        /// candidate, independent of how many `advisory_ids` actually
-        /// carries — the same `total_known`/capped-list split
-        /// [`DependencyVulnerabilities`] already makes, mirrored here so a
-        /// truncated `advisory_ids` is never silently mistaken for complete.
-        total_known: usize,
+        /// **not necessarily exhaustive**. Check [`Capped::is_complete`] before
+        /// treating it as the complete set of advisories still affecting this
+        /// candidate; an incomplete list means some are missing, not that none
+        /// exist.
+        advisory_ids: Capped<String>,
     },
 }
 
@@ -164,33 +264,31 @@ pub enum UpgradeStatus {
 #[derive(Debug, Clone)]
 pub struct DependencyVulnerabilities {
     /// Advisories fetched in full, capped at [`crate::osv::ADVISORY_DISPLAY_CAP`] (invariant 3
-    /// in `architecture.md` §8: the fetch itself is capped, not only the render).
-    pub advisories: Vec<Arc<Advisory>>,
-    /// Total advisory count OSV reported for this dependency, independent of
-    /// how many were actually fetched — the source of the render layer's
-    /// "+N more advisories" count (`architecture.md` §7/§8 invariant 3).
-    pub total_known: usize,
+    /// in `architecture.md` §8: the fetch itself is capped, not only the render) — the total
+    /// advisory count OSV reported is carried alongside via [`Capped::total`], independent of
+    /// how many were actually fetched, and is the source of the render layer's "+N more
+    /// advisories" count (`architecture.md` §7/§8 invariant 3).
+    pub advisories: Capped<Arc<Advisory>>,
     /// Result of phase B's "latest" check, if it has run for this dependency.
     pub upgrade_status: UpgradeStatus,
     /// Independent verification of [`Self::recommended_fix`]'s target version F, if F
-    /// differs from the "latest" candidate `upgrade_status` already covers. `None` until
-    /// [`Self::recommended_fix`] has been computed and F's status resolved — either reused
-    /// from `upgrade_status` when F equals latest, or checked live via
-    /// [`crate::osv::OsvClient::check_candidates`] otherwise (always live-checked when F
-    /// differs from latest: a data-derived shortcut was tried and rejected — see git history
+    /// differs from the "latest" candidate `upgrade_status` already covers. Left at
+    /// [`UpgradeStatus::NotChecked`] until [`Self::recommended_fix`] has been computed and F's
+    /// status resolved — either reused from `upgrade_status` when F equals latest, or checked
+    /// live via [`crate::osv::OsvClient::check_candidates`] otherwise (always live-checked when
+    /// F differs from latest: a data-derived shortcut was tried and rejected — see git history
     /// on this field and #462's critique — because it degenerates into checking F against
     /// exactly the advisories it was computed from, proving nothing about an advisory phase
     /// A never fetched at all, which is the actual gap #462 closes). See
     /// `run_osv_phase_b_and_commit` in `deps-lsp` for the resolution order.
     ///
-    /// A caller must not treat a bare `Some(UpgradeStatus::CandidateClean { .. })` check as
-    /// the only valid "verified" state: `Some(UpgradeStatus::CandidateVulnerable { .. })` can
-    /// also be a legitimate, presentable fix when every reported id is an advisory
-    /// [`Self::recommended_fix`] already declined to claim (excluded via `still_applying`, or
-    /// never had a known fix) — see `deps-core`'s `lsp_helpers::code_actions::fix_target_is_verified`
-    /// (the actual gate `generate_code_actions` uses) for the full contract, rather than
-    /// re-deriving it ad hoc.
-    pub fix_target_status: Option<UpgradeStatus>,
+    /// A caller must not treat a bare [`UpgradeStatus::CandidateClean`] check as the only valid
+    /// "verified" state: [`UpgradeStatus::CandidateVulnerable`] can also be a legitimate,
+    /// presentable fix when every reported id is an advisory [`Self::recommended_fix`] already
+    /// declined to claim (excluded via `still_applying`, or never had a known fix) — see
+    /// `deps-core`'s `lsp_helpers::code_actions::fix_target_is_verified` (the actual gate
+    /// `generate_code_actions` uses) for the full contract, rather than re-deriving it ad hoc.
+    pub fix_target_status: UpgradeStatus,
 }
 
 /// A single upgrade target recommended by [`DependencyVulnerabilities::recommended_fix`].
@@ -259,7 +357,7 @@ impl DependencyVulnerabilities {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+    /// use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
     /// use std::sync::Arc;
     ///
     /// fn advisory(id: &str, fixed: &str) -> Arc<Advisory> {
@@ -276,10 +374,9 @@ impl DependencyVulnerabilities {
     /// }
     ///
     /// let dv = DependencyVulnerabilities {
-    ///     advisories: vec![advisory("RUSTSEC-1", "1.2.0")],
-    ///     total_known: 1,
+    ///     advisories: Capped::new(vec![advisory("RUSTSEC-1", "1.2.0")], 1),
     ///     upgrade_status: UpgradeStatus::NotChecked,
-    ///     fix_target_status: None,
+    ///     fix_target_status: UpgradeStatus::NotChecked,
     /// };
     ///
     /// let fix = dv.recommended_fix().unwrap();
@@ -289,12 +386,13 @@ impl DependencyVulnerabilities {
     #[must_use]
     pub fn recommended_fix(&self) -> Option<FixRecommendation> {
         let still_applying: &[String] = match &self.upgrade_status {
-            UpgradeStatus::CandidateVulnerable { advisory_ids, .. } => advisory_ids,
+            UpgradeStatus::CandidateVulnerable { advisory_ids, .. } => advisory_ids.items(),
             UpgradeStatus::NotChecked | UpgradeStatus::CandidateClean { .. } => &[],
         };
 
         let mut claimed: Vec<&Advisory> = self
             .advisories
+            .items()
             .iter()
             .map(Arc::as_ref)
             .filter(|a| !a.fixed_versions.is_empty())
@@ -808,11 +906,11 @@ mod recommended_fix_tests {
         advisories: Vec<Arc<Advisory>>,
         upgrade_status: UpgradeStatus,
     ) -> DependencyVulnerabilities {
+        let total = advisories.len();
         DependencyVulnerabilities {
-            total_known: advisories.len(),
-            advisories,
+            advisories: Capped::new(advisories, total),
             upgrade_status,
-            fix_target_status: None,
+            fix_target_status: UpgradeStatus::NotChecked,
         }
     }
 
@@ -855,8 +953,7 @@ mod recommended_fix_tests {
             ],
             UpgradeStatus::CandidateVulnerable {
                 version: "1.2.0".to_string(),
-                advisory_ids: vec!["A1".to_string()],
-                total_known: 1,
+                advisory_ids: Capped::new(vec!["A1".to_string()], 1),
             },
         );
 
@@ -871,8 +968,7 @@ mod recommended_fix_tests {
             vec![advisory("A1", VulnSeverity::High, &["1.1.0"])],
             UpgradeStatus::CandidateVulnerable {
                 version: "1.1.0".to_string(),
-                advisory_ids: vec!["A1".to_string()],
-                total_known: 1,
+                advisory_ids: Capped::new(vec!["A1".to_string()], 1),
             },
         );
         assert!(vulns.recommended_fix().is_none());
@@ -920,8 +1016,7 @@ mod recommended_fix_tests {
             ],
             UpgradeStatus::CandidateVulnerable {
                 version: "3.0.0".to_string(),
-                advisory_ids: vec!["A1".to_string()],
-                total_known: 1,
+                advisory_ids: Capped::new(vec!["A1".to_string()], 1),
             },
         );
 

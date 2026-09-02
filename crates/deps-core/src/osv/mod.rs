@@ -25,8 +25,8 @@ use dashmap::DashMap;
 
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 pub use types::{
-    Advisory, DependencyVulnerabilities, FixRecommendation, ScanOutcome, ScanTarget, SkipReason,
-    UpgradeStatus, VulnSeverity, VulnerabilityMap, vulnerability_keys,
+    Advisory, Capped, DependencyVulnerabilities, FixRecommendation, ScanOutcome, ScanTarget,
+    SkipReason, UpgradeStatus, VulnSeverity, VulnerabilityMap, vulnerability_keys,
 };
 use types::{
     OsvBatchRequest, OsvBatchResponse, OsvPackage, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,
@@ -35,7 +35,7 @@ use types::{
 use crate::cache::HttpCache;
 
 /// Advisories fetched (invariant 3) and rendered (§7) per dependency, plus a
-/// trailing "+N more advisories" entry when `total_known` exceeds this.
+/// trailing "+N more advisories" entry when [`Capped::total`] exceeds this.
 pub const ADVISORY_DISPLAY_CAP: usize = 5;
 
 /// Query cache TTL (approved Q6).
@@ -246,8 +246,10 @@ impl OsvClient {
                     ScanOutcome::Clean => UpgradeStatus::CandidateClean { version },
                     ScanOutcome::Vulnerable(dv) => UpgradeStatus::CandidateVulnerable {
                         version,
-                        advisory_ids: dv.advisories.iter().map(|a| a.id.clone()).collect(),
-                        total_known: dv.total_known,
+                        advisory_ids: Capped::new(
+                            dv.advisories.items().iter().map(|a| a.id.clone()).collect(),
+                            dv.advisories.total(),
+                        ),
                     },
                     ScanOutcome::Skipped(_) => return None,
                 };
@@ -477,7 +479,7 @@ impl OsvClient {
     /// no follow-up `GET /v1/vulns/{id}` is needed for these (§8 invariant 2).
     /// A record whose id fails [`types::OsvVulnRecord::into_advisory`]'s
     /// validation is dropped, not counted toward `advisories`/the cache, but
-    /// `total_known` still reflects OSV's reported count (critique M1).
+    /// [`Capped::total`] still reflects OSV's reported count (critique M1).
     fn outcome_from_full_records(
         &self,
         osv_eco: &'static str,
@@ -506,9 +508,8 @@ impl OsvClient {
             ScanOutcome::Clean
         } else {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories,
-                total_known: total,
-                fix_target_status: None,
+                advisories: Capped::new(advisories, total),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::NotChecked,
             })
         }
@@ -530,9 +531,8 @@ impl OsvClient {
         let advisories = self.fetch_records(osv_eco, osv_name, to_fetch).await;
 
         ScanOutcome::Vulnerable(DependencyVulnerabilities {
-            advisories,
-            total_known: vuln_ids.len(),
-            fix_target_status: None,
+            advisories: Capped::new(advisories, vuln_ids.len()),
+            fix_target_status: UpgradeStatus::NotChecked,
             upgrade_status: UpgradeStatus::NotChecked,
         })
     }
@@ -968,8 +968,11 @@ mod tests {
             panic!("expected Vulnerable outcome");
         };
         // Must pick up log4j-core's own severity/fix, not log4j-api's.
-        assert_eq!(dv.advisories[0].severity, VulnSeverity::Critical);
-        assert_eq!(dv.advisories[0].fixed_versions, vec!["2.17.1".to_string()]);
+        assert_eq!(dv.advisories.items()[0].severity, VulnSeverity::Critical);
+        assert_eq!(
+            dv.advisories.items()[0].fixed_versions,
+            vec!["2.17.1".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -990,13 +993,13 @@ mod tests {
         let targets = vec![target("pkg", "1.0.0")];
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
-        // total_known still counts the batch stub; the malformed-id record
+        // total() still counts the batch stub; the malformed-id record
         // is dropped rather than rendered with an unsafe id.
         let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("pkg") else {
             panic!("expected Vulnerable outcome, got {:?}", outcomes.get("pkg"));
         };
-        assert_eq!(dv.total_known, 1);
-        assert!(dv.advisories.is_empty());
+        assert_eq!(dv.advisories.total(), 1);
+        assert!(dv.advisories.items().is_empty());
     }
 
     #[tokio::test]
@@ -1073,19 +1076,19 @@ mod tests {
                 outcomes.get("time")
             );
         };
-        assert_eq!(dv.total_known, 1);
-        assert_eq!(dv.advisories.len(), 1);
-        assert_eq!(dv.advisories[0].id, "RUSTSEC-2020-0071");
-        assert_eq!(dv.advisories[0].severity, VulnSeverity::High);
+        assert_eq!(dv.advisories.total(), 1);
+        assert_eq!(dv.advisories.items().len(), 1);
+        assert_eq!(dv.advisories.items()[0].id, "RUSTSEC-2020-0071");
+        assert_eq!(dv.advisories.items()[0].severity, VulnSeverity::High);
         assert_eq!(
-            dv.advisories[0].fixed_versions,
+            dv.advisories.items()[0].fixed_versions,
             vec![
                 "0.1.43", "0.1.44", "0.2.0", "0.2.1", "0.2.2", "0.2.3", "0.2.4", "0.2.23"
             ]
         );
         // The highest fixed version, not the first in document order.
         assert_eq!(
-            dv.advisories[0].fixed_versions.last(),
+            dv.advisories.items()[0].fixed_versions.last(),
             Some(&"0.2.23".to_string())
         );
     }
@@ -1110,13 +1113,13 @@ mod tests {
         let targets = vec![target("pkg", "1.0.0")];
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
-        // total_known still reflects the batch stub count; the failed fetch
+        // total() still reflects the batch stub count; the failed fetch
         // is dropped rather than rendered half-populated.
         let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("pkg") else {
             panic!("expected Vulnerable outcome, got {:?}", outcomes.get("pkg"));
         };
-        assert_eq!(dv.total_known, 1);
-        assert!(dv.advisories.is_empty());
+        assert_eq!(dv.advisories.total(), 1);
+        assert!(dv.advisories.items().is_empty());
     }
 
     #[tokio::test]
@@ -1187,8 +1190,8 @@ mod tests {
         let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("rack") else {
             panic!("expected Vulnerable outcome");
         };
-        assert_eq!(dv.total_known, 40);
-        assert_eq!(dv.advisories.len(), ADVISORY_DISPLAY_CAP);
+        assert_eq!(dv.advisories.total(), 40);
+        assert_eq!(dv.advisories.items().len(), ADVISORY_DISPLAY_CAP);
         record.assert_async().await;
     }
 
@@ -1239,8 +1242,10 @@ mod tests {
         ));
         assert!(matches!(
             statuses.get("bad-pkg"),
-            Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids, total_known })
-                if version == "2.0.0" && advisory_ids == &vec!["ADV-1".to_string()] && *total_known == 1
+            Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids })
+                if version == "2.0.0"
+                    && advisory_ids.items() == ["ADV-1".to_string()]
+                    && advisory_ids.total() == 1
         ));
     }
 
@@ -1406,7 +1411,10 @@ mod tests {
         let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("pkg") else {
             panic!("expected Vulnerable outcome");
         };
-        assert_eq!(dv.advisories[0].summary.as_deref(), Some("updated summary"));
+        assert_eq!(
+            dv.advisories.items()[0].summary.as_deref(),
+            Some("updated summary")
+        );
         record.assert_async().await;
     }
 }

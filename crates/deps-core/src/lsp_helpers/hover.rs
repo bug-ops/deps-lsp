@@ -1,6 +1,6 @@
 use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
-use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome};
+use crate::osv::ScanOutcome;
 use crate::{
     ConcreteVersion, Deprecation, ParseResult, PublishTime, Registry, Version, VersionReq,
     format_relative_age, is_within_cooldown,
@@ -428,8 +428,7 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
         Some(ScanOutcome::Vulnerable(dv)) => {
             markdown.push_str("### Security advisories\n\n");
 
-            let shown = dv.advisories.iter().take(ADVISORY_DISPLAY_CAP);
-            for advisory in shown {
+            for advisory in dv.advisories.items() {
                 writeln!(
                     markdown,
                     "- **[{}]({})** — {}",
@@ -465,8 +464,7 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
                 }
             }
 
-            let shown_count = dv.advisories.len().min(ADVISORY_DISPLAY_CAP);
-            let remaining = dv.total_known.saturating_sub(shown_count);
+            let remaining = dv.advisories.remaining();
             if remaining > 0 {
                 writeln!(markdown, "- *(+{remaining} more advisories)*").unwrap();
             }
@@ -2083,7 +2081,8 @@ mod tests {
     #[tokio::test]
     async fn test_generate_hover_vulnerable_outcome_shows_advisories_and_more_count() {
         use crate::osv::{
-            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
         };
 
         let parse_result = MockParseResult {
@@ -2097,13 +2096,14 @@ mod tests {
         vulns.insert(
             "bad-pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
-                total_known: 3,
-                fix_target_status: None,
+                advisories: Capped::new(
+                    vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
+                    3,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::CandidateVulnerable {
                     version: "2.0.0".into(),
-                    advisory_ids: vec!["RUSTSEC-2020-0071".to_string()],
-                    total_known: 1,
+                    advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
                 },
             }),
         );
@@ -2140,7 +2140,8 @@ mod tests {
         // one patched. Hover on the patched occurrence must not show the
         // vulnerable occurrence's advisory just because they share a name.
         use crate::osv::{
-            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
         };
 
         let vulnerable_dep = MockDep {
@@ -2177,9 +2178,11 @@ mod tests {
         vulns.insert(
             vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
-                total_known: 1,
-                fix_target_status: None,
+                advisories: Capped::new(
+                    vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
