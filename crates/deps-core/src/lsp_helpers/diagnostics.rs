@@ -2584,15 +2584,13 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 2);
 
-        let has_outdated = diagnostics
-            .iter()
-            .any(|d| d.message.contains("Newer version"));
-        let has_unknown = diagnostics
-            .iter()
-            .any(|d| d.message.contains("Unknown package"));
-
-        assert!(has_outdated, "Expected outdated version diagnostic");
-        assert!(has_unknown, "Expected unknown package diagnostic");
+        // Dependency-loop order (not rule order): "serde" is up to date and emits
+        // nothing, so index 0 is "tokio"'s R7 outdated diagnostic and index 1 is
+        // "unknown"'s R5d unknown-package diagnostic — the same order as `deps`.
+        assert_eq!(diagnostics[0].message, "Newer version available: 2.0.0");
+        assert_eq!(diagnostics[0].code, None);
+        assert_eq!(diagnostics[1].message, "Unknown package 'unknown'");
+        assert_eq!(diagnostics[1].code, None);
     }
 
     #[test]
@@ -2803,16 +2801,16 @@ mod tests {
             2,
             "expected both diagnostics: {diagnostics:?}"
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.starts_with(formatter.yanked_message()))
+        // R4 (in-use-yanked, #263) has no `continue` and runs before R7 (outdated) in
+        // the orchestrator, so index 0 is always the yanked finding and index 1 is
+        // always the outdated finding — never the reverse.
+        assert_eq!(
+            diagnostics[0].message,
+            format!("{} (1.0.5)", formatter.yanked_message())
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.contains("Newer version available"))
-        );
+        assert_eq!(diagnostics[0].code, None);
+        assert_eq!(diagnostics[1].message, "Newer version available: 2.0.0");
+        assert_eq!(diagnostics[1].code, None);
     }
 
     /// T2 (D5 collision): an exact-pin dependency whose package is both package-level
@@ -2925,16 +2923,21 @@ mod tests {
             "a genuine Yanked finding must never be hidden behind a package-level \
              deprecation notice: {diagnostics:?}"
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.starts_with(formatter.yanked_message()))
+        // R3 (deprecation) always runs before R4 (in-use-yanked) in the orchestrator,
+        // so index 0 is the deprecation finding and index 1 is the yanked finding.
+        assert_eq!(
+            diagnostics[0].message,
+            format!("{}: project archived", formatter.deprecated_message())
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.starts_with(formatter.deprecated_message()))
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into()))
         );
+        assert_eq!(
+            diagnostics[1].message,
+            format!("{} (1.0.0)", formatter.yanked_message())
+        );
+        assert_eq!(diagnostics[1].code, None);
     }
 
     /// T6b (D5 gate, severity independence): on an npm-shaped fixture where the two
@@ -4610,18 +4613,30 @@ mod tests {
                 PublishTime::now(),
             );
 
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message.starts_with(formatter.yanked_message())),
+            assert_eq!(
+                diagnostics.len(),
+                2,
+                "expected exactly the deprecation diagnostic plus the #247 yanked-only \
+                 match, got: {diagnostics:?}"
+            );
+            // R3 (deprecation) always runs before R6b (#247, yanked-only) in the
+            // orchestrator, so index 0 is the deprecation finding and index 1 is the
+            // #247 match — R6b's own status (`Yanked`) fires regardless of
+            // `deprecation_found`, unlike R4's D5 gate.
+            assert_eq!(
+                diagnostics[0].message,
+                format!("{}: archived", formatter.deprecated_message()),
                 "a genuine Yanked #247 match must still fire, without a #263 entry: {diagnostics:?}"
             );
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message.starts_with(formatter.deprecated_message())),
-                "the deprecation finding must also still fire: {diagnostics:?}"
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into()))
             );
+            assert_eq!(
+                diagnostics[1].message,
+                format!("{}; latest is 2.0.0", formatter.yanked_message())
+            );
+            assert_eq!(diagnostics[1].code, None);
         }
 
         /// #437 companion: unlike the `Yanked` case above, a #247 match whose own status is
@@ -4747,25 +4762,34 @@ mod tests {
                 PublishTime::now(),
             );
 
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message.starts_with(formatter.yanked_message())
-                        && d.message.contains("; latest is")),
+            assert_eq!(
+                diagnostics.len(),
+                2,
+                "expected exactly the deprecation diagnostic plus the #247 yanked-only \
+                 match — the D5-suppressed #263 in-use-version diagnostic (for the \
+                 deprecated 2.0.0) must stay suppressed and contribute nothing, got: \
+                 {diagnostics:?}"
+            );
+            // R3 (deprecation) always runs before R6b (#247, yanked-only) in the
+            // orchestrator, so index 0 is the deprecation finding and index 1 is the
+            // #247 match against the genuinely Yanked 1.2.1 — fired independently of
+            // R4's D5-suppressed #263 finding for the unrelated 2.0.0 entry.
+            assert_eq!(
+                diagnostics[0].message,
+                format!("{}: archived", formatter.deprecated_message()),
+                "the package-level deprecation finding must still fire: {diagnostics:?}"
+            );
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into()))
+            );
+            assert_eq!(
+                diagnostics[1].message,
+                format!("{}; latest is 2.0.0", formatter.yanked_message()),
                 "the #247 match against the genuinely Yanked 1.2.1 must still fire even though \
                  the unrelated #263 in-use-version finding was D5-suppressed, got: {diagnostics:?}"
             );
-            assert!(
-                diagnostics.iter().all(|d| !d.message.contains("(2.0.0)")),
-                "the #263 in-use-version diagnostic (for the deprecated 2.0.0) must stay \
-                 suppressed, got: {diagnostics:?}"
-            );
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message.starts_with(formatter.deprecated_message())),
-                "the package-level deprecation finding must still fire: {diagnostics:?}"
-            );
+            assert_eq!(diagnostics[1].code, None);
         }
 
         /// #247 vs. #263 dedup: a dependency whose in-use version (lock-file-resolved, or an
@@ -4819,32 +4843,27 @@ mod tests {
             // `test_generate_diagnostics_from_cache_yanked_and_outdated_both_emitted`.
             // What this test actually proves is narrower: exactly one *yanked*
             // diagnostic, not two — #247's `yanked_only` check must not also fire.
-            let yanked_diags: Vec<_> = diagnostics
-                .iter()
-                .filter(|d| d.message.starts_with(formatter.yanked_message()))
-                .collect();
-            assert_eq!(
-                yanked_diags.len(),
-                1,
-                "expected exactly one yanked diagnostic, got: {diagnostics:?}"
-            );
-            // The in-use-version check (#263) runs first and wins.
-            assert_eq!(
-                yanked_diags[0].message,
-                format!("{} (1.2.1)", formatter.yanked_message())
-            );
             assert_eq!(
                 diagnostics.len(),
                 2,
                 "expected exactly the yanked diagnostic plus the co-emitted outdated \
                  diagnostic (#263's policy), got: {diagnostics:?}"
             );
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message == "Newer version available: 2.0.0"),
+            // R4 (#263, in-use-yanked) runs before R7 (outdated); R6b (#247,
+            // yanked-only) is dedup-suppressed by R4 having already emitted, so it
+            // contributes nothing at any index. Index 0 is therefore always the
+            // in-use-version-yanked finding and index 1 the outdated finding.
+            assert_eq!(
+                diagnostics[0].message,
+                format!("{} (1.2.1)", formatter.yanked_message()),
+                "expected the in-use-version check (#263) to run first and win, got: {diagnostics:?}"
+            );
+            assert_eq!(diagnostics[0].code, None);
+            assert_eq!(
+                diagnostics[1].message, "Newer version available: 2.0.0",
                 "expected the co-emitted outdated diagnostic, got: {diagnostics:?}"
             );
+            assert_eq!(diagnostics[1].code, None);
         }
 
         /// `severities.yanked` reaches the emitted diagnostic on the cache-only path, the same
