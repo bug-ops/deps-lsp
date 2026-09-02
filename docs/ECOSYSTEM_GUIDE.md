@@ -10,7 +10,7 @@ deps-lsp provides comprehensive LSP support for 13 package ecosystems:
 |-----------|----------|-----------------|--------------|----------|
 | **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens, feature flag completion, alternate/private registry resolution via `.cargo/config.toml` (see below) |
 | **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens, custom/private registry resolution via `.npmrc` (see below) |
-| **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` (also recognized under a `requirements/` directory, e.g. `requirements/base.txt`) | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens, document links for `-r`/`-c`/`--requirement`/`--constraint` file references |
+| **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` (also recognized under a `requirements/` directory, e.g. `requirements/base.txt`) | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens, document links for `-r`/`-c`/`--requirement`/`--constraint` file references, private/custom index resolution via `--index-url`/`--extra-index-url`, Poetry `[[tool.poetry.source]]`, and uv `[tool.uv.index]`/`[tool.uv.sources]` (see below) |
 | **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support |
 | **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
 | **Dart** | Dart | `pubspec.yaml` | `pubspec.lock` | Hover with corrected version ordering (prereleases sort below base release — see below), inlay hints, completion, code actions, diagnostics, code lens |
@@ -66,10 +66,12 @@ worse than the pre-existing crates.io answer.
 workspace-declared registry index (the `registry`/`registry-index` alias path, or a
 `[source]` mirror) is checked against this setting before it is ever fetched — a
 hostile cloned repository can write both, and this LSP parses on file open, before
-any build runs. This setting is shared with npm's `.npmrc` resolution below (one
-process-wide `HttpCache` policy governs every ecosystem's workspace-declared
-registry fetches — see [npm Custom/Private Registries](#npm-customprivate-registries)
-for what that sharing means in practice). Three values:
+any build runs. This setting is shared with npm's `.npmrc` resolution and PyPI's
+custom-index resolution below (one process-wide `HttpCache` policy governs every
+ecosystem's workspace-declared registry fetches — see
+[npm Custom/Private Registries](#npm-customprivate-registries) and
+[PyPI Custom/Private Indexes](#pypi-customprivate-indexes) for what that sharing
+means in practice). Three values:
 
 | Value | Behavior |
 |-------|----------|
@@ -166,6 +168,119 @@ setting's own doc above.
 - `.yarnrc`/`.yarnrc.yml` (Yarn Berry's own config format) and pnpm-specific
   extensions to `.npmrc` are not read; a standard `.npmrc` present in the
   workspace is still honored either way.
+
+### PyPI Custom/Private Indexes
+
+A PyPI/pip dependency whose applicable index is overridden via `requirements.txt`
+`--index-url`/`--extra-index-url`, Poetry's `[[tool.poetry.source]]`, or uv's
+`[tool.uv.index]`/`[tool.uv.sources]` gets the same hover/diagnostic/completion
+value a plain `pypi.org` dependency gets — instead of showing no version data, or
+(before this feature) silently checking the wrong (public) index.
+
+**Resolution order — the security-relevant rule**: whether an explicit
+`--index-url` (or Poetry `primary`/`default`-priority source, or a uv index with
+`default = true`) is present in the file determines the order every plain
+dependency is checked in:
+
+- **An explicit primary is declared**: that index is checked first, then every
+  `--extra-index-url`/supplemental source, in declaration order. No implicit
+  `pypi.org` hop is appended — `--index-url` *replaces* the default index (matching
+  pip's own semantics), so a file that wants `pypi.org` reachable alongside an
+  explicit primary must list it as an extra itself.
+- **No explicit primary, but extras exist**: declared extras are checked *before*
+  the implicit `pypi.org` fallback, which is always checked last. This is
+  deliberately the reverse of what might seem intuitive, and is the whole point of
+  this feature's design: it stops a private-only package's name from ever being
+  sent to `pypi.org` before the user's own declared index has had a chance, and
+  stops a same-named public package from silently shadowing a private one the user
+  explicitly configured (the "dependency confusion" attack shape). This diverges
+  from pip's own resolver, which pip's docs describe as having no defined
+  precedence between `--index-url` and `--extra-index-url` and explicitly warn is
+  unsafe for private packages for exactly this reason.
+
+uv's `default = true` index follows this same "no explicit primary" shape: it is
+uv's own lowest-priority, last-resort index — checked *after* every other declared
+uv index, replacing the implicit `pypi.org` slot, never checked first the way an
+explicit `--index-url` primary is.
+
+**Poetry named sources**: a dependency declaring `source = "<name>"` (Poetry) or a
+`[tool.uv.sources] <dep> = { index = "<name>" }` binding (uv) resolves directly
+against that one named source, with no fallback to any other index — a deliberate,
+single-hop route. A Poetry source with no `priority` key is treated as `primary`
+(matching current Poetry documentation); `explicit`-priority Poetry sources and
+`explicit = true` uv indexes are reachable only by name, never auto-included in the
+extras chain.
+
+**Authentication**: phase 1 carries **no** authentication at all — the same
+Cargo/npm precedent. Any index URL with embedded userinfo (`https://user:pass@…`)
+is rejected outright rather than stripped-and-used; `keyring`/`.netrc` are not
+detected or acknowledged. This means an auth-gated private feed (e.g. Azure
+Artifacts) is not reachable end-to-end until a follow-up auth spec ships — the
+routing/fallback mechanism itself still works correctly for any unauthenticated
+private index (an internal mirror behind network-level access control, or a devpi
+instance with anonymous read).
+
+**Fail-closed on misconfiguration**: an explicit `--index-url`, Poetry
+primary/named source, or uv `default`/named index that fails validation (not
+`https`, malformed, or blocked by the reachability policy below) shows no version
+data for every affected dependency — never a silent fallback to `pypi.org`. An
+invalid `--extra-index-url`/supplemental/non-default entry, by contrast, is simply
+dropped from the fallback chain (with a logged warning) rather than failing the
+whole dependency closed, since an extra is additive/optional by definition — the
+remaining valid hops (including the implicit `pypi.org` fallback, if applicable)
+still serve the dependency.
+
+**Availability trade-off of the security fix above**: a genuine transport error
+(timeout, 5xx, connection refused) on any hop — including a declared extra that
+happens to be hop 0 in the no-explicit-primary case — halts resolution for that
+dependency rather than silently falling through to the next hop. Applied to a file
+with only `--extra-index-url` entries, an unreachable extra (a developer off the
+corporate VPN, say) means every dependency in that file loses its version data,
+including ordinary public ones with no relation to the private index. This is
+intentional, not a bug: falling through on a transport failure would send every
+affected package's name to `pypi.org` precisely when the private index is merely
+unreachable — the same disclosure the resolution-order rule above exists to
+prevent. A distinguishable log message ("extra index unreachable — resolution
+halted, not falling back to pypi.org") accompanies this case so it can be told
+apart from a genuinely missing package.
+
+**Reachability policy**: governed by the same `registries.workspace_registries`
+setting documented above for Cargo/npm — the same `"public_only"`/`"off"`/`"all"`
+values, the same shared process-wide `HttpCache` policy. Only *explicitly-declared*
+indexes (a primary, every extra, every named source) are gated; the implicit
+`pypi.org` fallback used by the no-explicit-primary case is never itself subject
+to this setting, since it is the same public-tier client every plain dependency
+already uses. What this means in practice depends on whether the file declares an
+explicit `--index-url` primary:
+
+- **No explicit primary, extras only**: `workspace_registries = "off"` blocks
+  every declared extra, and — since there is no implicit-fallback slot to lose —
+  every plain dependency in the file degrades gracefully to resolving against
+  `pypi.org` directly, exactly as if the file declared nothing at all.
+- **An explicit `--index-url` primary**: an explicit primary *replaces* the
+  default index rather than adding to it (FR-005(a)), so there is no implicit
+  `pypi.org` hop to fall back to. If `off` blocks that primary, it fails closed
+  (`CustomRegistry`, FR-006) and **every** dependency in the file loses version
+  data — `off` does not silently degrade to public resolution here, unlike the
+  extras-only case above.
+
+**Known limitations**:
+- Editing a file's index declarations does not take effect until it is next
+  reparsed (edited, or the document reopened) — there is no dedicated file watcher
+  for it yet.
+- `pip.conf`/`pip.ini` and `PIP_INDEX_URL`/`PIP_EXTRA_INDEX_URL` environment
+  variables are not read at all — a project relying solely on those (rather than
+  in-file `--index-url` flags) sees no improvement from this feature.
+- `-r`/`-c` include propagation is not implemented: a file included via `-r
+  base.txt` does not inherit the includer's index declarations, and vice versa.
+- A `[tool.uv.sources]` binding is only recognized for the `index = "<name>"`
+  shape — `git =`, `path =`, and `workspace = true` bindings are a distinct
+  concept (dependency provenance, not registry routing) and are not read.
+- **Cosmetic limitation**: a plain dependency in an extras-only file is classified
+  as resolved via the alternate-index chain at parse time, before the winning hop
+  is actually known — if it ends up resolving via the implicit `pypi.org`
+  fallback, its hover heading still omits the `pypi.org` project link (the same
+  suppression a genuinely private dependency gets). No data-correctness impact.
 
 ### Yanked-Version Diagnostics
 

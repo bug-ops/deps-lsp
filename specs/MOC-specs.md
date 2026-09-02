@@ -54,6 +54,7 @@ status: moc
 | 030 | [[030-gitlab-ci-ecosystem/spec\|New ecosystem: GitLab CI/CD include: version pins]] | specify | draft — research/new ecosystem, P4, 8 open `[NEEDS CLARIFICATION]` items, blocked on #208 (issue #466 tracks implementation) |
 | 031 | [[031-github-actions-sha-pin-diagnostic/spec\|GitHub Actions mutable-ref-pin security diagnostic (SHA-pin recommendation)]] | tasks | implemented — research/parity, P2, awaiting merge (PR #477, issue #473) |
 | 032 | [[032-npm-npmrc-registry-support/spec\|npm .npmrc custom/private registry support (scoped registries + top-level registry=)]] | plan | implemented — research/enhancement, P3, awaiting merge (PR #510, issue #502) |
+| 033 | [[033-pypi-private-index-support/spec\|PyPI private/custom index resolution (--index-url / --extra-index-url / Poetry source / uv index)]] | tasks | shipped — research/enhancement, P3 (PR #516, issue #513) |
 
 ## Completed Specs
 

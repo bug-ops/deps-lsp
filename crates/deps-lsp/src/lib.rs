@@ -304,7 +304,16 @@ pub fn register_ecosystems(
     #[cfg(all(feature = "deno", not(feature = "npm")))]
     register!("deno", DenoEcosystem, registry, &cache);
 
-    register!("pypi", PypiEcosystem, registry, &cache);
+    // pypi is written out explicitly rather than via `register!` (spec 033, mirroring npm's
+    // spec 032 S3 precedent): that macro's `PypiEcosystem::new(cache)` would give pypi a
+    // default, disconnected `RegistryAccessPolicy` — its private-index reachability policy
+    // would never see a live `initialize`/`didChangeConfiguration` update.
+    #[cfg(feature = "pypi")]
+    registry.register(Arc::new(PypiEcosystem::with_policy(
+        Arc::new(PypiRegistry::new(Arc::clone(&cache))),
+        Arc::clone(&policy),
+    )));
+
     register!("go", GoEcosystem, registry, &cache);
     register!("bundler", BundlerEcosystem, registry, &cache);
     register!("dart", DartEcosystem, registry, &cache);

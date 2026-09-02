@@ -365,6 +365,12 @@ pub struct ParseResult {
     /// `-r`/`-c` file references found in a requirements file (always empty
     /// for `pyproject.toml`).
     pub document_links: Vec<RequirementRef>,
+    /// Every private-index chain this file's `--index-url`/`--extra-index-url`/Poetry-source/
+    /// uv-index declarations imply (spec FR-002/003/005/007/013), ready for
+    /// `PypiRegistry::register_chain`/`register_named_source` — the only point where this
+    /// per-document resolution and the long-lived, shared `PypiRegistry` router meet (see
+    /// `PypiEcosystem::parse_manifest`). Empty for a file with no such declaration (US-004).
+    pub resolved_chains: Vec<crate::config::ResolvedChain>,
 }
 
 impl deps_core::ParseResult for ParseResult {

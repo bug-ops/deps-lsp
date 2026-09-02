@@ -12,7 +12,14 @@ publish = true
 [lints]
 workspace = true
 
+[features]
+# Gates the test-only https loopback carve-out in `config::PypiIndexUrl::new` for
+# downstream crates' own test builds (`cfg(test)` alone would not apply there) —
+# mirrors `deps-npm`'s identical `test-util` feature.
+test-util = []
+
 [dependencies]
+dashmap = { workspace = true }
 deps-core = { workspace = true }
 pep440_rs = { workspace = true }
 pep508_rs = { workspace = true }
@@ -24,6 +31,7 @@ tokio = { workspace = true }
 toml-span = { workspace = true }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]

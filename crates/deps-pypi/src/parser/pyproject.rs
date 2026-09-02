@@ -2,11 +2,42 @@
 //! build-system requires.
 
 use super::{ParseResult, PypiParser, normalize_marker_string, span_start, span_to_range};
+use crate::config::PypiIndexConfig;
 use crate::error::Result;
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::net_policy::RegistryAccessPolicy;
+use std::collections::HashMap;
 use toml_span::value::{Table, Value};
 use tower_lsp_server::ls_types::Uri;
+
+/// Everything a `pyproject.toml` parse needs to resolve a dependency's PyPI index routing
+/// (spec FR-002/003/005/006/007/013) — built once from the TOML tree's `[[tool.poetry.source]]`
+/// and `[tool.uv.index]`/`[tool.uv.sources]` tables (see [`PypiParser::parse_content_with_policy`]),
+/// then threaded through every dependency-parsing function below.
+struct IndexContext<'a> {
+    /// The primary/extras/named-source router (FR-005's chain rules).
+    config: &'a PypiIndexConfig,
+    /// `[tool.uv.sources] <dep> = { index = "<name>" }` bindings, keyed by dependency name
+    /// (FR-013) — the uv analogue of Poetry's per-dependency `source = "<name>"` key.
+    uv_named_by_dep: &'a HashMap<String, String>,
+}
+
+impl IndexContext<'_> {
+    /// Resolves `dep`'s source through `self.config`, **only** when `dep.source` is still the
+    /// PEP 508-string-parser default `Registry` — a dependency already routed to Git/Path/Url
+    /// (a direct reference) has no PyPI index concept and is left untouched.
+    fn resolve(&self, dep: &mut PypiDependency) {
+        if dep.source != PypiDependencySource::Registry {
+            return;
+        }
+        let named = self
+            .uv_named_by_dep
+            .get(dep.name.as_str())
+            .map(String::as_str);
+        dep.source = self.config.resolve_source_for(named);
+    }
+}
 
 impl PypiParser {
     /// Parse pyproject.toml content and extract all dependencies.
@@ -30,6 +61,23 @@ impl PypiParser {
     /// let result = parser.parse_content(&content, &uri).unwrap();
     /// ```
     pub fn parse_content(&self, content: &str, uri: &Uri) -> Result<ParseResult> {
+        self.parse_content_with_policy(content, uri, &RegistryAccessPolicy::default())
+    }
+
+    /// Like [`Self::parse_content`], but resolves `[[tool.poetry.source]]`/
+    /// `[tool.uv.index]`/`[tool.uv.sources]` index declarations (spec FR-002/003/005–007/013)
+    /// against `policy` rather than the default (`public_only`) — the production entry point
+    /// `PypiEcosystem` calls, threading through its own live `RegistryAccessPolicy` handle.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::parse_content`].
+    pub fn parse_content_with_policy(
+        &self,
+        content: &str,
+        uri: &Uri,
+        policy: &RegistryAccessPolicy,
+    ) -> Result<ParseResult> {
         if let Err(depth) =
             deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
         {
@@ -57,8 +105,30 @@ impl PypiParser {
                     workspace_root: None,
                     uri: uri.clone(),
                     document_links: Vec::new(),
+                    resolved_chains: Vec::new(),
                 });
             }
+        };
+
+        // Index declarations are resolved from the full TOML tree up front — unlike
+        // requirements.txt's line-oriented two-pass parse, a TOML document has no
+        // "position relative to a dependency" concept at all, so this single pass over
+        // `tool.poetry`/`tool.uv` before any dependency is parsed already gives every
+        // dependency function the fully-collected config (spec FR-007/FR-013).
+        let mut config = PypiIndexConfig::new();
+        let mut uv_named_by_dep: HashMap<String, String> = HashMap::new();
+        if let Some(tool_table) = get_table(root_table, "tool") {
+            if let Some(poetry) = get_table(tool_table, "poetry") {
+                collect_poetry_sources(poetry, &mut config, policy);
+            }
+            if let Some(uv) = get_table(tool_table, "uv") {
+                collect_uv_index(uv, &mut config, policy);
+                collect_uv_sources(uv, &mut uv_named_by_dep);
+            }
+        }
+        let ctx = IndexContext {
+            config: &config,
+            uv_named_by_dep: &uv_named_by_dep,
         };
 
         // Parse build-system requires (PEP 517/518)
@@ -67,30 +137,47 @@ impl PypiParser {
                 build_system,
                 content,
                 &line_table,
+                &ctx,
             )?);
         }
 
         // Parse PEP 621 format
         if let Some(project) = get_table(root_table, "project") {
-            dependencies.extend(self.parse_pep621_dependencies(project, content, &line_table)?);
+            dependencies.extend(self.parse_pep621_dependencies(
+                project,
+                content,
+                &line_table,
+                &ctx,
+            )?);
             dependencies.extend(self.parse_pep621_optional_dependencies(
                 project,
                 content,
                 &line_table,
+                &ctx,
             )?);
         }
 
         // Parse PEP 735 dependency-groups format
         if let Some(dep_groups) = get_table(root_table, "dependency-groups") {
-            dependencies.extend(self.parse_dependency_groups(dep_groups, content, &line_table)?);
+            dependencies.extend(self.parse_dependency_groups(
+                dep_groups,
+                content,
+                &line_table,
+                &ctx,
+            )?);
         }
 
         // Parse Poetry format
         if let Some(tool_table) = get_table(root_table, "tool")
             && let Some(poetry) = get_table(tool_table, "poetry")
         {
-            dependencies.extend(self.parse_poetry_dependencies(poetry, content, &line_table)?);
-            dependencies.extend(self.parse_poetry_groups(poetry, content, &line_table)?);
+            dependencies.extend(self.parse_poetry_dependencies(
+                poetry,
+                content,
+                &line_table,
+                &ctx,
+            )?);
+            dependencies.extend(self.parse_poetry_groups(poetry, content, &line_table, &ctx)?);
         }
 
         Ok(ParseResult {
@@ -98,6 +185,7 @@ impl PypiParser {
             workspace_root: None,
             uri: uri.clone(),
             document_links: Vec::new(),
+            resolved_chains: config.resolved_chains(),
         })
     }
 
@@ -107,6 +195,7 @@ impl PypiParser {
         build_system: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
+        ctx: &IndexContext<'_>,
     ) -> Result<Vec<PypiDependency>> {
         let Some(requires_val) = build_system.get("requires") else {
             return Ok(Vec::new());
@@ -128,6 +217,7 @@ impl PypiParser {
                 ) {
                     Ok(mut dep) => {
                         dep.section = PypiDependencySection::BuildSystem;
+                        ctx.resolve(&mut dep);
                         dependencies.push(dep);
                     }
                     Err(e) => {
@@ -150,6 +240,7 @@ impl PypiParser {
         project: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
+        ctx: &IndexContext<'_>,
     ) -> Result<Vec<PypiDependency>> {
         let Some(deps_val) = project.get("dependencies") else {
             return Ok(Vec::new());
@@ -171,6 +262,7 @@ impl PypiParser {
                 ) {
                     Ok(mut dep) => {
                         dep.section = PypiDependencySection::Dependencies;
+                        ctx.resolve(&mut dep);
                         dependencies.push(dep);
                     }
                     Err(e) => {
@@ -193,6 +285,7 @@ impl PypiParser {
         project: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
+        ctx: &IndexContext<'_>,
     ) -> Result<Vec<PypiDependency>> {
         let Some(opt_deps_val) = project.get("optional-dependencies") else {
             return Ok(Vec::new());
@@ -218,6 +311,7 @@ impl PypiParser {
                                 dep.section = PypiDependencySection::OptionalDependencies {
                                     group: group_key.name.to_string(),
                                 };
+                                ctx.resolve(&mut dep);
                                 dependencies.push(dep);
                             }
                             Err(e) => {
@@ -250,6 +344,7 @@ impl PypiParser {
         dep_groups: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
+        ctx: &IndexContext<'_>,
     ) -> Result<Vec<PypiDependency>> {
         let mut dependencies = Vec::new();
 
@@ -267,6 +362,7 @@ impl PypiParser {
                                 dep.section = PypiDependencySection::DependencyGroup {
                                     group: group_key.name.to_string(),
                                 };
+                                ctx.resolve(&mut dep);
                                 dependencies.push(dep);
                             }
                             Err(e) => {
@@ -292,6 +388,7 @@ impl PypiParser {
         poetry: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
+        ctx: &IndexContext<'_>,
     ) -> Result<Vec<PypiDependency>> {
         let Some(deps_val) = poetry.get("dependencies") else {
             return Ok(Vec::new());
@@ -312,7 +409,14 @@ impl PypiParser {
 
             let position = span_start(content, line_table, name_key.span);
 
-            match self.parse_poetry_dependency(name, value, Some(position), content, line_table) {
+            match self.parse_poetry_dependency(
+                name,
+                value,
+                Some(position),
+                content,
+                line_table,
+                ctx,
+            ) {
                 Ok(mut dep) => {
                     dep.section = PypiDependencySection::PoetryDependencies;
                     dependencies.push(dep);
@@ -332,6 +436,7 @@ impl PypiParser {
         poetry: &Table<'_>,
         content: &str,
         line_table: &LineOffsetTable,
+        ctx: &IndexContext<'_>,
     ) -> Result<Vec<PypiDependency>> {
         let Some(group_val) = poetry.get("group") else {
             return Ok(Vec::new());
@@ -359,6 +464,7 @@ impl PypiParser {
                         Some(position),
                         content,
                         line_table,
+                        ctx,
                     ) {
                         Ok(mut dep) => {
                             dep.section = PypiDependencySection::PoetryGroup {
@@ -390,6 +496,7 @@ impl PypiParser {
         base_position: Option<tower_lsp_server::ls_types::Position>,
         content: &str,
         line_table: &LineOffsetTable,
+        ctx: &IndexContext<'_>,
     ) -> Result<PypiDependency> {
         use tower_lsp_server::ls_types::{Position, Range};
 
@@ -444,6 +551,9 @@ impl PypiParser {
                 _ => (None, None),
             };
 
+            // String-form Poetry dependencies have no `source =` key of their own — resolve
+            // through the primary/extras chain only (FR-002/003/005), same as a plain PEP
+            // 621/requirements.txt dependency.
             return Ok(PypiDependency {
                 name: name.into(),
                 name_range,
@@ -454,7 +564,7 @@ impl PypiParser {
                 markers,
                 markers_range,
                 section: PypiDependencySection::PoetryDependencies,
-                source: PypiDependencySource::Registry,
+                source: ctx.config.resolve_source_for(None),
             });
         }
 
@@ -508,7 +618,11 @@ impl PypiParser {
                         .to_string(),
                 }
             } else {
-                PypiDependencySource::Registry
+                // FR-007: a `source = "<name>"` key routes to that named Poetry source;
+                // absent, the dependency routes through the primary/extras chain like any
+                // other plain dependency.
+                let source_name = table.get("source").and_then(|s| s.as_str());
+                ctx.config.resolve_source_for(source_name)
             };
 
             return Ok(PypiDependency {
@@ -534,6 +648,123 @@ impl PypiParser {
 /// Get a nested table value by key from a toml-span Table.
 fn get_table<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Table<'a>> {
     table.get(key)?.as_table()
+}
+
+/// Parses `[[tool.poetry.source]]` entries (`name`, `url`, `priority`) into `config` (spec
+/// FR-007). Every entry — **including** an `explicit`-priority one — is registered as a named
+/// source, reachable via a dependency's own `source = "<name>"` key, regardless of priority.
+/// Additionally routed into `config`'s primary/extras chain per the corrected priority
+/// mapping (plan.md's decision table, verified live against current Poetry documentation):
+/// `primary`/`default`/**no `priority` key at all** -> primary; `supplemental`/`secondary` ->
+/// extras; `explicit` -> named source only, never auto-included in the chain. An entry
+/// missing `name` or `url` is skipped outright — there is nothing to register it under.
+fn collect_poetry_sources(
+    poetry: &Table<'_>,
+    config: &mut PypiIndexConfig,
+    policy: &RegistryAccessPolicy,
+) {
+    let Some(sources) = poetry.get("source").and_then(Value::as_array) else {
+        return;
+    };
+
+    for entry in sources {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+        let Some(name) = table.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(url) = table.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        let priority = table.get("priority").and_then(Value::as_str);
+
+        let resolved = crate::config::resolve_entry(url, policy);
+        config.add_named_source_resolved(name.to_string(), resolved.clone());
+
+        match priority {
+            None | Some("primary" | "default") => config.set_primary_resolved(resolved),
+            Some("supplemental" | "secondary") => config.add_extra_resolved(resolved),
+            Some(_) => {} // "explicit" or any other value: named-source only
+        }
+    }
+}
+
+/// Parses `[tool.uv.index]` entries (`name`, `url`, `default`, `explicit`) into `config`
+/// (spec FR-013). Every entry is always registered as a named source (reachable via
+/// `[tool.uv.sources] <dep> = { index = "<name>" }`, via [`collect_uv_sources`] — works for
+/// both `default`/`explicit` and plain entries per FR-013). Routing beyond that depends on
+/// the entry's own flags, verified live against `docs.astral.sh/uv/concepts/indexes/`:
+/// `explicit = true` -> named-source only, never auto-included; `default = true` (uv permits
+/// at most one) -> the chain's last-resort tail hop, **never** `config.primary` — a pure-uv
+/// config never populates that slot, always routing through the FR-005(b) shape instead;
+/// neither flag set -> an automatic chain hop (the `--extra-index-url` analogue). An entry
+/// missing `name` or `url` is skipped outright.
+fn collect_uv_index(uv: &Table<'_>, config: &mut PypiIndexConfig, policy: &RegistryAccessPolicy) {
+    let Some(entries) = uv.get("index").and_then(Value::as_array) else {
+        return;
+    };
+
+    for entry in entries {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+        let Some(name) = table.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(url) = table.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        let is_default = table.get("default").and_then(Value::as_bool) == Some(true);
+        let is_explicit = table.get("explicit").and_then(Value::as_bool) == Some(true);
+
+        let resolved = crate::config::resolve_entry(url, policy);
+        // Validator finding S4: keyed by the PEP 503-normalized name, not the raw TOML
+        // value — `[tool.uv.sources] { index = "<name>" }` bindings are matched against this
+        // same normalized form in `collect_uv_sources` below, so a casing/separator
+        // difference between the two declarations (`Flask-SQLAlchemy` vs `flask-sqlalchemy`)
+        // no longer silently fails the binding.
+        config.add_named_source_resolved(crate::name::normalize(name), resolved.clone());
+
+        if is_explicit {
+            // Named-source only — never auto-included in the chain.
+        } else if is_default {
+            config.set_tail_hop_resolved(resolved);
+        } else {
+            config.add_extra_resolved(resolved);
+        }
+    }
+}
+
+/// Parses `[tool.uv.sources] <dep> = { index = "<name>" }` bindings into `uv_named_by_dep`,
+/// keyed by dependency name (spec FR-013) — the uv analogue of Poetry's per-dependency
+/// `source = "<name>"` key. Every other `[tool.uv.sources]` shape (`git =`, `path =`,
+/// `workspace = true`, or any table without an `index =` key) is deliberately not recognized
+/// here — dependency provenance, not registry routing, explicitly out of this feature's
+/// scope (spec Out of Scope).
+fn collect_uv_sources(uv: &Table<'_>, uv_named_by_dep: &mut HashMap<String, String>) {
+    let Some(sources) = uv.get("sources").and_then(Value::as_table) else {
+        return;
+    };
+
+    for (dep_key, value) in sources {
+        if let Some(table) = value.as_table()
+            && let Some(index_name) = table.get("index").and_then(Value::as_str)
+        {
+            // Validator finding S4: both sides normalized per PEP 503 — the dependency-name
+            // key (so it matches `dep.name.as_str()`, itself already PEP 508-normalized —
+            // see `PypiDependency::name`'s own doc) and the target index name (so it matches
+            // `collect_uv_index`'s normalized `named_sources` key above). Without this, a
+            // casing/separator mismatch between `[tool.uv.sources]`'s own key and the actual
+            // parsed dependency name would silently miss the binding, falling through to
+            // `resolve_source_for(None)` — for a file with no other index declared, that
+            // resolves to plain `pypi.org`, exactly the leak this feature exists to prevent.
+            uv_named_by_dep.insert(
+                crate::name::normalize(&dep_key.name),
+                crate::name::normalize(index_name),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2129,5 +2360,374 @@ dependencies = [
         assert_eq!(dep.name, "pkg");
         assert_eq!(dep.markers, Some(raw_marker));
         assert!(dep.markers_range.is_some());
+    }
+
+    // --- T004: Poetry [[tool.poetry.source]] + per-dependency source = (FR-007) ---
+
+    fn parse_with_all_policy(content: &str) -> ParseResult {
+        let policy = deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        );
+        PypiParser::new()
+            .parse_content_with_policy(content, &test_uri(), &policy)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_poetry_unlabeled_source_is_primary() {
+        // No `priority` key at all -> primary (FR-007 corrected mapping), so every plain
+        // dependency in the file routes through it.
+        let content = r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://pypi.mycorp.example/simple"
+
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+"#;
+        let result = parse_with_all_policy(content);
+        let dep = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "requests")
+            .unwrap();
+        assert!(matches!(
+            dep.source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    /// Validator finding S3: two primary-priority Poetry sources must not silently pick an
+    /// arbitrary (last-declared) one — the first registered wins, verified end-to-end via the
+    /// registered chain's sole hop.
+    #[test]
+    fn test_poetry_multiple_primary_sources_keeps_first() {
+        let content = r#"
+[[tool.poetry.source]]
+name = "first"
+url = "https://first.example/simple"
+
+[[tool.poetry.source]]
+name = "second"
+url = "https://second.example/simple"
+priority = "primary"
+
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+"#;
+        let result = parse_with_all_policy(content);
+        let dep = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "requests")
+            .unwrap();
+        let PypiDependencySource::AlternateRegistry { index, .. } = &dep.source else {
+            panic!("expected AlternateRegistry, got {:?}", dep.source);
+        };
+
+        let chain = result
+            .resolved_chains
+            .iter()
+            .find(|c| &c.key == index)
+            .expect("chain must be registered");
+        assert_eq!(chain.hops.len(), 1);
+        assert_eq!(chain.hops[0].as_str(), "https://first.example/simple");
+    }
+
+    #[test]
+    fn test_poetry_explicit_source_via_dependency_key() {
+        let content = r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "https://pypi.mycorp.example/simple"
+priority = "explicit"
+
+[tool.poetry.dependencies]
+flask = { version = "^3.0", source = "internal" }
+requests = "^2.28.0"
+"#;
+        let result = parse_with_all_policy(content);
+        let flask = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "flask")
+            .unwrap();
+        assert_eq!(
+            flask.source,
+            PypiDependencySource::AlternateRegistry {
+                index: "https://pypi.mycorp.example/simple".to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+
+        // An `explicit`-priority source is never auto-included in the chain — an unrelated
+        // dependency with no `source =` key stays plain `Registry`.
+        let requests = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "requests")
+            .unwrap();
+        assert_eq!(requests.source, PypiDependencySource::Registry);
+    }
+
+    #[test]
+    fn test_poetry_source_reference_with_no_matching_entry_fails_closed() {
+        let content = r#"
+[tool.poetry.dependencies]
+flask = { version = "^3.0", source = "does-not-exist" }
+"#;
+        let result = parse_with_all_policy(content);
+        assert_eq!(
+            result.dependencies[0].source,
+            PypiDependencySource::CustomRegistry {
+                url: "does-not-exist".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_poetry_supplemental_priority_is_extra_not_primary() {
+        let content = r#"
+[[tool.poetry.source]]
+name = "extra"
+url = "https://extra.example/simple"
+priority = "supplemental"
+
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+"#;
+        let result = parse_with_all_policy(content);
+        // No primary declared, but a supplemental source exists -> case (b): still routes
+        // through an AlternateRegistry chain (extras + implicit public), not plain Registry.
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    // --- T005: uv [tool.uv.index] + [tool.uv.sources] (FR-013) ---
+
+    #[test]
+    fn test_uv_plain_entry_is_automatic_extra() {
+        let content = r#"
+[[tool.uv.index]]
+name = "extra"
+url = "https://extra.example/simple"
+
+[project]
+dependencies = ["requests>=2.28.0"]
+"#;
+        let result = parse_with_all_policy(content);
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    /// FR-013's corrected mapping: `default = true` is uv's lowest-priority, last-resort
+    /// hop — checked *after* every non-default entry, and never populates `primary`. A
+    /// package present on both a non-default entry and the `default` entry must resolve via
+    /// the non-default one (asserted at the `PypiIndexConfig` level in `config.rs`; here we
+    /// assert the parse-level contract: a pure-uv config never produces `CustomRegistry`'s
+    /// primary-fail-closed shape, since `primary` is never populated).
+    #[test]
+    fn test_uv_default_entry_is_last_resort_not_primary() {
+        let content = r#"
+[[tool.uv.index]]
+name = "non-default"
+url = "https://non-default.example/simple"
+
+[[tool.uv.index]]
+name = "default-index"
+url = "https://default.example/simple"
+default = true
+
+[project]
+dependencies = ["requests>=2.28.0"]
+"#;
+        let result = parse_with_all_policy(content);
+        // Both entries route through the same case-(b)-shaped chain (AlternateRegistry, not
+        // CustomRegistry) — proving `default = true` did not populate `primary` (which would
+        // make an invalid primary fail closed instead, a structurally different source).
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    #[test]
+    fn test_uv_explicit_entry_named_source_only() {
+        let content = r#"
+[[tool.uv.index]]
+name = "internal"
+url = "https://pypi.mycorp.example/simple"
+explicit = true
+
+[tool.uv.sources]
+mypkg = { index = "internal" }
+
+[project]
+dependencies = ["mypkg>=1.0.0", "requests>=2.28.0"]
+"#;
+        let result = parse_with_all_policy(content);
+        let mypkg = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "mypkg")
+            .unwrap();
+        assert_eq!(
+            mypkg.source,
+            PypiDependencySource::AlternateRegistry {
+                index: "https://pypi.mycorp.example/simple".to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+
+        // An `explicit` entry is never auto-included — an unrelated dependency stays plain
+        // `Registry`.
+        let requests = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "requests")
+            .unwrap();
+        assert_eq!(requests.source, PypiDependencySource::Registry);
+    }
+
+    /// Validator finding S4: a casing/separator mismatch between `[tool.uv.index]`'s `name`
+    /// and `[tool.uv.sources]`'s `index = "<name>"` value must not silently break the
+    /// binding — both are matched PEP 503-normalized. Without this fix, `mypkg` would fall
+    /// through to `resolve_source_for(None)` and, with no other index declared, resolve as
+    /// plain `pypi.org` — the exact leak this feature exists to prevent for an `explicit`
+    /// index a dependency is supposed to be routed to deliberately.
+    #[test]
+    fn test_uv_sources_index_binding_normalizes_name_mismatch() {
+        let content = r#"
+[[tool.uv.index]]
+name = "Internal-Index"
+url = "https://pypi.mycorp.example/simple"
+explicit = true
+
+[tool.uv.sources]
+mypkg = { index = "internal_index" }
+
+[project]
+dependencies = ["mypkg>=1.0.0"]
+"#;
+        let result = parse_with_all_policy(content);
+        let mypkg = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "mypkg")
+            .unwrap();
+        assert_eq!(
+            mypkg.source,
+            PypiDependencySource::AlternateRegistry {
+                index: "https://pypi.mycorp.example/simple".to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+    }
+
+    /// Same fix, verified against the dependency-name side of the binding: a casing mismatch
+    /// between `[tool.uv.sources]`'s own TOML key and the actual normalized dependency name
+    /// must not defeat the binding either.
+    #[test]
+    fn test_uv_sources_dependency_key_normalizes_name_mismatch() {
+        let content = r#"
+[[tool.uv.index]]
+name = "internal"
+url = "https://pypi.mycorp.example/simple"
+explicit = true
+
+[tool.uv.sources]
+"Flask-SQLAlchemy" = { index = "internal" }
+
+[project]
+dependencies = ["flask-sqlalchemy>=1.0.0"]
+"#;
+        let result = parse_with_all_policy(content);
+        let dep = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "flask-sqlalchemy")
+            .unwrap();
+        assert_eq!(
+            dep.source,
+            PypiDependencySource::AlternateRegistry {
+                index: "https://pypi.mycorp.example/simple".to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+    }
+
+    /// `[tool.uv.sources] { index = "<name>" }` also works for a non-`explicit` entry (FR-013
+    /// says "works for both explicit and non-explicit named entries").
+    #[test]
+    fn test_uv_sources_index_binding_works_for_non_explicit_entry() {
+        let content = r#"
+[[tool.uv.index]]
+name = "extra"
+url = "https://extra.example/simple"
+
+[tool.uv.sources]
+mypkg = { index = "extra" }
+
+[project]
+dependencies = ["mypkg>=1.0.0"]
+"#;
+        let result = parse_with_all_policy(content);
+        assert_eq!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry {
+                index: "https://extra.example/simple".to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+    }
+
+    /// Every other `[tool.uv.sources]` shape (`git =`, `path =`, `workspace = true`) has no
+    /// effect — confirmed by a dependency whose binding uses one of these shapes still
+    /// resolving as a plain dependency (its own PEP 508 string form is unaffected, since
+    /// `[tool.uv.sources]` never overrides a dependency's own declared version/extras — only
+    /// registry routing).
+    #[test]
+    fn test_uv_sources_non_index_shapes_have_no_routing_effect() {
+        let content = r#"
+[tool.uv.sources]
+git-pkg = { git = "https://github.com/example/git-pkg" }
+path-pkg = { path = "../path-pkg" }
+workspace-pkg = { workspace = true }
+
+[project]
+dependencies = ["git-pkg>=1.0.0", "path-pkg>=1.0.0", "workspace-pkg>=1.0.0"]
+"#;
+        let result = parse_with_all_policy(content);
+        for dep in &result.dependencies {
+            assert_eq!(
+                dep.source,
+                PypiDependencySource::Registry,
+                "{} should be unaffected by a non-index uv.sources shape",
+                dep.name
+            );
+        }
+    }
+
+    /// US-004: a `pyproject.toml` with no index declaration anywhere is unaffected —
+    /// byte-identical to today's behavior.
+    #[test]
+    fn test_no_index_declaration_pyproject_is_plain_registry() {
+        let content = r#"
+[project]
+dependencies = ["requests>=2.28.0"]
+
+[tool.poetry.dependencies]
+flask = "^3.0"
+"#;
+        let result = PypiParser::new()
+            .parse_content(content, &test_uri())
+            .unwrap();
+        for dep in &result.dependencies {
+            assert_eq!(dep.source, PypiDependencySource::Registry);
+        }
     }
 }

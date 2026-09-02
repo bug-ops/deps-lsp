@@ -111,6 +111,20 @@ pub enum DepsError {
     /// that was blocked, for diagnostic/logging purposes.
     #[error("offline: request to {url} was blocked by network.offline")]
     Offline { url: String },
+
+    /// A multi-hop alternate/private-index chain's resolution was halted because a hop
+    /// returned a genuine transport error (5xx, timeout, connection failure) rather than a
+    /// clean "not found" — the chain deliberately does not fall through to a further, less
+    /// trusted hop in this case (`deps_pypi`'s FR-005(c)/NFR-003(3), #513). Carries no
+    /// arbitrary error text — mirrors [`Self::RateLimited`]'s pre-vetted-message precedent
+    /// (see [`Self::fetch_failure`]'s security-load-bearing invariant) — so its
+    /// classification there can safely be [`FetchFailure::Actionable`] with a fixed, safe
+    /// message, surfacing this case in hover/diagnostics instead of only a `tracing::warn!`.
+    #[error(
+        "index chain resolution halted by a transport error on one hop — not falling back \
+         to a less-trusted index"
+    )]
+    ChainResolutionHalted,
 }
 
 impl DepsError {
@@ -190,6 +204,13 @@ impl DepsError {
     pub fn fetch_failure(&self) -> FetchFailure {
         match self {
             Self::RateLimited { message } => FetchFailure::Actionable(message.clone()),
+            // Fixed, pre-vetted message — see `Self::ChainResolutionHalted`'s own doc for why
+            // this is safe to build as `Actionable` the same way `RateLimited` is.
+            Self::ChainResolutionHalted => FetchFailure::Actionable(
+                "index unreachable — resolution halted, not falling back to a less-trusted \
+                 index"
+                    .to_string(),
+            ),
             _ => FetchFailure::Transient,
         }
     }
@@ -384,13 +405,15 @@ mod tests {
         );
     }
 
-    /// Exhaustive companion to the doc-test on [`DepsError::fetch_failure`]: every
-    /// variant other than [`DepsError::RateLimited`] must classify as
-    /// [`FetchFailure::Transient`]. This is the invariant the doc comment calls
-    /// security-load-bearing (a future variant wired to `Actionable` by mistake
-    /// could leak raw, potentially IP-bearing error text into a diagnostic), so it
-    /// must be a real test enumerating every variant, not just the 2-variant
-    /// doc-test spot check.
+    /// Exhaustive companion to the doc-test on [`DepsError::fetch_failure`]: every variant
+    /// other than [`DepsError::RateLimited`] and [`DepsError::ChainResolutionHalted`] must
+    /// classify as [`FetchFailure::Transient`]. This is the invariant the doc comment calls
+    /// security-load-bearing (a future variant wired to `Actionable` by mistake could leak
+    /// raw, potentially IP-bearing error text into a diagnostic), so it must be a real test
+    /// enumerating every variant, not just a handful of spot checks. `ChainResolutionHalted`
+    /// is exempted from the "everything else is Transient" list — like `RateLimited`, it
+    /// carries no arbitrary payload, only a fixed, pre-vetted message, so it is safe to be
+    /// the second `Actionable`-producing variant (see its own doc and #513's M2 fix).
     #[test]
     fn test_fetch_failure_classifies_every_non_rate_limited_variant_as_transient() {
         // A `reqwest::Error` built from an invalid URL — `RequestBuilder::build`
@@ -455,6 +478,15 @@ mod tests {
         assert_eq!(
             rate_limited.fetch_failure(),
             FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".into())
+        );
+
+        assert_eq!(
+            DepsError::ChainResolutionHalted.fetch_failure(),
+            FetchFailure::Actionable(
+                "index unreachable — resolution halted, not falling back to a less-trusted \
+                 index"
+                    .to_string()
+            )
         );
     }
 }

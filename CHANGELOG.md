@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-lsp**: `cache.enabled: false` now actually bypasses the HTTP entry-map cache instead of being silently ignored (resolves #482) (#491)
 - **deps-core, deps-lsp, deps-maven**: new `network.offline` setting blocks every outbound registry/OSV/GitHub request, serving already-cached data where available (resolves #483) (#491)
 - **deps-npm, deps-core, deps-lsp**: npm `.npmrc` custom/private registry support — project/user-tier `registry=`/`@scope:registry=` overrides now resolve to live hover/diagnostic/completion data instead of none, failing closed on a bad entry rather than falling back to `registry.npmjs.org` (resolves #502) (#510)
+- **deps-pypi, deps-lsp**: PyPI private/custom index resolution — `requirements.txt` `--index-url`/`--extra-index-url`, Poetry `[[tool.poetry.source]]`, and uv `[tool.uv.index]`/`[tool.uv.sources]` now resolve to live hover/diagnostic/completion data instead of none, checking declared extras before the implicit `pypi.org` fallback and failing closed on a bad explicit entry rather than falling back to `pypi.org` (resolves #513) (#516)
 
 ### Changed
 - **repo**: root `Cargo.toml` `[workspace.dependencies]` is now fully, case-insensitively sorted alphabetically (resolves #442) (#444)

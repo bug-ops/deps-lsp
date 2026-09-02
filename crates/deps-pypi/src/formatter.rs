@@ -142,6 +142,19 @@ impl PackageRendering for PypiFormatter {
 
         position.character >= start_char && position.character <= end_char
     }
+
+    /// FR-009/validator finding #2: suppresses the hover heading's `pypi.org` project link
+    /// for anything but plain public-registry content. Without this override (the trait
+    /// default is unconditionally `false`), a private-index dependency's hover would render
+    /// a `pypi.org` link right next to its actual private-index version data — once live
+    /// data renders alongside it, an unrelated `pypi.org` link reads as false confirmation
+    /// the link is real. Mirrors `NpmFormatter`'s/`CargoFormatter`'s identical override,
+    /// reusing `SourcePolicy::source_is_public_registry_content`'s default (`Registry` only
+    /// — PyPI has no crates.io-style verified-mirror concept for `AlternateRegistry` to
+    /// except).
+    fn suppress_package_url(&self, source: &deps_core::DependencySource) -> bool {
+        !self.source_is_public_registry_content(source)
+    }
 }
 
 impl RequirementResolution for PypiFormatter {
@@ -184,7 +197,28 @@ impl DiagnosticMessages for PypiFormatter {}
 
 impl DiagnosticPolicy for PypiFormatter {}
 
-impl SourcePolicy for PypiFormatter {}
+impl SourcePolicy for PypiFormatter {
+    /// FR-009: gates hover/diagnostics/code-actions on a resolved `AlternateRegistry`
+    /// (private-index) source, in addition to the plain public `Registry` default —
+    /// mirrors `NpmFormatter::can_resolve_source` exactly. `CustomRegistry` (an unresolved
+    /// or invalid explicit index — FR-006) is deliberately not accepted here: it falls
+    /// through to the default `is_version_resolvable() == false`, keeping the existing
+    /// fail-closed gate intact.
+    ///
+    /// Known cosmetic limitation (M1, not fixed): a plain dependency in an extras-only file
+    /// (FR-005(b)) is classified `AlternateRegistry` at parse time, before the winning hop
+    /// is known — if it actually resolves via the implicit public fallback, its `pypi.org`
+    /// hover link is still suppressed by `PackageRendering::suppress_package_url` (correct
+    /// for the private-index case this feature exists for, cosmetically over-cautious only
+    /// for this one edge case). Accepted for phase 1; documented in `ECOSYSTEM_GUIDE.md`.
+    fn can_resolve_source(&self, source: &deps_core::DependencySource) -> bool {
+        matches!(
+            source,
+            deps_core::DependencySource::Registry
+                | deps_core::DependencySource::AlternateRegistry { .. }
+        )
+    }
+}
 
 impl OsvNaming for PypiFormatter {}
 
@@ -212,6 +246,45 @@ fn truncate_release_to_match(source_version: &str, latest: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-009: `Registry` and `AlternateRegistry` both resolve; `CustomRegistry` and every
+    /// non-registry source stay fail-closed via the default `is_version_resolvable()`.
+    #[test]
+    fn test_can_resolve_source() {
+        let formatter = PypiFormatter;
+        assert!(formatter.can_resolve_source(&deps_core::DependencySource::Registry));
+        assert!(
+            formatter.can_resolve_source(&deps_core::DependencySource::AlternateRegistry {
+                index: "pypi-chain:deadbeef".to_string(),
+                mirrors_crates_io: false,
+            })
+        );
+        assert!(
+            !formatter.can_resolve_source(&deps_core::DependencySource::CustomRegistry {
+                url: "https://pypi.mycorp.example/simple".to_string(),
+            })
+        );
+    }
+
+    /// Validator finding #2 (security H2): a private-index (`AlternateRegistry`) dependency's
+    /// hover must suppress the `pypi.org` project link; a plain public-registry dependency
+    /// must not.
+    #[test]
+    fn test_suppress_package_url() {
+        let formatter = PypiFormatter;
+        assert!(!formatter.suppress_package_url(&deps_core::DependencySource::Registry));
+        assert!(
+            formatter.suppress_package_url(&deps_core::DependencySource::AlternateRegistry {
+                index: "pypi-chain:deadbeef".to_string(),
+                mirrors_crates_io: false,
+            })
+        );
+        assert!(
+            formatter.suppress_package_url(&deps_core::DependencySource::CustomRegistry {
+                url: "https://pypi.mycorp.example/simple".to_string(),
+            })
+        );
+    }
 
     #[test]
     fn test_normalize_package_name() {
