@@ -2,6 +2,7 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::parser::DependencySource;
 use deps_core::{
     ConcreteVersion, Dependency, PackageName, VersionReq, lsp_helpers::warn_rejected_value,
 };
@@ -76,6 +77,29 @@ impl EcosystemFormatter for GithubActionsFormatter {
                 name.as_str(),
             );
             String::new()
+        }
+    }
+
+    /// Suppresses the hover heading link for a local composite action (`./x`,
+    /// [`DependencySource::Path`]) and a Docker image ref (`docker://...`) — neither has a
+    /// dependency name that [`Self::package_url`] can turn into a real URL, so without this
+    /// override hover renders a dead `[name]()` link instead of a plain heading (#474).
+    ///
+    /// A reusable-workflow call (`owner/repo/.github/workflows/x.yml@ref`) is a
+    /// [`DependencySource::Url`] too, but its `url` is always built from a valid
+    /// `owner/repo` identity (see `crate::parser`'s `is_reusable_workflow` branch) and so is
+    /// left unsuppressed; a Docker ref's `url` is the raw `docker://...` value and never
+    /// matches that shape.
+    fn suppress_package_url(&self, source: &DependencySource) -> bool {
+        match source {
+            DependencySource::Path { .. } => true,
+            DependencySource::Url { url } => !url.starts_with("https://github.com/"),
+            // `DependencySource` is `#[non_exhaustive]` (deps-core), so a catch-all arm is
+            // required by the compiler regardless — this crate cannot match it exhaustively
+            // by variant name. Every other source (`Registry`, `Git`, `Sdk`, `Workspace`,
+            // `CustomRegistry`, `AlternateRegistry`, and any future variant) defaults to an
+            // unsuppressed (linked) heading, same as before this override existed.
+            _ => false,
         }
     }
 
@@ -159,6 +183,209 @@ mod tests {
         GithubActionsFormatter {
             tag_index: Arc::new(DashMap::new()),
         }
+    }
+
+    // --- #474: hover suppress_package_url / footer regression coverage ---
+
+    #[test]
+    fn test_suppress_package_url_local_path_action() {
+        let fmt = formatter();
+        assert!(fmt.suppress_package_url(&DependencySource::Path {
+            path: "./local-action".into(),
+        }));
+    }
+
+    #[test]
+    fn test_suppress_package_url_docker_ref() {
+        let fmt = formatter();
+        assert!(fmt.suppress_package_url(&DependencySource::Url {
+            url: "docker://alpine:3.18".into(),
+        }));
+    }
+
+    #[test]
+    fn test_suppress_package_url_reusable_workflow_not_suppressed() {
+        let fmt = formatter();
+        assert!(!fmt.suppress_package_url(&DependencySource::Url {
+            url: "https://github.com/octo-org/repo".into(),
+        }));
+    }
+
+    #[test]
+    fn test_suppress_package_url_registry_not_suppressed() {
+        let fmt = formatter();
+        assert!(!fmt.suppress_package_url(&DependencySource::Registry));
+    }
+
+    /// A registry mock whose `get_versions` always succeeds with an empty list — enough
+    /// to drive `generate_hover`'s `resolvable && available_versions.is_some()` footer
+    /// gate (#474) without needing a real `Box<dyn Version>` fixture.
+    struct EmptyRegistry;
+
+    impl deps_core::Registry for EmptyRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a PackageName,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = deps_core::Result<Vec<Box<dyn deps_core::Version>>>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Runs `generate_hover` end-to-end against a real parsed workflow line and the real
+    /// `GithubActionsFormatter`, mirroring the fixtures already used by `crate::parser`'s
+    /// own unit tests (`./local-action`, `docker://alpine:3.18`,
+    /// `octo-org/repo/.github/workflows/x.yml@v1`, `actions/checkout@v4`).
+    async fn hover_markdown_for(content: &str) -> String {
+        use deps_core::freshness::FreshnessSettings;
+        use deps_core::lsp_helpers::generate_hover;
+        use deps_core::{PublishTime, VersionData};
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::HoverContents;
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let fmt = formatter();
+
+        // Cursor placed at the start of the (single) parsed dependency's own name range,
+        // rather than a hardcoded line/column, so this helper works for fixtures whose
+        // `uses:` line varies in position (top-level `steps:` vs. nested `jobs:.call:`).
+        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            .name_range()
+            .start;
+
+        let hover = generate_hover(
+            &parse_result,
+            position,
+            VersionData::new(&cached, &resolved),
+            &EmptyRegistry,
+            &fmt,
+            FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for the dependency on this line");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        content.value
+    }
+
+    /// Hover escapes every name it renders (`# `/`# [...]` heading) via
+    /// `deps_core::lsp_helpers::escape_markdown`, which backslash-escapes all ASCII
+    /// punctuation — building the expected heading through the same function keeps these
+    /// assertions from hardcoding that escaping rather than testing it.
+    fn escaped(name: &str) -> String {
+        deps_core::lsp_helpers::escape_markdown(name)
+    }
+
+    #[tokio::test]
+    async fn test_hover_local_path_action_has_plain_header_and_no_footer() {
+        let markdown = hover_markdown_for("steps:\n  - uses: ./local-action\n").await;
+        assert!(
+            markdown.starts_with(&format!("# {}\n", escaped("./local-action"))),
+            "expected a plain heading, not a dead link; got: {markdown}"
+        );
+        assert!(!markdown.contains('['), "must not render a markdown link");
+        assert!(
+            !markdown.contains("Press `Cmd+.`"),
+            "a local composite action offers no update code action; got: {markdown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hover_docker_ref_has_plain_header_and_no_footer() {
+        let markdown = hover_markdown_for("steps:\n  - uses: docker://alpine:3.18\n").await;
+        assert!(
+            markdown.starts_with(&format!("# {}\n", escaped("docker://alpine:3.18"))),
+            "expected a plain heading, not a dead link; got: {markdown}"
+        );
+        assert!(!markdown.contains('['), "must not render a markdown link");
+        assert!(
+            !markdown.contains("Press `Cmd+.`"),
+            "a Docker ref offers no update code action; got: {markdown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hover_reusable_workflow_keeps_real_link_and_no_footer() {
+        let markdown = hover_markdown_for(
+            "jobs:\n  call:\n    uses: octo-org/repo/.github/workflows/x.yml@v1\n",
+        )
+        .await;
+        assert!(
+            markdown.starts_with(&format!(
+                "# [{}](https://github.com/octo-org/repo)\n",
+                escaped("octo-org/repo")
+            )),
+            "reusable-workflow calls resolve to a real owner/repo identity and keep their \
+             link unchanged; got: {markdown}"
+        );
+        assert!(
+            !markdown.contains("Press `Cmd+.`"),
+            "a reusable-workflow call is non-resolvable, so no update code action exists; \
+             got: {markdown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hover_registry_action_keeps_link_and_footer() {
+        let markdown = hover_markdown_for("steps:\n  - uses: actions/checkout@v4\n").await;
+        assert!(
+            markdown.starts_with(&format!(
+                "# [{}](https://github.com/actions/checkout)\n",
+                escaped("actions/checkout")
+            )),
+            "non-regression: a normal Registry-sourced action keeps its link; got: {markdown}"
+        );
+        assert!(
+            markdown.contains("Press `Cmd+.`"),
+            "a resolvable Registry source with version data must still show the update \
+             footer; got: {markdown}"
+        );
     }
 
     fn dep(pin: Option<PinStyle>, name: &str, literal: Option<&str>) -> GithubActionsDependency {

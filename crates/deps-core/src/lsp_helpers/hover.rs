@@ -91,8 +91,16 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // FR-014: a resolved-but-not-crates.io source (e.g. Cargo's `AlternateRegistry`) must
     // not carry a link to the ecosystem's *default* registry — once live version data from
     // the real registry renders below, an unrelated link reads as confirmation it's real.
-    let url =
-        (!formatter.suppress_package_url(&dep_source)).then(|| formatter.package_url(dep.name()));
+    //
+    // `.filter(|u| !u.is_empty())`: an `EcosystemFormatter::package_url` implementation can
+    // return an empty string for a dependency name it can't turn into a real URL (e.g. a
+    // name that isn't a valid identity for that ecosystem's registry) without also
+    // overriding `suppress_package_url` — defense-in-depth so an empty URL can never render
+    // as a dead `[name]()` markdown link regardless of which ecosystem forgot the override
+    // (#474).
+    let url = (!formatter.suppress_package_url(&dep_source))
+        .then(|| formatter.package_url(dep.name()))
+        .filter(|u| !u.is_empty());
 
     // Pre-allocate with estimated capacity to reduce allocations
     let mut markdown = String::with_capacity(512);
@@ -355,7 +363,17 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         }
     }
 
-    markdown.push_str("\n---\n⌨️ **Press `Cmd+.` to update version**");
+    // The footer advertises a `Cmd+.` code action — none is ever offered for a source that
+    // is deliberately non-resolvable (e.g. a local composite action or a Docker image ref),
+    // so rendering it unconditionally is misleading there (#474). Gated on `resolvable`
+    // alone, not on `available_versions`/`cached_latest` also being populated: a
+    // vulnerability-fix or unsatisfiable-fix code action (`code_actions.rs`) can exist from
+    // `versions.vulnerabilities` — populated independently of the registry fetch
+    // (`lifecycle.rs`) — even when both of those are empty (e.g. a registry fetch failure),
+    // so requiring them too would silently drop the footer while `Cmd+.` still offers a fix.
+    if resolvable {
+        markdown.push_str("\n---\n⌨️ **Press `Cmd+.` to update version**");
+    }
 
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -2274,6 +2292,91 @@ mod tests {
         assert!(
             !content.value.contains("Recent versions"),
             "must not render a broken version section from an empty list; got: {}",
+            content.value
+        );
+    }
+
+    /// #474: the "Press `Cmd+.` to update version" footer advertises a code action that
+    /// only exists for a resolvable source with actual version data — a resolvable
+    /// `Registry` source with a live (even empty) fetch must still show it.
+    #[tokio::test]
+    async fn test_generate_hover_footer_shown_for_resolvable_source_with_live_versions() {
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "1.2.3".into(),
+                yanked: false,
+                published_at: None,
+            }],
+        };
+        let parse_result = freshness_test_parse_result("serde");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("Press `Cmd+.` to update version"),
+            "a resolvable source with live version data must show the update footer; got: {}",
+            content.value
+        );
+    }
+
+    /// #474: a non-resolvable source (e.g. a local path or a Docker-style URL ref,
+    /// mirrored here by `DependencySource::Path`) offers no diagnostic, inlay hint, or
+    /// code action — the footer advertising `Cmd+.` must not render for it, even though a
+    /// cached `latest` value exists in `versions.cached` (which `resolvable.then(...)`
+    /// must gate *before* it ever reaches the footer condition).
+    #[tokio::test]
+    async fn test_generate_hover_footer_omitted_for_non_resolvable_source() {
+        use crate::parser::DependencySource;
+
+        let uri = crate::test_util::test_uri("/test/workflow.yml");
+        let parse_result = SingleDepParseResult {
+            dep: NonRegistryDep(
+                dep_at("local-action"),
+                DependencySource::Path {
+                    path: "./local-action".into(),
+                },
+            ),
+            uri,
+        };
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert("local-action".into(), PackageVersions::latest_only("9.9.9"));
+            m
+        };
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should still be generated for a non-resolvable-source dependency");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("Press `Cmd+.` to update version"),
+            "a non-resolvable source offers no update code action, even with a cached \
+             latest value present; got: {}",
             content.value
         );
     }
