@@ -26,7 +26,10 @@ pub async fn handle_hover(
 
     // Snapshot before the document lookup, matching diagnostics.rs's ordering — this
     // acquires the config RwLock before the DashMap shard guard, never the reverse.
-    let freshness = { config.read().await.freshness.to_settings() };
+    let (freshness, offline) = {
+        let config = config.read().await;
+        (config.freshness.to_settings(), config.network.offline)
+    };
 
     // Own everything `generate_hover` needs and release the DashMap shard `Ref`
     // before awaiting it: the default impl awaits a real registry fetch
@@ -64,7 +67,8 @@ pub async fn handle_hover(
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_vulnerabilities(&vulnerabilities)
                 .with_outcomes(&outcomes)
-                .with_ecosystem(ecosystem_id),
+                .with_ecosystem(ecosystem_id)
+                .with_offline(offline),
             freshness,
         )
         .await

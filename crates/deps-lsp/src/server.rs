@@ -219,11 +219,12 @@ impl Backend {
         // `handle_diagnostics` (which re-reads `self.config` per URI) would hold this
         // guard across a nested read of the same write-preferring `RwLock` — a writer
         // queued in between would then block that nested read forever.
-        let (freshness, severities) = {
+        let (freshness, severities, offline) = {
             let config = self.config.read().await;
             (
                 config.freshness.to_settings(),
                 config.diagnostics.to_severities(),
+                config.network.offline,
             )
         };
 
@@ -237,6 +238,7 @@ impl Backend {
                 &uri,
                 freshness,
                 severities,
+                offline,
             )
             .await;
 
@@ -346,6 +348,8 @@ impl LanguageServer for Backend {
             self.state
                 .cache
                 .set_registry_policy(config.cargo.workspace_registries.to_policy());
+            self.state.cache.set_offline(config.network.offline);
+            self.state.cache.set_cache_enabled(config.cache.enabled);
             *self.config.write().await = config;
         }
 
@@ -445,6 +449,10 @@ impl LanguageServer for Backend {
         self.state
             .cache
             .set_registry_policy(config.cargo.workspace_registries.to_policy());
+        // Must land before `workspace_diagnostic_refresh` below, or the refresh re-renders
+        // diagnostics under the stale flag values (critic M5).
+        self.state.cache.set_offline(config.network.offline);
+        self.state.cache.set_cache_enabled(config.cache.enabled);
         *self.config.write().await = config;
 
         // Hover/completion/code actions are computed on demand and pick up the new
@@ -1420,6 +1428,55 @@ mod tests {
                 .await;
 
             assert_eq!(backend.config.read().await.freshness.cooldown_secs, 60);
+        }
+
+        /// Issue #483 (critic M6a): the primary UX of the flag — a live
+        /// `workspace/didChangeConfiguration` toggle must both block fetches immediately
+        /// when turned on and let them resume immediately when turned back off, with no
+        /// editor restart.
+        #[tokio::test]
+        async fn test_did_change_configuration_offline_to_online_transition_resumes_fetching() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            let mut server = mockito::Server::new_async().await;
+            let url = format!("{}/api/data", server.url());
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "network": { "offline": true } }),
+                })
+                .await;
+            assert!(backend.state.cache.is_offline());
+
+            let blocked_mock = server
+                .mock("GET", "/api/data")
+                .with_status(200)
+                .with_body("must not be fetched")
+                .expect(0)
+                .create_async()
+                .await;
+            let result = backend.state.cache.get_cached(&url).await;
+            assert!(matches!(result, Err(deps_core::DepsError::Offline { .. })));
+            blocked_mock.assert_async().await;
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "network": { "offline": false } }),
+                })
+                .await;
+            assert!(!backend.state.cache.is_offline());
+
+            let resumed_mock = server
+                .mock("GET", "/api/data")
+                .with_status(200)
+                .with_body("fetched after returning online")
+                .expect(1)
+                .create_async()
+                .await;
+            let result = backend.state.cache.get_cached(&url).await.unwrap();
+            assert_eq!(result.as_ref(), b"fetched after returning online");
+            resumed_mock.assert_async().await;
         }
 
         /// C1 regression: `did_change_configuration` makes a concurrent `config.write()`

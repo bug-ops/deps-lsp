@@ -425,7 +425,14 @@ impl MavenCentralRegistry {
         let data = match data {
             Ok(data) => data,
             Err(e) => {
-                record_search_failure(&self.recent_search_failures, query);
+                // Skip recording an offline block (issue #483 M2): unlike a genuine
+                // registry failure, this isn't evidence the query itself is problematic,
+                // and poisoning `recent_search_failures` with `RECENT_FAILURE_TTL` would
+                // leave search silently broken after `network.offline` flips back to
+                // `false`, until the TTL expires on its own.
+                if !e.is_offline() {
+                    record_search_failure(&self.recent_search_failures, query);
+                }
                 return Err(e);
             }
         };
@@ -490,8 +497,16 @@ fn record_search_success(failures: &DashMap<String, tokio::time::Instant>, query
 /// treated as terminal: a 400 means the query itself is malformed and retrying changes
 /// nothing, and a 429 specifically must NOT be retried immediately — that adds to the
 /// very request volume this endpoint's undocumented rate limiting reacts to.
+///
+/// `DepsError::Offline` (issue #483) is likewise terminal: it is deterministic and
+/// permanent for the duration of the config, so retrying it just pays
+/// [`SEARCH_RETRY_DELAY`] and an extra iteration for nothing, on a path with a
+/// user-facing completion deadline. Before the M2 fix this cost was absorbed by
+/// `recent_search_failures` after the first query; now that `search_typed` skips
+/// recording an offline block there, every offline completion would otherwise pay it.
 fn is_retryable_error(e: &DepsError) -> bool {
     !matches!(e, DepsError::HttpStatus { status, .. } if (400..500).contains(status))
+        && !e.is_offline()
 }
 
 /// Retries `fetch` across [`SEARCH_ATTEMPT_TIMEOUTS`], each attempt bounded by its own
@@ -1451,6 +1466,25 @@ mod tests {
         let err = registry.search_typed("guava", 20).await.unwrap_err();
 
         assert!(err.to_string().contains("skipping duplicate live attempt"));
+    }
+
+    /// Issue #483 M2: an offline block must not poison `recent_search_failures` — unlike a
+    /// genuine registry failure, it says nothing about whether `query` itself is broken, and
+    /// `RECENT_FAILURE_TTL` would otherwise leave search silently short-circuited for a
+    /// while after `network.offline` flips back to `false`.
+    #[tokio::test]
+    async fn test_search_typed_offline_does_not_poison_recent_failures() {
+        let cache = Arc::new(HttpCache::new());
+        cache.set_offline(true);
+        let registry = MavenCentralRegistry::new(cache);
+
+        let err = registry.search_typed("guava", 20).await.unwrap_err();
+
+        assert!(err.is_offline(), "expected Offline, got {err:?}");
+        assert!(
+            registry.recent_search_failures.is_empty(),
+            "an offline block must not be recorded as a search failure"
+        );
     }
 
     /// #282 S1: `parse_search_response` is the sole trim mechanism now that the request

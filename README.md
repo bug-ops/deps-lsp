@@ -280,6 +280,9 @@ Configure via LSP initialization options:
   },
   "cargo": {
     "workspace_registries": "public_only"
+  },
+  "network": {
+    "offline": false
   }
 }
 ```
@@ -297,6 +300,7 @@ Configure via LSP initialization options:
 
 | Section | Option | Default | Description |
 | --------- | -------- | --------- | ------------- |
+| `cache` | `enabled` | `true` | Whether the HTTP entry-map cache is used at all; `false` fetches fresh on every request and never stores. Overridden to behave as `true` while `network.offline` is set |
 | `cache` | `fetch_timeout_secs` | `5` | Per-package fetch timeout (1-300 seconds) |
 | `cache` | `max_concurrent_fetches` | `20` | Concurrent registry requests (1-100) |
 | `loading_indicator` | `enabled` | `true` | Show loading feedback during fetches |
@@ -306,9 +310,13 @@ Configure via LSP initialization options:
 | `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
 | `cargo` | `workspace_registries` | `"public_only"` | Which workspace-declared Cargo registry index hosts are ever fetched — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#cargo-customprivate-registries) |
+| `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
 
 > [!NOTE]
 > The release-freshness signal applies uniformly across all ecosystems — there is no per-ecosystem override. Coverage depth varies with what each registry exposes (e.g. Deno's `jsr:` specifiers get full coverage at no extra request cost; Swift and Maven/Gradle have partial coverage since their APIs don't expose per-version publish dates directly). See [Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#mavengradle-release-freshness-coverage) for per-ecosystem details.
+
+> [!NOTE]
+> `network.offline` blocks every outbound request the server makes (registry, OSV vulnerability, and GitHub tags), across every ecosystem. Already-cached data keeps serving; an uncached dependency shows an offline marker in inlay hints, and hover appends a footer stating that version *and* vulnerability data were not checked. Toggling it via `workspace/didChangeConfiguration` takes effect immediately, with no editor restart.
 
 > [!TIP]
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.

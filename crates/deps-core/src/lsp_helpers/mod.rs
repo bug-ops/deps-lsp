@@ -390,6 +390,13 @@ pub struct VersionData<'a> {
     /// than one occurrence of a name has a distinct in-use version (S2).
     /// When `None`, both fall back to their pre-#394 name-only behavior.
     pub ecosystem: Option<EcosystemId>,
+    /// Whether `network.offline` is set (issue #483). When `true`, [`generate_hover`]
+    /// appends a footer stating that version *and vulnerability* data were not checked —
+    /// deliberately more specific than a bare "showing cached data" notice, since
+    /// `hover.rs`'s `Some(ScanOutcome::Skipped(_)) | None` arm renders nothing for an
+    /// offline OSV skip, which would otherwise look identical to a scanned-and-clean
+    /// dependency.
+    pub offline: bool,
 }
 
 impl<'a> VersionData<'a> {
@@ -420,6 +427,7 @@ impl<'a> VersionData<'a> {
             vulnerabilities: None,
             outcomes: None,
             ecosystem: None,
+            offline: false,
         }
     }
 
@@ -483,6 +491,26 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_ecosystem(mut self, ecosystem: EcosystemId) -> Self {
         self.ecosystem = Some(ecosystem);
+        self
+    }
+
+    /// Marks this `VersionData` as built while `network.offline` was set, so
+    /// [`generate_hover`] appends its offline footer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_offline(true);
+    /// assert!(versions.offline);
+    /// ```
+    #[must_use]
+    pub const fn with_offline(mut self, offline: bool) -> Self {
+        self.offline = offline;
         self
     }
 }

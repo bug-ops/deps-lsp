@@ -243,6 +243,7 @@ spring-boot = { module = "org.springframework.boot:spring-boot-starter", version
         needs_update_text: "❌ {}".to_string(),
         loading_text: "⏳".to_string(),
         show_loading_hints: true,
+        offline: false,
     };
 
     let hints = generate_inlay_hints(

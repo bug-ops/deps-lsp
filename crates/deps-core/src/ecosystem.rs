@@ -288,6 +288,11 @@ pub struct EcosystemConfig {
     pub loading_text: String,
     /// Whether to show loading hints in inlay hints
     pub show_loading_hints: bool,
+    /// Whether `network.offline` is set (issue #483): when `true` and no cached latest
+    /// version exists for a dependency, [`crate::lsp_helpers::generate_inlay_hints`]
+    /// shows an offline marker instead of silently falling back to the resolved-version
+    /// display, which would otherwise look identical to a normal pre-fetch state.
+    pub offline: bool,
 }
 
 impl Default for EcosystemConfig {
@@ -298,6 +303,7 @@ impl Default for EcosystemConfig {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         }
     }
 }
@@ -758,6 +764,7 @@ mod tests {
             needs_update_text: "Update to {}".to_string(),
             loading_text: "Loading...".to_string(),
             show_loading_hints: false,
+            offline: false,
         };
         assert!(!config.show_up_to_date_hints);
         assert_eq!(config.up_to_date_text, "OK");

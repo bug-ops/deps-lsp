@@ -23,10 +23,16 @@ pub async fn handle_diagnostics(
     }
 
     // Snapshot before generating diagnostics (Copy value, no lock held across the call)
-    let freshness = { full_config.read().await.freshness.to_settings() };
+    let (freshness, offline) = {
+        let full_config = full_config.read().await;
+        (
+            full_config.freshness.to_settings(),
+            full_config.network.offline,
+        )
+    };
     let severities = config.to_severities();
 
-    generate_diagnostics_internal(state, uri, freshness, severities).await
+    generate_diagnostics_internal(state, uri, freshness, severities, offline).await
 }
 
 /// Internal diagnostic generation without cold start support.
@@ -37,6 +43,7 @@ pub(crate) async fn generate_diagnostics_internal(
     uri: &Uri,
     freshness: deps_core::FreshnessSettings,
     severities: deps_core::DiagnosticSeverities,
+    offline: bool,
 ) -> Vec<Diagnostic> {
     // Own everything `generate_diagnostics` needs and release the DashMap shard `Ref`
     // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
@@ -90,7 +97,8 @@ pub(crate) async fn generate_diagnostics_internal(
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_vulnerabilities(&vulnerabilities)
                 .with_outcomes(&outcomes)
-                .with_ecosystem(ecosystem_id),
+                .with_ecosystem(ecosystem_id)
+                .with_offline(offline),
             uri,
             freshness,
             severities,

@@ -1304,7 +1304,15 @@ async fn fetch_latest_versions_parallel(
                         })
                     }
                     Ok(Err(e)) => {
-                        tracing::warn!(package = %name, error = %e, "fetch failed");
+                        // Issue #483: while offline, every fetch fails by design — this
+                        // would otherwise log a per-dependency WARNING for every open/edit,
+                        // contradicting the toast suppression two call sites away in this
+                        // same file for being "unusable".
+                        if e.is_offline() {
+                            tracing::debug!(package = %name, "fetch skipped: offline");
+                        } else {
+                            tracing::warn!(package = %name, error = %e, "fetch failed");
+                        }
                         failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let mut fe = first_error.lock().unwrap_or_else(|p| p.into_inner());
                         if fe.is_none() {
@@ -1394,6 +1402,28 @@ async fn fetch_latest_versions_parallel(
     }
 }
 
+/// Decides whether a fetch-failure toast should be shown for this fetch cycle, and what
+/// its message should be — a pure decision, factored out of the two call sites in
+/// [`handle_document_open`] and [`handle_document_change`] so both share one policy and the
+/// policy itself is unit-testable without an LSP transport.
+///
+/// Returns `None` when there were no failures at all, or when `offline` is set (issue
+/// #483): every fetch fails by design while `network.offline` is set, so toasting on every
+/// document open/change would make offline mode unusable.
+fn fetch_failure_toast(
+    failed_count: usize,
+    first_error: Option<&str>,
+    offline: bool,
+) -> Option<String> {
+    if failed_count == 0 || offline {
+        return None;
+    }
+    Some(format!(
+        "deps-lsp: {failed_count} package(s) failed to fetch: {}",
+        first_error.unwrap_or("timeout or network error")
+    ))
+}
+
 /// Generic document open handler using ecosystem registry.
 ///
 /// Parses manifest using the ecosystem's parser, creates document state,
@@ -1442,13 +1472,14 @@ pub async fn handle_document_open(
     // Clone cache, diagnostics, and freshness config before spawning background task
     // (all read here, before any OSV request is built, so disabling the feature
     // suppresses the network call itself — FR-011).
-    let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities) = {
+    let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities, offline) = {
         let cfg = config.read().await;
         (
             cfg.cache.clone(),
             cfg.diagnostics.vulnerabilities_enabled,
             cfg.freshness.to_settings(),
             cfg.diagnostics.to_severities(),
+            cfg.network.offline,
         )
     };
 
@@ -1645,21 +1676,28 @@ pub async fn handle_document_open(
             progress.end(success).await;
         }
 
-        // Notify user about failed packages. `error_message` is always populated by
-        // `fetch_latest_versions_parallel` whenever `failed_count > 0` — every site that
-        // increments `failed_count` also sets either `priority_error` or `first_error`.
-        if fetch_result.failed_count > 0 {
-            let message = format!(
-                "deps-lsp: {} package(s) failed to fetch: {}",
-                fetch_result.failed_count,
-                fetch_result
-                    .first_error
-                    .as_deref()
-                    .unwrap_or("timeout or network error")
-            );
-            client_clone
-                .show_message(MessageType::WARNING, message)
-                .await;
+        // Notify user about failed packages — suppressed when offline, see
+        // `fetch_failure_toast`'s docs. `fetch_result.first_error` is always populated
+        // by `fetch_latest_versions_parallel` whenever `failed_count > 0` (#480: every
+        // site that increments `failed_count` also sets either `priority_error` or
+        // `first_error`, and the two are merged into this field before returning).
+        match fetch_failure_toast(
+            fetch_result.failed_count,
+            fetch_result.first_error.as_deref(),
+            state_clone.cache.is_offline(),
+        ) {
+            Some(message) => {
+                client_clone
+                    .show_message(MessageType::WARNING, message)
+                    .await;
+            }
+            None if fetch_result.failed_count > 0 => {
+                tracing::debug!(
+                    failed_count = fetch_result.failed_count,
+                    "suppressing fetch-failure toast: offline"
+                );
+            }
+            None => {}
         }
 
         // Refresh inlay hints IMMEDIATELY after loading completes
@@ -1700,6 +1738,7 @@ pub async fn handle_document_open(
             &uri_clone,
             freshness_settings,
             diagnostic_severities,
+            offline,
         )
         .await;
 
@@ -1816,13 +1855,14 @@ pub async fn handle_document_change(
 
     // Clone cache, diagnostics, and freshness config before spawning background task
     // (all read here, before any OSV request is built — FR-011).
-    let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities) = {
+    let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities, offline) = {
         let cfg = config.read().await;
         (
             cfg.cache.clone(),
             cfg.diagnostics.vulnerabilities_enabled,
             cfg.freshness.to_settings(),
             cfg.diagnostics.to_severities(),
+            cfg.network.offline,
         )
     };
 
@@ -1915,6 +1955,7 @@ pub async fn handle_document_change(
                 &uri_clone,
                 freshness_settings,
                 diagnostic_severities,
+                offline,
             )
             .await;
             client_clone
@@ -2047,21 +2088,28 @@ pub async fn handle_document_change(
             progress.end(success).await;
         }
 
-        // Notify user about failed packages. `error_message` is always populated by
-        // `fetch_latest_versions_parallel` whenever `failed_count > 0` — every site that
-        // increments `failed_count` also sets either `priority_error` or `first_error`.
-        if fetch_result.failed_count > 0 {
-            let message = format!(
-                "deps-lsp: {} package(s) failed to fetch: {}",
-                fetch_result.failed_count,
-                fetch_result
-                    .first_error
-                    .as_deref()
-                    .unwrap_or("timeout or network error")
-            );
-            client_clone
-                .show_message(MessageType::WARNING, message)
-                .await;
+        // Notify user about failed packages — suppressed when offline, see
+        // `fetch_failure_toast`'s docs. `fetch_result.first_error` is always populated
+        // by `fetch_latest_versions_parallel` whenever `failed_count > 0` (#480: every
+        // site that increments `failed_count` also sets either `priority_error` or
+        // `first_error`, and the two are merged into this field before returning).
+        match fetch_failure_toast(
+            fetch_result.failed_count,
+            fetch_result.first_error.as_deref(),
+            state_clone.cache.is_offline(),
+        ) {
+            Some(message) => {
+                client_clone
+                    .show_message(MessageType::WARNING, message)
+                    .await;
+            }
+            None if fetch_result.failed_count > 0 => {
+                tracing::debug!(
+                    failed_count = fetch_result.failed_count,
+                    "suppressing fetch-failure toast: offline"
+                );
+            }
+            None => {}
         }
 
         if let Err(e) = client_clone.inlay_hint_refresh().await {
@@ -2095,6 +2143,7 @@ pub async fn handle_document_change(
             &uri_clone,
             freshness_settings,
             diagnostic_severities,
+            offline,
         )
         .await;
 
@@ -2309,6 +2358,50 @@ mod tests {
             .into_iter()
             .map(|name| (name, DependencySource::Registry))
             .collect()
+    }
+
+    /// Issue #483: `fetch_failure_toast` is the pure decision both `handle_document_open`
+    /// and `handle_document_change` delegate to, factored out specifically so the
+    /// suppress-while-offline policy is unit-testable without an LSP transport to capture
+    /// `show_message` calls over.
+    mod fetch_failure_toast_tests {
+        use super::*;
+
+        #[test]
+        fn test_no_failures_produces_no_toast_regardless_of_offline() {
+            assert_eq!(fetch_failure_toast(0, None, false), None);
+            assert_eq!(fetch_failure_toast(0, Some("ignored"), true), None);
+        }
+
+        #[test]
+        fn test_offline_suppresses_toast_even_with_failures() {
+            assert_eq!(
+                fetch_failure_toast(3, Some("offline: request to https://x was blocked"), true),
+                None,
+                "every fetch fails by design while offline; toasting would make it unusable"
+            );
+        }
+
+        #[test]
+        fn test_online_failure_with_first_error_uses_it_verbatim() {
+            assert_eq!(
+                fetch_failure_toast(1, Some("HTTP 503 for https://example.com"), false),
+                Some(
+                    "deps-lsp: 1 package(s) failed to fetch: HTTP 503 for https://example.com"
+                        .to_string()
+                )
+            );
+        }
+
+        #[test]
+        fn test_online_failure_with_no_first_error_uses_count_fallback() {
+            assert_eq!(
+                fetch_failure_toast(5, None, false),
+                Some(
+                    "deps-lsp: 5 package(s) failed to fetch: timeout or network error".to_string()
+                )
+            );
+        }
     }
 
     /// FR-011's actual collision bail-out, exercised directly against

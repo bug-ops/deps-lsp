@@ -105,6 +105,12 @@ pub enum DepsError {
 
     #[error("invalid URI: {0}")]
     InvalidUri(String),
+
+    /// Returned by `deps_core::cache::HttpCache`'s 4 send sites (issue #483) when
+    /// `network.offline` is set, instead of attempting the request. `url` is the request
+    /// that was blocked, for diagnostic/logging purposes.
+    #[error("offline: request to {url} was blocked by network.offline")]
+    Offline { url: String },
 }
 
 impl DepsError {
@@ -186,6 +192,29 @@ impl DepsError {
             Self::RateLimited { message } => FetchFailure::Actionable(message.clone()),
             _ => FetchFailure::Transient,
         }
+    }
+
+    /// Returns `true` when this error means a request was blocked by `network.offline`
+    /// (issue #483), as opposed to any other network or registry failure.
+    ///
+    /// Used by `deps_maven::registry` to skip poisoning its negative-search-failure
+    /// cache with an offline block, so toggling `network.offline` back to `false` takes
+    /// effect immediately instead of being masked by `RECENT_FAILURE_TTL`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::DepsError;
+    ///
+    /// let offline = DepsError::Offline { url: "https://crates.io/".into() };
+    /// assert!(offline.is_offline());
+    ///
+    /// let other = DepsError::CacheError("connection reset".into());
+    /// assert!(!other.is_offline());
+    /// ```
+    #[must_use]
+    pub const fn is_offline(&self) -> bool {
+        matches!(self, Self::Offline { .. })
     }
 }
 
@@ -298,6 +327,19 @@ mod tests {
     }
 
     #[test]
+    fn test_offline_error_display_and_predicate() {
+        let error = DepsError::Offline {
+            url: "https://crates.io/api/v1/crates/serde".into(),
+        };
+        assert!(error.to_string().contains("offline"));
+        assert!(error.is_offline());
+        assert!(!error.is_not_found());
+
+        let other = DepsError::CacheError("boom".into());
+        assert!(!other.is_offline());
+    }
+
+    #[test]
     fn test_package_not_found() {
         let error = DepsError::PackageNotFound {
             package: "flask".into(),
@@ -394,6 +436,9 @@ mod tests {
             DepsError::UnsupportedEcosystem("unknown".into()),
             DepsError::AmbiguousEcosystem("file.txt".into()),
             DepsError::InvalidUri("not a uri".into()),
+            DepsError::Offline {
+                url: "https://example.com".into(),
+            },
         ];
 
         for error in non_rate_limited {

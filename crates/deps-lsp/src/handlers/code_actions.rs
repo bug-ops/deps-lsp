@@ -22,10 +22,12 @@ pub async fn handle_code_actions(
     let position = params.range.start;
 
     // Ensure document is loaded (cold start support)
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, config).await {
+    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
         tracing::warn!("Could not load document for code actions: {:?}", uri);
         return vec![];
     }
+
+    let offline = { config.read().await.network.offline };
 
     // Own everything `generate_code_actions` needs and release the DashMap shard
     // `Ref` before awaiting it: the default impl awaits a real registry fetch, so
@@ -69,7 +71,8 @@ pub async fn handle_code_actions(
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_vulnerabilities(&vulnerabilities)
                 .with_outcomes(&outcomes)
-                .with_ecosystem(ecosystem_id),
+                .with_ecosystem(ecosystem_id)
+                .with_offline(offline),
             &content,
         )
         .await;
