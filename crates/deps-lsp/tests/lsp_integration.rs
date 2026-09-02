@@ -616,3 +616,66 @@ serde = "1.0"
     assert!(hover1.get("error").is_none());
     assert!(hover2.get("error").is_none());
 }
+
+/// Regression test for issue #496: reproduces the exact client behavior the bug
+/// report was filed against — a client that never replies to a server-initiated
+/// `workspace/applyEdit` request.
+///
+/// Before the fix, `execute_command`'s `deps-lsp.updateVersion` handler awaited
+/// `client.apply_edit(edit)` inline with no timeout, so an unanswered request
+/// stalled the handler — and permanently occupied one of tower-lsp-server's
+/// limited `buffer_unordered` concurrency slots — forever. Today the call is
+/// bounded by `CLIENT_REFRESH_TIMEOUT` (5s), so `workspace/executeCommand` must
+/// still return well within `read_response`'s own 10s `READ_TIMEOUT` budget.
+/// `deps-lsp.updateVersion` needs no live document state (the edit is built
+/// entirely from the command's own arguments), so this skips `did_open`.
+#[test]
+fn test_execute_command_update_version_not_blocked_by_unanswered_apply_edit() {
+    let mut client = LspClient::spawn();
+    client.initialize();
+    client.stop_responding_to_apply_edit();
+
+    let start = std::time::Instant::now();
+    client.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "workspace/executeCommand",
+        "params": {
+            "command": "deps-lsp.updateVersion",
+            "arguments": [{
+                "uri": "file:///test/Cargo.toml",
+                "range": {
+                    "start": {"line": 0, "character": 9},
+                    "end": {"line": 0, "character": 14}
+                },
+                "version": "1.2.3"
+            }]
+        }
+    }));
+
+    let response = client.read_response(Some(42));
+    let elapsed = start.elapsed();
+
+    assert_eq!(response["result"], json!(null));
+    assert!(
+        elapsed < Duration::from_secs(9),
+        "expected workspace/executeCommand to return within the 5s apply_edit \
+         timeout budget, took {elapsed:?} instead (possible regression: an \
+         unwrapped await here would hang until the harness's own 10s \
+         READ_TIMEOUT panics the test)"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(4),
+        "expected workspace/executeCommand to wait out close to the full 5s \
+         apply_edit timeout before returning, took only {elapsed:?} — did \
+         apply_edit resolve some other way?"
+    );
+    assert!(
+        client.unanswered_apply_edit_request_count() >= 1,
+        "expected the server to have actually attempted workspace/applyEdit \
+         (proving the timeout, not some other short-circuit, is why the \
+         handler returned) even though the harness never answered it"
+    );
+
+    let _shutdown_response = client.shutdown();
+}

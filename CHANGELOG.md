@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-github-actions**: a tripped rate-limit gate no longer fans out one near-duplicate diagnostic per remaining dependency; fetch failures now collapse into a single diagnostic per manifest, naming every affected dependency via related information and still surfacing a shared actionable hint when one applies (resolves #479) (#489)
 - **deps-github-actions, deps-core**: hover release-age hint and cooldown diagnostic now fire for GitHub Actions — `GithubActionsRegistry` enriches tags-API versions with GitHub Release publish dates via a new shared `deps_core::github::ReleaseDatesCache`, also adopted by `deps-swift` (resolves #486) (#494)
 - **deps-lsp**: a client that never answers a server-initiated `workspace/inlayHint/refresh`, `workspace/codeLens/refresh`, `client/registerCapability`, or `workspace/diagnostic/refresh` request no longer permanently stalls the OSV vulnerability commit and diagnostics publish for that document; these requests are now capability-gated and timeout-bounded (5s) instead of awaited unconditionally on the critical path (resolves #493) (#495)
+- **deps-lsp**: a client that never answers `workspace/applyEdit` for `deps-lsp.updateVersion` or `deps-lsp.updateAllOutdated` no longer permanently occupies a `workspace/executeCommand` concurrency slot; the request is now timeout-bounded (5s), same as #493's fix (resolves #496) (#498)
+
+### Removed
+- **Breaking (pre-1.0, public API)**: **deps-lsp**: dropped the dead `CacheConfig::refresh_interval_secs` field — `HttpCache` has no local TTL concept to attach it to (resolves #492) (#498)
 
 ## [0.11.1] - 2026-09-01
 
