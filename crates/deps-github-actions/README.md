@@ -26,6 +26,10 @@ implements `deps_core::Ecosystem`.
   fetch, not N, and a local rate-limit gate that stops hammering GitHub once a 403 is seen
 - **SHA-pin-aware code actions** — updating a `@<sha> # vX.Y.Z` pin writes both a new SHA
   and its matching tag comment, never silently downgrading a SHA pin to a bare tag
+- **Mutable-ref-pin security diagnostic** (issue #473) — a tag-pinned `uses:` step (e.g.
+  `@v4`) gets an additive, independent diagnostic recommending SHA pinning, plus a "Pin to
+  commit SHA" quick fix rewriting it to `@<sha> # <tag>` when the tag's commit is already
+  known; on by default, configurable via `mutable_ref_pin_severity`/`mutable_ref_pin_enabled`
 
 ## Installation
 
@@ -78,6 +82,10 @@ against the tag with zero SHA-to-tag network resolution.
   keystroke would burn the 60 req/hour unauthenticated budget fast
 - The unauthenticated GitHub API budget (60 req/hour) is per-IP and shared with any
   `deps-swift` traffic in the same process; set `GITHUB_TOKEN` to raise it to 5000 req/hour
+- The "Pin to commit SHA" quick fix is withheld for a quoted `uses:` value
+  (`uses: "actions/checkout@v4"`) — the ref sits inside the quotes there, and appending
+  `# <tag>` would corrupt the value instead of adding a YAML comment; the diagnostic still
+  fires, just without the automated fix
 
 ## License
 

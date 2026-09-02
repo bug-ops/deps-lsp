@@ -24,6 +24,7 @@ pub use code_lenses::{collect_update_all_edits, generate_code_lenses};
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, UNSATISFIABLE_DIAGNOSTIC_CODE,
     compile_requirement_unless, generate_diagnostics_from_cache, requirement_is_unsatisfiable,
+    truncate_for_diagnostic,
 };
 pub use hover::generate_hover;
 pub use in_use_version::{concrete_pin_version, in_use_version, is_full_semver_shape};

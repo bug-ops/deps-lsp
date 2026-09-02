@@ -1,8 +1,14 @@
 //! `insta` snapshots pinning the OSV vulnerability-diagnostic shape across
 //! every ecosystem, per `architecture.md` §9 (NFR-003/SC-004 enforcement):
-//! since no ecosystem crate overrides `generate_diagnostics`, a divergence
-//! introduced by an ecosystem-specific formatter shows up here as a
-//! snapshot diff rather than needing a manual comparison pass.
+//! a divergence introduced by an ecosystem-specific formatter shows up here
+//! as a snapshot diff rather than needing a manual comparison pass. As of
+//! issue #473, `deps-github-actions` overrides `generate_diagnostics` too —
+//! but only to *append* an unrelated, independent mutable-ref-pin
+//! diagnostic after calling the exact same shared default this suite
+//! exercises for every other ecosystem, so the OSV shape itself stays
+//! covered by the same guarantee. `deps-github-actions` is not itself one
+//! of the ecosystems snapshotted below (pre-existing gap from #471, not
+//! introduced here).
 //!
 //! Hover is intentionally not snapshotted per ecosystem: `generate_hover`
 //! makes a real registry network call (`registry.get_versions`), which is

@@ -553,6 +553,7 @@ dependencies = [
  "deps-core",
  "mockito",
  "semver",
+ "serde_json",
  "tokio",
  "tokio-test",
  "tower-lsp-server",

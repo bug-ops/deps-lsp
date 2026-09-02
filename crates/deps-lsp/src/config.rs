@@ -107,6 +107,8 @@ impl Default for InlayHintsConfig {
 /// - `yanked_severity`: `WARNING` - Dependencies using yanked versions
 /// - `unsatisfiable_severity`: `WARNING` - Dependencies whose requirement matches zero published versions
 /// - `deprecated_severity`: `WARNING` - Dependencies on a package the registry reports as deprecated/abandoned
+/// - `mutable_ref_pin_severity`: `HINT` - GitHub Actions `uses:` steps pinned to a mutable ref (tag) instead of a commit SHA
+/// - `mutable_ref_pin_enabled`: `true` - Whether the mutable-ref-pin diagnostic runs at all
 ///
 /// # Examples
 ///
@@ -120,6 +122,8 @@ impl Default for InlayHintsConfig {
 ///     yanked_severity: DiagnosticSeverity::ERROR,
 ///     unsatisfiable_severity: DiagnosticSeverity::ERROR,
 ///     deprecated_severity: DiagnosticSeverity::ERROR,
+///     mutable_ref_pin_severity: DiagnosticSeverity::ERROR,
+///     mutable_ref_pin_enabled: true,
 ///     vulnerabilities_enabled: true,
 /// };
 ///
@@ -143,6 +147,21 @@ pub struct DiagnosticsConfig {
     /// call. Matches the severity-only precedent set by the four fields above.
     #[serde(default = "default_deprecated_severity")]
     pub deprecated_severity: DiagnosticSeverity,
+    /// Severity for a GitHub Actions `uses:` step pinned to a mutable ref (a tag)
+    /// instead of a full commit SHA (issue #473). Tunes loudness only; see
+    /// `mutable_ref_pin_enabled` for the on/off toggle.
+    #[serde(default = "default_mutable_ref_pin_severity")]
+    pub mutable_ref_pin_severity: DiagnosticSeverity,
+    /// Whether the mutable-ref-pin diagnostic (issue #473) runs at all. Default
+    /// `true`. **Corrected during implementation review (spec 031 FR-009)**: unlike
+    /// `deprecated_severity`, this diagnostic *does* need a real `_enabled` toggle —
+    /// `DiagnosticSeverity` has no suppression value, and severity is never treated
+    /// as a suppression input anywhere in this codebase, so without this boolean the
+    /// diagnostic would be permanent and unremovable on every tag-pinned `uses:` step
+    /// (the dominant pinning style), even for teams that intentionally reject
+    /// SHA-pinning. Mirrors `vulnerabilities_enabled`'s exact shape.
+    #[serde(default = "default_true")]
+    pub mutable_ref_pin_enabled: bool,
     /// Whether to run the OSV.dev vulnerability scan and render its
     /// diagnostics/hover content. Default `true` (opt-out): `cargo audit`/
     /// `npm audit` run by default, and an opt-in gate would undercut the
@@ -159,6 +178,8 @@ impl Default for DiagnosticsConfig {
             yanked_severity: default_yanked_severity(),
             unsatisfiable_severity: default_unsatisfiable_severity(),
             deprecated_severity: default_deprecated_severity(),
+            mutable_ref_pin_severity: default_mutable_ref_pin_severity(),
+            mutable_ref_pin_enabled: true,
             vulnerabilities_enabled: true,
         }
     }
@@ -180,6 +201,8 @@ impl DiagnosticsConfig {
     /// assert_eq!(severities.yanked, config.yanked_severity);
     /// assert_eq!(severities.unsatisfiable, config.unsatisfiable_severity);
     /// assert_eq!(severities.deprecated, config.deprecated_severity);
+    /// assert_eq!(severities.mutable_ref_pin, config.mutable_ref_pin_severity);
+    /// assert_eq!(severities.mutable_ref_pin_enabled, config.mutable_ref_pin_enabled);
     /// ```
     #[must_use]
     pub const fn to_severities(&self) -> deps_core::DiagnosticSeverities {
@@ -189,6 +212,8 @@ impl DiagnosticsConfig {
             yanked: self.yanked_severity,
             unsatisfiable: self.unsatisfiable_severity,
             deprecated: self.deprecated_severity,
+            mutable_ref_pin: self.mutable_ref_pin_severity,
+            mutable_ref_pin_enabled: self.mutable_ref_pin_enabled,
         }
     }
 }
@@ -350,6 +375,10 @@ const fn default_unsatisfiable_severity() -> DiagnosticSeverity {
 
 const fn default_deprecated_severity() -> DiagnosticSeverity {
     DiagnosticSeverity::WARNING
+}
+
+const fn default_mutable_ref_pin_severity() -> DiagnosticSeverity {
+    DiagnosticSeverity::HINT
 }
 
 const fn default_refresh_interval() -> u64 {
@@ -778,6 +807,38 @@ mod tests {
         let json = r"{}";
         let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.deprecated_severity, DiagnosticSeverity::WARNING);
+    }
+
+    /// Severity default (issue #473) — see `mutable_ref_pin_enabled` tests below for the
+    /// separate on/off toggle, unlike `deprecated_severity`'s severity-only precedent.
+    #[test]
+    fn test_diagnostics_config_mutable_ref_pin_severity_defaults_hint() {
+        let config = DiagnosticsConfig::default();
+        assert_eq!(config.mutable_ref_pin_severity, DiagnosticSeverity::HINT);
+
+        let json = r"{}";
+        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mutable_ref_pin_severity, DiagnosticSeverity::HINT);
+    }
+
+    /// FR-009 (corrected during implementation review): mirrors
+    /// `test_diagnostics_config_vulnerabilities_enabled_defaults_true` — this diagnostic
+    /// does need a real `_enabled` toggle, since severity alone cannot suppress it.
+    #[test]
+    fn test_diagnostics_config_mutable_ref_pin_enabled_defaults_true() {
+        let config = DiagnosticsConfig::default();
+        assert!(config.mutable_ref_pin_enabled);
+
+        let json = r"{}";
+        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
+        assert!(config.mutable_ref_pin_enabled);
+    }
+
+    #[test]
+    fn test_diagnostics_config_mutable_ref_pin_enabled_can_be_disabled() {
+        let json = r#"{ "mutable_ref_pin_enabled": false }"#;
+        let config: DiagnosticsConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.mutable_ref_pin_enabled);
     }
 
     #[test]

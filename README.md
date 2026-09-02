@@ -252,6 +252,8 @@ Configure via LSP initialization options:
     "yanked_severity": "warning",
     "unsatisfiable_severity": "warning",
     "deprecated_severity": "warning",
+    "mutable_ref_pin_severity": "hint",
+    "mutable_ref_pin_enabled": true,
     "vulnerabilities_enabled": true
   },
   "freshness": {
@@ -287,6 +289,9 @@ Configure via LSP initialization options:
 
 > [!NOTE]
 > `diagnostics.deprecated_severity` flags a dependency whose *package* — not a specific version — is reported as deprecated/abandoned (`This package is deprecated: <reason>`), with a matching hover section and, for Composer packages naming a successor, a "Replace with X" quick fix. Currently sourced from **npm**'s `deprecated` field and **Composer**'s `abandoned` field only. See [Package Deprecation Diagnostics](docs/ECOSYSTEM_GUIDE.md#package-deprecation-diagnostics-issue-205) for the full ecosystem coverage table and how this differs from the yanked diagnostic above.
+
+> [!NOTE]
+> `diagnostics.mutable_ref_pin_severity` flags a **GitHub Actions** `uses:` step pinned to a mutable ref (a tag, e.g. `actions/checkout@v4`) instead of a full commit SHA — a supply-chain hardening recommendation independent of the outdated-version check above (a step can be both up to date *and* mutable). Comes with a "Pin `<name>` to commit SHA" quick fix that rewrites the ref to `<sha> # <tag>`, when the tag's commit SHA is already known. Set `diagnostics.mutable_ref_pin_enabled` to `false` to turn the diagnostic off entirely — unlike the other diagnostics above, severity alone cannot silence it. GitHub Actions only; see [Mutable-Ref-Pin Diagnostic](docs/ECOSYSTEM_GUIDE.md#mutable-ref-pin-diagnostic-issue-473) for full details.
 
 ### Configuration reference
 

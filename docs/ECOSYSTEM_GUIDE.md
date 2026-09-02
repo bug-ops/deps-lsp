@@ -586,6 +586,45 @@ message is shown verbatim, which is the useful part), just not an automated rena
 | Composer | Yes, with replace action | `abandoned` (bare `true`, or a string naming a successor package) |
 | Cargo, Go, PyPI, Bundler, Dart, Maven, Gradle, Swift, NuGet, Deno | Not yet | No registry-native package-level deprecation signal wired up yet (tracked as fast-follows; Dart's `isDiscontinued`/`replacedBy` and PyPI's PEP 792 `project-status` already exist on the wire and are the best next targets) |
 
+### Mutable-Ref-Pin Diagnostic (issue #473)
+
+**GitHub Actions only.** A `uses:` step pinned to a mutable ref — a tag (`actions/checkout@v4`)
+or, in a future iteration, a branch — can silently start running different code than the
+workflow file shows: a compromised or republished tag changes what CI executes without a single
+line of the workflow file changing. This is a distinct, additive signal from the outdated-version
+diagnostic above (configurable via `diagnostics.mutable_ref_pin_severity`, default HINT) — a step
+can be up to date on its tag and still vulnerable to tag mutation, so both diagnostics can fire
+independently on the same step with distinct codes:
+
+```
+actions/checkout is pinned to the mutable tag ref `v4`; pin to a full commit SHA to guard against tag mutation
+```
+
+Unlike every other diagnostic in this project, severity alone cannot silence this one —
+`DiagnosticSeverity` has no suppression value. Set `diagnostics.mutable_ref_pin_enabled` to
+`false` in initialization options to turn it off entirely for teams that intentionally accept
+tag pinning.
+
+**"Pin `<name>` to commit SHA" quick fix.** When offered, rewrites the step's ref to
+`<sha> # <tag>` — the exact same `{sha} # {tag}` shape the outdated-SHA-update quick fix already
+produces for a SHA-pinned step, reusing the tag/SHA cross-reference already populated by the
+existing outdated-version check (zero new network calls). The quick fix is withheld, not offered
+with a wrong or destructive edit, in two cases:
+
+- The tag's commit SHA is not yet known — e.g. the document was opened before the registry fetch
+  completed, or the tag was moved/deleted/is not a full `major.minor.patch` release the registry
+  indexes (a moving major-version ref like `v4` itself is frequently in this category — GitHub's
+  tags API lists `v4.3.1`, not a synthetic `v4` tag object).
+- The `uses:` value is a **quoted YAML scalar** (`uses: "actions/checkout@v4"`). The ref text
+  sits inside the quotes there, so appending `# <tag>` would place a `#` inside the string rather
+  than starting a YAML comment — a `uses:` value GitHub Actions rejects. Re-pin a quoted step by
+  hand, or remove the quotes first.
+
+**Out of scope for this iteration:** branch pins (`@main`) get no diagnostic yet — no
+tag-to-SHA-style index exists for branches, and adding one would require a new network call per
+branch; reusable-workflow calls (`owner/repo/.github/workflows/x.yml@ref`) and `./local`/
+`docker://` references are not resolvable refs and get no diagnostic either.
+
 ### npm Package Name Validation
 
 When a dependency in `package.json` fails to resolve against the npm registry, the diagnostic distinguishes between two cases instead of always reporting "Unknown package":
