@@ -2,7 +2,7 @@ use tower_lsp_server::ls_types::{
     CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Uri,
 };
 
-use crate::osv::{ADVISORY_DISPLAY_CAP, ScanOutcome, diagnostic_severity_for};
+use crate::osv::{ScanOutcome, diagnostic_severity_for};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, ParseResult, PublishTime, RemovalStatus, VersionReq,
     format_relative_age, is_within_cooldown,
@@ -856,10 +856,10 @@ fn push_deprecation_diagnostic(
 
 /// Pushes one [`Diagnostic`] per advisory (each with its own severity, code,
 /// and clickable `code_description`), capped at
-/// [`ADVISORY_DISPLAY_CAP`] plus a trailing "+N more advisories" entry.
+/// [`crate::osv::ADVISORY_DISPLAY_CAP`] plus a trailing "+N more advisories" entry.
 ///
-/// `N` is derived from `dv.total_known` — the batch result's reported count —
-/// never from `dv.advisories.len()`, since invariant 3 (`architecture.md` §8)
+/// `N` is derived from [`crate::osv::Capped::remaining`] — the batch result's reported count,
+/// never from `dv.advisories.items().len()`, since invariant 3 (`architecture.md` §8)
 /// caps the record *fetch* independently of the render cap.
 fn push_vulnerability_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
@@ -868,10 +868,7 @@ fn push_vulnerability_diagnostics(
 ) {
     let range = dep.version_range().unwrap_or_else(|| dep.name_range());
 
-    let shown = dv.advisories.iter().take(ADVISORY_DISPLAY_CAP);
-    let mut shown_count = 0usize;
-    for advisory in shown {
-        shown_count += 1;
+    for advisory in dv.advisories.items() {
         let code_description = advisory
             .url
             .parse::<Uri>()
@@ -896,7 +893,7 @@ fn push_vulnerability_diagnostics(
         });
     }
 
-    let remaining = dv.total_known.saturating_sub(shown_count);
+    let remaining = dv.advisories.remaining();
     if remaining > 0 {
         diagnostics.push(Diagnostic {
             range,
@@ -2650,7 +2647,8 @@ mod tests {
     fn test_generate_diagnostics_vulnerable_dependency_emits_advisory_diagnostic_even_without_registry_data()
      {
         use crate::osv::{
-            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
         };
 
         let formatter = MockFormatter;
@@ -2668,9 +2666,11 @@ mod tests {
         vulns.insert(
             "vulnerable-pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
-                total_known: 1,
-                fix_target_status: None,
+                advisories: Capped::new(
+                    vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -2698,7 +2698,8 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_advisory_cap_emits_more_count_from_total_known() {
         use crate::osv::{
-            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+            ADVISORY_DISPLAY_CAP, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
         };
 
         let formatter = MockFormatter;
@@ -2717,9 +2718,8 @@ mod tests {
         vulns.insert(
             "noisy-pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories,
-                total_known: 40,
-                fix_target_status: None,
+                advisories: Capped::new(advisories, 40),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -2753,8 +2753,8 @@ mod tests {
         // result lands under its own key instead of colliding on the plain
         // name. The patched occurrence must render no advisory diagnostic.
         use crate::osv::{
-            DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
-            vulnerability_keys,
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap, vulnerability_keys,
         };
         use tower_lsp_server::ls_types::{Position, Range};
 
@@ -2798,9 +2798,11 @@ mod tests {
         vulns.insert(
             vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
-                total_known: 1,
-                fix_target_status: None,
+                advisories: Capped::new(
+                    vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );

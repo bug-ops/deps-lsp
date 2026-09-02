@@ -508,8 +508,8 @@ serde = "1.0.0"
             // together, confirming the wiring order (generate -> attach ->
             // filter) end-to-end rather than only at the helper-unit level.
             use deps_core::osv::{
-                Advisory, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
-                VulnerabilityMap,
+                Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
+                VulnSeverity, VulnerabilityMap,
             };
             use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
 
@@ -534,20 +534,22 @@ serde = "1.0.0"
             vulnerabilities.insert(
                 "serde".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                    advisories: vec![Arc::new(Advisory {
-                        id: "RUSTSEC-2020-0071".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.0.5".to_string()],
-                        url: String::new(),
-                    })],
-                    total_known: 1,
-                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    advisories: Capped::new(
+                        vec![Arc::new(Advisory {
+                            id: "RUSTSEC-2020-0071".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            fixed_versions: vec!["1.0.5".to_string()],
+                            url: String::new(),
+                        })],
+                        1,
+                    ),
+                    fix_target_status: UpgradeStatus::CandidateClean {
                         version: "1.0.5".to_string(),
-                    }),
+                    },
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
@@ -672,8 +674,8 @@ serde = "1.0.0"
             // `context.only: [QUICKFIX]` additionally drops any REFACTOR items a live
             // fetch might otherwise have produced.
             use deps_core::osv::{
-                Advisory, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
-                VulnerabilityMap,
+                Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
+                VulnSeverity, VulnerabilityMap,
             };
             use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
 
@@ -701,20 +703,22 @@ serde = "1.0.0"
             vulnerabilities.insert(
                 "vapor/vapor".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
-                    advisories: vec![Arc::new(Advisory {
-                        id: "GHSA-test-0001".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["4.50.1".to_string()],
-                        url: String::new(),
-                    })],
-                    total_known: 1,
-                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    advisories: Capped::new(
+                        vec![Arc::new(Advisory {
+                            id: "GHSA-test-0001".to_string(),
+                            modified: "2023-01-01T00:00:00Z".to_string(),
+                            summary: None,
+                            aliases: vec![],
+                            severity: VulnSeverity::High,
+                            cvss_vector: None,
+                            fixed_versions: vec!["4.50.1".to_string()],
+                            url: String::new(),
+                        })],
+                        1,
+                    ),
+                    fix_target_status: UpgradeStatus::CandidateClean {
                         version: "4.50.1".to_string(),
-                    }),
+                    },
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );

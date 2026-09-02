@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use deps_core::VersionData;
 use deps_core::osv::{
-    Advisory, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity, VulnerabilityMap,
+    Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+    VulnerabilityMap,
 };
 
 use super::ServerState;
@@ -69,9 +70,8 @@ async fn diagnostics_snapshot_for(
     vulnerabilities.insert(
         normalized_key,
         ScanOutcome::Vulnerable(DependencyVulnerabilities {
-            advisories: vec![sample_advisory()],
-            total_known: 6,
-            fix_target_status: None,
+            advisories: Capped::new(vec![sample_advisory()], 6),
+            fix_target_status: UpgradeStatus::NotChecked,
             upgrade_status: UpgradeStatus::NotChecked,
         }),
     );

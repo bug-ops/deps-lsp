@@ -675,9 +675,9 @@ const FIX_TARGET_KEY_SUFFIX: &str = "\u{0}fix";
 ///
 /// A dependency whose F fails [`deps_core::lsp_helpers::is_safe_version_string`], or whose
 /// `osv_name` is unavailable, is skipped (logged at `debug`), never crashes the scan. A
-/// dependency whose live check above times out or fails simply keeps `fix_target_status:
-/// None` (case 2's `HashMap` result never carries that key) — the safe, fail-closed
-/// degradation FR-004/NFR-002 call for: `deps_core::lsp_helpers::code_actions::fix_target_is_verified`
+/// dependency whose live check above times out or fails simply keeps `fix_target_status`
+/// left at `NotChecked` (case 2's `HashMap` result never carries that key) — the safe,
+/// fail-closed degradation FR-004/NFR-002 call for: `deps_core::lsp_helpers::code_actions::fix_target_is_verified`
 /// treats an unresolved status as unverified and omits the fix action, so a stalled
 /// verification never surfaces a fix action that was never actually checked.
 #[allow(clippy::too_many_arguments)]
@@ -703,7 +703,7 @@ async fn run_osv_fix_target_verification(
 
     for (key, status) in resolved {
         if let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get_mut(key.as_str()) {
-            dv.fix_target_status = Some(status);
+            dv.fix_target_status = status;
         }
     }
 
@@ -724,7 +724,7 @@ async fn run_osv_fix_target_verification(
 enum FixTargetResolution {
     /// No fix recommended, F failed [`deps_core::lsp_helpers::is_safe_version_string`], or no
     /// `osv_name` is on record for this key — nothing to verify or record; `fix_target_status`
-    /// stays untouched (`None`).
+    /// stays untouched (left at `NotChecked`).
     Skip,
     /// F's status was resolved without a network call by reusing the already-checked
     /// "latest" candidate's result (FR-002, F == latest).
@@ -823,9 +823,9 @@ fn collect_fix_target_resolutions(
 /// [`FIX_TARGET_KEY_SUFFIX`] back onto the matching dependency's `fix_target_status`.
 ///
 /// A key absent from `statuses` (timeout, OSV outage, or a chunk `check_candidates` itself
-/// dropped) simply leaves that dependency's `fix_target_status` untouched — `None` if it was
-/// never set, which is exactly the fail-closed degradation FR-004/NFR-002 call for (never a
-/// panic, never a fabricated "verified" status).
+/// dropped) simply leaves that dependency's `fix_target_status` untouched — still
+/// `NotChecked` if it was never set, which is exactly the fail-closed degradation
+/// FR-004/NFR-002 call for (never a panic, never a fabricated "verified" status).
 fn apply_live_fix_target_statuses(
     vulnerabilities: &mut deps_core::osv::VulnerabilityMap,
     statuses: HashMap<String, deps_core::osv::UpgradeStatus>,
@@ -837,7 +837,7 @@ fn apply_live_fix_target_statuses(
             continue;
         };
         if let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get_mut(key) {
-            dv.fix_target_status = Some(status);
+            dv.fix_target_status = status;
         }
     }
 }
@@ -6802,7 +6802,7 @@ tokio = "1.0"
         use super::*;
         use deps_core::lsp_helpers::EcosystemFormatter;
         use deps_core::osv::{
-            Advisory, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
             VulnerabilityMap,
         };
         use std::sync::Arc;
@@ -6834,11 +6834,11 @@ tokio = "1.0"
             advisories: Vec<Arc<Advisory>>,
             upgrade_status: UpgradeStatus,
         ) -> DependencyVulnerabilities {
+            let total = advisories.len();
             DependencyVulnerabilities {
-                total_known: advisories.len(),
-                advisories,
+                advisories: Capped::new(advisories, total),
                 upgrade_status,
-                fix_target_status: None,
+                fix_target_status: UpgradeStatus::NotChecked,
             }
         }
 
@@ -7021,8 +7021,8 @@ tokio = "1.0"
         fn apply_live_fix_target_statuses_sets_only_matching_keys_leaving_others_untouched() {
             // Case (e): a live-check batch that timed out for one dependency simply omits
             // its key from `statuses` — that dependency's `fix_target_status` must stay
-            // `None` afterward, with no panic, while a dependency whose result did arrive
-            // gets it applied.
+            // `NotChecked` afterward, with no panic, while a dependency whose result did
+            // arrive gets it applied.
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
                 "checked".to_string(),
@@ -7055,16 +7055,16 @@ tokio = "1.0"
             };
             assert_eq!(
                 checked.fix_target_status,
-                Some(UpgradeStatus::CandidateClean {
+                UpgradeStatus::CandidateClean {
                     version: "1.0.0".to_string()
-                })
+                }
             );
 
             let ScanOutcome::Vulnerable(timed_out) = vulnerabilities.get("timed-out").unwrap()
             else {
                 panic!("expected Vulnerable");
             };
-            assert_eq!(timed_out.fix_target_status, None);
+            assert_eq!(timed_out.fix_target_status, UpgradeStatus::NotChecked);
         }
     }
 

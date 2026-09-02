@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **repo**: per-crate `[dependencies]`/`[dev-dependencies]` tables in 8 member crates are now sorted alphabetically (resolves #445) (#446)
 - **Breaking (pre-1.0, public API)**: `PackageVersions::yanked` field type changed from `Arc<[ConcreteVersion]>` to `Arc<[(ConcreteVersion, RemovalStatus)]>`, carrying each yanked/deprecated version's `RemovalStatus` (resolves #437) (#438)
 - **deps-npm, deps-composer**: `AdvisoryDeprecated` no longer feeds the manifest-requirement yanked diagnostic; the #205 package-level deprecation diagnostic is now its sole signal (resolves #436) (#439)
+- **Breaking (pre-1.0, public API)**: `deps-core` extracts a shared `Capped<T>` type for the "possibly-truncated list + total count" pattern, replacing the separate `Vec<T>` + `total_known: usize` fields on `DependencyVulnerabilities::advisories` and `UpgradeStatus::CandidateVulnerable::advisory_ids`; `DependencyVulnerabilities::fix_target_status` drops its redundant `Option` wrapper in favor of `UpgradeStatus::NotChecked` (resolves #469, #468)
 
 ### Fixed
 - **deps-core, deps-lsp**: the "requirement satisfiable only by a yanked version" diagnostic no longer lets a co-occurring package-level deprecation finding hide a genuine hard yank (resolves #437) (#438)
