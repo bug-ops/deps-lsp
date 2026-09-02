@@ -310,7 +310,9 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     push_deprecation_hover_section(
         &mut markdown,
         formatter,
-        versions.deprecations.and_then(|m| m.get(&normalized_name)),
+        versions
+            .outcomes
+            .and_then(|o| o.deprecation(&normalized_name)),
     );
     push_vulnerability_hover_section(&mut markdown, vuln_outcome);
 
@@ -1682,9 +1684,8 @@ mod tests {
         let parse_result = freshness_test_parse_result("pkg");
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let mut deprecations = HashMap::new();
-        deprecations.insert(
-            "pkg".to_string(),
+        let outcomes = crate::lsp_helpers::DependencyOutcomes::new().with_deprecation(
+            "pkg",
             crate::Deprecation {
                 reason: Some("no longer maintained".to_string()),
                 replacement: None,
@@ -1694,7 +1695,7 @@ mod tests {
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2),
-            VersionData::new(&cached_versions, &resolved_versions).with_deprecations(&deprecations),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &registry,
             &NpmLikeFormatter,
             crate::freshness::FreshnessSettings::default(),

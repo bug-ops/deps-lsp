@@ -4,8 +4,8 @@ use deps_core::lockfile::LockFileCache;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{
-    ConcreteVersion, Deprecation, EcosystemId, EcosystemRegistry, FetchFailure, PackageName,
-    PackageVersions, ParseResult, RemovalStatus,
+    ConcreteVersion, DependencyOutcomes, EcosystemId, EcosystemRegistry, PackageName,
+    PackageVersions, ParseResult,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,29 +57,15 @@ pub struct DocumentState {
     /// the first background scan completes; carried across document edits
     /// by `preserve_cache` so it is not wiped on every keystroke.
     pub vulnerabilities: VulnerabilityMap,
-    /// Yanked-version findings from the lifecycle's registry fetch, keyed by
-    /// **normalized** package name -> the version string found yanked. This
-    /// is deliberately a different type from `FetchResult::yanked_versions`
-    /// (raw-keyed): the split makes a forgotten normalization at a
-    /// store/merge site a compile error rather than a silent bug for
-    /// ecosystems where normalization changes the name (e.g. PyPI). Empty
-    /// until the first fetch completes; carried across document edits by
-    /// `preserve_cache`.
-    pub yanked_versions: HashMap<String, (ConcreteVersion, RemovalStatus)>,
-    /// Package-level deprecation findings from the lifecycle's registry fetch (issue
-    /// #205), keyed by **normalized** package name — same raw/normalized split
-    /// rationale as [`Self::yanked_versions`]. Empty until the first fetch completes;
-    /// carried across document edits by `preserve_cache`.
-    pub deprecations: HashMap<String, Deprecation>,
-    /// Packages whose registry fetch errored or timed out on the most recent
-    /// lifecycle fetch, keyed by **normalized** package name (same raw/normalized
-    /// split as `yanked_versions` above, for the same reason — see §3.1). Lets
-    /// diagnostic generation (#267) distinguish "the registry said this package
-    /// doesn't exist" from "the registry couldn't be asked", so a transient
-    /// outage isn't reported as "Unknown package". Cleared and repopulated by
-    /// each fetch cycle; carried across document edits by `preserve_cache` so
-    /// it doesn't flicker off on every keystroke, same as `yanked_versions`.
-    pub fetch_failed: HashMap<String, FetchFailure>,
+    /// Yanked, deprecation, and fetch-failure findings from the lifecycle's registry
+    /// fetch, keyed by **normalized** package name. This is deliberately a different
+    /// type from `FetchResult`'s raw-keyed triple: the split makes a forgotten
+    /// normalization at a store/merge site a compile error rather than a silent bug for
+    /// ecosystems where normalization changes the name (e.g. PyPI). See
+    /// [`DependencyOutcome`](deps_core::DependencyOutcome) for what each of the three
+    /// channels means. Empty until the first fetch completes; carried across document
+    /// edits by `preserve_cache` so it doesn't flicker off on every keystroke.
+    pub outcomes: DependencyOutcomes,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -105,9 +91,7 @@ impl Clone for DocumentState {
             cached_versions: self.cached_versions.clone(),
             resolved_versions: self.resolved_versions.clone(),
             vulnerabilities: self.vulnerabilities.clone(),
-            yanked_versions: self.yanked_versions.clone(),
-            deprecations: self.deprecations.clone(),
-            fetch_failed: self.fetch_failed.clone(),
+            outcomes: self.outcomes.clone(),
             parsed_at: self.parsed_at,
             loading_state: self.loading_state,
             // Note: Instant is Copy. Clones share the same loading start time.
@@ -206,9 +190,9 @@ impl std::fmt::Debug for DocumentState {
             .field("cached_versions_count", &self.cached_versions.len())
             .field("resolved_versions_count", &self.resolved_versions.len())
             .field("vulnerabilities_count", &self.vulnerabilities.len())
-            .field("yanked_versions_count", &self.yanked_versions.len())
-            .field("deprecations_count", &self.deprecations.len())
-            .field("fetch_failed_count", &self.fetch_failed.len())
+            .field("yanked_versions_count", &self.outcomes.yanked_count())
+            .field("deprecations_count", &self.outcomes.deprecation_count())
+            .field("fetch_failed_count", &self.outcomes.fetch_failure_count())
             .field("parsed_at", &self.parsed_at)
             .field("loading_state", &self.loading_state)
             .field("loading_started_at", &self.loading_started_at)
@@ -233,9 +217,7 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
-            yanked_versions: HashMap::new(),
-            deprecations: HashMap::new(),
-            fetch_failed: HashMap::new(),
+            outcomes: DependencyOutcomes::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -255,9 +237,7 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             vulnerabilities: VulnerabilityMap::new(),
-            yanked_versions: HashMap::new(),
-            deprecations: HashMap::new(),
-            fetch_failed: HashMap::new(),
+            outcomes: DependencyOutcomes::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -302,24 +282,10 @@ impl DocumentState {
         self.vulnerabilities = vulnerabilities;
     }
 
-    /// Updates the yanked-version findings, keyed by normalized package name.
-    pub fn update_yanked_versions(
-        &mut self,
-        yanked_versions: HashMap<String, (ConcreteVersion, RemovalStatus)>,
-    ) {
-        self.yanked_versions = yanked_versions;
-    }
-
-    /// Updates the package-level deprecation findings (issue #205), keyed by
-    /// normalized package name.
-    pub fn update_deprecations(&mut self, deprecations: HashMap<String, Deprecation>) {
-        self.deprecations = deprecations;
-    }
-
-    /// Replaces the set of packages whose registry fetch errored or timed out
-    /// (normalized-keyed, see [`Self::fetch_failed`]).
-    pub fn update_fetch_failed(&mut self, fetch_failed: HashMap<String, FetchFailure>) {
-        self.fetch_failed = fetch_failed;
+    /// Replaces the yanked/deprecation/fetch-failure outcome map wholesale (normalized-keyed,
+    /// see [`Self::outcomes`]).
+    pub fn replace_outcomes(&mut self, outcomes: DependencyOutcomes) {
+        self.outcomes = outcomes;
     }
 
     /// Sets the LSP document version from the client's `didOpen`/`didChange`, or clears

@@ -362,8 +362,8 @@ fn build_replacement_action(
 
     let normalized_name = formatter.normalize_package_name(dep.name());
     let replacement = versions
-        .deprecations
-        .and_then(|d| d.get(&normalized_name))
+        .outcomes
+        .and_then(|o| o.deprecation(&normalized_name))
         .and_then(|dep_info| dep_info.replacement.as_deref())
         .filter(|r| !r.is_empty())?;
 
@@ -559,7 +559,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     let unsat_fix =
         build_unsatisfiable_fix_action(dep, uri, version_range, versions, version_req, formatter);
     // Registry-independent for the same FR-007 reason as the two fix actions above —
-    // `versions.deprecations` is cache-derived, not a fresh registry call.
+    // `versions.outcomes`' deprecation channel is cache-derived, not a fresh registry call.
     let replacement_action = build_replacement_action(
         dep,
         uri,
