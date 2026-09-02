@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: refactored `generate_diagnostics_from_cache`'s per-dependency checks into an explicit ordered rule pipeline; no behavior change (resolves #500)
 - **deps-core**: order-sensitive diagnostics tests now pin exact `diagnostics[i]` message/code instead of presence-only checks, closing a regression-detection gap left by #500's refactor; no behavior change (resolves #508) (#509)
 - **Breaking (pre-1.0, user-facing config)**: **deps-lsp**: `cargo.workspace_registries` is renamed to `registries.workspace_registries` (now also governs npm's `.npmrc` resolution); no compatibility alias, so a client still sending the old key falls back to defaults (resolves #502) (#510)
-- **deps-gradle**: simplified regex caching from `OnceLock` + wrapper functions to `LazyLock<Regex>`, matching the `deps-swift`/`deps-bundler`/`deps-go` idiom; no behavior change (resolves #511)
+- **deps-gradle**: simplified regex caching from `OnceLock` + wrapper functions to `LazyLock<Regex>`, matching the `deps-swift`/`deps-bundler`/`deps-go` idiom; no behavior change (resolves #511) (#514)
 
 ### Fixed
 - **deps-github-actions**: a tags-API page with one entry missing/malformed `commit.sha` no longer aborts the whole page's parse and silently truncates later pages — only that entry is now skipped (side effect of the #472 GitHub-tags-client extraction) (#476)
