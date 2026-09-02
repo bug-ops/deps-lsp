@@ -9,7 +9,7 @@ use deps_core::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
@@ -139,8 +139,11 @@ impl Clone for DocumentState {
 pub struct ColdStartLimiter {
     /// Maps URI to last cold start attempt time.
     last_attempts: DashMap<Uri, Instant>,
-    /// Minimum interval between cold start attempts for the same URI.
-    min_interval: Duration,
+    /// Minimum interval between cold start attempts for the same URI, in
+    /// milliseconds. Atomic so `set_min_interval` can live-update it from
+    /// `did_change_configuration` (issue #499) without disturbing in-flight
+    /// `allow_cold_start` callers.
+    min_interval_ms: AtomicU64,
 }
 
 impl ColdStartLimiter {
@@ -148,21 +151,31 @@ impl ColdStartLimiter {
     pub fn new(min_interval: Duration) -> Self {
         Self {
             last_attempts: DashMap::new(),
-            min_interval,
+            min_interval_ms: AtomicU64::new(min_interval.as_millis() as u64),
         }
+    }
+
+    /// Updates the minimum interval between cold start attempts.
+    ///
+    /// Takes effect on the next `allow_cold_start` call. Used to apply a
+    /// live-reloaded `cold_start.rate_limit_ms` (issue #499).
+    pub fn set_min_interval(&self, min_interval: Duration) {
+        self.min_interval_ms
+            .store(min_interval.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Returns true if cold start is allowed, false if rate limited.
     ///
     /// Updates the last attempt time if the cold start is allowed.
     pub fn allow_cold_start(&self, uri: &Uri) -> bool {
+        let min_interval = Duration::from_millis(self.min_interval_ms.load(Ordering::Relaxed));
         let now = Instant::now();
 
         // Check last attempt time
         if let Some(mut entry) = self.last_attempts.get_mut(uri) {
             let elapsed = now.duration_since(*entry);
-            if elapsed < self.min_interval {
-                let retry_after = self.min_interval.checked_sub(elapsed).unwrap();
+            if elapsed < min_interval {
+                let retry_after = min_interval.checked_sub(elapsed).unwrap();
                 tracing::warn!(
                     "Cold start rate limited for {:?} (retry after {:?})",
                     uri,
@@ -509,8 +522,13 @@ impl ServerState {
             Arc::clone(&registry_policy),
         );
 
-        // Create cold start limiter with default 100ms interval (10 req/sec per URI)
-        let cold_start_limiter = ColdStartLimiter::new(Duration::from_millis(100));
+        // Default interval, live-updated by `set_min_interval` once `initialize`/
+        // `did_change_configuration` parses a real `cold_start.rate_limit_ms` (issue
+        // #499). Sourced from `ColdStartConfig::default()` rather than a bare literal
+        // so this can never drift from `default_rate_limit_ms()`.
+        let cold_start_limiter = ColdStartLimiter::new(Duration::from_millis(
+            crate::config::ColdStartConfig::default().rate_limit_ms,
+        ));
 
         Self {
             documents: DashMap::new(),
@@ -1158,6 +1176,34 @@ mod tests {
             assert!(
                 limiter.allow_cold_start(&uri),
                 "Request after interval should be allowed"
+            );
+        }
+
+        /// Issue #499: `set_min_interval` must actually change rate-limiting
+        /// behavior, not just be stored inertly.
+        #[tokio::test]
+        async fn test_set_min_interval_changes_behavior() {
+            let limiter = ColdStartLimiter::new(Duration::from_millis(100));
+            let uri = deps_core::test_util::test_uri("/test.toml");
+
+            assert!(limiter.allow_cold_start(&uri), "First request allowed");
+            assert!(
+                !limiter.allow_cold_start(&uri),
+                "Second immediate request blocked under the original 100ms interval"
+            );
+
+            // `rate_limit_ms: 0` disables rate limiting entirely (`elapsed < ZERO` is
+            // never true), so this is deterministic regardless of scheduling jitter —
+            // no sleep needed, unlike a short nonzero interval would require.
+            limiter.set_min_interval(Duration::ZERO);
+
+            assert!(
+                limiter.allow_cold_start(&uri),
+                "Lowering the interval to 0 should allow every request immediately"
+            );
+            assert!(
+                limiter.allow_cold_start(&uri),
+                "A zero interval keeps allowing consecutive requests"
             );
         }
 

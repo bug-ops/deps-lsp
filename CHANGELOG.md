@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: `deps-core`'s `GithubTagsClient::headers()` is now crate-private; authenticated GitHub requests go through the new `fetch_authenticated` method (trusted-origin-pinned), and the auth token is wrapped in a redacting `AuthToken` type that never leaks via `Debug`/`Display` (resolves #484) (#487)
 - **Breaking (pre-1.0, public API)**: `deps-core`, `deps-lsp` consolidate the yanked/deprecation/fetch-failure maps into one `DependencyOutcome`/`DependencyOutcomes` type; `VersionData`'s three `with_yanked`/`with_deprecations`/`with_fetch_failed` builders and fields collapse into `with_outcomes`/`outcomes`, removing triplicated re-keying and pruning logic (resolves #481) (#488)
 - **Breaking (pre-1.0, public API)**: `deps_core::lsp_helpers::generate_diagnostics_from_cache` gained a required `uri: &Uri` parameter, used to anchor `DiagnosticRelatedInformation` locations for collapsed fetch-failure diagnostics (resolves #479) (#489)
+- **deps-core**: refactored `generate_diagnostics_from_cache`'s per-dependency checks into an explicit ordered rule pipeline; no behavior change (resolves #500)
+- **deps-core**: order-sensitive diagnostics tests now pin exact `diagnostics[i]` message/code instead of presence-only checks, closing a regression-detection gap left by #500's refactor; no behavior change (resolves #508) (#509)
 - **Breaking (pre-1.0, user-facing config)**: **deps-lsp**: `cargo.workspace_registries` is renamed to `registries.workspace_registries` (now also governs npm's `.npmrc` resolution); no compatibility alias, so a client still sending the old key falls back to defaults (resolves #502) (#510)
 
 ### Fixed
@@ -50,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-core**: hover release-age hint and cooldown diagnostic now fire for GitHub Actions — `GithubActionsRegistry` enriches tags-API versions with GitHub Release publish dates via a new shared `deps_core::github::ReleaseDatesCache`, also adopted by `deps-swift` (resolves #486) (#494)
 - **deps-lsp**: a client that never answers a server-initiated `workspace/inlayHint/refresh`, `workspace/codeLens/refresh`, `client/registerCapability`, or `workspace/diagnostic/refresh` request no longer permanently stalls the OSV vulnerability commit and diagnostics publish for that document; these requests are now capability-gated and timeout-bounded (5s) instead of awaited unconditionally on the critical path (resolves #493) (#495)
 - **deps-lsp**: a client that never answers `workspace/applyEdit` for `deps-lsp.updateVersion` or `deps-lsp.updateAllOutdated` no longer permanently occupies a `workspace/executeCommand` concurrency slot; the request is now timeout-bounded (5s), same as #493's fix (resolves #496) (#498)
+- **deps-lsp**: `cold_start.rate_limit_ms` now actually rate-limits cold starts instead of being parsed and silently ignored in favor of a hardcoded 100ms interval (resolves #499) (#504)
+- **deps-github-actions**: resolve SHA-pin quickfix never firing for bare-major moving GitHub Actions tags (v3, v4) (resolves #503)
+- **deps-core, deps-github-actions**: hover no longer shows the "Press Cmd+. to update version" footer for a dependency with no actual data or code action while `network.offline` is set (resolves #501) (#506)
 
 ### Removed
 - **Breaking (pre-1.0, public API)**: **deps-lsp**: dropped the dead `CacheConfig::refresh_interval_secs` field — `HttpCache` has no local TTL concept to attach it to (resolves #492) (#498)

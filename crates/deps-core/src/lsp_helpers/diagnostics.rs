@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use tower_lsp_server::ls_types::{
     CodeDescription, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location,
     NumberOrString, Position, Range, Uri,
@@ -9,7 +11,9 @@ use crate::{
     RemovalStatus, VersionReq, format_relative_age, is_within_cooldown,
 };
 
-use super::{EcosystemFormatter, RequirementMatcher, RequirementStatus, VersionData};
+use super::{
+    EcosystemFormatter, PackageVersions, RequirementMatcher, RequirementStatus, VersionData,
+};
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
 ///
@@ -501,18 +505,191 @@ pub fn generate_diagnostics_from_cache(
     // collapse still needs to name every affected dependency (via
     // `related_information`) and must never silently drop an `Actionable` hint
     // (#478/#485's whole point) just because #479's collapse kicked in.
-    let mut fetch_failed_diagnostics: Vec<(String, Diagnostic, Option<FetchFailure>)> = Vec::new();
+    let mut fetch_failed: Vec<FetchFailureEntry> = Vec::new();
 
-    // Issue #483 S2/I2: `network.offline` silently degrades every diagnostic in this
-    // function that depends on a registry/OSV fetch — vulnerabilities never queried,
-    // "unknown"/"outdated"/deprecation checks all working from whatever was already
-    // cached. Absence of a warning must not read as "safe" in this *persistent,
-    // user-configured* mode (S2's own argument, applied here to the Problems panel
-    // rather than hover). One file-level diagnostic, not per-dependency: emitting one
-    // per affected dependency (the per-dependency `fetch_failed` message below is
-    // suppressed while offline for exactly this reason) would be strictly noisier than
-    // the failure toast this same PR suppresses for being "unusable" — the two must not
-    // contradict each other.
+    offline_notice(&mut diagnostics, versions, &deps);
+    blocked_registry_diagnostics(&mut diagnostics, parse_result);
+
+    // #394 S2: version-qualified OSV lookup keys, so two occurrences of one
+    // name pinned to different versions never share a `Vulnerable`/`Clean`
+    // result. `None` when this `VersionData` carries no ecosystem (most test
+    // fixtures) — the per-dep lookup below then falls back to the plain
+    // name, unaffected.
+    let vuln_keys = versions.ecosystem.map(|ecosystem| {
+        crate::osv::vulnerability_keys(parse_result, versions.resolved, formatter, ecosystem)
+    });
+
+    for dep in deps {
+        let normalized_name = formatter.normalize_package_name(dep.name());
+        let ctx = RuleContext {
+            dep,
+            normalized_name: &normalized_name,
+            versions,
+            formatter,
+            severities,
+            freshness,
+            now,
+        };
+
+        // R2, R3, R4 run before both terminal guards below (registry outage, no
+        // version range): an OSV / deprecation / in-use-yanked finding must never be
+        // hidden by an unrelated "latest" lookup failure (FR-007/US-004) — each reads
+        // an independent data source.
+        apply_vulnerability_rule(&mut diagnostics, &ctx, vuln_keys.as_ref());
+        let deprecation_found = apply_deprecation_rule(&mut diagnostics, &ctx);
+        let in_use_yanked_emitted =
+            apply_in_use_yanked_rule(&mut diagnostics, &ctx, deprecation_found);
+
+        let Some(package_versions) = ctx.cached_versions() else {
+            apply_unknown_package_rule(&mut diagnostics, &mut fetch_failed, &ctx);
+            continue;
+        };
+
+        // Every rule below anchors its diagnostic on the declared version range.
+        let Some(version_range) = dep.version_range() else {
+            continue;
+        };
+        let resolved = ResolvedData {
+            package_versions,
+            version_range,
+        };
+
+        if apply_unsatisfiable_rule(&mut diagnostics, &ctx, &resolved) == RuleFlow::Stop {
+            continue;
+        }
+        if apply_yanked_only_rule(
+            &mut diagnostics,
+            &ctx,
+            &resolved,
+            YankedOnlyPrior {
+                deprecation_found,
+                in_use_yanked_emitted,
+            },
+        ) == RuleFlow::Stop
+        {
+            continue;
+        }
+        apply_outdated_rule(&mut diagnostics, &ctx, &resolved);
+    }
+
+    push_collapsed_fetch_failures(&mut diagnostics, fetch_failed, uri);
+    diagnostics
+}
+
+/// Per-dependency inputs every rule in the pipeline reads.
+///
+/// Bundled so each rule takes one borrow instead of re-threading seven parameters (and so
+/// no rule can read state a later refactor forgot to pass it). `VersionData<'a>`,
+/// [`crate::freshness::FreshnessSettings`], and [`PublishTime`] are all `Copy`, so
+/// `RuleContext` is held by value.
+struct RuleContext<'a> {
+    dep: &'a dyn Dependency,
+    /// `formatter.normalize_package_name(dep.name())`, computed once per dependency
+    /// because five rules key their lookups on it.
+    normalized_name: &'a str,
+    versions: VersionData<'a>,
+    formatter: &'a dyn EcosystemFormatter,
+    severities: DiagnosticSeverities,
+    /// Whether an "outdated" diagnostic's message should differentiate a release
+    /// still within its cooldown window (issue #227 §4.3). Read only by
+    /// [`apply_outdated_rule`].
+    freshness: crate::freshness::FreshnessSettings,
+    /// The instant every publish age in this call is aged against. Read only by
+    /// [`apply_outdated_rule`].
+    now: PublishTime,
+}
+
+impl<'a> RuleContext<'a> {
+    /// The registry cache entry for this dependency, tried under the normalized name
+    /// first and the declared name second. `None` routes the dependency into the
+    /// unknown-package family (R5) and ends its evaluation.
+    fn cached_versions(&self) -> Option<&'a PackageVersions> {
+        self.versions
+            .cached
+            .get(self.normalized_name)
+            .or_else(|| self.versions.cached.get(self.dep.name()))
+    }
+}
+
+/// The registry-derived inputs the post-lookup rules (R6a, R6b, R7) share.
+///
+/// Constructing one requires both a cache hit (see [`RuleContext::cached_versions`])
+/// and a declared version range, so a rule that reads either cannot be moved above the
+/// guards that produce them.
+struct ResolvedData<'a> {
+    package_versions: &'a PackageVersions,
+    version_range: Range,
+}
+
+/// Whether the per-dependency pipeline continues past a rule that is allowed to
+/// suppress its successors.
+///
+/// Only rules that end the dependency's evaluation return this. The #263
+/// in-use-version-yanked check (R4) deliberately does **not** return it — it must
+/// co-emit with the outdated rule (R7) — so it cannot acquire suppression power
+/// without a signature change a reviewer will see. With every rule otherwise
+/// returning a plain `bool`, "emitted, does not stop" (R4) and "emitted, stops" (R6a/
+/// R6b) would be indistinguishable at the call site — the #437-class confusion this
+/// type exists to make visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleFlow {
+    /// Evaluate the next rule for this dependency.
+    Continue,
+    /// Suppress every remaining rule for this dependency.
+    Stop,
+}
+
+/// One buffered fetch-failure finding, collapsed by [`push_collapsed_fetch_failures`]
+/// (R8).
+///
+/// `name` and `failure` are kept alongside the built `diagnostic` because the collapse
+/// must still name every affected dependency (`related_information`) and must never
+/// drop an `Actionable` hint (#478/#485) just because #479's collapse kicked in.
+struct FetchFailureEntry {
+    name: String,
+    diagnostic: Diagnostic,
+    failure: Option<FetchFailure>,
+}
+
+/// The two upstream-rule facts [`apply_yanked_only_rule`] gates on.
+///
+/// Bundled solely so its one construction site (in the orchestrator) uses Rust's
+/// field-named struct-literal syntax instead of two adjacent positional `bool`
+/// arguments — field-name binding is order-independent, so it rules out a silent
+/// argument swap the same way [`offline_notice`]'s `versions`/`deps` parameters do for
+/// its own two bools. Not threaded any further than that one call site. This is a
+/// different fix than the `PriorFindings` struct an earlier draft of this refactor
+/// used and the implementation critic had removed (M1): that one was rejected for a
+/// false *conflation* safety claim ("mixing up which finding fed which field can't
+/// happen"), not for this *argument-order* concern, and it was also passed as a
+/// parameter to a second function beyond its one true reader — this type is not.
+struct YankedOnlyPrior {
+    deprecation_found: bool,
+    in_use_yanked_emitted: bool,
+}
+
+/// R0 — file-level "offline" notice (#483 S2/I2).
+///
+/// `network.offline` silently degrades every diagnostic in this pipeline that depends
+/// on a registry/OSV fetch — vulnerabilities never queried, "unknown"/"outdated"/
+/// deprecation checks all working from whatever was already cached. Absence of a
+/// warning must not read as "safe" in this *persistent, user-configured* mode. One
+/// file-level diagnostic, not per-dependency: emitting one per affected dependency
+/// (the per-dependency fetch-failure arm inside [`apply_unknown_package_rule`] is
+/// suppressed while offline for exactly this reason, R5b below) would be strictly
+/// noisier than the failure toast this same PR suppresses for being "unusable" — the
+/// two must not contradict each other.
+///
+/// Reads: `versions.offline`, `deps` (only to check non-emptiness — takes the slice
+/// itself, not two positional bools, so a caller can never silently swap them).
+/// Emits: at most one [`DiagnosticSeverity::INFORMATION`] at `Position(0,0)`, appended
+/// first so it always precedes every other diagnostic in the returned `Vec`.
+/// Suppressed by: nothing. Suppresses: R5b (see [`apply_unknown_package_rule`]).
+fn offline_notice(
+    diagnostics: &mut Vec<Diagnostic>,
+    versions: VersionData<'_>,
+    deps: &[&dyn Dependency],
+) {
     if versions.offline && !deps.is_empty() {
         diagnostics.push(Diagnostic {
             range: Range {
@@ -527,11 +704,20 @@ pub fn generate_diagnostics_from_cache(
             ..Default::default()
         });
     }
+}
 
-    // #443/plan-1b §1.7: a registry index blocked by `registries.workspace_registries` must
-    // not degrade silently — surface it as an informational diagnostic on the dependency's
-    // own line, independent of the loop below (a blocked dependency never reaches version
-    // resolution, so it would otherwise leave no trace at all in the editor).
+/// R1 — blocked-registry notices (#443/plan-1b §1.7).
+///
+/// A registry index blocked by `registries.workspace_registries` must not degrade silently.
+/// Independent of the dependency loop below: a blocked dependency never reaches
+/// version resolution, so it would otherwise leave no trace at all in the editor.
+///
+/// Reads: `parse_result.blocked_registries()`.
+/// Emits: one [`DiagnosticSeverity::INFORMATION`] per entry, on the dependency's own
+/// range, message truncated at [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`]. Pushed
+/// after R0, before any per-dependency diagnostic.
+/// Suppressed by: nothing. Suppresses: nothing.
+fn blocked_registry_diagnostics(diagnostics: &mut Vec<Diagnostic>, parse_result: &dyn ParseResult) {
     for (range, class, raw_value) in parse_result.blocked_registries() {
         diagnostics.push(Diagnostic {
             range,
@@ -545,435 +731,537 @@ pub fn generate_diagnostics_from_cache(
             ..Default::default()
         });
     }
+}
 
-    // #394 S2: version-qualified OSV lookup keys, so two occurrences of one
-    // name pinned to different versions never share a `Vulnerable`/`Clean`
-    // result. `None` when this `VersionData` carries no ecosystem (most test
-    // fixtures) — the per-dep lookup below then falls back to the plain
-    // name, unaffected.
-    let vuln_keys = versions.ecosystem.map(|ecosystem| {
-        crate::osv::vulnerability_keys(parse_result, versions.resolved, formatter, ecosystem)
-    });
+/// R2 — OSV vulnerability findings (#394 S2, FR-007/US-004).
+///
+/// Emitted before either terminal guard in the orchestrator (registry outage, no
+/// version range) so a registry failure never suppresses an OSV finding — the two are
+/// independent data sources.
+///
+/// Reads: `ctx.versions.vulnerabilities`; `vuln_keys` looked up by `ctx.dep.name_range()`
+/// (#394 S2, preferred), falling back to `ctx.normalized_name`, then `ctx.dep.name()` —
+/// first `Some(ScanOutcome::Vulnerable(_))` wins.
+/// Emits: N advisory diagnostics (in `dv.advisories.items()` order) plus an optional
+/// "+N more advisories" entry, via [`push_vulnerability_diagnostics`].
+/// Suppressed by: nothing — not gated on `can_resolve_source`.
+/// Suppresses: nothing.
+fn apply_vulnerability_rule(
+    diagnostics: &mut Vec<Diagnostic>,
+    ctx: &RuleContext<'_>,
+    vuln_keys: Option<&HashMap<Range, String>>,
+) {
+    if let Some(vulnerabilities) = ctx.versions.vulnerabilities
+        && let Some(ScanOutcome::Vulnerable(dv)) = vuln_keys
+            .and_then(|keys| keys.get(&ctx.dep.name_range()))
+            .and_then(|key| vulnerabilities.get(key))
+            .or_else(|| vulnerabilities.get(ctx.normalized_name))
+            .or_else(|| vulnerabilities.get(ctx.dep.name().as_str()))
+    {
+        push_vulnerability_diagnostics(diagnostics, ctx.dep, dv);
+    }
+}
 
-    for dep in deps {
-        let normalized_name = formatter.normalize_package_name(dep.name());
-
-        // Emitted before either early-`continue` below (registry outage,
-        // no version range) so a registry failure never suppresses an OSV
-        // finding — the two are independent data sources (FR-007/US-004).
-        if let Some(vulnerabilities) = versions.vulnerabilities
-            && let Some(ScanOutcome::Vulnerable(dv)) = vuln_keys
-                .as_ref()
-                .and_then(|keys| keys.get(&dep.name_range()))
-                .and_then(|key| vulnerabilities.get(key))
-                .or_else(|| vulnerabilities.get(&normalized_name))
-                .or_else(|| vulnerabilities.get(dep.name().as_str()))
-        {
-            push_vulnerability_diagnostics(&mut diagnostics, dep, dv);
-        }
-
-        // Independent of the registry-outage/no-range early-`continue`s below,
-        // for the same reason as the vulnerability push above — a yanked
-        // finding from the lifecycle probe must never be suppressed by an
-        // unrelated "latest" lookup failure.
-        //
-        // Two independent yanked-version checks exist and both run in this loop:
-        // this one (#263) flags the specific in-use version (lockfile-resolved,
-        // or an exact manifest pin) when it is yanked, while `yanked_only` below
-        // (#247) flags a declared *range* requirement that can currently only be
-        // satisfied by a yanked version, even with no lockfile at all. They answer
-        // different questions and neither subsumes the other, but for a dependency
-        // pinned to the one version that also happens to be the only version
-        // satisfying its own requirement, both would fire on the same dependency.
-        // `yanked_263_diagnostic_pushed` suppresses the second (#247) check once the
-        // first (#263) already emitted a diagnostic for this dependency, so a
-        // single dependency never gets two yanked diagnostics.
-        //
-        // The two checks deliberately keep different outdated-interaction policies —
-        // this is not an oversight left over from the merge. This (#263) check has no
-        // `continue`, so it co-emits alongside an "outdated" diagnostic for the same
-        // dependency (see `test_generate_diagnostics_from_cache_yanked_and_outdated_both_emitted`,
-        // asserting exactly that on the upstream #263 design). `yanked_only` below
-        // (#247) does `continue`, suppressing "outdated" for the same dependency (see
-        // `test_yanked_only_match_suppresses_outdated_diagnostic`). Each policy was
-        // independently reviewed and tested before this merge; harmonizing them is out
-        // of scope here.
-        // #394 S1: when multiple occurrences share `normalized_name`, the
-        // finding recorded under it may belong to a *different* occurrence
-        // (e.g. `[dependencies] time = "=0.1.43"`, yanked, and
-        // `[dev-dependencies] time = "=0.1.44"`, not yanked — both name-keyed
-        // to the same `yanked_version`). Emitting unconditionally would push
-        // a false-positive "yanked" diagnostic onto the safe occurrence, for
-        // a version string that does not even appear on that line. Gated on
-        // `versions.ecosystem` being set (production always sets it; the
-        // check is skipped, matching pre-#394 behavior, for the test
-        // fixtures that do not).
-        // #205: a package-level deprecation finding is derived and pushed independently
-        // of the yanked check below, for the same FR-007-style reason as the
-        // vulnerability push above — a registry-reported deprecation must never be
-        // suppressed by an unrelated "latest" lookup failure.
-        //
-        // I4: gated on `can_resolve_source()`, same guard `unsatisfiable`/`yanked_only`
-        // apply further down — `versions.outcomes`' deprecation channel is name-keyed, so a
-        // git/path/SDK occurrence sharing a name with an unrelated registry-resolved package (the same
-        // #248 coincidental-namesake hazard) must not surface a diagnostic for a package
-        // it doesn't actually resolve against. Folded into `deprecation` itself (rather
-        // than only guarding the `push` call) so the D5 suppression gate below — which
-        // reads `deprecation.is_some()` — sees the same answer.
-        let deprecation = formatter
-            .can_resolve_source(&dep.source())
-            .then(|| {
-                versions
-                    .outcomes
-                    .and_then(|o| o.deprecation(&normalized_name))
-            })
-            .flatten();
-        if let Some(dep_info) = deprecation {
-            push_deprecation_diagnostic(&mut diagnostics, dep, formatter, dep_info, severities);
-        }
-
-        // D5: a package-level deprecation finding suppresses the in-use-version yanked
-        // check (#263) below — but only when the underlying yanked finding's status is
-        // `AdvisoryDeprecated`, never when it is `Yanked`. A genuine hard yank ("the exact
-        // version you pinned was withdrawn") is strictly more actionable than a
-        // package-level deprecation notice ("the project is archived"), so it must never be
-        // hidden behind one.
-        //
-        // Requires an *actual* `versions.outcomes` yanked (#263) entry with that status — a
-        // vacuous `None` (`is_none_or` would default to "suppress") must NOT suppress.
-        // #247 reads a different data source (`package_versions.yanked`, now carrying its
-        // own `RemovalStatus` per entry — see `PackageVersions::yanked`) and, as of #437,
-        // applies this identical D5 polarity *independently* from its own matched entry's
-        // status, regardless of what this #263 check decided — see `yanked_only_status`
-        // further down. This is deliberately NOT folded into `yanked_263_diagnostic_pushed`
-        // below (an earlier version of this fix did that, via a `deprecation_suppresses_yanked
-        // -> true` sentinel, and thereby let a suppressed-AdvisoryDeprecated #263 entry also
-        // silently gate off a same-dependency #247 match whose own aggregate was `Yanked` —
-        // reintroducing the exact bug #437 exists to close, just through the other branch).
-        // So "no #263 finding for this name", or "the #263 finding was itself suppressed", is
-        // not evidence that #247's finding (if any) is safe to hide: #247 can fire for a range
-        // requirement satisfiable only by a yanked version even when no specific
-        // in-use/latest version was itself flagged (impl-critic I1), and now always decides
-        // for itself from its own matched entry's status.
-        let deprecation_suppresses_yanked = deprecation.is_some()
-            && versions
+/// R3 — package-level deprecation finding (#205, I4).
+///
+/// Emitted independently of the in-use-yanked check (R4), for the same FR-007-style
+/// reason as R2 — a registry-reported deprecation must never be suppressed by an
+/// unrelated "latest" lookup failure.
+///
+/// Reads: `ctx.formatter.can_resolve_source(&ctx.dep.source())` **and**
+/// `ctx.versions.outcomes.deprecation(ctx.normalized_name)`. I4: the `can_resolve_source`
+/// gate is folded into the returned value (not just the push) so this rule, R4's D5
+/// gate, and R6b's #437 mirror of it all see the same answer — `versions.outcomes`'
+/// deprecation channel is name-keyed, so a git/path/SDK occurrence sharing a name with
+/// an unrelated registry-resolved package (the #248 coincidental-namesake hazard) must
+/// not surface a diagnostic for a package it doesn't actually resolve against.
+/// Emits: 1 deprecation diagnostic (`DEPRECATED_DIAGNOSTIC_CODE`) via
+/// [`push_deprecation_diagnostic`].
+/// Suppressed by: nothing — never suppressed by a registry outage (same FR-007
+/// reasoning as R2).
+/// Suppresses: R4 conditionally (D5, see [`apply_in_use_yanked_rule`]), R6b
+/// conditionally (#437, see [`apply_yanked_only_rule`]) — both read only this rule's
+/// return value (presence), never its content.
+fn apply_deprecation_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>) -> bool {
+    let deprecation = ctx
+        .formatter
+        .can_resolve_source(&ctx.dep.source())
+        .then(|| {
+            ctx.versions
                 .outcomes
-                .and_then(|o| o.yanked(&normalized_name))
-                .is_some_and(|(_, status)| *status != RemovalStatus::Yanked);
+                .and_then(|o| o.deprecation(ctx.normalized_name))
+        })
+        .flatten();
+    if let Some(dep_info) = deprecation {
+        push_deprecation_diagnostic(
+            diagnostics,
+            ctx.dep,
+            ctx.formatter,
+            dep_info,
+            ctx.severities,
+        );
+    }
+    deprecation.is_some()
+}
 
-        // Tracks only whether #263 actually pushed a `Diagnostic` — NOT whether it was
-        // suppressed by D5. #247's dedup guard (`yanked_only_status` below) keys on this:
-        // it must skip re-reporting a version #263 already emitted a diagnostic for, but a
-        // D5-suppressed #263 entry emitted nothing, so it must not gate #247 off too.
-        let yanked_263_diagnostic_pushed = if deprecation_suppresses_yanked {
-            false
-        } else if let Some((yanked_version, _status)) =
-            versions.outcomes.and_then(|o| o.yanked(&normalized_name))
-            && versions.ecosystem.is_none_or(|ecosystem| {
-                super::in_use_version(
-                    dep,
-                    &normalized_name,
-                    versions.resolved,
-                    formatter,
-                    ecosystem,
-                )
-                .as_deref()
-                    == Some(yanked_version.as_str())
-            })
-        {
-            diagnostics.push(Diagnostic {
-                range: dep.version_range().unwrap_or_else(|| dep.name_range()),
-                severity: Some(severities.yanked),
-                message: format!("{} ({})", formatter.yanked_message(), yanked_version),
-                source: Some("deps-lsp".into()),
-                ..Default::default()
-            });
-            true
-        } else {
-            false
-        };
+/// R4 — in-use-version yanked check (#263, #394 S1, D5).
+///
+/// Two independent yanked-version checks exist in this pipeline: this one (#263)
+/// flags the specific in-use version (lockfile-resolved, or an exact manifest pin)
+/// when it is yanked, while R6b ([`apply_yanked_only_rule`], #247) flags a declared
+/// *range* requirement that can currently only be satisfied by a yanked version, even
+/// with no lockfile at all. They answer different questions and neither subsumes the
+/// other, but for a dependency pinned to the one version that also happens to be the
+/// only version satisfying its own requirement, both would fire on the same
+/// dependency — this rule's return value lets R6b dedup that case.
+///
+/// The two checks deliberately keep different outdated-interaction policies — this is
+/// not an oversight. This (#263) check has no `continue`, so it co-emits alongside an
+/// "outdated" diagnostic for the same dependency (see
+/// `test_generate_diagnostics_from_cache_yanked_and_outdated_both_emitted`). R6b does
+/// `continue`, suppressing "outdated" for the same dependency (see
+/// `test_yanked_only_match_suppresses_outdated_diagnostic`). Each policy was
+/// independently reviewed and tested before this merge; harmonizing them is out of
+/// scope here.
+///
+/// Reads: `ctx.versions.outcomes.yanked(ctx.normalized_name)` -> `(yanked_version,
+/// status)`; `ctx.versions.ecosystem`; `super::in_use_version(...)`.
+/// Gate D5 (`deprecation_found`): a package-level deprecation finding suppresses this
+/// check — but only when the underlying yanked finding's status is
+/// `AdvisoryDeprecated`, never when it is `Yanked`. A genuine hard yank ("the exact
+/// version you pinned was withdrawn") is strictly more actionable than a package-level
+/// deprecation notice ("the project is archived"), so it must never be hidden behind
+/// one. Requires an *actual* yanked (#263) entry with that status — uses
+/// `is_some_and`, **not** `is_none_or`: a vacuous `None` (no #263 entry) must NOT count
+/// as "suppress". R6b reads a different data source (`package_versions.yanked`) and,
+/// as of #437, applies this identical D5 polarity *independently* from its own matched
+/// entry's status, regardless of what this check decided — this is deliberately NOT
+/// folded into this rule's return value (an earlier version of this fix did that, and
+/// thereby let a suppressed-`AdvisoryDeprecated` #263 entry also silently gate off a
+/// same-dependency #247 match whose own aggregate was `Yanked` — reintroducing the
+/// exact bug #437 exists to close, just through the other branch).
+/// Gate #394 S1: when multiple occurrences share `normalized_name`, the finding
+/// recorded under it may belong to a *different* occurrence (e.g.
+/// `[dependencies] time = "=0.1.43"`, yanked, and `[dev-dependencies] time =
+/// "=0.1.44"`, not yanked — both name-keyed to the same `yanked_version`). Emitting
+/// unconditionally would push a false-positive "yanked" diagnostic onto the safe
+/// occurrence, for a version string that does not even appear on that line. Gated on
+/// `ctx.versions.ecosystem` being set (production always sets it; the check is
+/// skipped, matching pre-#394 behavior, for the test fixtures that do not) via
+/// `is_none_or`.
+/// Emits: 1 yanked diagnostic on `version_range().unwrap_or(name_range())`. Message is
+/// deliberately `"{yanked_message()} ({version})"` — do not "harmonize" it with R6b's
+/// message (`"{yanked_message()}; latest is {latest}"`), which differs on purpose.
+/// Suppressed by: D5 above. Not gated on `can_resolve_source`.
+/// Suppresses: nothing — deliberately returns `bool`, not [`RuleFlow`], so it
+/// structurally cannot stop the pipeline.
+///
+/// Returns whether a diagnostic was actually **pushed** — never `true` for a
+/// D5-suppressed finding, and never merely "a #263 entry existed". [`apply_yanked_only_rule`]
+/// reads this as its dedup gate.
+fn apply_in_use_yanked_rule(
+    diagnostics: &mut Vec<Diagnostic>,
+    ctx: &RuleContext<'_>,
+    deprecation_found: bool,
+) -> bool {
+    let deprecation_suppresses_yanked = deprecation_found
+        && ctx
+            .versions
+            .outcomes
+            .and_then(|o| o.yanked(ctx.normalized_name))
+            .is_some_and(|(_, status)| *status != RemovalStatus::Yanked);
 
-        let package_versions = versions
-            .cached
-            .get(normalized_name.as_str())
-            .or_else(|| versions.cached.get(dep.name()));
-
-        let Some(package_versions) = package_versions else {
-            // Skip "unknown" diagnostic if package exists in lock file
-            // (registry fetch may have failed due to rate limiting), or if
-            // the source isn't resolvable against the registry this LSP
-            // queries (e.g. `CustomRegistry` / Git / Path) — an absent cache
-            // entry there just means we never fetched it, not that the
-            // package doesn't exist (#248). Name-syntax validation is
-            // unaffected: it never depends on registry data.
-            let in_lockfile = versions.resolved.contains_key(normalized_name.as_str())
-                || versions.resolved.contains_key(dep.name());
-            if !in_lockfile {
-                // A fetch error/timeout (#267) is not evidence the package doesn't
-                // exist — the registry was never successfully asked. Report it
-                // distinctly from a genuine "not found" so a transient registry
-                // outage or a malformed response (e.g. unparseable
-                // maven-metadata.xml) doesn't masquerade as "Unknown package".
-                let fetch_failure: Option<&FetchFailure> = formatter
-                    .can_resolve_source(&dep.source())
-                    .then(|| {
-                        versions
-                            .outcomes
-                            .and_then(|o| o.fetch_failure(normalized_name.as_str()))
-                    })
-                    .flatten();
-                match formatter.validate_package_name(dep.name().as_str()) {
-                    Err(reason) => {
-                        diagnostics.push(Diagnostic {
-                            range: dep.name_range(),
-                            severity: Some(severities.unknown),
-                            message: format!("Invalid package name '{}': {reason}", dep.name()),
-                            source: Some("deps-lsp".into()),
-                            ..Default::default()
-                        });
-                    }
-                    // Issue #483 I2: while offline, a per-dependency "lookup failed"
-                    // diagnostic (of any `FetchFailure` kind, collapsed or not) is
-                    // misattributed — this is a deliberately configured mode, not a
-                    // registry outage — and would be strictly noisier than the toast this
-                    // same PR suppresses for being unusable offline. The file-level
-                    // informational diagnostic pushed above already covers this
-                    // dependency, so nothing is queued into `fetch_failed_diagnostics`.
-                    Ok(()) if fetch_failure.is_some() && versions.offline => {}
-                    // Deferred to `fetch_failed_diagnostics` (collapsed below the main
-                    // loop) rather than pushed inline like the other two arms: a fetch
-                    // failure is a registry-wide condition that can hit many
-                    // dependencies identically, so it is worth collapsing into one
-                    // diagnostic when it does (#479) — without ever dropping a
-                    // per-dependency `Actionable` hint (#478/#485).
-                    Ok(()) if fetch_failure.is_some() => {
-                        let message = match fetch_failure {
-                            Some(FetchFailure::Actionable(hint)) => {
-                                format!("Registry lookup failed for '{}': {hint}", dep.name())
-                            }
-                            Some(FetchFailure::Transient | FetchFailure::NotAttempted) | None => {
-                                format!(
-                                    "Registry lookup failed for '{}'; package status could not be determined",
-                                    dep.name()
-                                )
-                            }
-                        };
-                        fetch_failed_diagnostics.push((
-                            dep.name().to_string(),
-                            Diagnostic {
-                                range: dep.name_range(),
-                                severity: Some(severities.unknown),
-                                message,
-                                source: Some("deps-lsp".into()),
-                                ..Default::default()
-                            },
-                            fetch_failure.cloned(),
-                        ));
-                    }
-                    Ok(()) if formatter.can_resolve_source(&dep.source()) => {
-                        diagnostics.push(Diagnostic {
-                            range: dep.name_range(),
-                            severity: Some(severities.unknown),
-                            message: format!("Unknown package '{}'", dep.name()),
-                            source: Some("deps-lsp".into()),
-                            ..Default::default()
-                        });
-                    }
-                    Ok(()) => {}
-                }
-            }
-            continue;
-        };
-        let latest = &package_versions.latest;
-
-        let Some(version_range) = dep.version_range() else {
-            continue;
-        };
-
-        // Path/git/URL/SDK/workspace dependencies never resolve against a
-        // registry version list at all — `package_versions` (when present)
-        // either came from a coincidentally-matching registry entry of the
-        // same name (e.g. this workspace's own `deps-core = { path = ...
-        // version = "0.10.1" }`, which only avoids a false WARNING today
-        // because 0.10.1 also happens to be published) or an entirely
-        // unrelated package (Dart's `{ sdk: flutter, version = "^3.24.0" }`
-        // resolves against pub.dev's unrelated `flutter` package). Neither
-        // is a meaningful "no published version satisfies this" check.
-        let unsatisfiable = formatter.can_resolve_source(&dep.source())
-            && dep.version_requirement().is_some_and(|version_req| {
-                requirement_is_unsatisfiable(formatter, version_req, &package_versions.available)
-            });
-
-        if unsatisfiable {
-            let req_str = dep.version_requirement().map_or("", |r| r.as_str());
-            let mut message = format!(
-                "No published version satisfies requirement '{req_str}'; latest is {latest}"
-            );
-            if let Some(prerelease) = dep.version_requirement().and_then(|version_req| {
-                matching_prerelease_would_satisfy(
-                    formatter,
-                    version_req,
-                    &package_versions.available,
-                    &package_versions.yanked,
-                )
-            }) {
-                use std::fmt::Write as _;
-                let _ = write!(
-                    message,
-                    " (a pre-release, {prerelease}, is excluded by SemVer's default \
-                     pre-release-matching rules; require it explicitly to use it)"
-                );
-            }
-            diagnostics.push(Diagnostic {
-                range: version_range,
-                severity: Some(severities.unsatisfiable),
-                message,
-                source: Some("deps-lsp".into()),
-                code: Some(NumberOrString::String(UNSATISFIABLE_DIAGNOSTIC_CODE.into())),
-                ..Default::default()
-            });
-            continue;
-        }
-
-        // Same source-resolvability guard as `unsatisfiable` above — only meaningful once a
-        // requirement is known to match *something* in `available` (see `requirement_is_unsatisfiable`).
-        // `yanked_diagnostic_applies_to` additionally opts an ecosystem out of *this specific*
-        // diagnostic for a requirement shape (or, npm, unconditionally, #436) where it would
-        // duplicate a more specific one or where `removal_status()` isn't a reliable enough
-        // per-version signal — see that method's docs. Independent of the #263 in-use-version
-        // check just above, which reads `versions.outcomes` directly and is unaffected by this
-        // hook. Skipped entirely when the in-use-version
-        // check above already pushed a yanked diagnostic for this dependency (see
-        // `yanked_263_diagnostic_pushed`), so the two checks never double-report — but,
-        // critically (#437 S1), NOT skipped merely because the #263 check was D5-suppressed:
-        // that suppression pushed nothing, so #247 must still be free to decide for itself.
-        // Source-resolvability guard migrated to `can_resolve_source` (#431) so a source this
-        // ecosystem cannot fetch from (e.g. an unresolved Cargo registry alias) is excluded the
-        // same way the other diagnostics in this function already are.
-        let yanked_only_status = (!yanked_263_diagnostic_pushed
-            && formatter.can_resolve_source(&dep.source()))
-        .then(|| dep.version_requirement())
-        .flatten()
-        .filter(|version_req| formatter.yanked_diagnostic_applies_to(dep, version_req))
-        .and_then(|version_req| {
-            requirement_matches_only_yanked(
-                formatter,
-                version_req,
-                &package_versions.available,
-                &package_versions.yanked,
+    if deprecation_suppresses_yanked {
+        false
+    } else if let Some((yanked_version, _status)) = ctx
+        .versions
+        .outcomes
+        .and_then(|o| o.yanked(ctx.normalized_name))
+        && ctx.versions.ecosystem.is_none_or(|ecosystem| {
+            super::in_use_version(
+                ctx.dep,
+                ctx.normalized_name,
+                ctx.versions.resolved,
+                ctx.formatter,
+                ecosystem,
             )
+            .as_deref()
+                == Some(yanked_version.as_str())
+        })
+    {
+        diagnostics.push(Diagnostic {
+            range: ctx
+                .dep
+                .version_range()
+                .unwrap_or_else(|| ctx.dep.name_range()),
+            severity: Some(ctx.severities.yanked),
+            message: format!("{} ({})", ctx.formatter.yanked_message(), yanked_version),
+            source: Some("deps-lsp".into()),
+            ..Default::default()
         });
+        true
+    } else {
+        false
+    }
+}
 
-        // #437: mirrors D5's polarity above (see `deprecation_suppresses_yanked`), applied
-        // independently of the #263 `versions.outcomes` yanked channel and of whatever that check decided
-        // — a matched entry whose own status is `AdvisoryDeprecated` yields to a co-occurring
-        // package-level deprecation finding, but a matched `Yanked` status always fires
-        // regardless, whether or not a #263 entry exists for this package, and whether or not
-        // that #263 entry (if any) was itself suppressed (the PyPI
-        // range-satisfiable-only-by-yanked-with-no-exact-pin case this fixes, plus the
-        // mixed-status-within-one-package case S1 closes).
-        let yanked_only = yanked_only_status.is_some_and(|status| {
-            status != RemovalStatus::AdvisoryDeprecated || deprecation.is_none()
-        });
-
-        if yanked_only {
-            diagnostics.push(Diagnostic {
-                range: version_range,
-                severity: Some(severities.yanked),
-                message: format!("{}; latest is {latest}", formatter.yanked_message()),
-                source: Some("deps-lsp".into()),
-                ..Default::default()
-            });
-            continue;
-        }
-
-        // As with the unsatisfiable check above, a non-resolvable source's `latest`
-        // (when present at all) comes from an unrelated or coincidental cache entry,
-        // not a real lookup against the registry this dependency actually resolves
-        // against — so "Outdated" must not be evaluated for it either (#248).
-        let status = match dep.version_requirement() {
-            Some(version_req) if formatter.can_resolve_source(&dep.source()) => {
-                formatter.requirement_status(version_req, latest)
-            }
-            _ => RequirementStatus::Unresolved,
-        };
-
-        if status == RequirementStatus::Outdated {
-            // Message-only differentiation: severity stays `severities.outdated` in both
-            // cases (already the floor — see the module docs). A within-cooldown release
-            // still deserves the recommendation, just with the extra context that it may
-            // yet be yanked or superseded (issue #227 §4.3).
-            let published_at = freshness
-                .enabled
-                .then_some(package_versions.published_at)
-                .flatten();
-            let message = match published_at {
-                Some(published_at)
-                    if is_within_cooldown(
-                        published_at.age_secs_from(now),
-                        freshness.cooldown_secs,
-                    ) =>
-                {
-                    format!(
-                        "Newer version available: {latest} (published {} — still within the release cooldown window)",
-                        format_relative_age(published_at.age_secs_from(now))
-                    )
-                }
-                _ => format!("Newer version available: {latest}"),
-            };
-            diagnostics.push(Diagnostic {
-                range: version_range,
-                severity: Some(severities.outdated),
-                message,
-                source: Some("deps-lsp".into()),
-                ..Default::default()
-            });
-        }
+/// R5 — unknown-package family. Reached only when [`RuleContext::cached_versions`]
+/// returns `None`. Always terminal — the orchestrator `continue`s unconditionally
+/// after calling this.
+///
+/// R5-guard `in_lockfile` (#248): if `ctx.versions.resolved` contains either key,
+/// emits nothing at all — a registry fetch may simply have been rate-limited.
+/// Name-syntax validation is unaffected by this guard: it never depends on registry
+/// data.
+///
+/// `fetch_failure = can_resolve_source(&dep.source()) &&
+/// outcomes.fetch_failure(normalized_name)` — a fetch error/timeout (#267) is not
+/// evidence the package doesn't exist, so it is reported distinctly from a genuine
+/// "not found".
+///
+/// `match formatter.validate_package_name(dep.name())` — **arm order is
+/// load-bearing**:
+/// 1. `Err(reason)` -> R5a `Invalid package name '{name}': {reason}`. Fires regardless
+///    of `can_resolve_source`/`fetch_failure` — a fetch failure must never mask an
+///    invalid name.
+/// 2. `Ok(())` + `fetch_failure.is_some()` + `versions.offline` -> R5b emits nothing
+///    (#483 I2): this is a deliberately configured mode, not a registry outage, and
+///    [`offline_notice`]'s file-level notice already covers this dependency.
+/// 3. `Ok(())` + `fetch_failure.is_some()` -> R5c: queued into `fetch_failed`
+///    (deferred, collapsed by [`push_collapsed_fetch_failures`] — R8) rather than
+///    pushed inline, since a fetch failure is a registry-wide condition that can hit
+///    many dependencies identically.
+/// 4. `Ok(())` + `can_resolve_source` -> R5d `Unknown package '{name}'`.
+/// 5. `Ok(())` -> nothing (#248: unresolvable source, absent cache entry means "never
+///    fetched").
+fn apply_unknown_package_rule(
+    diagnostics: &mut Vec<Diagnostic>,
+    fetch_failed: &mut Vec<FetchFailureEntry>,
+    ctx: &RuleContext<'_>,
+) {
+    let dep = ctx.dep;
+    let in_lockfile = ctx.versions.resolved.contains_key(ctx.normalized_name)
+        || ctx.versions.resolved.contains_key(dep.name());
+    if in_lockfile {
+        return;
     }
 
-    // A single fetch failure keeps its own per-dependency diagnostic (same range as
-    // before, though — unlike every other diagnostic in this function — no longer
-    // necessarily at the same position in the returned `Vec` in dependency order: it's
-    // now appended after the main loop rather than interleaved with it, so an assertion
-    // keyed on vec index rather than message content could be affected). More than one
-    // collapses into one combined diagnostic (on the first failing dependency's range)
-    // rather than fanning out N near-duplicates that all trace back to the same
-    // registry-wide condition (#479) — but unlike the first cut of this collapse, every
-    // *additional* failing dependency's name and location survive via
-    // `related_information` (#480 S2) instead of being silently dropped along with their
-    // per-line diagnostic marker.
-    match fetch_failed_diagnostics.len() {
+    let fetch_failure: Option<&FetchFailure> = ctx
+        .formatter
+        .can_resolve_source(&dep.source())
+        .then(|| {
+            ctx.versions
+                .outcomes
+                .and_then(|o| o.fetch_failure(ctx.normalized_name))
+        })
+        .flatten();
+    match ctx.formatter.validate_package_name(dep.name().as_str()) {
+        Err(reason) => {
+            diagnostics.push(Diagnostic {
+                range: dep.name_range(),
+                severity: Some(ctx.severities.unknown),
+                message: format!("Invalid package name '{}': {reason}", dep.name()),
+                source: Some("deps-lsp".into()),
+                ..Default::default()
+            });
+        }
+        Ok(()) if fetch_failure.is_some() && ctx.versions.offline => {}
+        Ok(()) if fetch_failure.is_some() => {
+            let message = match fetch_failure {
+                Some(FetchFailure::Actionable(hint)) => {
+                    format!("Registry lookup failed for '{}': {hint}", dep.name())
+                }
+                Some(FetchFailure::Transient | FetchFailure::NotAttempted) | None => {
+                    format!(
+                        "Registry lookup failed for '{}'; package status could not be determined",
+                        dep.name()
+                    )
+                }
+            };
+            fetch_failed.push(FetchFailureEntry {
+                name: dep.name().to_string(),
+                diagnostic: Diagnostic {
+                    range: dep.name_range(),
+                    severity: Some(ctx.severities.unknown),
+                    message,
+                    source: Some("deps-lsp".into()),
+                    ..Default::default()
+                },
+                failure: fetch_failure.cloned(),
+            });
+        }
+        Ok(()) if ctx.formatter.can_resolve_source(&dep.source()) => {
+            diagnostics.push(Diagnostic {
+                range: dep.name_range(),
+                severity: Some(ctx.severities.unknown),
+                message: format!("Unknown package '{}'", dep.name()),
+                source: Some("deps-lsp".into()),
+                ..Default::default()
+            });
+        }
+        Ok(()) => {}
+    }
+}
+
+/// R6a — unsatisfiable requirement (#206, #299).
+///
+/// Path/git/URL/SDK/workspace dependencies never resolve against a registry version
+/// list at all — `resolved.package_versions` (when present) either came from a
+/// coincidentally-matching registry entry of the same name or an entirely unrelated
+/// package. Neither is a meaningful "no published version satisfies this" check,
+/// hence the `can_resolve_source` gate below.
+///
+/// Reads: `can_resolve_source(&dep.source())` **and** `dep.version_requirement()`
+/// **and** `requirement_is_unsatisfiable(formatter, req,
+/// &resolved.package_versions.available)`. Message enriched via
+/// `matching_prerelease_would_satisfy` when a non-yanked pre-release whose stable core
+/// matches exists (#299).
+/// Emits: 1 diagnostic (`UNSATISFIABLE_DIAGNOSTIC_CODE`) on `resolved.version_range`.
+/// Suppressed by: nothing.
+/// Suppresses: R6b and R7 via the returned `RuleFlow::Stop`. `resolved: &ResolvedData`
+/// (carrying `version_range`) is a precondition all three rules share — established by
+/// the orchestrator's `version_range` guard *before* this rule runs, not an effect of
+/// this rule running — so it is `RuleFlow::Stop` alone, not `version_range`'s
+/// existence, that skips R6b and R7 here.
+fn apply_unsatisfiable_rule(
+    diagnostics: &mut Vec<Diagnostic>,
+    ctx: &RuleContext<'_>,
+    resolved: &ResolvedData<'_>,
+) -> RuleFlow {
+    let dep = ctx.dep;
+    let package_versions = resolved.package_versions;
+    let latest = &package_versions.latest;
+
+    let unsatisfiable = ctx.formatter.can_resolve_source(&dep.source())
+        && dep.version_requirement().is_some_and(|version_req| {
+            requirement_is_unsatisfiable(ctx.formatter, version_req, &package_versions.available)
+        });
+
+    if !unsatisfiable {
+        return RuleFlow::Continue;
+    }
+
+    let req_str = dep.version_requirement().map_or("", |r| r.as_str());
+    let mut message =
+        format!("No published version satisfies requirement '{req_str}'; latest is {latest}");
+    if let Some(prerelease) = dep.version_requirement().and_then(|version_req| {
+        matching_prerelease_would_satisfy(
+            ctx.formatter,
+            version_req,
+            &package_versions.available,
+            &package_versions.yanked,
+        )
+    }) {
+        use std::fmt::Write as _;
+        let _ = write!(
+            message,
+            " (a pre-release, {prerelease}, is excluded by SemVer's default \
+             pre-release-matching rules; require it explicitly to use it)"
+        );
+    }
+    diagnostics.push(Diagnostic {
+        range: resolved.version_range,
+        severity: Some(ctx.severities.unsatisfiable),
+        message,
+        source: Some("deps-lsp".into()),
+        code: Some(NumberOrString::String(UNSATISFIABLE_DIAGNOSTIC_CODE.into())),
+        ..Default::default()
+    });
+    RuleFlow::Stop
+}
+
+/// R6b — yanked-only range match (#247, #437, #431, #436).
+///
+/// Independent of R4 ([`apply_in_use_yanked_rule`]), which reads `versions.outcomes`
+/// directly and is unaffected by the gates below.
+///
+/// Three independent gates, in order:
+/// 1. `!in_use_yanked_emitted` (dedup with R4) — **and critically not** "R4 was
+///    D5-suppressed" (#437 S1): that suppression pushed nothing, so this rule must
+///    still be free to decide for itself.
+/// 2. `formatter.can_resolve_source(&dep.source())` (#431) — a source this ecosystem
+///    cannot fetch from (e.g. an unresolved Cargo registry alias) is excluded the same
+///    way the other diagnostics in this pipeline already are.
+/// 3. `formatter.yanked_diagnostic_applies_to(dep, version_req)` — per-ecosystem
+///    opt-out (npm unconditionally, #436) for a requirement shape where this
+///    diagnostic would duplicate a more specific one or where `removal_status()`
+///    isn't a reliable enough per-version signal.
+///
+/// Then `requirement_matches_only_yanked(...)` -> `Option<RemovalStatus>` (the
+/// aggregate: `Yanked` if any matching entry's status is `Yanked`, else
+/// `AdvisoryDeprecated`).
+///
+/// Final D5-mirror (#437): mirrors R4's D5 polarity, applied independently of the
+/// #263 `versions.outcomes` yanked channel and of whatever R4 decided — fires iff
+/// `status != AdvisoryDeprecated || !deprecation_found`, i.e. a `Yanked` aggregate
+/// always fires regardless of a co-occurring deprecation and regardless of what R4
+/// decided; an `AdvisoryDeprecated` aggregate yields to a deprecation finding (the
+/// PyPI range-satisfiable-only-by-yanked-with-no-exact-pin case this fixes, plus the
+/// mixed-status-within-one-package case S1 closes).
+/// Emits: 1 yanked diagnostic on `resolved.version_range`. Message is deliberately
+/// `"{yanked_message()}; latest is {latest}"` — do not "harmonize" it with R4's
+/// message (`"{yanked_message()} ({version})"`), which differs on purpose.
+/// Suppressed by: the three gates above.
+/// Suppresses: R7 (`RuleFlow::Stop`) — the deliberate asymmetry with R4, which never
+/// stops the pipeline (see `test_yanked_only_match_suppresses_outdated_diagnostic`).
+fn apply_yanked_only_rule(
+    diagnostics: &mut Vec<Diagnostic>,
+    ctx: &RuleContext<'_>,
+    resolved: &ResolvedData<'_>,
+    prior: YankedOnlyPrior,
+) -> RuleFlow {
+    let YankedOnlyPrior {
+        deprecation_found,
+        in_use_yanked_emitted,
+    } = prior;
+    let dep = ctx.dep;
+    let package_versions = resolved.package_versions;
+    let latest = &package_versions.latest;
+
+    let yanked_only_status = (!in_use_yanked_emitted
+        && ctx.formatter.can_resolve_source(&dep.source()))
+    .then(|| dep.version_requirement())
+    .flatten()
+    .filter(|version_req| ctx.formatter.yanked_diagnostic_applies_to(dep, version_req))
+    .and_then(|version_req| {
+        requirement_matches_only_yanked(
+            ctx.formatter,
+            version_req,
+            &package_versions.available,
+            &package_versions.yanked,
+        )
+    });
+
+    let yanked_only = yanked_only_status
+        .is_some_and(|status| status != RemovalStatus::AdvisoryDeprecated || !deprecation_found);
+
+    if !yanked_only {
+        return RuleFlow::Continue;
+    }
+
+    diagnostics.push(Diagnostic {
+        range: resolved.version_range,
+        severity: Some(ctx.severities.yanked),
+        message: format!("{}; latest is {latest}", ctx.formatter.yanked_message()),
+        source: Some("deps-lsp".into()),
+        ..Default::default()
+    });
+    RuleFlow::Stop
+}
+
+/// R7 — outdated (#227 §4.3). Last rule; nothing to suppress, so no [`RuleFlow`].
+///
+/// As with R6a's `unsatisfiable` check, a non-resolvable source's `latest` (when
+/// present at all) comes from an unrelated or coincidental cache entry, not a real
+/// lookup against the registry this dependency actually resolves against — so
+/// "Outdated" must not be evaluated for it either (#248).
+///
+/// `status` = `Unresolved` unless `dep.version_requirement()` is `Some` **and**
+/// `can_resolve_source` (#248); otherwise `formatter.requirement_status(req, latest)`.
+/// Fires on `RequirementStatus::Outdated`. Message-only cooldown differentiation
+/// gated on `ctx.freshness.enabled` + `package_versions.published_at` +
+/// `is_within_cooldown(age, cooldown_secs)`; **severity is identical in both cases**
+/// (already the floor — see the module docs).
+fn apply_outdated_rule(
+    diagnostics: &mut Vec<Diagnostic>,
+    ctx: &RuleContext<'_>,
+    resolved: &ResolvedData<'_>,
+) {
+    let dep = ctx.dep;
+    let package_versions = resolved.package_versions;
+    let latest = &package_versions.latest;
+
+    let status = match dep.version_requirement() {
+        Some(version_req) if ctx.formatter.can_resolve_source(&dep.source()) => {
+            ctx.formatter.requirement_status(version_req, latest)
+        }
+        _ => RequirementStatus::Unresolved,
+    };
+
+    if status != RequirementStatus::Outdated {
+        return;
+    }
+
+    let published_at = ctx
+        .freshness
+        .enabled
+        .then_some(package_versions.published_at)
+        .flatten();
+    let message = match published_at {
+        Some(published_at)
+            if is_within_cooldown(
+                published_at.age_secs_from(ctx.now),
+                ctx.freshness.cooldown_secs,
+            ) =>
+        {
+            format!(
+                "Newer version available: {latest} (published {} — still within the release cooldown window)",
+                format_relative_age(published_at.age_secs_from(ctx.now))
+            )
+        }
+        _ => format!("Newer version available: {latest}"),
+    };
+    diagnostics.push(Diagnostic {
+        range: resolved.version_range,
+        severity: Some(ctx.severities.outdated),
+        message,
+        source: Some("deps-lsp".into()),
+        ..Default::default()
+    });
+}
+
+/// R8 — fetch-failure collapse (#479, #480 S2, #478/#485).
+///
+/// A single fetch failure keeps its own per-dependency diagnostic (same range as
+/// before, though — unlike every other diagnostic in this pipeline — no longer
+/// necessarily at the same position in the returned `Vec` in dependency order: it's
+/// appended after the main loop rather than interleaved with it, so an assertion keyed
+/// on vec index rather than message content could be affected). More than one
+/// collapses into one combined diagnostic (on the first failing dependency's range)
+/// rather than fanning out N near-duplicates that all trace back to the same
+/// registry-wide condition — but every *additional* failing dependency's name and
+/// location survive via `related_information` instead of being silently dropped along
+/// with their per-line diagnostic marker.
+///
+/// `0` -> nothing. `1` -> push the single buffered diagnostic verbatim. `n >= 2` -> one
+/// diagnostic at entry 0's `range`/`severity`, message using the *first* `Actionable`
+/// hint found across the batch (falling back to the generic form), with
+/// `related_information` built from entries `[1..]` as `'{name}' also failed` anchored
+/// at each entry's own range and `uri`.
+fn push_collapsed_fetch_failures(
+    diagnostics: &mut Vec<Diagnostic>,
+    fetch_failed: Vec<FetchFailureEntry>,
+    uri: &Uri,
+) {
+    match fetch_failed.len() {
         0 => {}
-        1 => diagnostics.extend(fetch_failed_diagnostics.into_iter().map(|(_, d, _)| d)),
+        1 => diagnostics.extend(fetch_failed.into_iter().map(|entry| entry.diagnostic)),
         n => {
-            let (_, first, _) = &fetch_failed_diagnostics[0];
+            let first = &fetch_failed[0].diagnostic;
             let range = first.range;
             let severity = first.severity;
             // Surface a shared/first actionable hint across the batch if one exists,
             // so collapsing 2+ failures into one diagnostic never drops the specific,
             // pre-vetted remedy #478/#485 introduced — only fall back to the generic
             // message when nothing in the batch has one.
-            let shared_hint =
-                fetch_failed_diagnostics
-                    .iter()
-                    .find_map(|(_, _, failure)| match failure {
-                        Some(FetchFailure::Actionable(hint)) => Some(hint.clone()),
-                        _ => None,
-                    });
+            let shared_hint = fetch_failed.iter().find_map(|entry| match &entry.failure {
+                Some(FetchFailure::Actionable(hint)) => Some(hint.clone()),
+                _ => None,
+            });
             let message = match shared_hint {
                 Some(hint) => format!("Registry lookup failed for {n} packages: {hint}"),
                 None => format!(
                     "Registry lookup failed for {n} packages; package status could not be determined"
                 ),
             };
-            let related_information = fetch_failed_diagnostics[1..]
+            let related_information = fetch_failed[1..]
                 .iter()
-                .map(|(name, d, _)| DiagnosticRelatedInformation {
+                .map(|entry| DiagnosticRelatedInformation {
                     location: Location {
                         uri: uri.clone(),
-                        range: d.range,
+                        range: entry.diagnostic.range,
                     },
-                    message: format!("'{name}' also failed"),
+                    message: format!("'{}' also failed", entry.name),
                 })
                 .collect();
             diagnostics.push(Diagnostic {
@@ -986,8 +1274,6 @@ pub fn generate_diagnostics_from_cache(
             });
         }
     }
-
-    diagnostics
 }
 
 /// Pushes the package-level deprecation [`Diagnostic`] for `dep` (issue #205).
@@ -2298,15 +2584,13 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 2);
 
-        let has_outdated = diagnostics
-            .iter()
-            .any(|d| d.message.contains("Newer version"));
-        let has_unknown = diagnostics
-            .iter()
-            .any(|d| d.message.contains("Unknown package"));
-
-        assert!(has_outdated, "Expected outdated version diagnostic");
-        assert!(has_unknown, "Expected unknown package diagnostic");
+        // Dependency-loop order (not rule order): "serde" is up to date and emits
+        // nothing, so index 0 is "tokio"'s R7 outdated diagnostic and index 1 is
+        // "unknown"'s R5d unknown-package diagnostic — the same order as `deps`.
+        assert_eq!(diagnostics[0].message, "Newer version available: 2.0.0");
+        assert_eq!(diagnostics[0].code, None);
+        assert_eq!(diagnostics[1].message, "Unknown package 'unknown'");
+        assert_eq!(diagnostics[1].code, None);
     }
 
     #[test]
@@ -2517,16 +2801,16 @@ mod tests {
             2,
             "expected both diagnostics: {diagnostics:?}"
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.starts_with(formatter.yanked_message()))
+        // R4 (in-use-yanked, #263) has no `continue` and runs before R7 (outdated) in
+        // the orchestrator, so index 0 is always the yanked finding and index 1 is
+        // always the outdated finding — never the reverse.
+        assert_eq!(
+            diagnostics[0].message,
+            format!("{} (1.0.5)", formatter.yanked_message())
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.contains("Newer version available"))
-        );
+        assert_eq!(diagnostics[0].code, None);
+        assert_eq!(diagnostics[1].message, "Newer version available: 2.0.0");
+        assert_eq!(diagnostics[1].code, None);
     }
 
     /// T2 (D5 collision): an exact-pin dependency whose package is both package-level
@@ -2639,16 +2923,21 @@ mod tests {
             "a genuine Yanked finding must never be hidden behind a package-level \
              deprecation notice: {diagnostics:?}"
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.starts_with(formatter.yanked_message()))
+        // R3 (deprecation) always runs before R4 (in-use-yanked) in the orchestrator,
+        // so index 0 is the deprecation finding and index 1 is the yanked finding.
+        assert_eq!(
+            diagnostics[0].message,
+            format!("{}: project archived", formatter.deprecated_message())
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.starts_with(formatter.deprecated_message()))
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into()))
         );
+        assert_eq!(
+            diagnostics[1].message,
+            format!("{} (1.0.0)", formatter.yanked_message())
+        );
+        assert_eq!(diagnostics[1].code, None);
     }
 
     /// T6b (D5 gate, severity independence): on an npm-shaped fixture where the two
@@ -4324,18 +4613,30 @@ mod tests {
                 PublishTime::now(),
             );
 
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message.starts_with(formatter.yanked_message())),
+            assert_eq!(
+                diagnostics.len(),
+                2,
+                "expected exactly the deprecation diagnostic plus the #247 yanked-only \
+                 match, got: {diagnostics:?}"
+            );
+            // R3 (deprecation) always runs before R6b (#247, yanked-only) in the
+            // orchestrator, so index 0 is the deprecation finding and index 1 is the
+            // #247 match — R6b's own status (`Yanked`) fires regardless of
+            // `deprecation_found`, unlike R4's D5 gate.
+            assert_eq!(
+                diagnostics[0].message,
+                format!("{}: archived", formatter.deprecated_message()),
                 "a genuine Yanked #247 match must still fire, without a #263 entry: {diagnostics:?}"
             );
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message.starts_with(formatter.deprecated_message())),
-                "the deprecation finding must also still fire: {diagnostics:?}"
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into()))
             );
+            assert_eq!(
+                diagnostics[1].message,
+                format!("{}; latest is 2.0.0", formatter.yanked_message())
+            );
+            assert_eq!(diagnostics[1].code, None);
         }
 
         /// #437 companion: unlike the `Yanked` case above, a #247 match whose own status is
@@ -4461,25 +4762,34 @@ mod tests {
                 PublishTime::now(),
             );
 
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message.starts_with(formatter.yanked_message())
-                        && d.message.contains("; latest is")),
+            assert_eq!(
+                diagnostics.len(),
+                2,
+                "expected exactly the deprecation diagnostic plus the #247 yanked-only \
+                 match — the D5-suppressed #263 in-use-version diagnostic (for the \
+                 deprecated 2.0.0) must stay suppressed and contribute nothing, got: \
+                 {diagnostics:?}"
+            );
+            // R3 (deprecation) always runs before R6b (#247, yanked-only) in the
+            // orchestrator, so index 0 is the deprecation finding and index 1 is the
+            // #247 match against the genuinely Yanked 1.2.1 — fired independently of
+            // R4's D5-suppressed #263 finding for the unrelated 2.0.0 entry.
+            assert_eq!(
+                diagnostics[0].message,
+                format!("{}: archived", formatter.deprecated_message()),
+                "the package-level deprecation finding must still fire: {diagnostics:?}"
+            );
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String(DEPRECATED_DIAGNOSTIC_CODE.into()))
+            );
+            assert_eq!(
+                diagnostics[1].message,
+                format!("{}; latest is 2.0.0", formatter.yanked_message()),
                 "the #247 match against the genuinely Yanked 1.2.1 must still fire even though \
                  the unrelated #263 in-use-version finding was D5-suppressed, got: {diagnostics:?}"
             );
-            assert!(
-                diagnostics.iter().all(|d| !d.message.contains("(2.0.0)")),
-                "the #263 in-use-version diagnostic (for the deprecated 2.0.0) must stay \
-                 suppressed, got: {diagnostics:?}"
-            );
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message.starts_with(formatter.deprecated_message())),
-                "the package-level deprecation finding must still fire: {diagnostics:?}"
-            );
+            assert_eq!(diagnostics[1].code, None);
         }
 
         /// #247 vs. #263 dedup: a dependency whose in-use version (lock-file-resolved, or an
@@ -4533,32 +4843,27 @@ mod tests {
             // `test_generate_diagnostics_from_cache_yanked_and_outdated_both_emitted`.
             // What this test actually proves is narrower: exactly one *yanked*
             // diagnostic, not two — #247's `yanked_only` check must not also fire.
-            let yanked_diags: Vec<_> = diagnostics
-                .iter()
-                .filter(|d| d.message.starts_with(formatter.yanked_message()))
-                .collect();
-            assert_eq!(
-                yanked_diags.len(),
-                1,
-                "expected exactly one yanked diagnostic, got: {diagnostics:?}"
-            );
-            // The in-use-version check (#263) runs first and wins.
-            assert_eq!(
-                yanked_diags[0].message,
-                format!("{} (1.2.1)", formatter.yanked_message())
-            );
             assert_eq!(
                 diagnostics.len(),
                 2,
                 "expected exactly the yanked diagnostic plus the co-emitted outdated \
                  diagnostic (#263's policy), got: {diagnostics:?}"
             );
-            assert!(
-                diagnostics
-                    .iter()
-                    .any(|d| d.message == "Newer version available: 2.0.0"),
+            // R4 (#263, in-use-yanked) runs before R7 (outdated); R6b (#247,
+            // yanked-only) is dedup-suppressed by R4 having already emitted, so it
+            // contributes nothing at any index. Index 0 is therefore always the
+            // in-use-version-yanked finding and index 1 the outdated finding.
+            assert_eq!(
+                diagnostics[0].message,
+                format!("{} (1.2.1)", formatter.yanked_message()),
+                "expected the in-use-version check (#263) to run first and win, got: {diagnostics:?}"
+            );
+            assert_eq!(diagnostics[0].code, None);
+            assert_eq!(
+                diagnostics[1].message, "Newer version available: 2.0.0",
                 "expected the co-emitted outdated diagnostic, got: {diagnostics:?}"
             );
+            assert_eq!(diagnostics[1].code, None);
         }
 
         /// `severities.yanked` reaches the emitted diagnostic on the cache-only path, the same

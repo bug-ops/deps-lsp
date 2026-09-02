@@ -204,13 +204,12 @@ impl Ecosystem for GithubActionsEcosystem {
     /// shown here comes from `TagIndex.sha_to_tag`, not from trusting the comment text.
     ///
     /// Scoped to [`PinStyle::Sha`] only — the SHA is the one pin form GitHub itself does
-    /// not render as a readable version, and it is the only form
-    /// [`crate::registry::TagIndex`] can resolve unambiguously by construction (it is
-    /// populated only from fully-`major.minor.patch`-parseable tags, so a moving major
-    /// tag like `v4` never has its own entry to resolve through). Guarded on
-    /// `dep.version_range().is_some()` (N3): a non-resolvable dependency (a reusable-
-    /// workflow call, `./local`, `docker://…`) still matches the shared helper's own
-    /// hover-target predicate and must not have a `**Resolved**` line spliced onto it.
+    /// not render as a readable version, so it is the only form where naming the tag it
+    /// resolves to adds information; a `PinStyle::Tag` pin already shows the tag text
+    /// directly. Guarded on `dep.version_range().is_some()` (N3): a non-resolvable
+    /// dependency (a reusable-workflow call, `./local`, `docker://…`) still matches the
+    /// shared helper's own hover-target predicate and must not have a `**Resolved**` line
+    /// spliced onto it.
     fn generate_hover<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -246,6 +245,41 @@ impl Ecosystem for GithubActionsEcosystem {
             let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
                 return Some(hover);
             };
+
+            // #501 gap (tester finding): the shared `has_offline_actionable_data` gate in
+            // `deps_core::generate_hover` only sees `VersionData` and cannot see
+            // `formatter.tag_index` — GHA's "Pin to commit SHA" quickfix
+            // (`build_sha_pin_action`, wired into `generate_code_actions` above) is driven
+            // entirely by that separately-populated index, independent of `versions`. So a
+            // `PinStyle::Tag` step with a warm `TagIndex` entry has a real `Cmd+.` action
+            // while offline, even when the shared gate suppressed the footer for lack of any
+            // `VersionData` signal. Restores it post-hoc using the shared `CMD_DOT_FOOTER`
+            // constant (not a hand-copied literal) so the two can never drift apart.
+            // `is_plain_scalar` mirrors `build_sha_pin_action`'s own guard (FR-010, spec
+            // 031): for a quoted `uses:` scalar, `version_range` sits inside the quotes, so
+            // the quickfix withholds itself rather than corrupt the value — the footer must
+            // not advertise an action that was never actually offered.
+            if versions.offline
+                && gha_dep.pin == Some(PinStyle::Tag)
+                && gha_dep.is_plain_scalar
+                && let Some(tag) = gha_dep
+                    .version_req
+                    .as_ref()
+                    .map(deps_core::VersionReq::as_str)
+                && self
+                    .formatter
+                    .sha_pin_replacement_for(&gha_dep.name, tag)
+                    .is_some()
+                && let HoverContents::Markup(content) = &mut hover.contents
+                && !content
+                    .value
+                    .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER)
+            {
+                content
+                    .value
+                    .push_str(deps_core::lsp_helpers::CMD_DOT_FOOTER);
+            }
+
             let Some(PinStyle::Sha { comment_tag }) = &gha_dep.pin else {
                 return Some(hover);
             };
@@ -296,7 +330,7 @@ impl Ecosystem for GithubActionsEcosystem {
 /// only if neither anchor is found.
 fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
     // `sha` is expected to be a validated, pure-ASCII full hex SHA by the time it
-    // reaches here (`TagIndex` entries are filtered in `tags_to_versions`, security
+    // reaches here (`TagIndex` entries are filtered in `populate_tag_index`, security
     // S-3), so a byte slice is normally safe — `get(..7)` is a char-boundary-safe
     // belt-and-braces guard rather than a raw index (security S-4), falling back to
     // the whole string on anything unexpected instead of panicking.
@@ -885,5 +919,138 @@ mod tests {
         let spliced = splice_resolved_line(markdown, "v4.2.0", &"c".repeat(40));
         assert!(spliced.starts_with(markdown));
         assert!(spliced.contains("**Resolved**"));
+    }
+
+    /// #501 (tester finding): the shared `deps_core::generate_hover` gate only sees
+    /// `VersionData` and cannot know a `PinStyle::Tag` step still has a real "Pin to commit
+    /// SHA" quickfix available via the ecosystem-private `TagIndex`. Seeding the index
+    /// directly simulates a fetch that succeeded before the session went offline;
+    /// `cache.set_offline(true)` then makes the live fetch this call attempts fail without
+    /// touching the network (mirroring `HttpCache`'s real offline-cold behavior), so
+    /// `VersionData` carries no signal of its own and only the post-hoc restore can produce
+    /// the footer.
+    #[tokio::test]
+    async fn test_generate_hover_restores_footer_offline_for_tag_pin_with_warm_tag_index() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        cache.set_offline(true);
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        eco.formatter.tag_index.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            Arc::new(index),
+        );
+
+        let position = parse_result.dependencies()[0].name_range().start;
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        let hover = eco
+            .generate_hover(
+                parse_result.as_ref(),
+                position,
+                deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("Press `Cmd+.` to update version"),
+            "a Tag-pinned step with a warm TagIndex entry still offers the SHA-pin quickfix \
+             while offline, so the footer must be restored even with no VersionData signal; \
+             got: {}",
+            content.value
+        );
+    }
+
+    /// A `PinStyle::Tag` step with no `TagIndex` entry (true cold start, nothing ever
+    /// resolved) must not have the footer restored — there is no quickfix to advertise.
+    #[tokio::test]
+    async fn test_generate_hover_footer_stays_omitted_offline_for_tag_pin_without_tag_index() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        cache.set_offline(true);
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+        let position = parse_result.dependencies()[0].name_range().start;
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        let hover = eco
+            .generate_hover(
+                parse_result.as_ref(),
+                position,
+                deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("Press `Cmd+.` to update version"),
+            "no TagIndex entry exists, so there is no quickfix to restore the footer for; \
+             got: {}",
+            content.value
+        );
+    }
+
+    /// FR-010 (security audit finding, mirrored from
+    /// `test_build_sha_pin_action_no_quickfix_for_quoted_scalar`): a quoted `uses:` scalar
+    /// never gets the SHA-pin quickfix even on a `TagIndex` hit, since `version_range` sits
+    /// inside the quotes and editing it there would corrupt the value. The footer
+    /// restoration must withhold itself the same way `build_sha_pin_action` does, not just
+    /// check `pin`/`TagIndex` resolvability.
+    #[tokio::test]
+    async fn test_generate_hover_footer_not_restored_offline_for_quoted_tag_pin() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        cache.set_offline(true);
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        eco.formatter.tag_index.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            Arc::new(index),
+        );
+
+        let position = parse_result.dependencies()[0].name_range().start;
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        let hover = eco
+            .generate_hover(
+                parse_result.as_ref(),
+                position,
+                deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("Press `Cmd+.` to update version"),
+            "a quoted uses: scalar offers no SHA-pin quickfix even on a TagIndex hit, so the \
+             footer must not be restored; got: {}",
+            content.value
+        );
     }
 }
