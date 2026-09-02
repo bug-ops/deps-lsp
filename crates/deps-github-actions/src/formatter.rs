@@ -16,7 +16,7 @@ use crate::types::{GithubActionsDependency, PinStyle};
 pub struct GithubActionsFormatter {
     /// Shared handle to [`crate::registry::GithubActionsRegistry`]'s tag/SHA
     /// cross-reference — read-only from here (`format_version_replacing_for`'s
-    /// `PinStyle::Sha` branch).
+    /// `PinStyle::Sha` branch and [`Self::sha_pin_replacement_for`]).
     pub(crate) tag_index: Arc<DashMap<PackageName, Arc<TagIndex>>>,
 }
 
@@ -32,6 +32,84 @@ fn match_v_prefix_style(current: &str, tag: &str) -> String {
         (true, false) => format!("v{tag}"),
         (false, true) => tag[1..].to_string(),
         _ => tag.to_string(),
+    }
+}
+
+impl GithubActionsFormatter {
+    /// Creates a new formatter over an already-populated (or empty) [`TagIndex`] map,
+    /// the same shared handle [`crate::registry::GithubActionsRegistry::tag_index`]
+    /// returns.
+    ///
+    /// `tag_index` stays `pub(crate)` (critic M1): this constructor is the intended
+    /// external construction path — a seeded `TagIndex` for a doctest/integration test
+    /// goes through [`crate::registry::TagIndex`]'s own already-`pub` fields, not
+    /// through widening this struct's field visibility.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dashmap::DashMap;
+    /// use deps_github_actions::GithubActionsFormatter;
+    /// use deps_github_actions::registry::TagIndex;
+    /// use deps_core::PackageName;
+    /// use std::sync::Arc;
+    ///
+    /// let tag_index = Arc::new(DashMap::new());
+    /// let mut index = TagIndex::default();
+    /// index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+    /// tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
+    ///
+    /// let formatter = GithubActionsFormatter::new(tag_index);
+    /// assert_eq!(
+    ///     formatter.sha_pin_replacement_for(&PackageName::new("actions/checkout"), "v4"),
+    ///     Some(format!("{} # v4", "a".repeat(40)))
+    /// );
+    /// ```
+    #[must_use]
+    pub fn new(tag_index: Arc<DashMap<PackageName, Arc<TagIndex>>>) -> Self {
+        Self { tag_index }
+    }
+
+    /// Looks up `tag`'s commit SHA for `name` in the shared [`TagIndex`], returning the
+    /// `{sha} # {tag}` replacement text a "Pin to commit SHA" code action (issue #473)
+    /// writes — `None` on a cache miss (no `TagIndex` entry for `name`, or no entry for
+    /// this specific `tag`).
+    ///
+    /// Deliberately separate from [`Self::format_version_replacing_for`]'s
+    /// `PinStyle::Tag` branch: that branch bumps to the *latest* tag (outdated-version
+    /// semantics — "update `v3` to `v4`"), while this pins the *current* tag to its own
+    /// SHA (mutability semantics — "harden `v4` to `<sha> # v4`"). The two operations
+    /// are independent (a step can need either, both, or neither) and must never be
+    /// conflated behind one method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dashmap::DashMap;
+    /// use deps_github_actions::GithubActionsFormatter;
+    /// use deps_github_actions::registry::TagIndex;
+    /// use deps_core::PackageName;
+    /// use std::sync::Arc;
+    ///
+    /// let tag_index = Arc::new(DashMap::new());
+    /// let mut index = TagIndex::default();
+    /// index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+    /// tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
+    ///
+    /// let formatter = GithubActionsFormatter::new(tag_index);
+    /// // Miss: no entry for this tag.
+    /// assert_eq!(
+    ///     formatter.sha_pin_replacement_for(&PackageName::new("actions/checkout"), "v5"),
+    ///     None
+    /// );
+    /// ```
+    #[must_use]
+    pub fn sha_pin_replacement_for(&self, name: &PackageName, tag: &str) -> Option<String> {
+        let sha = self
+            .tag_index
+            .get(name)
+            .and_then(|index| index.tag_to_sha.get(tag).cloned())?;
+        Some(format!("{sha} # {tag}"))
     }
 }
 
@@ -57,13 +135,21 @@ impl EcosystemFormatter for GithubActionsFormatter {
         };
         match &gha_dep.pin {
             Some(PinStyle::Tag) => match_v_prefix_style(current, version.as_str()),
-            Some(PinStyle::Sha { .. }) => self
+            // `is_plain_scalar` guard (issue #473 sibling fix): for a quoted `uses:`
+            // scalar, `version_range` sits inside the quotes, so appending `# {tag}`
+            // would place a `#` inside the string instead of starting a YAML comment —
+            // the same corruption the mutable-ref-pin SHA-pin action guards against.
+            // Falls straight to the no-op fallback without even consulting `TagIndex`,
+            // identical to a cache miss.
+            Some(PinStyle::Sha { .. }) if gha_dep.is_plain_scalar => self
                 .tag_index
                 .get(dep.name())
                 .and_then(|index| index.tag_to_sha.get(version.as_str()).cloned())
                 .map(|sha| format!("{sha} # {}", version.as_str()))
                 .unwrap_or_else(|| dep.version_literal().unwrap_or(current).to_string()),
-            Some(PinStyle::Branch) | None => current.to_string(),
+            Some(PinStyle::Sha { .. } | PinStyle::Branch) | None => {
+                dep.version_literal().unwrap_or(current).to_string()
+            }
         }
     }
 
@@ -397,6 +483,7 @@ mod tests {
             version_literal: literal.map(str::to_string),
             pin,
             source: DependencySource::Registry,
+            is_plain_scalar: true,
         }
     }
 
@@ -516,6 +603,33 @@ mod tests {
         assert_eq!(new_text, format!("{} # v5.0.0", "deadbeef".repeat(5)));
     }
 
+    /// FR-010 sibling fix (security audit finding): a quoted-scalar SHA pin must fall
+    /// back to the no-op literal even on a `TagIndex` hit — never append `# {tag}` inside
+    /// the quotes.
+    #[test]
+    fn test_format_version_replacing_for_sha_quoted_scalar_falls_back_to_literal() {
+        let fmt = formatter();
+        let name = PackageName::new("actions/checkout");
+        let mut index = TagIndex::default();
+        index
+            .tag_to_sha
+            .insert("v5.0.0".to_string(), "deadbeef".repeat(5));
+        fmt.tag_index.insert(name, Arc::new(index));
+
+        let mut d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v4.2.0".to_string()),
+            }),
+            "actions/checkout",
+            Some("oldsha # v4.2.0"),
+        );
+        d.is_plain_scalar = false;
+
+        let new_text =
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), "v4.2.0");
+        assert_eq!(new_text, "oldsha # v4.2.0");
+    }
+
     #[test]
     fn test_format_version_replacing_for_sha_miss_returns_raw_literal_not_current() {
         // B1: on a TagIndex miss, the guard must compare byte-identical to the raw
@@ -544,6 +658,80 @@ mod tests {
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v1.0.0"), "main"),
             "main"
         );
+    }
+
+    #[test]
+    fn test_sha_pin_replacement_for_hit() {
+        let fmt = formatter();
+        let name = PackageName::new("actions/checkout");
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        fmt.tag_index.insert(name.clone(), Arc::new(index));
+
+        assert_eq!(
+            fmt.sha_pin_replacement_for(&name, "v4"),
+            Some(format!("{} # v4", "a".repeat(40)))
+        );
+    }
+
+    /// M5 (tasks.md T003 gotcha): `TagIndex.tag_to_sha` keys are exact tag strings as
+    /// published — a repository that tags without a `v` prefix must still hit.
+    #[test]
+    fn test_sha_pin_replacement_for_hit_without_v_prefix() {
+        let fmt = formatter();
+        let name = PackageName::new("owner/repo");
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert("2.1.0".to_string(), "b".repeat(40));
+        fmt.tag_index.insert(name.clone(), Arc::new(index));
+
+        assert_eq!(
+            fmt.sha_pin_replacement_for(&name, "2.1.0"),
+            Some(format!("{} # 2.1.0", "b".repeat(40)))
+        );
+    }
+
+    #[test]
+    fn test_sha_pin_replacement_for_miss_no_repo_entry() {
+        let fmt = formatter();
+        let name = PackageName::new("actions/checkout");
+        assert_eq!(fmt.sha_pin_replacement_for(&name, "v4"), None);
+    }
+
+    #[test]
+    fn test_sha_pin_replacement_for_miss_tag_not_indexed() {
+        let fmt = formatter();
+        let name = PackageName::new("actions/checkout");
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        fmt.tag_index.insert(name.clone(), Arc::new(index));
+
+        assert_eq!(fmt.sha_pin_replacement_for(&name, "v5"), None);
+    }
+
+    /// SC-005: the "Pin to commit SHA" code action's replacement text must be
+    /// byte-identical to what `format_version_replacing_for`'s `PinStyle::Sha` branch
+    /// already produces for the same `(name, tag)` pair.
+    #[test]
+    fn test_sha_pin_replacement_for_matches_format_version_replacing_for_sha_branch() {
+        let fmt = formatter();
+        let name = PackageName::new("actions/checkout");
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        fmt.tag_index.insert(name.clone(), Arc::new(index));
+
+        let via_sha_pin_action = fmt.sha_pin_replacement_for(&name, "v4").unwrap();
+
+        let sha_dep = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v3".to_string()),
+            }),
+            "actions/checkout",
+            Some("oldsha # v3"),
+        );
+        let via_outdated_sha_update =
+            fmt.format_version_replacing_for(&sha_dep, &ConcreteVersion::new("v4"), "v3");
+
+        assert_eq!(via_sha_pin_action, via_outdated_sha_update);
     }
 
     #[test]

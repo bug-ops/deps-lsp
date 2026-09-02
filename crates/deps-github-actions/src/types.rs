@@ -54,6 +54,17 @@ pub struct GithubActionsDependency {
     /// [`DependencySource::Path`] for `./local`, [`DependencySource::Url`] for
     /// `docker://image:tag` and a reusable-workflow call.
     pub source: DependencySource,
+    /// Whether the whole `uses:` value was written as a plain (unquoted) YAML scalar,
+    /// as opposed to single- or double-quoted (`uses: "actions/checkout@v4"`).
+    ///
+    /// For a quoted scalar, `version_range` spans text *inside* the quotes — writing
+    /// `{sha} # {tag}` there would place a `#` inside the string rather than starting a
+    /// YAML comment, producing a `uses:` value GitHub Actions rejects and that re-parses
+    /// as [`PinStyle::Branch`] (issue #473, spec 031 FR-010). A SHA-pin code action must
+    /// check this before writing any edit that assumes an unquoted YAML comment can
+    /// follow the ref text — see `crate::formatter::GithubActionsFormatter::sha_pin_replacement_for`'s
+    /// caller.
+    pub is_plain_scalar: bool,
 }
 
 impl deps_core::ecosystem::Dependency for GithubActionsDependency {
@@ -159,6 +170,7 @@ mod tests {
             version_literal: None,
             pin: Some(PinStyle::Tag),
             source: DependencySource::Registry,
+            is_plain_scalar: true,
         };
         assert_eq!(dep.name(), "actions/checkout");
         assert_eq!(
@@ -180,6 +192,7 @@ mod tests {
                 comment_tag: Some("v4.2.0".to_string()),
             }),
             source: DependencySource::Registry,
+            is_plain_scalar: true,
         };
         assert_eq!(dep.version_literal(), dep.version_literal.as_deref());
         assert_ne!(
@@ -217,6 +230,7 @@ mod tests {
                 version_literal: None,
                 pin: Some(PinStyle::Tag),
                 source: DependencySource::Registry,
+                is_plain_scalar: true,
             }],
             uri,
         };

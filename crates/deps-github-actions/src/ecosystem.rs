@@ -2,13 +2,18 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{Hover, HoverContents, Position, Uri};
+use tower_lsp_server::ls_types::{
+    CodeAction, CodeActionKind, Diagnostic, Hover, HoverContents, NumberOrString, Position,
+    TextEdit, Uri, WorkspaceEdit,
+};
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
     completion::Completions,
     lsp_helpers::{EcosystemFormatter, markdown_code_span},
 };
+
+use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
 use crate::formatter::GithubActionsFormatter;
 use crate::registry::GithubActionsRegistry;
@@ -32,9 +37,7 @@ impl GithubActionsEcosystem {
     #[must_use]
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
         let registry = Arc::new(GithubActionsRegistry::new(cache));
-        let formatter = GithubActionsFormatter {
-            tag_index: registry.tag_index(),
-        };
+        let formatter = GithubActionsFormatter::new(registry.tag_index());
         Self {
             registry,
             formatter,
@@ -117,6 +120,74 @@ impl Ecosystem for GithubActionsEcosystem {
                 | CompletionContext::Feature { .. }
                 | CompletionContext::None => Completions::default(),
             }
+        })
+    }
+
+    /// Appends the mutable-ref-pin diagnostic (issue #473) to the shared default's
+    /// output, one per `PinStyle::Tag` step — an additive, independent signal from the
+    /// outdated-version diagnostic the shared default already computes (spec 031
+    /// NFR-004: this override never changes that behavior, only appends to it).
+    ///
+    /// Gated on `severities.mutable_ref_pin_enabled` (spec 031 FR-009, corrected during
+    /// implementation review): `severities.mutable_ref_pin` alone cannot silence this
+    /// diagnostic, since `DiagnosticSeverity` has no suppression value.
+    fn generate_diagnostics<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        versions: deps_core::VersionData<'a>,
+        _uri: &'a Uri,
+        freshness: deps_core::FreshnessSettings,
+        severities: deps_core::lsp_helpers::DiagnosticSeverities,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
+        Box::pin(async move {
+            let mut diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
+                parse_result,
+                versions,
+                self.formatter(),
+                freshness,
+                severities,
+                deps_core::PublishTime::now(),
+            );
+            if severities.mutable_ref_pin_enabled {
+                diagnostics.extend(mutable_ref_pin_diagnostics(
+                    parse_result,
+                    severities.mutable_ref_pin,
+                ));
+            }
+            diagnostics
+        })
+    }
+
+    /// Appends the "Pin to commit SHA" quickfix (issue #473) to the shared default's
+    /// output when the position's dependency is a `PinStyle::Tag` step with a resolvable
+    /// `TagIndex` entry.
+    fn generate_code_actions<'a>(
+        &'a self,
+        parse_result: &'a dyn ParseResultTrait,
+        position: Position,
+        uri: &'a Uri,
+        versions: deps_core::VersionData<'a>,
+        content: &'a str,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Vec<CodeAction>> {
+        Box::pin(async move {
+            let registry = self.registry();
+            let mut actions = deps_core::lsp_helpers::generate_code_actions(
+                parse_result,
+                position,
+                uri,
+                versions,
+                content,
+                registry.as_ref(),
+                self.formatter(),
+            )
+            .await;
+            actions.extend(build_sha_pin_action(
+                parse_result,
+                position,
+                uri,
+                &self.formatter,
+            ));
+            actions
         })
     }
 
@@ -250,9 +321,498 @@ fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String
     format!("{markdown}{line}")
 }
 
+/// Builds one mutable-ref-pin [`Diagnostic`] (issue #473) per `PinStyle::Tag` step in
+/// `parse_result` — `PinStyle::Sha`, `PinStyle::Branch`, and `None` steps produce no
+/// diagnostic (FR-003; `PinStyle::Branch` is out of scope for this iteration, see spec
+/// 031 §"Out of Scope").
+/// Maximum character count of `mutable_ref_pin_diagnostics`' interpolated `name`/`tag`
+/// values before truncation (security audit finding). Mirrors
+/// `deps_core::lsp_helpers::diagnostics`' `MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`
+/// precedent: nothing upstream caps a workflow file's `owner/repo` or ref text length, so
+/// this is the last chokepoint before either renders inline in the editor, re-sent on
+/// every `publishDiagnostics`.
+const MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS: usize = 128;
+
+fn mutable_ref_pin_diagnostics(
+    parse_result: &dyn ParseResultTrait,
+    severity: tower_lsp_server::ls_types::DiagnosticSeverity,
+) -> Vec<Diagnostic> {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .filter_map(|dep| {
+            let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+            if gha_dep.pin != Some(PinStyle::Tag) {
+                return None;
+            }
+            let range = gha_dep.version_range?;
+            let tag = gha_dep
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str)?;
+            let name = deps_core::lsp_helpers::truncate_for_diagnostic(
+                gha_dep.name.as_str(),
+                MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS,
+            );
+            let tag = deps_core::lsp_helpers::truncate_for_diagnostic(
+                tag,
+                MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS,
+            );
+            Some(Diagnostic {
+                range,
+                severity: Some(severity),
+                message: format!(
+                    "{name} is pinned to the mutable tag ref `{tag}`; pin to a full commit \
+                     SHA to guard against tag mutation"
+                ),
+                code: Some(NumberOrString::String(
+                    MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into(),
+                )),
+                source: Some("deps-lsp".into()),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// Builds the "Pin `{name}` to commit SHA" quickfix (issue #473, US-002) for the
+/// `PinStyle::Tag` dependency at `position`, if [`GithubActionsFormatter::sha_pin_replacement_for`]
+/// resolves its current tag against the shared `TagIndex`.
+///
+/// Returns `None` (no destructive/no-op edit, FR-005) when the dependency at `position`
+/// is not `PinStyle::Tag`, has no `version_range`, or the `TagIndex` lookup misses (cache
+/// miss — e.g. the document was opened before the registry fetch completed).
+fn build_sha_pin_action(
+    parse_result: &dyn ParseResultTrait,
+    position: Position,
+    uri: &Uri,
+    formatter: &GithubActionsFormatter,
+) -> Option<CodeAction> {
+    // Same lookup convention every other deps-lsp code action goes through (critic S2) —
+    // not a hand-rolled position check. The default (`version_range` only, GHA does not
+    // override it) is exactly right here: the diagnostic and the edit both anchor on
+    // `version_range`, never `name_range`.
+    let dep = parse_result
+        .dependencies()
+        .into_iter()
+        .find(|d| formatter.is_position_on_dependency(*d, position))?;
+
+    let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+    if gha_dep.pin != Some(PinStyle::Tag) {
+        return None;
+    }
+    // FR-010: for a quoted `uses:` scalar, `version_range` sits inside the quotes —
+    // writing `{sha} # {tag}` there corrupts the value instead of adding a YAML comment
+    // (security audit finding, spec 031 FR-010). Withhold rather than risk that edit.
+    if !gha_dep.is_plain_scalar {
+        return None;
+    }
+    let version_range = gha_dep.version_range?;
+    let tag = gha_dep
+        .version_req
+        .as_ref()
+        .map(deps_core::VersionReq::as_str)?;
+    let new_text = formatter.sha_pin_replacement_for(&gha_dep.name, tag)?;
+
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(
+        uri.clone(),
+        vec![TextEdit {
+            range: version_range,
+            new_text,
+        }],
+    );
+
+    Some(CodeAction {
+        title: format!("Pin {} to commit SHA", gha_dep.name),
+        kind: Some(CodeActionKind::QUICKFIX),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        data: Some(serde_json::json!({
+            "diagnostic_codes": [MUTABLE_REF_PIN_DIAGNOSTIC_CODE],
+            "diagnostic_range": version_range,
+        })),
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use tower_lsp_server::ls_types::DiagnosticSeverity;
+
+    // --- issue #473: mutable-ref-pin diagnostic + "Pin to commit SHA" code action ---
+
+    fn mutable_ref_pin_code() -> NumberOrString {
+        NumberOrString::String(MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into())
+    }
+
+    async fn diagnostics_for(content: &str) -> Vec<Diagnostic> {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        eco.generate_diagnostics(
+            parse_result.as_ref(),
+            deps_core::VersionData::new(&cached, &resolved),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+        )
+        .await
+    }
+
+    /// SC-003/SC-004: one fixture workflow mixing every `PinStyle` variant — exactly the
+    /// `Tag` steps get the mutable-ref-pin diagnostic, and `Sha` steps (with or without a
+    /// comment) get none, in the same document.
+    #[tokio::test]
+    async fn test_generate_diagnostics_fixture_covers_every_pin_style() {
+        let content = format!(
+            "steps:\n\
+             \x20 - uses: actions/checkout@v4\n\
+             \x20 - uses: actions/setup-node@{sha} # v4.0.0\n\
+             \x20 - uses: actions/setup-node@{sha}\n\
+             \x20 - uses: some-org/some-action@main\n",
+            sha = "a".repeat(40)
+        );
+        let diagnostics = diagnostics_for(&content).await;
+        let mutable_count = diagnostics
+            .iter()
+            .filter(|d| d.code == Some(mutable_ref_pin_code()))
+            .count();
+        assert_eq!(
+            mutable_count, 1,
+            "exactly the one Tag-pinned step must get the diagnostic: {diagnostics:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_emits_mutable_ref_pin_for_tag_pin() {
+        let diagnostics = diagnostics_for("steps:\n  - uses: actions/checkout@v4\n").await;
+        let found = diagnostics
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected a mutable-ref-pin diagnostic for a tag pin");
+        assert_eq!(found.severity, Some(DiagnosticSeverity::HINT));
+        assert!(found.message.contains("actions/checkout"));
+    }
+
+    /// Security audit finding (low): a huge ref text (attacker-controlled workflow file,
+    /// no upstream length cap) must not render unbounded into the diagnostic message,
+    /// re-sent on every `publishDiagnostics`.
+    #[tokio::test]
+    async fn test_generate_diagnostics_mutable_ref_pin_message_caps_long_tag() {
+        let long_tag = format!("v{}", "1".repeat(10_000));
+        let content = format!("steps:\n  - uses: actions/checkout@{long_tag}\n");
+        let diagnostics = diagnostics_for(&content).await;
+
+        let found = diagnostics
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected a mutable-ref-pin diagnostic");
+        assert!(
+            found.message.len() < long_tag.len(),
+            "a 10,000-char tag must not render in full inside the diagnostic message"
+        );
+        assert!(found.message.contains('…'));
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_no_mutable_ref_pin_for_sha_pin() {
+        let diagnostics = diagnostics_for(&format!(
+            "steps:\n  - uses: actions/checkout@{}\n",
+            "a".repeat(40)
+        ))
+        .await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == Some(mutable_ref_pin_code()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_no_mutable_ref_pin_for_sha_with_comment_pin() {
+        let diagnostics = diagnostics_for(&format!(
+            "steps:\n  - uses: actions/checkout@{} # v4\n",
+            "a".repeat(40)
+        ))
+        .await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == Some(mutable_ref_pin_code()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_no_mutable_ref_pin_for_branch_pin() {
+        let diagnostics = diagnostics_for("steps:\n  - uses: some-org/some-action@main\n").await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == Some(mutable_ref_pin_code()))
+        );
+    }
+
+    /// US-003/FR-006: a step both stale and mutable gets both diagnostics, independently,
+    /// with distinct codes — neither suppresses the other.
+    #[tokio::test]
+    async fn test_generate_diagnostics_mutable_and_outdated_coexist_with_distinct_codes() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v3\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+        let mut cached = HashMap::new();
+        cached.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            deps_core::PackageVersions {
+                latest: "v4".into(),
+                available: Arc::from(vec!["v4".into(), "v3".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+            },
+        );
+        let resolved = HashMap::new();
+
+        let diagnostics = eco
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "expected both diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == Some(mutable_ref_pin_code()))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code != Some(mutable_ref_pin_code())
+                    && d.message.contains("Newer version available"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_diagnostics_mutable_ref_pin_uses_configured_severity() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let severities = deps_core::lsp_helpers::DiagnosticSeverities {
+            mutable_ref_pin: DiagnosticSeverity::ERROR,
+            ..deps_core::lsp_helpers::DiagnosticSeverities::default()
+        };
+
+        let diagnostics = eco
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                severities,
+            )
+            .await;
+
+        let found = diagnostics
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected a mutable-ref-pin diagnostic");
+        assert_eq!(found.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    /// FR-009 (corrected): `mutable_ref_pin_enabled: false` must suppress the diagnostic
+    /// entirely, since `mutable_ref_pin` severity alone has no way to.
+    #[tokio::test]
+    async fn test_generate_diagnostics_mutable_ref_pin_disabled_emits_nothing() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let severities = deps_core::lsp_helpers::DiagnosticSeverities {
+            mutable_ref_pin_enabled: false,
+            ..deps_core::lsp_helpers::DiagnosticSeverities::default()
+        };
+
+        let diagnostics = eco
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                severities,
+            )
+            .await;
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == Some(mutable_ref_pin_code())),
+            "mutable_ref_pin_enabled: false must suppress the diagnostic entirely: {diagnostics:?}"
+        );
+    }
+
+    /// Exercises `build_sha_pin_action` directly rather than through
+    /// `GithubActionsEcosystem::generate_code_actions`: the shared default that override
+    /// delegates to first drives a *live* registry fetch (to list "Update to X" actions),
+    /// which would overwrite a hand-seeded `TagIndex` fixture with real GitHub data before
+    /// this function ever runs.
+    #[test]
+    fn test_build_sha_pin_action_offers_quickfix_on_tag_index_hit() {
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+
+        let formatter = GithubActionsFormatter {
+            tag_index: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        formatter.tag_index.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            Arc::new(index),
+        );
+
+        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            .version_range()
+            .unwrap()
+            .start;
+
+        let action = build_sha_pin_action(&parse_result, position, &uri, &formatter)
+            .expect("expected a Pin-to-commit-SHA quickfix");
+        assert!(action.title.contains("Pin") && action.title.contains("commit SHA"));
+        let edit = action.edit.as_ref().unwrap();
+        let text_edits = edit.changes.as_ref().unwrap().get(&uri).unwrap();
+        assert_eq!(text_edits.len(), 1);
+        assert_eq!(text_edits[0].new_text, format!("{} # v4", "a".repeat(40)));
+    }
+
+    /// Critic S2: the lookup now goes through the shared `is_position_on_dependency`
+    /// convention (`version_range` only, GHA does not override it) rather than a
+    /// hand-rolled check that also matched `name_range` — a cursor on the action *name*
+    /// must not offer this quickfix, matching every other deps-lsp code action's UX.
+    #[test]
+    fn test_build_sha_pin_action_cursor_on_name_range_offers_nothing() {
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+
+        let formatter = GithubActionsFormatter {
+            tag_index: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        formatter.tag_index.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            Arc::new(index),
+        );
+
+        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            .name_range()
+            .start;
+
+        assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+    }
+
+    /// FR-005: a `TagIndex` cache miss must never offer a destructive/no-op edit.
+    #[test]
+    fn test_build_sha_pin_action_no_quickfix_on_tag_index_miss() {
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+
+        let formatter = GithubActionsFormatter {
+            tag_index: Arc::new(dashmap::DashMap::new()),
+        };
+
+        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            .version_range()
+            .unwrap()
+            .start;
+
+        assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+    }
+
+    /// FR-005/plan §11: a `PinStyle::Branch` step must never get the SHA-pin quickfix,
+    /// even if a `TagIndex` entry happens to exist for its literal ref text.
+    #[test]
+    fn test_build_sha_pin_action_no_quickfix_for_branch_pin() {
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: some-org/some-action@main\n";
+        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+
+        let formatter = GithubActionsFormatter {
+            tag_index: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert("main".to_string(), "a".repeat(40));
+        formatter.tag_index.insert(
+            deps_core::PackageName::new("some-org/some-action"),
+            Arc::new(index),
+        );
+
+        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            .version_range()
+            .unwrap()
+            .start;
+
+        assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+    }
+
+    /// FR-010 (security audit finding): a quoted `uses:` scalar must never get the
+    /// SHA-pin quickfix, even on a `TagIndex` hit — writing `{sha} # {tag}` inside the
+    /// quotes would corrupt the value and make it re-parse as `PinStyle::Branch`.
+    #[test]
+    fn test_build_sha_pin_action_no_quickfix_for_quoted_scalar() {
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
+        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+        assert!(!parse_result.dependencies[0].is_plain_scalar);
+
+        let formatter = GithubActionsFormatter {
+            tag_index: Arc::new(dashmap::DashMap::new()),
+        };
+        let mut index = crate::registry::TagIndex::default();
+        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        formatter.tag_index.insert(
+            deps_core::PackageName::new("actions/checkout"),
+            Arc::new(index),
+        );
+
+        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            .version_range()
+            .unwrap()
+            .start;
+
+        assert!(
+            build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
+            "a quoted uses: scalar must withhold the quickfix even on a TagIndex hit"
+        );
+    }
 
     #[test]
     fn test_ecosystem_id_and_display_name() {

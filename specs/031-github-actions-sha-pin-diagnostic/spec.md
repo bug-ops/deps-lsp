@@ -113,10 +113,12 @@ what the existing outdated-version check already performs.
 - `./local` action references and `docker://image:tag` uses — both already
   excluded from version resolution in #471 for unrelated reasons (no
   resolvable ref) and are out of scope here for the same reason.
-- Workspace/client configuration to disable the diagnostic — it ships
-  on by default (consistent with every other deps-lsp diagnostic), using
-  the existing `DiagnosticSeverities`-style mechanism a user already has
-  to lower its severity or silence it; no new opt-in toggle is introduced.
+- ~~Workspace/client configuration to disable the diagnostic~~ — **superseded
+  by FR-009's correction**: it ships on by default, but *does* get a new
+  `mutable_ref_pin_enabled` boolean toggle (mirroring `vulnerabilities_enabled`),
+  because `DiagnosticSeverities` alone cannot silence a diagnostic in this
+  codebase. What remains out of scope is only a *severity-based* suppression
+  mechanism — none is introduced or assumed to exist beyond the toggle.
 
 ## 2. User Stories
 
@@ -190,7 +192,8 @@ Use EARS notation. Prefix with FR-NNN.
 | FR-006 | WHEN both the mutable-ref-pin diagnostic and the existing outdated-version diagnostic apply to the same step THE SYSTEM SHALL emit both independently, with distinct diagnostic codes/sources, and SHALL NOT suppress either one in favor of the other | must |
 | FR-007 | WHEN the mutable-ref-pin diagnostic's code action is applied THE SYSTEM SHALL preserve the step's existing trailing comment convention (`# {tag}`), matching the format already used by the outdated-SHA-update code action, so the two code actions are visually consistent to the user | should |
 | FR-008 | WHEN the mutable-ref-pin diagnostic fires THE SYSTEM SHALL use `Hint` severity by default, configurable through the same `DiagnosticSeverities`-style mechanism as other deps-lsp diagnostics (`crates/deps-core/src/lsp_helpers/diagnostics.rs`) | must |
-| FR-009 | THE SYSTEM SHALL emit the mutable-ref-pin diagnostic without requiring any new workspace or client configuration to opt in — it ships enabled by default, matching every other deps-lsp diagnostic | must |
+| FR-009 | THE SYSTEM SHALL ship the mutable-ref-pin diagnostic enabled by default, gated by a `mutable_ref_pin_enabled: bool` workspace/client config toggle (default `true`), mirroring the existing `vulnerabilities_enabled` precedent — *not* the four severity-only categories. **Corrected 2026-09-02 during implementation review**: the original wording assumed `DiagnosticSeverities` alone lets a user silence this diagnostic; that premise is false — `DiagnosticSeverity` (LSP) has no suppression value and severity is never treated as a suppression input anywhere in this codebase, so without this toggle the diagnostic would be permanent and unremovable for any repository using tag pins (the dominant style) | must |
+| FR-010 | WHEN the mutable-ref-pin diagnostic's code action would rewrite a `uses:` ref that is a quoted YAML scalar (single- or double-quoted) THE SYSTEM SHALL withhold the code action rather than write `{sha} # {tag}` inside the quotes — writing inside the quotes produces a `uses:` value GitHub Actions rejects, and the resulting corrupted ref re-parses as `PinStyle::Branch`, silently making the mutable-ref-pin diagnostic disappear on the very step it just broke. Found during implementation review (security audit); the parser already tracks scalar style (`parser.rs`'s `TScalarStyle::Plain` gate) for the analogous existing SHA-update case | must |
 
 ## 4. Non-Functional Requirements
 

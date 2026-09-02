@@ -106,22 +106,25 @@ pub async fn handle_code_actions(
 ///    is recomputed from the freshly re-parsed buffer. Requiring equality here would make
 ///    an in-flight edit break a binding that works today.
 /// 3. Only when two or more candidates remain — reachable because
-///    `UNSATISFIABLE_DIAGNOSTIC_CODE` is a constant shared by every unsatisfiable
-///    dependency in a document, unlike a unique advisory id — narrow to the candidates
-///    whose range *overlaps* `diagnostic_range`, so one action does not claim every
-///    unsatisfiable dependency in the document. Overlap, not equality, so a range shifted
-///    by an in-flight edit still matches. If the narrowing leaves nothing, fall back to
-///    the full code-matched set rather than binding nothing.
+///    `UNSATISFIABLE_DIAGNOSTIC_CODE` (and, since issue #473, GitHub Actions'
+///    `MUTABLE_REF_PIN_DIAGNOSTIC_CODE` — the more frequent case in practice, since it
+///    fires on every tag-pinned `uses:` step in a workflow) is a constant shared by
+///    every matching dependency in a document, unlike a unique advisory id — narrow to
+///    the candidates whose range *overlaps* `diagnostic_range`, so one action does not
+///    claim every same-code dependency in the document. Overlap, not equality, so a
+///    range shifted by an in-flight edit still matches. If the narrowing leaves nothing,
+///    fall back to the full code-matched set rather than binding nothing.
 ///
 /// `data` is cleared afterward regardless of whether a match was found, so a stale payload
 /// can never be mistaken for a still-resolvable action.
 ///
-/// Accepted tradeoff: because `UNSATISFIABLE_DIAGNOSTIC_CODE` is a constant, if the client's
-/// diagnostic list happens to contain exactly one unsatisfiable diagnostic and it belongs to
-/// a *different* dependency than the one this action targets, step 2 still binds it (no range
-/// check on a single candidate). This is cosmetic mis-attribution of the editor's "fix this
-/// problem" affordance only — the `TextEdit` itself always comes from this action's own
-/// `dep.version_range()`, so no incorrect edit is possible.
+/// Accepted tradeoff: because a diagnostic code can be a shared constant rather than a
+/// per-instance id (`UNSATISFIABLE_DIAGNOSTIC_CODE`, `MUTABLE_REF_PIN_DIAGNOSTIC_CODE`), if
+/// the client's diagnostic list happens to contain exactly one same-code diagnostic and it
+/// belongs to a *different* dependency than the one this action targets, step 2 still binds
+/// it (no range check on a single candidate). This is cosmetic mis-attribution of the
+/// editor's "fix this problem" affordance only — the `TextEdit` itself always comes from
+/// this action's own `dep.version_range()`, so no incorrect edit is possible.
 fn bind_diagnostics(actions: &mut [CodeAction], diagnostics: &[Diagnostic]) {
     for action in actions {
         let Some(data) = action.data.take() else {

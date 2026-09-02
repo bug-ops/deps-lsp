@@ -366,6 +366,14 @@ fn build_dependency(
     char_offsets: &CharOffsets,
     candidate: UsesCandidate,
 ) -> Option<GithubActionsDependency> {
+    // Whether the *whole* `uses:` value scalar was written unquoted. For a quoted scalar,
+    // any `Range` computed below sits inside the quotes — a SHA-pin code action (issue
+    // #473) must not write `{sha} # {tag}` there, since the `#` would land inside the
+    // string rather than starting a YAML comment (spec 031 FR-010). Read once here and
+    // carried on every constructed dependency, mirroring the existing single-purpose
+    // `TScalarStyle::Plain` gate below for the SHA-with-comment case.
+    let is_plain_scalar = candidate.style == TScalarStyle::Plain;
+
     let value_start = char_offsets.byte_offset(candidate.char_index);
     let (raw_start, raw_end) = locate_value_span(content, value_start, &candidate.value)?;
 
@@ -409,6 +417,7 @@ fn build_dependency(
             source: DependencySource::Path {
                 path: trimmed_value,
             },
+            is_plain_scalar,
         }),
         ParsedUses::Docker => Some(GithubActionsDependency {
             name: trimmed_value.clone().into(),
@@ -418,6 +427,7 @@ fn build_dependency(
             version_literal: None,
             pin: None,
             source: DependencySource::Url { url: trimmed_value },
+            is_plain_scalar,
         }),
         ParsedUses::NoAt { name } => {
             let name_end = span_start + name.len();
@@ -429,6 +439,7 @@ fn build_dependency(
                 version_literal: None,
                 pin: None,
                 source: DependencySource::Registry,
+                is_plain_scalar,
             })
         }
         ParsedUses::Ref {
@@ -457,6 +468,7 @@ fn build_dependency(
                     source: DependencySource::Url {
                         url: format!("https://github.com/{name}"),
                     },
+                    is_plain_scalar,
                 });
             }
 
@@ -465,7 +477,7 @@ fn build_dependency(
                 let rest_of_line_end = rest_of_line.find('\n').unwrap_or(rest_of_line.len());
                 let rest_of_line = &rest_of_line[..rest_of_line_end];
 
-                let comment = (candidate.style == TScalarStyle::Plain)
+                let comment = is_plain_scalar
                     .then(|| extract_comment_tag(rest_of_line))
                     .flatten();
 
@@ -480,6 +492,7 @@ fn build_dependency(
                             comment_tag: Some(tag.to_string()),
                         }),
                         source: DependencySource::Registry,
+                        is_plain_scalar,
                     },
                     None => GithubActionsDependency {
                         name: name.into(),
@@ -489,6 +502,7 @@ fn build_dependency(
                         version_literal: None,
                         pin: Some(PinStyle::Sha { comment_tag: None }),
                         source: DependencySource::Registry,
+                        is_plain_scalar,
                     },
                 });
             }
@@ -506,6 +520,7 @@ fn build_dependency(
                 version_literal: None,
                 pin: Some(pin),
                 source: DependencySource::Registry,
+                is_plain_scalar,
             })
         }
         ParsedUses::Malformed => {
@@ -931,6 +946,24 @@ mod tests {
             dep.version_requirement().map(deps_core::VersionReq::as_str),
             Some("v4")
         );
+        // Security audit finding (issue #473, spec 031 FR-010): a quoted `uses:` scalar
+        // must be flagged so a SHA-pin code action never writes `{sha} # {tag}` inside
+        // the quotes.
+        assert!(!dep.is_plain_scalar);
+    }
+
+    #[test]
+    fn test_is_plain_scalar_true_for_unquoted_uses_value() {
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert!(result.dependencies[0].is_plain_scalar);
+    }
+
+    #[test]
+    fn test_is_plain_scalar_false_for_single_quoted_uses_value() {
+        let content = "steps:\n  - uses: 'actions/checkout@v4'\n";
+        let result = parse_workflow_yaml(content, &test_uri()).unwrap();
+        assert!(!result.dependencies[0].is_plain_scalar);
     }
 
     #[test]

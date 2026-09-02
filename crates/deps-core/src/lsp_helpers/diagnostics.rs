@@ -29,13 +29,24 @@ pub const UNSATISFIABLE_DIAGNOSTIC_CODE: &str = "unsatisfiable-requirement";
 /// [`DiagnosticSeverity::INFORMATION`] message.
 const MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS: usize = 128;
 
-/// Truncates `value` to at most `max_chars` characters, appending `…` when truncated, so an
-/// attacker-controlled string interpolated into a diagnostic message can never render an
-/// unbounded amount of text inline in the editor.
+/// Truncates `value` to at most `max_chars` characters, appending `…` when truncated.
 ///
-/// Counts characters, not bytes, so a truncation point never lands mid-character (`value` may
-/// contain multi-byte UTF-8).
-fn truncate_for_diagnostic(value: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+/// So an attacker-controlled string interpolated into a diagnostic message can never
+/// render an unbounded amount of text inline in the editor. Counts characters, not bytes,
+/// so a truncation point never lands mid-character (`value` may contain multi-byte
+/// UTF-8). `pub`, not module-private: `deps-github-actions`' mutable-ref-pin diagnostic
+/// (issue #473) reuses this same chokepoint for its own attacker-controlled `name`/`tag`
+/// interpolation, rather than duplicating the truncation logic in a second crate.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::truncate_for_diagnostic;
+///
+/// assert_eq!(truncate_for_diagnostic("short", 128), "short");
+/// assert_eq!(truncate_for_diagnostic(&"a".repeat(200), 5), "aaaaa…");
+/// ```
+pub fn truncate_for_diagnostic(value: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
     if value.chars().count() <= max_chars {
         return std::borrow::Cow::Borrowed(value);
     }
@@ -68,6 +79,8 @@ pub const DEPRECATED_DIAGNOSTIC_CODE: &str = "deprecated-package";
 /// assert_eq!(severities.yanked, DiagnosticSeverity::WARNING);
 /// assert_eq!(severities.unsatisfiable, DiagnosticSeverity::WARNING);
 /// assert_eq!(severities.deprecated, DiagnosticSeverity::WARNING);
+/// assert_eq!(severities.mutable_ref_pin, DiagnosticSeverity::HINT);
+/// assert!(severities.mutable_ref_pin_enabled);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiagnosticSeverities {
@@ -82,6 +95,21 @@ pub struct DiagnosticSeverities {
     /// Severity for a dependency on a package the registry reports as
     /// deprecated/abandoned (issue #205).
     pub deprecated: DiagnosticSeverity,
+    /// Severity for a GitHub Actions `uses:` step pinned to a mutable ref (a tag)
+    /// instead of a full commit SHA (issue #473). Unused by every ecosystem except
+    /// `deps-github-actions` today — see that crate's
+    /// `MUTABLE_REF_PIN_DIAGNOSTIC_CODE` for the diagnostic this severity gates.
+    /// Tunes loudness only; see [`Self::mutable_ref_pin_enabled`] for the on/off
+    /// toggle.
+    pub mutable_ref_pin: DiagnosticSeverity,
+    /// Whether the mutable-ref-pin diagnostic (issue #473) runs at all, unused by
+    /// every ecosystem except `deps-github-actions`. Unlike every other field in
+    /// this struct, `mutable_ref_pin` alone cannot silence the diagnostic —
+    /// `DiagnosticSeverity` has no suppression value, and severity is never treated
+    /// as a suppression input anywhere in this codebase — so this diagnostic
+    /// additionally needs a real presence toggle, mirroring
+    /// `deps_lsp::config::DiagnosticsConfig::vulnerabilities_enabled`'s shape.
+    pub mutable_ref_pin_enabled: bool,
 }
 
 impl Default for DiagnosticSeverities {
@@ -92,6 +120,8 @@ impl Default for DiagnosticSeverities {
             yanked: DiagnosticSeverity::WARNING,
             unsatisfiable: DiagnosticSeverity::WARNING,
             deprecated: DiagnosticSeverity::WARNING,
+            mutable_ref_pin: DiagnosticSeverity::HINT,
+            mutable_ref_pin_enabled: true,
         }
     }
 }
