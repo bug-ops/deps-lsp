@@ -12,7 +12,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
+use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
+
+/// Upper bound on how long a server-to-client request is allowed to wait for a
+/// reply before being abandoned (issue #493). Used both for the detached
+/// `workspace/*/refresh` requests below (S2: without it, a client that declares
+/// refresh support but stops replying would let these detached tasks — and
+/// `tower_lsp_server`'s internal pending-request bookkeeping — accumulate without
+/// limit as the user keeps editing) and, via re-export, for the `initialized()`
+/// registration requests and `workspace/diagnostic/refresh` in `server.rs` (S1: same
+/// hang risk, an unresponsive client would otherwise stall those handlers forever).
+pub(crate) const CLIENT_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Re-export LoadingState from deps-core for convenience
 pub use deps_core::LoadingState;
@@ -463,6 +474,14 @@ pub struct ServerState {
     /// direct access to `ClientCapabilities` (see `RegistryProgress::start` call
     /// sites in `document::lifecycle`).
     progress_supported: AtomicBool,
+    /// Whether the client advertised `workspace.inlayHint.refreshSupport` during
+    /// `initialize`. Set once, read from spawned lifecycle tasks (issue #493: a
+    /// client that never declared this and never replies would otherwise hang the
+    /// unbounded `inlay_hint_refresh` await forever).
+    inlay_hint_refresh_supported: AtomicBool,
+    /// Whether the client advertised `workspace.codeLens.refreshSupport` during
+    /// `initialize`. See `inlay_hint_refresh_supported` for rationale.
+    code_lens_refresh_supported: AtomicBool,
 }
 
 impl ServerState {
@@ -498,6 +517,8 @@ impl ServerState {
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
             progress_supported: AtomicBool::new(false),
+            inlay_hint_refresh_supported: AtomicBool::new(false),
+            code_lens_refresh_supported: AtomicBool::new(false),
         }
     }
 
@@ -512,6 +533,74 @@ impl ServerState {
     /// `window.workDoneProgress` from `ClientCapabilities`.
     pub fn set_progress_supported(&self, supported: bool) {
         self.progress_supported.store(supported, Ordering::Relaxed);
+    }
+
+    /// Returns whether the client supports `workspace/inlayHint/refresh`.
+    pub fn inlay_hint_refresh_supported(&self) -> bool {
+        self.inlay_hint_refresh_supported.load(Ordering::Relaxed)
+    }
+
+    /// Records whether the client supports `workspace/inlayHint/refresh`.
+    ///
+    /// Called once from `initialize` with the result of negotiating
+    /// `workspace.inlayHint.refreshSupport` from `ClientCapabilities`.
+    pub fn set_inlay_hint_refresh_supported(&self, supported: bool) {
+        self.inlay_hint_refresh_supported
+            .store(supported, Ordering::Relaxed);
+    }
+
+    /// Returns whether the client supports `workspace/codeLens/refresh`.
+    pub fn code_lens_refresh_supported(&self) -> bool {
+        self.code_lens_refresh_supported.load(Ordering::Relaxed)
+    }
+
+    /// Records whether the client supports `workspace/codeLens/refresh`.
+    ///
+    /// Called once from `initialize` with the result of negotiating
+    /// `workspace.codeLens.refreshSupport` from `ClientCapabilities`.
+    pub fn set_code_lens_refresh_supported(&self, supported: bool) {
+        self.code_lens_refresh_supported
+            .store(supported, Ordering::Relaxed);
+    }
+
+    /// Fires `workspace/inlayHint/refresh` and `workspace/codeLens/refresh` as
+    /// detached, capability-gated, timeout-bounded background requests (issue #493).
+    ///
+    /// Neither refresh feeds anything downstream (hover/inlay-hint/code-lens
+    /// handlers recompute on demand from already-committed document state), so a
+    /// failure or timeout is only logged and never blocks the caller's critical
+    /// path — the OSV vulnerability commit and diagnostics publish this is called
+    /// alongside. The capability gate skips clients that never declared support (and
+    /// so may never reply); the timeout additionally bounds a client that declares
+    /// support but stops replying, so detached tasks can't accumulate without limit.
+    pub fn spawn_refresh_requests(&self, client: &Client) {
+        if self.inlay_hint_refresh_supported() {
+            let client = client.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.inlay_hint_refresh())
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!("inlay_hint_refresh failed: {:?}", e),
+                    Err(_) => tracing::debug!(
+                        "inlay_hint_refresh timed out after {CLIENT_REFRESH_TIMEOUT:?}"
+                    ),
+                }
+            });
+        }
+        if self.code_lens_refresh_supported() {
+            let client = client.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.code_lens_refresh()).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!("code_lens_refresh failed: {:?}", e),
+                    Err(_) => tracing::debug!(
+                        "code_lens_refresh timed out after {CLIENT_REFRESH_TIMEOUT:?}"
+                    ),
+                }
+            });
+        }
     }
 
     /// Retrieves document state by URI.
@@ -956,6 +1045,35 @@ mod tests {
     fn test_server_state_default() {
         let state = ServerState::default();
         assert_eq!(state.document_count(), 0);
+    }
+
+    /// Issue #493: the fire-and-forget refresh call sites in `document::lifecycle`
+    /// read these flags synchronously instead of awaiting `ClientCapabilities` — a
+    /// wrong default (or a setter that doesn't round-trip) would either suppress a
+    /// refresh a client wants or resurrect the original hang by letting an
+    /// unsupported client's request be sent anyway.
+    #[test]
+    fn test_inlay_hint_refresh_supported_defaults_false_and_round_trips() {
+        let state = ServerState::new();
+        assert!(!state.inlay_hint_refresh_supported());
+
+        state.set_inlay_hint_refresh_supported(true);
+        assert!(state.inlay_hint_refresh_supported());
+
+        state.set_inlay_hint_refresh_supported(false);
+        assert!(!state.inlay_hint_refresh_supported());
+    }
+
+    #[test]
+    fn test_code_lens_refresh_supported_defaults_false_and_round_trips() {
+        let state = ServerState::new();
+        assert!(!state.code_lens_refresh_supported());
+
+        state.set_code_lens_refresh_supported(true);
+        assert!(state.code_lens_refresh_supported());
+
+        state.set_code_lens_refresh_supported(false);
+        assert!(!state.code_lens_refresh_supported());
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 use crate::config::DepsConfig;
-use crate::document::{ServerState, handle_document_change, handle_document_open};
+use crate::document::{
+    CLIENT_REFRESH_TIMEOUT, ServerState, handle_document_change, handle_document_open,
+};
 use crate::file_watcher;
 use crate::handlers::{
     code_actions, code_lens, completion, diagnostics, document_link, hover, inlay_hints,
@@ -245,12 +247,9 @@ impl Backend {
             self.client.publish_diagnostics(uri, items, None).await;
         }
 
-        if let Err(e) = self.client.inlay_hint_refresh().await {
-            tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
-        }
-        if let Err(e) = self.client.code_lens_refresh().await {
-            tracing::debug!("code_lens_refresh not supported: {:?}", e);
-        }
+        // Detached, capability-gated, timeout-bounded (issue #493): see
+        // `ServerState::spawn_refresh_requests` for rationale.
+        self.state.spawn_refresh_requests(&self.client);
     }
 
     /// Check if client supports work done progress.
@@ -283,6 +282,29 @@ impl Backend {
             .and_then(|c| c.workspace.as_ref())
             .and_then(|w| w.diagnostics.as_ref())
             .and_then(|d| d.refresh_support)
+            .unwrap_or(false)
+    }
+
+    /// Whether the client implements `workspace/inlayHint/refresh` (issue #493: a
+    /// client that never declares this may also never reply, which would hang an
+    /// unbounded `inlay_hint_refresh` await forever).
+    async fn inlay_hint_refresh_supported(&self) -> bool {
+        let caps = self.client_capabilities.read().await;
+        caps.as_ref()
+            .and_then(|c| c.workspace.as_ref())
+            .and_then(|w| w.inlay_hint.as_ref())
+            .and_then(|h| h.refresh_support)
+            .unwrap_or(false)
+    }
+
+    /// Whether the client implements `workspace/codeLens/refresh`. See
+    /// `inlay_hint_refresh_supported` for rationale.
+    async fn code_lens_refresh_supported(&self) -> bool {
+        let caps = self.client_capabilities.read().await;
+        caps.as_ref()
+            .and_then(|c| c.workspace.as_ref())
+            .and_then(|w| w.code_lens.as_ref())
+            .and_then(|c| c.refresh_support)
             .unwrap_or(false)
     }
 
@@ -339,6 +361,25 @@ impl LanguageServer for Backend {
         *self.client_capabilities.write().await = Some(params.capabilities.clone());
         self.state
             .set_progress_supported(self.supports_progress().await);
+        let inlay_hint_refresh_supported = self.inlay_hint_refresh_supported().await;
+        self.state
+            .set_inlay_hint_refresh_supported(inlay_hint_refresh_supported);
+        let code_lens_refresh_supported = self.code_lens_refresh_supported().await;
+        self.state
+            .set_code_lens_refresh_supported(code_lens_refresh_supported);
+        // Note (issue #493 M1): a client that implements refresh but never declares
+        // `refreshSupport` is gated off here too, and will not see hints/lenses update
+        // after a background fetch until the document is reopened.
+        if !inlay_hint_refresh_supported {
+            tracing::debug!(
+                "client did not declare workspace.inlayHint.refreshSupport; inlay hints won't auto-refresh after background fetches"
+            );
+        }
+        if !code_lens_refresh_supported {
+            tracing::debug!(
+                "client did not declare workspace.codeLens.refreshSupport; code lenses won't auto-refresh after background fetches"
+            );
+        }
 
         // Parse initialization options
         if let Some(init_options) = params.initialization_options
@@ -377,34 +418,11 @@ impl LanguageServer for Backend {
             )
             .await;
 
-        // Register lock file watchers using patterns from all ecosystems
-        let patterns = self.state.ecosystem_registry.all_lockfile_patterns();
-        if let Err(e) = file_watcher::register_lock_file_watchers(&self.client, &patterns).await {
-            tracing::warn!("Failed to register file watchers: {}", e);
-            self.client
-                .log_message(MessageType::WARNING, format!("File watching disabled: {e}"))
-                .await;
-        }
-
-        // Dynamically register for `workspace/didChangeConfiguration` so clients that
-        // gate the notification on this (M3) actually send it — without it, a changed
-        // `freshness.cooldown_secs` would never reach `did_change_configuration`.
-        if self
-            .did_change_configuration_dynamic_registration_supported()
-            .await
-        {
-            let registration = Registration {
-                id: "deps-lsp-did-change-configuration".to_string(),
-                method: "workspace/didChangeConfiguration".to_string(),
-                register_options: None,
-            };
-            if let Err(e) = self.client.register_capability(vec![registration]).await {
-                tracing::warn!("Failed to register didChangeConfiguration: {}", e);
-            }
-        }
-
         // Spawn background cleanup task for cold start rate limiter, supervised so a
-        // panic surfaces as an `error!` log instead of silently stopping cleanup forever.
+        // panic surfaces as an `error!` log instead of silently stopping cleanup
+        // forever. Spawned before the two registration requests below (issue #493
+        // S1) so an unresponsive client stalling those never delays this from
+        // starting.
         let state_clone = Arc::clone(&self.state);
         let cleanup_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_mins(1));
@@ -421,6 +439,60 @@ impl LanguageServer for Backend {
             let Err(e) = cleanup_task.await;
             tracing::error!("Cold start rate limiter cleanup task exited unexpectedly: {e}");
         });
+
+        // Register lock file watchers using patterns from all ecosystems. Timeout-bounded
+        // (issue #493 S1): tower-lsp-server 0.23.0 dispatches handlers via
+        // `buffer_unordered(4)`, so an unresponsive client hanging this await would
+        // permanently burn one of only 4 concurrent message slots for the session.
+        let patterns = self.state.ecosystem_registry.all_lockfile_patterns();
+        match tokio::time::timeout(
+            CLIENT_REFRESH_TIMEOUT,
+            file_watcher::register_lock_file_watchers(&self.client, &patterns),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("Failed to register file watchers: {}", e);
+                self.client
+                    .log_message(MessageType::WARNING, format!("File watching disabled: {e}"))
+                    .await;
+            }
+            Err(_) => {
+                tracing::warn!("Timed out registering file watchers");
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        "File watching disabled: registration timed out".to_string(),
+                    )
+                    .await;
+            }
+        }
+
+        // Dynamically register for `workspace/didChangeConfiguration` so clients that
+        // gate the notification on this (M3) actually send it — without it, a changed
+        // `freshness.cooldown_secs` would never reach `did_change_configuration`.
+        // Timeout-bounded for the same reason as the file watcher registration above.
+        if self
+            .did_change_configuration_dynamic_registration_supported()
+            .await
+        {
+            let registration = Registration {
+                id: "deps-lsp-did-change-configuration".to_string(),
+                method: "workspace/didChangeConfiguration".to_string(),
+                register_options: None,
+            };
+            match tokio::time::timeout(
+                CLIENT_REFRESH_TIMEOUT,
+                self.client.register_capability(vec![registration]),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("Failed to register didChangeConfiguration: {}", e),
+                Err(_) => tracing::warn!("Timed out registering didChangeConfiguration"),
+            }
+        }
     }
 
     /// Handles `workspace/didChangeConfiguration`, applying a live-reloaded
@@ -458,13 +530,19 @@ impl LanguageServer for Backend {
         // Hover/completion/code actions are computed on demand and pick up the new
         // config for free. Diagnostics are pull-based, so a pull-capable client must be
         // told to re-request them (push-only clients are a known v1 gap, M2).
-        if self.diagnostic_refresh_supported().await
-            && let Err(e) = self.client.workspace_diagnostic_refresh().await
-        {
-            tracing::debug!(
-                "workspace/diagnostic/refresh failed or unsupported: {:?}",
-                e
-            );
+        // Timeout-bounded (issue #493, same class as S1): capability-gated already, but
+        // an unresponsive client would otherwise hang this handler forever.
+        if self.diagnostic_refresh_supported().await {
+            match tokio::time::timeout(
+                CLIENT_REFRESH_TIMEOUT,
+                self.client.workspace_diagnostic_refresh(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!("workspace/diagnostic/refresh failed: {:?}", e),
+                Err(_) => tracing::debug!("workspace/diagnostic/refresh timed out"),
+            }
         }
     }
 
@@ -1252,8 +1330,9 @@ mod tests {
     mod capability_support_tests {
         use super::*;
         use tower_lsp_server::ls_types::{
-            ClientCapabilities, DiagnosticWorkspaceClientCapabilities,
-            DynamicRegistrationClientCapabilities, WorkspaceClientCapabilities,
+            ClientCapabilities, CodeLensWorkspaceClientCapabilities,
+            DiagnosticWorkspaceClientCapabilities, DynamicRegistrationClientCapabilities,
+            InlayHintWorkspaceClientCapabilities, WorkspaceClientCapabilities,
         };
 
         #[tokio::test]
@@ -1294,6 +1373,109 @@ mod tests {
             });
 
             assert!(backend.diagnostic_refresh_supported().await);
+        }
+
+        /// Issue #493: `inlay_hint_refresh`/`code_lens_refresh` are now capability-gated
+        /// before being fired off, so a wrong reading here would either silently drop a
+        /// refresh a client actually wants, or (pre-fix) let a client that never
+        /// declared support hang the caller. Pin both branches for each helper.
+        #[tokio::test]
+        async fn test_inlay_hint_refresh_supported_true_branch() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            *backend.client_capabilities.write().await = Some(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    inlay_hint: Some(InlayHintWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+
+            assert!(backend.inlay_hint_refresh_supported().await);
+        }
+
+        #[tokio::test]
+        async fn test_inlay_hint_refresh_supported_false_when_absent() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            assert!(!backend.inlay_hint_refresh_supported().await);
+        }
+
+        #[tokio::test]
+        async fn test_code_lens_refresh_supported_true_branch() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            *backend.client_capabilities.write().await = Some(ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    code_lens: Some(CodeLensWorkspaceClientCapabilities {
+                        refresh_support: Some(true),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+
+            assert!(backend.code_lens_refresh_supported().await);
+        }
+
+        #[tokio::test]
+        async fn test_code_lens_refresh_supported_false_when_absent() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            assert!(!backend.code_lens_refresh_supported().await);
+        }
+
+        /// `initialize` must snapshot both flags into `ServerState` (mirroring
+        /// `progress_supported`) so the fire-and-forget call sites in
+        /// `document::lifecycle` can read them without an async `ClientCapabilities`
+        /// lock (issue #493).
+        #[tokio::test]
+        async fn test_initialize_propagates_refresh_support_flags_into_state() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            assert!(!backend.state.inlay_hint_refresh_supported());
+            assert!(!backend.state.code_lens_refresh_supported());
+
+            let result = backend
+                .initialize(InitializeParams {
+                    capabilities: ClientCapabilities {
+                        workspace: Some(WorkspaceClientCapabilities {
+                            inlay_hint: Some(InlayHintWorkspaceClientCapabilities {
+                                refresh_support: Some(true),
+                            }),
+                            code_lens: Some(CodeLensWorkspaceClientCapabilities {
+                                refresh_support: Some(true),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .await;
+
+            assert!(result.is_ok());
+            assert!(backend.state.inlay_hint_refresh_supported());
+            assert!(backend.state.code_lens_refresh_supported());
+        }
+
+        #[tokio::test]
+        async fn test_initialize_without_refresh_capabilities_keeps_state_flags_false() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            let result = backend.initialize(InitializeParams::default()).await;
+
+            assert!(result.is_ok());
+            assert!(!backend.state.inlay_hint_refresh_supported());
+            assert!(!backend.state.code_lens_refresh_supported());
         }
     }
 

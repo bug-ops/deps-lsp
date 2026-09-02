@@ -145,6 +145,18 @@ pub(crate) struct LspClient {
     /// just observing a `$/progress` notification that could in principle
     /// arrive some other way.
     progress_create_requests: u64,
+    /// When `false`, `auto_respond` receives (and counts, see
+    /// [`Self::unanswered_refresh_request_count`]) `workspace/inlayHint/refresh` and
+    /// `workspace/codeLens/refresh` requests but never replies — simulating the
+    /// exact client behavior issue #493 was filed against (a hand-rolled client
+    /// that declares refresh support but never answers the request). Defaults to
+    /// `true` (reply immediately), matching every other server-initiated request.
+    respond_to_refresh_requests: bool,
+    /// Count of `workspace/inlayHint/refresh` / `workspace/codeLens/refresh`
+    /// requests received while [`Self::respond_to_refresh_requests`] is `false`.
+    /// Lets a test prove the server actually attempted the refresh (capability
+    /// negotiation worked) even though the harness deliberately never answered it.
+    unanswered_refresh_requests: u64,
 }
 
 impl LspClient {
@@ -167,6 +179,8 @@ impl LspClient {
             notification_counter: Arc::new(AtomicU64::new(0)),
             message_rx: rx,
             progress_create_requests: 0,
+            respond_to_refresh_requests: true,
+            unanswered_refresh_requests: 0,
         }
     }
 
@@ -174,6 +188,25 @@ impl LspClient {
     #[allow(dead_code)] // Used in notification_ordering tests
     pub(crate) fn progress_create_request_count(&self) -> u64 {
         self.progress_create_requests
+    }
+
+    /// Stop auto-answering `workspace/inlayHint/refresh` and
+    /// `workspace/codeLens/refresh` server-initiated requests: they are received
+    /// and counted (see [`Self::unanswered_refresh_request_count`]) but never get a
+    /// reply, simulating issue #493's exact reproduction — a client that declares
+    /// refresh support during `initialize` but never answers the request. Must be
+    /// called before the request that is expected to trigger a refresh.
+    #[allow(dead_code)] // Used in notification_ordering tests
+    pub(crate) fn stop_responding_to_refresh_requests(&mut self) {
+        self.respond_to_refresh_requests = false;
+    }
+
+    /// Number of `workspace/inlayHint/refresh` / `workspace/codeLens/refresh`
+    /// requests received (and deliberately left unanswered) since
+    /// [`Self::stop_responding_to_refresh_requests`] was called.
+    #[allow(dead_code)] // Used in notification_ordering tests
+    pub(crate) fn unanswered_refresh_request_count(&self) -> u64 {
+        self.unanswered_refresh_requests
     }
 
     /// Get all captured notifications.
@@ -353,6 +386,14 @@ impl LspClient {
                 self.progress_create_requests += 1;
                 json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
             }
+            "workspace/inlayHint/refresh" | "workspace/codeLens/refresh"
+                if !self.respond_to_refresh_requests =>
+            {
+                // Simulate issue #493's client: receive the request but never
+                // reply to it, instead of answering immediately below.
+                self.unanswered_refresh_requests += 1;
+                return;
+            }
             "workspace/inlayHint/refresh"
             | "workspace/codeLens/refresh"
             | "client/registerCapability" => {
@@ -397,6 +438,9 @@ impl LspClient {
                     },
                     "workspace": {
                         "inlayHint": {
+                            "refreshSupport": true
+                        },
+                        "codeLens": {
                             "refreshSupport": true
                         }
                     },

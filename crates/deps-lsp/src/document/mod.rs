@@ -14,4 +14,5 @@ mod state;
 // Re-export all public items from submodules
 pub use lifecycle::{ensure_document_loaded, handle_document_change, handle_document_open};
 pub use loader::load_document_from_disk;
+pub(crate) use state::CLIENT_REFRESH_TIMEOUT;
 pub use state::{ColdStartLimiter, DocumentState, LoadingState, ServerState};

@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-github-actions, deps-lsp**: a rate-limited GitHub Actions registry lookup now surfaces its actionable hint (e.g. "set GITHUB_TOKEN") in the "Registry lookup failed" diagnostic instead of the generic fallback (resolves #478) (#485)
 - **deps-lsp**: the one-shot "failed to fetch" toast no longer reports a not-found race winner over a co-occurring actionable failure (e.g. rate limit) in the same batch, and now always states the affected package count (resolves #480) (#489)
 - **deps-core, deps-github-actions**: a tripped rate-limit gate no longer fans out one near-duplicate diagnostic per remaining dependency; fetch failures now collapse into a single diagnostic per manifest, naming every affected dependency via related information and still surfacing a shared actionable hint when one applies (resolves #479) (#489)
+- **deps-lsp**: a client that never answers a server-initiated `workspace/inlayHint/refresh`, `workspace/codeLens/refresh`, `client/registerCapability`, or `workspace/diagnostic/refresh` request no longer permanently stalls the OSV vulnerability commit and diagnostics publish for that document; these requests are now capability-gated and timeout-bounded (5s) instead of awaited unconditionally on the critical path (resolves #493)
 
 ## [0.11.1] - 2026-09-01
 
