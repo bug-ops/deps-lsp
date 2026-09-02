@@ -26,7 +26,7 @@ pub use diagnostics::{
     compile_requirement_unless, generate_diagnostics_from_cache, requirement_is_unsatisfiable,
     truncate_for_diagnostic,
 };
-pub use hover::generate_hover;
+pub use hover::{CMD_DOT_FOOTER, generate_hover};
 pub use in_use_version::{concrete_pin_version, in_use_version, is_full_semver_shape};
 pub use inlay_hints::generate_inlay_hints;
 
