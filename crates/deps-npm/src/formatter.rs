@@ -176,6 +176,28 @@ impl EcosystemFormatter for NpmFormatter {
     ) -> bool {
         false
     }
+
+    /// FR-009: a `.npmrc`-resolved `AlternateRegistry` is resolvable, alongside the default
+    /// public `Registry` — gates hover/diagnostics/code-actions onto the router's per-source
+    /// dispatch (`NpmRegistry::get_versions_from`) instead of the source-blind path.
+    /// `CustomRegistry` (FR-006's fail-closed state) keeps the trait default's `false`.
+    fn can_resolve_source(&self, source: &deps_core::DependencySource) -> bool {
+        matches!(
+            source,
+            deps_core::DependencySource::Registry
+                | deps_core::DependencySource::AlternateRegistry { .. }
+        )
+    }
+
+    /// FR-015: suppresses the hover heading's npmjs.com link for anything but the plain
+    /// public registry — a private package's hover showing a `npmjs.com` link once live data
+    /// from the real (alternate) registry renders alongside it would read as false
+    /// confirmation the link is real. Reuses `source_is_public_registry_content`'s default
+    /// (`Registry` only, not overridden — npm has no crates.io-style verified-mirror concept
+    /// for `AlternateRegistry` to except).
+    fn suppress_package_url(&self, source: &deps_core::DependencySource) -> bool {
+        !self.source_is_public_registry_content(source)
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +302,43 @@ mod tests {
             formatter
                 .validate_package_name("@valid-scope/pkg name")
                 .is_err()
+        );
+    }
+
+    /// FR-009 (M7): `can_resolve_source` accepts `Registry` and `AlternateRegistry`, rejects
+    /// `CustomRegistry` (FR-006's fail-closed state).
+    #[test]
+    fn test_can_resolve_source_fr009() {
+        let formatter = NpmFormatter;
+        assert!(formatter.can_resolve_source(&deps_core::DependencySource::Registry));
+        assert!(
+            formatter.can_resolve_source(&deps_core::DependencySource::AlternateRegistry {
+                index: "https://npm.pkg.github.com".to_string(),
+                mirrors_crates_io: false,
+            })
+        );
+        assert!(
+            !formatter.can_resolve_source(&deps_core::DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            })
+        );
+    }
+
+    /// FR-015 (M7): no npmjs.com hover link for anything but the plain public registry.
+    #[test]
+    fn test_suppress_package_url_fr015() {
+        let formatter = NpmFormatter;
+        assert!(!formatter.suppress_package_url(&deps_core::DependencySource::Registry));
+        assert!(
+            formatter.suppress_package_url(&deps_core::DependencySource::AlternateRegistry {
+                index: "https://npm.pkg.github.com".to_string(),
+                mirrors_crates_io: false,
+            })
+        );
+        assert!(
+            formatter.suppress_package_url(&deps_core::DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            })
         );
     }
 
@@ -437,6 +496,7 @@ mod tests {
                 version_req: Some(VersionReq::new(requirement)),
                 version_range: None,
                 section: NpmDependencySection::Dependencies,
+                source: deps_core::parser::DependencySource::Registry,
             };
             assert!(
                 !formatter.yanked_diagnostic_applies_to(&dep, &VersionReq::new(requirement)),

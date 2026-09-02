@@ -476,11 +476,12 @@ pub struct ServerState {
     pub lockfile_cache: Arc<LockFileCache>,
     /// Ecosystem registry for trait-based architecture
     pub ecosystem_registry: Arc<EcosystemRegistry>,
-    /// Live-updatable Cargo workspace-registry reachability policy (spec #443,
-    /// `cargo.workspace_registries`) — the same handle `crate::register_ecosystems` hands to
-    /// `CargoEcosystem::with_context`, so `Backend::initialize`/`did_change_configuration`
-    /// updating this value here takes effect on every parse from then on, with no need to
-    /// reconstruct the ecosystem.
+    /// Live-updatable workspace-registry reachability policy (spec #443,
+    /// `registries.workspace_registries`, widened from Cargo-only by
+    /// `032-npm-npmrc-registry-support`) — the same handle `crate::register_ecosystems` hands
+    /// to `CargoEcosystem::with_context` and `NpmEcosystem::with_context` alike, so
+    /// `Backend::initialize`/`did_change_configuration` updating this value here takes effect
+    /// on every parse from then on, with no need to reconstruct either ecosystem.
     pub registry_policy: Arc<RegistryAccessPolicy>,
     /// Cold start rate limiter
     pub cold_start_limiter: ColdStartLimiter,

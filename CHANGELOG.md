@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-github-actions, deps-core, deps-lsp**: mutable-ref-pin security diagnostic for a `uses:` step pinned to a tag, with a "Pin to commit SHA" code action rewriting it to `{sha} # {tag}` via the existing tag/SHA index (resolves #473) (#477)
 - **deps-core, deps-lsp**: `cache.enabled: false` now actually bypasses the HTTP entry-map cache instead of being silently ignored (resolves #482) (#491)
 - **deps-core, deps-lsp, deps-maven**: new `network.offline` setting blocks every outbound registry/OSV/GitHub request, serving already-cached data where available (resolves #483) (#491)
+- **deps-npm, deps-core, deps-lsp**: npm `.npmrc` custom/private registry support — project/user-tier `registry=`/`@scope:registry=` overrides now resolve to live hover/diagnostic/completion data instead of none, failing closed on a bad entry rather than falling back to `registry.npmjs.org` (resolves #502) (#510)
 
 ### Changed
 - **repo**: root `Cargo.toml` `[workspace.dependencies]` is now fully, case-insensitively sorted alphabetically (resolves #442) (#444)
@@ -33,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: `deps_core::lsp_helpers::generate_diagnostics_from_cache` gained a required `uri: &Uri` parameter, used to anchor `DiagnosticRelatedInformation` locations for collapsed fetch-failure diagnostics (resolves #479) (#489)
 - **deps-core**: refactored `generate_diagnostics_from_cache`'s per-dependency checks into an explicit ordered rule pipeline; no behavior change (resolves #500)
 - **deps-core**: order-sensitive diagnostics tests now pin exact `diagnostics[i]` message/code instead of presence-only checks, closing a regression-detection gap left by #500's refactor; no behavior change (resolves #508) (#509)
+- **Breaking (pre-1.0, user-facing config)**: **deps-lsp**: `cargo.workspace_registries` is renamed to `registries.workspace_registries` (now also governs npm's `.npmrc` resolution); no compatibility alias, so a client still sending the old key falls back to defaults (resolves #502) (#510)
 
 ### Fixed
 - **deps-github-actions**: a tags-API page with one entry missing/malformed `commit.sha` no longer aborts the whole page's parse and silently truncates later pages — only that entry is now skipped (side effect of the #472 GitHub-tags-client extraction) (#476)

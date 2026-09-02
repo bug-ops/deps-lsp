@@ -9,7 +9,7 @@ deps-lsp provides comprehensive LSP support for 13 package ecosystems:
 | Ecosystem | Language | Manifest File(s) | Lock File(s) | Features |
 |-----------|----------|-----------------|--------------|----------|
 | **Cargo** | Rust | `Cargo.toml` | `Cargo.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens, feature flag completion, alternate/private registry resolution via `.cargo/config.toml` (see below) |
-| **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
+| **npm** | JavaScript/TypeScript | `package.json` | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` | Hover, inlay hints, completion, code actions, diagnostics, code lens, custom/private registry resolution via `.npmrc` (see below) |
 | **PyPI** | Python | `pyproject.toml`, `requirements.txt`, `constraints.txt` (also recognized under a `requirements/` directory, e.g. `requirements/base.txt`) | `poetry.lock`, `uv.lock` | Hover with PEP 508 environment marker display ("Active when: `<marker>`"), inlay hints, completion, code actions, diagnostics, code lens, document links for `-r`/`-c`/`--requirement`/`--constraint` file references |
 | **Go** | Go | `go.mod` | `go.sum` | Hover, inlay hints, completion, code actions, diagnostics, code lens, pseudo-version support |
 | **Bundler** | Ruby | `Gemfile` | `Gemfile.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens |
@@ -62,11 +62,14 @@ crates.io unchanged — vendoring/mirroring through those mechanisms doesn't
 guarantee the same version *set* as crates.io, so degrading to no data would be
 worse than the pre-existing crates.io answer.
 
-**Reachability policy (`cargo.workspace_registries`, security)**: a
+**Reachability policy (`registries.workspace_registries`, security)**: a
 workspace-declared registry index (the `registry`/`registry-index` alias path, or a
 `[source]` mirror) is checked against this setting before it is ever fetched — a
 hostile cloned repository can write both, and this LSP parses on file open, before
-any build runs. Three values:
+any build runs. This setting is shared with npm's `.npmrc` resolution below (one
+process-wide `HttpCache` policy governs every ecosystem's workspace-declared
+registry fetches — see [npm Custom/Private Registries](#npm-customprivate-registries)
+for what that sharing means in practice). Three values:
 
 | Value | Behavior |
 |-------|----------|
@@ -107,6 +110,62 @@ its owning document is next re-parsed (edited, or reopened).
   workspace whose default registry is mirrored elsewhere.
 - Git-index (non-sparse) private registries remain unsupported, matching prior
   behavior.
+
+### npm Custom/Private Registries
+
+An npm dependency whose scope (via `@scope:registry=`) or whose workspace (via a
+top-level `registry=` override) resolves to a private/custom registry through
+`.npmrc` gets the same hover/diagnostic/completion value a `registry.npmjs.org`
+dependency gets — instead of showing no version data, or (before this feature)
+silently checking the wrong (public) registry.
+
+**Resolution**: `.npmrc` is read from a two-tier hierarchy — the project tier
+(walked from the opened `package.json`'s directory up to the filesystem root,
+closest directory winning; a deliberate superset of npm's own project-root-only
+read, chosen for monorepo ergonomics and mirroring Cargo's `.cargo/config.toml`
+discovery) and the user tier (`~/.npmrc`). The global tier
+(`$PREFIX/etc/npmrc`) is not read. A `@scope:registry=` entry always takes
+precedence over a top-level `registry=` override for a dependency in that scope.
+Scope keys are matched byte-exact, with no case folding, matching npm's own
+lookup. A `${VAR}`-style placeholder in either key's value is expanded from this
+LSP server's own process environment; an undefined variable makes the whole entry
+invalid (same outcome as an invalid URL, below).
+
+**Authentication**: phase 1 carries **no** authentication at all. `_authToken`,
+`_auth`, `_password`, `_authIdent`, `always-auth`, and every `//<host>/:_*`
+scoped-credential key are never parsed, held in memory, logged, or transmitted —
+every alternate-registry request is unauthenticated. A follow-up spec is required
+before any credential is wired up.
+
+**Fail-closed on misconfiguration**: a `registry=`/`@scope:registry=` value that
+is not a well-formed `https://` URL, carries userinfo, or is blocked by the
+reachability policy below shows no version data for the affected dependency —
+never a silent fallback to `registry.npmjs.org`, matching Cargo's equivalent
+guarantee for a misconfigured registry alias.
+
+**Reachability policy**: governed by the same `registries.workspace_registries`
+setting documented above — unlike Cargo's `$CARGO_HOME`-is-trusted split, npm's
+project and user `.npmrc` tiers are policy-*symmetric*: phase 1 has no credential
+provenance to protect, so there is no tier that is "the user's own configuration"
+in the way `$CARGO_HOME` is for Cargo. Setting `registries.workspace_registries`
+to `"all"` for npm's benefit also widens it for Cargo, and vice versa — see the
+setting's own doc above.
+
+**Known limitations**:
+- Editing `.npmrc` does not take effect until the affected `package.json` is next
+  reparsed (edited, or the document reopened) — there is no dedicated file
+  watcher for it yet.
+- Package-*name* completion (typing a brand-new dependency) always searches
+  `registry.npmjs.org`, even for a scope resolved to a private registry — the
+  string being searched is a prefix the user typed into the name field, not a
+  resolved private dependency name, so this is safe but not registry-aware.
+- A dependency resolved to a private registry drops out of OSV vulnerability
+  scanning and loses its npmjs.com hover link (an advisory or link keyed to the
+  public package name does not apply to a same-named private package) and its
+  relative-age ("published N days ago") hover suffix.
+- `.yarnrc`/`.yarnrc.yml` (Yarn Berry's own config format) and pnpm-specific
+  extensions to `.npmrc` are not read; a standard `.npmrc` present in the
+  workspace is still honored either way.
 
 ### Yanked-Version Diagnostics
 

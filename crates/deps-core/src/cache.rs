@@ -1039,12 +1039,37 @@ impl HttpCache {
     /// # }
     /// ```
     pub async fn get_cached_workspace(&self, url: &str) -> Result<Bytes> {
+        self.get_cached_workspace_with_headers(url, &[]).await
+    }
+
+    /// Like [`Self::get_cached_workspace`], but additionally forwards `extra_headers` to the
+    /// underlying request — the headered form needed by a registry client whose
+    /// workspace-declared fetch requires a non-default header (e.g. `deps-npm`'s abbreviated-
+    /// packument `Accept` header for an alternate npm registry).
+    ///
+    /// # Security
+    ///
+    /// `extra_headers` are attached to the **initial** request only. The workspace transport
+    /// pins by [`crate::net_policy::HostClass`], not origin — unlike
+    /// [`Self::get_cached_trusted_origin_with_headers`], which exists precisely to close this
+    /// gap for a caller that needs it — so a cross-origin redirect hop to any other
+    /// policy-permitted host is followed with `extra_headers` re-sent by reqwest's default
+    /// redirect policy. **This method must never carry a credential.** Harmless for its
+    /// current sole caller (a fixed `Accept` header), but directly load-bearing for any
+    /// future auth-wiring work: reach for [`Self::get_cached_trusted_origin_with_headers`]
+    /// instead if a header ever needs to stay pinned to one origin.
+    pub async fn get_cached_workspace_with_headers(
+        &self,
+        url: &str,
+        extra_headers: &[(header::HeaderName, &str)],
+    ) -> Result<Bytes> {
         let transport = self
             .workspace
             .read()
             .expect("workspace transport lock poisoned")
             .clone();
-        self.get_cached_with_headers_via(url, &[], &transport).await
+        self.get_cached_with_headers_via(url, extra_headers, &transport)
+            .await
     }
 
     /// Updates the policy governing [`Self::get_cached_workspace`], rebuilding the workspace
@@ -2546,6 +2571,37 @@ mod tests {
         let result: Bytes = cache.get_cached_with_headers(&url, &headers).await.unwrap();
 
         assert_eq!(result.as_ref(), b"authed data");
+    }
+
+    /// The headered form of `get_cached_workspace` used by `deps-npm`'s alternate-registry
+    /// client (A1): forwards `extra_headers` while still going through the workspace-tier
+    /// transport (mirrors `test_get_cached_and_get_cached_workspace_do_not_share_an_entry`'s
+    /// use of the unheadered `get_cached_workspace` against a loopback mockito server under
+    /// the default policy — an IP-literal host like mockito's has no DNS resolution step for
+    /// the connect-time `AddrGuard` to intercept, so no policy elevation is needed here
+    /// either; that guard's actual job is catching a *hostname* that resolves differently at
+    /// connect time than its parse-time classification, see `validate_resolved_addrs`).
+    #[tokio::test]
+    async fn test_get_cached_workspace_with_headers_sends_extra_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+
+        let _m = server
+            .mock("GET", "/api/data")
+            .match_header("accept", "application/vnd.npm.install-v1+json")
+            .with_status(200)
+            .with_body("abbreviated packument")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let headers = [(header::ACCEPT, "application/vnd.npm.install-v1+json")];
+        let result: Bytes = cache
+            .get_cached_workspace_with_headers(&url, &headers)
+            .await
+            .unwrap();
+
+        assert_eq!(result.as_ref(), b"abbreviated packument");
     }
 
     #[tokio::test]

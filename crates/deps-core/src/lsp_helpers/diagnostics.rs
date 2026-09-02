@@ -708,7 +708,7 @@ fn offline_notice(
 
 /// R1 — blocked-registry notices (#443/plan-1b §1.7).
 ///
-/// A registry index blocked by `cargo.workspace_registries` must not degrade silently.
+/// A registry index blocked by `registries.workspace_registries` must not degrade silently.
 /// Independent of the dependency loop below: a blocked dependency never reaches
 /// version resolution, so it would otherwise leave no trace at all in the editor.
 ///
@@ -723,7 +723,7 @@ fn blocked_registry_diagnostics(diagnostics: &mut Vec<Diagnostic>, parse_result:
             range,
             severity: Some(DiagnosticSeverity::INFORMATION),
             message: format!(
-                "registry index \"{}\" blocked by cargo.workspace_registries policy \
+                "registry index \"{}\" blocked by registries.workspace_registries policy \
                  (host class: {class})",
                 truncate_for_diagnostic(&raw_value, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS)
             ),

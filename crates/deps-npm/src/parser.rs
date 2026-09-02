@@ -3,6 +3,7 @@
 //! Parses package.json files and extracts dependency information with precise
 //! source positions for LSP operations.
 
+use crate::config::{NpmConfig, NpmParseContext, NpmRegistryIndex};
 use crate::types::{NpmDependency, NpmDependencySection};
 use deps_core::Result;
 use serde_json::Value;
@@ -56,6 +57,12 @@ impl LineOffsetTable {
 pub struct NpmParseResult {
     pub dependencies: Vec<NpmDependency>,
     pub uri: Uri,
+    /// Every `.npmrc`-resolved alternate registry this parse's dependencies reference,
+    /// deduplicated (spec FR-002–004) — fed to `NpmRegistry::register_alternate` by
+    /// `NpmEcosystem::parse_manifest`, the one place a per-document `.npmrc` resolution and
+    /// the long-lived shared router meet. Empty for a workspace declaring no `.npmrc`
+    /// (NFR-005: zero regression).
+    pub resolved_registries: Vec<NpmRegistryIndex>,
 }
 
 impl deps_core::ParseResult for NpmParseResult {
@@ -111,6 +118,23 @@ impl deps_core::ParseResult for NpmParseResult {
 /// assert_eq!(result.dependencies[0].name, "express");
 /// ```
 pub fn parse_package_json(content: &str, uri: &Uri) -> Result<NpmParseResult> {
+    parse_package_json_with_context(content, uri, &NpmParseContext::default())
+}
+
+/// [`parse_package_json`], but threading `ctx` through to `.npmrc` registry resolution.
+///
+/// Spec FR-002–FR-008 — the real entry point; [`parse_package_json`] delegates here with a
+/// fresh, default context, mirroring
+/// `deps_cargo::parser::parse_cargo_toml_with_context`'s pattern.
+///
+/// # Errors
+///
+/// Same as [`parse_package_json`].
+pub fn parse_package_json_with_context(
+    content: &str,
+    uri: &Uri,
+    ctx: &NpmParseContext,
+) -> Result<NpmParseResult> {
     let root: Value = deps_core::parse_json_checked(content.as_bytes())?;
 
     // Build line offset table once for O(log n) position lookups
@@ -155,9 +179,24 @@ pub fn parse_package_json(content: &str, uri: &Uri) -> Result<NpmParseResult> {
         ));
     }
 
+    // FR-002: a non-file URI (or one `Uri::to_file_path` cannot resolve) has no directory to
+    // walk `.npmrc` discovery from — falls back to the empty `NpmConfig`, which resolves
+    // every dependency to `DependencySource::Registry` (NFR-005: byte-identical to
+    // pre-feature behavior), rather than failing the whole parse.
+    let npm_config: NpmConfig = uri
+        .to_file_path()
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .map(|dir| crate::config::resolve(&dir, &ctx.config_cache, &ctx.policy))
+        .unwrap_or_default();
+
+    for dep in &mut dependencies {
+        dep.source = npm_config.resolve_source_for(&dep.name);
+    }
+
     Ok(NpmParseResult {
         dependencies,
         uri: uri.clone(),
+        resolved_registries: npm_config.resolved_registries(),
     })
 }
 
@@ -183,6 +222,11 @@ fn parse_dependency_section(
             version_req: version_req.map(Into::into),
             version_range,
             section,
+            // Overwritten by `parse_package_json_with_context` once `.npmrc` resolution has
+            // run; `Registry` here is the correct value for a manifest with no `.npmrc` at
+            // all (NFR-005) and for `parse_dependency_section`'s own unit tests, which do
+            // not go through that resolution step.
+            source: deps_core::parser::DependencySource::Registry,
         });
     }
 
@@ -664,5 +708,129 @@ mod tests {
         // ASCII, so byte offset and UTF-16 character offset coincide.
         let expected_start = content.find(&quoted_version).unwrap() + 1;
         assert_eq!(version_range.start.character, expected_start as u32);
+    }
+
+    // --- `.npmrc` registry resolution (spec FR-002–FR-008, FR-010) ---
+
+    fn all_policy() -> crate::config::NpmParseContext {
+        crate::config::NpmParseContext {
+            policy: std::sync::Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::All,
+            )),
+            config_cache: std::sync::Arc::new(crate::config::NpmConfigCache::new()),
+        }
+    }
+
+    /// FR-003 end-to-end (M7): a top-level `registry=` override rewrites every unscoped
+    /// dependency, and leaves a scoped dependency with its own `@scope:registry` entry alone.
+    #[test]
+    fn test_parse_with_context_top_level_override_and_scope_override_coexist() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "registry=https://npm.mycorp.example\n@myorg:registry=https://npm.pkg.github.com\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"dependencies": {"express": "^4.18.2", "@myorg/internal-lib": "^2.0.0"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        let express = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "express")
+            .unwrap();
+        assert_eq!(
+            express.source,
+            deps_core::parser::DependencySource::AlternateRegistry {
+                index: "https://npm.mycorp.example".to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+
+        let scoped = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "@myorg/internal-lib")
+            .unwrap();
+        assert_eq!(
+            scoped.source,
+            deps_core::parser::DependencySource::AlternateRegistry {
+                index: "https://npm.pkg.github.com".to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+
+        assert_eq!(result.resolved_registries.len(), 2);
+    }
+
+    /// FR-006/US-004/SC-004: the npm form of issue #248 — a misconfigured `@scope:registry=`
+    /// fails closed to `CustomRegistry`, never falling back to `Registry` (the public
+    /// registry).
+    #[test]
+    fn test_parse_with_context_invalid_scope_registry_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "@myorg:registry=not-a-valid-url\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"dependencies": {"@myorg/internal-lib": "^2.0.0"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            }
+        );
+        assert!(!result.dependencies[0].source.is_version_resolvable());
+        assert!(result.resolved_registries.is_empty());
+    }
+
+    /// NFR-005: no `.npmrc` at any tier is byte-identical to pre-feature behavior — every
+    /// dependency resolves to the plain public registry.
+    #[test]
+    fn test_parse_with_context_no_npmrc_resolves_to_public_registry() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"dependencies": {"express": "^4.18.2"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+        assert!(result.resolved_registries.is_empty());
+    }
+
+    /// FR-008: a workspace-declared index blocked by the default `public_only` policy fails
+    /// closed to `CustomRegistry`, same shape as an invalid URL.
+    #[test]
+    fn test_parse_with_context_policy_blocked_registry_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "registry=https://169.254.169.254\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"dependencies": {"express": "^4.18.2"}}"#;
+        let ctx = NpmParseContext::default(); // default policy is `public_only`
+        let result = parse_package_json_with_context(json, &uri, &ctx).unwrap();
+
+        assert!(matches!(
+            &result.dependencies[0].source,
+            deps_core::parser::DependencySource::CustomRegistry { .. }
+        ));
     }
 }

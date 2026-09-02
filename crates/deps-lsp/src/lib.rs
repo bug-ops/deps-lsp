@@ -261,7 +261,7 @@ pub fn register_ecosystems(
     #[cfg(feature = "cargo")]
     {
         let context = deps_cargo::parser::CargoParseContext {
-            policy,
+            policy: Arc::clone(&policy),
             config_cache: Arc::new(deps_cargo::config::ConfigFileCache::new()),
         };
         registry.register(Arc::new(CargoEcosystem::with_context(
@@ -272,17 +272,35 @@ pub fn register_ecosystems(
 
     #[cfg(all(feature = "npm", feature = "deno"))]
     {
+        let npm_context = deps_npm::config::NpmParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(deps_npm::config::NpmConfigCache::new()),
+        };
         let npm_registry = Arc::new(NpmRegistry::new(Arc::clone(&cache)));
-        registry.register(Arc::new(NpmEcosystem::with_registry(Arc::clone(
-            &npm_registry,
-        ))));
+        registry.register(Arc::new(NpmEcosystem::with_context(
+            Arc::clone(&npm_registry),
+            npm_context,
+        )));
         registry.register(Arc::new(DenoEcosystem::with_npm(
             Arc::clone(&cache),
             npm_registry.as_ref().clone(),
         )));
     }
+    // npm is written out explicitly rather than via `register!` (spec 032, S3): that macro's
+    // `NpmEcosystem::new(cache)` would give npm a default, disconnected `NpmParseContext` —
+    // its `.npmrc` reachability policy would never see a live `initialize`/
+    // `didChangeConfiguration` update.
     #[cfg(all(feature = "npm", not(feature = "deno")))]
-    register!("npm", NpmEcosystem, registry, &cache);
+    {
+        let npm_context = deps_npm::config::NpmParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(deps_npm::config::NpmConfigCache::new()),
+        };
+        registry.register(Arc::new(NpmEcosystem::with_context(
+            Arc::new(NpmRegistry::new(Arc::clone(&cache))),
+            npm_context,
+        )));
+    }
     #[cfg(all(feature = "deno", not(feature = "npm")))]
     register!("deno", DenoEcosystem, registry, &cache);
 
