@@ -145,7 +145,7 @@ pub enum Provenance {
 /// protecting the auth boundary; adding a policy branch on it would make that sentence false
 /// and invite a future reader to add an auth branch too. Two small enums, one invariant
 /// each.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IndexTrust {
     /// `$CARGO_HOME/config.toml` or a `CARGO_REGISTRIES_*` environment variable — the
     /// user's own environment. Never policy-checked (see [`RegistryIndex::new`]).
@@ -163,9 +163,11 @@ impl IndexTrust {
     /// Used to fold a `[source]` replace-with chain's trust (plan-1b §1.4 step 3): one
     /// workspace-tier link anywhere in the chain makes the whole chain `WorkspaceDeclared`,
     /// closing the shape where a hostile `[source.crates-io] replace-with = "corp"` in the
-    /// repo borrows a `$CARGO_HOME`-defined source's credential.
+    /// repo borrows a `$CARGO_HOME`-defined source's credential. Also used by
+    /// [`crate::registry::CargoRegistry::register_alternate`] (issue #455, C3) to fold a
+    /// re-registration of the same index URL to the stricter of its old and new trust tier.
     #[must_use]
-    const fn min(self, other: Self) -> Self {
+    pub(crate) const fn min(self, other: Self) -> Self {
         match (self, other) {
             (Self::WorkspaceDeclared, _) | (_, Self::WorkspaceDeclared) => Self::WorkspaceDeclared,
             (Self::Trusted, Self::Trusted) => Self::Trusted,
@@ -194,7 +196,15 @@ fn is_loopback_url(url: &url::Url) -> bool {
 /// can never reach a network call — this is SSRF-adjacent input, since a workspace file
 /// controls a network destination (spec NFR-002, plan-1b §1.1-§1.2).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RegistryIndex(url::Url);
+pub struct RegistryIndex {
+    url: url::Url,
+    /// This candidate's [`IndexTrust`] tier, carried alongside the validated URL so a
+    /// consumer (issue #455's [`crate::sparse::SparseIndexClient`] fail-closed auth gate, C2;
+    /// [`crate::registry::CargoRegistry::register_alternate`]'s trust fold, C3) never needs a
+    /// second, disconnected argument that could drift from the tier this URL was actually
+    /// validated under.
+    trust: IndexTrust,
+}
 
 /// Why a candidate index URL failed [`RegistryIndex::new`]'s validation.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -284,7 +294,7 @@ impl RegistryIndex {
                 return Err(RegistryIndexError::BlockedHost { class });
             }
         }
-        Ok(Self(url))
+        Ok(Self { url, trust })
     }
 
     /// Wraps a compile-time-known-safe literal (e.g. crates.io's own sparse index base),
@@ -309,7 +319,13 @@ impl RegistryIndex {
     /// splicing a path onto this must trim as needed — see `sparse::sparse_index_url`).
     #[must_use]
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.url.as_str()
+    }
+
+    /// The [`IndexTrust`] tier this index was validated under.
+    #[must_use]
+    pub const fn trust(&self) -> IndexTrust {
+        self.trust
     }
 }
 
@@ -1234,6 +1250,30 @@ mod tests {
         // Also the coverage that makes `builtin`'s panic path unreachable in practice.
         let index = RegistryIndex::builtin("https://index.crates.io");
         assert_eq!(index.as_str(), "https://index.crates.io/");
+    }
+
+    // Issue #455, test-plan item 11: `RegistryIndex::trust()` round-trips `new`'s argument.
+    #[test]
+    fn test_registry_index_trust_round_trips_new_argument() {
+        let policy = all_policy();
+        let trusted =
+            RegistryIndex::new("https://index.mycorp.dev", IndexTrust::Trusted, &policy).unwrap();
+        assert_eq!(trusted.trust(), IndexTrust::Trusted);
+
+        let workspace_declared = RegistryIndex::new(
+            "https://index.mycorp.dev",
+            IndexTrust::WorkspaceDeclared,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(workspace_declared.trust(), IndexTrust::WorkspaceDeclared);
+    }
+
+    // Issue #455, test-plan item 11: `builtin` is always `Trusted`.
+    #[test]
+    fn test_registry_index_builtin_is_trusted() {
+        let index = RegistryIndex::builtin("https://index.crates.io");
+        assert_eq!(index.trust(), IndexTrust::Trusted);
     }
 
     /// Policy gate matrix (plan-1b §4): every `WorkspaceRegistryAccess` x `IndexTrust`

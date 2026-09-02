@@ -81,11 +81,21 @@ informational diagnostic naming the blocked host class (a `[source]`-chain block
 log-only, since it is a property of `.cargo/config.toml`, not of any one
 dependency line).
 
-*Residual risk*: `public_only` classifies a candidate index by its URL alone, never
-by resolving it — a workspace file declaring `https://evil.example/`, where
-`evil.example` happens to resolve to a blocked address, still passes. Closing that
-needs a DNS-resolved-address filter, deferred as a follow-up; `"off"` is the only
-setting immune to it.
+Beyond that initial URL-string check, `public_only` (and `off`/`all`) is also
+enforced at **connect time**: the address a workspace-declared index's hostname
+actually resolves to, and the target of any redirect hop the fetch follows, are
+both checked against the setting too — not just the declared URL string at parse
+time. This closes a DNS-rebinding gap (issue #455) where a workspace file declares
+a host that classifies as public at parse time (`https://evil.example/`) but
+resolves to a blocked address (an RFC1918/CGNAT range, or one rebound after parse
+time) at actual fetch time.
+
+*Residual risk*: tightening the setting (e.g. `all` -> `public_only`/`off`) only
+gates *future* parses. An alternate-registry client already registered while the
+policy was looser stays reachable after the tightening, because
+`workspace/didChangeConfiguration` does not re-parse already-open documents, so
+the registry client that URL produced is never purged. It goes away only once
+its owning document is next re-parsed (edited, or reopened).
 
 **Known limitations**:
 - Editing `.cargo/config.toml` does not take effect until the affected `Cargo.toml`

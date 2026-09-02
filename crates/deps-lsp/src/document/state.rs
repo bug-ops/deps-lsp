@@ -502,11 +502,15 @@ pub struct ServerState {
 impl ServerState {
     /// Creates a new server state with default configuration.
     pub fn new() -> Self {
-        let cache = Arc::new(HttpCache::new());
+        let registry_policy = Arc::new(RegistryAccessPolicy::default());
+        // `HttpCache::with_policy` (not `HttpCache::new`) so this server's one long-lived cache
+        // shares the same policy handle `register_ecosystems` hands to `CargoEcosystem` below —
+        // issue #455's workspace-tier connect-time guard needs the live policy, not a
+        // default-initialized copy.
+        let cache = Arc::new(HttpCache::with_policy(Arc::clone(&registry_policy)));
         let osv = Arc::new(OsvClient::new(Arc::clone(&cache)));
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
-        let registry_policy = Arc::new(RegistryAccessPolicy::default());
 
         // Register ecosystems based on enabled features
         crate::register_ecosystems(
