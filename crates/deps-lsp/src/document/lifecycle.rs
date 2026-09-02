@@ -1700,14 +1700,15 @@ pub async fn handle_document_open(
             None => {}
         }
 
-        // Refresh inlay hints IMMEDIATELY after loading completes
-        // (before diagnostics which may take longer due to additional network calls)
-        if let Err(e) = client_clone.inlay_hint_refresh().await {
-            tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
-        }
-        if let Err(e) = client_clone.code_lens_refresh().await {
-            tracing::debug!("code_lens_refresh not supported: {:?}", e);
-        }
+        // Kick off inlay hint / code lens refresh as soon as loading completes, so
+        // clients see updated hints as early as possible — typically before
+        // diagnostics, which may take longer due to additional network calls, though
+        // that ordering is scheduler-dependent, not guaranteed, since the requests
+        // are detached (issue #493: nothing downstream depends on their result, and a
+        // client that never declared refresh support, or stops replying, must not
+        // hang this task's critical path — including the OSV commit and diagnostics
+        // publish below — forever).
+        state_clone.spawn_refresh_requests(&client_clone);
 
         // Join phase A (already running concurrently since it was spawned
         // above) and, only now that `cached_versions` holds the registry's
@@ -1924,12 +1925,9 @@ pub async fn handle_document_change(
                 doc.set_loaded();
             }
 
-            if let Err(e) = client_clone.inlay_hint_refresh().await {
-                tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
-            }
-            if let Err(e) = client_clone.code_lens_refresh().await {
-                tracing::debug!("code_lens_refresh not supported: {:?}", e);
-            }
+            // Detached, capability-gated, timeout-bounded (issue #493): see
+            // `ServerState::spawn_refresh_requests` for rationale.
+            state_clone.spawn_refresh_requests(&client_clone);
 
             if let Some(osv_task) = osv_task {
                 match osv_task.await {
@@ -2112,12 +2110,9 @@ pub async fn handle_document_change(
             None => {}
         }
 
-        if let Err(e) = client_clone.inlay_hint_refresh().await {
-            tracing::debug!("inlay_hint_refresh not supported: {:?}", e);
-        }
-        if let Err(e) = client_clone.code_lens_refresh().await {
-            tracing::debug!("code_lens_refresh not supported: {:?}", e);
-        }
+        // Detached, capability-gated, timeout-bounded (issue #493): see
+        // `ServerState::spawn_refresh_requests` for rationale.
+        state_clone.spawn_refresh_requests(&client_clone);
 
         if let Some(osv_task) = osv_task {
             match osv_task.await {
@@ -4847,6 +4842,117 @@ serde = "1.0"
             assert_eq!(
                 doc.content, original_content,
                 "Document content must be unchanged by the rejected change"
+            );
+        }
+
+        /// Issue #493 regression: before the fix, `inlay_hint_refresh`/`code_lens_refresh`
+        /// were awaited inline in the spawned background task, ahead of the OSV
+        /// vulnerability commit and diagnostics publish. A client that declares refresh
+        /// support (`ServerState`'s cached flag is `true`) but whose request never
+        /// resolves must not be able to stall that commit — the calls are fire-and-forget
+        /// now, so the background task must still reach a terminal loading state and
+        /// return within a bounded time regardless of what the refresh call does.
+        #[tokio::test]
+        async fn test_handle_document_open_completes_promptly_with_refresh_support_enabled() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            state.set_inlay_hint_refresh_supported(true);
+            state.set_code_lens_refresh_supported(true);
+
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let content = r#"[dependencies]
+serde = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+
+            let task =
+                handle_document_open(uri.clone(), content, Some(1), state.clone(), client, config)
+                    .await
+                    .expect("normal-sized content should be accepted");
+
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect(
+                    "background task must complete promptly even with refresh support \
+                     enabled (issue #493 regression: an inline refresh await could hang here)",
+                )
+                .expect("background task must not panic");
+
+            let doc = state.get_document(&uri).expect("document should be stored");
+            assert!(
+                matches!(
+                    doc.loading_state,
+                    deps_core::LoadingState::Loaded | deps_core::LoadingState::Failed
+                ),
+                "document loading must reach a terminal state, proving the pipeline ran \
+                 past the refresh call sites to commit OSV results and diagnostics: {:?}",
+                doc.loading_state
+            );
+        }
+
+        #[tokio::test]
+        async fn test_handle_document_change_completes_promptly_with_refresh_support_enabled() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            state.set_inlay_hint_refresh_supported(true);
+            state.set_code_lens_refresh_supported(true);
+
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let original_content = r#"[dependencies]
+serde = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            handle_document_open(
+                uri.clone(),
+                original_content,
+                Some(1),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("initial open should succeed")
+            .await
+            .expect("initial open's background task must not panic");
+
+            let changed_content = r#"[dependencies]
+serde = "1.0"
+tokio = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            let task = handle_document_change(
+                uri.clone(),
+                changed_content,
+                Some(2),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("normal-sized change should be accepted");
+
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect(
+                    "background task must complete promptly even with refresh support \
+                     enabled (issue #493 regression: an inline refresh await could hang here)",
+                )
+                .expect("background task must not panic");
+
+            let doc = state.get_document(&uri).expect("document should be stored");
+            assert!(
+                matches!(
+                    doc.loading_state,
+                    deps_core::LoadingState::Loaded | deps_core::LoadingState::Failed
+                ),
+                "document loading must reach a terminal state, proving the pipeline ran \
+                 past the refresh call sites to commit OSV results and diagnostics: {:?}",
+                doc.loading_state
             );
         }
     }

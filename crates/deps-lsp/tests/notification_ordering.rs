@@ -1,8 +1,11 @@
 //! Tests for LSP notification ordering.
 //!
 //! Verifies that notifications are sent in the correct order during document
-//! lifecycle events, particularly ensuring `inlay_hint_refresh` comes before
-//! `publish_diagnostics` after document open.
+//! lifecycle events. `workspace/inlayHint/refresh` is fired off (fire-and-forget,
+//! via `tokio::spawn`) before `textDocument/publishDiagnostics` is generated, so
+//! in practice it is observed first — but since the two run as independent
+//! detached tasks, that relative order is scheduler-dependent, not a guarantee
+//! the server makes to the client (see issue #493).
 
 mod common;
 
@@ -75,6 +78,61 @@ tokio = { version = "1.0", features = ["full"] }
     // - Verification that refresh comes before diagnostics
 
     // Shutdown cleanly
+    let _shutdown_response = client.shutdown();
+}
+
+/// Regression test for issue #493: reproduces the exact client behavior from the
+/// bug report — a client that declares `workspace.inlayHint.refreshSupport` and
+/// `workspace.codeLens.refreshSupport` during `initialize`, but never replies to
+/// either `workspace/inlayHint/refresh` or `workspace/codeLens/refresh` once the
+/// server sends them.
+///
+/// Before the fix, both requests were awaited inline in the background task
+/// ahead of the OSV vulnerability commit and `textDocument/publishDiagnostics`,
+/// with no timeout — an unanswered request stalled that task forever, and
+/// `publishDiagnostics` was never sent. `wait_for_notification`'s bounded polling
+/// (~2s total) would time out and this test would fail on that revert; today the
+/// refresh calls are fire-and-forget (and, since #493 S2, additionally bounded by
+/// a 5s server-side timeout), so diagnostics must still arrive promptly.
+#[cfg(feature = "cargo")]
+#[test]
+fn test_diagnostics_not_blocked_by_unanswered_refresh_requests() {
+    let mut client = LspClient::spawn();
+
+    let _init_response = client.initialize();
+    client.stop_responding_to_refresh_requests();
+    client.clear_notifications();
+
+    let cargo_toml = r#"[package]
+name = "test-package"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0.0"
+"#;
+
+    client.did_open("file:///test/Cargo.toml", "toml", cargo_toml);
+
+    let _diagnostics = client
+        .wait_for_notification(20, |n| {
+            n.method == "textDocument/publishDiagnostics"
+                && n.params["uri"] == "file:///test/Cargo.toml"
+        })
+        .expect(
+            "Server must publish diagnostics even though the client never answers \
+             workspace/inlayHint/refresh or workspace/codeLens/refresh (issue #493 \
+             regression: an inline, un-timeouted await here would hang the \
+             background task forever)",
+        );
+
+    assert!(
+        client.unanswered_refresh_request_count() >= 1,
+        "Expected the server to have actually attempted at least one refresh \
+         request (proving capability negotiation and the refresh call both \
+         happened) even though the harness never answered it"
+    );
+
     let _shutdown_response = client.shutdown();
 }
 
