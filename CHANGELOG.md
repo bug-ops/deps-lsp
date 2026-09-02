@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cargo, deps-lsp**: `[source.crates-io] replace-with` resolution to a sparse-index mirror — plain dependencies in a mirrored workspace now resolve against the mirror instead of crates.io, while still receiving crates.io-content-correct OSV scanning and hover links (resolves #441) (#447)
 - **deps-core, deps-cargo, deps-lsp**: new `cargo.workspace_registries` setting (`off`/`public_only`/`all`, default `public_only`) blocking workspace-declared registry/source URLs that resolve to loopback, link-local, cloud-metadata, RFC1918/CGNAT/ULA, or internal-name hosts, plus redirect-hop host reclassification shared by every ecosystem — closes the SSRF/reachability-probing sign-off from #443 (#447)
 - **deps-core, deps-npm, deps-composer, deps-lsp**: package-level deprecation/abandoned diagnostic and hover section (npm `deprecated`, Composer `abandoned`), plus a Composer-only "Replace with X" code action when a successor package is named (resolves #205) (#435)
-- **deps-github-actions, deps-core, deps-lsp**: mutable-ref-pin security diagnostic for a `uses:` step pinned to a tag, with a "Pin to commit SHA" code action rewriting it to `{sha} # {tag}` via the existing tag/SHA index (resolves #473)
+- **deps-github-actions, deps-core, deps-lsp**: mutable-ref-pin security diagnostic for a `uses:` step pinned to a tag, with a "Pin to commit SHA" code action rewriting it to `{sha} # {tag}` via the existing tag/SHA index (resolves #473) (#477)
 
 ### Changed
 - **repo**: root `Cargo.toml` `[workspace.dependencies]` is now fully, case-insensitively sorted alphabetically (resolves #442) (#444)
