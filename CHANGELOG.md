@@ -18,8 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-lsp**: new `cargo.workspace_registries` setting (`off`/`public_only`/`all`, default `public_only`) blocking workspace-declared registry/source URLs that resolve to loopback, link-local, cloud-metadata, RFC1918/CGNAT/ULA, or internal-name hosts, plus redirect-hop host reclassification shared by every ecosystem — closes the SSRF/reachability-probing sign-off from #443 (#447)
 - **deps-core, deps-npm, deps-composer, deps-lsp**: package-level deprecation/abandoned diagnostic and hover section (npm `deprecated`, Composer `abandoned`), plus a Composer-only "Replace with X" code action when a successor package is named (resolves #205) (#435)
 - **deps-github-actions, deps-core, deps-lsp**: mutable-ref-pin security diagnostic for a `uses:` step pinned to a tag, with a "Pin to commit SHA" code action rewriting it to `{sha} # {tag}` via the existing tag/SHA index (resolves #473) (#477)
-- **deps-core, deps-lsp**: `cache.enabled: false` now actually bypasses the HTTP entry-map cache instead of being silently ignored (resolves #482)
-- **deps-core, deps-lsp, deps-maven**: new `network.offline` setting blocks every outbound registry/OSV/GitHub request, serving already-cached data where available (resolves #483)
+- **deps-core, deps-lsp**: `cache.enabled: false` now actually bypasses the HTTP entry-map cache instead of being silently ignored (resolves #482) (#491)
+- **deps-core, deps-lsp, deps-maven**: new `network.offline` setting blocks every outbound registry/OSV/GitHub request, serving already-cached data where available (resolves #483) (#491)
 
 ### Changed
 - **repo**: root `Cargo.toml` `[workspace.dependencies]` is now fully, case-insensitively sorted alphabetically (resolves #442) (#444)
