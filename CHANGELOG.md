@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: a client that never answers `workspace/applyEdit` for `deps-lsp.updateVersion` or `deps-lsp.updateAllOutdated` no longer permanently occupies a `workspace/executeCommand` concurrency slot; the request is now timeout-bounded (5s), same as #493's fix (resolves #496) (#498)
 - **deps-lsp**: `cold_start.rate_limit_ms` now actually rate-limits cold starts instead of being parsed and silently ignored in favor of a hardcoded 100ms interval (resolves #499) (#504)
 - **deps-github-actions**: resolve SHA-pin quickfix never firing for bare-major moving GitHub Actions tags (v3, v4) (resolves #503)
+- **deps-core, deps-github-actions**: hover no longer shows the "Press Cmd+. to update version" footer for a dependency with no actual data or code action while `network.offline` is set (resolves #501) (#506)
 
 ### Removed
 - **Breaking (pre-1.0, public API)**: **deps-lsp**: dropped the dead `CacheConfig::refresh_interval_secs` field — `HttpCache` has no local TTL concept to attach it to (resolves #492) (#498)

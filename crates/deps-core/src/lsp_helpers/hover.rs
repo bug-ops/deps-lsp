@@ -37,6 +37,15 @@ fn version_age_suffix(version: &dyn Version, now: PublishTime) -> String {
 /// delaying the common case, which never reaches this fallback at all.
 const HOVER_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The `Cmd+.` update-footer markdown this function appends when a code action may exist
+/// for the hovered dependency.
+///
+/// `pub` (re-exported from `lsp_helpers`) so an ecosystem's own `generate_hover` override
+/// can restore it post-hoc for an action source this shared gate has no visibility into
+/// (e.g. GHA's `TagIndex`-driven SHA-pin quickfix, #501) without hand-copying the literal
+/// and risking drift between the two.
+pub const CMD_DOT_FOOTER: &str = "\n---\n⌨️ **Press `Cmd+.` to update version**";
+
 pub async fn generate_hover<R: Registry + ?Sized>(
     parse_result: &dyn ParseResult,
     position: Position,
@@ -305,15 +314,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             .or_else(|| m.get(&normalized_name))
             .or_else(|| m.get(dep.name().as_str()))
     });
+    let deprecation = versions
+        .outcomes
+        .and_then(|o| o.deprecation(&normalized_name));
     // Package-level context (#205) renders before per-version security advisories:
     // deprecation is a property of the package, advisories of the version.
-    push_deprecation_hover_section(
-        &mut markdown,
-        formatter,
-        versions
-            .outcomes
-            .and_then(|o| o.deprecation(&normalized_name)),
-    );
+    push_deprecation_hover_section(&mut markdown, formatter, deprecation);
     push_vulnerability_hover_section(&mut markdown, vuln_outcome);
 
     if let Some(available_versions) = &available_versions {
@@ -373,8 +379,27 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // `versions.vulnerabilities` — populated independently of the registry fetch
     // (`lifecycle.rs`) — even when both of those are empty (e.g. a registry fetch failure),
     // so requiring them too would silently drop the footer while `Cmd+.` still offers a fix.
-    if resolvable {
-        markdown.push_str("\n---\n⌨️ **Press `Cmd+.` to update version**");
+    //
+    // Also gated on offline data availability (#501): `HttpCache` deliberately serves warm
+    // entries while offline (it force-enables caching in that mode), and doc-state fields —
+    // `versions.vulnerabilities`/`cached_latest`/deprecation — survive an online-to-offline
+    // transition via `preserve_cache`, so `Cmd+.` can still produce a real REFACTOR/fix/
+    // replacement action offline as long as *some* version, vulnerability, or deprecation
+    // data was actually rendered above. Only suppress when offline AND none of that data is
+    // present — a cold process with nothing cached yet, where no producer in
+    // `generate_code_actions` has anything to act on.
+    //
+    // `matches!(vuln_outcome, Some(ScanOutcome::Vulnerable(_)))`, not `vuln_outcome.is_some()`
+    // (#501 C5): offline does not skip the OSV scan, it lets it run and fail, which writes
+    // `ScanOutcome::Skipped(_)` for every dependency — `is_some()` would be true in exactly
+    // #501's own cold-start repro and only `Vulnerable` ever backs
+    // `build_vulnerability_fix_action` (`code_actions.rs`).
+    let has_offline_actionable_data = available_versions.as_ref().is_some_and(|v| !v.is_empty())
+        || cached_latest.is_some()
+        || matches!(vuln_outcome, Some(ScanOutcome::Vulnerable(_)))
+        || deprecation.is_some();
+    if resolvable && (!versions.offline || has_offline_actionable_data) {
+        markdown.push_str(CMD_DOT_FOOTER);
     }
 
     // `versions.offline` (issue #483): the OSV lookup that produced `ScanOutcome::Skipped`
@@ -2393,6 +2418,102 @@ mod tests {
             !content.value.contains("Press `Cmd+.` to update version"),
             "a non-resolvable source offers no update code action, even with a cached \
              latest value present; got: {}",
+            content.value
+        );
+    }
+
+    /// #501: while `network.offline` is set, `HttpCache` can still serve warm data and
+    /// doc-state (`versions.vulnerabilities`/`cached_latest`/deprecation) can still survive
+    /// the transition (see `test_generate_hover_footer_shown_when_offline_with_warm_cache_versions`),
+    /// so the footer isn't suppressed on `offline` alone — only when offline AND no such
+    /// actionable data exists at all. This test is that cold-start case: nothing cached,
+    /// nothing resolved, and the OSV scan's own offline failure (`Skipped(QueryFailed)`,
+    /// not `Vulnerable`) counts as "no data" too (#501 C5).
+    #[tokio::test]
+    async fn test_generate_hover_footer_omitted_when_offline_with_no_cached_data() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+        // Cold process, nothing cached yet (#501's actual repro): the registry fetch fails
+        // (offline, no warm `HttpCache` entry) and there is no cached/resolved/deprecation
+        // doc state either, so no `generate_code_actions` producer has anything to act on.
+        //
+        // `vulnerabilities` carries a `Skipped(QueryFailed)` entry rather than being empty
+        // (#501 C5): offline doesn't skip the OSV scan, it lets it run and fail, which is
+        // exactly what a real offline cold start writes for every dependency — the gate must
+        // not treat that `Skipped` presence as an actionable `Vulnerable` outcome.
+        let parse_result = freshness_test_parse_result("serde");
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "serde".to_string(),
+            ScanOutcome::Skipped(SkipReason::QueryFailed),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new())
+                .with_offline(true)
+                .with_vulnerabilities(&vulns),
+            &ErrorRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("Press `Cmd+.` to update version"),
+            "no code action can be produced while offline with nothing cached, so the \
+             footer must not render; got: {}",
+            content.value
+        );
+        assert!(
+            content
+                .value
+                .contains("📴 *Offline: version and vulnerability data not checked*"),
+            "the existing offline notice must still render; got: {}",
+            content.value
+        );
+    }
+
+    /// #501 (impl-critic C1): `HttpCache` deliberately serves warm entries while offline, so
+    /// a `Cmd+.` REFACTOR "update to X" action is still genuinely available whenever a live
+    /// version list came back — the footer must not be suppressed just because
+    /// `versions.offline` is set.
+    #[tokio::test]
+    async fn test_generate_hover_footer_shown_when_offline_with_warm_cache_versions() {
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "1.2.3".into(),
+                yanked: false,
+                published_at: None,
+            }],
+        };
+        let parse_result = freshness_test_parse_result("serde");
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &HashMap::new()).with_offline(true),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("Press `Cmd+.` to update version"),
+            "a warm-cache live version list still offers a real REFACTOR action while \
+             offline, so the footer must render; got: {}",
             content.value
         );
     }
