@@ -2018,6 +2018,30 @@ mod tests {
         abbrev_mock.assert_async().await;
     }
 
+    /// Issue #483: a cheap proof that `network.offline` actually holds at the
+    /// `deps-core::cache::HttpCache` choke point for a non-Cargo ecosystem, not just for
+    /// `deps-core`'s own unit tests.
+    #[tokio::test]
+    async fn test_get_versions_offline_issues_zero_network_requests() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let cache = Arc::new(HttpCache::new());
+        cache.set_offline(true);
+        let registry = NpmRegistry::with_registry_base(cache, base);
+
+        let mock = server
+            .mock("GET", "/widget")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = registry.get_versions("widget").await.unwrap_err();
+        assert!(err.is_offline(), "expected Offline, got {err:?}");
+        mock.assert_async().await;
+    }
+
     #[tokio::test]
     async fn test_get_versions_with_enabled_issues_both_requests_and_attaches_times() {
         use deps_core::{FreshnessSettings, PackageName, Registry};

@@ -424,6 +424,7 @@ mod tests {
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -461,6 +462,7 @@ mod tests {
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -498,6 +500,7 @@ mod tests {
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -533,6 +536,7 @@ mod tests {
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
             show_up_to_date_hints: false,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -569,6 +573,7 @@ mod tests {
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -603,6 +608,7 @@ mod tests {
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),
@@ -938,6 +944,7 @@ mod tests {
         let config = EcosystemConfig {
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
             needs_update_text: "❌ {}".to_string(),

@@ -40,10 +40,12 @@ pub async fn handle_code_lens(
     let uri = &params.text_document.uri;
 
     // Ensure document is loaded (cold start support)
-    if !ensure_document_loaded(uri, Arc::clone(&state), client, config).await {
+    if !ensure_document_loaded(uri, Arc::clone(&state), client, Arc::clone(&config)).await {
         tracing::warn!("Could not load document for code lens: {:?}", uri);
         return vec![];
     }
+
+    let offline = { config.read().await.network.offline };
 
     // Own everything `generate_code_lenses` needs and release the DashMap shard `Ref`
     // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
@@ -80,7 +82,7 @@ pub async fn handle_code_lens(
         .generate_code_lenses(
             parse_result.as_ref(),
             &content,
-            VersionData::new(&cached_versions, &resolved_versions),
+            VersionData::new(&cached_versions, &resolved_versions).with_offline(offline),
             uri,
             COMMAND_ID,
         )

@@ -49,6 +49,8 @@ pub struct DepsConfig {
     pub freshness: FreshnessConfig,
     #[serde(default)]
     pub cargo: CargoConfig,
+    #[serde(default)]
+    pub network: NetworkConfig,
 }
 
 /// Configuration for inlay hints (inline version annotations).
@@ -246,8 +248,24 @@ impl DiagnosticsConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
+    // TODO(critic): refresh_interval_secs is parsed but never read (see #482 follow-up)
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval_secs: u64,
+    /// Whether `deps_core::cache::HttpCache`'s entry map is used at all (issue #482):
+    /// `false` bypasses it entirely (fetch fresh every time, never store).
+    ///
+    /// **Offline override**: while `network.offline` (see [`NetworkConfig::offline`]) is
+    /// set, this flag's `false` value is overridden and treated as `true` — otherwise a
+    /// warm entry fetched before going offline could never survive an online→offline
+    /// transition, since nothing would have been stored while online in the first place.
+    ///
+    /// **Maven exception**: `deps-maven`'s `peek_cached`-based stale-data fallback
+    /// (`crates/deps-maven/src/registry.rs`) behaves differently from every other
+    /// ecosystem under `enabled: false`, which has no equivalent second-layer fallback to
+    /// diverge on. This only "always misses" for a process that started cold with the
+    /// flag already off — `peek_cached` reads the entry map directly and
+    /// `set_cache_enabled` never clears it, so a *live* `true` -> `false` toggle leaves
+    /// every already-stored entry servable through this fallback indefinitely.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Timeout for fetching a single package's versions (default: 10 seconds)
@@ -693,6 +711,36 @@ impl WorkspaceRegistriesSetting {
             Self::All => deps_core::net_policy::WorkspaceRegistryAccess::All,
         }
     }
+}
+
+/// Configuration for outbound network access (issue #483).
+///
+/// # Defaults
+///
+/// - `offline`: `false`
+///
+/// # Examples
+///
+/// ```
+/// use deps_lsp::config::NetworkConfig;
+///
+/// let config = NetworkConfig::default();
+/// assert!(!config.offline);
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NetworkConfig {
+    /// When `true`, blocks every *new* outbound registry/OSV/GitHub-tags request
+    /// (`deps_core::cache::HttpCache`'s 4 send sites) instead of making it, serving
+    /// already-cached data where available and returning `deps_core::DepsError::Offline`
+    /// otherwise. Also forces `cache.enabled` semantics to `true` for the duration (see
+    /// [`CacheConfig::enabled`]'s doc comment), so a warm entry keeps serving through an
+    /// online→offline transition even if caching was explicitly disabled.
+    ///
+    /// `HttpCache::set_offline` is a bare atomic store: a request already past its
+    /// `ensure_online` check and awaiting a response completes normally, and toggling
+    /// this flag never cancels in-flight requests.
+    #[serde(default)]
+    pub offline: bool,
 }
 
 #[cfg(test)]
@@ -1202,5 +1250,21 @@ mod tests {
         let config: DepsConfig = serde_json::from_str("{}").unwrap();
         assert!(config.freshness.enabled);
         assert_eq!(config.freshness.cooldown_secs, 259_200);
+    }
+
+    #[test]
+    fn test_network_config_defaults_to_online() {
+        let config = NetworkConfig::default();
+        assert!(!config.offline);
+
+        let config: DepsConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.network.offline);
+    }
+
+    #[test]
+    fn test_network_config_accepts_offline_true() {
+        let json = r#"{"network":{"offline":true}}"#;
+        let config: DepsConfig = serde_json::from_str(json).unwrap();
+        assert!(config.network.offline);
     }
 }

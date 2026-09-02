@@ -375,6 +375,21 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         markdown.push_str("\n---\n⌨️ **Press `Cmd+.` to update version**");
     }
 
+    // `versions.offline` (issue #483): the OSV lookup that produced `ScanOutcome::Skipped`
+    // for this dependency renders nothing above (the `Some(ScanOutcome::Skipped(_)) | None`
+    // arm below), which would otherwise be visually indistinguishable from a scanned,
+    // vulnerability-free dependency — this footer must explicitly call out that
+    // vulnerability data specifically was not checked, not just version data (S2).
+    //
+    // Gated on `resolvable` too, matching the `Cmd+.` footer immediately above (#474/#475):
+    // a dependency that is never network-resolved under any setting (a local composite
+    // action, a Docker image ref, a Git/path dependency) must not claim its version or
+    // vulnerability data went unchecked *because of* `network.offline` — nothing there was
+    // ever going to be checked regardless.
+    if versions.offline && resolvable {
+        markdown.push_str("\n---\n📴 *Offline: version and vulnerability data not checked*");
+    }
+
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -2377,6 +2392,94 @@ mod tests {
             !content.value.contains("Press `Cmd+.` to update version"),
             "a non-resolvable source offers no update code action, even with a cached \
              latest value present; got: {}",
+            content.value
+        );
+    }
+
+    /// Issue #483 I1: the offline footer must render for a resolvable source, mirroring
+    /// the `Cmd+.` footer's own `resolvable` gate immediately above it.
+    #[tokio::test]
+    async fn test_generate_hover_offline_footer_shown_for_resolvable_source() {
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "1.2.3".into(),
+                yanked: false,
+                published_at: None,
+            }],
+        };
+        let parse_result = freshness_test_parse_result("serde");
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached, &resolved).with_offline(true),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("Offline: version and vulnerability data not checked"),
+            "a resolvable source must show the offline footer when versions.offline is set; \
+             got: {}",
+            content.value
+        );
+    }
+
+    /// Issue #483 I1 (regression guard for the #474/#475 bug class): a non-resolvable
+    /// source must never render the offline footer — it was never going to be checked
+    /// regardless of `network.offline`, so claiming otherwise is misleading, exactly like
+    /// the `Cmd+.` footer this mirrors.
+    #[tokio::test]
+    async fn test_generate_hover_offline_footer_omitted_for_non_resolvable_source() {
+        use crate::parser::DependencySource;
+
+        let uri = crate::test_util::test_uri("/test/workflow.yml");
+        let parse_result = SingleDepParseResult {
+            dep: NonRegistryDep(
+                dep_at("local-action"),
+                DependencySource::Path {
+                    path: "./local-action".into(),
+                },
+            ),
+            uri,
+        };
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert("local-action".into(), PackageVersions::latest_only("9.9.9"));
+            m
+        };
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&cached_versions, &resolved_versions).with_offline(true),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should still be generated for a non-resolvable-source dependency");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("Offline:"),
+            "a non-resolvable source must not show the offline footer, even with \
+             versions.offline set; got: {}",
             content.value
         );
     }

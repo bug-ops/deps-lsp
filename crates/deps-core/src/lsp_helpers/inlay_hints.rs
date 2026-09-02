@@ -58,6 +58,28 @@ pub fn generate_inlay_hints(
         }
 
         let Some(latest) = latest_version else {
+            // Issue #483 I5/SEC-2: never discard a purely-local, lockfile-derived
+            // `resolved_version` just because the registry side is unknown while
+            // offline — show it alongside the marker rather than replacing it.
+            if config.offline {
+                let label = resolved_version
+                    .as_ref()
+                    .map_or_else(|| "📴".to_string(), |resolved| format!("📴 {resolved}"));
+                hints.push(InlayHint {
+                    position: version_range.end,
+                    label: InlayHintLabel::String(label),
+                    kind: Some(InlayHintKind::TYPE),
+                    tooltip: Some(InlayHintTooltip::String(
+                        "Offline: registry not checked".to_string(),
+                    )),
+                    padding_left: Some(true),
+                    padding_right: None,
+                    text_edits: None,
+                    data: None,
+                });
+                continue;
+            }
+
             if let Some(resolved) = &resolved_version
                 && config.show_up_to_date_hints
             {
@@ -114,6 +136,15 @@ pub fn generate_inlay_hints(
             RequirementStatus::Unresolved => continue,
         };
 
+        // Issue #483 I5/SEC-2: `latest` here may be a warm-cache value fetched before an
+        // online -> offline flip — without this, the badge is indistinguishable from live
+        // data on this always-visible inline surface.
+        let label_text = if config.offline {
+            format!("{label_text} 📴")
+        } else {
+            label_text
+        };
+
         hints.push(InlayHint {
             position: version_range.end,
             label: InlayHintLabel::String(label_text),
@@ -147,6 +178,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -194,6 +226,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -245,6 +278,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -304,6 +338,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -358,6 +393,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -408,6 +444,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: false,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -488,6 +525,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -540,6 +578,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -591,6 +630,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -642,6 +682,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
+            offline: false,
         };
 
         let parse_result = MockParseResult {
@@ -677,5 +718,147 @@ mod tests {
             hints.is_empty(),
             "Expected no inlay hint at all for an unresolved requirement (not even 'up to date'), got: {hints:?}"
         );
+    }
+
+    /// Issue #483 I5/SEC-2 (cold, no resolved version): with no cached `latest` and no
+    /// lockfile-resolved version, offline mode shows the bare marker alone.
+    #[test]
+    fn test_inlay_hint_offline_cold_no_resolved_shows_bare_marker() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: true,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "^2.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => assert_eq!(text, "📴"),
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    /// Issue #483 I5/SEC-2 (cold, with a lockfile-resolved version): offline mode must not
+    /// discard purely-local, lockfile-derived version information — show it alongside the
+    /// marker rather than replacing it with a bare 📴.
+    #[test]
+    fn test_inlay_hint_offline_cold_with_resolved_shows_marker_and_version() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: true,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "^2.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), "2.0.12".into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => assert_eq!(text, "📴 2.0.12"),
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    /// Issue #483 I5/SEC-2 (warm cache): a normal up-to-date/outdated badge built from a
+    /// warm-cache `latest` value (possibly fetched before an online -> offline flip) must
+    /// carry the offline marker too, or it is indistinguishable from live data on this
+    /// always-visible inline surface.
+    #[test]
+    fn test_inlay_hint_offline_warm_cache_appends_marker_to_outdated_badge() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: true,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "=2.0.12".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("2.1.1"));
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), "2.0.12".into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => assert_eq!(text, "❌ 2.1.1 📴"),
+            _ => panic!("Expected string label"),
+        }
     }
 }

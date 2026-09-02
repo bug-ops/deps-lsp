@@ -1,5 +1,5 @@
 use tower_lsp_server::ls_types::{
-    CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Uri,
+    CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Uri,
 };
 
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
@@ -490,6 +490,31 @@ pub fn generate_diagnostics_from_cache(
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
 
+    // Issue #483 S2/I2: `network.offline` silently degrades every diagnostic in this
+    // function that depends on a registry/OSV fetch — vulnerabilities never queried,
+    // "unknown"/"outdated"/deprecation checks all working from whatever was already
+    // cached. Absence of a warning must not read as "safe" in this *persistent,
+    // user-configured* mode (S2's own argument, applied here to the Problems panel
+    // rather than hover). One file-level diagnostic, not per-dependency: emitting one
+    // per affected dependency (the per-dependency `fetch_failed` message below is
+    // suppressed while offline for exactly this reason) would be strictly noisier than
+    // the failure toast this same PR suppresses for being "unusable" — the two must not
+    // contradict each other.
+    if versions.offline && !deps.is_empty() {
+        diagnostics.push(Diagnostic {
+            range: Range {
+                start: Position::new(0, 0),
+                end: Position::new(0, 0),
+            },
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            message: "deps-lsp is offline (network.offline): dependency and vulnerability \
+                      data reflects only what was already cached, not the current registry state"
+                .to_string(),
+            source: Some("deps-lsp".into()),
+            ..Default::default()
+        });
+    }
+
     // #443/plan-1b §1.7: a registry index blocked by `cargo.workspace_registries` must not
     // degrade silently — surface it as an informational diagnostic on the dependency's own
     // line, independent of the loop below (a blocked dependency never reaches version
@@ -682,6 +707,13 @@ pub fn generate_diagnostics_from_cache(
                     .flatten();
                 let message = match formatter.validate_package_name(dep.name().as_str()) {
                     Err(reason) => Some(format!("Invalid package name '{}': {reason}", dep.name())),
+                    // Issue #483 I2: while offline, a per-dependency "lookup failed" WARNING
+                    // (of any `FetchFailure` kind) is misattributed — this is a deliberately
+                    // configured mode, not a registry outage — and would be strictly noisier
+                    // than the toast this same PR suppresses for being unusable offline. The
+                    // file-level informational diagnostic pushed above already covers this
+                    // dependency.
+                    Ok(()) if fetch_failure.is_some() && versions.offline => None,
                     Ok(()) => match fetch_failure {
                         Some(FetchFailure::Actionable(hint)) => Some(format!(
                             "Registry lookup failed for '{}': {hint}",
@@ -1200,6 +1232,116 @@ mod tests {
         assert!(!diagnostics[0].message.contains("Unknown package"));
         assert!(diagnostics[0].message.contains("Registry lookup failed"));
         assert!(diagnostics[0].message.contains("flaky-pkg"));
+    }
+
+    /// Issue #483 I2: while offline, the per-dependency "Registry lookup failed" WARNING
+    /// (misattributing a deliberately configured mode to a registry failure) must be
+    /// replaced by exactly one file-level INFORMATION diagnostic, not emitted per
+    /// dependency — the same noise argument that justified suppressing the failure toast.
+    #[test]
+    fn test_generate_diagnostics_from_cache_offline_suppresses_per_dependency_warning() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![
+                MockDep {
+                    name: "flaky-pkg-a".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+                },
+                MockDep {
+                    name: "flaky-pkg-b".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: Range::new(Position::new(1, 0), Position::new(1, 11)),
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let fetch_failed = HashMap::from([
+            ("flaky-pkg-a".to_string(), FetchFailure::Transient),
+            ("flaky-pkg-b".to_string(), FetchFailure::Transient),
+        ]);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_fetch_failed(&fetch_failed)
+                .with_offline(true),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("Registry lookup failed")),
+            "the per-dependency WARNING must not fire while offline, got: {diagnostics:?}"
+        );
+        let offline_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::INFORMATION))
+            .filter(|d| d.message.to_lowercase().contains("offline"))
+            .collect();
+        assert_eq!(
+            offline_diagnostics.len(),
+            1,
+            "expected exactly one file-level offline diagnostic, not one per dependency; \
+             got: {diagnostics:?}"
+        );
+    }
+
+    /// Issue #483 I2: an offline document with no fetch failures at all (everything
+    /// served from a warm cache) must still surface the file-level offline signal — S2's
+    /// premise is that "no warning" must not read as "safe" in this persistent mode,
+    /// independent of whether any individual dependency's lookup happened to fail.
+    #[test]
+    fn test_generate_diagnostics_from_cache_offline_signal_present_even_with_no_fetch_failures() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "=1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.0"));
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_offline(true),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::INFORMATION)
+                    && d.message.to_lowercase().contains("offline")),
+            "expected a file-level offline diagnostic even with zero fetch failures; \
+             got: {diagnostics:?}"
+        );
     }
 
     #[test]

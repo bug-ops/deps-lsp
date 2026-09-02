@@ -35,7 +35,13 @@ pub async fn handle_inlay_hints(
     }
 
     // Snapshot config before the document lookup (Copy value, no lock held across the call)
-    let loading_config = { full_config.read().await.loading_indicator.clone() };
+    let (loading_config, offline) = {
+        let full_config = full_config.read().await;
+        (
+            full_config.loading_indicator.clone(),
+            full_config.network.offline,
+        )
+    };
 
     // Own everything `generate_inlay_hints` needs and release the DashMap shard `Ref`
     // before awaiting it (#333): `with_document` only ever hands `extract` a borrowed
@@ -70,6 +76,7 @@ pub async fn handle_inlay_hints(
         needs_update_text: config.needs_update_text.clone(),
         loading_text: loading_config.loading_text,
         show_loading_hints: loading_config.enabled && loading_config.fallback_to_hints,
+        offline,
     };
 
     ecosystem
