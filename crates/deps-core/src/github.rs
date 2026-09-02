@@ -709,9 +709,17 @@ mod tests {
             GithubTagsClient::for_test(Arc::new(HttpCache::new()), trusted_server.url(), true);
         let result = client.fetch_tags_page("owner/repo", 1).await;
 
-        assert!(
-            matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
-            "expected the cross-origin redirect to be stopped, got {result:?}"
+        // Extract only the status code rather than formatting `result` itself: the error
+        // carries no sensitive data, but CodeQL's cleartext-logging check flags any format
+        // of a value derived from a call chain that touched the client's auth headers.
+        let status = match result {
+            Err(DepsError::HttpStatus { status, .. }) => Some(status),
+            _ => None,
+        };
+        assert_eq!(
+            status,
+            Some(302),
+            "expected the cross-origin redirect to be stopped"
         );
         escape.assert_async().await;
     }
