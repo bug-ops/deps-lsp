@@ -55,7 +55,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 > - **Composer** — `require`/`require-dev` sections, Packagist v2 API with metadata de-minification, Composer-specific tilde semantics (`~1.2` = `>=1.2.0 <2.0.0`)
 > - **NuGet** — `PackageReference` (attribute and child-element form), Central Package Management (`Directory.Packages.props`), legacy `packages.config`, `packages.lock.json`; NuGet V3 registry (service index, flat container, search)
 > - **Deno** — `imports` map only (`scopes`/`importMap` not yet supported); `jsr:` specifiers via the keyless JSR API, `npm:` specifiers reuse the existing npm registry client; no `deno.lock` support yet
-> - **GitHub Actions** — `uses:` steps and reusable-workflow calls across every job; tag, commit-SHA (optionally `# vX.Y.Z`-annotated), and branch pins via the GitHub tags API; no lock file, no package-name search completion
+> - **GitHub Actions** — `uses:` steps and reusable-workflow calls across every job; tag, commit-SHA (optionally `# vX.Y.Z`-annotated), and branch pins via the GitHub tags API; release-age hint and cooldown diagnostic require `GITHUB_TOKEN` (partial coverage, like Swift); no lock file, no package-name search completion
 
 ## Installation
 
@@ -313,7 +313,7 @@ Configure via LSP initialization options:
 | `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
 
 > [!NOTE]
-> The release-freshness signal applies uniformly across all ecosystems — there is no per-ecosystem override. Coverage depth varies with what each registry exposes (e.g. Deno's `jsr:` specifiers get full coverage at no extra request cost; Swift and Maven/Gradle have partial coverage since their APIs don't expose per-version publish dates directly). See [Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#mavengradle-release-freshness-coverage) for per-ecosystem details.
+> The release-freshness signal applies uniformly across all ecosystems — there is no per-ecosystem override. Coverage depth varies with what each registry exposes (e.g. Deno's `jsr:` specifiers get full coverage at no extra request cost; Swift, GitHub Actions, and Maven/Gradle have partial coverage since their APIs don't expose per-version publish dates directly). See [Swift/GitHub Actions Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#swift-and-github-actions-release-freshness-coverage) and [Maven/Gradle Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#mavengradle-release-freshness-coverage) for per-ecosystem details.
 
 > [!NOTE]
 > `network.offline` blocks every outbound request the server makes (registry, OSV vulnerability, and GitHub tags), across every ecosystem. Already-cached data keeps serving; an uncached dependency shows an offline marker in inlay hints, and hover appends a footer stating that version *and* vulnerability data were not checked. Toggling it via `workspace/didChangeConfiguration` takes effect immediately, with no editor restart.

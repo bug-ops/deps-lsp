@@ -107,6 +107,12 @@ pub struct GithubActionsVersion {
     /// Whether the tag's semver `pre` component is non-empty, computed once from the
     /// `semver::Version` already parsed while sorting tags.
     pub prerelease: bool,
+    /// When the matching GitHub Release was published, if the tags API's own response
+    /// (which carries no timestamp) was enriched with one via
+    /// [`crate::registry::GithubActionsRegistry::get_versions_with_release_dates`]
+    /// (#486). `None` for a plain [`GithubActionsRegistry::get_versions`](crate::registry::GithubActionsRegistry::get_versions)
+    /// call, or when the tag has no matching (non-draft, dated) GitHub Release.
+    pub published_at: Option<deps_core::PublishTime>,
 }
 
 // GitHub's tags API exposes no yank/deprecation signal for actions (mirroring
@@ -115,6 +121,7 @@ pub struct GithubActionsVersion {
 deps_core::impl_version!(GithubActionsVersion {
     version: version,
     status: |_v: &GithubActionsVersion| deps_core::RemovalStatus::Available,
+    published_at: published_at,
     prerelease: |v: &GithubActionsVersion| v.prerelease,
 });
 
@@ -207,11 +214,13 @@ mod tests {
             version: "v4.2.0".into(),
             sha: "a".repeat(40),
             prerelease: false,
+            published_at: None,
         };
         let pre = GithubActionsVersion {
             version: "v4.2.0-beta.1".into(),
             sha: "b".repeat(40),
             prerelease: true,
+            published_at: None,
         };
         assert!(!stable.is_prerelease());
         assert!(pre.is_prerelease());

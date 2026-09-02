@@ -20,7 +20,7 @@ deps-lsp provides comprehensive LSP support for 13 package ecosystems:
 | **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, code lens (range-form dependencies not covered — see below), GitHub API support |
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json`, `packages.<project>.lock.json` (multi-project) | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling, hover-only unlisted-version marker |
 | **Deno** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics, code lens — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
-| **GitHub Actions** | YAML | `.github/workflows/*.yml`, `*.yaml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered — see below); tag/commit-SHA/branch `uses:` pins via the GitHub tags API; reusable-workflow calls recognized but not version-resolved — see below |
+| **GitHub Actions** | YAML | `.github/workflows/*.yml`, `*.yaml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered — see below); tag/commit-SHA/branch `uses:` pins via the GitHub tags API; reusable-workflow calls recognized but not version-resolved — see below; release-age hint and cooldown diagnostic require `GITHUB_TOKEN` — see below |
 
 ### Cargo Custom/Private Registries
 
@@ -634,17 +634,18 @@ When a dependency in `package.json` fails to resolve against the npm registry, t
 
 The check is deliberately permissive: uppercase names are still accepted (npm only warns on those for legacy packages, never rejects), and it accepts every character npm's own `encodeURIComponent(segment) === segment` predicate accepts, including `! ' ( ) * - . _ ~` — not just alphanumerics and hyphens.
 
-### Swift Release-Freshness Coverage
+### Swift and GitHub Actions Release-Freshness Coverage
 
-Unlike the six ecosystems whose registry already carries a publish timestamp, Swift sources
-package versions from GitHub's `tags` API, which has no date field. `deps-swift` augments the
-tag-derived version list with publish times from GitHub's *releases* API (one extra request per
-package, memoized behind a TTL) — but this makes Swift's freshness signal **partial**, in four
-distinct ways:
+Unlike the ecosystems whose registry already carries a publish timestamp, Swift and GitHub
+Actions both source package versions from GitHub's `tags` API, which has no date field.
+`deps-swift` and `deps-github-actions` each augment their tag-derived version list with publish
+times from GitHub's *releases* API (one extra request per package, memoized behind a TTL) via the
+same shared `deps_core::github::ReleaseDatesCache` (#486) — but this makes both ecosystems'
+freshness signal **partial**, in four distinct ways:
 
-- **Requires `GITHUB_TOKEN`.** Without it, hover and completion render Swift versions exactly as
-  they did before this feature — no publish age shown, no error. A one-time `tracing::info!`
-  notes the skip on first use (`export GITHUB_TOKEN=$(gh auth token)` to enable it).
+- **Requires `GITHUB_TOKEN`.** Without it, hover and completion render versions exactly as they
+  did before this feature — no publish age shown, no error. A one-time `tracing::info!` notes the
+  skip on first use (`export GITHUB_TOKEN=$(gh auth token)` to enable it).
 - **Covers only versions with a matching GitHub Release.** A tag with no corresponding Release
   shows no date. Coverage of the versions actually rendered is high but not universal even among
   recent versions — one real-world counterexample (`SwiftyJSON/SwiftyJSON`) is missing dates for
@@ -657,7 +658,11 @@ distinct ways:
   filtered to an older major version line can show no dates at all, even though the same package's
   newest versions do — this is a known, accepted inconsistency within a single session.
 
-A miss in any of the above degrades to no date shown, never a wrong one.
+A miss in any of the above degrades to no date shown, never a wrong one. GitHub Actions inherits
+this coverage verbatim (same shared cache, same `/releases` endpoint) — the one difference is the
+join key: a GHA `uses:` step's tag keeps its `v` prefix as published in the version list, so the
+join normalizes it before matching against the releases map, while Swift's tag-derived versions
+are already normalized at parse time.
 
 ## Architecture Overview
 

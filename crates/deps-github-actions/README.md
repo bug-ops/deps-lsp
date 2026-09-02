@@ -30,6 +30,12 @@ implements `deps_core::Ecosystem`.
   `@v4`) gets an additive, independent diagnostic recommending SHA pinning, plus a "Pin to
   commit SHA" quick fix rewriting it to `@<sha> # <tag>` when the tag's commit is already
   known; on by default, configurable via `mutable_ref_pin_severity`/`mutable_ref_pin_enabled`
+- **Release-freshness signal (partial)** (issue #486) — `GithubActionsRegistry::
+  get_versions_with_release_dates`, invoked via `Registry::get_versions_with` when
+  freshness rendering is enabled, attaches GitHub Release publish timestamps to
+  tag-derived versions via the shared `deps_core::github::ReleaseDatesCache` (also used
+  by `deps-swift`), memoized behind a TTL; requires `GITHUB_TOKEN` and covers only
+  versions with a matching GitHub Release (see `ECOSYSTEM_GUIDE.md`)
 
 ## Installation
 
@@ -75,8 +81,9 @@ against the tag with zero SHA-to-tag network resolution.
   recognized but deliberately non-resolvable: the referenced workflow's version and the
   host repository's release tags are not reliably the same thing, and a wrong diagnostic
   on a supply-chain feature is worse than none
-- No publish-date/freshness signal — the tags API carries no publish timestamp, and
-  fetching one via `/releases` would double the request count per repository
+- The publish-date/freshness signal requires `GITHUB_TOKEN`: without it, the second
+  `/releases` fetch is skipped and hover/completion omit publish ages (the tags fetch
+  itself still works unauthenticated)
 - Package-name completion is unimplemented (`search()` always returns empty): GitHub has
   no action-specific search endpoint cheaper than repository search, and querying it per
   keystroke would burn the 60 req/hour unauthenticated budget fast
