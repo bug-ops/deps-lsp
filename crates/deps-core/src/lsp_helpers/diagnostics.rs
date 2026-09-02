@@ -2670,6 +2670,7 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
                 total_known: 1,
+                fix_target_status: None,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -2718,6 +2719,7 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories,
                 total_known: 40,
+                fix_target_status: None,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -2798,6 +2800,7 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
                 total_known: 1,
+                fix_target_status: None,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );

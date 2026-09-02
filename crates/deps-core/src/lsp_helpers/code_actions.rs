@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, Uri, WorkspaceEdit};
 
-use crate::osv::ScanOutcome;
+use crate::osv::{ScanOutcome, UpgradeStatus};
 use crate::{ConcreteVersion, Dependency, ParseResult, Registry, VersionReq};
 
 use super::{
@@ -27,13 +27,67 @@ struct VulnerabilityFixAction {
     action: CodeAction,
 }
 
-/// Builds the "fix vulnerability" quickfix for `dep`, if OSV data
-/// recommends one.
+/// Whether `dv.fix_target_status` clears `fix` (F) as an honest, presentable fix (#462
+/// FR-003).
+///
+/// `CandidateClean { version: F }` always clears it. A `CandidateVulnerable { version: F,
+/// advisory_ids, total_known }` result can *also* clear it — F may legitimately still be
+/// affected by advisories `recommended_fix()` never claimed to resolve in the first place
+/// (excluded via `upgrade_status`'s `still_applying` subtraction, or never had a known fix at
+/// all): that is #216's original honest "partial fix" contract, not a gap this verification
+/// introduces. It is suppressed the moment `advisory_ids` names either a *claimed* advisory
+/// (`fix`'s own `advisory_ids` — the fix doesn't do what its title says) or an advisory this
+/// dependency's `advisories` never recorded at all: a brand-new advisory only visible by
+/// live-checking F itself, since phase A only ever queries the dependency's *declared*
+/// version, not F (the #462 repro: an advisory affecting some version strictly between
+/// declared and F, invisible until F is checked directly). Any other state (`None`,
+/// `NotChecked`, or a `version` mismatch) means F was never actually verified, so it is
+/// rejected too.
+///
+/// `advisory_ids` is itself capped at [`crate::osv::ADVISORY_DISPLAY_CAP`] the same way
+/// [`crate::osv::DependencyVulnerabilities::advisories`] is (#462 critic M1) — a truncated
+/// list can never be read as exhaustive, since the ids it dropped could just as easily be the
+/// claimed or unknown one that should have suppressed this fix. `advisory_ids.len() <
+/// total_known` is rejected unconditionally before the known/unclaimed check even runs, so a
+/// dependency with more affecting advisories than the cap never gets a false "verified clean"
+/// reading from a partial list.
+fn fix_target_is_verified(
+    dv: &crate::osv::DependencyVulnerabilities,
+    fix: &crate::osv::FixRecommendation,
+    version_native: &str,
+) -> bool {
+    match &dv.fix_target_status {
+        Some(UpgradeStatus::CandidateClean { version }) => version == version_native,
+        Some(UpgradeStatus::CandidateVulnerable {
+            version,
+            advisory_ids,
+            total_known,
+        }) if version == version_native => {
+            if advisory_ids.len() < *total_known {
+                return false;
+            }
+            let known_ids: HashSet<&str> = dv.advisories.iter().map(|a| a.id.as_str()).collect();
+            advisory_ids
+                .iter()
+                .all(|id| known_ids.contains(id.as_str()) && !fix.advisory_ids.contains(id))
+        }
+        _ => false,
+    }
+}
+
+/// Builds the "fix vulnerability" quickfix for `dep`, if OSV data recommends
+/// one AND that recommendation's target version F has itself been verified
+/// against OSV (#462) — see [`fix_target_is_verified`].
 ///
 /// Registry-independent by construction (FR-007, mirroring the rule already
 /// enforced in [`generate_diagnostics_from_cache`]): computed entirely from
 /// `versions.vulnerabilities` and `version_req` (the caller's already-fetched
-/// `dep.version_requirement()`), never from a registry fetch. Callers must
+/// `dep.version_requirement()`), never from a registry fetch — a *registry*
+/// outage still never hides this action. It is not OSV-independent, though:
+/// F's verification is computed in `deps-lsp`'s phase B and handed in via
+/// `dv.fix_target_status`, so an OSV outage (or a code-action request that
+/// races ahead of phase B completing) leaves that unresolved and suppresses
+/// this action — the intended fail-safe degradation, not a bug. Callers must
 /// still reconcile the result against a successful registry fetch when one
 /// is available — see the yank check in [`generate_code_actions`].
 fn build_vulnerability_fix_action(
@@ -73,6 +127,14 @@ fn build_vulnerability_fix_action(
         );
         return None;
     }
+
+    // #462: F must itself have been independently verified against OSV before it is
+    // offered as a fix — see `fix_target_is_verified`'s doc for the exact contract and why
+    // a `CandidateVulnerable` result doesn't always disqualify F.
+    if !fix_target_is_verified(dv, &fix, &version_native) {
+        return None;
+    }
+
     // Computed before the N1 guard below against the *same* formatting the
     // plain "update version" action uses (`format_version_replacing`), not
     // the bare version: several ecosystems wrap or expand it (`deps-dart`'s
@@ -354,17 +416,23 @@ fn build_replacement_action(
 /// Otherwise returns up to three kinds of action, in this order:
 ///
 /// 1. At most one `QUICKFIX` "fix vulnerability" action, if `versions`
-///    carries an OSV scan result flagging this dependency and
+///    carries an OSV scan result flagging this dependency,
 ///    [`crate::osv::DependencyVulnerabilities::recommended_fix`] has a
-///    claimable target (see the private `build_vulnerability_fix_action` helper
-///    just above). This action
+///    claimable target F, and F's own `fix_target_status` (populated by
+///    `deps-lsp`'s phase B, #462) clears it as a verified fix — see the
+///    private `build_vulnerability_fix_action` helper just above. This action
 ///    is computed entirely from `versions` and the dependency's declared
 ///    requirement, deliberately *before* the `registry.get_versions` call
-///    below — a registry outage must never hide a known-vulnerable
+///    below — a *registry* outage must never hide a known-vulnerable
 ///    dependency's fix (FR-007), so this action is still returned even when
-///    the registry fetch that produces the plain list below fails. When the
-///    fetch does succeed, a fix target the registry reports as yanked is
-///    dropped rather than offered.
+///    the registry fetch that produces the plain list below fails. This does
+///    not extend to an *OSV* outage or unavailability: F's verification is an
+///    OSV-derived precondition (`fix_target_status`), not a registry one, so
+///    an OSV outage — or a code-action request racing ahead of phase B
+///    completing — degrades to omitting this action entirely rather than
+///    presenting an unverified F as verified (FR-004, fail-safe). When the
+///    registry fetch does succeed, a fix target the registry reports as
+///    yanked is dropped rather than offered.
 /// 2. At most one `QUICKFIX` "fix unsatisfiable requirement" action, computed the same
 ///    registry-independent way (see the private `build_unsatisfiable_fix_action` helper
 ///    just above) for the same FR-007 reason. If its rewritten text collides with the
@@ -686,6 +754,9 @@ mod tests {
                     }),
                 ],
                 total_known: 2,
+                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    version: "1.2.0".to_string(),
+                }),
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -729,6 +800,13 @@ mod tests {
         // version that clears what is actually claimed — not 3.0.0, which
         // would push the user across an unnecessary major-version boundary
         // for a fix A1 that version does not even resolve.
+        //
+        // #462 critic S1: `fix_target_status` is deliberately `CandidateVulnerable{1.2.0,
+        // [A1]}`, not `CandidateClean` — the state a real live-check of F=1.2.0 would
+        // actually produce here, since A1 (known, fixed only at 3.0.0 > 1.2.0) still
+        // applies. Because A1 was already excluded from `claimed` (it is not in
+        // `fix.advisory_ids`), this must still be presented as a fix for A2 — the honest
+        // #216 partial-fix contract `fix_target_is_verified` preserves.
         use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
         use std::collections::HashMap;
 
@@ -765,9 +843,15 @@ mod tests {
                     }),
                 ],
                 total_known: 2,
+                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                    version: "1.2.0".to_string(),
+                    advisory_ids: vec!["A1".to_string()],
+                    total_known: 1,
+                }),
                 upgrade_status: UpgradeStatus::CandidateVulnerable {
                     version: "3.0.0".to_string(),
                     advisory_ids: vec!["A1".to_string()],
+                    total_known: 1,
                 },
             }),
         );
@@ -789,6 +873,347 @@ mod tests {
 
         let titles = quickfix_titles(&actions);
         assert_eq!(titles, vec!["Update to 1.2.0 (fixes A2)"]);
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_fix_target_is_not_suppressed_by_an_open_ended_advisory() {
+        // #462 critic re-critique: the sibling S1 scenario the fix exists to preserve — a
+        // dependency with an *open-ended* advisory (A1, no known fix at all) must not lose its
+        // quickfix. `recommended_fix()` filters A1 out of `claimed` for having no
+        // `fixed_versions` (a *different* exclusion path than the still-applying-at-latest
+        // subtraction the `..._subtracted_advisory` test above exercises), so F is computed
+        // from A2 alone (1.2.0) and `fix.advisory_ids = ["A2"]`. The live check of F=1.2.0
+        // correctly reports A1 still applies (it was never fixed) — A1 is known and unclaimed,
+        // so this must still be presented as a fix for A2, the honest #216 partial-fix contract.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![
+                    std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec![],
+                        url: String::new(),
+                    }),
+                    std::sync::Arc::new(Advisory {
+                        id: "A2".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::Medium,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    }),
+                ],
+                total_known: 2,
+                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                    version: "1.2.0".to_string(),
+                    advisory_ids: vec!["A1".to_string()],
+                    total_known: 1,
+                }),
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await;
+
+        let titles = quickfix_titles(&actions);
+        assert_eq!(titles, vec!["Update to 1.2.0 (fixes A2)"]);
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_omits_fix_when_fix_target_status_reports_still_vulnerable()
+    {
+        // #462 critic C1 repro shape (smallvec 0.6.0 -> F=0.6.13, still affected by
+        // RUSTSEC-2021-0003, an advisory phase A's declared-version-only query never saw):
+        // `recommended_fix()` computes a claim (A1, fixed at 1.2.0) from the only advisory
+        // this dependency's `advisories` records, but the live verification of F reports a
+        // *different* id (A2) still applies — one this dependency's `advisories` never
+        // recorded at all. Unlike an already-known-and-excluded advisory (see the
+        // `..._subtracted_advisory` test above), a brand-new unknown advisory must always
+        // suppress the fix: it is not the honest #216 partial-fix case, it is exactly the
+        // gap #462 exists to close.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.2.0".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                    version: "1.2.0".to_string(),
+                    advisory_ids: vec!["A2".to_string()],
+                    total_known: 1,
+                }),
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await;
+
+        assert!(
+            quickfix_titles(&actions).is_empty(),
+            "a fix target OSV found still vulnerable must never be presented as a verified fix"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_omits_fix_when_fix_target_status_reports_a_claimed_advisory_still_applies()
+     {
+        // #462 FR-003, the other half of the S1 fix: unlike an already-excluded known
+        // advisory, a live check reporting that a *claimed* advisory (one `fix.advisory_ids`
+        // actually names) still applies to F means the fix doesn't do what its own title
+        // says — this must suppress the action even though the id is known, distinguishing
+        // it from the `..._subtracted_advisory` test's honest-partial-fix case.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.2.0".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                // A1 is claimed (it's the only advisory, with a known fix, and nothing
+                // excludes it), yet the live check of F=1.2.0 reports A1 itself still
+                // applies — a claim the verification actually contradicts.
+                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                    version: "1.2.0".to_string(),
+                    advisory_ids: vec!["A1".to_string()],
+                    total_known: 1,
+                }),
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await;
+
+        assert!(
+            quickfix_titles(&actions).is_empty(),
+            "a fix must never claim to resolve an advisory the live check found it doesn't"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_omits_fix_when_fix_target_status_advisory_ids_are_truncated()
+     {
+        // #462 critic M1: `check_candidates` caps `advisory_ids` at `ADVISORY_DISPLAY_CAP` the
+        // same way `DependencyVulnerabilities::advisories` is capped, so a `CandidateVulnerable`
+        // whose `advisory_ids` is shorter than `total_known` is NOT the complete list of
+        // advisories still affecting F — one of the truncated-away ids could be the claimed or
+        // unknown one that should suppress this fix. Here the single reported id (A2) is known
+        // and unclaimed — which the pre-M1-fix gate would have accepted — but `total_known: 2`
+        // proves a second, unreported advisory exists, so this must still be rejected rather
+        // than trusting a partial list as if it were exhaustive.
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![
+                    std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    }),
+                    std::sync::Arc::new(Advisory {
+                        id: "A2".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::Medium,
+                        cvss_vector: None,
+                        fixed_versions: vec![],
+                        url: String::new(),
+                    }),
+                ],
+                total_known: 2,
+                // Only A2 is reported (known, unclaimed — A1 is the sole claimed advisory),
+                // but `total_known: 2` says the live check actually found 2 advisories still
+                // affecting F; the second one was truncated out of `advisory_ids` and could be
+                // anything, including the still-applying A1 itself.
+                fix_target_status: Some(UpgradeStatus::CandidateVulnerable {
+                    version: "1.2.0".to_string(),
+                    advisory_ids: vec!["A2".to_string()],
+                    total_known: 2,
+                }),
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await;
+
+        assert!(
+            quickfix_titles(&actions).is_empty(),
+            "a truncated advisory_ids list must never be trusted as exhaustive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_code_actions_omits_fix_when_fix_target_status_is_unresolved() {
+        // #462 FR-004/NFR-002: `fix_target_status: None` covers both "verification never ran
+        // yet" and "verification timed out" — either way, an unverified F must never be
+        // offered as a fix, the fail-safe default (no "unverified" qualifier, just omission).
+        use crate::osv::{Advisory, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: vec![std::sync::Arc::new(Advisory {
+                    id: "A1".to_string(),
+                    modified: "2023-01-01T00:00:00Z".to_string(),
+                    summary: None,
+                    aliases: vec![],
+                    severity: VulnSeverity::High,
+                    cvss_vector: None,
+                    fixed_versions: vec!["1.2.0".to_string()],
+                    url: String::new(),
+                })],
+                total_known: 1,
+                fix_target_status: None,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MockFormatter,
+        )
+        .await;
+
+        assert!(
+            quickfix_titles(&actions).is_empty(),
+            "an unverified fix target must never be presented as a fix, timed out or not yet checked"
+        );
     }
 
     #[tokio::test]
@@ -817,6 +1242,9 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    version: "2.0.0".to_string(),
+                }),
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -874,6 +1302,7 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: None,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -928,6 +1357,7 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: None,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1099,6 +1529,7 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: None,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1198,6 +1629,9 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    version: "2.17.1".to_string(),
+                }),
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1273,6 +1707,9 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    version: "1.2.5".to_string(),
+                }),
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1394,6 +1831,9 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    version: "1.0.2".to_string(),
+                }),
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1451,6 +1891,9 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    version: "1.2.0".to_string(),
+                }),
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1511,6 +1954,9 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    version: "1.2.0".to_string(),
+                }),
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1656,6 +2102,9 @@ mod tests {
                     url: String::new(),
                 })],
                 total_known: 1,
+                fix_target_status: Some(UpgradeStatus::CandidateClean {
+                    version: "1.0.2".to_string(),
+                }),
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
@@ -1940,6 +2389,7 @@ mod tests {
                         url: String::new(),
                     })],
                     total_known: 1,
+                    fix_target_status: None,
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
@@ -2576,6 +3026,9 @@ mod tests {
                         url: String::new(),
                     })],
                     total_known: 1,
+                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                        version: "5.5.5".to_string(),
+                    }),
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
@@ -2653,6 +3106,9 @@ mod tests {
                         url: String::new(),
                     })],
                     total_known: 1,
+                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                        version: "9.9.9".to_string(),
+                    }),
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
@@ -2713,6 +3169,9 @@ mod tests {
                         url: String::new(),
                     })],
                     total_known: 1,
+                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                        version: "9.9.5".to_string(),
+                    }),
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );

@@ -125,7 +125,10 @@ pub struct Advisory {
 /// Result of checking whether a recommended upgrade target is itself affected.
 ///
 /// Populated by [`crate::osv::OsvClient::check_candidates`] (phase B), which only runs for
-/// dependencies phase A already flagged as [`ScanOutcome::Vulnerable`].
+/// dependencies phase A already flagged as [`ScanOutcome::Vulnerable`]. Used for both the
+/// registry's "latest" candidate ([`DependencyVulnerabilities::upgrade_status`]) and the
+/// independently-verified fix target F ([`DependencyVulnerabilities::fix_target_status`]) —
+/// see the latter's doc for why F needs its own verification result distinct from latest's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeStatus {
     /// Phase B has not run for this dependency (phase A found nothing, or
@@ -140,8 +143,20 @@ pub enum UpgradeStatus {
     CandidateVulnerable {
         /// The version that was checked.
         version: String,
-        /// Advisory IDs that still apply to the candidate version.
+        /// Advisory IDs that still apply to the candidate version, capped at
+        /// [`crate::osv::ADVISORY_DISPLAY_CAP`] the same way
+        /// [`DependencyVulnerabilities::advisories`] is (#462 critic M1) —
+        /// **not necessarily exhaustive**. Compare its length against
+        /// `total_known` before treating it as the complete set of advisories
+        /// still affecting this candidate; a shorter list means some are
+        /// missing, not that none exist.
         advisory_ids: Vec<String>,
+        /// The true count of advisories OSV reported as still affecting this
+        /// candidate, independent of how many `advisory_ids` actually
+        /// carries — the same `total_known`/capped-list split
+        /// [`DependencyVulnerabilities`] already makes, mirrored here so a
+        /// truncated `advisory_ids` is never silently mistaken for complete.
+        total_known: usize,
     },
 }
 
@@ -155,8 +170,27 @@ pub struct DependencyVulnerabilities {
     /// how many were actually fetched — the source of the render layer's
     /// "+N more advisories" count (`architecture.md` §7/§8 invariant 3).
     pub total_known: usize,
-    /// Result of phase B, if it has run for this dependency.
+    /// Result of phase B's "latest" check, if it has run for this dependency.
     pub upgrade_status: UpgradeStatus,
+    /// Independent verification of [`Self::recommended_fix`]'s target version F, if F
+    /// differs from the "latest" candidate `upgrade_status` already covers. `None` until
+    /// [`Self::recommended_fix`] has been computed and F's status resolved — either reused
+    /// from `upgrade_status` when F equals latest, or checked live via
+    /// [`crate::osv::OsvClient::check_candidates`] otherwise (always live-checked when F
+    /// differs from latest: a data-derived shortcut was tried and rejected — see git history
+    /// on this field and #462's critique — because it degenerates into checking F against
+    /// exactly the advisories it was computed from, proving nothing about an advisory phase
+    /// A never fetched at all, which is the actual gap #462 closes). See
+    /// `run_osv_phase_b_and_commit` in `deps-lsp` for the resolution order.
+    ///
+    /// A caller must not treat a bare `Some(UpgradeStatus::CandidateClean { .. })` check as
+    /// the only valid "verified" state: `Some(UpgradeStatus::CandidateVulnerable { .. })` can
+    /// also be a legitimate, presentable fix when every reported id is an advisory
+    /// [`Self::recommended_fix`] already declined to claim (excluded via `still_applying`, or
+    /// never had a known fix) — see `deps-core`'s `lsp_helpers::code_actions::fix_target_is_verified`
+    /// (the actual gate `generate_code_actions` uses) for the full contract, rather than
+    /// re-deriving it ad hoc.
+    pub fix_target_status: Option<UpgradeStatus>,
 }
 
 /// A single upgrade target recommended by [`DependencyVulnerabilities::recommended_fix`].
@@ -245,6 +279,7 @@ impl DependencyVulnerabilities {
     ///     advisories: vec![advisory("RUSTSEC-1", "1.2.0")],
     ///     total_known: 1,
     ///     upgrade_status: UpgradeStatus::NotChecked,
+    ///     fix_target_status: None,
     /// };
     ///
     /// let fix = dv.recommended_fix().unwrap();
@@ -777,6 +812,7 @@ mod recommended_fix_tests {
             total_known: advisories.len(),
             advisories,
             upgrade_status,
+            fix_target_status: None,
         }
     }
 
@@ -820,6 +856,7 @@ mod recommended_fix_tests {
             UpgradeStatus::CandidateVulnerable {
                 version: "1.2.0".to_string(),
                 advisory_ids: vec!["A1".to_string()],
+                total_known: 1,
             },
         );
 
@@ -835,6 +872,7 @@ mod recommended_fix_tests {
             UpgradeStatus::CandidateVulnerable {
                 version: "1.1.0".to_string(),
                 advisory_ids: vec!["A1".to_string()],
+                total_known: 1,
             },
         );
         assert!(vulns.recommended_fix().is_none());
@@ -883,6 +921,7 @@ mod recommended_fix_tests {
             UpgradeStatus::CandidateVulnerable {
                 version: "3.0.0".to_string(),
                 advisory_ids: vec!["A1".to_string()],
+                total_known: 1,
             },
         );
 

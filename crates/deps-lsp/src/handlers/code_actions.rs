@@ -545,6 +545,9 @@ serde = "1.0.0"
                         url: String::new(),
                     })],
                     total_known: 1,
+                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                        version: "1.0.5".to_string(),
+                    }),
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
@@ -709,6 +712,9 @@ serde = "1.0.0"
                         url: String::new(),
                     })],
                     total_known: 1,
+                    fix_target_status: Some(UpgradeStatus::CandidateClean {
+                        version: "4.50.1".to_string(),
+                    }),
                     upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
