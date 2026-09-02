@@ -730,15 +730,23 @@ mod tests {
         // of holding any of the values above at all — this assertion is the closest a test
         // can get to proving that without reading the source, by confirming none of the
         // secret strings appears anywhere in the parsed struct's debug output.
+        //
+        // The assert message deliberately names only the *label*, never the secret value
+        // itself — echoing the literal fixture string into a panic/format output is exactly
+        // the "secret in a log" pattern this test exists to rule out, and CodeQL's cleartext-
+        // logging query flags it even in test code that's asserting the value's *absence*.
         let debug = format!("{raw:?}");
-        for secret in [
-            "super-secret-token",
-            "another-secret",
-            "hunter2",
-            "scoped-secret",
-            "scoped-password",
+        for (label, secret) in [
+            ("_authToken", "super-secret-token"),
+            ("_auth", "another-secret"),
+            ("_password", "hunter2"),
+            ("scoped _authToken", "scoped-secret"),
+            ("scoped _password", "scoped-password"),
         ] {
-            assert!(!debug.contains(secret), "leaked {secret:?} into {debug:?}");
+            assert!(
+                !debug.contains(secret),
+                "{label}'s value leaked into parsed config Debug output"
+            );
         }
     }
 
