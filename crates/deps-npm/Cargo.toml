@@ -18,11 +18,18 @@ workspace = true
 # dependency of e.g. deps-deno. Mirrors deps-core's own `test-util` feature (see its
 # Cargo.toml). Only ever enabled from a `[dev-dependencies]` entry, so Cargo's feature
 # unification keeps it out of non-test builds of downstream crates.
+#
+# SECURITY: also gates `NpmRegistryIndex::new`'s `http`-loopback carve-out (spec FR-006/
+# NFR-002) — the only shape a plain `http://` registry index is ever accepted, and only for
+# `127.0.0.1`/`localhost`/`::1`. `deps-deno` (a `publish = true` crate) enables this feature
+# from its own `[dev-dependencies]`, same as every other consumer — never from a non-dev
+# dependency, or a release build of that crate would compile in the http carve-out too.
 test-util = []
 
 [dependencies]
 dashmap = { workspace = true }
 deps-core = { workspace = true }
+dirs = { workspace = true }
 node-semver = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -31,6 +38,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 urlencoding = { workspace = true }
 
 [dev-dependencies]
@@ -40,7 +48,6 @@ insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-url = { workspace = true }
 
 [[bench]]
 name = "npm_benchmarks"

@@ -277,7 +277,7 @@ Configure via LSP initialization options:
   "code_lens": {
     "enabled": true
   },
-  "cargo": {
+  "registries": {
     "workspace_registries": "public_only"
   },
   "network": {
@@ -308,7 +308,7 @@ Configure via LSP initialization options:
 | `code_lens` | `enabled` | `true` | Show the "Update N outdated dependencies" code lens |
 | `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
-| `cargo` | `workspace_registries` | `"public_only"` | Which workspace-declared Cargo registry index hosts are ever fetched — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#cargo-customprivate-registries) |
+| `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`) — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#cargo-customprivate-registries) and [npm Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#npm-customprivate-registries). **Breaking rename** from `cargo.workspace_registries` — see CHANGELOG |
 | `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
 
 > [!NOTE]

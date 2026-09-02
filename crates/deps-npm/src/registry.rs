@@ -6,11 +6,12 @@
 //!
 //! All HTTP requests are cached aggressively using ETag/Last-Modified headers.
 
+use crate::config::NpmRegistryIndex;
 use crate::types::{NpmPackage, NpmVersion};
 use dashmap::DashMap;
 use deps_core::{
     DepsError, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, is_dot_segment,
-    lsp_helpers::warn_rejected_value,
+    lsp_helpers::warn_rejected_value, parser::DependencySource,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -70,6 +71,28 @@ const PUBLISH_TIMES_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Display name for the npm registry used in not-found and API-response
 /// error messages.
 pub const REGISTRY: &str = "npm";
+
+/// Upper bound on [`NpmRegistry::alternates`]' entry count. Generous for any realistic
+/// `.npmrc` registry count; exists only to keep this map, keyed by workspace-controlled
+/// URLs, from growing unbounded for the process lifetime. Mirrors `deps-cargo`'s
+/// `MAX_ALTERNATE_REGISTRIES`. Once at capacity, a *new* index is simply never registered
+/// (see [`NpmRegistry::register_alternate`]) — a dependency resolved to an unregistered
+/// alternate index degrades to [`DepsError::PackageNotFound`], never to a
+/// `registry.npmjs.org` lookup by name (spec FR-010).
+const MAX_ALTERNATE_REGISTRIES: usize = 256;
+
+/// Which transport an [`NpmRegistry`] instance fetches through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NpmRegistryTier {
+    /// `registry.npmjs.org` (or a test override) — `HttpCache::get_cached_with_headers`,
+    /// today's path, unchanged.
+    Public,
+    /// A `.npmrc`-declared alternate index — `HttpCache::get_cached_workspace_with_headers`,
+    /// so every redirect hop is re-classified against the live
+    /// [`deps_core::net_policy::RegistryAccessPolicy`] (mirrors
+    /// `deps-cargo/src/sparse.rs`'s identical `WorkspaceDeclared` routing).
+    WorkspaceDeclared,
+}
 
 /// Base URL for package pages on npmjs.com
 pub const NPMJS_URL: &str = "https://www.npmjs.com/package";
@@ -178,19 +201,32 @@ pub struct NpmRegistry {
     cache: Arc<HttpCache>,
     /// Registry base URL — `REGISTRY_BASE` in production, overridden to a mockito server URL
     /// in tests via [`Self::with_registry_base`] (mirrors `deps-nuget`'s
-    /// `NuGetRegistry::with_service_index_url`).
+    /// `NuGetRegistry::with_service_index_url`), or to a `.npmrc`-resolved alternate index
+    /// via [`Self::with_base`]. Never carries a trailing slash (see
+    /// [`crate::config::NpmRegistryIndex`]'s normalization).
     registry_base: String,
     /// Derived publish-time maps, keyed by package name. Separate from `cache`: the full
     /// packument body itself is never retained anywhere (fetched via
     /// `HttpCache::get_transport_only_with_headers`, which bypasses the entry-map cache) —
-    /// only the small `{version: date}` map this holds survives past one call.
+    /// only the small `{version: date}` map this holds survives past one call. Each
+    /// alternate-registry instance gets its own map — sharing one across registries would
+    /// let a public package's publish times satisfy a lookup for a same-named private one.
     publish_times: Arc<DashMap<String, CachedTimes>>,
+    /// Which transport [`Self::get_versions`]/[`Self::search`] fetch through (spec FR-008).
+    tier: NpmRegistryTier,
+    /// Resolved alternate-registry clients, keyed by [`NpmRegistryIndex::as_str`] on both
+    /// registration ([`Self::register_alternate`]) and lookup ([`Self::alternate_client`]).
+    /// `Arc<DashMap<..>>` (not a bare `DashMap`) because `NpmRegistry` is `Clone` and is
+    /// cloned for `deps-deno`'s `DenoRegistry::with_npm` — a bare field would silently fork
+    /// the map. Only the root (`Public`-tier) instance ever registers into this; an
+    /// alternate instance's own map is always empty (`Self::with_base` never populates it).
+    alternates: Arc<DashMap<String, Arc<Self>>>,
 }
 
 impl NpmRegistry {
     /// Creates a new npm registry client with the given HTTP cache.
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        Self::build(cache, REGISTRY_BASE.to_string())
+        Self::build(cache, REGISTRY_BASE.to_string(), NpmRegistryTier::Public)
     }
 
     /// Creates a new npm registry client pointed at a custom registry base URL, for
@@ -203,18 +239,87 @@ impl NpmRegistry {
     /// enabled via `deps-npm = { workspace = true, features = ["test-util"] }` under
     /// `[dev-dependencies]`, mirroring `deps-core`'s own `test-util` feature. Never
     /// reachable from a non-test build of a downstream crate.
+    ///
+    /// Always `Public`-tier: this is the pre-existing entry point every non-alternate-registry
+    /// test in the workspace already uses (fetches through the ungated transport). A test
+    /// exercising the `.npmrc`-alternate-registry path constructs its mock client via
+    /// [`Self::with_base`] instead, so it goes through the workspace-gated transport (FR-008)
+    /// and exercises the same production routing.
     #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn with_registry_base(cache: Arc<HttpCache>, registry_base: String) -> Self {
-        Self::build(cache, registry_base)
+        Self::build(cache, registry_base, NpmRegistryTier::Public)
     }
 
-    fn build(cache: Arc<HttpCache>, registry_base: String) -> Self {
+    /// Creates an [`NpmRegistry`] client for a resolved `.npmrc` alternate registry — an
+    /// ordinary production constructor (unlike [`Self::with_registry_base`], not gated).
+    ///
+    /// No `AlternateNpmClient` type exists: an alternate client *is* an [`NpmRegistry`] with
+    /// a different base and `tier: WorkspaceDeclared`, so it fetches through
+    /// `HttpCache::get_cached_workspace_with_headers` (FR-008's redirect-hop gating) instead
+    /// of the ungated transport. Its own `alternates` map is always empty — only the root
+    /// (`Public`-tier) registry this was registered on ever registers further alternates.
+    #[must_use]
+    pub fn with_base(cache: Arc<HttpCache>, index: &NpmRegistryIndex) -> Self {
+        Self::build(
+            cache,
+            index.as_str().to_string(),
+            NpmRegistryTier::WorkspaceDeclared,
+        )
+    }
+
+    fn build(cache: Arc<HttpCache>, registry_base: String, tier: NpmRegistryTier) -> Self {
         Self {
             cache,
             registry_base,
             publish_times: Arc::new(DashMap::new()),
+            tier,
+            alternates: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Registers (or reuses an existing registration for) `index` as an alternate registry
+    /// client, callable via [`Self::alternate_client`].
+    ///
+    /// A no-op when `index` is already registered — the first successful registration for a
+    /// given index URL sticks for the process lifetime. Also a no-op, with a
+    /// `tracing::warn!`, once `MAX_ALTERNATE_REGISTRIES` is reached and `index` is not
+    /// already present: the dependency stays unregistered (fails closed to
+    /// [`DepsError::PackageNotFound`] at fetch time, spec FR-010) rather than evicting an
+    /// existing, possibly still-in-use, client.
+    ///
+    /// Called only from `NpmEcosystem::parse_manifest` over `NpmParseResult::resolved_registries`
+    /// — the one place a per-document `.npmrc` resolution and this long-lived shared router
+    /// meet. Registration is parse-time-only; there is no lazy creation on the fetch path
+    /// (spec FR-010 dispatch table).
+    pub fn register_alternate(&self, index: NpmRegistryIndex) {
+        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds
+        // a write guard on one — checking capacity from inside the `Vacant` arm would
+        // self-deadlock on that shard (mirrors `deps-cargo::CargoRegistry::register_alternate`).
+        let at_capacity = self.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
+        let key = index.as_str().to_string();
+
+        if let dashmap::mapref::entry::Entry::Vacant(slot) = self.alternates.entry(key.clone()) {
+            if at_capacity {
+                tracing::warn!(
+                    index = %key,
+                    cap = MAX_ALTERNATE_REGISTRIES,
+                    "npm alternate registry cap reached; not registering a new index"
+                );
+                return;
+            }
+            slot.insert(Arc::new(Self::with_base(Arc::clone(&self.cache), &index)));
+        }
+    }
+
+    /// The registered client for `index`, if any — read-only, performs no registration, no
+    /// validation. `index` only ever originates from an already-validated
+    /// [`NpmRegistryIndex::as_str`], on both sides (registration above, and a dependency's
+    /// own resolved [`DependencySource::AlternateRegistry`] `index` string), so lookup stays
+    /// a plain map read.
+    #[must_use]
+    pub fn alternate_client(&self, index: &str) -> Option<Arc<Self>> {
+        self.alternates.get(index).map(|entry| Arc::clone(&entry))
     }
 
     /// Fetches all versions for a package from the npm registry.
@@ -263,11 +368,16 @@ impl NpmRegistry {
         }
 
         let url = versions_url(&self.registry_base, name);
-        let data = self
-            .cache
-            .get_cached_with_headers(&url, &[(reqwest::header::ACCEPT, ABBREVIATED_ACCEPT)])
-            .await
-            .map_err(|e| not_found_or(e, name))?;
+        let headers = [(reqwest::header::ACCEPT, ABBREVIATED_ACCEPT)];
+        let data = match self.tier {
+            NpmRegistryTier::Public => self.cache.get_cached_with_headers(&url, &headers).await,
+            NpmRegistryTier::WorkspaceDeclared => {
+                self.cache
+                    .get_cached_workspace_with_headers(&url, &headers)
+                    .await
+            }
+        }
+        .map_err(|e| not_found_or(e, name))?;
 
         parse_package_metadata(&data)
     }
@@ -466,6 +576,17 @@ impl NpmRegistry {
     /// # }
     /// ```
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<NpmPackage>> {
+        // N-M3: an alternate registry never performs a package-*name* search. Today's
+        // routing never reaches this on a `WorkspaceDeclared` instance (`complete_package_names`
+        // always uses the root/`Public` instance, spec FR-011), but nothing else enforces
+        // that — and this method's own request would go through the **ungated** transport
+        // (`self.cache.get_cached`, below), bypassing FR-008's redirect-hop gating entirely
+        // if a future call site ever did reach it. Enforced here rather than relied on via
+        // the call graph (cf. "a gate before a match proves coverage of that function only").
+        if self.tier == NpmRegistryTier::WorkspaceDeclared {
+            return Ok(Vec::new());
+        }
+
         let url = format!(
             "{}/-/v1/search?text={}&size={}",
             self.registry_base,
@@ -679,7 +800,15 @@ impl deps_core::Registry for NpmRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let mut versions = self.get_versions(name.as_str()).await?;
-            if freshness.enabled {
+            // A2: an alternate (`WorkspaceDeclared`-tier) registry always skips the
+            // full-packument publish-times fetch, regardless of `freshness.enabled` —
+            // `HttpCache` has no workspace-gated `get_transport_only_*` variant, and routing
+            // an alternate's multi-MB full packument through the ungated transport would
+            // reopen the redirect-hop hole FR-008's routing closes, for a cosmetic
+            // relative-age suffix. `fetch_publish_times` already degrades to an empty map on
+            // any failure, so private-registry dependencies simply keep that same shape —
+            // version data itself is unaffected.
+            if freshness.enabled && self.tier == NpmRegistryTier::Public {
                 let all_versions: Vec<String> =
                     versions.iter().map(|v| v.version.to_string()).collect();
                 let top8 = top_n(&versions, HOVER_RECENT_VERSIONS);
@@ -695,6 +824,38 @@ impl deps_core::Registry for NpmRegistry {
         })
     }
 
+    /// Dispatches by `source` (spec FR-010): an `AlternateRegistry` whose index has a
+    /// registered client routes there; one with **no** registered client is
+    /// `PackageNotFound`, never a fall back to `registry.npmjs.org` (npm always sets
+    /// `mirrors_crates_io: false`, so Cargo's mirror-degradation arm is dead here and must
+    /// not be written — falling back would send a private package name to the public
+    /// registry, the exact #248-class leak the rest of this spec closes). Every other source
+    /// keeps today's public-registry path unchanged.
+    fn get_versions_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        freshness: deps_core::FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            match source {
+                DependencySource::AlternateRegistry { index, .. } => {
+                    match self.alternate_client(index) {
+                        Some(client) => {
+                            deps_core::Registry::get_versions_with(client.as_ref(), name, freshness)
+                                .await
+                        }
+                        None => Err(DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "alternate registry (not registered)",
+                        }),
+                    }
+                }
+                _ => deps_core::Registry::get_versions_with(self, name, freshness).await,
+            }
+        })
+    }
+
     fn get_latest_matching<'a>(
         &'a self,
         name: &'a deps_core::PackageName,
@@ -705,6 +866,42 @@ impl deps_core::Registry for NpmRegistry {
                 .get_latest_matching(name.as_str(), req.as_str())
                 .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
+    }
+
+    /// `get_versions_from`'s `get_latest_matching`-shaped counterpart — same three-arm
+    /// dispatch, same N-S1 "must never fall back to the public registry" invariant for an
+    /// unregistered `AlternateRegistry` index.
+    fn get_latest_matching_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        req: &'a deps_core::VersionReq,
+        _minimum_stability: Option<&'a str>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            match source {
+                DependencySource::AlternateRegistry { index, .. } => {
+                    match self.alternate_client(index) {
+                        Some(client) => {
+                            let version = client
+                                .get_latest_matching(name.as_str(), req.as_str())
+                                .await?;
+                            Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+                        }
+                        None => Err(DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "alternate registry (not registered)",
+                        }),
+                    }
+                }
+                _ => {
+                    let version = self
+                        .get_latest_matching(name.as_str(), req.as_str())
+                        .await?;
+                    Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+                }
+            }
         })
     }
 
@@ -2208,5 +2405,318 @@ mod tests {
         // Within TTL and unchanged top-8: must return the identical Arc, not refetch.
         let second = registry.publish_times("express", &top8, &top8).await;
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    // --- Alternate-registry router (spec FR-008/FR-010, N-S1, N-M3, M2) ---
+
+    fn all_policy() -> deps_core::net_policy::RegistryAccessPolicy {
+        deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        )
+    }
+
+    /// S6/N-C1: mockito binds `http://127.0.0.1`, so registering it as an alternate needs
+    /// both gates open — the `cfg(test)` `http`-loopback carve-out in `NpmRegistryIndex::new`
+    /// (automatic in a test binary) **and** the runtime policy (`WorkspaceRegistryAccess::All`
+    /// here, since the default `PublicOnly` denies `HostClass::Loopback`).
+    fn alternate_index(raw: &str) -> crate::config::NpmRegistryIndex {
+        crate::config::NpmRegistryIndex::new(raw, &all_policy()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_from_routes_alternate_registry_never_public() {
+        use deps_core::PackageName;
+
+        let mut alt_server = mockito::Server::new_async().await;
+        let alt_mock = alt_server
+            .mock("GET", "/@myorg/internal-lib")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+            .create_async()
+            .await;
+
+        let mut public_server = mockito::Server::new_async().await;
+        let public_mock = public_server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"versions": {"9.9.9": {}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let registry = NpmRegistry::with_registry_base(Arc::clone(&cache), public_server.url());
+        let index = alternate_index(&alt_server.url());
+        registry.register_alternate(index.clone());
+
+        let source = DependencySource::AlternateRegistry {
+            index: index.as_str().to_string(),
+            mirrors_crates_io: false,
+        };
+        let versions = deps_core::Registry::get_versions_from(
+            &registry,
+            &PackageName::new("@myorg/internal-lib"),
+            &source,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(versions.len(), 1);
+
+        alt_mock.assert_async().await;
+        public_mock.assert_async().await;
+    }
+
+    /// Blocker-3 (review): proves an alternate-registry fetch actually goes through
+    /// `HttpCache::get_cached_workspace_with_headers` (`Self::get_versions`'s
+    /// `WorkspaceDeclared` arm, `:376`) rather than the ungated baseline transport
+    /// `get_cached_with_headers` uses — the transport FR-008's whole redirect-hop SSRF-gating
+    /// architecture depends on, and until now the only thing asserting *which client* served
+    /// a request, never *which transport tier*.
+    ///
+    /// Proven the same way `deps-core`'s
+    /// `test_get_cached_and_get_cached_workspace_do_not_share_an_entry` proves it: the
+    /// workspace tier writes under a policy-prefixed cache key distinct from the baseline
+    /// tier's bare-URL key (`HttpCache::cache_key`), so a same-URL fetch through the plain
+    /// baseline tier right after an alternate fetch lands in a **second, separate** cache
+    /// entry — `cache.len() == 2`. Request count alone can't distinguish this: `HttpCache`
+    /// always revalidates over the network on a hit too (no `ETag`/`Last-Modified` here), so
+    /// both the "separate keys" and "shared key" cases make exactly two requests either way —
+    /// only the entry count tells them apart. If `:376` were ever reverted to the ungated
+    /// `get_cached_with_headers`, the alternate fetch above would write under the *baseline*
+    /// key, the plain `get_cached` call below would hit that same entry, and `cache.len()`
+    /// would be `1`, failing this test.
+    #[tokio::test]
+    async fn test_alternate_registry_fetch_uses_workspace_cache_key_namespace() {
+        use deps_core::PackageName;
+
+        let mut alt_server = mockito::Server::new_async().await;
+        let alt_mock = alt_server
+            .mock("GET", "/@myorg/internal-lib")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let registry = NpmRegistry::new(Arc::clone(&cache));
+        let index = alternate_index(&alt_server.url());
+        registry.register_alternate(index.clone());
+
+        let source = DependencySource::AlternateRegistry {
+            index: index.as_str().to_string(),
+            mirrors_crates_io: false,
+        };
+        deps_core::Registry::get_versions_from(
+            &registry,
+            &PackageName::new("@myorg/internal-lib"),
+            &source,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+
+        // Same URL, fetched through the *baseline* tier directly.
+        let url = format!("{}/@myorg/internal-lib", alt_server.url());
+        cache.get_cached(&url).await.unwrap();
+
+        assert_eq!(
+            cache.len(),
+            2,
+            "alternate fetch and baseline fetch of the same URL must land in distinct cache \
+             entries, proving the alternate fetch used the workspace-tier key namespace"
+        );
+        alt_mock.assert_async().await;
+    }
+
+    /// N-S1: an `AlternateRegistry` source whose index was never registered must return
+    /// `PackageNotFound`, never a fall back to the public registry — asserted independently
+    /// for both `get_versions_from` and `get_latest_matching_from`, since Cargo's own
+    /// precedent notes this exact arm enumeration "has been wrong twice during design review".
+    #[tokio::test]
+    async fn test_get_versions_from_unregistered_alternate_never_falls_back_to_public() {
+        use deps_core::PackageName;
+
+        let mut public_server = mockito::Server::new_async().await;
+        let public_mock = public_server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"versions": {"9.9.9": {}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let source = DependencySource::AlternateRegistry {
+            index: "https://never-registered.example".to_string(),
+            mirrors_crates_io: false,
+        };
+
+        let result = deps_core::Registry::get_versions_from(
+            &registry,
+            &PackageName::new("@myorg/internal-lib"),
+            &source,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await;
+        match result {
+            Err(err) => assert!(matches!(
+                err,
+                DepsError::PackageNotFound {
+                    registry: "alternate registry (not registered)",
+                    ..
+                }
+            )),
+            Ok(_) => panic!("expected an unregistered alternate to fail closed"),
+        }
+        public_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_matching_from_unregistered_alternate_never_falls_back_to_public() {
+        use deps_core::{PackageName, VersionReq};
+
+        let mut public_server = mockito::Server::new_async().await;
+        let public_mock = public_server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"versions": {"9.9.9": {}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let source = DependencySource::AlternateRegistry {
+            index: "https://never-registered.example".to_string(),
+            mirrors_crates_io: false,
+        };
+
+        let result = deps_core::Registry::get_latest_matching_from(
+            &registry,
+            &PackageName::new("@myorg/internal-lib"),
+            &source,
+            &VersionReq::new("*"),
+            None,
+        )
+        .await;
+        match result {
+            Err(err) => assert!(matches!(
+                err,
+                DepsError::PackageNotFound {
+                    registry: "alternate registry (not registered)",
+                    ..
+                }
+            )),
+            Ok(_) => panic!("expected an unregistered alternate to fail closed"),
+        }
+        public_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_from_registry_source_uses_public_client() {
+        use deps_core::PackageName;
+
+        let mut public_server = mockito::Server::new_async().await;
+        public_server
+            .mock("GET", "/express")
+            .with_status(200)
+            .with_body(r#"{"versions": {"4.0.0": {}}}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::with_registry_base(cache, public_server.url());
+        let versions = deps_core::Registry::get_versions_from(
+            &registry,
+            &PackageName::new("express"),
+            &DependencySource::Registry,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    /// N-M3: an alternate (`WorkspaceDeclared`-tier) instance never performs a package-name
+    /// search, even if called directly — the enforcement of the "an alternate never searches"
+    /// invariant, not just the (today-true) claim that nothing routes there.
+    #[tokio::test]
+    async fn test_search_on_alternate_tier_returns_empty_without_request() {
+        let mut alt_server = mockito::Server::new_async().await;
+        let mock = alt_server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let index = alternate_index(&alt_server.url());
+        let alternate = NpmRegistry::with_base(cache, &index);
+
+        let results = alternate.search("express", 10).await.unwrap();
+        assert!(results.is_empty());
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_register_alternate_is_idempotent() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+        let index = alternate_index("https://npm.pkg.github.com");
+
+        registry.register_alternate(index.clone());
+        let first = registry.alternate_client(index.as_str()).unwrap();
+        registry.register_alternate(index.clone());
+        let second = registry.alternate_client(index.as_str()).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn test_register_alternate_capacity_cap() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            let index = alternate_index(&format!("https://registry-{i}.example"));
+            registry.register_alternate(index);
+        }
+        assert_eq!(registry.alternates.len(), MAX_ALTERNATE_REGISTRIES);
+
+        let overflow = alternate_index("https://overflow.example");
+        registry.register_alternate(overflow.clone());
+        assert_eq!(registry.alternates.len(), MAX_ALTERNATE_REGISTRIES);
+        assert!(registry.alternate_client(overflow.as_str()).is_none());
+    }
+
+    /// M2: `NpmRegistry` is `Clone` and `deps-lsp` hands a clone to `deps-deno`'s
+    /// `DenoRegistry::with_npm` — `alternates` must be the *same* map after cloning, not a
+    /// forked copy, or npm and Deno would each see only their own registrations.
+    #[test]
+    fn test_clone_shares_alternates_map() {
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+        let cloned = registry.clone();
+
+        let index = alternate_index("https://npm.pkg.github.com");
+        registry.register_alternate(index.clone());
+
+        assert!(cloned.alternate_client(index.as_str()).is_some());
+    }
+
+    #[test]
+    fn test_with_base_sets_workspace_declared_tier_and_empty_alternates() {
+        let cache = Arc::new(HttpCache::new());
+        let index = alternate_index("https://npm.pkg.github.com");
+        let alternate = NpmRegistry::with_base(cache, &index);
+
+        assert_eq!(alternate.tier, NpmRegistryTier::WorkspaceDeclared);
+        assert!(alternate.alternates.is_empty());
+        assert_eq!(alternate.registry_base, "https://npm.pkg.github.com");
     }
 }

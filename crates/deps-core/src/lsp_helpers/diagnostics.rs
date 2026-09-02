@@ -528,16 +528,16 @@ pub fn generate_diagnostics_from_cache(
         });
     }
 
-    // #443/plan-1b §1.7: a registry index blocked by `cargo.workspace_registries` must not
-    // degrade silently — surface it as an informational diagnostic on the dependency's own
-    // line, independent of the loop below (a blocked dependency never reaches version
+    // #443/plan-1b §1.7: a registry index blocked by `registries.workspace_registries` must
+    // not degrade silently — surface it as an informational diagnostic on the dependency's
+    // own line, independent of the loop below (a blocked dependency never reaches version
     // resolution, so it would otherwise leave no trace at all in the editor).
     for (range, class, raw_value) in parse_result.blocked_registries() {
         diagnostics.push(Diagnostic {
             range,
             severity: Some(DiagnosticSeverity::INFORMATION),
             message: format!(
-                "registry index \"{}\" blocked by cargo.workspace_registries policy \
+                "registry index \"{}\" blocked by registries.workspace_registries policy \
                  (host class: {class})",
                 truncate_for_diagnostic(&raw_value, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS)
             ),

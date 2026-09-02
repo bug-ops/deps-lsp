@@ -388,7 +388,7 @@ impl LanguageServer for Backend {
             tracing::debug!("loaded configuration: {:?}", config);
             self.state
                 .cache
-                .set_registry_policy(config.cargo.workspace_registries.to_policy());
+                .set_registry_policy(config.registries.workspace_registries.to_policy());
             self.state.cache.set_offline(config.network.offline);
             self.state.cache.set_cache_enabled(config.cache.enabled);
             *self.config.write().await = config;
@@ -520,7 +520,7 @@ impl LanguageServer for Backend {
         tracing::info!("configuration updated via workspace/didChangeConfiguration");
         self.state
             .cache
-            .set_registry_policy(config.cargo.workspace_registries.to_policy());
+            .set_registry_policy(config.registries.workspace_registries.to_policy());
         // Must land before `workspace_diagnostic_refresh` below, or the refresh re-renders
         // diagnostics under the stale flag values (critic M5).
         self.state.cache.set_offline(config.network.offline);

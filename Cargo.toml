@@ -30,6 +30,7 @@ deps-npm = { version = "0.11.1", path ="crates/deps-npm" }
 deps-nuget = { version = "0.11.1", path ="crates/deps-nuget" }
 deps-pypi = { version = "0.11.1", path ="crates/deps-pypi" }
 deps-swift = { version = "0.11.1", path ="crates/deps-swift" }
+dirs = "6"
 futures = "0.3"
 insta = "1.48"
 jsonc-parser = "0.33"

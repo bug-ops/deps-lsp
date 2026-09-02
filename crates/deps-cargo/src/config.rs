@@ -220,7 +220,7 @@ pub enum RegistryIndexError {
     UserInfoPresent,
     /// A `WorkspaceDeclared` candidate's host is blocked by the current
     /// [`deps_core::net_policy::WorkspaceRegistryAccess`] policy.
-    #[error("registry index host class {class} blocked by cargo.workspace_registries policy")]
+    #[error("registry index host class {class} blocked by registries.workspace_registries policy")]
     BlockedHost {
         /// The blocked host's classification.
         class: HostClass,
@@ -289,7 +289,7 @@ impl RegistryIndex {
                 tracing::warn!(
                     url = %url,
                     ?class,
-                    "workspace-declared registry index host blocked by cargo.workspace_registries policy"
+                    "workspace-declared registry index host blocked by registries.workspace_registries policy"
                 );
                 return Err(RegistryIndexError::BlockedHost { class });
             }

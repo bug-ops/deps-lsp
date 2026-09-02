@@ -48,7 +48,7 @@ pub struct DepsConfig {
     #[serde(default)]
     pub freshness: FreshnessConfig,
     #[serde(default)]
-    pub cargo: CargoConfig,
+    pub registries: RegistriesConfig,
     #[serde(default)]
     pub network: NetworkConfig,
 }
@@ -622,29 +622,49 @@ where
     Ok(clamped)
 }
 
-/// Cargo ecosystem-specific settings (spec #443, plan-1b §1.7).
+/// Cross-ecosystem workspace-declared registry settings (spec #443/plan-1b §1.7, renamed
+/// from `cargo.workspace_registries` by `032-npm-npmrc-registry-support` FR-008/C2).
+///
+/// **Breaking, pre-1.0, no alias.** `HttpCache` holds exactly one global
+/// `Arc<RegistryAccessPolicy>`, so this setting was never actually Cargo-scoped — it already
+/// governed every ecosystem's workspace-declared registry fetches (the npm `.npmrc`
+/// `registry=`/`@scope:registry=` path included, once that feature also reads it). A client
+/// still sending the old `cargo` key fails `DepsConfig`'s top-level `deny_unknown_fields`
+/// parse — since that attribute sits on `DepsConfig` itself, not on this section, the
+/// rejection takes the **whole** settings payload with it, not just this one setting. Sent at
+/// `initialize` (the common case) that means every setting reverts to its default — safely,
+/// for the security-relevant one here, since `WorkspaceRegistriesSetting::default()` is
+/// `PublicOnly` and `HttpCache::new` already starts there; sent later via
+/// `workspace/didChangeConfiguration` the previously applied configuration is kept instead.
+/// Either way the failure is logged (`tracing::warn!`), just not surfaced by most editors.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_lsp::config::{CargoConfig, WorkspaceRegistriesSetting};
+/// use deps_lsp::config::{RegistriesConfig, WorkspaceRegistriesSetting};
 ///
-/// let config = CargoConfig::default();
+/// let config = RegistriesConfig::default();
 /// assert_eq!(config.workspace_registries, WorkspaceRegistriesSetting::PublicOnly);
 /// ```
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct CargoConfig {
+pub struct RegistriesConfig {
     #[serde(default)]
     pub workspace_registries: WorkspaceRegistriesSetting,
 }
 
-/// Controls which workspace-declared Cargo registry index hosts this LSP will ever fetch
-/// (spec #443, plan-1b §1.1/§1.7).
+/// Controls which workspace-declared registry index hosts this LSP will ever fetch.
 ///
-/// Applies to both the `registry`/`registry-index` alias path (#440) and a
-/// `[source.crates-io] replace-with` chain (1b). Never affects a `$CARGO_HOME/config.toml`-
-/// configured registry, which is the user's own trusted configuration, not something a
-/// cloned repository controls.
+/// Shared by every ecosystem with a workspace-declared-registry concept (spec #443,
+/// plan-1b §1.1/§1.7; `032-npm-npmrc-registry-support` FR-008 widened this from Cargo-only
+/// to cross-ecosystem).
+///
+/// Applies to Cargo's `registry`/`registry-index` alias path (#440), a
+/// `[source.crates-io] replace-with` chain (1b), and npm's `.npmrc` `registry=`/
+/// `@scope:registry=` resolution alike. Never affects a `$CARGO_HOME/config.toml`-configured
+/// Cargo registry, which is the user's own trusted configuration, not something a cloned
+/// repository controls — npm's `.npmrc` has no equivalent always-trusted tier (both its
+/// project and user tiers are policy-symmetric, since phase 1 carries no credential
+/// provenance to protect).
 ///
 /// # Defaults
 ///
@@ -744,7 +764,7 @@ mod tests {
         assert_eq!(config.inlay_hints.up_to_date_text, "✅");
         assert_eq!(config.inlay_hints.needs_update_text, "❌ {}");
         assert_eq!(
-            config.cargo.workspace_registries,
+            config.registries.workspace_registries,
             WorkspaceRegistriesSetting::PublicOnly
         );
     }
@@ -766,13 +786,22 @@ mod tests {
     }
 
     #[test]
-    fn test_cargo_config_section_deserialization() {
-        let json = r#"{"cargo": {"workspace_registries": "off"}}"#;
+    fn test_registries_config_section_deserialization() {
+        let json = r#"{"registries": {"workspace_registries": "off"}}"#;
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(
-            config.cargo.workspace_registries,
+            config.registries.workspace_registries,
             WorkspaceRegistriesSetting::Off
         );
+    }
+
+    /// The renamed key: a client still sending the old `cargo` section fails the whole
+    /// settings payload's `deny_unknown_fields` parse (N-S2) — never silently accepted as a
+    /// no-op, and never partially applied.
+    #[test]
+    fn test_old_cargo_config_key_is_rejected_not_silently_ignored() {
+        let json = r#"{"cargo": {"workspace_registries": "off"}}"#;
+        assert!(serde_json::from_str::<DepsConfig>(json).is_err());
     }
 
     #[test]

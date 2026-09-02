@@ -18,6 +18,7 @@ use tower_lsp_server::ls_types::Range;
 ///     version_req: Some("^4.18.2".into()),
 ///     version_range: Some(Range::new(Position::new(5, 16), Position::new(5, 25))),
 ///     section: NpmDependencySection::Dependencies,
+///     source: deps_core::parser::DependencySource::Registry,
 /// };
 ///
 /// assert_eq!(dep.name, "express");
@@ -30,15 +31,42 @@ pub struct NpmDependency {
     pub version_req: Option<deps_core::VersionReq>,
     pub version_range: Option<Range>,
     pub section: NpmDependencySection,
+    /// Resolved by `.npmrc` lookup (spec `032-npm-npmrc-registry-support`) — `Registry`
+    /// (the public default) unless a `registry=`/`@scope:registry=` entry applies.
+    pub source: deps_core::parser::DependencySource,
 }
 
-// Use macro to implement the Dependency trait
-deps_core::impl_dependency!(NpmDependency {
-    name: name,
-    name_range: name_range,
-    version: version_req,
-    version_range: version_range,
-});
+// Implemented by hand rather than via `deps_core::impl_dependency!`: the macro's `source:
+// $source:expr` arm substitutes the expression into a generated `fn source(&self)` body, but
+// macro hygiene ties a `self` token written at the call site to the call site's own scope
+// (module-level, not a method), not to the generated function's `&self` parameter — so
+// `self.source.clone()` cannot be passed through the macro at all. Mirrors `deps-cargo`'s
+// identical direct `impl deps_core::Dependency for ParsedDependency`.
+impl deps_core::Dependency for NpmDependency {
+    fn name(&self) -> &deps_core::PackageName {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_req.as_ref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::parser::DependencySource {
+        self.source.clone()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 /// Section in package.json where a dependency is declared.
 ///
@@ -173,6 +201,7 @@ mod tests {
             version_req: Some("^18.0.0".into()),
             version_range: Some(Range::new(Position::new(0, 8), Position::new(0, 16))),
             section: NpmDependencySection::Dependencies,
+            source: deps_core::parser::DependencySource::Registry,
         };
 
         assert_eq!(dep.name, "react");
