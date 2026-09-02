@@ -204,13 +204,12 @@ impl Ecosystem for GithubActionsEcosystem {
     /// shown here comes from `TagIndex.sha_to_tag`, not from trusting the comment text.
     ///
     /// Scoped to [`PinStyle::Sha`] only — the SHA is the one pin form GitHub itself does
-    /// not render as a readable version, and it is the only form
-    /// [`crate::registry::TagIndex`] can resolve unambiguously by construction (it is
-    /// populated only from fully-`major.minor.patch`-parseable tags, so a moving major
-    /// tag like `v4` never has its own entry to resolve through). Guarded on
-    /// `dep.version_range().is_some()` (N3): a non-resolvable dependency (a reusable-
-    /// workflow call, `./local`, `docker://…`) still matches the shared helper's own
-    /// hover-target predicate and must not have a `**Resolved**` line spliced onto it.
+    /// not render as a readable version, so it is the only form where naming the tag it
+    /// resolves to adds information; a `PinStyle::Tag` pin already shows the tag text
+    /// directly. Guarded on `dep.version_range().is_some()` (N3): a non-resolvable
+    /// dependency (a reusable-workflow call, `./local`, `docker://…`) still matches the
+    /// shared helper's own hover-target predicate and must not have a `**Resolved**` line
+    /// spliced onto it.
     fn generate_hover<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -296,7 +295,7 @@ impl Ecosystem for GithubActionsEcosystem {
 /// only if neither anchor is found.
 fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
     // `sha` is expected to be a validated, pure-ASCII full hex SHA by the time it
-    // reaches here (`TagIndex` entries are filtered in `tags_to_versions`, security
+    // reaches here (`TagIndex` entries are filtered in `populate_tag_index`, security
     // S-3), so a byte slice is normally safe — `get(..7)` is a char-boundary-safe
     // belt-and-braces guard rather than a raw index (security S-4), falling back to
     // the whole string on anything unexpected instead of panicking.
