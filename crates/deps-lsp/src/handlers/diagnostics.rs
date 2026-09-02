@@ -64,9 +64,7 @@ pub(crate) async fn generate_diagnostics_internal(
             doc.cached_versions.clone(),
             doc.resolved_versions.clone(),
             doc.vulnerabilities.clone(),
-            doc.yanked_versions.clone(),
-            doc.deprecations.clone(),
-            doc.fetch_failed.clone(),
+            doc.outcomes.clone(),
         ))
     }) else {
         tracing::warn!("Document not found for diagnostics: {:?}", uri);
@@ -80,9 +78,7 @@ pub(crate) async fn generate_diagnostics_internal(
         cached_versions,
         resolved_versions,
         vulnerabilities,
-        yanked_versions,
-        deprecations,
-        fetch_failed,
+        outcomes,
     )) = extracted
     else {
         return vec![];
@@ -93,9 +89,7 @@ pub(crate) async fn generate_diagnostics_internal(
             parse_result.as_ref(),
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_vulnerabilities(&vulnerabilities)
-                .with_yanked(&yanked_versions)
-                .with_deprecations(&deprecations)
-                .with_fetch_failed(&fetch_failed)
+                .with_outcomes(&outcomes)
                 .with_ecosystem(ecosystem_id),
             uri,
             freshness,
@@ -719,12 +713,10 @@ serde = "1.0.0"
             resolved.insert("left-pad".into(), "1.0.1".into());
             doc_state.update_resolved_versions(resolved);
 
-            let mut yanked_versions = std::collections::HashMap::new();
-            yanked_versions.insert(
-                "left-pad".to_string(),
+            doc_state.replace_outcomes(deps_core::DependencyOutcomes::new().with_yanked(
+                "left-pad",
                 ("1.0.1".into(), deps_core::RemovalStatus::AdvisoryDeprecated),
-            );
-            doc_state.update_yanked_versions(yanked_versions);
+            ));
 
             state.update_document(uri.clone(), doc_state);
 

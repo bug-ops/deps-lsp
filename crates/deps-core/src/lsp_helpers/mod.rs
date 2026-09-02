@@ -64,7 +64,7 @@ pub const HOVER_RECENT_VERSIONS: usize = 8;
 /// [`crate::lsp_helpers::generate_diagnostics_from_cache`]'s #247 "requirement satisfiable
 /// only by a yanked version" check can gate its own package-level-deprecation suppression
 /// on `AdvisoryDeprecated` specifically, never on a genuine `Yanked` finding — mirroring
-/// [`VersionData::yanked`]'s D5 gate for the #263 in-use-version check (see #437).
+/// [`VersionData::outcomes`]'s D5 gate for the #263 in-use-version check (see #437).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageVersions {
     /// Latest usable version for this package.
@@ -147,6 +147,195 @@ impl PackageVersions {
     }
 }
 
+/// Everything the lifecycle fetch learned about one package, keyed by its normalized name.
+///
+/// All three channels can hold simultaneously for the same package — this is load-bearing,
+/// not an incidental shape. The D5 status gate in
+/// [`generate_diagnostics_from_cache`] reads the [`Self::deprecation`] and [`Self::yanked`]
+/// entries for the same normalized name together and compares their [`RemovalStatus`], and on
+/// the didChange path a surviving deprecation can coexist with a later fetch failure. A single
+/// enum variant per package could not express that overlap.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DependencyOutcome {
+    /// The version found yanked (the in-use version, or `latest` when only `latest` itself is
+    /// yanked), paired with its [`RemovalStatus`]. See [`VersionData::outcomes`]'s prior
+    /// semantics (#233/#263).
+    pub yanked: Option<(ConcreteVersion, RemovalStatus)>,
+    /// Package-level deprecation finding (#205). See [`Deprecation`].
+    pub deprecation: Option<Deprecation>,
+    /// Registry fetch errored, timed out, or was never attempted (#267). See [`FetchFailure`].
+    pub fetch_failure: Option<FetchFailure>,
+}
+
+impl DependencyOutcome {
+    /// True when none of the three channels are set.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.yanked.is_none() && self.deprecation.is_none() && self.fetch_failure.is_none()
+    }
+}
+
+/// Normalized-package-name -> [`DependencyOutcome`] map.
+///
+/// A newtype rather than a bare `HashMap` so the empty-entry pruning invariant (an entry is
+/// removed once all three of its channels are cleared) lives in one place, and so test
+/// fixtures get chainable `with_*` constructors instead of building three ad-hoc `HashMap`s.
+/// Mirrors the existing [`crate::osv::VulnerabilityMap`] convention of a `String`-keyed map by
+/// normalized name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DependencyOutcomes(HashMap<String, DependencyOutcome>);
+
+impl DependencyOutcomes {
+    /// Creates an empty map.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Looks up the full outcome recorded for `name`.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&DependencyOutcome> {
+        self.0.get(name)
+    }
+
+    /// Looks up the yanked-version finding for `name`.
+    #[must_use]
+    pub fn yanked(&self, name: &str) -> Option<&(ConcreteVersion, RemovalStatus)> {
+        self.0.get(name)?.yanked.as_ref()
+    }
+
+    /// Looks up the package-level deprecation finding for `name`.
+    #[must_use]
+    pub fn deprecation(&self, name: &str) -> Option<&Deprecation> {
+        self.0.get(name)?.deprecation.as_ref()
+    }
+
+    /// Looks up the fetch-failure finding for `name`.
+    #[must_use]
+    pub fn fetch_failure(&self, name: &str) -> Option<&FetchFailure> {
+        self.0.get(name)?.fetch_failure.as_ref()
+    }
+
+    /// Records a yanked-version finding for `name`, creating the entry if absent.
+    pub fn set_yanked(&mut self, name: String, yanked: (ConcreteVersion, RemovalStatus)) {
+        self.0.entry(name).or_default().yanked = Some(yanked);
+    }
+
+    /// Records a package-level deprecation finding for `name`, creating the entry if absent.
+    pub fn set_deprecation(&mut self, name: String, deprecation: Deprecation) {
+        self.0.entry(name).or_default().deprecation = Some(deprecation);
+    }
+
+    /// Records a fetch-failure finding for `name`, creating the entry if absent.
+    pub fn set_fetch_failure(&mut self, name: String, failure: FetchFailure) {
+        self.0.entry(name).or_default().fetch_failure = Some(failure);
+    }
+
+    /// Records a fetch-failure finding for `name` only if one is not already recorded,
+    /// creating the entry if absent.
+    pub fn set_fetch_failure_if_absent(&mut self, name: String, failure: FetchFailure) {
+        self.0
+            .entry(name)
+            .or_default()
+            .fetch_failure
+            .get_or_insert(failure);
+    }
+
+    /// Clears the yanked-version channel for `name`, pruning the entry if it becomes empty.
+    pub fn clear_yanked(&mut self, name: &str) {
+        if let Some(entry) = self.0.get_mut(name) {
+            entry.yanked = None;
+            self.prune(name);
+        }
+    }
+
+    /// Clears the deprecation channel for `name`, pruning the entry if it becomes empty.
+    pub fn clear_deprecation(&mut self, name: &str) {
+        if let Some(entry) = self.0.get_mut(name) {
+            entry.deprecation = None;
+            self.prune(name);
+        }
+    }
+
+    /// Clears the fetch-failure channel for `name`, pruning the entry if it becomes empty.
+    pub fn clear_fetch_failure(&mut self, name: &str) {
+        if let Some(entry) = self.0.get_mut(name) {
+            entry.fetch_failure = None;
+            self.prune(name);
+        }
+    }
+
+    /// Removes the whole entry for `name`, regardless of which channels are set.
+    pub fn remove(&mut self, name: &str) {
+        self.0.remove(name);
+    }
+
+    fn prune(&mut self, name: &str) {
+        if self.0.get(name).is_some_and(DependencyOutcome::is_empty) {
+            self.0.remove(name);
+        }
+    }
+
+    /// Number of entries currently stored.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True when no entries are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Number of entries with a yanked-version finding, for logging/`Debug`.
+    #[must_use]
+    pub fn yanked_count(&self) -> usize {
+        self.0.values().filter(|o| o.yanked.is_some()).count()
+    }
+
+    /// Number of entries with a deprecation finding, for logging/`Debug`.
+    #[must_use]
+    pub fn deprecation_count(&self) -> usize {
+        self.0.values().filter(|o| o.deprecation.is_some()).count()
+    }
+
+    /// Number of entries with a fetch-failure finding, for logging/`Debug`.
+    #[must_use]
+    pub fn fetch_failure_count(&self) -> usize {
+        self.0
+            .values()
+            .filter(|o| o.fetch_failure.is_some())
+            .count()
+    }
+
+    /// Chainable builder recording a yanked-version finding. Test/fixture ergonomics.
+    #[must_use]
+    pub fn with_yanked(
+        mut self,
+        name: impl Into<String>,
+        yanked: (ConcreteVersion, RemovalStatus),
+    ) -> Self {
+        self.set_yanked(name.into(), yanked);
+        self
+    }
+
+    /// Chainable builder recording a package-level deprecation finding. Test/fixture
+    /// ergonomics.
+    #[must_use]
+    pub fn with_deprecation(mut self, name: impl Into<String>, deprecation: Deprecation) -> Self {
+        self.set_deprecation(name.into(), deprecation);
+        self
+    }
+
+    /// Chainable builder recording a fetch-failure finding. Test/fixture ergonomics.
+    #[must_use]
+    pub fn with_fetch_failure(mut self, name: impl Into<String>, failure: FetchFailure) -> Self {
+        self.set_fetch_failure(name.into(), failure);
+        self
+    }
+}
+
 /// Bundles the two per-package version maps (`cached`, `resolved`) that LSP handlers pass
 /// together everywhere.
 ///
@@ -180,28 +369,12 @@ pub struct VersionData<'a> {
     /// scan has run yet (e.g. the feature is disabled) — distinct from an
     /// empty map, which would mean "scanned, nothing found".
     pub vulnerabilities: Option<&'a VulnerabilityMap>,
-    /// Yanked-version findings, keyed by normalized package name -> (the
-    /// version string found yanked (the in-use version, or `latest` when
-    /// only `latest` itself is yanked — see `deps-lsp`'s lifecycle probe),
-    /// its [`RemovalStatus`]). The status rides alongside the version string
-    /// so [`generate_diagnostics_from_cache`] can gate #205's package-level
-    /// deprecation suppression on `AdvisoryDeprecated` specifically, never on
-    /// a genuine `Yanked` finding (see that function's D5 handling). `None`
-    /// when no yanked check has run yet — distinct from an empty map, which
-    /// would mean "checked, nothing yanked".
-    pub yanked: Option<&'a HashMap<String, (ConcreteVersion, RemovalStatus)>>,
-    /// Package-level deprecation findings, keyed by normalized package name.
-    /// `None` when no fetch has run yet — distinct from an empty map, which
-    /// would mean "checked, nothing deprecated". See [`crate::Deprecation`].
-    pub deprecations: Option<&'a HashMap<String, Deprecation>>,
-    /// Packages whose registry fetch errored or timed out during the most
-    /// recent lifecycle fetch, keyed by normalized package name. Lets
-    /// [`generate_diagnostics_from_cache`] distinguish "the registry was
-    /// asked and said this package doesn't exist" from "the registry
-    /// couldn't be asked" (#267) — a `cached` miss alone conflates both into
-    /// a misleading "Unknown package" diagnostic. `None` when no fetch has
-    /// run yet, same convention as [`Self::yanked`].
-    pub fetch_failed: Option<&'a HashMap<String, FetchFailure>>,
+    /// Yanked, deprecation, and fetch-failure findings from the most recent lifecycle fetch,
+    /// keyed by normalized package name — see [`DependencyOutcome`] for what each channel
+    /// means and why they must stay readable together off one lookup (D5 in
+    /// [`generate_diagnostics_from_cache`], #233/#263/#205/#267). `None` when no fetch has run
+    /// yet — distinct from an empty map, which would mean "checked, nothing found".
+    pub outcomes: Option<&'a DependencyOutcomes>,
     /// This document's ecosystem, when the caller has one to give. `None` in
     /// most test fixtures and a handful of ecosystem-crate self-tests that
     /// predate this field.
@@ -245,9 +418,7 @@ impl<'a> VersionData<'a> {
             cached,
             resolved,
             vulnerabilities: None,
-            yanked: None,
-            deprecations: None,
-            fetch_failed: None,
+            outcomes: None,
             ecosystem: None,
         }
     }
@@ -273,67 +444,25 @@ impl<'a> VersionData<'a> {
         self
     }
 
-    /// Attaches yanked-version findings to this `VersionData`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::{ConcreteVersion, RemovalStatus, VersionData};
-    /// use std::collections::HashMap;
-    ///
-    /// let cached = HashMap::new();
-    /// let resolved = HashMap::new();
-    /// let yanked: HashMap<String, (ConcreteVersion, RemovalStatus)> = HashMap::new();
-    /// let versions = VersionData::new(&cached, &resolved).with_yanked(&yanked);
-    /// assert!(versions.yanked.is_some());
-    /// ```
-    #[must_use]
-    pub fn with_yanked(
-        mut self,
-        yanked: &'a HashMap<String, (ConcreteVersion, RemovalStatus)>,
-    ) -> Self {
-        self.yanked = Some(yanked);
-        self
-    }
-
-    /// Attaches package-level deprecation findings to this `VersionData`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::{Deprecation, VersionData};
-    /// use std::collections::HashMap;
-    ///
-    /// let cached = HashMap::new();
-    /// let resolved = HashMap::new();
-    /// let deprecations: HashMap<String, Deprecation> = HashMap::new();
-    /// let versions = VersionData::new(&cached, &resolved).with_deprecations(&deprecations);
-    /// assert!(versions.deprecations.is_some());
-    /// ```
-    #[must_use]
-    pub fn with_deprecations(mut self, deprecations: &'a HashMap<String, Deprecation>) -> Self {
-        self.deprecations = Some(deprecations);
-        self
-    }
-
-    /// Attaches the set of packages whose registry fetch failed (error or timeout)
-    /// during the most recent lifecycle fetch.
+    /// Attaches yanked, deprecation, and fetch-failure findings to this `VersionData`. See
+    /// [`Self::outcomes`].
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_core::VersionData;
+    /// use deps_core::lsp_helpers::DependencyOutcomes;
     /// use std::collections::HashMap;
     ///
     /// let cached = HashMap::new();
     /// let resolved = HashMap::new();
-    /// let fetch_failed = HashMap::new();
-    /// let versions = VersionData::new(&cached, &resolved).with_fetch_failed(&fetch_failed);
-    /// assert!(versions.fetch_failed.is_some());
+    /// let outcomes = DependencyOutcomes::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_outcomes(&outcomes);
+    /// assert!(versions.outcomes.is_some());
     /// ```
     #[must_use]
-    pub fn with_fetch_failed(mut self, fetch_failed: &'a HashMap<String, FetchFailure>) -> Self {
-        self.fetch_failed = Some(fetch_failed);
+    pub fn with_outcomes(mut self, outcomes: &'a DependencyOutcomes) -> Self {
+        self.outcomes = Some(outcomes);
         self
     }
 
@@ -1709,6 +1838,107 @@ mod tests {
     use super::*;
     use crate::PackageName;
     use crate::lsp_helpers::test_support::*;
+
+    /// The empty-entry pruning invariant: an entry is removed once its last set channel
+    /// is cleared, one channel at a time, in every order — never left behind as a
+    /// vacuous `Some(DependencyOutcome::default())` that would inflate `len()`.
+    #[test]
+    fn test_dependency_outcomes_prunes_entry_once_all_channels_cleared() {
+        let mut outcomes = DependencyOutcomes::new()
+            .with_yanked("pkg", ("1.0.0".into(), RemovalStatus::Yanked))
+            .with_deprecation(
+                "pkg",
+                Deprecation {
+                    reason: None,
+                    replacement: None,
+                },
+            )
+            .with_fetch_failure("pkg", FetchFailure::Transient);
+        assert_eq!(outcomes.len(), 1);
+
+        outcomes.clear_yanked("pkg");
+        assert!(
+            outcomes.get("pkg").is_some(),
+            "entry must survive while other channels are still set"
+        );
+
+        outcomes.clear_deprecation("pkg");
+        assert!(
+            outcomes.get("pkg").is_some(),
+            "entry must survive while the fetch-failure channel is still set"
+        );
+
+        outcomes.clear_fetch_failure("pkg");
+        assert!(
+            outcomes.is_empty(),
+            "entry must be pruned once its last channel is cleared, not left as a vacuous Some"
+        );
+        assert_eq!(outcomes.len(), 0);
+    }
+
+    /// Clearing a channel that was never set on an existing entry must not spuriously
+    /// prune channels that ARE still set (each `clear_*` only nulls its own field).
+    #[test]
+    fn test_dependency_outcomes_clear_on_unset_channel_is_a_no_op_for_others() {
+        let mut outcomes = DependencyOutcomes::new()
+            .with_yanked("pkg", ("1.0.0".into(), RemovalStatus::AdvisoryDeprecated));
+
+        outcomes.clear_deprecation("pkg");
+        outcomes.clear_fetch_failure("pkg");
+
+        assert!(
+            outcomes.yanked("pkg").is_some(),
+            "clearing unset channels must not touch the still-set yanked channel"
+        );
+        assert_eq!(outcomes.len(), 1);
+    }
+
+    /// `remove` drops the whole entry regardless of which channels are set, unlike the
+    /// per-channel `clear_*` methods.
+    #[test]
+    fn test_dependency_outcomes_remove_drops_entry_with_multiple_channels_set() {
+        let mut outcomes = DependencyOutcomes::new()
+            .with_yanked("pkg", ("1.0.0".into(), RemovalStatus::Yanked))
+            .with_fetch_failure("pkg", FetchFailure::Transient);
+
+        outcomes.remove("pkg");
+
+        assert!(outcomes.get("pkg").is_none());
+        assert!(outcomes.is_empty());
+    }
+
+    /// `set_fetch_failure_if_absent` (impl-critic M2) must never clobber a genuine
+    /// `Actionable`/`Transient` failure already recorded for the name — only `set_fetch_failure`
+    /// unconditionally overwrites.
+    #[test]
+    fn test_dependency_outcomes_set_fetch_failure_if_absent_does_not_clobber_existing() {
+        let mut outcomes = DependencyOutcomes::new().with_fetch_failure(
+            "pkg",
+            FetchFailure::Actionable("set GITHUB_TOKEN".to_string()),
+        );
+
+        outcomes.set_fetch_failure_if_absent("pkg".to_string(), FetchFailure::NotAttempted);
+
+        assert_eq!(
+            outcomes.fetch_failure("pkg"),
+            Some(&FetchFailure::Actionable("set GITHUB_TOKEN".to_string())),
+            "an existing genuine failure must survive a collided-name NotAttempted marker"
+        );
+    }
+
+    /// The mirror case: when no failure is recorded yet, `set_fetch_failure_if_absent` does
+    /// populate the entry.
+    #[test]
+    fn test_dependency_outcomes_set_fetch_failure_if_absent_populates_when_unset() {
+        let mut outcomes = DependencyOutcomes::new();
+
+        outcomes.set_fetch_failure_if_absent("pkg".to_string(), FetchFailure::NotAttempted);
+
+        assert_eq!(
+            outcomes.fetch_failure("pkg"),
+            Some(&FetchFailure::NotAttempted)
+        );
+    }
 
     #[test]
     fn test_line_offset_table_line_start_crlf() {

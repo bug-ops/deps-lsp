@@ -576,15 +576,19 @@ pub fn generate_diagnostics_from_cache(
         // suppressed by an unrelated "latest" lookup failure.
         //
         // I4: gated on `can_resolve_source()`, same guard `unsatisfiable`/`yanked_only`
-        // apply further down — `versions.deprecations` is name-keyed, so a git/path/SDK
-        // occurrence sharing a name with an unrelated registry-resolved package (the same
+        // apply further down — `versions.outcomes`' deprecation channel is name-keyed, so a
+        // git/path/SDK occurrence sharing a name with an unrelated registry-resolved package (the same
         // #248 coincidental-namesake hazard) must not surface a diagnostic for a package
         // it doesn't actually resolve against. Folded into `deprecation` itself (rather
         // than only guarding the `push` call) so the D5 suppression gate below — which
         // reads `deprecation.is_some()` — sees the same answer.
         let deprecation = formatter
             .can_resolve_source(&dep.source())
-            .then(|| versions.deprecations.and_then(|d| d.get(&normalized_name)))
+            .then(|| {
+                versions
+                    .outcomes
+                    .and_then(|o| o.deprecation(&normalized_name))
+            })
             .flatten();
         if let Some(dep_info) = deprecation {
             push_deprecation_diagnostic(&mut diagnostics, dep, formatter, dep_info, severities);
@@ -597,7 +601,7 @@ pub fn generate_diagnostics_from_cache(
         // package-level deprecation notice ("the project is archived"), so it must never be
         // hidden behind one.
         //
-        // Requires an *actual* `versions.yanked` (#263) entry with that status — a
+        // Requires an *actual* `versions.outcomes` yanked (#263) entry with that status — a
         // vacuous `None` (`is_none_or` would default to "suppress") must NOT suppress.
         // #247 reads a different data source (`package_versions.yanked`, now carrying its
         // own `RemovalStatus` per entry — see `PackageVersions::yanked`) and, as of #437,
@@ -615,8 +619,8 @@ pub fn generate_diagnostics_from_cache(
         // for itself from its own matched entry's status.
         let deprecation_suppresses_yanked = deprecation.is_some()
             && versions
-                .yanked
-                .and_then(|y| y.get(&normalized_name))
+                .outcomes
+                .and_then(|o| o.yanked(&normalized_name))
                 .is_some_and(|(_, status)| *status != RemovalStatus::Yanked);
 
         // Tracks only whether #263 actually pushed a `Diagnostic` — NOT whether it was
@@ -626,7 +630,7 @@ pub fn generate_diagnostics_from_cache(
         let yanked_263_diagnostic_pushed = if deprecation_suppresses_yanked {
             false
         } else if let Some((yanked_version, _status)) =
-            versions.yanked.and_then(|y| y.get(&normalized_name))
+            versions.outcomes.and_then(|o| o.yanked(&normalized_name))
             && versions.ecosystem.is_none_or(|ecosystem| {
                 super::in_use_version(
                     dep,
@@ -676,8 +680,8 @@ pub fn generate_diagnostics_from_cache(
                     .can_resolve_source(&dep.source())
                     .then(|| {
                         versions
-                            .fetch_failed
-                            .and_then(|f| f.get(normalized_name.as_str()))
+                            .outcomes
+                            .and_then(|o| o.fetch_failure(normalized_name.as_str()))
                     })
                     .flatten();
                 let message = match formatter.validate_package_name(dep.name().as_str()) {
@@ -768,7 +772,7 @@ pub fn generate_diagnostics_from_cache(
         // diagnostic for a requirement shape (or, npm, unconditionally, #436) where it would
         // duplicate a more specific one or where `removal_status()` isn't a reliable enough
         // per-version signal — see that method's docs. Independent of the #263 in-use-version
-        // check just above, which reads `versions.yanked` directly and is unaffected by this
+        // check just above, which reads `versions.outcomes` directly and is unaffected by this
         // hook. Skipped entirely when the in-use-version
         // check above already pushed a yanked diagnostic for this dependency (see
         // `yanked_263_diagnostic_pushed`), so the two checks never double-report — but,
@@ -792,7 +796,7 @@ pub fn generate_diagnostics_from_cache(
         });
 
         // #437: mirrors D5's polarity above (see `deprecation_suppresses_yanked`), applied
-        // independently of the #263 `versions.yanked` map and of whatever that check decided
+        // independently of the #263 `versions.outcomes` yanked channel and of whatever that check decided
         // — a matched entry whose own status is `AdvisoryDeprecated` yields to a co-occurring
         // package-level deprecation finding, but a matched `Yanked` status always fires
         // regardless, whether or not a #263 entry exists for this package, and whether or not
@@ -1185,11 +1189,12 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let fetch_failed = HashMap::from([("flaky-pkg".to_string(), FetchFailure::Transient)]);
+        let outcomes =
+            DependencyOutcomes::new().with_fetch_failure("flaky-pkg", FetchFailure::Transient);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -1223,14 +1228,14 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let fetch_failed = HashMap::from([(
-            "rate-limited-pkg".to_string(),
+        let outcomes = DependencyOutcomes::new().with_fetch_failure(
+            "rate-limited-pkg",
             FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".to_string()),
-        )]);
+        );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -1269,11 +1274,12 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let fetch_failed = HashMap::from([("transient-pkg".to_string(), FetchFailure::Transient)]);
+        let outcomes =
+            DependencyOutcomes::new().with_fetch_failure("transient-pkg", FetchFailure::Transient);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -1312,12 +1318,12 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let fetch_failed =
-            HashMap::from([("collided-pkg".to_string(), FetchFailure::NotAttempted)]);
+        let outcomes = DependencyOutcomes::new()
+            .with_fetch_failure("collided-pkg", FetchFailure::NotAttempted);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -1355,11 +1361,12 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let fetch_failed = HashMap::from([("bad name".to_string(), FetchFailure::Transient)]);
+        let outcomes =
+            DependencyOutcomes::new().with_fetch_failure("bad name", FetchFailure::Transient);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -1860,8 +1867,8 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), ("1.0.5".into(), RemovalStatus::Yanked));
+        let outcomes =
+            DependencyOutcomes::new().with_yanked("serde", ("1.0.5".into(), RemovalStatus::Yanked));
 
         let severities = DiagnosticSeverities {
             yanked: DiagnosticSeverity::ERROR,
@@ -1870,7 +1877,7 @@ mod tests {
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             severities,
@@ -1904,12 +1911,12 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), ("1.0.5".into(), RemovalStatus::Yanked));
+        let outcomes =
+            DependencyOutcomes::new().with_yanked("serde", ("1.0.5".into(), RemovalStatus::Yanked));
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -1930,7 +1937,7 @@ mod tests {
 
         // Regression guard for the four handlers (hover, completion, code_lens,
         // inlay_hints) that keep calling `VersionData::new` without
-        // `.with_yanked(..)` — `yanked: None` must never produce a diagnostic.
+        // `.with_outcomes(..)` — `outcomes: None` must never produce a diagnostic.
         let formatter = MockFormatter;
 
         let parse_result = MockParseResult {
@@ -1987,12 +1994,12 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("serde".into(), PackageVersions::latest_only("2.0.0"));
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), ("1.0.5".into(), RemovalStatus::Yanked));
+        let outcomes =
+            DependencyOutcomes::new().with_yanked("serde", ("1.0.5".into(), RemovalStatus::Yanked));
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -2041,25 +2048,22 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("left-pad".into(), PackageVersions::latest_only("1.3.0"));
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
-        yanked.insert(
-            "left-pad".to_string(),
-            ("1.3.0".into(), RemovalStatus::AdvisoryDeprecated),
-        );
-        let mut deprecations = HashMap::new();
-        deprecations.insert(
-            "left-pad".to_string(),
-            Deprecation {
-                reason: Some("use String.prototype.padStart()".to_string()),
-                replacement: None,
-            },
-        );
+        let outcomes = DependencyOutcomes::new()
+            .with_yanked(
+                "left-pad",
+                ("1.3.0".into(), RemovalStatus::AdvisoryDeprecated),
+            )
+            .with_deprecation(
+                "left-pad",
+                Deprecation {
+                    reason: Some("use String.prototype.padStart()".to_string()),
+                    replacement: None,
+                },
+            );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions)
-                .with_yanked(&yanked)
-                .with_deprecations(&deprecations),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -2102,22 +2106,19 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.0.0"));
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
-        yanked.insert("pkg".to_string(), ("1.0.0".into(), RemovalStatus::Yanked));
-        let mut deprecations = HashMap::new();
-        deprecations.insert(
-            "pkg".to_string(),
-            Deprecation {
-                reason: Some("project archived".to_string()),
-                replacement: None,
-            },
-        );
+        let outcomes = DependencyOutcomes::new()
+            .with_yanked("pkg", ("1.0.0".into(), RemovalStatus::Yanked))
+            .with_deprecation(
+                "pkg",
+                Deprecation {
+                    reason: Some("project archived".to_string()),
+                    replacement: None,
+                },
+            );
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions)
-                .with_yanked(&yanked)
-                .with_deprecations(&deprecations),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -2166,22 +2167,20 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("left-pad".into(), PackageVersions::latest_only("1.3.0"));
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
-        yanked.insert(
-            "left-pad".to_string(),
-            ("1.3.0".into(), RemovalStatus::AdvisoryDeprecated),
-        );
-        let mut deprecations = HashMap::new();
-        deprecations.insert(
-            "left-pad".to_string(),
-            Deprecation {
-                reason: Some("use String.prototype.padStart()".to_string()),
-                replacement: None,
-            },
-        );
-        let versions = VersionData::new(&cached_versions, &resolved_versions)
-            .with_yanked(&yanked)
-            .with_deprecations(&deprecations);
+        let outcomes = DependencyOutcomes::new()
+            .with_yanked(
+                "left-pad",
+                ("1.3.0".into(), RemovalStatus::AdvisoryDeprecated),
+            )
+            .with_deprecation(
+                "left-pad",
+                Deprecation {
+                    reason: Some("use String.prototype.padStart()".to_string()),
+                    replacement: None,
+                },
+            );
+        let versions =
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes);
 
         let default_severities = DiagnosticSeverities::default();
         let inverted_severities = DiagnosticSeverities {
@@ -2212,7 +2211,7 @@ mod tests {
         }
     }
 
-    /// I4: `versions.deprecations` is name-keyed, so a git/path/SDK/workspace dependency
+    /// I4: `versions.outcomes`' deprecation channel is name-keyed, so a git/path/SDK/workspace dependency
     /// whose name coincidentally matches an unrelated registry-resolved package's
     /// deprecation finding must not surface that diagnostic — the same #248 hazard
     /// `unsatisfiable`/`unknown`/`yanked_only` already guard against.
@@ -2223,9 +2222,8 @@ mod tests {
         let mut cached_versions = HashMap::new();
         cached_versions.insert("dep".into(), PackageVersions::latest_only("1.0.0"));
         let resolved_versions = HashMap::new();
-        let mut deprecations = HashMap::new();
-        deprecations.insert(
-            "dep".to_string(),
+        let outcomes = DependencyOutcomes::new().with_deprecation(
+            "dep",
             Deprecation {
                 reason: Some("archived".to_string()),
                 replacement: None,
@@ -2252,8 +2250,7 @@ mod tests {
             };
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
-                VersionData::new(&cached_versions, &resolved_versions)
-                    .with_deprecations(&deprecations),
+                VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &MockFormatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -2276,7 +2273,7 @@ mod tests {
         };
         let diagnostics = generate_diagnostics_from_cache(
             &registry_parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_deprecations(&deprecations),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &MockFormatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -2309,12 +2306,12 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
-        yanked.insert("serde".to_string(), ("1.0.5".into(), RemovalStatus::Yanked));
+        let outcomes =
+            DependencyOutcomes::new().with_yanked("serde", ("1.0.5".into(), RemovalStatus::Yanked));
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -2362,16 +2359,13 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
         // Keyed by the *normalized* (lowercase) name, not the raw manifest name.
-        yanked.insert(
-            "newtonsoft.json".to_string(),
-            ("13.0.1".into(), RemovalStatus::Yanked),
-        );
+        let outcomes = DependencyOutcomes::new()
+            .with_yanked("newtonsoft.json", ("13.0.1".into(), RemovalStatus::Yanked));
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -2419,13 +2413,13 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
-        yanked.insert("time".to_string(), ("0.1.43".into(), RemovalStatus::Yanked));
+        let outcomes =
+            DependencyOutcomes::new().with_yanked("time", ("0.1.43".into(), RemovalStatus::Yanked));
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions)
-                .with_yanked(&yanked)
+                .with_outcomes(&outcomes)
                 .with_ecosystem(crate::EcosystemId::Cargo),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
@@ -2481,12 +2475,12 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let mut yanked = HashMap::new();
-        yanked.insert("time".to_string(), ("0.1.43".into(), RemovalStatus::Yanked));
+        let outcomes =
+            DependencyOutcomes::new().with_yanked("time", ("0.1.43".into(), RemovalStatus::Yanked));
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_yanked(&yanked),
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -3747,7 +3741,7 @@ mod tests {
 
         /// #437 (formerly I1, D5 gate regression): a package-level deprecation finding must
         /// NOT suppress the #247 `requirement_matches_only_yanked` check when there is no
-        /// corresponding #263 (`versions.yanked`) entry to justify it AND the #247 match's own
+        /// corresponding #263 (`versions.outcomes` yanked) entry to justify it AND the #247 match's own
         /// status is `Yanked` — a genuine hard yank must never be hidden behind a deprecation
         /// notice, exactly like D5 guards for #263. #247 now reads its own `RemovalStatus` per
         /// entry from `package_versions.yanked` (see `PackageVersions::yanked`), so "no #263
@@ -3780,12 +3774,11 @@ mod tests {
                 },
             );
             let resolved_versions = HashMap::new();
-            // Deliberately empty: no #263 (in-use-version) finding for "serde" — the bug
-            // this test guards against is suppression that vacuously fires on this case.
-            let yanked: HashMap<String, (ConcreteVersion, RemovalStatus)> = HashMap::new();
-            let mut deprecations = HashMap::new();
-            deprecations.insert(
-                "serde".to_string(),
+            // Deliberately no yanked entry: no #263 (in-use-version) finding for "serde" —
+            // the bug this test guards against is suppression that vacuously fires on this
+            // case.
+            let outcomes = DependencyOutcomes::new().with_deprecation(
+                "serde",
                 Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -3794,9 +3787,7 @@ mod tests {
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
-                VersionData::new(&cached_versions, &resolved_versions)
-                    .with_yanked(&yanked)
-                    .with_deprecations(&deprecations),
+                VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -3847,12 +3838,11 @@ mod tests {
                 },
             );
             let resolved_versions = HashMap::new();
-            // Deliberately empty: no #263 (in-use-version) finding for "serde" — proves the
-            // suppression decision comes from #247's own matched-entry status, not the #263 map.
-            let yanked: HashMap<String, (ConcreteVersion, RemovalStatus)> = HashMap::new();
-            let mut deprecations = HashMap::new();
-            deprecations.insert(
-                "serde".to_string(),
+            // Deliberately no yanked entry: no #263 (in-use-version) finding for "serde" —
+            // proves the suppression decision comes from #247's own matched-entry status,
+            // not the #263 map.
+            let outcomes = DependencyOutcomes::new().with_deprecation(
+                "serde",
                 Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -3861,9 +3851,7 @@ mod tests {
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
-                VersionData::new(&cached_versions, &resolved_versions)
-                    .with_yanked(&yanked)
-                    .with_deprecations(&deprecations),
+                VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -3922,25 +3910,19 @@ mod tests {
             let resolved_versions = HashMap::new();
             // #263 entry for a *different* version ("2.0.0") than the one #247 matches
             // ("1.2.1"), with status `AdvisoryDeprecated` — this is the D5-suppressed case.
-            let mut in_use_yanked = HashMap::new();
-            in_use_yanked.insert(
-                "serde".to_string(),
-                ("2.0.0".into(), RemovalStatus::AdvisoryDeprecated),
-            );
-            let mut deprecations = HashMap::new();
-            deprecations.insert(
-                "serde".to_string(),
-                Deprecation {
-                    reason: Some("archived".to_string()),
-                    replacement: None,
-                },
-            );
+            let outcomes = DependencyOutcomes::new()
+                .with_yanked("serde", ("2.0.0".into(), RemovalStatus::AdvisoryDeprecated))
+                .with_deprecation(
+                    "serde",
+                    Deprecation {
+                        reason: Some("archived".to_string()),
+                        replacement: None,
+                    },
+                );
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
-                VersionData::new(&cached_versions, &resolved_versions)
-                    .with_yanked(&in_use_yanked)
-                    .with_deprecations(&deprecations),
+                VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -3970,7 +3952,7 @@ mod tests {
 
         /// #247 vs. #263 dedup: a dependency whose in-use version (lock-file-resolved, or an
         /// exact pin) is yanked *and* is the only version satisfying its own requirement
-        /// triggers both the in-use-version check (`versions.yanked`, #263) and the
+        /// triggers both the in-use-version check (`versions.outcomes` yanked, #263) and the
         /// requirement-only-satisfiable-by-yanked check (`requirement_matches_only_yanked`,
         /// #247). Exactly one diagnostic must be emitted, not two.
         #[test]
@@ -3998,12 +3980,12 @@ mod tests {
                 },
             );
             let resolved_versions = HashMap::new();
-            let mut in_use_yanked = HashMap::new();
-            in_use_yanked.insert("serde".to_string(), ("1.2.1".into(), RemovalStatus::Yanked));
+            let outcomes = DependencyOutcomes::new()
+                .with_yanked("serde", ("1.2.1".into(), RemovalStatus::Yanked));
 
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
-                VersionData::new(&cached_versions, &resolved_versions).with_yanked(&in_use_yanked),
+                VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &formatter,
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
