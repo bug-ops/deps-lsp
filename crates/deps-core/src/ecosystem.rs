@@ -569,7 +569,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &'a self,
         parse_result: &'a dyn ParseResult,
         versions: VersionData<'a>,
-        _uri: &'a Uri,
+        uri: &'a Uri,
         freshness: crate::freshness::FreshnessSettings,
         severities: crate::lsp_helpers::DiagnosticSeverities,
     ) -> BoxFuture<'a, Vec<Diagnostic>> {
@@ -578,6 +578,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
                 parse_result,
                 versions,
                 self.formatter(),
+                uri,
                 freshness,
                 severities,
                 crate::freshness::PublishTime::now(),
