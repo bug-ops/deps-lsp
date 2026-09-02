@@ -6,17 +6,25 @@ use crate::parser::{GradleParseResult, find_name_range, find_version_range};
 use crate::types::GradleDependency;
 use deps_core::Result;
 use regex::Regex;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use tower_lsp_server::ls_types::Uri;
 
 /// Matches: implementation('group:artifact:version') or implementation("group:artifact:version")
-static RE_WITH_PARENS: OnceLock<Regex> = OnceLock::new();
+static RE_WITH_PARENS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\w+)\(\s*['"]([^:'"]+):([^:'"]+):([^'"]+)['"]\s*\)"#).expect("RE_WITH_PARENS")
+});
 /// Matches: implementation 'group:artifact:version' or implementation "group:artifact:version"
-static RE_WITHOUT_PARENS: OnceLock<Regex> = OnceLock::new();
+static RE_WITHOUT_PARENS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\w+)\s+['"]([^:'"]+):([^:'"]+):([^'"]+)['"]"#).expect("RE_WITHOUT_PARENS")
+});
 /// Matches: implementation 'group:artifact' or implementation "group:artifact" (no version)
-static RE_NO_VERSION_WITHOUT_PARENS: OnceLock<Regex> = OnceLock::new();
+static RE_NO_VERSION_WITHOUT_PARENS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\w+)\s+['"]([^:'"]+):([^:'"]+)['"]"#).expect("RE_NO_VERSION_WITHOUT_PARENS")
+});
 /// Matches: implementation('group:artifact') (no version, with parens)
-static RE_NO_VERSION_WITH_PARENS: OnceLock<Regex> = OnceLock::new();
+static RE_NO_VERSION_WITH_PARENS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\w+)\(\s*['"]([^:'"]+):([^:'"]+)['"]\s*\)"#).expect("RE_NO_VERSION_WITH_PARENS")
+});
 
 const CONFIGURATIONS: &[&str] = &[
     "implementation",
@@ -34,27 +42,6 @@ const CONFIGURATIONS: &[&str] = &[
     "testCompile",
     "provided",
 ];
-
-fn re_with_parens() -> &'static Regex {
-    RE_WITH_PARENS.get_or_init(|| {
-        Regex::new(r#"(\w+)\(\s*['"]([^:'"]+):([^:'"]+):([^'"]+)['"]\s*\)"#).unwrap()
-    })
-}
-
-fn re_without_parens() -> &'static Regex {
-    RE_WITHOUT_PARENS
-        .get_or_init(|| Regex::new(r#"(\w+)\s+['"]([^:'"]+):([^:'"]+):([^'"]+)['"]"#).unwrap())
-}
-
-fn re_no_version_without_parens() -> &'static Regex {
-    RE_NO_VERSION_WITHOUT_PARENS
-        .get_or_init(|| Regex::new(r#"(\w+)\s+['"]([^:'"]+):([^:'"]+)['"]"#).unwrap())
-}
-
-fn re_no_version_with_parens() -> &'static Regex {
-    RE_NO_VERSION_WITH_PARENS
-        .get_or_init(|| Regex::new(r#"(\w+)\(\s*['"]([^:'"]+):([^:'"]+)['"]\s*\)"#).unwrap())
-}
 
 pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
@@ -94,7 +81,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         let mut matched_positions: Vec<usize> = Vec::new();
 
         // Pattern 1: with parens and version
-        for caps in re_with_parens().captures_iter(line) {
+        for caps in RE_WITH_PARENS.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
             if !CONFIGURATIONS.contains(&config) {
                 continue;
@@ -122,7 +109,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         }
 
         // Pattern 2: without parens and with version
-        for caps in re_without_parens().captures_iter(line) {
+        for caps in RE_WITHOUT_PARENS.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
             if !CONFIGURATIONS.contains(&config) {
                 continue;
@@ -153,7 +140,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         }
 
         // Pattern 3: with parens, no version
-        for caps in re_no_version_with_parens().captures_iter(line) {
+        for caps in RE_NO_VERSION_WITH_PARENS.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
             if !CONFIGURATIONS.contains(&config) {
                 continue;
@@ -181,7 +168,7 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         }
 
         // Pattern 4: without parens, no version
-        for caps in re_no_version_without_parens().captures_iter(line) {
+        for caps in RE_NO_VERSION_WITHOUT_PARENS.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
             if !CONFIGURATIONS.contains(&config) {
                 continue;

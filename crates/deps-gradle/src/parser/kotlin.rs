@@ -6,13 +6,17 @@ use crate::parser::{GradleParseResult, find_name_range, find_version_range};
 use crate::types::GradleDependency;
 use deps_core::Result;
 use regex::Regex;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use tower_lsp_server::ls_types::Uri;
 
 /// Matches: implementation("group:artifact:version")
-static RE_WITH_VERSION: OnceLock<Regex> = OnceLock::new();
+static RE_WITH_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\w+)\(\s*"([^:"\s]+):([^:"\s]+):([^"]+)"\s*\)"#).expect("RE_WITH_VERSION")
+});
 /// Matches: implementation("group:artifact") — no version
-static RE_NO_VERSION: OnceLock<Regex> = OnceLock::new();
+static RE_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\w+)\(\s*"([^:"\s]+):([^:"\s"]+)"\s*\)"#).expect("RE_NO_VERSION")
+});
 
 const CONFIGURATIONS: &[&str] = &[
     "implementation",
@@ -27,15 +31,6 @@ const CONFIGURATIONS: &[&str] = &[
     "ksp",
     "testCompileOnly",
 ];
-
-fn re_with_version() -> &'static Regex {
-    RE_WITH_VERSION
-        .get_or_init(|| Regex::new(r#"(\w+)\(\s*"([^:"\s]+):([^:"\s]+):([^"]+)"\s*\)"#).unwrap())
-}
-
-fn re_no_version() -> &'static Regex {
-    RE_NO_VERSION.get_or_init(|| Regex::new(r#"(\w+)\(\s*"([^:"\s]+):([^:"\s"]+)"\s*\)"#).unwrap())
-}
 
 pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
@@ -77,7 +72,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         let line_u32 = line_idx as u32;
 
         // Try pattern with version first
-        for caps in re_with_version().captures_iter(line) {
+        for caps in RE_WITH_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
             if !CONFIGURATIONS.contains(&config) {
                 continue;
@@ -105,7 +100,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
 
         // Try pattern without version (only if no versioned match on this line)
         // Avoid double-matching lines that were already caught above
-        let already_matched: Vec<_> = re_with_version()
+        let already_matched: Vec<_> = RE_WITH_VERSION
             .captures_iter(line)
             .filter_map(|c| {
                 let config = c.get(1)?.as_str();
@@ -115,7 +110,7 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             })
             .collect();
 
-        for caps in re_no_version().captures_iter(line) {
+        for caps in RE_NO_VERSION.captures_iter(line) {
             let config = caps.get(1).map_or("", |m| m.as_str());
             if !CONFIGURATIONS.contains(&config) {
                 continue;
