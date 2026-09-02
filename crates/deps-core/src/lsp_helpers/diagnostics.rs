@@ -1270,15 +1270,14 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let fetch_failed = HashMap::from([
-            ("flaky-pkg-a".to_string(), FetchFailure::Transient),
-            ("flaky-pkg-b".to_string(), FetchFailure::Transient),
-        ]);
+        let outcomes = DependencyOutcomes::new()
+            .with_fetch_failure("flaky-pkg-a", FetchFailure::Transient)
+            .with_fetch_failure("flaky-pkg-b", FetchFailure::Transient);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions)
-                .with_fetch_failed(&fetch_failed)
+                .with_outcomes(&outcomes)
                 .with_offline(true),
             &formatter,
             crate::freshness::FreshnessSettings::default(),
