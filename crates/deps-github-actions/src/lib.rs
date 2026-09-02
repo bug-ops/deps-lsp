@@ -40,9 +40,9 @@ pub use types::{
 /// [`deps_core::is_dot_segment`]).
 ///
 /// Shared by `registry::validate_owner_repo` (a credential-bearing fetch-URL gate) and
-/// `formatter::GithubActionsFormatter::package_url` (a display-URL gate) — precedent:
-/// `deps_swift::is_valid_github_identity` (`crates/deps-swift/src/lib.rs`), which this
-/// mirrors so both GitHub-API-backed crates share one URL-injection gate shape.
+/// `formatter::GithubActionsFormatter::package_url` (a display-URL gate). Delegates to
+/// [`deps_core::github::is_valid_github_identity`], shared with `deps-swift` so both
+/// GitHub-tags-backed crates cannot drift apart on what counts as a valid identity (#472).
 ///
 /// # Examples
 ///
@@ -53,48 +53,4 @@ pub use types::{
 /// assert!(!is_valid_github_identity("not-a-valid-identifier"));
 /// assert!(!is_valid_github_identity("owner/.."));
 /// ```
-#[must_use]
-pub fn is_valid_github_identity(name: &str) -> bool {
-    let Some((owner, repo)) = name.split_once('/') else {
-        return false;
-    };
-    if owner.is_empty() || repo.is_empty() || repo.contains('/') {
-        return false;
-    }
-    let charset_ok = |s: &str| {
-        s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-    };
-    charset_ok(owner)
-        && charset_ok(repo)
-        && !deps_core::is_dot_segment(owner)
-        && !deps_core::is_dot_segment(repo)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_valid_github_identity_accepts_owner_repo() {
-        assert!(is_valid_github_identity("actions/checkout"));
-        assert!(is_valid_github_identity("org.name/repo_name-v2"));
-    }
-
-    #[test]
-    fn test_is_valid_github_identity_rejects_malformed() {
-        assert!(!is_valid_github_identity("no-slash"));
-        assert!(!is_valid_github_identity(""));
-        assert!(!is_valid_github_identity("owner/repo/extra"));
-        assert!(!is_valid_github_identity("owner/ repo"));
-        assert!(!is_valid_github_identity("../../etc/passwd"));
-    }
-
-    #[test]
-    fn test_is_valid_github_identity_rejects_dot_segment() {
-        assert!(!is_valid_github_identity("owner/.."));
-        assert!(!is_valid_github_identity("owner/."));
-        assert!(!is_valid_github_identity("../repo"));
-        assert!(!is_valid_github_identity("./repo"));
-    }
-}
+pub use deps_core::github::is_valid_github_identity;

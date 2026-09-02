@@ -24,8 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: `PackageVersions::yanked` field type changed from `Arc<[ConcreteVersion]>` to `Arc<[(ConcreteVersion, RemovalStatus)]>`, carrying each yanked/deprecated version's `RemovalStatus` (resolves #437) (#438)
 - **deps-npm, deps-composer**: `AdvisoryDeprecated` no longer feeds the manifest-requirement yanked diagnostic; the #205 package-level deprecation diagnostic is now its sole signal (resolves #436) (#439)
 - **Breaking (pre-1.0, public API)**: `deps-core` extracts a shared `Capped<T>` type for the "possibly-truncated list + total count" pattern, replacing the separate `Vec<T>` + `total_known: usize` fields on `DependencyVulnerabilities::advisories` and `UpgradeStatus::CandidateVulnerable::advisory_ids`; `DependencyVulnerabilities::fix_target_status` drops its redundant `Option` wrapper in favor of `UpgradeStatus::NotChecked` (resolves #469, #468) (#470)
+- **deps-core, deps-swift, deps-github-actions**: extracted the duplicated GitHub tags-API client (owner/repo validation, auth-header setup, tags pagination, page parsing) into a shared `deps_core::github` module; no external behavior change (resolves #472)
 
 ### Fixed
+- **deps-github-actions**: a tags-API page with one entry missing/malformed `commit.sha` no longer aborts the whole page's parse and silently truncates later pages — only that entry is now skipped (side effect of the #472 GitHub-tags-client extraction)
 - **deps-core, deps-lsp**: the "requirement satisfiable only by a yanked version" diagnostic no longer lets a co-occurring package-level deprecation finding hide a genuine hard yank (resolves #437) (#438)
 - **deps-deno, deps-npm**: an exact-pin `npm:` dependency in `deno.json` no longer surfaces the yanked-worded diagnostic, matching the equivalent `package.json` dependency's post-#436 behavior; `jsr:` specifiers are unaffected (resolves #448)
 - **deps-core**: block DNS-rebinding to loopback/link-local/cloud-metadata/unspecified addresses at connect time, shared by every ecosystem crate (resolves #449; RFC1918/CGNAT residual tracked in #455) (#457)
