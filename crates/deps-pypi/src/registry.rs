@@ -9,8 +9,13 @@
 //!
 //! All HTTP requests are cached aggressively using ETag/Last-Modified headers.
 
+use crate::config::{PypiIndexUrl, ResolvedChain};
 use crate::types::{PypiPackage, PypiVersion};
-use deps_core::{DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value};
+use dashmap::DashMap;
+use deps_core::parser::DependencySource;
+use deps_core::{
+    DepsError, FreshnessSettings, HttpCache, Result, lsp_helpers::warn_rejected_value,
+};
 use pep440_rs::{Version, VersionSpecifiers};
 use serde::Deserialize;
 use std::any::Any;
@@ -33,6 +38,33 @@ pub(crate) const SIMPLE_API_ACCEPT: &str = "application/vnd.pypi.simple.v1+json"
 
 /// Display name for PyPI used in not-found and API-response error messages.
 pub const REGISTRY: &str = "PyPI";
+
+/// Upper bound on [`PypiRegistry::alternates`]' entry count. Generous for any realistic
+/// project's private-index configuration count; exists only to keep this map, keyed by
+/// workspace-controlled chain identities, from growing unbounded for the process lifetime.
+/// Mirrors `deps-npm`'s identical `MAX_ALTERNATE_REGISTRIES`. Once at capacity, a *new* chain
+/// is simply never registered (see [`PypiRegistry::register_chain`]) — a dependency resolved
+/// to an unregistered chain degrades to [`DepsError::PackageNotFound`], never to a
+/// `pypi.org` lookup by name (spec FR-010).
+///
+/// Note (plan.md §1's risk note): this cap counts distinct *chain identities*
+/// ([`ResolvedChain::key`]), not distinct index URLs — a monorepo with many files declaring
+/// different `--extra-index-url` combinations against the same primary could exhaust it
+/// faster than a simpler one-registration-per-URL model.
+const MAX_ALTERNATE_REGISTRIES: usize = 256;
+
+/// Which transport a [`PypiRegistry`] instance fetches through (spec FR-008).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PypiRegistryTier {
+    /// `pypi.org` (or a test override) — `HttpCache::get_cached_with_headers`, today's path,
+    /// unchanged.
+    Public,
+    /// A `requirements.txt`/`pyproject.toml`-declared private index —
+    /// `HttpCache::get_cached_workspace_with_headers`, so every redirect hop is re-classified
+    /// against the live [`deps_core::net_policy::RegistryAccessPolicy`] (mirrors
+    /// `deps-npm`'s identical `WorkspaceDeclared` routing).
+    WorkspaceDeclared,
+}
 
 /// Base URL for package pages on pypi.org
 pub const PYPI_URL: &str = "https://pypi.org/project";
@@ -57,16 +89,29 @@ pub fn package_url(name: &str) -> String {
     format!("{}/{}", PYPI_URL, urlencoding::encode(&normalized))
 }
 
-/// Builds the Simple API request URL for `normalized`'s version listing.
+/// Builds the Simple API request URL for `normalized`'s version listing against `base`.
+///
+/// `base` is `PYPI_SIMPLE_BASE` for the public registry, or a resolved
+/// [`PypiIndexUrl`]'s own `simple_base` for a private/alternate index — the C4 fix (see
+/// `crates/deps-pypi/src/registry.rs`'s `PypiRegistry::simple_base` doc): version fetches
+/// must be parameterized on the index actually configured, not hardcoded to `pypi.org`.
+/// `metadata_url` deliberately stays unparameterized — see `metadata_url`'s own doc.
 ///
 /// The name segment is URL-encoded (matching `package_url`) since
 /// `name::normalize` only collapses `-`/`_`/`.` separators and leaves
 /// characters like `/`, `?`, `#` untouched.
-fn simple_api_url(normalized: &str) -> String {
-    format!("{PYPI_SIMPLE_BASE}/{}/", urlencoding::encode(normalized))
+fn simple_api_url(base: &str, normalized: &str) -> String {
+    format!("{base}/{}/", urlencoding::encode(normalized))
 }
 
 /// Builds the JSON API request URL for `normalized`'s package metadata.
+///
+/// Always built from the module-level `PYPI_BASE` constant, never parameterized on a
+/// resolved private index's base — `PYPI_BASE`/`PYPI_SIMPLE_BASE` are different URL roots
+/// (`/pypi` vs `/simple`), so parameterizing this on a private index's `simple_base` would
+/// 404. This is also moot in practice: [`PypiRegistry::get_package_metadata`] is tier-guarded
+/// off for any `WorkspaceDeclared` client (T008), so this is only ever reached by the public
+/// root.
 fn metadata_url(normalized: &str) -> String {
     format!("{PYPI_BASE}/{}/json", urlencoding::encode(normalized))
 }
@@ -128,10 +173,44 @@ pub struct PypiRegistry {
     cache: Arc<HttpCache>,
     /// Base URL for the package-name search index (see [`Self::search`]).
     /// Injectable for tests, mirroring `NuGetRegistry::with_service_index_url`.
+    ///
+    /// **Unchanged meaning** — package-name *search*-index base only, consumed solely by
+    /// `search`/`warm_search_index`. Distinct from [`Self::simple_base`] below (the C4 fix):
+    /// do not reuse one for the other.
     index_url: String,
+    /// Version-fetch base for **this client's own hop**, consumed only by
+    /// [`simple_api_url`] (PEP 503/691 Simple API). `PYPI_SIMPLE_BASE` for the public root;
+    /// a resolved [`PypiIndexUrl`]'s own URL for a private/alternate hop.
+    ///
+    /// New field (fixes C4, plan.md's second critic pass finding N3): an earlier draft
+    /// reused [`Self::index_url`] as if it were the version-fetch base — but that field is
+    /// `crate::search::SIMPLE_INDEX_URL`, consumed only by `search`/`warm_search_index`, so
+    /// an alternate client would have silently kept fetching `pypi.org` for every version
+    /// lookup. Deliberately does **not** parameterize `metadata_url` too — see that
+    /// function's own doc for why (different URL root, would 404).
+    simple_base: String,
     /// Build-once, in-memory package-name search index (issue #419). See
-    /// `crate::search` for the full design.
+    /// `crate::search` for the full design. Never populated for a `WorkspaceDeclared`-tier
+    /// client — `search`/`warm_search_index` are tier-guarded off before ever reaching it
+    /// (T008).
     index: Arc<crate::search::IndexCell>,
+    /// Which transport [`Self::get_versions`]/[`Self::search`] fetch through (spec FR-008).
+    tier: PypiRegistryTier,
+    /// Resolved chain-router clients, keyed by [`ResolvedChain::key`] (a primary/extras
+    /// chain) or by a named source's own URL (Poetry `source =`/uv `index =`). Only the root
+    /// (`Public`-tier) instance this crate constructs via [`Self::new`] ever registers into
+    /// this or is ever looked up by [`Self::alternate_client`] — a chain-hop leaf's own map
+    /// is always empty by construction (never populated by [`Self::with_base`]), the same
+    /// invariant `deps-npm`'s `NpmRegistry::alternates` documents. `Arc<DashMap<..>>` (not a
+    /// bare `DashMap`) since `PypiRegistry` is `Clone` — a bare field would silently fork the
+    /// map.
+    alternates: Arc<DashMap<String, Arc<Self>>>,
+    /// Resolved, already-constructed hop clients this instance falls through to when it
+    /// (hop 0) misses (spec FR-005, fixes C1). Empty for the `Public`-tier root and every
+    /// named-source/leaf client — populated only on the *head* client
+    /// [`Self::register_chain`] builds for a multi-hop chain. Never looked up by string key at
+    /// fetch time; `Self::get_versions_chained` walks this `Vec` positionally.
+    fallback_chain: Vec<Arc<Self>>,
 }
 
 impl PypiRegistry {
@@ -144,12 +223,235 @@ impl PypiRegistry {
     /// rather than the real [`crate::search::SIMPLE_INDEX_URL`]. `pub(crate)` so
     /// tests elsewhere in the crate (`crate::ecosystem`) can point it at a mock
     /// server; mirrors `NuGetRegistry::with_service_index_url`.
+    ///
+    /// Always `Public`-tier with an empty `fallback_chain`: this is the pre-existing entry
+    /// point every non-alternate-index test in the workspace already uses. A test exercising
+    /// the private-index chain path constructs its mock client via [`Self::with_base`]
+    /// instead, so it goes through the workspace-gated transport (FR-008) and exercises the
+    /// same production routing.
     pub(crate) fn with_index_url(cache: Arc<HttpCache>, index_url: String) -> Self {
         Self {
             cache,
             index_url,
+            simple_base: PYPI_SIMPLE_BASE.to_string(),
             index: Arc::new(crate::search::IndexCell::new()),
+            tier: PypiRegistryTier::Public,
+            alternates: Arc::new(DashMap::new()),
+            fallback_chain: Vec::new(),
         }
+    }
+
+    /// Test-only: constructs a `Public`-tier root client with `simple_base` pointed at a
+    /// mock server, so the implicit public fallback hop (spec FR-005(b)) can be exercised in
+    /// a behavioral test — request order/count via mockito — without ever contacting the real
+    /// `pypi.org`. Mirrors [`PypiIndexUrl`]'s identical `cfg(test)`/`test-util`-gated loopback
+    /// carve-out (validator finding #9).
+    ///
+    /// [`Self::register_chain`]'s implicit-public-fallback hop is built from `root`'s own
+    /// `simple_base` (not the hardcoded `PYPI_SIMPLE_BASE` constant), so registering a chain
+    /// against a root constructed this way makes that hop resolve to the mock server too —
+    /// the same code path production uses, just pointed elsewhere.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_public_base_for_test(cache: Arc<HttpCache>, simple_base: String) -> Self {
+        Self {
+            cache,
+            index_url: crate::search::SIMPLE_INDEX_URL.to_string(),
+            simple_base,
+            index: Arc::new(crate::search::IndexCell::new()),
+            tier: PypiRegistryTier::Public,
+            alternates: Arc::new(DashMap::new()),
+            fallback_chain: Vec::new(),
+        }
+    }
+
+    /// Creates a [`PypiRegistry`] client for one resolved private-index hop — an ordinary
+    /// production constructor, `WorkspaceDeclared`-tier so it fetches through
+    /// `HttpCache::get_cached_workspace_with_headers` (FR-008's redirect-hop gating) instead
+    /// of the ungated transport.
+    ///
+    /// `fallback_chain` is empty for every call except the *head* client
+    /// [`Self::register_chain`] builds for a multi-hop chain — every other hop (a chain's own
+    /// leaf hops, or a single-hop named-source client) is a dead end with nothing further to
+    /// fall through to, matching plan.md §1's "leaf clients are never themselves looked up by
+    /// key, only walked positionally" design. Its own `alternates` map starts empty and is
+    /// never populated — only the root ever registers a chain (see `Self::alternates`'s
+    /// doc).
+    #[must_use]
+    pub fn with_base(
+        cache: Arc<HttpCache>,
+        simple_base: &PypiIndexUrl,
+        fallback_chain: Vec<Arc<Self>>,
+    ) -> Self {
+        Self {
+            cache,
+            index_url: crate::search::SIMPLE_INDEX_URL.to_string(),
+            simple_base: simple_base.as_str().to_string(),
+            index: Arc::new(crate::search::IndexCell::new()),
+            tier: PypiRegistryTier::WorkspaceDeclared,
+            alternates: Arc::new(DashMap::new()),
+            fallback_chain,
+        }
+    }
+
+    /// Builds the full hop tree for one [`ResolvedChain`] and inserts the head into
+    /// `root.alternates` under `chain.key`. Idempotent per key (a repeat registration for the
+    /// same key is a no-op), capacity-capped at `MAX_ALTERNATE_REGISTRIES`.
+    ///
+    /// Called only from `PypiEcosystem::parse_manifest` over
+    /// `PypiIndexConfig::resolved_chains()`, at parse time only. Takes `root: &Arc<Self>` as a
+    /// plain parameter rather than `&self` (fixes N1, second critic pass) — `self: &Arc<Self>`
+    /// receivers are unstable, and building the implicit-public final hop needs an owned
+    /// `Arc<Self>`; `PypiEcosystem` already holds `registry: Arc<PypiRegistry>` and passes it
+    /// here directly.
+    ///
+    /// The implicit-public final hop (when `chain.implicit_public_fallback` is set) is a
+    /// **freshly-constructed `Public`-tier client** ([`Self::new`], same URL/transport as the
+    /// root), never `Arc::clone(root)` — cloning the root would create a
+    /// root→alternates→head→fallback_chain→root reference cycle (N1's second half).
+    pub fn register_chain(root: &Arc<Self>, chain: &ResolvedChain) {
+        let Some((first_hop, rest_hops)) = chain.hops.split_first() else {
+            // Defensive: `PypiIndexConfig::resolved_chains` never produces an empty-hop
+            // chain (the zero-hop case resolves to plain `DependencySource::Registry`
+            // instead, with nothing to register).
+            return;
+        };
+
+        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds
+        // a write guard on one — checking capacity from inside the `Vacant` arm would
+        // self-deadlock on that shard (mirrors `deps-npm::NpmRegistry::register_alternate`).
+        let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
+
+        if let dashmap::mapref::entry::Entry::Vacant(slot) =
+            root.alternates.entry(chain.key.clone())
+        {
+            if at_capacity {
+                tracing::warn!(
+                    key = %chain.key,
+                    cap = MAX_ALTERNATE_REGISTRIES,
+                    "PyPI alternate registry cap reached; not registering a new chain"
+                );
+                return;
+            }
+
+            let mut fallback_chain: Vec<Arc<Self>> = rest_hops
+                .iter()
+                .map(|hop| Arc::new(Self::with_base(Arc::clone(&root.cache), hop, Vec::new())))
+                .collect();
+            if chain.implicit_public_fallback {
+                // Built from `root`'s own `simple_base`/`index_url` rather than
+                // `Self::new(..)`'s hardcoded `PYPI_SIMPLE_BASE` (validator finding #9) — in
+                // production `root` is always constructed via `Self::new`, so this is the
+                // exact same URL either way; in a test built via
+                // `Self::with_public_base_for_test`, this hop follows the root to a mock
+                // server, making the implicit-fallback ordering behaviorally testable.
+                fallback_chain.push(Arc::new(Self {
+                    cache: Arc::clone(&root.cache),
+                    index_url: root.index_url.clone(),
+                    simple_base: root.simple_base.clone(),
+                    index: Arc::new(crate::search::IndexCell::new()),
+                    tier: PypiRegistryTier::Public,
+                    alternates: Arc::new(DashMap::new()),
+                    fallback_chain: Vec::new(),
+                }));
+            }
+
+            let head = Self::with_base(Arc::clone(&root.cache), first_hop, fallback_chain);
+            slot.insert(Arc::new(head));
+        }
+    }
+
+    /// Registers a single-hop named-source client (Poetry `source =`/uv `index =`, spec
+    /// FR-007/FR-013) under `index`'s own URL into `root.alternates`. Same
+    /// idempotency/capacity rules and `root: &Arc<Self>` parameter shape as
+    /// [`Self::register_chain`].
+    pub fn register_named_source(root: &Arc<Self>, index: &PypiIndexUrl) {
+        let key = index.as_str().to_string();
+        let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
+
+        if let dashmap::mapref::entry::Entry::Vacant(slot) = root.alternates.entry(key.clone()) {
+            if at_capacity {
+                tracing::warn!(
+                    key = %key,
+                    cap = MAX_ALTERNATE_REGISTRIES,
+                    "PyPI alternate registry cap reached; not registering a new named source"
+                );
+                return;
+            }
+            slot.insert(Arc::new(Self::with_base(
+                Arc::clone(&root.cache),
+                index,
+                Vec::new(),
+            )));
+        }
+    }
+
+    /// The registered client for `index` (a [`ResolvedChain::key`] or a named source's own
+    /// URL), if any — read-only, performs no registration, no validation.
+    ///
+    /// Intentionally only ever meaningful on the **root** — a chain-hop leaf's own
+    /// `alternates` map is always empty by construction ([`Self::with_base`] never populates
+    /// it), so calling this on a non-root client always returns `None`, documenting the
+    /// invariant rather than a bug: `Self::get_versions_chained` never calls this on
+    /// `self`, only walks the already-resolved `Self::fallback_chain` positionally.
+    #[must_use]
+    pub fn alternate_client(&self, index: &str) -> Option<Arc<Self>> {
+        self.alternates.get(index).map(|entry| Arc::clone(&entry))
+    }
+
+    /// FR-005/NFR-006: tries `self` (hop 0) first, then each already-resolved
+    /// `Self::fallback_chain` entry in order — no further map lookup at any point (verifies
+    /// [`Self::register_chain`]'s C1 fix actually resolves a hop end to end).
+    ///
+    /// Implements the plan's three-way failure taxonomy: `Ok(versions)` with `versions`
+    /// non-empty is terminal success; `Err(PackageNotFound)` or `Ok(versions)` with `versions`
+    /// empty (some PEP 503 indexes answer `200` with an empty listing for an unknown project)
+    /// continues to the next hop; any other `Err` (5xx, timeout, network error) is terminal,
+    /// propagated immediately — this is the confirmed trade-off (N4, second critic pass):
+    /// applied to a case-(b) chain (no explicit primary, hop 0 is a declared extra), an
+    /// unreachable hop 0 halts resolution for every dependency in that file, public ones
+    /// included, rather than silently falling through to `pypi.org` (which would leak the
+    /// package's name to the public index precisely when the private index is merely
+    /// unreachable — the exact disclosure NFR-003(2) exists to prevent). This terminal case
+    /// returns [`DepsError::ChainResolutionHalted`] (M2 fix) rather than the underlying
+    /// transport error unchanged — deps-core's `RateLimited`-precedented mechanism for a safe,
+    /// fixed diagnostic hint (`DepsError::fetch_failure` -> `FetchFailure::Actionable`) that
+    /// reaches hover/diagnostics text, not just the `tracing::warn!` below (which still logs
+    /// the real underlying error for debugging) — this is NFR-003(3)'s required
+    /// distinguishable diagnostic.
+    async fn get_versions_chained(&self, name: &str) -> Result<Vec<PypiVersion>> {
+        let mut last_miss: Result<Vec<PypiVersion>> = Err(DepsError::PackageNotFound {
+            package: name.to_string(),
+            registry: REGISTRY,
+        });
+
+        for hop in std::iter::once(self).chain(self.fallback_chain.iter().map(Arc::as_ref)) {
+            match hop.get_versions(name).await {
+                Ok(versions) if !versions.is_empty() => return Ok(versions),
+                Ok(empty) => last_miss = Ok(empty),
+                Err(DepsError::PackageNotFound { .. }) => {
+                    last_miss = Err(DepsError::PackageNotFound {
+                        package: name.to_string(),
+                        registry: REGISTRY,
+                    });
+                }
+                Err(other) => {
+                    tracing::warn!(
+                        package = name,
+                        error = %other,
+                        "PyPI alternate-index chain resolution halted on a transport error \
+                         — not falling back to pypi.org or the next configured index"
+                    );
+                    // M2 fix: returns deps-core's pre-vetted-message `ChainResolutionHalted`
+                    // rather than propagating `other` unchanged, so the diagnostic/hover path
+                    // (via `DepsError::fetch_failure`) can safely surface a fixed, safe hint
+                    // instead of only this log line — see this method's own doc.
+                    return Err(DepsError::ChainResolutionHalted);
+                }
+            }
+        }
+
+        last_miss
     }
 
     /// Fetches all versions for a package from PyPI's Simple API (PEP 691).
@@ -197,12 +499,17 @@ impl PypiRegistry {
                 registry: REGISTRY,
             });
         }
-        let url = simple_api_url(&normalized);
-        let data = self
-            .cache
-            .get_cached_with_headers(&url, &[(reqwest::header::ACCEPT, SIMPLE_API_ACCEPT)])
-            .await
-            .map_err(|e| not_found_or(e, name))?;
+        let url = simple_api_url(&self.simple_base, &normalized);
+        let headers = [(reqwest::header::ACCEPT, SIMPLE_API_ACCEPT)];
+        let data = match self.tier {
+            PypiRegistryTier::Public => self.cache.get_cached_with_headers(&url, &headers).await,
+            PypiRegistryTier::WorkspaceDeclared => {
+                self.cache
+                    .get_cached_workspace_with_headers(&url, &headers)
+                    .await
+            }
+        }
+        .map_err(|e| not_found_or(e, name))?;
 
         parse_simple_api_response(name, &data)
     }
@@ -303,7 +610,16 @@ impl PypiRegistry {
         let cache = Arc::clone(&self.cache);
         let index_url = self.index_url.clone();
         let index = Arc::clone(&self.index);
+        let tier = self.tier;
         async move {
+            // T008 (fixes S4/M3): a `WorkspaceDeclared`-tier client never performs a
+            // package-*name* search — an unguarded search would trigger a full
+            // project-listing download from the private host (the multi-MB Simple index,
+            // not a single-package fetch). Enforced here rather than relied on via the call
+            // graph, mirroring `deps-npm::NpmRegistry::search`'s identical guard.
+            if tier == PypiRegistryTier::WorkspaceDeclared {
+                return Ok(Vec::new());
+            }
             if normalized.is_empty() {
                 return Ok(Vec::new());
             }
@@ -329,6 +645,11 @@ impl PypiRegistry {
     /// completion), so the index is typically already built by the time the user
     /// starts typing a package name.
     pub fn warm_search_index(&self) {
+        // T008: mirrors `Self::search`'s tier guard — never triggers `trigger_index_build`'s
+        // full-listing download for a private index client.
+        if self.tier == PypiRegistryTier::WorkspaceDeclared {
+            return;
+        }
         crate::search::trigger_index_build(
             Arc::clone(&self.cache),
             self.index_url.clone(),
@@ -344,7 +665,19 @@ impl PypiRegistry {
     /// - HTTP request fails
     /// - Package does not exist
     /// - JSON parsing fails
+    /// - `self` is `WorkspaceDeclared`-tier (T008, fixes S4/M3) — this method is `pub`,
+    ///   ungated, and unrouted by any in-workspace caller today, but a future call site
+    ///   reaching it on a private-index client would otherwise send that client's package
+    ///   name to `pypi.org`'s JSON API (`metadata_url` is always built from the hardcoded
+    ///   `PYPI_BASE`, never parameterized — see `metadata_url`'s doc) — closed here before
+    ///   any such call site exists, not relied on via the call graph
     pub async fn get_package_metadata(&self, name: &str) -> Result<PypiPackage> {
+        if self.tier == PypiRegistryTier::WorkspaceDeclared {
+            return Err(DepsError::PackageNotFound {
+                package: name.to_string(),
+                registry: REGISTRY,
+            });
+        }
         let normalized = crate::name::normalize(name);
         if normalized.is_empty() {
             warn_rejected_value(
@@ -397,6 +730,95 @@ impl deps_core::Registry for PypiRegistry {
         Box::pin(async move {
             let version = Self::get_latest_matching(self, name.as_str(), req.as_str()).await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
+    }
+
+    /// Dispatches by `source` (spec FR-010): an `AlternateRegistry` whose index has a
+    /// registered client routes through `Self::get_versions_chained` (FR-005's chain
+    /// walk); one with **no** registered client is `PackageNotFound`, never a fall back to
+    /// `pypi.org` (PyPI always sets `mirrors_crates_io: false`, so Cargo's mirror-degradation
+    /// arm is dead here and must not be written — falling back would send a private package
+    /// name to the public index, the exact #248-class leak this feature closes). Every other
+    /// source keeps today's public-registry path unchanged.
+    fn get_versions_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        freshness: FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<
+        'a,
+        deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
+    > {
+        Box::pin(async move {
+            match source {
+                DependencySource::AlternateRegistry { index, .. } => {
+                    match self.alternate_client(index) {
+                        Some(client) => {
+                            let versions = client.get_versions_chained(name.as_str()).await?;
+                            Ok(versions
+                                .into_iter()
+                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                                .collect())
+                        }
+                        None => Err(DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "alternate registry (not registered)",
+                        }),
+                    }
+                }
+                _ => deps_core::Registry::get_versions_with(self, name, freshness).await,
+            }
+        })
+    }
+
+    /// `get_versions_from`'s `get_latest_matching`-shaped counterpart — same dispatch, same
+    /// "never fall back to `pypi.org` for an unregistered `AlternateRegistry`" invariant.
+    ///
+    /// Derived from `Self::get_versions_chained` +
+    /// [`Registry::select_latest_matching`](deps_core::Registry::select_latest_matching) (fixes
+    /// M4) rather than an independent per-hop version-matching walk: the winning hop (first
+    /// hop with a non-empty version list) is selected once by
+    /// `Self::get_versions_chained`, and matching happens only within that single hop's
+    /// list. If the winning hop has no version matching `req`, that is terminal (`Ok(None)`),
+    /// not a trigger to search later hops for a "better" match — continuing would reintroduce
+    /// the cross-index version comparison this design avoids for the same
+    /// dependency-confusion reasons FR-005(b)'s ordering exists.
+    fn get_latest_matching_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        req: &'a deps_core::VersionReq,
+        _minimum_stability: Option<&'a str>,
+    ) -> deps_core::ecosystem::BoxFuture<
+        'a,
+        deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
+    > {
+        Box::pin(async move {
+            match source {
+                DependencySource::AlternateRegistry { index, .. } => {
+                    match self.alternate_client(index) {
+                        Some(client) => {
+                            let versions: Vec<Box<dyn deps_core::Version>> = client
+                                .get_versions_chained(name.as_str())
+                                .await?
+                                .into_iter()
+                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                                .collect();
+                            let idx = client.select_latest_matching(&versions, req);
+                            Ok(idx.and_then(|i| versions.into_iter().nth(i)))
+                        }
+                        None => Err(DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "alternate registry (not registered)",
+                        }),
+                    }
+                }
+                _ => {
+                    let version =
+                        Self::get_latest_matching(self, name.as_str(), req.as_str()).await?;
+                    Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+                }
+            }
         })
     }
 
@@ -1187,7 +1609,7 @@ mod tests {
         // `normalize_package_name` only collapses `-`/`_`/`.` separators and
         // leaves characters like `/` untouched, so the URL builder itself
         // must encode them to prevent smuggling extra path segments.
-        let url = simple_api_url("evil/../secret");
+        let url = simple_api_url(PYPI_SIMPLE_BASE, "evil/../secret");
         assert!(url.starts_with(PYPI_SIMPLE_BASE));
         assert!(!url.contains("/../"));
         assert_eq!(url, format!("{PYPI_SIMPLE_BASE}/evil%2F..%2Fsecret/"));
@@ -1212,7 +1634,7 @@ mod tests {
         deps_core::test_util::assert_dot_segment_gated_or_contained_transformed(
             |seg| {
                 let normalized = crate::name::normalize(seg);
-                (!normalized.is_empty()).then(|| simple_api_url(&normalized))
+                (!normalized.is_empty()).then(|| simple_api_url(PYPI_SIMPLE_BASE, &normalized))
             },
             crate::name::normalize,
             "pypi.org",
@@ -1239,11 +1661,11 @@ mod tests {
     #[test]
     fn test_simple_api_url_normal_names() {
         assert_eq!(
-            simple_api_url("requests"),
+            simple_api_url(PYPI_SIMPLE_BASE, "requests"),
             "https://pypi.org/simple/requests/"
         );
         assert_eq!(
-            simple_api_url("zope-interface"),
+            simple_api_url(PYPI_SIMPLE_BASE, "zope-interface"),
             "https://pypi.org/simple/zope-interface/"
         );
     }
@@ -1669,5 +2091,705 @@ mod tests {
             .await
             .unwrap();
         assert!(no_match.is_empty());
+    }
+
+    // --- T006/T007/T008: private-index chain infrastructure ---
+
+    fn all_policy() -> deps_core::net_policy::RegistryAccessPolicy {
+        deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        )
+    }
+
+    /// Builds a validated [`PypiIndexUrl`] for a `mockito` loopback server — requires both
+    /// the `cfg(test)` loopback carve-out and an `All` runtime policy.
+    fn index_url(raw: &str) -> PypiIndexUrl {
+        PypiIndexUrl::new(raw, &all_policy()).unwrap()
+    }
+
+    /// C4 fix: an alternate client's version fetch must hit the configured private host, not
+    /// `pypi.org` — proven by asserting the `simple_base`-derived request lands on the mock
+    /// server, not by absence-of-request on a `pypi.org` mock (which this crate's existing
+    /// tests never contact anyway).
+    #[tokio::test]
+    async fn test_with_base_fetches_configured_host_not_pypi_org() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/flask/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["3.0.0"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let base = index_url(&format!("{}/simple", server.url()));
+        let client = PypiRegistry::with_base(Arc::clone(&cache), &base, Vec::new());
+
+        let versions = client.get_versions("flask").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version.as_str(), "3.0.0");
+        mock.assert_async().await;
+    }
+
+    /// FR-005(a)/NFR-006: an explicit-primary chain resolves via hop 0 first — a package
+    /// present there never reaches the extra.
+    #[tokio::test]
+    async fn test_get_versions_from_case_a_primary_wins() {
+        use deps_core::PackageName;
+
+        let mut primary_server = mockito::Server::new_async().await;
+        let primary_mock = primary_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let mut extra_server = mockito::Server::new_async().await;
+        let extra_mock = extra_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["9.9.9"], "files": []}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+
+        let primary = index_url(&format!("{}/simple", primary_server.url()));
+        let extra = index_url(&format!("{}/simple", extra_server.url()));
+        let chain = crate::config::ResolvedChain {
+            key: "test-chain-a".to_string(),
+            hops: vec![primary, extra],
+            implicit_public_fallback: false,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: chain.key.clone(),
+            mirrors_crates_io: false,
+        };
+        let versions = deps_core::Registry::get_versions_from(
+            root.as_ref(),
+            &PackageName::new("pkg"),
+            &source,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_string().as_str(), "1.0.0");
+
+        primary_mock.assert_async().await;
+        extra_mock.assert_async().await;
+    }
+
+    /// S5 failure taxonomy: hop 0 misses (`PackageNotFound`, a 404) -> falls through to hop 1.
+    #[tokio::test]
+    async fn test_get_versions_chained_falls_through_on_package_not_found() {
+        let mut hop0_server = mockito::Server::new_async().await;
+        let hop0_mock = hop0_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let mut hop1_server = mockito::Server::new_async().await;
+        let hop1_mock = hop1_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["2.0.0"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let hop1 = Arc::new(PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop1_server.url())),
+            Vec::new(),
+        ));
+        let head = PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop0_server.url())),
+            vec![hop1],
+        );
+
+        let versions = head.get_versions_chained("pkg").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version.as_str(), "2.0.0");
+
+        hop0_mock.assert_async().await;
+        hop1_mock.assert_async().await;
+    }
+
+    /// S5 failure taxonomy: hop 0 answers `200` with an empty listing (not a 404) -> treated
+    /// identically to `PackageNotFound`, falls through.
+    #[tokio::test]
+    async fn test_get_versions_chained_falls_through_on_empty_listing() {
+        let mut hop0_server = mockito::Server::new_async().await;
+        let hop0_mock = hop0_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": [], "files": []}"#)
+            .create_async()
+            .await;
+
+        let mut hop1_server = mockito::Server::new_async().await;
+        let hop1_mock = hop1_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["2.0.0"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let hop1 = Arc::new(PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop1_server.url())),
+            Vec::new(),
+        ));
+        let head = PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop0_server.url())),
+            vec![hop1],
+        );
+
+        let versions = head.get_versions_chained("pkg").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version.as_str(), "2.0.0");
+
+        hop0_mock.assert_async().await;
+        hop1_mock.assert_async().await;
+    }
+
+    /// N4/second critic pass: a genuine transport error (5xx) on hop 0 is terminal — the
+    /// chain does **not** try hop 1, even though hop 1 would have succeeded. This is the
+    /// case-(b) "unreachable declared extra halts resolution for the whole file" trade-off,
+    /// exercised directly at the chain-walk level.
+    #[tokio::test]
+    async fn test_get_versions_chained_terminates_on_transport_error_never_tries_next_hop() {
+        let mut hop0_server = mockito::Server::new_async().await;
+        let hop0_mock = hop0_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let mut hop1_server = mockito::Server::new_async().await;
+        let hop1_mock = hop1_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["2.0.0"], "files": []}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let hop1 = Arc::new(PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop1_server.url())),
+            Vec::new(),
+        ));
+        let head = PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop0_server.url())),
+            vec![hop1],
+        );
+
+        let err = head.get_versions_chained("pkg").await.unwrap_err();
+        // M2 fix: a terminal transport error is reported as `ChainResolutionHalted` — not
+        // `PackageNotFound` (which would wrongly trigger "continue to next hop" logic
+        // anywhere else this error might be inspected), and not the raw underlying transport
+        // error either (which `DepsError::fetch_failure` cannot safely classify as
+        // `Actionable` — see `ChainResolutionHalted`'s own doc).
+        assert!(
+            matches!(err, DepsError::ChainResolutionHalted),
+            "expected ChainResolutionHalted, got: {err:?}"
+        );
+        // NFR-003(3): this must reach hover/diagnostics as a distinguishable, safe hint via
+        // deps-core's established `fetch_failure` -> `Actionable` mechanism, not stay
+        // log-only.
+        assert_eq!(
+            err.fetch_failure(),
+            deps_core::error::FetchFailure::Actionable(
+                "index unreachable — resolution halted, not falling back to a less-trusted \
+                 index"
+                    .to_string()
+            )
+        );
+
+        hop0_mock.assert_async().await;
+        hop1_mock.assert_async().await;
+    }
+
+    /// NFR-003(3): the terminal-transport-error path logs a distinguishable diagnostic
+    /// naming the halted-chain behavior, not a generic fetch-failed message.
+    #[tokio::test]
+    async fn test_transport_error_logs_distinguishable_diagnostic() {
+        let mut hop0_server = mockito::Server::new_async().await;
+        let hop0_mock = hop0_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let head = PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop0_server.url())),
+            Vec::new(),
+        );
+
+        let log = deps_core::test_util::capture_tracing_output_async(async {
+            head.get_versions_chained("pkg").await.unwrap_err();
+        })
+        .await;
+        assert!(
+            log.contains("not falling back to pypi.org"),
+            "expected a distinguishable halted-chain diagnostic, got: {log:?}"
+        );
+
+        hop0_mock.assert_async().await;
+    }
+
+    /// Zero-hop `ResolvedChain::hops` (defensive — `PypiIndexConfig` never actually produces
+    /// one) is a no-op registration, not a panic.
+    #[test]
+    fn test_register_chain_empty_hops_is_noop() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(PypiRegistry::new(cache));
+        let chain = crate::config::ResolvedChain {
+            key: "empty".to_string(),
+            hops: Vec::new(),
+            implicit_public_fallback: false,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+        assert!(root.alternate_client("empty").is_none());
+    }
+
+    /// `register_chain` is idempotent per key — a second registration for the same key is a
+    /// no-op (mirrors `deps-npm::NpmRegistry::register_alternate`'s identical guarantee).
+    #[test]
+    fn test_register_chain_idempotent() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(PypiRegistry::new(cache));
+        let chain = crate::config::ResolvedChain {
+            key: "dup".to_string(),
+            hops: vec![index_url("https://a.example/simple")],
+            implicit_public_fallback: false,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+        let first = root.alternate_client("dup").unwrap();
+        PypiRegistry::register_chain(&root, &chain);
+        let second = root.alternate_client("dup").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// `MAX_ALTERNATE_REGISTRIES` cap: once reached, a new chain is not registered (degrades
+    /// to `PackageNotFound` at fetch time, never a silent public fallback).
+    #[test]
+    fn test_register_chain_capacity_cap() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(PypiRegistry::new(cache));
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            let chain = crate::config::ResolvedChain {
+                key: format!("chain-{i}"),
+                hops: vec![index_url("https://a.example/simple")],
+                implicit_public_fallback: false,
+            };
+            PypiRegistry::register_chain(&root, &chain);
+        }
+        let overflow = crate::config::ResolvedChain {
+            key: "overflow".to_string(),
+            hops: vec![index_url("https://b.example/simple")],
+            implicit_public_fallback: false,
+        };
+        PypiRegistry::register_chain(&root, &overflow);
+        assert!(root.alternate_client("overflow").is_none());
+    }
+
+    /// The C1 invariant: a chain-hop leaf's own `alternates` map is always empty — calling
+    /// `alternate_client` on a non-root client returns `None` for everything, documented as
+    /// intentional (T006), not a bug.
+    #[test]
+    fn test_alternate_client_only_meaningful_on_root() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+        let chain = crate::config::ResolvedChain {
+            key: "chain".to_string(),
+            hops: vec![index_url("https://a.example/simple")],
+            implicit_public_fallback: false,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+        let head = root.alternate_client("chain").unwrap();
+        assert!(head.alternate_client("chain").is_none());
+    }
+
+    /// N1's fix: the implicit-public final hop is a fresh `Public`-tier leaf, not
+    /// `Arc::clone(&root)` — dropping the root (and every other strong reference) after
+    /// registering an implicit-fallback chain must actually deallocate it, proving there is
+    /// no root->alternates->head->fallback_chain->root reference cycle.
+    #[test]
+    fn test_implicit_public_hop_does_not_create_reference_cycle() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+        let root_weak = Arc::downgrade(&root);
+
+        let chain = crate::config::ResolvedChain {
+            key: "implicit".to_string(),
+            hops: vec![index_url("https://a.example/simple")],
+            implicit_public_fallback: true,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+
+        drop(root);
+        assert!(
+            root_weak.upgrade().is_none(),
+            "root must deallocate once its only strong reference is dropped — a cycle would \
+             keep it alive"
+        );
+    }
+
+    /// FR-005(b)/N1: `register_chain` with `implicit_public_fallback: true` appends a
+    /// freshly-constructed `Public`-tier leaf (same URL/transport as `pypi.org`) as the
+    /// chain's final hop — verified structurally rather than by dispatching a live
+    /// `get_versions_from` call, since walking off the end of this chain would otherwise
+    /// contact the real `pypi.org` from a unit test.
+    #[test]
+    fn test_register_chain_implicit_public_fallback_hop_shape() {
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+
+        let extra = index_url("https://extra.example/simple");
+        let chain = crate::config::ResolvedChain {
+            key: "case-b".to_string(),
+            hops: vec![extra],
+            implicit_public_fallback: true,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+
+        let head = root.alternate_client("case-b").unwrap();
+        assert_eq!(head.simple_base, "https://extra.example/simple");
+        assert_eq!(head.fallback_chain.len(), 1);
+        assert_eq!(head.fallback_chain[0].tier, PypiRegistryTier::Public);
+        assert_eq!(head.fallback_chain[0].simple_base, PYPI_SIMPLE_BASE);
+    }
+
+    /// T012's explicit "must" criterion (validator finding #9), now actually testable via
+    /// `Self::with_public_base_for_test`: FR-005(b) — a package present on **both** a
+    /// declared extra and the (mocked) implicit public fallback resolves via the extra, and
+    /// the public mock is **never contacted** for that name. `expect(0)` on the public mock
+    /// makes this a hard request-count assertion, not just a check of the final result.
+    #[tokio::test]
+    async fn test_case_b_extra_wins_over_implicit_public_request_count_asserted() {
+        use deps_core::PackageName;
+
+        let mut extra_server = mockito::Server::new_async().await;
+        let extra_mock = extra_server
+            .mock("GET", "/simple/mypkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0"], "files": []}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mut public_server = mockito::Server::new_async().await;
+        let public_mock = public_server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let root = Arc::new(PypiRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            format!("{}/simple", public_server.url()),
+        ));
+
+        let extra = index_url(&format!("{}/simple", extra_server.url()));
+        let chain = crate::config::ResolvedChain {
+            key: "case-b-request-count".to_string(),
+            hops: vec![extra],
+            implicit_public_fallback: true,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: chain.key.clone(),
+            mirrors_crates_io: false,
+        };
+        let versions = deps_core::Registry::get_versions_from(
+            root.as_ref(),
+            &PackageName::new("mypkg"),
+            &source,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(versions.len(), 1);
+
+        extra_mock.assert_async().await;
+        public_mock.assert_async().await;
+    }
+
+    /// The mirror scenario: the extra misses (404), so the chain correctly falls through to
+    /// the (mocked) implicit public fallback — proving the ordering is "extra first, public
+    /// last", not "public only" or "extra only".
+    #[tokio::test]
+    async fn test_case_b_falls_through_to_implicit_public_when_extra_misses() {
+        use deps_core::PackageName;
+
+        let mut extra_server = mockito::Server::new_async().await;
+        let extra_mock = extra_server
+            .mock("GET", "/simple/mypkg/")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let mut public_server = mockito::Server::new_async().await;
+        let public_mock = public_server
+            .mock("GET", "/simple/mypkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["9.9.9"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let root = Arc::new(PypiRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            format!("{}/simple", public_server.url()),
+        ));
+
+        let extra = index_url(&format!("{}/simple", extra_server.url()));
+        let chain = crate::config::ResolvedChain {
+            key: "case-b-fallthrough".to_string(),
+            hops: vec![extra],
+            implicit_public_fallback: true,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: chain.key.clone(),
+            mirrors_crates_io: false,
+        };
+        let versions = deps_core::Registry::get_versions_from(
+            root.as_ref(),
+            &PackageName::new("mypkg"),
+            &source,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version_string().as_str(), "9.9.9");
+
+        extra_mock.assert_async().await;
+        public_mock.assert_async().await;
+    }
+
+    /// Validator finding #10: a happy-path test for `get_latest_matching_from` — only the
+    /// unregistered-alternate failure case was previously tested. Derived from
+    /// `get_versions_chained` (M4, no independent chain walk), so this also confirms that
+    /// path picks the right version out of the winning hop's list.
+    #[tokio::test]
+    async fn test_get_latest_matching_from_alternate_registry_happy_path() {
+        use deps_core::PackageName;
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0", "1.5.0", "2.0.0"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+
+        let chain = crate::config::ResolvedChain {
+            key: "latest-matching-happy-path".to_string(),
+            hops: vec![index_url(&format!("{}/simple", server.url()))],
+            implicit_public_fallback: false,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: chain.key.clone(),
+            mirrors_crates_io: false,
+        };
+        let latest = deps_core::Registry::get_latest_matching_from(
+            root.as_ref(),
+            &PackageName::new("pkg"),
+            &source,
+            &deps_core::VersionReq::new(">=1.0.0,<2.0.0"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            latest.map(|v| v.version_string().to_string()),
+            Some("1.5.0".to_string())
+        );
+        mock.assert_async().await;
+    }
+
+    /// Validator finding #11: a 3+-hop chain — every prior test caps at 2 hops. Confirms
+    /// `get_versions_chained` correctly walks past a second miss to reach a third, winning
+    /// hop, and that both earlier hops were actually queried in order (not skipped).
+    #[tokio::test]
+    async fn test_three_hop_chain_falls_through_to_third_hop() {
+        let mut hop0_server = mockito::Server::new_async().await;
+        let hop0_mock = hop0_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let mut hop1_server = mockito::Server::new_async().await;
+        let hop1_mock = hop1_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": [], "files": []}"#)
+            .create_async()
+            .await;
+
+        let mut hop2_server = mockito::Server::new_async().await;
+        let hop2_mock = hop2_server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["3.0.0"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        // `fallback_chain` is a flat list of every hop after hop 0, all direct children of
+        // the head — never nested per-hop (that's how `register_chain` actually builds it;
+        // `get_versions_chained` only ever walks `self.fallback_chain` one level deep, not
+        // recursively).
+        let hop1 = Arc::new(PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop1_server.url())),
+            Vec::new(),
+        ));
+        let hop2 = Arc::new(PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop2_server.url())),
+            Vec::new(),
+        ));
+        let head = PypiRegistry::with_base(
+            Arc::clone(&cache),
+            &index_url(&format!("{}/simple", hop0_server.url())),
+            vec![hop1, hop2],
+        );
+
+        let versions = head.get_versions_chained("pkg").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version.as_str(), "3.0.0");
+
+        hop0_mock.assert_async().await;
+        hop1_mock.assert_async().await;
+        hop2_mock.assert_async().await;
+    }
+
+    /// `AlternateRegistry` with no registered client -> `PackageNotFound`, never a public
+    /// fallback (FR-010).
+    #[tokio::test]
+    async fn test_get_versions_from_unregistered_alternate_never_falls_back() {
+        use deps_core::PackageName;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PypiRegistry::new(cache);
+        let source = DependencySource::AlternateRegistry {
+            index: "pypi-chain:never-registered".to_string(),
+            mirrors_crates_io: false,
+        };
+        let result = deps_core::Registry::get_versions_from(
+            &registry,
+            &PackageName::new("pkg"),
+            &source,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+
+        let result = deps_core::Registry::get_latest_matching_from(
+            &registry,
+            &PackageName::new("pkg"),
+            &source,
+            &deps_core::VersionReq::new("*"),
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+    }
+
+    // --- T008: tier guard on search/warm_search_index/get_package_metadata ---
+
+    #[tokio::test]
+    async fn test_search_on_workspace_declared_tier_issues_no_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let base = index_url(&format!("{}/simple", server.url()));
+        let client = PypiRegistry::with_base(Arc::clone(&cache), &base, Vec::new());
+
+        assert!(client.search("flask", 10).await.unwrap().is_empty());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_warm_search_index_on_workspace_declared_tier_issues_no_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let base = index_url(&format!("{}/simple", server.url()));
+        let client = PypiRegistry::with_base(Arc::clone(&cache), &base, Vec::new());
+
+        client.warm_search_index();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_package_metadata_on_workspace_declared_tier_issues_no_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let base = index_url(&format!("{}/simple", server.url()));
+        let client = PypiRegistry::with_base(Arc::clone(&cache), &base, Vec::new());
+
+        let err = client.get_package_metadata("flask").await.unwrap_err();
+        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        mock.assert_async().await;
     }
 }

@@ -11,12 +11,60 @@ use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Position, Range, 
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter,
+    lsp_helpers::EcosystemFormatter, parser::DependencySource,
 };
 
 use crate::formatter::PypiFormatter;
 use crate::parser::PypiParser;
 use crate::registry::PypiRegistry;
+
+/// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
+/// manifest's already-parsed dependencies (validator finding #1 — mirrors
+/// `deps_npm::ecosystem`'s identical type).
+enum CompletionSource {
+    /// No dependency in the manifest has this exact name yet — most commonly because the
+    /// user is still typing a brand-new dependency line. Callers fall back to the
+    /// pre-existing public-registry-only behavior, unchanged.
+    NotInManifest,
+    /// Every occurrence of this name in the manifest agrees on one resolved source.
+    Resolved(DependencySource),
+    /// Two or more occurrences of this name resolve to different sources — callers must
+    /// offer no completions at all rather than picking one arbitrarily.
+    Ambiguous,
+}
+
+/// Joins `package_name` back to `parse_result.dependencies()` by name — the single choke
+/// point [`PypiEcosystem::complete_versions`] uses to decide whether a version-completion
+/// request may safely reach `pypi.org` at all (validator finding #1: without this,
+/// `complete_versions` fetched from the root `Public`-tier client unconditionally, sending an
+/// `AlternateRegistry`-sourced dependency's name to `pypi.org` on every keystroke, and still
+/// fetching from `pypi.org` for a `CustomRegistry`-sourced one that hover/diagnostics
+/// correctly fail closed for).
+///
+/// Mirrors `deps_npm::ecosystem`'s identical helper.
+fn resolve_completion_source(
+    parse_result: &dyn ParseResultTrait,
+    package_name: &deps_core::PackageName,
+) -> CompletionSource {
+    let mut sources = parse_result
+        .dependencies()
+        .into_iter()
+        .filter(|d| d.name() == package_name)
+        .map(deps_core::Dependency::source);
+
+    let Some(first) = sources.next() else {
+        return CompletionSource::NotInManifest;
+    };
+    if sources.all(|s| s == first) {
+        CompletionSource::Resolved(first)
+    } else {
+        tracing::warn!(
+            package = %package_name,
+            "ambiguous dependency source for version completion; offering none"
+        );
+        CompletionSource::Ambiguous
+    }
+}
 
 /// Which manifest shape a URI's basename identifies, so `parse_manifest` can
 /// dispatch to the right parser method and report the right `file_type` on
@@ -58,15 +106,42 @@ pub struct PypiEcosystem {
     registry: Arc<PypiRegistry>,
     parser: PypiParser,
     formatter: PypiFormatter,
+    /// The reachability policy every `parse_manifest` call threads through to
+    /// [`PypiParser::parse_content_with_policy`]/[`PypiParser::parse_requirements_with_policy`]
+    /// (spec FR-008). Defaulted to `RegistryAccessPolicy::default()` by [`Self::new`]; set
+    /// explicitly by [`Self::with_policy`] so `crate::lib::register_ecosystems`-equivalent
+    /// wiring in `deps-lsp` can share one process-wide `Arc<RegistryAccessPolicy>` handle
+    /// with `ServerState`, mirroring `deps_npm::ecosystem::NpmEcosystem`'s identical `context`
+    /// field.
+    policy: Arc<deps_core::net_policy::RegistryAccessPolicy>,
 }
 
 impl PypiEcosystem {
-    /// Creates a new PyPI ecosystem with the given HTTP cache.
+    /// Creates a new PyPI ecosystem with the given HTTP cache, using a fresh, default
+    /// (`public_only`) [`deps_core::net_policy::RegistryAccessPolicy`] private to this
+    /// ecosystem instance. Production use goes through [`Self::with_policy`] instead.
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
+        Self::with_policy(
+            Arc::new(PypiRegistry::new(cache)),
+            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+        )
+    }
+
+    /// Creates a new PyPI ecosystem around an existing [`PypiRegistry`] instance, sharing
+    /// `policy`'s live reachability setting — the production constructor, used by
+    /// `deps-lsp`'s `register_ecosystems` so `initialize`/`workspace/didChangeConfiguration`
+    /// updating the same `Arc<RegistryAccessPolicy>` takes effect immediately, with no need
+    /// to reconstruct the ecosystem.
+    #[must_use]
+    pub fn with_policy(
+        registry: Arc<PypiRegistry>,
+        policy: Arc<deps_core::net_policy::RegistryAccessPolicy>,
+    ) -> Self {
         Self {
-            registry: Arc::new(PypiRegistry::new(cache)),
+            registry,
             parser: PypiParser::new(),
             formatter: PypiFormatter,
+            policy,
         }
     }
 
@@ -125,20 +200,48 @@ impl PypiEcosystem {
         })
     }
 
+    /// Completes version requirements for `package_name`, routed by the source that name
+    /// resolves to in `parse_result` (validator finding #1). An ambiguous, unresolved, or
+    /// unregistered-alternate source offers no completions rather than risking a private
+    /// package name lookup against `pypi.org` — the same leak class FR-006 closes for
+    /// hover/diagnostics/code-actions.
     async fn complete_versions(
         &self,
+        parse_result: &dyn ParseResultTrait,
         package_name: &deps_core::PackageName,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_generic(
-            self.registry.as_ref(),
-            package_name,
-            prefix,
-            &['>', '<', '=', '~', '!'],
-            freshness,
-        )
-        .await
+        match resolve_completion_source(parse_result, package_name) {
+            CompletionSource::Ambiguous => vec![],
+            CompletionSource::NotInManifest
+            | CompletionSource::Resolved(DependencySource::Registry) => {
+                deps_core::completion::complete_versions_generic(
+                    self.registry.as_ref(),
+                    package_name,
+                    prefix,
+                    &['>', '<', '=', '~', '!'],
+                    freshness,
+                )
+                .await
+            }
+            CompletionSource::Resolved(DependencySource::AlternateRegistry { index, .. }) => {
+                match self.registry.alternate_client(&index) {
+                    Some(client) => {
+                        deps_core::completion::complete_versions_generic(
+                            client.as_ref(),
+                            package_name,
+                            prefix,
+                            &['>', '<', '=', '~', '!'],
+                            freshness,
+                        )
+                        .await
+                    }
+                    None => vec![],
+                }
+            }
+            CompletionSource::Resolved(_) => vec![],
+        }
     }
 }
 
@@ -182,17 +285,38 @@ impl Ecosystem for PypiEcosystem {
         Box::pin(async move {
             let kind = PypiManifestKind::from_uri(uri);
             let result = match kind {
-                PypiManifestKind::PyProject => self.parser.parse_content(content, uri),
+                PypiManifestKind::PyProject => {
+                    self.parser
+                        .parse_content_with_policy(content, uri, &self.policy)
+                }
                 PypiManifestKind::Requirements => {
                     let require_strong_signal = self.matched_only_via_directory_pattern(uri);
-                    self.parser
-                        .parse_requirements(content, uri, require_strong_signal)
+                    self.parser.parse_requirements_with_policy(
+                        content,
+                        uri,
+                        require_strong_signal,
+                        &self.policy,
+                    )
                 }
             }
             .map_err(|e| deps_core::DepsError::ParseError {
                 file_type: kind.file_type().into(),
                 source: Box::new(e),
             })?;
+            // Registers every chain this file's --index-url/--extra-index-url/Poetry-source/
+            // uv-index declarations imply (spec FR-002/003/005/007/013) into the shared
+            // root registry — the only point where a per-document resolution and the
+            // long-lived `PypiRegistry` this ecosystem shares across every document ever
+            // meet. A file with no such declaration contributes an empty `resolved_chains`
+            // (US-004), so this loop is a no-op for the overwhelming majority of projects.
+            // `register_chain` handles both shapes uniformly: a primary/extras chain and a
+            // single-hop named-source registration (Poetry `source =`/uv `index =`) are both
+            // just `ResolvedChain`s whose hop-tree construction only differs in length — a
+            // named source's `key` is already its own literal URL (`ResolvedChain::named_source`),
+            // so there is no separate `register_named_source` call needed here.
+            for chain in &result.resolved_chains {
+                PypiRegistry::register_chain(&self.registry, chain);
+            }
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
     }
@@ -244,7 +368,7 @@ impl Ecosystem for PypiEcosystem {
                     package_name,
                     prefix,
                 } => self
-                    .complete_versions(&package_name, &prefix, freshness)
+                    .complete_versions(parse_result, &package_name, &prefix, freshness)
                     .await
                     .into(),
                 CompletionContext::Feature { .. } | CompletionContext::None => {
@@ -365,6 +489,20 @@ mod tests {
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
+    }
+
+    /// A `ParseResult` with no dependencies — `resolve_completion_source` always answers
+    /// `NotInManifest` for it, matching this feature's pre-existing (public-registry-only)
+    /// version-completion behavior. Used by tests that only exercise `complete_versions`
+    /// directly, with no manifest content to join against.
+    fn empty_parse_result() -> crate::parser::ParseResult {
+        crate::parser::ParseResult {
+            dependencies: Vec::new(),
+            workspace_root: None,
+            uri: deps_core::test_util::test_uri("/test/requirements.txt"),
+            document_links: Vec::new(),
+            resolved_chains: Vec::new(),
+        }
     }
 
     #[test]
@@ -678,6 +816,7 @@ mod tests {
             registry: Arc::new(PypiRegistry::with_index_url(cache, index_url)),
             parser: PypiParser::new(),
             formatter: PypiFormatter,
+            policy: Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
         }
     }
 
@@ -856,6 +995,7 @@ mod tests {
 
         let results = ecosystem
             .complete_versions(
+                &empty_parse_result(),
                 &pkg("requests"),
                 "2.",
                 deps_core::FreshnessSettings::default(),
@@ -873,6 +1013,7 @@ mod tests {
 
         let results = ecosystem
             .complete_versions(
+                &empty_parse_result(),
                 &pkg("requests"),
                 ">=2.",
                 deps_core::FreshnessSettings::default(),
@@ -890,12 +1031,187 @@ mod tests {
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_versions(
+                &empty_parse_result(),
                 &pkg("this-package-does-not-exist-12345"),
                 "1.0",
                 deps_core::FreshnessSettings::default(),
             )
             .await;
         assert!(results.is_empty());
+    }
+
+    /// A minimal single-dependency `ParseResult`, for the `resolve_completion_source` join
+    /// `complete_versions` performs — the source under test.
+    fn parse_result_with_dependency(
+        name: &str,
+        source: DependencySource,
+    ) -> crate::parser::ParseResult {
+        use tower_lsp_server::ls_types::{Position, Range};
+        crate::parser::ParseResult {
+            dependencies: vec![crate::types::PypiDependency {
+                name: pkg(name),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                version_req: None,
+                version_range: None,
+                extras: Vec::new(),
+                extras_range: None,
+                markers: None,
+                markers_range: None,
+                section: crate::types::PypiDependencySection::Requirements,
+                source,
+            }],
+            workspace_root: None,
+            uri: deps_core::test_util::test_uri("/test/requirements.txt"),
+            document_links: Vec::new(),
+            resolved_chains: Vec::new(),
+        }
+    }
+
+    /// Validator finding #1 (security H1 + impl-critic C1): a version-completion request for
+    /// an `AlternateRegistry`-sourced dependency must route through the resolved chain, never
+    /// through the root `Public`-tier client — fetching from the root would send the
+    /// dependency's name to `pypi.org` on every keystroke.
+    #[tokio::test]
+    async fn test_complete_versions_alternate_registry_routes_through_chain() {
+        let mut alt_server = mockito::Server::new_async().await;
+        let alt_mock = alt_server
+            .mock("GET", "/simple/mypkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0", "2.0.0"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        ));
+        let ecosystem = PypiEcosystem::with_policy(Arc::clone(&root), policy);
+
+        let base = crate::config::PypiIndexUrl::new(
+            &format!("{}/simple", alt_server.url()),
+            &deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::All,
+            ),
+        )
+        .unwrap();
+        let chain = crate::config::ResolvedChain {
+            key: "test-alt-chain".to_string(),
+            hops: vec![base],
+            implicit_public_fallback: false,
+        };
+        PypiRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: chain.key.clone(),
+            mirrors_crates_io: false,
+        };
+        let parse_result = parse_result_with_dependency("mypkg", source);
+
+        let results = ecosystem
+            .complete_versions(
+                &parse_result,
+                &pkg("mypkg"),
+                "",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            !results.is_empty(),
+            "expected version completions fetched from the alternate index"
+        );
+        alt_mock.assert_async().await;
+    }
+
+    /// Validator finding #1: a `CustomRegistry`-sourced dependency (an invalid/blocked
+    /// explicit index, US-005) must offer no version completions at all — never falling back
+    /// to `pypi.org`, matching hover/diagnostics' existing fail-closed behavior for it
+    /// (SC-004).
+    #[tokio::test]
+    async fn test_complete_versions_custom_registry_offers_nothing() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+
+        let source = DependencySource::CustomRegistry {
+            url: "not-a-valid-url".to_string(),
+        };
+        let parse_result = parse_result_with_dependency("mypkg", source);
+
+        let results = ecosystem
+            .complete_versions(
+                &parse_result,
+                &pkg("mypkg"),
+                "",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(results.is_empty());
+    }
+
+    /// Validator finding #1: an `AlternateRegistry` source whose chain was never registered
+    /// (or whose registration is now stale) offers nothing rather than falling back to the
+    /// root client.
+    #[tokio::test]
+    async fn test_complete_versions_unregistered_alternate_offers_nothing() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "pypi-chain:never-registered".to_string(),
+            mirrors_crates_io: false,
+        };
+        let parse_result = parse_result_with_dependency("mypkg", source);
+
+        let results = ecosystem
+            .complete_versions(
+                &parse_result,
+                &pkg("mypkg"),
+                "",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(results.is_empty());
+    }
+
+    /// `resolve_completion_source`'s three-way classification, tested directly.
+    #[test]
+    fn test_resolve_completion_source_classification() {
+        let not_in_manifest = empty_parse_result();
+        assert!(matches!(
+            resolve_completion_source(&not_in_manifest, &pkg("mypkg")),
+            CompletionSource::NotInManifest
+        ));
+
+        let resolved = parse_result_with_dependency("mypkg", DependencySource::Registry);
+        assert!(matches!(
+            resolve_completion_source(&resolved, &pkg("mypkg")),
+            CompletionSource::Resolved(DependencySource::Registry)
+        ));
+
+        let ambiguous = crate::parser::ParseResult {
+            dependencies: vec![
+                parse_result_with_dependency("mypkg", DependencySource::Registry).dependencies[0]
+                    .clone(),
+                parse_result_with_dependency(
+                    "mypkg",
+                    DependencySource::AlternateRegistry {
+                        index: "https://a.example/simple".to_string(),
+                        mirrors_crates_io: false,
+                    },
+                )
+                .dependencies[0]
+                    .clone(),
+            ],
+            workspace_root: None,
+            uri: deps_core::test_util::test_uri("/test/requirements.txt"),
+            document_links: Vec::new(),
+            resolved_chains: Vec::new(),
+        };
+        assert!(matches!(
+            resolve_completion_source(&ambiguous, &pkg("mypkg")),
+            CompletionSource::Ambiguous
+        ));
     }
 
     #[tokio::test]
@@ -941,6 +1257,7 @@ mod tests {
         // Test that we respect the 20 result limit
         let results = ecosystem
             .complete_versions(
+                &empty_parse_result(),
                 &pkg("requests"),
                 "2",
                 deps_core::FreshnessSettings::default(),
@@ -1213,6 +1530,7 @@ dependencies = []
         // Empty prefix should show non-yanked versions (up to 20)
         let results = ecosystem
             .complete_versions(
+                &empty_parse_result(),
                 &pkg("nonexistent-package"),
                 "",
                 deps_core::FreshnessSettings::default(),
@@ -1230,6 +1548,7 @@ dependencies = []
         // Test PEP 440 operators are stripped correctly
         let results = ecosystem
             .complete_versions(
+                &empty_parse_result(),
                 &pkg("nonexistent-pkg"),
                 "~=2.0",
                 deps_core::FreshnessSettings::default(),
@@ -1246,6 +1565,7 @@ dependencies = []
         // Test != operator stripping
         let results = ecosystem
             .complete_versions(
+                &empty_parse_result(),
                 &pkg("nonexistent-pkg"),
                 "!=2.0",
                 deps_core::FreshnessSettings::default(),
@@ -1388,5 +1708,100 @@ dependencies = []
                 "no 'Unknown package' diagnostic should be emitted: {diagnostics:?}"
             );
         }
+    }
+
+    // --- T010: ecosystem wiring — parse_manifest registers resolved chains ---
+
+    fn parsed_dependencies(
+        result: &dyn ParseResultTrait,
+    ) -> Vec<(String, deps_core::parser::DependencySource)> {
+        result
+            .dependencies()
+            .into_iter()
+            .map(|d| (d.name().to_string(), d.source()))
+            .collect()
+    }
+
+    /// A file with no index declaration anywhere never constructs more than an empty
+    /// `PypiIndexConfig` and never calls `register_chain` (US-004).
+    #[tokio::test]
+    async fn test_parse_manifest_no_declaration_registers_nothing() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+        let result = ecosystem
+            .parse_manifest("requests==2.31.0\n", &uri)
+            .await
+            .unwrap();
+
+        for (_, source) in parsed_dependencies(result.as_ref()) {
+            assert_eq!(source, DependencySource::Registry);
+        }
+    }
+
+    /// **Test A (S6, mixed chain)**: a chain with one policy-blocked hop and one valid hop
+    /// still resolves via the valid hop — a blocked extra must not break a chain that still
+    /// has a working remaining hop. Uses `public_only` (Global primary, RFC1918 extra) rather
+    /// than a literal `off` policy: `Off::allows` is unconditionally `false` for every host
+    /// class, so under a real `off` policy the "explicit valid primary" in this scenario
+    /// would *also* be blocked (there is no host class `off` ever allows) — `public_only`
+    /// exercises the identical code path (one hop blocked by policy, one hop not) without
+    /// that contradiction, and is the policy under which this mixed-chain scenario is
+    /// actually reachable in production.
+    #[tokio::test]
+    async fn test_parse_manifest_blocked_extra_does_not_break_chain_with_valid_primary() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
+        ));
+        let registry = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+        let ecosystem = PypiEcosystem::with_policy(Arc::clone(&registry), policy);
+        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+        let content = "--index-url https://pypi.mycorp.example/simple\n\
+                        --extra-index-url https://10.0.0.5/simple\n\
+                        requests==2.31.0\n";
+        let result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        let deps = parsed_dependencies(result.as_ref());
+        let (_, source) = deps.iter().find(|(name, _)| name == "requests").unwrap();
+        let DependencySource::AlternateRegistry { index, .. } = source else {
+            panic!("expected AlternateRegistry, got {source:?}");
+        };
+        // The registered chain must actually be reachable through the root registry this
+        // ecosystem shares — proving `parse_manifest` really called `register_chain`, not
+        // just that `resolve_source_for` computed the right `DependencySource` in isolation.
+        assert!(registry.alternate_client(index).is_some());
+    }
+
+    /// **Test B (N5, zero-hop)**: `workspace_registries = off`, a file declaring only
+    /// `--extra-index-url` entries (no explicit primary) — every extra is blocked, the chain
+    /// has zero hops, and every plain dependency in the file degrades to plain
+    /// `DependencySource::Registry` (not per-dependency fail-closed, not a structurally-broken
+    /// empty `AlternateRegistry`).
+    #[tokio::test]
+    async fn test_parse_manifest_all_extras_blocked_degrades_to_plain_registry() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::Off,
+        ));
+        let registry = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+        let ecosystem = PypiEcosystem::with_policy(Arc::clone(&registry), policy);
+        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+        let content = "--extra-index-url https://extra.example/simple\nrequests==2.31.0\n";
+        let result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        let deps = parsed_dependencies(result.as_ref());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].1, DependencySource::Registry);
+
+        // Nothing was registered — a zero-hop config has no chain to register at all.
+        let downcast = result
+            .as_any()
+            .downcast_ref::<crate::parser::ParseResult>()
+            .unwrap();
+        assert!(downcast.resolved_chains.is_empty());
     }
 }

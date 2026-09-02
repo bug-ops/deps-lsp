@@ -703,6 +703,7 @@ name = "deps-pypi"
 version = "0.11.1"
 dependencies = [
  "criterion",
+ "dashmap",
  "deps-core",
  "insta",
  "mockito",
@@ -717,6 +718,7 @@ dependencies = [
  "toml-span",
  "tower-lsp-server",
  "tracing",
+ "url",
  "urlencoding",
 ]
 

@@ -102,6 +102,7 @@
 //! mypy = "^1.0"
 //! ```
 
+pub mod config;
 pub mod ecosystem;
 pub mod error;
 pub mod formatter;
@@ -113,6 +114,7 @@ mod search;
 pub mod types;
 
 // Re-export commonly used types
+pub use config::{PypiIndexConfig, PypiIndexUrl};
 pub use ecosystem::PypiEcosystem;
 pub use error::{PypiError, Result};
 pub use formatter::PypiFormatter;

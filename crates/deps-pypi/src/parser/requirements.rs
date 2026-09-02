@@ -12,9 +12,11 @@
 //! diagnostics.
 
 use super::{ParseResult, PypiParser, RequirementRef};
+use crate::config::PypiIndexConfig;
 use crate::error::Result;
 use crate::types::{PypiDependencySection, PypiDependencySource};
 use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::net_policy::RegistryAccessPolicy;
 use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Pip option tokens recognized on an option line (a line whose first
@@ -117,6 +119,35 @@ impl PypiParser {
         uri: &Uri,
         require_strong_signal: bool,
     ) -> Result<ParseResult> {
+        self.parse_requirements_with_policy(
+            content,
+            uri,
+            require_strong_signal,
+            &RegistryAccessPolicy::default(),
+        )
+    }
+
+    /// Like [`Self::parse_requirements`], but resolves `--index-url`/`--extra-index-url`
+    /// declarations (spec FR-001–FR-006) against `policy` rather than the default
+    /// (`public_only`) — the production entry point `PypiEcosystem` calls, threading through
+    /// its own live `RegistryAccessPolicy` handle.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::parse_requirements`] — never actually errs.
+    pub fn parse_requirements_with_policy(
+        &self,
+        content: &str,
+        uri: &Uri,
+        require_strong_signal: bool,
+        policy: &RegistryAccessPolicy,
+    ) -> Result<ParseResult> {
+        // Two-pass parse (fixes S2): pip applies `--index-url`/`--extra-index-url`
+        // file-wide, not from-this-line-down, so every declaration must be collected before
+        // any dependency's source is resolved — a dependency declared *before* a late
+        // `--index-url` line must still route through it.
+        let config = collect_index_config(content, policy);
+
         let line_table = LineOffsetTable::new(content);
         let mut dependencies = Vec::new();
         let mut document_links = Vec::new();
@@ -253,6 +284,13 @@ impl PypiParser {
                     {
                         strong_signal = true;
                     }
+                    // FR-002/003/005/006: a plain registry-sourced dependency routes through
+                    // this file's collected `--index-url`/`--extra-index-url` config; a
+                    // Git/Path/Url-sourced one is untouched — those have no PyPI index
+                    // routing concept.
+                    if dep.source == PypiDependencySource::Registry {
+                        dep.source = config.resolve_source_for(None);
+                    }
                     dependencies.push(dep);
                 }
                 // A length-cap rejection is "we refused to parse this",
@@ -287,8 +325,72 @@ impl PypiParser {
             workspace_root: None,
             uri: uri.clone(),
             document_links: if keep { document_links } else { Vec::new() },
+            // Any `--index-url`/`--extra-index-url` occurrence sets `strong_signal` (it's a
+            // `KNOWN_OPTIONS` entry), so `keep` is always true whenever `config` has anything
+            // to register — gating on `keep` here only ever discards chains for a prose file
+            // that was never going to register any, never a real one.
+            resolved_chains: if keep {
+                config.resolved_chains()
+            } else {
+                Vec::new()
+            },
         })
     }
+}
+
+/// Pass 1 of the two-pass parse (fixes S2): scans every physical line of `content` and
+/// collects every `--index-url <url>`/`--index-url=<url>`/`-i <url>`/`--extra-index-url
+/// <url>`/`--extra-index-url=<url>` occurrence into a [`PypiIndexConfig`], regardless of its
+/// position relative to any dependency line. Mirrors [`PypiParser::parse_requirements_with_policy`]'s
+/// main loop's comment-stripping/trimming, but does not need continuation-joining: an
+/// option's target is read from its own physical line only, matching pip's own line-oriented
+/// option grammar (a continued `--index-url` value is not a realistic real-world shape).
+fn collect_index_config(content: &str, policy: &RegistryAccessPolicy) -> PypiIndexConfig {
+    let mut config = PypiIndexConfig::new();
+
+    for (line_idx, raw_line) in content.lines().enumerate() {
+        // A leading BOM on the first physical line is not ASCII/Unicode whitespace, so
+        // `str::trim()` alone never removes it — without stripping it here the same way the
+        // main parsing loop below does, a file starting with a BOM immediately followed by
+        // `--index-url`/`--extra-index-url` would have that line's leading token read as
+        // `"\u{feff}--index-url"` (fails the `starts_with('-')` check) and silently skip the
+        // whole declaration, leaving every dependency in the file resolving against
+        // `pypi.org` instead (validator finding S1).
+        let line = if line_idx == 0 {
+            raw_line.strip_prefix('\u{feff}').unwrap_or(raw_line)
+        } else {
+            raw_line
+        };
+        let without_comment = strip_comment(line);
+        let trimmed = without_comment.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let Some(first_token) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+        if !first_token.starts_with('-') {
+            continue;
+        }
+
+        let option_name = first_token.split('=').next().unwrap_or(first_token);
+        if !matches!(option_name, "--index-url" | "-i" | "--extra-index-url") {
+            continue;
+        }
+
+        let Some((target, _offset)) = extract_option_target(first_token, trimmed) else {
+            continue;
+        };
+
+        match option_name {
+            "--index-url" | "-i" => config.set_primary(target, policy),
+            "--extra-index-url" => config.add_extra(target, policy),
+            _ => unreachable!("matched above"),
+        }
+    }
+
+    config
 }
 
 /// Extracts the target path/URL text and its byte offset within `text` for a
@@ -299,13 +401,25 @@ impl PypiParser {
 /// no target text at all (a bare `-r` with nothing after it).
 fn extract_option_target<'a>(first_token: &str, text: &'a str) -> Option<(&'a str, usize)> {
     if let Some(eq_idx) = first_token.find('=') {
-        let target = &text[eq_idx + 1..];
+        let after_eq = &text[eq_idx + 1..];
+        // Bounded to just this token's own value (validator finding S2) — a later option on
+        // the same line (e.g. `--index-url=https://x --trusted-host x`) must not be swallowed
+        // into the value, which could otherwise silently produce a mangled-but-technically-
+        // parseable URL once whitespace gets percent-encoded rather than a clean parse
+        // failure.
+        let value_end = after_eq.find(char::is_whitespace).unwrap_or(after_eq.len());
+        let target = &after_eq[..value_end];
         return (!target.is_empty()).then_some((target, eq_idx + 1));
     }
 
     let rest = &text[first_token.len()..];
     let leading_ws = rest.len() - rest.trim_start().len();
-    let target = rest.trim();
+    let after_ws = &rest[leading_ws..];
+    // Same bound as the `=`-spelling branch above — stop at the next whitespace run rather
+    // than capturing the rest of the line, which would otherwise include any further option
+    // present on the same line.
+    let value_end = after_ws.find(char::is_whitespace).unwrap_or(after_ws.len());
+    let target = &after_ws[..value_end];
     (!target.is_empty()).then_some((target, first_token.len() + leading_ws))
 }
 
@@ -375,6 +489,18 @@ mod tests {
     fn parse_strict(content: &str) -> ParseResult {
         PypiParser::new()
             .parse_requirements(content, &test_uri(), true)
+            .unwrap()
+    }
+
+    fn all_policy() -> RegistryAccessPolicy {
+        RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All)
+    }
+
+    /// Like [`parse`], but threading an explicit policy through
+    /// [`PypiParser::parse_requirements_with_policy`] — the entry point T003's own tests use.
+    fn parse_with_policy(content: &str, policy: &RegistryAccessPolicy) -> ParseResult {
+        PypiParser::new()
+            .parse_requirements_with_policy(content, &test_uri(), false, policy)
             .unwrap()
     }
 
@@ -1116,5 +1242,209 @@ mod tests {
         let content = "requests==2.31.0\n";
         let result = parse_strict(content);
         assert_eq!(result.dependencies.len(), 1);
+    }
+
+    // --- T003: --index-url / --extra-index-url / -i capture (FR-001, US-001, US-002) ---
+
+    #[test]
+    fn test_index_url_routes_every_dependency() {
+        let content = "--index-url https://pypi.mycorp.example/simple\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    /// `--index-url=<url>` (equals spelling) is captured identically to the space-separated
+    /// form.
+    #[test]
+    fn test_index_url_equals_spelling() {
+        let content = "--index-url=https://pypi.mycorp.example/simple\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    /// `-i` is pip's short alias for `--index-url`.
+    #[test]
+    fn test_short_dash_i_alias() {
+        let content = "-i https://pypi.mycorp.example/simple\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    /// S2 regression: a dependency declared *before* a late `--index-url` line still routes
+    /// through it — the two-pass parse's whole reason for existing.
+    #[test]
+    fn test_index_url_after_dependency_line_still_routes_it() {
+        let content = "requests==2.31.0\n--index-url https://pypi.mycorp.example/simple\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(
+            matches!(
+                result.dependencies[0].source,
+                PypiDependencySource::AlternateRegistry { .. }
+            ),
+            "dependency declared before a late --index-url must still resolve through it, \
+             got {:?}",
+            result.dependencies[0].source
+        );
+    }
+
+    /// FR-005(b): `--extra-index-url` alone, no explicit primary — routes through the
+    /// extras+implicit-public chain, not plain `Registry`.
+    #[test]
+    fn test_extra_index_url_alone_routes_through_chain() {
+        let content = "--extra-index-url https://extra.example/simple\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    /// FR-006: an explicit `--index-url` that fails validation fails closed
+    /// (`CustomRegistry`), not a silent `pypi.org` fallback — the #248-class regression.
+    #[test]
+    fn test_invalid_index_url_fails_closed() {
+        let content = "--index-url not-a-valid-url\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert_eq!(
+            result.dependencies[0].source,
+            PypiDependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            }
+        );
+    }
+
+    /// US-004: no `--index-url`/`--extra-index-url` anywhere -> every dependency stays plain
+    /// `Registry`, byte-identical to pre-feature behavior.
+    #[test]
+    fn test_no_index_declaration_is_plain_registry() {
+        let result = parse("requests==2.31.0\nflask>=3.0\n");
+        assert_eq!(result.dependencies.len(), 2);
+        for dep in &result.dependencies {
+            assert_eq!(dep.source, PypiDependencySource::Registry);
+        }
+    }
+
+    /// Existing `KNOWN_OPTIONS` classification (e.g. `--pre`, `--no-index`) is unaffected by
+    /// the new capture logic — an unrelated recognized option still contributes no index
+    /// routing.
+    #[test]
+    fn test_unrelated_known_option_does_not_affect_routing() {
+        let content = "--pre\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            PypiDependencySource::Registry
+        );
+    }
+
+    /// A direct URL/Git-sourced dependency is untouched by index routing — those have no
+    /// PyPI index concept.
+    #[test]
+    fn test_git_sourced_dependency_untouched_by_index_config() {
+        let content = "--index-url https://pypi.mycorp.example/simple\nname @ https://example.com/name.tar.gz\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::Url { .. }
+        ));
+    }
+
+    /// Validator finding S1: a UTF-8 BOM on the first physical line must not defeat
+    /// `--index-url` capture — without stripping it in pass 1, `"\u{feff}--index-url"` fails
+    /// the `starts_with('-')` check and the whole declaration is silently skipped.
+    #[test]
+    fn test_index_url_after_bom_on_first_line_still_captured() {
+        let content = "\u{feff}--index-url https://pypi.mycorp.example/simple\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(
+            matches!(
+                result.dependencies[0].source,
+                PypiDependencySource::AlternateRegistry { .. }
+            ),
+            "BOM must not defeat --index-url capture, got {:?}",
+            result.dependencies[0].source
+        );
+    }
+
+    /// Validator finding S2: a multi-option line must not let a later option's token(s) leak
+    /// into the earlier option's captured value — `extract_option_target` must bound the
+    /// value to the current token only, not the rest of the line. Tested directly against
+    /// `extract_option_target`, since the parsed-config-level chain key is an opaque hash
+    /// that can't itself distinguish a clean value from a mangled one.
+    #[test]
+    fn test_extract_option_target_space_separated_stops_at_next_option() {
+        let text =
+            "--index-url https://pypi.mycorp.example/simple --trusted-host pypi.mycorp.example";
+        let (target, _offset) = extract_option_target("--index-url", text).unwrap();
+        assert_eq!(target, "https://pypi.mycorp.example/simple");
+    }
+
+    /// Same bug (S2), `--opt=value` equals-spelling with a trailing option on the same line.
+    #[test]
+    fn test_extract_option_target_equals_separated_stops_at_next_option() {
+        let text =
+            "--index-url=https://pypi.mycorp.example/simple --trusted-host pypi.mycorp.example";
+        let first_token = text.split_whitespace().next().unwrap();
+        let (target, _offset) = extract_option_target(first_token, text).unwrap();
+        assert_eq!(target, "https://pypi.mycorp.example/simple");
+    }
+
+    /// End-to-end confirmation that the fix actually reaches `PypiIndexConfig`: a chain built
+    /// from a multi-option line resolves via a clean single-hop URL, not a policy-rejected
+    /// mangled one (the mangled form, once percent-encoded, is a different — and differently
+    /// classified — URL, so this would fail closed to `CustomRegistry` if the bug regressed).
+    #[test]
+    fn test_index_url_multi_option_line_does_not_swallow_trailing_options() {
+        let content = "--index-url https://pypi.mycorp.example/simple --trusted-host pypi.mycorp.example\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(
+            matches!(
+                result.dependencies[0].source,
+                PypiDependencySource::AlternateRegistry { .. }
+            ),
+            "a mangled URL would still validate as *some* URL but registers a different \
+             chain than the clean one — got {:?}",
+            result.dependencies[0].source
+        );
+    }
+
+    /// Same bug (S2), `--extra-index-url=<url>` equals-spelling with a trailing option on the
+    /// same line.
+    #[test]
+    fn test_extra_index_url_equals_multi_option_line_does_not_swallow_trailing_options() {
+        let content = "--extra-index-url=https://extra.example/simple --trusted-host extra.example\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    /// T012 test gap #12: `--extra-index-url=<url>` equals-spelling is captured identically
+    /// to the space-separated form (only `--index-url=` was previously covered).
+    #[test]
+    fn test_extra_index_url_equals_spelling() {
+        let content = "--extra-index-url=https://extra.example/simple\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert!(matches!(
+            result.dependencies[0].source,
+            PypiDependencySource::AlternateRegistry { .. }
+        ));
     }
 }
