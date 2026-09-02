@@ -7,6 +7,28 @@ use std::collections::HashMap;
 use crate::lsp_helpers::EcosystemFormatter;
 use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
 
+/// How a *bare* (no explicit pin marker) version requirement should be treated when
+/// deciding whether it denotes a single concrete version.
+///
+/// Replaces a plain boolean (critique B2 of #208's plan) because neither `true` nor
+/// `false` is correct for GitHub Actions: `AlwaysRange`/`Concrete` alone cannot express
+/// "a bare `v4` is a range, but a bare `v4.2.0` is a pin" — the two forms share no
+/// syntactic marker to distinguish them by, only the number of components present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BareRequirementPolicy {
+    /// A bare requirement is always a range under this ecosystem's own default
+    /// semantics (Cargo's implicit caret, npm/Composer's implicit caret) — never
+    /// treated as concrete without an explicit `=`/`==` pin marker.
+    AlwaysRange,
+    /// A bare requirement is concrete only when it has the shape of a full
+    /// `major.minor.patch` version ([`is_full_semver_shape`]); a partial form (a bare
+    /// major or major.minor, e.g. GitHub Actions' moving-major `v4` tag) is treated as
+    /// a range instead, since it is one.
+    ConcreteIfFullVersion,
+    /// A bare requirement is already exact (no implicit range operator).
+    Concrete,
+}
+
 /// Ecosystems whose *bare* (no explicit pin marker) version requirement is a
 /// range under that ecosystem's own default semantics — Cargo's implicit
 /// caret, npm/Composer's implicit caret. For these, [`is_concrete_version`]
@@ -18,17 +40,71 @@ use crate::{ConcreteVersion, Dependency, EcosystemId, PackageName};
 /// (`DenoFormatter::compile_requirement` compiles both through the same
 /// `node_semver::Range` npm itself uses), so it gets the same treatment here.
 ///
+/// GitHub Actions gets [`BareRequirementPolicy::ConcreteIfFullVersion`]: a bare `v4`
+/// (a moving-major tag) genuinely is a range, so it must not be queried as if it were
+/// the concrete version `4`, but a bare `v4.2.0` is a pin — see
+/// [`BareRequirementPolicy`]'s docs. A bare 40-character SHA also falls to the
+/// `None` side of this gate ([`is_full_semver_shape`] rejects it), which is the
+/// correct "honest unknown" outcome: resolving a SHA to its tag would need registry
+/// access this pure function does not have.
+///
 /// Gradle is deliberately excluded: a bare Gradle coordinate version (e.g.
 /// `"2.14.1"`) is an exact match under `GradleFormatter`'s own
 /// `version_satisfies_requirement` unless it uses the `+` dynamic-version
 /// suffix, which [`looks_like_a_single_version`] already rejects via its
 /// reject-char set — Gradle has no implicit-caret default the way
 /// Cargo/npm/Composer do.
-const fn bare_version_is_a_range(ecosystem: EcosystemId) -> bool {
-    matches!(
-        ecosystem,
-        EcosystemId::Cargo | EcosystemId::Npm | EcosystemId::Composer | EcosystemId::Deno
-    )
+const fn bare_requirement_policy(ecosystem: EcosystemId) -> BareRequirementPolicy {
+    match ecosystem {
+        EcosystemId::Cargo | EcosystemId::Npm | EcosystemId::Composer | EcosystemId::Deno => {
+            BareRequirementPolicy::AlwaysRange
+        }
+        EcosystemId::GithubActions => BareRequirementPolicy::ConcreteIfFullVersion,
+        _ => BareRequirementPolicy::Concrete,
+    }
+}
+
+/// Whether `s` has the shape of a full `major.minor.patch` version.
+///
+/// An optional leading `v`/`V`, three dot-separated all-digit components, and an
+/// optional SemVer-style prerelease/build suffix introduced by `-` or `+` (accepted,
+/// but not itself validated beyond "starts here").
+///
+/// Hand-rolled rather than pulled in via the `regex` crate: this is consulted from
+/// `bare_requirement_policy` in `deps-core`, the workspace's most-depended-on crate,
+/// which has no `regex` dependency today — equivalent to the pattern
+/// `^v?\d+\.\d+\.\d+(?:[-+].*)?$`. Shared verbatim by `deps-github-actions`'s
+/// SHA-comment-tag parsing rule so the two mechanisms can never silently diverge on
+/// what counts as a full version (e.g. `v4.2.0-beta.1` must be treated identically by
+/// both).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::is_full_semver_shape;
+///
+/// assert!(is_full_semver_shape("v4.2.0"));
+/// assert!(is_full_semver_shape("4.2.0-beta.1"));
+/// assert!(!is_full_semver_shape("v4"));
+/// assert!(!is_full_semver_shape("v4.2"));
+/// assert!(!is_full_semver_shape("not-a-version"));
+/// ```
+#[must_use]
+pub fn is_full_semver_shape(s: &str) -> bool {
+    let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    let core = match s.find(['-', '+']) {
+        Some(idx) => &s[..idx],
+        None => s,
+    };
+    let mut parts = core.split('.');
+    let (Some(major), Some(minor), Some(patch), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    [major, minor, patch]
+        .iter()
+        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Returns `true` if `s` (already stripped of any pin marker) has the shape
@@ -109,8 +185,15 @@ pub fn concrete_pin_version(requirement: &str, ecosystem: EcosystemId) -> Option
 
     match pinned.or(bracket_pinned) {
         Some(body) => looks_like_a_single_version(body).then_some(body),
-        None if bare_version_is_a_range(ecosystem) => None,
-        None => looks_like_a_single_version(trimmed).then_some(trimmed),
+        None => match bare_requirement_policy(ecosystem) {
+            BareRequirementPolicy::AlwaysRange => None,
+            BareRequirementPolicy::Concrete => {
+                looks_like_a_single_version(trimmed).then_some(trimmed)
+            }
+            BareRequirementPolicy::ConcreteIfFullVersion => {
+                is_full_semver_shape(trimmed).then_some(trimmed)
+            }
+        },
     }
 }
 
@@ -360,5 +443,71 @@ mod tests {
         assert_eq!(concrete_pin_version("^1.0", EcosystemId::Cargo), None);
         assert_eq!(concrete_pin_version("1.2.3", EcosystemId::Cargo), None);
         assert_eq!(concrete_pin_version(">=1.0,<2.0", EcosystemId::Pypi), None);
+    }
+
+    // --- is_full_semver_shape ---
+
+    #[test]
+    fn is_full_semver_shape_accepts_full_versions_with_and_without_v_prefix() {
+        assert!(is_full_semver_shape("4.2.0"));
+        assert!(is_full_semver_shape("v4.2.0"));
+        assert!(is_full_semver_shape("V4.2.0"));
+    }
+
+    #[test]
+    fn is_full_semver_shape_accepts_prerelease_and_build_suffixes() {
+        assert!(is_full_semver_shape("v4.2.0-beta.1"));
+        assert!(is_full_semver_shape("4.2.0+build.5"));
+    }
+
+    #[test]
+    fn is_full_semver_shape_rejects_partial_versions() {
+        assert!(!is_full_semver_shape("v4"));
+        assert!(!is_full_semver_shape("v4.2"));
+    }
+
+    #[test]
+    fn is_full_semver_shape_rejects_non_version_and_sha_shapes() {
+        assert!(!is_full_semver_shape("main"));
+        assert!(!is_full_semver_shape(
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+        ));
+        assert!(!is_full_semver_shape(""));
+        assert!(!is_full_semver_shape("4.2.0.1"));
+        assert!(!is_full_semver_shape("4..0"));
+    }
+
+    // --- concrete_pin_version: BareRequirementPolicy::ConcreteIfFullVersion (GitHub Actions) ---
+
+    #[test]
+    fn concrete_pin_version_github_actions_full_bare_tag_is_concrete() {
+        assert_eq!(
+            concrete_pin_version("v4.2.0", EcosystemId::GithubActions),
+            Some("v4.2.0")
+        );
+    }
+
+    #[test]
+    fn concrete_pin_version_github_actions_moving_major_tag_is_a_range() {
+        // `v4` genuinely is a range (a moving major tag) — must not be queried as if
+        // it were the concrete version `4` (critique B2).
+        assert_eq!(concrete_pin_version("v4", EcosystemId::GithubActions), None);
+        assert_eq!(
+            concrete_pin_version("v4.2", EcosystemId::GithubActions),
+            None
+        );
+    }
+
+    #[test]
+    fn concrete_pin_version_github_actions_bare_sha_is_not_concrete() {
+        // A bare SHA has no dots, so it fails `is_full_semver_shape` and falls to the
+        // honest "unknown" `None` rather than being queried as a fabricated version.
+        assert_eq!(
+            concrete_pin_version(
+                "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                EcosystemId::GithubActions
+            ),
+            None
+        );
     }
 }

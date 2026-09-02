@@ -287,27 +287,33 @@ impl EcosystemRegistry {
         self.get_for_directory_pattern(path, filename)
     }
 
-    /// Matches a file directly inside a directory whose name and file suffix
-    /// are declared by an ecosystem's
-    /// [`manifest_directory_patterns`](Ecosystem::manifest_directory_patterns)
-    /// (e.g. Python's `requirements/base.txt` layout, where the basename alone —
-    /// `base.txt` — carries no signal). This needs the full path, not just the
-    /// basename, so unlike [`manifest_patterns`](Ecosystem::manifest_patterns) it
-    /// is consulted only from [`get_for_uri`](Self::get_for_uri), never from
+    /// Matches a file whose containing directory path (tail) and file suffix are
+    /// declared by an ecosystem's
+    /// [`manifest_directory_patterns`](Ecosystem::manifest_directory_patterns) — e.g.
+    /// Python's single-segment `requirements/base.txt` layout, or GitHub Actions'
+    /// multi-segment `.github/workflows/ci.yml` layout, where the basename alone
+    /// carries no ecosystem signal. This needs the full path, not just the basename,
+    /// so unlike [`manifest_patterns`](Ecosystem::manifest_patterns) it is consulted
+    /// only from [`get_for_uri`](Self::get_for_uri), never from
     /// [`get_for_filename`](Self::get_for_filename). Mirrors
     /// [`get_for_lockfile`](Self::get_for_lockfile)'s linear scan rather than
     /// building a dedicated map — the pattern count per ecosystem is tiny.
+    ///
+    /// The scan is `DashMap`-iteration-order-dependent when two ecosystems' patterns
+    /// could both match the same path; today's registered patterns (PyPI's
+    /// `requirements`, GitHub Actions' `.github/workflows`) are disjoint, so this is
+    /// deterministic in practice, but a future third owner introducing an overlapping
+    /// pattern would need its own disambiguation, not silent first-match-wins.
     fn get_for_directory_pattern(&self, path: &str, filename: &str) -> Option<Arc<dyn Ecosystem>> {
-        let mut segments = path.rsplit('/');
-        segments.next()?; // the filename itself
-        let dir = segments.next()?;
-
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
-            let matches = ecosystem
-                .manifest_directory_patterns()
-                .iter()
-                .any(|(dir_name, suffix)| *dir_name == dir && filename.ends_with(suffix));
+            let matches =
+                ecosystem
+                    .manifest_directory_patterns()
+                    .iter()
+                    .any(|(dir_pattern, suffix)| {
+                        directory_pattern_matches(path, filename, dir_pattern, suffix)
+                    });
             if matches {
                 return Some(Arc::clone(ecosystem));
             }
@@ -439,6 +445,35 @@ fn prefix_suffix_matches(filename: &str, prefix: &str, suffix: &str) -> bool {
     filename.len() >= prefix.len() + suffix.len()
         && filename.starts_with(prefix)
         && filename.ends_with(suffix)
+}
+
+/// Whether `filename`'s containing directory path, relative to any ancestor, ends
+/// exactly at `dir_pattern` on a `/`-segment boundary, and `filename` itself ends
+/// with `suffix`.
+///
+/// `dir_pattern` may be a single segment (PyPI's `"requirements"`, matching any
+/// `.../requirements/base.txt`) or multiple segments joined by `/` (GitHub Actions'
+/// `".github/workflows"`, matching any `.../.github/workflows/ci.yml`) — the
+/// single-segment case is just the multi-segment rule applied to a one-element path,
+/// so both share this one matcher rather than PyPI keeping a separate
+/// immediate-parent-only check.
+///
+/// `path` is the full URI path (e.g. `/home/user/project/.github/workflows/ci.yml`);
+/// `filename` is its basename, passed separately so the caller (which already split
+/// it off) does not force a second basename computation here.
+fn directory_pattern_matches(path: &str, filename: &str, dir_pattern: &str, suffix: &str) -> bool {
+    if !filename.ends_with(suffix) {
+        return false;
+    }
+    let Some(dir_path) = path.strip_suffix(filename) else {
+        return false;
+    };
+    let dir_path = dir_path.trim_end_matches('/');
+    match dir_path.len().checked_sub(dir_pattern.len()) {
+        Some(0) => dir_path == dir_pattern,
+        Some(n) => dir_path.ends_with(dir_pattern) && dir_path.as_bytes()[n - 1] == b'/',
+        None => false,
+    }
 }
 
 /// Whether `filename` matches a raw [`Ecosystem::manifest_patterns`] entry (e.g.
@@ -687,6 +722,69 @@ mod tests {
             dir_patterns: &[("requirements", ".txt")],
         }));
         registry
+    }
+
+    /// D1 regression fixture: a multi-segment `manifest_directory_patterns` entry
+    /// (`.github/workflows`), the shape a single-segment directory pattern like
+    /// PyPI's `requirements` could never express.
+    fn gha_pattern_registry() -> EcosystemRegistry {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockPatternEcosystem {
+            id: "github-actions",
+            patterns: &[],
+            dir_patterns: &[
+                (".github/workflows", ".yml"),
+                (".github/workflows", ".yaml"),
+            ],
+        }));
+        registry
+    }
+
+    #[test]
+    fn test_get_for_uri_multi_segment_directory_pattern_matches_yml_and_yaml() {
+        let registry = gha_pattern_registry();
+        for path in [
+            "/repo/.github/workflows/ci.yml",
+            "/repo/.github/workflows/release.yaml",
+        ] {
+            let uri = crate::test_util::test_uri(path);
+            assert_eq!(
+                registry.get_for_uri(&uri).map(|e| e.id()),
+                Some("github-actions"),
+                "{path} should match the .github/workflows/*.y[a]ml directory pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_for_uri_multi_segment_directory_pattern_matches_nested_repo() {
+        let registry = gha_pattern_registry();
+        let uri = crate::test_util::test_uri("/home/user/a/b/.github/workflows/x.yml");
+        assert_eq!(
+            registry.get_for_uri(&uri).map(|e| e.id()),
+            Some("github-actions"),
+            "a repo nested under arbitrary ancestor directories should still match"
+        );
+    }
+
+    #[test]
+    fn test_get_for_uri_multi_segment_directory_pattern_rejects_partial_paths() {
+        let registry = gha_pattern_registry();
+        for path in [
+            // Missing the `.github` segment entirely.
+            "/repo/workflows/x.yml",
+            // Missing the `workflows` segment.
+            "/repo/.github/x.yml",
+            // A directory that merely ends with the pattern as a substring, not on a
+            // segment boundary — mirrors PyPI's `myrequirements` regression guard.
+            "/repo/my.github/workflows/x.yml",
+        ] {
+            let uri = crate::test_util::test_uri(path);
+            assert!(
+                registry.get_for_uri(&uri).is_none(),
+                "{path} should not match the .github/workflows/*.y[a]ml directory pattern"
+            );
+        }
     }
 
     #[test]

@@ -26,7 +26,7 @@ pub use diagnostics::{
     compile_requirement_unless, generate_diagnostics_from_cache, requirement_is_unsatisfiable,
 };
 pub use hover::generate_hover;
-pub use in_use_version::{concrete_pin_version, in_use_version};
+pub use in_use_version::{concrete_pin_version, in_use_version, is_full_semver_shape};
 pub use inlay_hints::generate_inlay_hints;
 
 /// Maximum number of recent versions hover's "Recent versions" section renders.
@@ -687,6 +687,31 @@ pub trait EcosystemFormatter: Send + Sync {
     /// of pinning.
     fn format_version_replacing(&self, version: &ConcreteVersion, _current: &str) -> String {
         self.format_version_for_text_edit(version)
+    }
+
+    /// Like [`format_version_replacing`](Self::format_version_replacing), but also
+    /// carries the dependency identity `version`/`current` apply to.
+    ///
+    /// Default: ignores `dep`, delegating to
+    /// [`format_version_replacing`](Self::format_version_replacing). Override when the
+    /// replacement text cannot be derived from `version`/`current` alone — e.g.
+    /// `deps-github-actions`'s SHA-pinned `uses: owner/repo@<sha> # vX.Y.Z` form, where
+    /// the new SHA for a given tag is looked up per `dep.name()` (a tag's commit SHA is
+    /// per-repository, unknowable from the tag string alone) in a registry-populated
+    /// index the formatter holds a shared handle to.
+    ///
+    /// Every shared call site that builds a version-update edit (the vulnerability and
+    /// unsatisfiable-requirement quickfixes, the REFACTOR-loop "update to X" actions, and
+    /// the "Update N outdated dependencies" code lens) already has `dep` in scope and
+    /// calls this method instead of [`format_version_replacing`](Self::format_version_replacing)
+    /// directly, so an override here is picked up on every edit path at once.
+    fn format_version_replacing_for(
+        &self,
+        _dep: &dyn Dependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        self.format_version_replacing(version, current)
     }
 
     /// Check if a version satisfies a requirement string.
@@ -2149,6 +2174,21 @@ mod tests {
         );
         assert_eq!(formatter.yanked_message(), "This version has been yanked");
         assert_eq!(formatter.yanked_label(), "*(yanked)*");
+    }
+
+    #[test]
+    fn test_format_version_replacing_for_default_delegates_to_format_version_replacing() {
+        let formatter = MockFormatter;
+        let dep = MockDep {
+            name: pkg("test-pkg"),
+            version_req: VersionReq::new("1.0.0"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        assert_eq!(
+            formatter.format_version_replacing_for(&dep, &ConcreteVersion::new("1.2.3"), "1.0.0"),
+            formatter.format_version_replacing(&ConcreteVersion::new("1.2.3"), "1.0.0")
+        );
     }
 
     #[test]

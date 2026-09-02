@@ -1169,6 +1169,7 @@ mod tests {
             ("swift", EcosystemId::Swift),
             ("nuget", EcosystemId::NuGet),
             ("deno", EcosystemId::Deno),
+            ("github-actions", EcosystemId::GithubActions),
         ] {
             let parsed: EcosystemId = id
                 .parse()
