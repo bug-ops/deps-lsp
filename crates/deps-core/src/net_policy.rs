@@ -364,6 +364,161 @@ impl Default for RegistryAccessPolicy {
     }
 }
 
+/// Why a candidate registry/index URL failed [`validate_index_url`].
+///
+/// Shared by `deps-cargo`, `deps-npm`, and `deps-pypi` — each ecosystem crate either
+/// re-exports this directly (`deps-cargo`, `deps-pypi`) or wraps it in its own
+/// `From`-mapped error enum (`deps-npm`, which needs an extra `${VAR}`-expansion variant).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::{IndexUrlError, PolicyGate, validate_index_url};
+///
+/// let err = validate_index_url("not a url", "not a url", "cargo", PolicyGate::Skip).unwrap_err();
+/// assert_eq!(err, IndexUrlError::InvalidUrl("not a url".to_string()));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IndexUrlError {
+    /// The value did not parse as a URL at all.
+    #[error("not a valid URL: {0}")]
+    InvalidUrl(String),
+    /// The URL's scheme is not `https`.
+    #[error("registry index must use https, got scheme {0:?}")]
+    NotHttps(String),
+    /// The URL carries a `user:pass@`/`user@` component.
+    #[error("registry index URL must not carry userinfo")]
+    UserInfoPresent,
+    /// The candidate's host is blocked by the current [`WorkspaceRegistryAccess`] policy.
+    #[error("registry index host class {class} blocked by registries.workspace_registries policy")]
+    BlockedHost {
+        /// The blocked host's classification.
+        class: HostClass,
+    },
+}
+
+/// Whether [`validate_index_url`] must check a candidate's host against a live
+/// [`RegistryAccessPolicy`].
+///
+/// An explicit enum, not `Option`/`bool`: a trusted-provenance candidate (e.g. `deps-cargo`'s
+/// `$CARGO_HOME`-sourced `IndexTrust::Trusted`) skipping the policy check entirely is a
+/// security-relevant decision each call site must make visibly, not something that can be
+/// expressed by a `None` a reader might mistake for "no policy configured yet".
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, WorkspaceRegistryAccess, validate_index_url};
+///
+/// let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off);
+/// assert!(
+///     validate_index_url("https://index.mycorp.dev", "https://index.mycorp.dev", "cargo", PolicyGate::Skip)
+///         .is_ok()
+/// );
+/// assert!(
+///     validate_index_url(
+///         "https://index.mycorp.dev",
+///         "https://index.mycorp.dev",
+///         "cargo",
+///         PolicyGate::Enforce(&policy)
+///     )
+///     .is_err()
+/// );
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub enum PolicyGate<'a> {
+    /// Skip the policy check entirely — the candidate's provenance is already trusted (e.g.
+    /// the user's own `$CARGO_HOME` configuration), not something a cloned repository
+    /// controls.
+    Skip,
+    /// Check the candidate's host against `policy` — the candidate's provenance is a
+    /// workspace file, which an opened repository fully controls.
+    Enforce(&'a RegistryAccessPolicy),
+}
+
+/// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`) with an `http`
+/// scheme — the shape every `mockito::Server` binds to.
+///
+/// Only compiled into test builds (see [`validate_index_url`]): a non-loopback host must
+/// never be allowed to bypass the https requirement, even under `cfg(test)`/`test-util`.
+#[cfg(any(test, feature = "test-util"))]
+fn is_loopback_url(url: &url::Url) -> bool {
+    url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+}
+
+/// Validates a candidate registry/index URL: `https` scheme, no userinfo, and — when `gate`
+/// is [`PolicyGate::Enforce`] — a host the live [`RegistryAccessPolicy`] allows.
+///
+/// `candidate` is the string actually parsed (e.g. `deps-npm`'s already `${VAR}`-expanded
+/// value); `raw_for_log` is what an error payload and the blocked-host `tracing::warn!`
+/// name instead — the pre-expansion `.npmrc` value for `deps-npm`, or the same string as
+/// `candidate` for `deps-cargo`/`deps-pypi` (neither has an expansion step). This split
+/// keeps an environment variable's expanded value out of any log line or error a caller
+/// might surface in a diagnostic. `ecosystem` is carried on the blocked-host warning only,
+/// to tell `deps-cargo`/`deps-npm`/`deps-pypi` call sites apart in the logs.
+///
+/// The check order — parse, then https, then userinfo, then the policy gate — is
+/// load-bearing: userinfo is rejected *before* the policy gate runs, which is what lets a
+/// caller safely log `raw_for_log` unredacted on a [`IndexUrlError::BlockedHost`] warning,
+/// since a userinfo-bearing candidate can never reach that point. Do not reorder.
+///
+/// # Errors
+///
+/// Returns [`IndexUrlError`] if `candidate` does not parse as a URL, is not `https` (outside
+/// the `cfg(test)`/`test-util` loopback carve-out), carries a userinfo component, or (under
+/// [`PolicyGate::Enforce`]) resolves to a host class the current policy blocks.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::{PolicyGate, validate_index_url};
+///
+/// let url = validate_index_url(
+///     "https://index.mycorp.dev",
+///     "https://index.mycorp.dev",
+///     "cargo",
+///     PolicyGate::Skip,
+/// )
+/// .unwrap();
+/// assert_eq!(url.as_str(), "https://index.mycorp.dev/");
+///
+/// assert!(
+///     validate_index_url("http://example.com", "http://example.com", "cargo", PolicyGate::Skip)
+///         .is_err()
+/// );
+/// ```
+pub fn validate_index_url(
+    candidate: &str,
+    raw_for_log: &str,
+    ecosystem: &'static str,
+    gate: PolicyGate<'_>,
+) -> Result<url::Url, IndexUrlError> {
+    let url = url::Url::parse(candidate)
+        .map_err(|_| IndexUrlError::InvalidUrl(raw_for_log.to_string()))?;
+    let is_https = url.scheme() == "https";
+    #[cfg(any(test, feature = "test-util"))]
+    let is_https = is_https || is_loopback_url(&url);
+    if !is_https {
+        return Err(IndexUrlError::NotHttps(url.scheme().to_string()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(IndexUrlError::UserInfoPresent);
+    }
+    if let PolicyGate::Enforce(policy) = gate {
+        let class = classify_host(&url);
+        if !policy.get().allows(class) {
+            tracing::warn!(
+                url = raw_for_log,
+                ?class,
+                ecosystem,
+                "workspace-declared registry index host blocked by registries.workspace_registries policy"
+            );
+            return Err(IndexUrlError::BlockedHost { class });
+        }
+    }
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +750,48 @@ mod tests {
         assert_eq!(policy.get(), WorkspaceRegistryAccess::All);
         policy.set(WorkspaceRegistryAccess::Off);
         assert_eq!(policy.get(), WorkspaceRegistryAccess::Off);
+    }
+
+    /// Load-bearing check order: userinfo must be rejected *before* the policy gate runs —
+    /// this is what lets a caller safely log `raw_for_log` unredacted on a `BlockedHost`
+    /// warning, since a userinfo-bearing candidate can never reach that point. This URL's
+    /// host (`169.254.169.254`) would also fail as `BlockedHost` under `Off`, so a
+    /// `UserInfoPresent` result here proves the order, not just that one check fires.
+    #[test]
+    fn test_validate_index_url_userinfo_rejected_before_policy_gate() {
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off);
+        let result = validate_index_url(
+            "https://user:pass@169.254.169.254/",
+            "https://user:pass@169.254.169.254/",
+            "cargo",
+            PolicyGate::Enforce(&policy),
+        );
+        assert_eq!(result, Err(IndexUrlError::UserInfoPresent));
+    }
+
+    /// `PolicyGate::Skip` bypasses the policy check entirely — the same candidate accepted
+    /// under `Skip` is rejected under `Enforce` against a policy that blocks its host class,
+    /// proving the gate is truly skipped rather than defaulting to a permissive policy.
+    #[test]
+    fn test_validate_index_url_policy_gate_skip_vs_enforce() {
+        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off);
+        assert!(
+            validate_index_url(
+                "https://169.254.169.254/",
+                "https://169.254.169.254/",
+                "cargo",
+                PolicyGate::Skip
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_index_url(
+                "https://169.254.169.254/",
+                "https://169.254.169.254/",
+                "cargo",
+                PolicyGate::Enforce(&policy)
+            ),
+            Err(IndexUrlError::BlockedHost { .. })
+        ));
     }
 }

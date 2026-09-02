@@ -19,10 +19,13 @@ workspace = true
 #
 # Security note: enabling this feature also relaxes `cache::ensure_https`
 # to allow plain HTTP for loopback hosts (`127.0.0.1`/`localhost`/`::1`),
-# needed for cross-crate `mockito` tests. This feature is publicly
-# enablable by any downstream Cargo.toml (this crate has `publish = true`),
-# so it must never be enabled in a shipped/release build — see
-# `cache::ensure_https` for the full contract.
+# needed for cross-crate `mockito` tests. It also relaxes
+# `net_policy::validate_index_url`'s identical https-only gate the same way —
+# the shared chokepoint `deps-cargo`/`deps-npm`/`deps-pypi` all validate their
+# registry/index URLs through. This feature is publicly enablable by any
+# downstream Cargo.toml (this crate has `publish = true`), so it must never
+# be enabled in a shipped/release build — see `cache::ensure_https` and
+# `net_policy::validate_index_url` for the full contract.
 test-util = ["dep:tracing-subscriber", "dep:urlencoding"]
 
 [dependencies]

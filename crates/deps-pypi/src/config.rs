@@ -34,40 +34,14 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use deps_core::net_policy::{HostClass, RegistryAccessPolicy, classify_host};
+use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, validate_index_url};
 use deps_core::parser::DependencySource;
 
-/// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`) with an `http`
-/// scheme — the shape every `mockito::Server` binds to.
-///
-/// Only compiled into test builds — see `deps_npm::config::is_loopback_url`'s identical
-/// rationale, which this mirrors exactly.
-#[cfg(any(test, feature = "test-util"))]
-fn is_loopback_url(url: &url::Url) -> bool {
-    url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
-}
-
 /// Why a candidate index URL failed [`PypiIndexUrl::new`]'s validation.
-#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
-pub enum PypiIndexUrlError {
-    /// The value did not parse as a URL at all.
-    #[error("not a valid URL: {0}")]
-    InvalidUrl(String),
-    /// The URL's scheme is not `https` (the sole carve-out is a `cfg(test)`/`test-util`-only
-    /// `http` loopback host — see [`PypiIndexUrl::new`]).
-    #[error("index URL must use https, got scheme {0:?}")]
-    NotHttps(String),
-    /// The URL carries a `user:pass@`/`user@` component.
-    #[error("index URL must not carry userinfo")]
-    UserInfoPresent,
-    /// The candidate's host is blocked by the current
-    /// [`deps_core::net_policy::WorkspaceRegistryAccess`] policy.
-    #[error("index host class {class} blocked by registries.workspace_registries policy")]
-    BlockedHost {
-        /// The blocked host's classification.
-        class: HostClass,
-    },
-}
+///
+/// An alias of the shared [`deps_core::net_policy::IndexUrlError`] — see that type's docs
+/// for the variants and their wording.
+pub use deps_core::net_policy::IndexUrlError as PypiIndexUrlError;
 
 /// A validated, normalized, https-only PyPI-protocol index URL with no embedded userinfo.
 ///
@@ -102,26 +76,7 @@ impl PypiIndexUrl {
     /// assert!(PypiIndexUrl::new("https://user:pass@pypi.mycorp.example", &policy).is_err());
     /// ```
     pub fn new(raw: &str, policy: &RegistryAccessPolicy) -> Result<Self, PypiIndexUrlError> {
-        let url =
-            url::Url::parse(raw).map_err(|_| PypiIndexUrlError::InvalidUrl(raw.to_string()))?;
-        let is_https = url.scheme() == "https";
-        #[cfg(any(test, feature = "test-util"))]
-        let is_https = is_https || is_loopback_url(&url);
-        if !is_https {
-            return Err(PypiIndexUrlError::NotHttps(url.scheme().to_string()));
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(PypiIndexUrlError::UserInfoPresent);
-        }
-        let class = classify_host(&url);
-        if !policy.get().allows(class) {
-            tracing::warn!(
-                url = raw,
-                ?class,
-                "workspace-declared PyPI index host blocked by registries.workspace_registries policy"
-            );
-            return Err(PypiIndexUrlError::BlockedHost { class });
-        }
+        let url = validate_index_url(raw, raw, "pypi", PolicyGate::Enforce(policy))?;
         let normalized = url.as_str().trim_end_matches('/').to_string();
         Ok(Self { normalized })
     }

@@ -37,23 +37,10 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use deps_core::PackageName;
-use deps_core::net_policy::{HostClass, RegistryAccessPolicy, classify_host};
+use deps_core::net_policy::{
+    HostClass, IndexUrlError, PolicyGate, RegistryAccessPolicy, validate_index_url,
+};
 use deps_core::parser::DependencySource;
-
-/// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`) with an `http`
-/// scheme — the shape every `mockito::Server` binds to.
-///
-/// Only compiled into test builds: a non-loopback host must never be allowed to bypass the
-/// https requirement, even under `cfg(test)`/`test-util` — mirrors `deps_cargo::config`'s
-/// identical `is_loopback_url` and `deps_core::cache`'s `is_loopback_host` precedent. A
-/// release build has no `http` exception at all: `HttpCache::ensure_https` guards every send
-/// site on the workspace-transport path regardless, so accepting `http://localhost` here in
-/// a release build would only trade FR-006's clean fail-closed `CustomRegistry` + warning for
-/// an opaque `CacheError` at fetch time.
-#[cfg(any(test, feature = "test-util"))]
-fn is_loopback_url(url: &url::Url) -> bool {
-    url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
-}
 
 /// Why a candidate `registry=`/`@scope:registry=` value failed [`NpmRegistryIndex::new`]'s
 /// validation, or why expansion of a `${VAR}` placeholder inside it failed (FR-007).
@@ -81,6 +68,17 @@ pub enum NpmRegistryIndexError {
     /// `${VAR}`-containing string.
     #[error("environment variable {0:?} referenced in registry value is not set")]
     UndefinedEnvVar(String),
+}
+
+impl From<IndexUrlError> for NpmRegistryIndexError {
+    fn from(error: IndexUrlError) -> Self {
+        match error {
+            IndexUrlError::InvalidUrl(raw) => Self::InvalidUrl(raw),
+            IndexUrlError::NotHttps(scheme) => Self::NotHttps(scheme),
+            IndexUrlError::UserInfoPresent => Self::UserInfoPresent,
+            IndexUrlError::BlockedHost { class } => Self::BlockedHost { class },
+        }
+    }
 }
 
 /// A validated, normalized npm registry index URL.
@@ -137,26 +135,7 @@ impl NpmRegistryIndex {
         raw_for_log: &str,
         policy: &RegistryAccessPolicy,
     ) -> Result<Self, NpmRegistryIndexError> {
-        let url = url::Url::parse(expanded)
-            .map_err(|_| NpmRegistryIndexError::InvalidUrl(raw_for_log.to_string()))?;
-        let is_https = url.scheme() == "https";
-        #[cfg(any(test, feature = "test-util"))]
-        let is_https = is_https || is_loopback_url(&url);
-        if !is_https {
-            return Err(NpmRegistryIndexError::NotHttps(url.scheme().to_string()));
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(NpmRegistryIndexError::UserInfoPresent);
-        }
-        let class = classify_host(&url);
-        if !policy.get().allows(class) {
-            tracing::warn!(
-                url = raw_for_log,
-                ?class,
-                "workspace-declared npm registry index host blocked by registries.workspace_registries policy"
-            );
-            return Err(NpmRegistryIndexError::BlockedHost { class });
-        }
+        let url = validate_index_url(expanded, raw_for_log, "npm", PolicyGate::Enforce(policy))?;
         let normalized = url.as_str().trim_end_matches('/').to_string();
         Ok(Self { normalized })
     }
