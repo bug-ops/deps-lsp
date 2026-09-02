@@ -16,6 +16,7 @@ pub mod ecosystem;
 pub mod ecosystem_registry;
 pub mod error;
 pub mod freshness;
+pub mod github;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;

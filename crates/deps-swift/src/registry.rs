@@ -6,9 +6,10 @@
 use crate::types::{SwiftPackage, SwiftVersion};
 use bytes::Bytes;
 use dashmap::DashMap;
-use deps_core::{
-    DepsError, HttpCache, PublishTime, Result, is_dot_segment, lsp_helpers::warn_rejected_value,
+use deps_core::github::{
+    GithubTag, GithubTagsClient, github_rate_limit_error, paginate_tags, validate_owner_repo,
 };
+use deps_core::{DepsError, HttpCache, PublishTime, Result};
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
@@ -16,38 +17,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const GITHUB_API: &str = "https://api.github.com";
-
 /// Display name for the registry backing Swift package version lookups,
 /// used in not-found and API-response error messages.
 pub const REGISTRY: &str = "GitHub";
-
-/// Maximum number of `tags` pages fetched per package (100 tags/page).
-///
-/// This is a **safety ceiling, not the correctness mechanism** — the loop
-/// already stops as soon as a page comes back with fewer than 100 entries
-/// (`page_has_more`), which is GitHub's documented signal that no further
-/// page exists. Every real repository terminates via that signal well
-/// before this bound is reached.
-///
-/// The bound exists only to protect against a pathological repo with an
-/// unbounded number of tags. It must stay high enough that it never
-/// truncates a real repository's tag list, because GitHub returns tags in
-/// **lexicographic, not semver, order** — verified live on
-/// `firebase/firebase-ios-sdk` (1131 tags): page 1 is headed by `v8.15.0`
-/// (a `v`-prefixed tag lexicographically outranks unprefixed ones), pages
-/// 2-9 are entirely unrelated `DataTransport-*`/`Core-*` subproject tags
-/// with zero semver-parseable entries, and the real `11.x`/`12.x` releases
-/// only appear around pages 10-11. A low page cap (previously 5, i.e. 500
-/// tags) silently dropped those newer tags out of `available` entirely —
-/// no amount of sorting the *fetched* subset fixes that, since the highest
-/// real versions were never fetched at all. This produced two distinct
-/// bugs: an ordinary pin like `from: "11.0.0"` read as "unsatisfiable",
-/// and hover/completion/update-all reported the stale `8.15.0` as
-/// `latest`. 3000 tags (30 pages) comfortably covers this repository and
-/// any other known real-world package with room to spare, while still
-/// bounding worst-case request count for an adversarial input.
-const MAX_TAG_PAGES: u32 = 30;
 
 /// TTL for a successful `/releases` memo entry (§3.1 of #223's plan). Chosen so a
 /// newly published release surfaces within a coffee break while keeping the
@@ -76,34 +48,6 @@ const RELEASE_DATES_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 /// Comfortably above the distinct-Swift-package count of any realistic workspace
 /// while bounding the memo at a few hundred KB (#223 M7).
 const MAX_MEMO_ENTRIES: usize = 256;
-
-/// Validates that `name` is a valid `owner/repo` GitHub identifier.
-///
-/// Accepts characters `[a-zA-Z0-9._-]` in both owner and repo segments, and additionally
-/// rejects a segment that is exactly `.` or `..` (see [`is_dot_segment`]): both characters
-/// are allowed by the charset regex alone, but a segment of exactly `.`/`..` is not
-/// neutralized by URL construction the way other charset-allowed characters are — `name`
-/// reaches `get_versions`'s tags fetch and `release_dates`'s releases fetch
-/// (`{api_base}/repos/{name}/...`) as a bare path segment, so a repo half of `..` retargets
-/// the request one path segment up (#357), mirroring the same class of gap `deps-npm` and
-/// `deps-dart` already close for their own bare-segment registry fetches.
-///
-/// Delegates the shape check to [`crate::is_valid_github_identity`], shared with
-/// `formatter::is_valid_owner_repo`'s display-URL gate, so the two can't drift apart on
-/// what counts as valid.
-fn validate_owner_repo(name: &str) -> Result<()> {
-    if crate::is_valid_github_identity(name) {
-        return Ok(());
-    }
-    if let Some((owner, repo)) = name.split_once('/')
-        && (is_dot_segment(owner) || is_dot_segment(repo))
-    {
-        warn_rejected_value("is_dot_segment", "GitHub owner/repo request URL", name);
-    }
-    Err(DepsError::InvalidUri(format!(
-        "invalid owner/repo format: '{name}'"
-    )))
-}
 
 /// One memoized `/releases` lookup for a single package.
 ///
@@ -144,21 +88,15 @@ fn evict_if_full(map: &DashMap<String, ReleaseDatesEntry>) {
 /// Client for fetching Swift package information from GitHub.
 #[derive(Clone)]
 pub struct SwiftRegistry {
-    cache: Arc<HttpCache>,
-    auth_headers: Vec<(reqwest::header::HeaderName, String)>,
-    has_token: bool,
+    github: GithubTagsClient,
     /// Per-package memoized GitHub Release publish times (#223 §3.1). `Arc` because
     /// `SwiftRegistry` is `Clone` and clones must share one memo, the same reason
-    /// `cache` is an `Arc`.
+    /// `github`'s cache is an `Arc`.
     release_dates: Arc<DashMap<String, ReleaseDatesEntry>>,
     /// Set once the first skipped release-date enrichment (no `GITHUB_TOKEN`) has
     /// been logged, so the informational message fires at most once per process
     /// rather than once per hover/completion/document-open (#223).
     enrichment_skip_logged: Arc<AtomicBool>,
-    /// Base URL for the GitHub API, `GITHUB_API` in production. A field rather than
-    /// always reading the constant so tests can point it at a `mockito` server —
-    /// `get_versions`/`release_dates`/`search` build every request URL from it.
-    api_base: String,
 }
 
 impl SwiftRegistry {
@@ -167,30 +105,11 @@ impl SwiftRegistry {
     /// Reads `GITHUB_TOKEN` from environment for authenticated requests
     /// (5000 req/h vs 60 req/h unauthenticated).
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
-        let has_token = token.is_some();
-        let auth_headers = token
-            .map(|token| {
-                tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
-                vec![(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))]
-            })
-            .unwrap_or_default();
-
         Self {
-            cache,
-            auth_headers,
-            has_token,
+            github: GithubTagsClient::new(cache),
             release_dates: Arc::new(DashMap::new()),
             enrichment_skip_logged: Arc::new(AtomicBool::new(false)),
-            api_base: GITHUB_API.to_string(),
         }
-    }
-
-    fn headers(&self) -> Vec<(reqwest::header::HeaderName, &str)> {
-        self.auth_headers
-            .iter()
-            .map(|(k, v): &(reqwest::header::HeaderName, String)| (k.clone(), v.as_str()))
-            .collect()
     }
 
     /// Fetches all semver-tagged versions for a package.
@@ -201,19 +120,13 @@ impl SwiftRegistry {
     /// pages exist).
     pub async fn get_versions(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         validate_owner_repo(name)?;
-        let tags = paginate_tags(name, |page| async move {
-            let url = format!(
-                "{}/repos/{name}/tags?per_page=100&page={page}",
-                self.api_base
-            );
-            self.cache
-                .get_cached_with_headers(&url, &self.headers())
+        let tags = paginate_tags("Swift", name, |page| async move {
+            self.github
+                .fetch_tags_page(name, page)
                 .await
                 .map_err(|e| match &e {
-                    DepsError::HttpStatus { status: 403, .. } if !self.has_token => {
-                        DepsError::CacheError(
-                            "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)".into(),
-                        )
+                    DepsError::HttpStatus { status: 403, .. } if !self.github.has_token() => {
+                        github_rate_limit_error()
                     }
                     DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
                         package: name.to_string(),
@@ -270,7 +183,7 @@ impl SwiftRegistry {
             return Arc::clone(&entry.dates);
         }
 
-        if !self.has_token {
+        if !self.github.has_token() {
             if !self.enrichment_skip_logged.swap(true, Ordering::Relaxed) {
                 tracing::info!(
                     "GITHUB_TOKEN not set — Swift release dates are unavailable; hover and \
@@ -280,10 +193,15 @@ impl SwiftRegistry {
             return Arc::new(HashMap::new());
         }
 
-        let url = format!("{}/repos/{name}/releases?per_page=100", self.api_base);
+        let url = format!(
+            "{}/repos/{name}/releases?per_page=100",
+            self.github.api_base()
+        );
         let fetch_result = tokio::time::timeout(
             RELEASE_DATES_FETCH_TIMEOUT,
-            self.cache.get_cached_with_headers(&url, &self.headers()),
+            self.github
+                .cache()
+                .get_cached_with_headers(&url, &self.github.headers()),
         )
         .await;
         match &fetch_result {
@@ -338,95 +256,16 @@ impl SwiftRegistry {
     /// N+1 API calls per search result.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SwiftPackage>> {
         let url = format!(
-            "{GITHUB_API}/search/repositories?q={}+language:swift&per_page={limit}",
+            "{}/search/repositories?q={}+language:swift&per_page={limit}",
+            deps_core::github::GITHUB_API,
             urlencoding::encode(query)
         );
         let data = self
-            .cache
-            .get_cached_with_headers(&url, &self.headers())
+            .github
+            .cache()
+            .get_cached_with_headers(&url, &self.github.headers())
             .await?;
         parse_search_response(&data)
-    }
-}
-
-/// GitHub tags API response item.
-#[derive(Deserialize)]
-struct GithubTag {
-    name: String,
-}
-
-/// GitHub API error response (rate limit, not found, etc.).
-#[derive(Deserialize)]
-struct GithubErrorResponse {
-    message: String,
-}
-
-/// Returns `true` when a fetched page came back full (`per_page=100`
-/// entries), meaning a subsequent page may exist and should be fetched too.
-/// A page with fewer entries is necessarily the last one.
-const fn page_has_more(page_len: usize) -> bool {
-    page_len >= 100
-}
-
-/// Logs a warning when tag pagination for `name` stops at [`MAX_TAG_PAGES`]
-/// while GitHub still had more pages available (`page_has_more(page_len)`).
-///
-/// Without this, hitting the safety ceiling on a pathological repo is
-/// indistinguishable in logs from "the repo genuinely has no matching
-/// version" — this makes truncation diagnosable.
-fn warn_if_pagination_truncated(name: &str, page: u32, page_len: usize) {
-    if page == MAX_TAG_PAGES && page_has_more(page_len) {
-        tracing::warn!(
-            package = name,
-            pages_fetched = MAX_TAG_PAGES,
-            "Swift tags pagination for '{name}' stopped at the {MAX_TAG_PAGES}-page cap while \
-             GitHub reported more pages available; the fetched version list may be truncated"
-        );
-    }
-}
-
-/// Drives the GitHub tags pagination loop, fetching pages via `fetch_page`
-/// until a partial page is seen or [`MAX_TAG_PAGES`] is reached.
-///
-/// Extracted out of [`SwiftRegistry::get_versions`] so tests can inject a
-/// fake `fetch_page` and exercise the real loop — including the
-/// [`warn_if_pagination_truncated`] call site — without a live GitHub API.
-async fn paginate_tags<F, Fut>(name: &str, mut fetch_page: F) -> Result<Vec<GithubTag>>
-where
-    F: FnMut(u32) -> Fut,
-    Fut: std::future::Future<Output = Result<Bytes>>,
-{
-    let mut tags = Vec::new();
-    for page in 1..=MAX_TAG_PAGES {
-        let data = fetch_page(page).await?;
-        let page_tags = parse_tags_page(&data)?;
-        let page_len = page_tags.len();
-        tags.extend(page_tags);
-        if !page_has_more(page_len) {
-            break;
-        }
-        warn_if_pagination_truncated(name, page, page_len);
-    }
-    Ok(tags)
-}
-
-/// Parses a single GitHub tags API page into raw tag entries.
-///
-/// GitHub returns an error object instead of array when rate-limited or on
-/// other errors. Detect this and return a descriptive error.
-fn parse_tags_page(data: &[u8]) -> Result<Vec<GithubTag>> {
-    match deps_core::parse_json_checked(data) {
-        Ok(tags) => Ok(tags),
-        Err(_) => {
-            if let Ok(err) = deps_core::parse_json_checked::<GithubErrorResponse>(data) {
-                Err(DepsError::CacheError(format!(
-                    "GitHub API error: {}",
-                    err.message
-                )))
-            } else {
-                Ok(vec![])
-            }
-        }
     }
 }
 
@@ -544,11 +383,12 @@ fn attach_publish_times(versions: &mut [SwiftVersion], dates: &HashMap<String, P
 }
 
 /// Parses a single GitHub tags API response page into a `SwiftVersion`
-/// list. Test-only convenience wrapper composing [`parse_tags_page`] and
-/// [`tags_to_versions`] for single-page fixtures.
+/// list. Test-only convenience wrapper composing
+/// [`deps_core::github::parse_tags_page`] and [`tags_to_versions`] for
+/// single-page fixtures.
 #[cfg(test)]
 fn parse_tags_response(data: &[u8]) -> Result<Vec<SwiftVersion>> {
-    Ok(tags_to_versions(parse_tags_page(data)?))
+    Ok(tags_to_versions(deps_core::github::parse_tags_page(data)?))
 }
 
 /// GitHub search API response.
@@ -678,6 +518,7 @@ impl deps_core::Registry for SwiftRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::test_util::capture_tracing_output_async;
 
     #[test]
     fn test_parse_tags_response() {
@@ -800,42 +641,12 @@ mod tests {
         assert_eq!(versions[0].version, "1.2.3");
     }
 
-    #[test]
-    fn test_validate_owner_repo_invalid_format_message() {
-        let err = validate_owner_repo("no-slash").unwrap_err();
-        assert!(err.to_string().contains("invalid owner/repo format"));
-    }
-
-    #[test]
-    fn test_validate_owner_repo_valid() {
-        assert!(validate_owner_repo("apple/swift-nio").is_ok());
-        assert!(validate_owner_repo("foo/bar").is_ok());
-        assert!(validate_owner_repo("org.name/repo_name-v2").is_ok());
-    }
-
-    #[test]
-    fn test_validate_owner_repo_invalid() {
-        assert!(validate_owner_repo("no-slash").is_err());
-        assert!(validate_owner_repo("../../etc/passwd").is_err());
-        assert!(validate_owner_repo("owner/repo/extra").is_err());
-        assert!(validate_owner_repo("owner/ repo").is_err());
-        assert!(validate_owner_repo("").is_err());
-    }
-
-    #[test]
-    fn test_validate_owner_repo_rejects_dot_segment_repo() {
-        // Regression for #357: the charset regex alone allows `.`, so a repo half of
-        // exactly `..` previously passed — retargeting the tags/releases fetch one path
-        // segment up (`{api_base}/repos/{owner}/../releases` -> `{api_base}/repos/releases`).
-        assert!(validate_owner_repo("owner/..").is_err());
-        assert!(validate_owner_repo("owner/.").is_err());
-    }
-
-    #[test]
-    fn test_validate_owner_repo_rejects_dot_segment_owner() {
-        assert!(validate_owner_repo("../repo").is_err());
-        assert!(validate_owner_repo("./repo").is_err());
-    }
+    // `validate_owner_repo`, `page_has_more`, `warn_if_pagination_truncated`,
+    // `paginate_tags`, and `parse_tags_page` are now shared with `deps-github-actions`
+    // via `deps_core::github` (#472); their unit tests moved there. This module keeps
+    // only tests for Swift-specific logic (`tags_to_versions`, `normalize_tag`,
+    // release-date handling) and end-to-end coverage that exercises the shared
+    // primitives through `SwiftRegistry`'s own public API.
 
     #[tokio::test]
     #[ignore]
@@ -847,137 +658,13 @@ mod tests {
     }
 
     #[test]
-    fn test_page_has_more_full_page_continues() {
-        assert!(page_has_more(100));
-    }
-
-    #[test]
-    fn test_page_has_more_partial_page_stops() {
-        assert!(!page_has_more(99));
-        assert!(!page_has_more(0));
-    }
-
-    // `capture_tracing_output`/`capture_tracing_output_async` (originally added here for
-    // #357) now live in `deps_core::test_util`, shared with every other crate's
-    // `warn_rejected_value`-firing tests (#380 review).
-    use deps_core::test_util::{capture_tracing_output, capture_tracing_output_async};
-
-    #[test]
-    fn test_pagination_warns_when_truncated_at_cap() {
-        let output = capture_tracing_output(|| {
-            warn_if_pagination_truncated("owner/repo", MAX_TAG_PAGES, 100);
-        });
-        assert!(output.contains("owner/repo"), "output was: {output}");
-        assert!(output.contains("cap"), "output was: {output}");
-    }
-
-    #[test]
-    fn test_pagination_silent_when_under_cap() {
-        let output = capture_tracing_output(|| {
-            warn_if_pagination_truncated("owner/repo", MAX_TAG_PAGES - 1, 100);
-        });
-        assert!(output.is_empty(), "output was: {output}");
-    }
-
-    #[test]
-    fn test_pagination_silent_when_last_page_at_cap_is_partial() {
-        let output = capture_tracing_output(|| {
-            warn_if_pagination_truncated("owner/repo", MAX_TAG_PAGES, 42);
-        });
-        assert!(output.is_empty(), "output was: {output}");
-    }
-
-    /// Builds a JSON tags page with `count` uniquely named entries.
-    fn tags_page_json(count: usize) -> Bytes {
-        let entries: Vec<String> = (0..count)
-            .map(|i| format!(r#"{{"name":"tag{i}"}}"#))
-            .collect();
-        Bytes::from(format!("[{}]", entries.join(",")))
-    }
-
-    /// Drives [`paginate_tags`] with a full page followed by a partial page,
-    /// then a third page that must never be fetched. This exercises the
-    /// real loop (accumulation + `break` on a partial page) end-to-end,
-    /// unlike the tests above which only call [`warn_if_pagination_truncated`]
-    /// directly — a reordered or dropped call site inside the loop, or a
-    /// broken `break` condition, would surface here as a wrong tag count,
-    /// an unexpected third fetch, or a spurious warning.
-    #[tokio::test]
-    async fn test_paginate_tags_stops_after_partial_page() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        let calls = AtomicU32::new(0);
-        let mut tags = Vec::new();
-        let output = capture_tracing_output_async(async {
-            let result = paginate_tags("owner/repo", |page| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    match page {
-                        1 => Ok(tags_page_json(100)),
-                        2 => Ok(tags_page_json(42)),
-                        _ => panic!("page {page} must not be fetched after a partial page"),
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            tags = result;
-        })
-        .await;
-
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "must stop after the partial page 2"
-        );
-        assert_eq!(tags.len(), 142);
-        assert!(
-            output.is_empty(),
-            "must not warn below the page cap: {output}"
-        );
-    }
-
-    /// Drives [`paginate_tags`] to the [`MAX_TAG_PAGES`] cap with every page
-    /// full, so the loop exits via the `for` bound rather than the `break`.
-    /// Only the real call site inside the loop can produce this warning —
-    /// dropping it, or moving it outside the loop where `page`/`page_len`
-    /// are unavailable, fails this test where it would not fail a test of
-    /// `warn_if_pagination_truncated` in isolation.
-    #[tokio::test]
-    async fn test_paginate_tags_warns_when_cap_reached_with_full_last_page() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        let calls = AtomicU32::new(0);
-        let output = capture_tracing_output_async(async {
-            let result = paginate_tags("owner/repo", |_page| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                async move { Ok(tags_page_json(100)) }
-            })
-            .await
-            .unwrap();
-            assert_eq!(result.len(), 100 * MAX_TAG_PAGES as usize);
-        })
-        .await;
-
-        assert_eq!(calls.load(Ordering::SeqCst), MAX_TAG_PAGES);
-        assert!(output.contains("owner/repo"), "output was: {output}");
-        assert!(output.contains("cap"), "output was: {output}");
-    }
-
-    #[test]
-    fn test_parse_tags_page_returns_raw_tags() {
-        let json = r#"[{"name": "v1.0.0"}, {"name": "not-semver"}]"#;
-        let tags = parse_tags_page(json.as_bytes()).unwrap();
-        assert_eq!(tags.len(), 2);
-        assert_eq!(tags[0].name, "v1.0.0");
-    }
-
-    #[test]
     fn test_tags_to_versions_accumulated_across_pages_sorts_and_dedupes_none() {
         // Simulates two accumulated pages being merged before sorting, the
         // shape `get_versions` produces when pagination fetches page 2.
-        let page1 = parse_tags_page(br#"[{"name": "3.0.0"}, {"name": "2.0.0"}]"#).unwrap();
-        let page2 = parse_tags_page(br#"[{"name": "1.0.0"}]"#).unwrap();
+        let page1 =
+            deps_core::github::parse_tags_page(br#"[{"name": "3.0.0"}, {"name": "2.0.0"}]"#)
+                .unwrap();
+        let page2 = deps_core::github::parse_tags_page(br#"[{"name": "1.0.0"}]"#).unwrap();
         let mut all = page1;
         all.extend(page2);
         let versions = tags_to_versions(all);
@@ -994,9 +681,11 @@ mod tests {
         // lexicographically ahead of unrelated subproject tags that fill
         // earlier pages on large monorepos). The final list must be sorted by
         // parsed semver regardless of fetch/page order.
-        let page1 =
-            parse_tags_page(br#"[{"name": "DataTransport-1.0.0"}, {"name": "1.0.0"}]"#).unwrap();
-        let page2 = parse_tags_page(br#"[{"name": "v12.0.0"}]"#).unwrap();
+        let page1 = deps_core::github::parse_tags_page(
+            br#"[{"name": "DataTransport-1.0.0"}, {"name": "1.0.0"}]"#,
+        )
+        .unwrap();
+        let page2 = deps_core::github::parse_tags_page(br#"[{"name": "v12.0.0"}]"#).unwrap();
         let mut all = page1;
         all.extend(page2);
         let versions = tags_to_versions(all);
@@ -1280,12 +969,13 @@ mod tests {
     /// and never attempt a real network request.
     fn untokened_registry() -> SwiftRegistry {
         SwiftRegistry {
-            cache: Arc::new(HttpCache::new()),
-            auth_headers: Vec::new(),
-            has_token: false,
+            github: GithubTagsClient::for_test(
+                Arc::new(HttpCache::new()),
+                deps_core::github::GITHUB_API,
+                false,
+            ),
             release_dates: Arc::new(DashMap::new()),
             enrichment_skip_logged: Arc::new(AtomicBool::new(false)),
-            api_base: GITHUB_API.to_string(),
         }
     }
 
@@ -1293,21 +983,10 @@ mod tests {
     /// `mockito::Server::url()`) instead of the real GitHub API, for tests driving
     /// `Registry::get_versions_with` end-to-end without a live network call.
     fn mock_registry(base: &str, has_token: bool) -> SwiftRegistry {
-        let auth_headers = if has_token {
-            vec![(
-                reqwest::header::AUTHORIZATION,
-                "Bearer test-token".to_string(),
-            )]
-        } else {
-            Vec::new()
-        };
         SwiftRegistry {
-            cache: Arc::new(HttpCache::new()),
-            auth_headers,
-            has_token,
+            github: GithubTagsClient::for_test(Arc::new(HttpCache::new()), base, has_token),
             release_dates: Arc::new(DashMap::new()),
             enrichment_skip_logged: Arc::new(AtomicBool::new(false)),
-            api_base: base.to_string(),
         }
     }
 
@@ -1522,5 +1201,41 @@ mod tests {
 
         assert_eq!(versions.len(), 1);
         assert!(versions.iter().all(|v| v.published_at().is_some()));
+    }
+
+    /// Regression for #472 critic M3: `get_versions` must label its pagination-cap
+    /// truncation warning `"Swift"`, not some other ecosystem's name or a stale literal
+    /// left over from the shared `deps_core::github::paginate_tags` extraction. A
+    /// hardcoded/rearranged `paginate_tags("Swift", ...)` call site would silently break
+    /// this without failing any other test, since `deps_core::github`'s own tests only
+    /// exercise `paginate_tags` with an arbitrary ecosystem string.
+    #[tokio::test]
+    async fn test_get_versions_pagination_cap_warning_is_labeled_swift() {
+        let mut server = mockito::Server::new_async().await;
+        let full_page: String = format!(
+            "[{}]",
+            (0..100)
+                .map(|i| format!(r#"{{"name":"{i}.0.0"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let _mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(full_page)
+            .expect(deps_core::github::MAX_TAG_PAGES as usize)
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        let output = capture_tracing_output_async(async {
+            registry.get_versions("owner/repo").await.unwrap();
+        })
+        .await;
+
+        assert!(output.contains("Swift"), "output was: {output}");
+        assert!(output.contains("cap"), "output was: {output}");
+        assert!(!output.contains("GitHub Actions"), "output was: {output}");
     }
 }

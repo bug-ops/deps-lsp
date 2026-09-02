@@ -12,12 +12,9 @@ description = "GitHub Actions workflow dependency support for deps-lsp"
 workspace = true
 
 [dependencies]
-bytes = { workspace = true }
 dashmap = { workspace = true }
 deps-core = { workspace = true }
-reqwest = { workspace = true }
 semver = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync"] }
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }

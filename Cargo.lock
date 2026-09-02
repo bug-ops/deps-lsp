@@ -549,13 +549,10 @@ dependencies = [
 name = "deps-github-actions"
 version = "0.11.1"
 dependencies = [
- "bytes",
  "dashmap",
  "deps-core",
  "mockito",
- "reqwest",
  "semver",
- "serde",
  "tokio",
  "tokio-test",
  "tower-lsp-server",
