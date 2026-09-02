@@ -975,7 +975,11 @@ struct FetchResult {
     /// package doesn't exist" from "the registry couldn't be asked" instead
     /// of conflating both into a misleading "Unknown package" diagnostic.
     fetch_failed: HashMap<PackageName, FetchFailure>,
-    /// Number of packages that failed to fetch (timeout or error)
+    /// Number of packages whose registry fetch did not succeed, counting both a genuine
+    /// fetch failure (timeout, error — recorded in `fetch_failed` above) and a not-found
+    /// lookup (the registry answered "no such package", never recorded in `fetch_failed`,
+    /// see #267 C1). Only the `fetch_failed` subset produces an inline "Registry lookup
+    /// failed" diagnostic, so this count can exceed `fetch_failed.len()` (#276 S2, #490).
     failed_count: usize,
     /// First actionable error message (shown to user via `window/showMessage`)
     first_error: Option<String>,
@@ -1407,6 +1411,14 @@ async fn fetch_latest_versions_parallel(
 /// [`handle_document_open`] and [`handle_document_change`] so both share one policy and the
 /// policy itself is unit-testable without an LSP transport.
 ///
+/// `failed_count` counts both genuine fetch failures and not-found lookups (see #276 S2),
+/// so the message deliberately says "could not be resolved" rather than "failed to fetch"
+/// or anything containing "lookup failed" — that phrasing is the exact inline "Registry
+/// lookup failed" diagnostic text, which excludes not-found by design (#267 C1), so reusing
+/// it here would recreate the same overcount confusion in different words. "could not be
+/// resolved" covers both the "Registry lookup failed" and "Unknown package" diagnostic
+/// outcomes, so the count stays checkable against their union (#490).
+///
 /// Returns `None` when there were no failures at all, or when `offline` is set (issue
 /// #483): every fetch fails by design while `network.offline` is set, so toasting on every
 /// document open/change would make offline mode unusable.
@@ -1419,7 +1431,7 @@ fn fetch_failure_toast(
         return None;
     }
     Some(format!(
-        "deps-lsp: {failed_count} package(s) failed to fetch: {}",
+        "deps-lsp: {failed_count} package(s) could not be resolved: {}",
         first_error.unwrap_or("timeout or network error")
     ))
 }
@@ -2382,7 +2394,7 @@ mod tests {
             assert_eq!(
                 fetch_failure_toast(1, Some("HTTP 503 for https://example.com"), false),
                 Some(
-                    "deps-lsp: 1 package(s) failed to fetch: HTTP 503 for https://example.com"
+                    "deps-lsp: 1 package(s) could not be resolved: HTTP 503 for https://example.com"
                         .to_string()
                 )
             );
@@ -2393,7 +2405,8 @@ mod tests {
             assert_eq!(
                 fetch_failure_toast(5, None, false),
                 Some(
-                    "deps-lsp: 5 package(s) failed to fetch: timeout or network error".to_string()
+                    "deps-lsp: 5 package(s) could not be resolved: timeout or network error"
+                        .to_string()
                 )
             );
         }
@@ -4110,6 +4123,100 @@ mod tests {
         );
     }
 
+    /// #490: this is the real-world shape of the toast-overcount bug — a mixed batch of
+    /// one not-found package and one genuinely-failed package leaves `failed_count` (2)
+    /// exceeding `fetch_failed.len()` (1), since the not-found package never gets a
+    /// "Registry lookup failed" diagnostic. The toast must still report the full count
+    /// without wording itself as if both packages failed a fetch. Uses the same fixture
+    /// shape as `test_fetch_fallback_error_recorded_as_fetch_failed_unless_not_found`
+    /// (kept separate, and that test kept byte-identical, so the #276 S2 contract stays
+    /// pinned independently of this wording assertion).
+    #[tokio::test]
+    async fn test_fetch_failure_toast_wording_for_mixed_not_found_and_genuine_failure_batch() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct FallbackErrorRegistry;
+
+        impl Registry for FallbackErrorRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                let name = name.clone();
+                Box::pin(async move {
+                    if name.as_str() == "not-found" {
+                        Err(deps_core::error::DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "mock",
+                        })
+                    } else {
+                        Err(deps_core::error::DepsError::CacheError(
+                            "mock fallback failure".to_string(),
+                        ))
+                    }
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(FallbackErrorRegistry);
+        let packages = vec![PackageName::new("flaky"), PackageName::new("not-found")];
+
+        let result = fetch_latest_versions_parallel(
+            registry,
+            with_registry_source(packages),
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            10,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.failed_count, 2);
+        assert_eq!(
+            result.fetch_failed.len(),
+            1,
+            "not-found must not be in fetch_failed"
+        );
+
+        let toast = fetch_failure_toast(result.failed_count, result.first_error.as_deref(), false)
+            .expect("failed_count > 0 and not offline, so a toast must be produced");
+        assert!(
+            toast.starts_with("deps-lsp: 2 package(s) could not be resolved:"),
+            "got: {toast}"
+        );
+        assert!(
+            !toast.contains("lookup failed"),
+            "must not reuse the 'Registry lookup failed' diagnostic wording, which \
+             excludes not-found and would misrepresent this mixed batch: {toast}"
+        );
+    }
+
     #[tokio::test]
     async fn test_fetch_fallback_timeout_recorded_as_fetch_failed() {
         // Timeout coverage for the `get_latest_matching` fallback path — a
@@ -4354,11 +4461,11 @@ mod tests {
         // message whenever `first_error` was `Some` — so a multi-package timeout batch
         // (which always populates `first_error` via `priority_error`, unlike the
         // not-found-only case) silently lost its count. The toast is now built
-        // unconditionally from both fields (`"{failed_count} package(s) failed to
-        // fetch: {first_error}"`), so this asserts the `FetchResult` data that feeds
-        // it: a batch where every package times out must report `failed_count` equal
-        // to the batch size *and* a populated, actionable `first_error` — both fields
-        // together, not one masking the other.
+        // unconditionally from both fields (`"{failed_count} package(s) could not be
+        // resolved: {first_error}"`, see #490), so this asserts the `FetchResult` data
+        // that feeds it: a batch where every package times out must report `failed_count`
+        // equal to the batch size *and* a populated, actionable `first_error` — both
+        // fields together, not one masking the other.
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
         use std::time::Duration;
