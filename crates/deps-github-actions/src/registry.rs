@@ -226,18 +226,49 @@ impl GithubActionsRegistry {
         )
     }
 
-    fn populate_tag_index(&self, name: &PackageName, tags: &[GithubActionsVersion]) {
+    /// Populates the SHA-pin lookup index from the raw tags API response, independent of
+    /// [`tags_to_versions`]' full-`major.minor.patch`-semver filter.
+    ///
+    /// A bare-major moving tag like `v3`/`v4` — the most common real-world GitHub Actions
+    /// pinning convention — normalizes to `"3"`/`"4"`, which `semver::Version::parse`
+    /// rejects, so it never appears in the semver-filtered `versions` list `get_versions`
+    /// returns. Indexing straight from `tags` instead means the "Pin to commit SHA"
+    /// quickfix (issue #473) can resolve *any* literal tag ref present on the repository,
+    /// not only the unusual full `vX.Y.Z` pin form (#503). Still gated on
+    /// [`crate::parser::is_full_sha`] (security S-3): the SHA is later spliced verbatim
+    /// into a manifest text edit and a hover string.
+    ///
+    /// `sha_to_tag` (the hover `**Resolved**` line) prefers a full-semver-parseable tag
+    /// name over a bare moving one when several tags share a commit SHA: GitHub's `/tags`
+    /// ordering is undocumented, and a first-wins pass over raw tag order can otherwise
+    /// resolve a SHA to a less-specific tag (`v1`) instead of the precise release
+    /// (`v0.1.15`) it was actually cut from (#503 critic S1). `tag_to_sha` has no such
+    /// ambiguity — it is keyed by the workflow's own literal ref text — so it stays a
+    /// plain first-wins index over the raw tags.
+    fn populate_tag_index(&self, name: &PackageName, tags: &[GithubTag]) {
         let mut index = TagIndex::default();
-        for tag in tags {
-            let tag_str = tag.version.as_str().to_string();
+        let valid_tags: Vec<&GithubTag> = tags
+            .iter()
+            .filter(|tag| crate::parser::is_full_sha(&tag.commit.sha))
+            .collect();
+
+        for tag in &valid_tags {
+            if semver::Version::parse(normalize_tag(&tag.name)).is_ok() {
+                index
+                    .sha_to_tag
+                    .entry(tag.commit.sha.clone())
+                    .or_insert_with(|| tag.name.clone());
+            }
+        }
+        for tag in &valid_tags {
             index
                 .sha_to_tag
-                .entry(tag.sha.clone())
-                .or_insert_with(|| tag_str.clone());
+                .entry(tag.commit.sha.clone())
+                .or_insert_with(|| tag.name.clone());
             index
                 .tag_to_sha
-                .entry(tag_str)
-                .or_insert_with(|| tag.sha.clone());
+                .entry(tag.name.clone())
+                .or_insert_with(|| tag.commit.sha.clone());
         }
         if !self.tag_index.contains_key(name) {
             evict_if_full(&self.tag_index, MAX_TAG_INDEX_ENTRIES);
@@ -276,9 +307,8 @@ impl GithubActionsRegistry {
         })
         .await?;
 
-        let versions = tags_to_versions(tags);
-        self.populate_tag_index(&package_name, &versions);
-        Ok(versions)
+        self.populate_tag_index(&package_name, &tags);
+        Ok(tags_to_versions(tags))
     }
 
     /// Like [`GithubActionsRegistry::get_versions`], but also attaches GitHub Release
@@ -340,12 +370,13 @@ impl GithubActionsRegistry {
 /// semver, first (page-order) occurrence wins.
 ///
 /// Also drops any tag whose `commit.sha` is not [`crate::parser::is_full_sha`]-shaped
-/// (security S-3): the SHA reaches `TagIndex` unfiltered from here, and is later
-/// spliced verbatim into a manifest text edit (`GithubActionsFormatter::
-/// format_version_replacing_for`'s `PinStyle::Sha` branch) and a hover string — the one
-/// registry-supplied value in this crate that otherwise bypasses every allowlist gate
-/// (`is_safe_version_string` covers the *version*, not the SHA). Filtering at ingestion
-/// covers both consumers from one place.
+/// (security S-3): a `GithubActionsVersion`'s `sha` is later spliced verbatim into a
+/// manifest text edit (`GithubActionsFormatter::format_version_replacing_for`'s
+/// `PinStyle::Sha` branch) and a hover string — the one registry-supplied value in this
+/// crate that otherwise bypasses every allowlist gate (`is_safe_version_string` covers
+/// the *version*, not the SHA). [`GithubActionsRegistry::populate_tag_index`] applies
+/// the identical filter independently for `TagIndex`, since it indexes from the raw
+/// tags rather than this function's semver-filtered output (#503).
 fn tags_to_versions(tags: Vec<GithubTag>) -> Vec<GithubActionsVersion> {
     let mut seen = std::collections::HashSet::new();
     let mut versions_with_parsed: Vec<(GithubActionsVersion, semver::Version)> = tags
@@ -626,6 +657,103 @@ mod tests {
         let index = registry.tag_index.get(&name).unwrap();
         assert_eq!(index.tag_to_sha.get("v4.2.0"), Some(&sha.to_string()));
         assert_eq!(index.sha_to_tag.get(sha), Some(&"v4.2.0".to_string()));
+    }
+
+    /// Regression for #503: a bare-major moving tag like `v4` fails
+    /// `semver::Version::parse` (needs `major.minor.patch`), so it never appears in the
+    /// semver-filtered `versions` list — but the SHA-pin index must still resolve it,
+    /// since it's the most common real-world GitHub Actions pinning convention.
+    #[tokio::test]
+    async fn test_get_versions_populates_tag_index_for_bare_major_tag() {
+        let sha = "abc123".repeat(7);
+        let sha = &sha[..40];
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/actions/checkout/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v4", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        let versions = registry.get_versions("actions/checkout").await.unwrap();
+        assert!(
+            versions.is_empty(),
+            "a bare-major tag must not parse as a full semver version"
+        );
+
+        let name = PackageName::new("actions/checkout");
+        let index = registry.tag_index.get(&name).unwrap();
+        assert_eq!(
+            index.tag_to_sha.get("v4"),
+            Some(&sha.to_string()),
+            "the SHA-pin index must resolve a bare-major tag even though it's not a version"
+        );
+        assert_eq!(index.sha_to_tag.get(sha), Some(&"v4".to_string()));
+    }
+
+    /// Regression for #503: a tag with a non-full-SHA `commit.sha` must still be excluded
+    /// from the SHA-pin index, matching `tags_to_versions`' security S-3 filter — the raw
+    /// tags list is no longer routed through that filter, so `populate_tag_index` must
+    /// apply its own.
+    #[tokio::test]
+    async fn test_get_versions_tag_index_excludes_non_full_sha() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/actions/checkout/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"[{"name": "v4", "commit": {"sha": "not-a-real-sha"}}]"#)
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        registry.get_versions("actions/checkout").await.unwrap();
+
+        let name = PackageName::new("actions/checkout");
+        let index = registry.tag_index.get(&name).unwrap();
+        assert!(index.tag_to_sha.is_empty());
+        assert!(index.sha_to_tag.is_empty());
+    }
+
+    /// Regression for #503 critic S1: when two tags share one commit SHA — a moving
+    /// bare-major tag and the precise release it currently points at — `sha_to_tag`
+    /// must resolve to the semver-parseable one regardless of the raw `/tags` API's
+    /// (undocumented) ordering, since a hover's `**Resolved**` line should name the
+    /// precise release, not the moving alias.
+    #[tokio::test]
+    async fn test_get_versions_sha_to_tag_prefers_semver_tag_over_bare_moving_tag() {
+        let sha = "a".repeat(40);
+        let mut server = mockito::Server::new_async().await;
+        // The moving tag ("v1") is listed before the precise release ("v0.1.15") —
+        // mirrors the live ordering observed for softprops/action-gh-release.
+        let _mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v1", "commit": {{"sha": "{sha}"}}}}, {{"name": "v0.1.15", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        registry.get_versions("owner/repo").await.unwrap();
+
+        let name = PackageName::new("owner/repo");
+        let index = registry.tag_index.get(&name).unwrap();
+        assert_eq!(
+            index.sha_to_tag.get(&sha),
+            Some(&"v0.1.15".to_string()),
+            "sha_to_tag must prefer the semver-parseable tag over the bare moving one"
+        );
+        // tag_to_sha has no such ambiguity (keyed by the workflow's own literal ref
+        // text) — both names must still resolve to the shared SHA.
+        assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
+        assert_eq!(index.tag_to_sha.get("v0.1.15"), Some(&sha));
     }
 
     #[tokio::test]
