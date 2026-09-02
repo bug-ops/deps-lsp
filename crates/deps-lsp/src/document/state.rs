@@ -4,10 +4,10 @@ use deps_core::lockfile::LockFileCache;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{
-    ConcreteVersion, Deprecation, EcosystemId, EcosystemRegistry, PackageName, PackageVersions,
-    ParseResult, RemovalStatus,
+    ConcreteVersion, Deprecation, EcosystemId, EcosystemRegistry, FetchFailure, PackageName,
+    PackageVersions, ParseResult, RemovalStatus,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -79,7 +79,7 @@ pub struct DocumentState {
     /// outage isn't reported as "Unknown package". Cleared and repopulated by
     /// each fetch cycle; carried across document edits by `preserve_cache` so
     /// it doesn't flicker off on every keystroke, same as `yanked_versions`.
-    pub fetch_failed: HashSet<String>,
+    pub fetch_failed: HashMap<String, FetchFailure>,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -235,7 +235,7 @@ impl DocumentState {
             vulnerabilities: VulnerabilityMap::new(),
             yanked_versions: HashMap::new(),
             deprecations: HashMap::new(),
-            fetch_failed: HashSet::new(),
+            fetch_failed: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -257,7 +257,7 @@ impl DocumentState {
             vulnerabilities: VulnerabilityMap::new(),
             yanked_versions: HashMap::new(),
             deprecations: HashMap::new(),
-            fetch_failed: HashSet::new(),
+            fetch_failed: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -318,7 +318,7 @@ impl DocumentState {
 
     /// Replaces the set of packages whose registry fetch errored or timed out
     /// (normalized-keyed, see [`Self::fetch_failed`]).
-    pub fn update_fetch_failed(&mut self, fetch_failed: HashSet<String>) {
+    pub fn update_fetch_failed(&mut self, fetch_failed: HashMap<String, FetchFailure>) {
         self.fetch_failed = fetch_failed;
     }
 

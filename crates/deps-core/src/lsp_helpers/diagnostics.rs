@@ -4,8 +4,8 @@ use tower_lsp_server::ls_types::{
 
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
 use crate::{
-    ConcreteVersion, Dependency, Deprecation, ParseResult, PublishTime, RemovalStatus, VersionReq,
-    format_relative_age, is_within_cooldown,
+    ConcreteVersion, Dependency, Deprecation, FetchFailure, ParseResult, PublishTime,
+    RemovalStatus, VersionReq, format_relative_age, is_within_cooldown,
 };
 
 use super::{EcosystemFormatter, RequirementMatcher, RequirementStatus, VersionData};
@@ -672,20 +672,32 @@ pub fn generate_diagnostics_from_cache(
                 // distinctly from a genuine "not found" so a transient registry
                 // outage or a malformed response (e.g. unparseable
                 // maven-metadata.xml) doesn't masquerade as "Unknown package".
-                let fetch_failed = formatter.can_resolve_source(&dep.source())
-                    && versions
-                        .fetch_failed
-                        .is_some_and(|f| f.contains(normalized_name.as_str()));
+                let fetch_failure = formatter
+                    .can_resolve_source(&dep.source())
+                    .then(|| {
+                        versions
+                            .fetch_failed
+                            .and_then(|f| f.get(normalized_name.as_str()))
+                    })
+                    .flatten();
                 let message = match formatter.validate_package_name(dep.name().as_str()) {
                     Err(reason) => Some(format!("Invalid package name '{}': {reason}", dep.name())),
-                    Ok(()) if fetch_failed => Some(format!(
-                        "Registry lookup failed for '{}'; package status could not be determined",
-                        dep.name()
-                    )),
-                    Ok(()) if formatter.can_resolve_source(&dep.source()) => {
-                        Some(format!("Unknown package '{}'", dep.name()))
-                    }
-                    Ok(()) => None,
+                    Ok(()) => match fetch_failure {
+                        Some(FetchFailure::Actionable(hint)) => Some(format!(
+                            "Registry lookup failed for '{}': {hint}",
+                            dep.name()
+                        )),
+                        Some(FetchFailure::Transient | FetchFailure::NotAttempted) => {
+                            Some(format!(
+                                "Registry lookup failed for '{}'; package status could not be \
+                             determined",
+                                dep.name()
+                            ))
+                        }
+                        None => formatter
+                            .can_resolve_source(&dep.source())
+                            .then(|| format!("Unknown package '{}'", dep.name())),
+                    },
                 };
                 if let Some(message) = message {
                     diagnostics.push(Diagnostic {
@@ -942,7 +954,7 @@ mod tests {
     use crate::lsp_helpers::*;
     use crate::{PackageName, VersionReq};
 
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     #[test]
@@ -1173,7 +1185,7 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let fetch_failed = HashSet::from(["flaky-pkg".to_string()]);
+        let fetch_failed = HashMap::from([("flaky-pkg".to_string(), FetchFailure::Transient)]);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -1188,6 +1200,137 @@ mod tests {
         assert!(!diagnostics[0].message.contains("Unknown package"));
         assert!(diagnostics[0].message.contains("Registry lookup failed"));
         assert!(diagnostics[0].message.contains("flaky-pkg"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_fetch_failed_actionable_shows_hint() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // #478: an `Actionable` fetch failure must surface its pre-vetted hint
+        // text in the diagnostic, not the generic fallback.
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "rate-limited-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 16)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let fetch_failed = HashMap::from([(
+            "rate-limited-pkg".to_string(),
+            FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".to_string()),
+        )]);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message.contains("Unknown package"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("set GITHUB_TOKEN to increase the rate limit")
+        );
+        assert!(diagnostics[0].message.contains("rate-limited-pkg"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_fetch_failed_transient_shows_generic_message() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // A `Transient` fetch failure has no safe detail to show, so it must
+        // fall back to the generic "package status could not be determined"
+        // message rather than leak anything failure-specific.
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "transient-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 13)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let fetch_failed = HashMap::from([("transient-pkg".to_string(), FetchFailure::Transient)]);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message.contains("Unknown package"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("package status could not be determined")
+        );
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_fetch_failed_not_attempted_shows_generic_message() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // #478 fix (impl-critic S1): `NotAttempted` (a source-collided
+        // dependency that was deliberately never queried) must render the
+        // SAME generic message as `Transient`, never "Unknown package" — the
+        // dependency's non-fetch is not evidence it doesn't exist.
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "collided-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 12)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let fetch_failed =
+            HashMap::from([("collided-pkg".to_string(), FetchFailure::NotAttempted)]);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_fetch_failed(&fetch_failed),
+            &formatter,
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message.contains("Unknown package"));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("package status could not be determined")
+        );
     }
 
     #[test]
@@ -1212,7 +1355,7 @@ mod tests {
 
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
-        let fetch_failed = HashSet::from(["bad name".to_string()]);
+        let fetch_failed = HashMap::from([("bad name".to_string(), FetchFailure::Transient)]);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,

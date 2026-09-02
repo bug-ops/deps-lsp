@@ -33,7 +33,7 @@ pub mod version_matcher;
 pub use cache::{BodyLimit, CachedResponse, HttpCache};
 pub use ecosystem::{Dependency, Ecosystem, EcosystemConfig, EcosystemId, ParseResult};
 pub use ecosystem_registry::EcosystemRegistry;
-pub use error::{DepsError, Result};
+pub use error::{DepsError, FetchFailure, Result};
 pub use freshness::{
     DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age, is_within_cooldown,
 };
