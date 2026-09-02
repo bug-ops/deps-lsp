@@ -110,6 +110,35 @@ pub fn github_rate_limit_error() -> DepsError {
     }
 }
 
+/// A `GITHUB_TOKEN` bearer-header value, redacted everywhere except the one call site
+/// ([`GithubTagsClient::headers`]) that hands it to a request as a header value.
+///
+/// `Debug`/`Display` are hand-implemented to redact the value so it cannot leak via a log
+/// line, a panic message, or a future `#[derive(Debug)]` added to [`GithubTagsClient`] or a
+/// struct embedding it — mirrors `deps_cargo::config::AuthToken`.
+#[derive(Clone, PartialEq, Eq)]
+struct AuthToken(String);
+
+impl AuthToken {
+    /// The raw header value, for attaching to a request. Never logged, printed, or
+    /// otherwise surfaced — callers must not pass this to anything but a header value.
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthToken(***)")
+    }
+}
+
+impl std::fmt::Display for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
 /// Shared cache, auth-header, and API-base state for a GitHub-tags-backed registry client.
 ///
 /// Callers embed this alongside their own ecosystem-specific state (caches, coalescing
@@ -118,9 +147,12 @@ pub fn github_rate_limit_error() -> DepsError {
 #[derive(Clone)]
 pub struct GithubTagsClient {
     cache: Arc<HttpCache>,
-    auth_headers: Vec<(HeaderName, String)>,
+    auth_headers: Vec<(HeaderName, AuthToken)>,
     has_token: bool,
     api_base: String,
+    /// `{api_base}/`, precomputed once so [`Self::fetch_authenticated`] never re-`format!`s
+    /// it per request; the trailing slash is load-bearing (see that method's docs).
+    trusted_origin: String,
 }
 
 impl GithubTagsClient {
@@ -146,7 +178,7 @@ impl GithubTagsClient {
         let auth_headers = token
             .map(|token| {
                 tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
-                vec![(AUTHORIZATION, format!("Bearer {token}"))]
+                vec![(AUTHORIZATION, AuthToken(format!("Bearer {token}")))]
             })
             .unwrap_or_default();
 
@@ -154,6 +186,7 @@ impl GithubTagsClient {
             cache,
             auth_headers,
             has_token,
+            trusted_origin: format!("{GITHUB_API}/"),
             api_base: GITHUB_API.to_string(),
         }
     }
@@ -168,15 +201,17 @@ impl GithubTagsClient {
     #[must_use]
     pub fn for_test(cache: Arc<HttpCache>, api_base: impl Into<String>, has_token: bool) -> Self {
         let auth_headers = if has_token {
-            vec![(AUTHORIZATION, "Bearer test-token".to_string())]
+            vec![(AUTHORIZATION, AuthToken("Bearer test-token".to_string()))]
         } else {
             Vec::new()
         };
+        let api_base = api_base.into();
         Self {
             cache,
             auth_headers,
             has_token,
-            api_base: api_base.into(),
+            trusted_origin: format!("{api_base}/"),
+            api_base,
         }
     }
 
@@ -194,8 +229,13 @@ impl GithubTagsClient {
     }
 
     /// Borrowed auth-header pairs to send on each request; empty when no token is set.
+    ///
+    /// `pub(crate)` rather than `pub`: this is the one place [`AuthToken`]'s redaction
+    /// boundary is crossed back into a plain `&str`, so it must not hand the raw token to
+    /// another crate. Ecosystem crates needing an authenticated GitHub request go through
+    /// [`Self::fetch_authenticated`] instead, which applies these headers internally.
     #[must_use]
-    pub fn headers(&self) -> Vec<(HeaderName, &str)> {
+    pub(crate) fn headers(&self) -> Vec<(HeaderName, &str)> {
         self.auth_headers
             .iter()
             .map(|(k, v)| (k.clone(), v.as_str()))
@@ -204,21 +244,50 @@ impl GithubTagsClient {
 
     /// The shared HTTP cache this client fetches through.
     ///
-    /// Exposed for ecosystem-specific endpoints beyond the tags API (e.g.
-    /// `deps-swift`'s GitHub Releases publish-date fetch) — the tags API itself should go
-    /// through [`GithubTagsClient::fetch_tags_page`] instead of rebuilding its URL here.
+    /// Exposed for ecosystem-specific endpoints beyond the tags API that don't carry a
+    /// credential (e.g. parsing a response this client already fetched) — anything that
+    /// needs this client's `Authorization` header should go through
+    /// [`GithubTagsClient::fetch_authenticated`] instead of rebuilding the header list here.
     #[must_use]
     pub const fn cache(&self) -> &Arc<HttpCache> {
         &self.cache
     }
 
+    /// Fetches `url` with this client's auth headers, pinning every redirect hop to
+    /// [`Self::api_base`].
+    ///
+    /// The single entry point for an authenticated request against the GitHub API: every
+    /// caller needing this client's `Authorization` header — the tags API
+    /// ([`Self::fetch_tags_page`]), `deps-swift`'s release-dates and search endpoints —
+    /// goes through here rather than combining [`Self::cache`] and `headers()`
+    /// itself, so the origin pin can't be forgotten at a new call site.
+    ///
+    /// Fetches through [`HttpCache::get_cached_trusted_origin_with_headers`] rather than
+    /// [`HttpCache::get_cached_with_headers`], pinning every redirect hop to `api_base` so
+    /// the `Authorization` header can never follow a cross-origin redirect off the GitHub
+    /// API — defense-in-depth alongside reqwest's own default header-stripping on
+    /// cross-origin redirects.
+    ///
+    /// `url` must itself be under `api_base` — this only pins *redirects*, not the initial
+    /// request, so a caller building `url` from a different base (e.g. a hardcoded
+    /// production constant instead of [`Self::api_base`]) both escapes the pin and, in
+    /// tests, silently bypasses the mock server this client was built with.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying HTTP/cache error unchanged.
+    pub async fn fetch_authenticated(&self, url: &str) -> Result<Bytes> {
+        self.cache
+            .get_cached_trusted_origin_with_headers(url, &self.trusted_origin, &self.headers())
+            .await
+    }
+
     /// Fetches one page of the GitHub tags API for `name` (`owner/repo`), authenticated
     /// with this client's headers.
     ///
-    /// Centralizes the `{api_base}/repos/{name}/tags?per_page=100&page={page}` URL and the
-    /// cache call so callers never re-derive them (#472 critic S2) — every caller still
-    /// supplies its own error mapping (rate-limit/not-found translation) via `map_err` on
-    /// the result.
+    /// Centralizes the `{api_base}/repos/{name}/tags?per_page=100&page={page}` URL so
+    /// callers never re-derive it (#472 critic S2) — every caller still supplies its own
+    /// error mapping (rate-limit/not-found translation) via `map_err` on the result.
     ///
     /// # Errors
     ///
@@ -228,9 +297,7 @@ impl GithubTagsClient {
             "{}/repos/{name}/tags?per_page=100&page={page}",
             self.api_base
         );
-        self.cache
-            .get_cached_with_headers(&url, &self.headers())
-            .await
+        self.fetch_authenticated(&url).await
     }
 }
 
@@ -564,5 +631,96 @@ mod tests {
             GithubTagsClient::for_test(Arc::new(HttpCache::new()), "http://example", false);
         assert!(!client.has_token());
         assert!(client.headers().is_empty());
+    }
+
+    // --- AuthToken redaction ---
+
+    #[test]
+    fn test_auth_token_debug_redacts_value() {
+        let token = AuthToken("Bearer super-secret-value".to_string());
+        assert_eq!(format!("{token:?}"), "AuthToken(***)");
+    }
+
+    #[test]
+    fn test_auth_token_display_redacts_value() {
+        let token = AuthToken("Bearer super-secret-value".to_string());
+        assert_eq!(format!("{token}"), "***");
+    }
+
+    #[test]
+    fn test_auth_token_debug_redacts_when_embedded_in_header_vec() {
+        // Guards against a future `#[derive(Debug)]` on `GithubTagsClient` (or a struct
+        // embedding it) accidentally printing a raw `GITHUB_TOKEN` value: exercises the
+        // exact shape `GithubTagsClient::auth_headers` stores, `Vec<(HeaderName,
+        // AuthToken)>`, not just a bare `AuthToken`.
+        let token = AuthToken("Bearer super-secret-value".to_string());
+        let headers = vec![(AUTHORIZATION, token)];
+        let debug_output = format!("{headers:?}");
+        assert!(
+            !debug_output.contains("super-secret-value"),
+            "{debug_output}"
+        );
+        assert!(debug_output.contains("AuthToken(***)"), "{debug_output}");
+    }
+
+    // --- fetch_authenticated: wire-level behavior ---
+
+    #[tokio::test]
+    async fn test_fetch_authenticated_sends_token_on_the_wire() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/repos/owner/repo/tags?per_page=100&page=1")
+            .match_header("authorization", "Bearer test-token")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        let client = GithubTagsClient::for_test(Arc::new(HttpCache::new()), server.url(), true);
+        client.fetch_tags_page("owner/repo", 1).await.unwrap();
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_authenticated_blocks_cross_origin_redirect() {
+        // Two separate `mockito::Server` instances bind to distinct ports, so a 302 from
+        // one to the other is a genuine cross-origin redirect the trusted-origin pin must
+        // stop (mirrors `cache::tests::test_get_cached_trusted_origin_stops_cross_origin_redirect`).
+        let mut trusted_server = mockito::Server::new_async().await;
+        let mut other_server = mockito::Server::new_async().await;
+
+        let escape_target = format!("{}/stolen", other_server.url());
+        let _redirect = trusted_server
+            .mock("GET", "/repos/owner/repo/tags?per_page=100&page=1")
+            .with_status(302)
+            .with_header("location", &escape_target)
+            .create_async()
+            .await;
+        let escape = other_server
+            .mock("GET", "/stolen")
+            .with_status(200)
+            .with_body("must not be returned")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client =
+            GithubTagsClient::for_test(Arc::new(HttpCache::new()), trusted_server.url(), true);
+        let result = client.fetch_tags_page("owner/repo", 1).await;
+
+        // Extract only the status code rather than formatting `result` itself: the error
+        // carries no sensitive data, but CodeQL's cleartext-logging check flags any format
+        // of a value derived from a call chain that touched the client's auth headers.
+        let status = match result {
+            Err(DepsError::HttpStatus { status, .. }) => Some(status),
+            _ => None,
+        };
+        assert_eq!(
+            status,
+            Some(302),
+            "expected the cross-origin redirect to be stopped"
+        );
+        escape.assert_async().await;
     }
 }
