@@ -199,9 +199,7 @@ impl SwiftRegistry {
         );
         let fetch_result = tokio::time::timeout(
             RELEASE_DATES_FETCH_TIMEOUT,
-            self.github
-                .cache()
-                .get_cached_with_headers(&url, &self.github.headers()),
+            self.github.fetch_authenticated(&url),
         )
         .await;
         match &fetch_result {
@@ -257,14 +255,10 @@ impl SwiftRegistry {
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SwiftPackage>> {
         let url = format!(
             "{}/search/repositories?q={}+language:swift&per_page={limit}",
-            deps_core::github::GITHUB_API,
+            self.github.api_base(),
             urlencoding::encode(query)
         );
-        let data = self
-            .github
-            .cache()
-            .get_cached_with_headers(&url, &self.github.headers())
-            .await?;
+        let data = self.github.fetch_authenticated(&url).await?;
         parse_search_response(&data)
     }
 }
