@@ -41,7 +41,7 @@ pub async fn handle_code_actions(
         cached_versions,
         resolved_versions,
         vulnerabilities,
-        deprecations,
+        outcomes,
         content,
     )) = state
         .with_document(uri, |doc| {
@@ -54,7 +54,7 @@ pub async fn handle_code_actions(
                 doc.cached_versions.clone(),
                 doc.resolved_versions.clone(),
                 doc.vulnerabilities.clone(),
-                doc.deprecations.clone(),
+                doc.outcomes.clone(),
                 doc.content.clone(),
             ))
         })
@@ -70,7 +70,7 @@ pub async fn handle_code_actions(
             uri,
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_vulnerabilities(&vulnerabilities)
-                .with_deprecations(&deprecations)
+                .with_outcomes(&outcomes)
                 .with_ecosystem(ecosystem_id)
                 .with_offline(offline),
             &content,

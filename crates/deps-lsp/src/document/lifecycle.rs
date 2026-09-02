@@ -9,6 +9,7 @@ use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
 use crate::progress::{ProgressSender, RegistryProgress};
 use deps_core::ConcreteVersion;
+use deps_core::DependencyOutcomes;
 use deps_core::Deprecation;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
@@ -70,7 +71,7 @@ fn resolve_ecosystem_id(ecosystem: &dyn Ecosystem) -> EcosystemId {
 ///    distinguishable from `deps-cargo`'s own FR-003 unresolved-alias warning.
 ///
 /// Returns `(sources, collided)`: `sources` is ready to fetch as-is; `collided` must be
-/// merged into `DocumentState::fetch_failed` by the caller so
+/// merged into `DocumentState::outcomes`' fetch-failure channel by the caller so
 /// `generate_diagnostics_from_cache` reports "lookup could not be determined" rather than
 /// a false "Unknown package" for a dependency that was never actually queried.
 fn dedup_dependencies_by_source(
@@ -173,8 +174,9 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
         cached = old_state.cached_versions.len(),
         resolved = old_state.resolved_versions.len(),
         vulnerabilities = old_state.vulnerabilities.len(),
-        yanked = old_state.yanked_versions.len(),
-        fetch_failed = old_state.fetch_failed.len(),
+        outcomes_yanked = old_state.outcomes.yanked_count(),
+        outcomes_deprecated = old_state.outcomes.deprecation_count(),
+        outcomes_fetch_failed = old_state.outcomes.fetch_failure_count(),
         "preserving version cache"
     );
     new_state
@@ -189,22 +191,15 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     new_state
         .vulnerabilities
         .clone_from(&old_state.vulnerabilities);
-    // Same rationale as `vulnerabilities` above — without this the yanked
-    // diagnostic would flicker off on every keystroke until the next fetch.
-    new_state
-        .yanked_versions
-        .clone_from(&old_state.yanked_versions);
-    // Same rationale — without this the #205 deprecation diagnostic/hover/quickfix
-    // would flicker off on every keystroke until the next fetch.
-    new_state.deprecations.clone_from(&old_state.deprecations);
-    // Same rationale — without this a registry-outage package would flip
-    // back to a misleading "Unknown package" diagnostic on every keystroke
-    // until the next fetch cycle re-populates it (#267).
-    new_state.fetch_failed.clone_from(&old_state.fetch_failed);
+    // Same rationale as `vulnerabilities` above — without this the yanked/deprecation/
+    // fetch-failure diagnostics would flicker off on every keystroke until the next fetch
+    // (or, for a registry-outage package, flip back to a misleading "Unknown package"
+    // diagnostic until the next fetch cycle re-populates it, #267).
+    new_state.outcomes.clone_from(&old_state.outcomes);
 }
 
-/// Merges a partial fetch's #205 deprecation findings into `doc.deprecations`
-/// (incremental didChange path — S1).
+/// Merges a partial fetch's #205 deprecation findings into `doc.outcomes`' deprecation
+/// channel (incremental didChange path — S1).
 ///
 /// Without the clearing half of this (S1), a package that stops being deprecated
 /// (`npm deprecate pkg ""`) would keep a stale finding for the document's lifetime —
@@ -217,7 +212,7 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
 /// previously-recorded finding when `fetched_deprecations` has no entry for it ("fetched
 /// and clean"); a name *not* fetched this round (untouched by `deps_to_fetch`) must not
 /// be touched at all, which is why this takes the explicit fetched-name list rather than
-/// iterating `doc.deprecations` itself.
+/// iterating `doc.outcomes` itself.
 fn merge_deprecations_after_fetch(
     doc: &mut DocumentState,
     fetched_names: &[PackageName],
@@ -243,10 +238,10 @@ fn merge_deprecations_after_fetch(
     for (normalized, deprecation) in per_normalized {
         match deprecation {
             Some(deprecation) => {
-                doc.deprecations.insert(normalized, deprecation);
+                doc.outcomes.set_deprecation(normalized, deprecation);
             }
             None => {
-                doc.deprecations.remove(&normalized);
+                doc.outcomes.clear_deprecation(&normalized);
             }
         }
     }
@@ -961,7 +956,7 @@ struct FetchResult {
     /// Successfully fetched versions (package -> latest + full version list)
     versions: HashMap<PackageName, PackageVersions>,
     /// Yanked-version findings, keyed by **raw** package name (unlike
-    /// `DocumentState::yanked_versions`, which is normalized-keyed — see
+    /// `DocumentState::outcomes`, which is normalized-keyed — see
     /// §3.1 of the design), to (the version string found yanked, its
     /// `RemovalStatus`). The status rides alongside so #205's package-level
     /// deprecation diagnostic can gate its yanked-check suppression on
@@ -1600,43 +1595,34 @@ pub async fn handle_document_open(
         // Update document state with cached versions (latest from registry)
         if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
             doc.update_cached_versions(fetch_result.versions);
-            // Re-key raw -> normalized (§3.1): `FetchResult::yanked_versions`
-            // is raw-keyed, `DocumentState::yanked_versions` is normalized.
+            // Re-key raw -> normalized (§3.1): `FetchResult`'s three fields are
+            // raw-keyed, `DocumentState::outcomes` is normalized.
             let formatter = ecosystem_clone.formatter();
-            doc.update_deprecations(
-                fetch_result
-                    .deprecations
-                    .into_iter()
-                    .map(|(name, d)| (formatter.normalize_package_name(&name), d))
-                    .collect(),
-            );
-            doc.update_yanked_versions(
-                fetch_result
-                    .yanked_versions
-                    .into_iter()
-                    .map(|(name, v)| (formatter.normalize_package_name(&name), v))
-                    .collect(),
-            );
+            let mut outcomes = DependencyOutcomes::new();
+            for (name, d) in fetch_result.deprecations {
+                outcomes.set_deprecation(formatter.normalize_package_name(&name), d);
+            }
+            for (name, v) in fetch_result.yanked_versions {
+                outcomes.set_yanked(formatter.normalize_package_name(&name), v);
+            }
+            for (name, failure) in fetch_result.fetch_failed {
+                outcomes.set_fetch_failure(formatter.normalize_package_name(&name), failure);
+            }
             // `collided_names` (spec FR-011) are merged in alongside genuine fetch
             // failures so `generate_diagnostics_from_cache` reports "lookup could not
             // be determined" rather than a false "Unknown package" for a name that
             // was deliberately never queried, not one that doesn't exist. Genuine
-            // failures are inserted first and `collided_names` uses `or_insert` so a
-            // collided name that normalizes to the same key as a genuine
-            // `Actionable`/`Transient` failure never clobbers it (impl-critic M2).
-            doc.update_fetch_failed({
-                let mut fetch_failed: HashMap<String, FetchFailure> = fetch_result
-                    .fetch_failed
-                    .into_iter()
-                    .map(|(name, failure)| (formatter.normalize_package_name(&name), failure))
-                    .collect();
-                for name in collided_names {
-                    fetch_failed
-                        .entry(formatter.normalize_package_name(&name))
-                        .or_insert(FetchFailure::NotAttempted);
-                }
-                fetch_failed
-            });
+            // failures are inserted first and `collided_names` uses
+            // `set_fetch_failure_if_absent` so a collided name that normalizes to the
+            // same key as a genuine `Actionable`/`Transient` failure never clobbers it
+            // (impl-critic M2).
+            for name in collided_names {
+                outcomes.set_fetch_failure_if_absent(
+                    formatter.normalize_package_name(&name),
+                    FetchFailure::NotAttempted,
+                );
+            }
+            doc.replace_outcomes(outcomes);
             if success {
                 doc.set_loaded();
             } else {
@@ -1797,13 +1783,7 @@ pub async fn handle_document_change(
             .vulnerabilities
             .remove(&formatter.normalize_package_name(removed_dep));
         doc_state
-            .yanked_versions
-            .remove(&formatter.normalize_package_name(removed_dep));
-        doc_state
-            .fetch_failed
-            .remove(&formatter.normalize_package_name(removed_dep));
-        doc_state
-            .deprecations
+            .outcomes
             .remove(&formatter.normalize_package_name(removed_dep));
     }
 
@@ -1822,12 +1802,9 @@ pub async fn handle_document_change(
     // version — editing which version is pinned does not make the package
     // any less (or more) deprecated, so there is nothing stale to drop here.
     for changed_dep in &diff.version_changed {
-        doc_state
-            .yanked_versions
-            .remove(&formatter.normalize_package_name(changed_dep));
-        doc_state
-            .fetch_failed
-            .remove(&formatter.normalize_package_name(changed_dep));
+        let normalized = formatter.normalize_package_name(changed_dep);
+        doc_state.outcomes.clear_yanked(&normalized);
+        doc_state.outcomes.clear_fetch_failure(&normalized);
     }
 
     state.update_document(uri.clone(), doc_state);
@@ -2034,20 +2011,21 @@ pub async fn handle_document_change(
             // Re-key raw -> normalized (§3.1), same as the didOpen path.
             let formatter = ecosystem_clone.formatter();
             for (name, version) in fetch_result.yanked_versions {
-                doc.yanked_versions
-                    .insert(formatter.normalize_package_name(&name), version);
+                doc.outcomes
+                    .set_yanked(formatter.normalize_package_name(&name), version);
             }
             for (name, failure) in fetch_result.fetch_failed {
-                doc.fetch_failed
-                    .insert(formatter.normalize_package_name(&name), failure);
+                doc.outcomes
+                    .set_fetch_failure(formatter.normalize_package_name(&name), failure);
             }
-            // `or_insert` (not `insert`): a collided name normalizing to the same key
-            // as a genuine failure just recorded above must not clobber it
-            // (impl-critic M2).
+            // `set_fetch_failure_if_absent` (not `set_fetch_failure`): a collided name
+            // normalizing to the same key as a genuine failure just recorded above must
+            // not clobber it (impl-critic M2).
             for name in collided_names {
-                doc.fetch_failed
-                    .entry(formatter.normalize_package_name(&name))
-                    .or_insert(FetchFailure::NotAttempted);
+                doc.outcomes.set_fetch_failure_if_absent(
+                    formatter.normalize_package_name(&name),
+                    FetchFailure::NotAttempted,
+                );
             }
             merge_deprecations_after_fetch(
                 &mut doc,
@@ -4825,14 +4803,18 @@ dependencies = ["requests>=2.0.0"]
                 parse_result,
             );
             doc_state.update_cached_versions(fetch_result.versions);
-            doc_state.update_yanked_versions(yanked_versions.clone());
+            let mut outcomes = DependencyOutcomes::new();
+            for (name, v) in yanked_versions.clone() {
+                outcomes.set_yanked(name, v);
+            }
+            doc_state.replace_outcomes(outcomes);
             state.update_document(uri.clone(), doc_state);
 
             let doc = state.get_document(&uri).unwrap();
             let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
                 doc.parse_result().unwrap(),
                 VersionData::new(&doc.cached_versions, &doc.resolved_versions)
-                    .with_yanked(&doc.yanked_versions),
+                    .with_outcomes(&doc.outcomes),
                 formatter,
                 deps_core::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -5164,10 +5146,10 @@ time = "0.1.43"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.update_yanked_versions(HashMap::from([(
-                    "time".to_string(),
+                doc.replace_outcomes(DependencyOutcomes::new().with_yanked(
+                    "time",
                     (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
-                )]));
+                ));
             }
 
             // A whitespace-only edit: DocumentState is rebuilt from scratch,
@@ -5191,7 +5173,7 @@ time = "0.1.43"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.yanked_versions.get("time"),
+                doc.outcomes.yanked("time"),
                 Some(&(ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked))
             );
         }
@@ -5215,13 +5197,13 @@ time = "0.1.43"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.update_deprecations(HashMap::from([(
-                    "time".to_string(),
+                doc.replace_outcomes(DependencyOutcomes::new().with_deprecation(
+                    "time",
                     Deprecation {
                         reason: Some("archived".to_string()),
                         replacement: None,
                     },
-                )]));
+                ));
             }
 
             // A whitespace-only edit: DocumentState is rebuilt from scratch, which
@@ -5245,7 +5227,7 @@ time = "0.1.43"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.deprecations.get("time"),
+                doc.outcomes.deprecation("time"),
                 Some(&Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -5273,13 +5255,13 @@ time = "0.1.43"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.update_deprecations(HashMap::from([(
-                    "time".to_string(),
+                doc.replace_outcomes(DependencyOutcomes::new().with_deprecation(
+                    "time",
                     Deprecation {
                         reason: Some("archived".to_string()),
                         replacement: None,
                     },
-                )]));
+                ));
             }
 
             let content2 = r#"[dependencies]
@@ -5309,7 +5291,7 @@ serde = "1.0"
             let formatter = ecosystem.formatter();
             for removed_dep in &diff.removed {
                 doc_state2
-                    .deprecations
+                    .outcomes
                     .remove(&formatter.normalize_package_name(removed_dep));
             }
 
@@ -5317,7 +5299,7 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                !doc.deprecations.contains_key("time"),
+                doc.outcomes.deprecation("time").is_none(),
                 "removed dependency's deprecation entry must be pruned"
             );
         }
@@ -5345,17 +5327,17 @@ time = "0.1.44"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.update_yanked_versions(HashMap::from([(
-                    "time".to_string(),
-                    ("0.1.44".into(), RemovalStatus::Yanked),
-                )]));
-                doc.update_deprecations(HashMap::from([(
-                    "time".to_string(),
-                    Deprecation {
-                        reason: Some("archived".to_string()),
-                        replacement: None,
-                    },
-                )]));
+                doc.replace_outcomes(
+                    DependencyOutcomes::new()
+                        .with_yanked("time", ("0.1.44".into(), RemovalStatus::Yanked))
+                        .with_deprecation(
+                            "time",
+                            Deprecation {
+                                reason: Some("archived".to_string()),
+                                replacement: None,
+                            },
+                        ),
+                );
             }
 
             // Edit the pin from a yanked version to a safe one — the *version-level*
@@ -5374,17 +5356,115 @@ time = "0.1.43"
             if let Some(old_doc) = state.get_document(&uri) {
                 preserve_cache(&mut doc_state2, &old_doc);
             }
-            doc_state2.yanked_versions.remove("time");
+            doc_state2.outcomes.clear_yanked("time");
 
             state.update_document(uri.clone(), doc_state2);
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                !doc.yanked_versions.contains_key("time"),
+                doc.outcomes.yanked("time").is_none(),
                 "the stale version-level yanked finding must be dropped"
             );
             assert_eq!(
-                doc.deprecations.get("time"),
+                doc.outcomes.deprecation("time"),
+                Some(&Deprecation {
+                    reason: Some("archived".to_string()),
+                    replacement: None,
+                }),
+                "the package-level deprecation finding must survive a version-only edit"
+            );
+        }
+
+        /// Mirrors `test_deprecations_survive_version_change_unlike_yanked_versions` for
+        /// `fetch_failed` (#267): the `version_changed` loop in `handle_document_change`
+        /// clears both `yanked` and `fetch_failed` together (lifecycle.rs, right above
+        /// `deps_to_fetch.extend`), never `deprecation`. With all three channels set on
+        /// the same normalized name, a version-only edit must clear the first two and
+        /// leave the deprecation finding untouched.
+        #[tokio::test]
+        async fn test_fetch_failed_and_yanked_cleared_but_deprecation_survives_version_change() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let content1 = r#"[dependencies]
+time = "0.1.44"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &uri).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.replace_outcomes(
+                    DependencyOutcomes::new()
+                        .with_yanked("time", ("0.1.44".into(), RemovalStatus::Yanked))
+                        .with_fetch_failure("time", FetchFailure::Transient)
+                        .with_deprecation(
+                            "time",
+                            Deprecation {
+                                reason: Some("archived".to_string()),
+                                replacement: None,
+                            },
+                        ),
+                );
+            }
+
+            let content2 = r#"[dependencies]
+time = "0.1.43"
+"#;
+            let old_deps = dependency_version_map(
+                ecosystem
+                    .parse_manifest(content1, &uri)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+            );
+            let new_deps = dependency_version_map(
+                ecosystem
+                    .parse_manifest(content2, &uri)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+            );
+            let diff = DependencyDiff::compute(&old_deps, &new_deps);
+            assert_eq!(diff.version_changed, vec![PackageName::new("time")]);
+
+            let parse_result2 = ecosystem.parse_manifest(content2, &uri).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            let formatter = ecosystem.formatter();
+            for changed_dep in &diff.version_changed {
+                let normalized = formatter.normalize_package_name(changed_dep);
+                doc_state2.outcomes.clear_yanked(&normalized);
+                doc_state2.outcomes.clear_fetch_failure(&normalized);
+            }
+
+            state.update_document(uri.clone(), doc_state2);
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                doc.outcomes.yanked("time").is_none(),
+                "the stale version-level yanked finding must be dropped"
+            );
+            assert!(
+                doc.outcomes.fetch_failure("time").is_none(),
+                "the stale fetch-failure finding must be dropped"
+            );
+            assert_eq!(
+                doc.outcomes.deprecation("time"),
                 Some(&Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -5402,7 +5482,7 @@ time = "0.1.43"
             let formatter = ecosystem.formatter();
             let mut doc =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
-            doc.deprecations.insert(
+            doc.outcomes.set_deprecation(
                 "vendor/a".to_string(),
                 Deprecation {
                     reason: None,
@@ -5428,7 +5508,7 @@ time = "0.1.43"
             );
 
             assert_eq!(
-                doc.deprecations.get("vendor/a"),
+                doc.outcomes.deprecation("vendor/a"),
                 Some(&Deprecation {
                     reason: None,
                     replacement: Some("vendor/a2".to_string()),
@@ -5436,7 +5516,7 @@ time = "0.1.43"
                 "a finding for a name not in this round's fetch must survive untouched"
             );
             assert_eq!(
-                doc.deprecations.get("vendor/b"),
+                doc.outcomes.deprecation("vendor/b"),
                 Some(&Deprecation {
                     reason: Some("abandoned".to_string()),
                     replacement: None,
@@ -5454,7 +5534,7 @@ time = "0.1.43"
             let formatter = ecosystem.formatter();
             let mut doc =
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
-            doc.deprecations.insert(
+            doc.outcomes.set_deprecation(
                 "vendor/a".to_string(),
                 Deprecation {
                     reason: None,
@@ -5471,7 +5551,7 @@ time = "0.1.43"
             );
 
             assert!(
-                !doc.deprecations.contains_key("vendor/a"),
+                doc.outcomes.deprecation("vendor/a").is_none(),
                 "a name that was fetched and produced no finding must be cleared"
             );
         }
@@ -5513,7 +5593,7 @@ time = "0.1.43"
                 merge_deprecations_after_fetch(&mut doc, &names, fetched, formatter);
 
                 assert_eq!(
-                    doc.deprecations.get("vendor/package"),
+                    doc.outcomes.deprecation("vendor/package"),
                     Some(&Deprecation {
                         reason: None,
                         replacement: Some("vendor/other".to_string()),
@@ -5544,10 +5624,10 @@ time = "0.1.43"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.update_yanked_versions(HashMap::from([(
-                    "time".to_string(),
+                doc.replace_outcomes(DependencyOutcomes::new().with_yanked(
+                    "time",
                     (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
-                )]));
+                ));
             }
 
             let content2 = r#"[dependencies]
@@ -5577,7 +5657,7 @@ serde = "1.0"
             let formatter = ecosystem.formatter();
             for removed_dep in &diff.removed {
                 doc_state2
-                    .yanked_versions
+                    .outcomes
                     .remove(&formatter.normalize_package_name(removed_dep));
             }
 
@@ -5585,7 +5665,7 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                !doc.yanked_versions.contains_key("time"),
+                doc.outcomes.yanked("time").is_none(),
                 "removed dependency's yanked entry must be pruned"
             );
         }
@@ -5617,10 +5697,10 @@ time = "=0.1.43"
             // `time` was found yanked at its old pin, "=0.1.43".
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.update_yanked_versions(HashMap::from([(
-                    "time".to_string(),
+                doc.replace_outcomes(DependencyOutcomes::new().with_yanked(
+                    "time",
                     (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
-                )]));
+                ));
             }
 
             // Edited to a different, safe pin — same dependency, in place.
@@ -5660,15 +5740,15 @@ time = "=0.1.44"
             let formatter = ecosystem.formatter();
             for changed_dep in &diff.version_changed {
                 doc_state2
-                    .yanked_versions
-                    .remove(&formatter.normalize_package_name(changed_dep));
+                    .outcomes
+                    .clear_yanked(&formatter.normalize_package_name(changed_dep));
             }
 
             state.update_document(uri.clone(), doc_state2);
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                !doc.yanked_versions.contains_key("time"),
+                doc.outcomes.yanked("time").is_none(),
                 "stale yanked entry against the OLD version must not survive an in-place edit"
             );
         }
@@ -5696,10 +5776,9 @@ time = "0.1.43"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.update_fetch_failed(HashMap::from([(
-                    "time".to_string(),
-                    FetchFailure::Transient,
-                )]));
+                doc.replace_outcomes(
+                    DependencyOutcomes::new().with_fetch_failure("time", FetchFailure::Transient),
+                );
             }
 
             let content2 = r#"[dependencies]
@@ -5730,14 +5809,14 @@ serde = "1.0"
             // carries `fetch_failed` across the edit, not just the final
             // (already-pruned) state below.
             assert!(
-                doc_state2.fetch_failed.contains_key("time"),
+                doc_state2.outcomes.fetch_failure("time").is_some(),
                 "preserve_cache must carry fetch_failed across an edit"
             );
 
             let formatter = ecosystem.formatter();
             for removed_dep in &diff.removed {
                 doc_state2
-                    .fetch_failed
+                    .outcomes
                     .remove(&formatter.normalize_package_name(removed_dep));
             }
 
@@ -5745,7 +5824,7 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                !doc.fetch_failed.contains_key("time"),
+                doc.outcomes.fetch_failure("time").is_none(),
                 "removed dependency's fetch_failed entry must be pruned"
             );
         }
@@ -5807,10 +5886,10 @@ time = "0.1.43"
             // Stale: `time` was yanked as of the last fetch.
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.update_yanked_versions(HashMap::from([(
-                    "time".to_string(),
+                doc.replace_outcomes(DependencyOutcomes::new().with_yanked(
+                    "time",
                     (ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked),
-                )]));
+                ));
             }
 
             // Identical manifest content re-parsed (as happens on a
@@ -5834,7 +5913,7 @@ time = "0.1.43"
             // lockfile in the meantime, nothing here would know.
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.yanked_versions.get("time"),
+                doc.outcomes.yanked("time"),
                 Some(&(ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked))
             );
         }

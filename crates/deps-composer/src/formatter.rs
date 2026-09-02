@@ -1114,9 +1114,8 @@ mod tests {
             "today's incidental coupling: the version search never runs either"
         );
 
-        let mut deprecations = HashMap::new();
-        deprecations.insert(
-            "vendor/package".to_string(),
+        let outcomes = deps_core::lsp_helpers::DependencyOutcomes::new().with_deprecation(
+            "vendor/package",
             deps_core::Deprecation {
                 reason: None,
                 replacement: Some("other/package".to_string()),
@@ -1124,8 +1123,7 @@ mod tests {
         );
         let cached = HashMap::new();
         let resolved = HashMap::new();
-        let versions =
-            deps_core::VersionData::new(&cached, &resolved).with_deprecations(&deprecations);
+        let versions = deps_core::VersionData::new(&cached, &resolved).with_outcomes(&outcomes);
 
         let actions = deps_core::lsp_helpers::generate_code_actions(
             &parse_result,
@@ -1185,9 +1183,8 @@ mod tests {
         assert_ne!(dep.name_range, Range::default());
         let version_range = dep.version_range.expect("version_range must be present");
 
-        let mut deprecations = HashMap::new();
-        deprecations.insert(
-            "vendor/package".to_string(),
+        let outcomes = deps_core::lsp_helpers::DependencyOutcomes::new().with_deprecation(
+            "vendor/package",
             deps_core::Deprecation {
                 reason: None,
                 replacement: Some("other/package".to_string()),
@@ -1195,8 +1192,7 @@ mod tests {
         );
         let cached = HashMap::new();
         let resolved = HashMap::new();
-        let versions =
-            deps_core::VersionData::new(&cached, &resolved).with_deprecations(&deprecations);
+        let versions = deps_core::VersionData::new(&cached, &resolved).with_outcomes(&outcomes);
 
         let actions = deps_core::lsp_helpers::generate_code_actions(
             &parse_result,
