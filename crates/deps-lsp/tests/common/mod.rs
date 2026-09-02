@@ -157,6 +157,17 @@ pub(crate) struct LspClient {
     /// Lets a test prove the server actually attempted the refresh (capability
     /// negotiation worked) even though the harness deliberately never answered it.
     unanswered_refresh_requests: u64,
+    /// When `false`, `auto_respond` receives (and counts, see
+    /// [`Self::unanswered_apply_edit_request_count`]) `workspace/applyEdit` requests
+    /// but never replies — simulating the exact client behavior issue #496 was filed
+    /// against (a client that never answers `workspace/applyEdit`). Defaults to
+    /// `true` (reply immediately), matching every other server-initiated request.
+    respond_to_apply_edit: bool,
+    /// Count of `workspace/applyEdit` requests received (and deliberately left
+    /// unanswered) while [`Self::respond_to_apply_edit`] is `false`. Lets a test
+    /// prove the server actually sent the edit even though the harness never
+    /// answered it.
+    unanswered_apply_edit_requests: u64,
 }
 
 impl LspClient {
@@ -181,6 +192,8 @@ impl LspClient {
             progress_create_requests: 0,
             respond_to_refresh_requests: true,
             unanswered_refresh_requests: 0,
+            respond_to_apply_edit: true,
+            unanswered_apply_edit_requests: 0,
         }
     }
 
@@ -207,6 +220,24 @@ impl LspClient {
     #[allow(dead_code)] // Used in notification_ordering tests
     pub(crate) fn unanswered_refresh_request_count(&self) -> u64 {
         self.unanswered_refresh_requests
+    }
+
+    /// Stop auto-answering `workspace/applyEdit` server-initiated requests: they
+    /// are received and counted (see
+    /// [`Self::unanswered_apply_edit_request_count`]) but never get a reply,
+    /// simulating issue #496's exact reproduction — a client that never answers
+    /// `workspace/applyEdit`. Must be called before the request that is expected
+    /// to trigger an edit.
+    #[allow(dead_code)] // Used in lsp_integration tests
+    pub(crate) fn stop_responding_to_apply_edit(&mut self) {
+        self.respond_to_apply_edit = false;
+    }
+
+    /// Number of `workspace/applyEdit` requests received (and deliberately left
+    /// unanswered) since [`Self::stop_responding_to_apply_edit`] was called.
+    #[allow(dead_code)] // Used in lsp_integration tests
+    pub(crate) fn unanswered_apply_edit_request_count(&self) -> u64 {
+        self.unanswered_apply_edit_requests
     }
 
     /// Get all captured notifications.
@@ -398,6 +429,12 @@ impl LspClient {
             | "workspace/codeLens/refresh"
             | "client/registerCapability" => {
                 json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
+            }
+            "workspace/applyEdit" if !self.respond_to_apply_edit => {
+                // Simulate issue #496's client: receive the request but never
+                // reply to it, instead of answering immediately below.
+                self.unanswered_apply_edit_requests += 1;
+                return;
             }
             "workspace/applyEdit" => {
                 json!({ "jsonrpc": "2.0", "id": id, "result": { "applied": true } })

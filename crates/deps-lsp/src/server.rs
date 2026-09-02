@@ -747,10 +747,16 @@ impl LanguageServer for Backend {
             && let Some(args) = params.arguments.first()
             && let Ok(update_args) = serde_json::from_value::<UpdateVersionArgs>(args.clone())
         {
-            if let Some(edit) = build_update_version_edit(&update_args)
-                && let Err(e) = self.client.apply_edit(edit).await
-            {
-                tracing::error!("Failed to apply edit: {:?}", e);
+            if let Some(edit) = build_update_version_edit(&update_args) {
+                match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, self.client.apply_edit(edit))
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::error!("Failed to apply edit: {:?}", e),
+                    Err(_) => tracing::warn!(
+                        "apply_edit for deps-lsp.updateVersion timed out after {CLIENT_REFRESH_TIMEOUT:?}"
+                    ),
+                }
             }
         } else if params.command == commands::UPDATE_ALL_OUTDATED
             && let Some(args) = params.arguments.first()
@@ -869,9 +875,9 @@ impl Backend {
 
         let edit = build_update_all_outdated_edit(&uri, version, edits, supports_document_changes);
 
-        match self.client.apply_edit(edit).await {
-            Ok(response) if response.applied => {}
-            Ok(response) => {
+        match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, self.client.apply_edit(edit)).await {
+            Ok(Ok(response)) if response.applied => {}
+            Ok(Ok(response)) => {
                 tracing::warn!(
                     "workspace/applyEdit for {:?} was rejected: {:?}",
                     uri,
@@ -884,12 +890,26 @@ impl Backend {
                     )
                     .await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::error!("Failed to apply edit for {:?}: {:?}", uri, e);
                 self.client
                     .show_message(
                         MessageType::WARNING,
                         "deps-lsp: failed to apply dependency updates",
+                    )
+                    .await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "apply_edit for {:?} timed out after {CLIENT_REFRESH_TIMEOUT:?}",
+                    uri
+                );
+                self.client
+                    .show_message(
+                        MessageType::WARNING,
+                        format!(
+                            "deps-lsp: the editor did not respond to the update within {CLIENT_REFRESH_TIMEOUT:?}"
+                        ),
                     )
                     .await;
             }

@@ -23,6 +23,10 @@ use tower_lsp_server::ls_types::Uri;
 /// limit as the user keeps editing) and, via re-export, for the `initialized()`
 /// registration requests and `workspace/diagnostic/refresh` in `server.rs` (S1: same
 /// hang risk, an unresponsive client would otherwise stall those handlers forever).
+/// Also reused (not itself a "refresh") for `workspace/applyEdit` in `server.rs`'s
+/// `execute_command` handlers (issue #496): same directly-awaited hang risk, since a
+/// client that never answers `applyEdit` would otherwise permanently occupy one of
+/// `tower_lsp_server`'s limited `buffer_unordered` concurrency slots.
 pub(crate) const CLIENT_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Re-export LoadingState from deps-core for convenience
