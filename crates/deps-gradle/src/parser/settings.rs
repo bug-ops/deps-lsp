@@ -6,17 +6,14 @@ use crate::parser::{GradleParseResult, utf16_len};
 use crate::types::GradleDependency;
 use deps_core::Result;
 use regex::Regex;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 use tower_lsp_server::ls_types::{Position, Range, Uri};
 
 /// Matches: id "plugin.id" version "1.0.0" (Groovy) or id("plugin.id") version "1.0.0" (Kotlin DSL)
-static RE_PLUGIN: OnceLock<Regex> = OnceLock::new();
-
-fn re_plugin() -> &'static Regex {
-    RE_PLUGIN.get_or_init(|| {
-        Regex::new(r#"id\s*\(?\s*['"]([^'"]+)['"]\s*\)?\s+version\s+['"]([^'"]+)['"]"#).unwrap()
-    })
-}
+static RE_PLUGIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"id\s*\(?\s*['"]([^'"]+)['"]\s*\)?\s+version\s+['"]([^'"]+)['"]"#)
+        .expect("RE_PLUGIN")
+});
 
 /// Finds the LSP range of `plugin_id` within `line`.
 fn find_plugin_name_range(line: &str, line_idx: u32, plugin_id: &str) -> Range {
@@ -102,7 +99,7 @@ pub fn parse_settings(content: &str, uri: &Uri) -> Result<GradleParseResult> {
 
         let line_u32 = line_idx as u32;
 
-        for caps in re_plugin().captures_iter(line) {
+        for caps in RE_PLUGIN.captures_iter(line) {
             let plugin_id = caps.get(1).map_or("", |m| m.as_str()).to_string();
             let version = caps.get(2).map_or("", |m| m.as_str()).trim().to_string();
 
