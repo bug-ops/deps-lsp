@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-lsp**: `cargo.workspace_registries`' `public_only`/`off` now enforced at connect time (resolved address) and on every redirect hop, not just the declared URL string at parse time, closing a DNS-rebinding bypass to RFC1918/CGNAT-range hosts (resolves #455) (#460)
 - **deps-core, deps-lsp**: the OSV vulnerability-fix code action's recommended target version is now independently verified against OSV before being offered, instead of only ever checking the registry's "latest" version (resolves #462) (#467)
 - **deps-github-actions, deps-core**: hover no longer renders a dead empty-URL link or a misleading "Press Cmd+. to update version" footer for a non-resolvable `uses:` ref (local composite action, Docker image) (resolves #474)
+- **deps-core, deps-github-actions, deps-lsp**: a rate-limited GitHub Actions registry lookup now surfaces its actionable hint (e.g. "set GITHUB_TOKEN") in the "Registry lookup failed" diagnostic instead of the generic fallback (resolves #478)
 
 ## [0.11.1] - 2026-09-01
 

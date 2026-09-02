@@ -56,6 +56,13 @@ pub enum DepsError {
     #[error("cache error: {0}")]
     CacheError(String),
 
+    /// A registry request was rejected for exceeding a rate limit. Unlike other variants,
+    /// `message` is a pre-vetted, IP-free, actionable hint safe to surface verbatim in a
+    /// per-dependency diagnostic (see [`Self::fetch_failure`]) — never build one from a raw
+    /// registry error body, which can embed the caller's public IP (`github.rs:332-346`).
+    #[error("{message}")]
+    RateLimited { message: String },
+
     #[error("{package} not found on {registry}")]
     PackageNotFound {
         package: String,
@@ -147,6 +154,62 @@ impl DepsError {
             Self::PackageNotFound { .. } | Self::HttpStatus { status: 404, .. }
         )
     }
+
+    /// Classifies this error for the per-dependency "registry lookup failed" diagnostic
+    /// (#478), distinguishing a failure with a safe, actionable hint to show the user from
+    /// one whose raw text must never reach a diagnostic.
+    ///
+    /// **Security-load-bearing invariant**: [`FetchFailure::Actionable`] is produced *only*
+    /// from [`Self::RateLimited`]'s pre-vetted, IP-free canned message. Every other variant
+    /// must classify as [`FetchFailure::Transient`] — never call `.to_string()`/`Display` on
+    /// an arbitrary `DepsError` to build an `Actionable` value, since a raw `HttpStatus` or
+    /// `RegistryError` body can embed the caller's public IP (`github.rs:332-346`, exercised
+    /// by the `github` crate's `test_parse_tags_page_github_rate_limit_returns_error`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::error::{DepsError, FetchFailure};
+    ///
+    /// let rate_limited = DepsError::RateLimited { message: "set GITHUB_TOKEN".into() };
+    /// assert_eq!(
+    ///     rate_limited.fetch_failure(),
+    ///     FetchFailure::Actionable("set GITHUB_TOKEN".into())
+    /// );
+    ///
+    /// let other = DepsError::CacheError("connection reset".into());
+    /// assert_eq!(other.fetch_failure(), FetchFailure::Transient);
+    /// ```
+    #[must_use]
+    pub fn fetch_failure(&self) -> FetchFailure {
+        match self {
+            Self::RateLimited { message } => FetchFailure::Actionable(message.clone()),
+            _ => FetchFailure::Transient,
+        }
+    }
+}
+
+/// Outcome of a registry fetch attempt for one dependency, as recorded in
+/// `DocumentState::fetch_failed` and rendered by
+/// [`crate::lsp_helpers::generate_diagnostics_from_cache`] (#478).
+///
+/// Replaces a bare `HashSet<PackageName>` membership check so the per-dependency diagnostic
+/// can distinguish a failure with a safe, user-actionable hint from an opaque one, without
+/// ever threading raw, potentially IP-bearing error text into the diagnostic (see
+/// [`DepsError::fetch_failure`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FetchFailure {
+    /// The fetch failed with a pre-vetted, safe-to-display hint (currently only produced
+    /// from [`DepsError::RateLimited`]).
+    Actionable(String),
+    /// The fetch failed for a reason with no safe user-facing detail to show — the
+    /// diagnostic falls back to a generic "lookup failed" message.
+    Transient,
+    /// The dependency was never actually queried (e.g. a name/source collision detected
+    /// before the fetch, see `deps-lsp`'s `dedup_dependencies_by_source`) — renders the
+    /// same generic "lookup failed" message as [`Self::Transient`], since the absence of
+    /// an attempt is not evidence the package doesn't exist.
+    NotAttempted,
 }
 
 /// Convenience type alias for `Result<T, DepsError>`.
@@ -276,6 +339,77 @@ mod tests {
             error
                 .to_string()
                 .starts_with("failed to parse PyPI response for flask:")
+        );
+    }
+
+    /// Exhaustive companion to the doc-test on [`DepsError::fetch_failure`]: every
+    /// variant other than [`DepsError::RateLimited`] must classify as
+    /// [`FetchFailure::Transient`]. This is the invariant the doc comment calls
+    /// security-load-bearing (a future variant wired to `Actionable` by mistake
+    /// could leak raw, potentially IP-bearing error text into a diagnostic), so it
+    /// must be a real test enumerating every variant, not just the 2-variant
+    /// doc-test spot check.
+    #[test]
+    fn test_fetch_failure_classifies_every_non_rate_limited_variant_as_transient() {
+        // A `reqwest::Error` built from an invalid URL — `RequestBuilder::build`
+        // is synchronous and fails on URL parsing alone, so this needs no network
+        // access or async runtime.
+        let reqwest_err = reqwest::Client::new()
+            .get("not a valid url")
+            .build()
+            .unwrap_err();
+        let json_err = serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err();
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+
+        let non_rate_limited = [
+            DepsError::ParseError {
+                file_type: "Cargo.toml".into(),
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad")),
+            },
+            DepsError::RegistryError {
+                package: "flask".into(),
+                source: reqwest_err,
+            },
+            DepsError::CacheError("connection reset".into()),
+            DepsError::PackageNotFound {
+                package: "flask".into(),
+                registry: "PyPI",
+            },
+            DepsError::HttpStatus {
+                url: "https://example.com".into(),
+                status: 500,
+            },
+            DepsError::ApiResponse {
+                package: "flask".into(),
+                registry: "PyPI",
+                source: json_err,
+            },
+            DepsError::ResponseTooLarge {
+                url: "https://example.com".into(),
+                limit: 1024,
+            },
+            DepsError::InvalidVersionReq("bad range".into()),
+            DepsError::Io(io_err),
+            DepsError::Json(serde_json::from_str::<serde_json::Value>("{bad}").unwrap_err()),
+            DepsError::UnsupportedEcosystem("unknown".into()),
+            DepsError::AmbiguousEcosystem("file.txt".into()),
+            DepsError::InvalidUri("not a uri".into()),
+        ];
+
+        for error in non_rate_limited {
+            assert_eq!(
+                error.fetch_failure(),
+                FetchFailure::Transient,
+                "expected Transient for {error:?}"
+            );
+        }
+
+        let rate_limited = DepsError::RateLimited {
+            message: "set GITHUB_TOKEN to increase the rate limit".into(),
+        };
+        assert_eq!(
+            rate_limited.fetch_failure(),
+            FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".into())
         );
     }
 }

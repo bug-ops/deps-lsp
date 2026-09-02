@@ -1,13 +1,13 @@
 //! Shared LSP response builders.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
 
 use crate::osv::VulnerabilityMap;
 use crate::{
-    ConcreteVersion, Dependency, Deprecation, EcosystemId, InvalidPackageName, PackageName,
-    RemovalStatus, VersionReq,
+    ConcreteVersion, Dependency, Deprecation, EcosystemId, FetchFailure, InvalidPackageName,
+    PackageName, RemovalStatus, VersionReq,
 };
 
 mod code_actions;
@@ -201,7 +201,7 @@ pub struct VersionData<'a> {
     /// couldn't be asked" (#267) — a `cached` miss alone conflates both into
     /// a misleading "Unknown package" diagnostic. `None` when no fetch has
     /// run yet, same convention as [`Self::yanked`].
-    pub fetch_failed: Option<&'a HashSet<String>>,
+    pub fetch_failed: Option<&'a HashMap<String, FetchFailure>>,
     /// This document's ecosystem, when the caller has one to give. `None` in
     /// most test fixtures and a handful of ecosystem-crate self-tests that
     /// predate this field.
@@ -323,16 +323,16 @@ impl<'a> VersionData<'a> {
     ///
     /// ```
     /// use deps_core::VersionData;
-    /// use std::collections::{HashMap, HashSet};
+    /// use std::collections::HashMap;
     ///
     /// let cached = HashMap::new();
     /// let resolved = HashMap::new();
-    /// let fetch_failed = HashSet::new();
+    /// let fetch_failed = HashMap::new();
     /// let versions = VersionData::new(&cached, &resolved).with_fetch_failed(&fetch_failed);
     /// assert!(versions.fetch_failed.is_some());
     /// ```
     #[must_use]
-    pub fn with_fetch_failed(mut self, fetch_failed: &'a HashSet<String>) -> Self {
+    pub fn with_fetch_failed(mut self, fetch_failed: &'a HashMap<String, FetchFailure>) -> Self {
         self.fetch_failed = Some(fetch_failed);
         self
     }

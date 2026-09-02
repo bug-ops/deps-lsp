@@ -12,6 +12,7 @@ use deps_core::ConcreteVersion;
 use deps_core::Deprecation;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
+use deps_core::FetchFailure;
 use deps_core::PackageName;
 use deps_core::PackageVersions;
 use deps_core::Registry;
@@ -978,7 +979,7 @@ struct FetchResult {
     /// Lets diagnostic generation (#267) distinguish "the registry said this
     /// package doesn't exist" from "the registry couldn't be asked" instead
     /// of conflating both into a misleading "Unknown package" diagnostic.
-    fetch_failed: HashSet<PackageName>,
+    fetch_failed: HashMap<PackageName, FetchFailure>,
     /// Number of packages that failed to fetch (timeout or error)
     failed_count: usize,
     /// First actionable error message (shown to user via `window/showMessage`)
@@ -1080,7 +1081,7 @@ async fn fetch_latest_versions_parallel(
                 .await;
 
                 let mut yanked: Option<(PackageName, ConcreteVersion, RemovalStatus)> = None;
-                let mut failed_name: Option<PackageName> = None;
+                let mut failed_name: Option<(PackageName, FetchFailure)> = None;
                 let mut deprecation: Option<(PackageName, Deprecation)> = None;
                 let version = match result {
                     Ok(Ok(versions)) => {
@@ -1191,7 +1192,7 @@ async fn fetch_latest_versions_parallel(
                                     // package") is not a fetch failure — only
                                     // an unanswerable request is (#267 C1).
                                     if !e.is_not_found() {
-                                        failed_name = Some(name.clone());
+                                        failed_name = Some((name.clone(), e.fetch_failure()));
                                     }
                                     None
                                 }
@@ -1202,7 +1203,7 @@ async fn fetch_latest_versions_parallel(
                                         timeout.as_secs()
                                     );
                                     failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    failed_name = Some(name.clone());
+                                    failed_name = Some((name.clone(), FetchFailure::Transient));
                                     None
                                 }
                             }
@@ -1300,14 +1301,14 @@ async fn fetch_latest_versions_parallel(
                         // instead of "Unknown package", inverting the bug
                         // this field exists to fix.
                         if !e.is_not_found() {
-                            failed_name = Some(name.clone());
+                            failed_name = Some((name.clone(), e.fetch_failure()));
                         }
                         None
                     }
                     Err(_) => {
                         tracing::warn!(package = %name, "fetch timed out ({}s)", timeout.as_secs());
                         failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        failed_name = Some(name.clone());
+                        failed_name = Some((name.clone(), FetchFailure::Transient));
                         None
                     }
                 };
@@ -1326,7 +1327,7 @@ async fn fetch_latest_versions_parallel(
 
     let mut versions = HashMap::with_capacity(results.len());
     let mut yanked_versions = HashMap::new();
-    let mut fetch_failed = HashSet::new();
+    let mut fetch_failed = HashMap::new();
     let mut deprecations = HashMap::new();
     for (version, yanked, failed_name, deprecation) in results {
         if let Some((name, v)) = version {
@@ -1335,8 +1336,8 @@ async fn fetch_latest_versions_parallel(
         if let Some((name, v, status)) = yanked {
             yanked_versions.insert(name, (v, status));
         }
-        if let Some(name) = failed_name {
-            fetch_failed.insert(name);
+        if let Some((name, failure)) = failed_name {
+            fetch_failed.insert(name, failure);
         }
         if let Some((name, d)) = deprecation {
             deprecations.insert(name, d);
@@ -1584,15 +1585,23 @@ pub async fn handle_document_open(
             // `collided_names` (spec FR-011) are merged in alongside genuine fetch
             // failures so `generate_diagnostics_from_cache` reports "lookup could not
             // be determined" rather than a false "Unknown package" for a name that
-            // was deliberately never queried, not one that doesn't exist.
-            doc.update_fetch_failed(
-                fetch_result
+            // was deliberately never queried, not one that doesn't exist. Genuine
+            // failures are inserted first and `collided_names` uses `or_insert` so a
+            // collided name that normalizes to the same key as a genuine
+            // `Actionable`/`Transient` failure never clobbers it (impl-critic M2).
+            doc.update_fetch_failed({
+                let mut fetch_failed: HashMap<String, FetchFailure> = fetch_result
                     .fetch_failed
                     .into_iter()
-                    .chain(collided_names)
-                    .map(|name| formatter.normalize_package_name(&name))
-                    .collect(),
-            );
+                    .map(|(name, failure)| (formatter.normalize_package_name(&name), failure))
+                    .collect();
+                for name in collided_names {
+                    fetch_failed
+                        .entry(formatter.normalize_package_name(&name))
+                        .or_insert(FetchFailure::NotAttempted);
+                }
+                fetch_failed
+            });
             if success {
                 doc.set_loaded();
             } else {
@@ -1984,9 +1993,17 @@ pub async fn handle_document_change(
                 doc.yanked_versions
                     .insert(formatter.normalize_package_name(&name), version);
             }
-            for name in fetch_result.fetch_failed.into_iter().chain(collided_names) {
+            for (name, failure) in fetch_result.fetch_failed {
                 doc.fetch_failed
-                    .insert(formatter.normalize_package_name(&name));
+                    .insert(formatter.normalize_package_name(&name), failure);
+            }
+            // `or_insert` (not `insert`): a collided name normalizing to the same key
+            // as a genuine failure just recorded above must not clobber it
+            // (impl-critic M2).
+            for name in collided_names {
+                doc.fetch_failed
+                    .entry(formatter.normalize_package_name(&name))
+                    .or_insert(FetchFailure::NotAttempted);
             }
             merge_deprecations_after_fetch(
                 &mut doc,
@@ -2602,7 +2619,7 @@ mod tests {
         // be recorded the same way as a hard registry error.
         assert_eq!(
             result.fetch_failed,
-            HashSet::from([PackageName::new("slow-package")]),
+            HashMap::from([(PackageName::new("slow-package"), FetchFailure::Transient)]),
             "timed-out package must be recorded in fetch_failed"
         );
     }
@@ -3729,10 +3746,10 @@ mod tests {
         // "genuinely not found" instead of reporting "Unknown package".
         assert_eq!(
             result.fetch_failed,
-            HashSet::from([
-                PackageName::new("package-1"),
-                PackageName::new("package-2"),
-                PackageName::new("package-3"),
+            HashMap::from([
+                (PackageName::new("package-1"), FetchFailure::Transient),
+                (PackageName::new("package-2"), FetchFailure::Transient),
+                (PackageName::new("package-3"), FetchFailure::Transient),
             ]),
             "every errored package must be recorded in fetch_failed"
         );
@@ -3968,7 +3985,7 @@ mod tests {
         assert!(result.versions.is_empty());
         assert_eq!(
             result.fetch_failed,
-            HashSet::from([PackageName::new("flaky")]),
+            HashMap::from([(PackageName::new("flaky"), FetchFailure::Transient)]),
             "the fallback's own non-not-found error must be recorded in fetch_failed, \
              but its not-found error must not"
         );
@@ -4043,7 +4060,7 @@ mod tests {
         assert!(result.versions.is_empty());
         assert_eq!(
             result.fetch_failed,
-            HashSet::from([PackageName::new("slow-fallback")])
+            HashMap::from([(PackageName::new("slow-fallback"), FetchFailure::Transient)])
         );
         assert_eq!(result.failed_count, 1);
     }
@@ -5587,7 +5604,10 @@ time = "0.1.43"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.update_fetch_failed(HashSet::from(["time".to_string()]));
+                doc.update_fetch_failed(HashMap::from([(
+                    "time".to_string(),
+                    FetchFailure::Transient,
+                )]));
             }
 
             let content2 = r#"[dependencies]
@@ -5618,7 +5638,7 @@ serde = "1.0"
             // carries `fetch_failed` across the edit, not just the final
             // (already-pruned) state below.
             assert!(
-                doc_state2.fetch_failed.contains("time"),
+                doc_state2.fetch_failed.contains_key("time"),
                 "preserve_cache must carry fetch_failed across an edit"
             );
 
@@ -5633,7 +5653,7 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                !doc.fetch_failed.contains("time"),
+                !doc.fetch_failed.contains_key("time"),
                 "removed dependency's fetch_failed entry must be pruned"
             );
         }

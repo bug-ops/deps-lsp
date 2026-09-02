@@ -103,11 +103,11 @@ pub fn validate_owner_repo(name: &str) -> Result<()> {
 /// (60 req/h per IP, vs 5000 req/h with a token).
 #[must_use]
 pub fn github_rate_limit_error() -> DepsError {
-    DepsError::CacheError(
-        "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit (5000 req/h). \
-         Run: export GITHUB_TOKEN=$(gh auth token)"
+    DepsError::RateLimited {
+        message: "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit \
+                   (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)"
             .into(),
-    )
+    }
 }
 
 /// Shared cache, auth-header, and API-base state for a GitHub-tags-backed registry client.

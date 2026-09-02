@@ -587,7 +587,34 @@ mod tests {
 
         let registry = mock_registry(&server.url(), false);
         let err = registry.get_versions("owner/repo").await.unwrap_err();
+        // Guards the variant itself (#478), not just the rendered text: a
+        // regression that left the old, differently-classified error type in
+        // place while keeping "GITHUB_TOKEN" in its `Display` text would pass
+        // a `to_string().contains(...)` check but must fail here.
+        assert!(
+            matches!(err, DepsError::RateLimited { .. }),
+            "expected DepsError::RateLimited, got {err:?}"
+        );
         assert!(err.to_string().contains("GITHUB_TOKEN"));
+
+        // Trace the real production error all the way to the diagnostic-facing
+        // classification: a rate-limited fetch must become an `Actionable`
+        // `FetchFailure` carrying the same hint, never `Transient`.
+        let failure = err.fetch_failure();
+        assert!(
+            matches!(&failure, deps_core::error::FetchFailure::Actionable(hint) if hint.contains("GITHUB_TOKEN")),
+            "expected Actionable hint mentioning GITHUB_TOKEN, got {failure:?}"
+        );
+
+        // And through the same `HashMap<String, FetchFailure>` shape
+        // `deps-lsp`'s document lifecycle threads into
+        // `generate_diagnostics_from_cache`.
+        let fetch_failed: HashMap<String, deps_core::error::FetchFailure> =
+            HashMap::from([("owner/repo".to_string(), failure)]);
+        assert!(matches!(
+            fetch_failed.get("owner/repo"),
+            Some(deps_core::error::FetchFailure::Actionable(_))
+        ));
     }
 
     #[tokio::test]
