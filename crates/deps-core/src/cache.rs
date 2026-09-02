@@ -1,9 +1,12 @@
 use crate::error::{DepsError, Result};
+use crate::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use reqwest::{Client, Response, StatusCode, Url, header};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 /// Maximum number of cached entries to prevent unbounded memory growth.
@@ -178,7 +181,47 @@ fn hop_targets_blocked_host(url: &Url) -> bool {
     class_blocked
 }
 
-/// Redirect policy for [`HttpCache`]'s client.
+/// Which cache-key namespace and [`AddrGuard`] tier a [`Transport`] enforces.
+///
+/// `Baseline` is every non-workspace request (all 11 ecosystems' registry/redirect/API
+/// traffic); `WorkspaceDeclared` is Cargo's workspace-declared-registry traffic, carrying the
+/// same [`WorkspaceRegistryAccess`] **value snapshot** an [`AddrGuard::WorkspaceDeclared`]
+/// carries (see that variant's docs) — [`HttpCache::cache_key`] reads the digit from this
+/// snapshot, never from a live `Arc<RegistryAccessPolicy>` read, so a request's cache key and
+/// its guard always agree on which policy era they were constructed under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheTier {
+    Baseline,
+    WorkspaceDeclared(WorkspaceRegistryAccess),
+}
+
+/// The tier a [`Transport`]'s redirect policy and DNS resolver both enforce.
+///
+/// `WorkspaceDeclared` holds a [`WorkspaceRegistryAccess`] **value snapshot**, taken once at
+/// [`Transport::workspace`] construction time — not a live `Arc<RegistryAccessPolicy>` read on
+/// every [`Self::tier_allows`] call. [`Transport::workspace`] takes this same snapshot for its
+/// paired [`CacheTier::WorkspaceDeclared`], and [`HttpCache::set_registry_policy`] rebuilds the
+/// whole `Transport` (both snapshots included) on every actual policy transition, so a
+/// request's cache key and its guard always come from one consistent construction-time value,
+/// with no read-skew window between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddrGuard {
+    Baseline,
+    WorkspaceDeclared(WorkspaceRegistryAccess),
+}
+
+impl AddrGuard {
+    /// Whether a host classified as `class` may be reached under this guard's tier.
+    fn tier_allows(self, class: crate::net_policy::HostClass) -> bool {
+        match self {
+            Self::Baseline => true,
+            Self::WorkspaceDeclared(policy) => policy.allows(class),
+        }
+    }
+}
+
+/// Redirect policy for a [`Transport`]'s client, parameterized by the [`AddrGuard`] tier that
+/// client enforces.
 ///
 /// [`ensure_https`] only validates the *initial* request URL; a `3xx` response can still
 /// redirect the actual connection anywhere, including down to plain HTTP — or, per spec
@@ -189,29 +232,41 @@ fn hop_targets_blocked_host(url: &Url) -> bool {
 /// other non-2xx status (`DepsError::HttpStatus`) instead of needing a distinct
 /// "redirect blocked" error variant.
 ///
-/// The blocked-host check is unconditional and policy-independent — it does not consult
-/// [`crate::net_policy::RegistryAccessPolicy`] at all, since [`HostClass::never_a_registry`](crate::net_policy::HostClass::never_a_registry)
+/// The blocked-host check (`hop_targets_blocked_host`) is unconditional and
+/// policy-independent — it does not consult `guard` at all, since
+/// [`HostClass::never_a_registry`](crate::net_policy::HostClass::never_a_registry)
 /// is deliberately narrower than any workspace-registry policy setting: it blocks only the
 /// classes (loopback, link-local, cloud metadata, unspecified) that are never a legitimate
 /// registry redirect target for *any* ecosystem, benefiting every one of the eleven crates
-/// sharing this client, not only Cargo's workspace-declared indexes.
+/// sharing the baseline client, not only Cargo's workspace-declared indexes.
+///
+/// `guard`'s own [`AddrGuard::tier_allows`] term additionally rejects a hop whose target class
+/// the *tier* does not allow — under [`AddrGuard::Baseline`] this term is constant `false`, so
+/// every non-Cargo ecosystem (and Cargo's own `$CARGO_HOME`-provenance traffic) is
+/// bit-for-bit unaffected; under [`AddrGuard::WorkspaceDeclared`] it closes the redirect-hop
+/// half of issue #455 (an IP-literal hop to an RFC1918/CGNAT address, which `hyper-util`
+/// parses directly and never routes through a resolver).
 ///
 /// This only classifies the redirect target's URL string, not its DNS-resolved address — that
-/// residual gap (issue #449, "D1" in PR #447's plan) is now closed by [`BlockedAddrResolver`],
-/// which [`build_client`] wires into every client this module builds: a redirect hop reuses the
-/// same `Client`, so its target's resolved address is validated too, for free (FR-007).
+/// residual gap (issue #449, "D1" in PR #447's plan) is closed for the name-hop case by
+/// [`BlockedAddrResolver`], which [`build_guarded_client`] wires into every client this module
+/// builds: a redirect hop reuses the same `Client`, so its target's resolved address is
+/// validated too, for free (FR-007).
 ///
 /// Every other redirect — including cross-host ones, which are out of scope for this
 /// policy — falls through to reqwest's default (`Policy::limited(10)`), preserving the
 /// existing hop-count limit and mockito's plain-`http://` loopback chains
 /// used throughout this module's tests.
-fn redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
+fn redirect_policy(guard: AddrGuard) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
         let downgraded = attempt
             .previous()
             .last()
             .is_some_and(|previous| is_https_downgrade(previous, attempt.url()));
-        if downgraded || hop_targets_blocked_host(attempt.url()) {
+        if downgraded
+            || hop_targets_blocked_host(attempt.url())
+            || !guard.tier_allows(crate::net_policy::classify_host(attempt.url()))
+        {
             attempt.stop()
         } else {
             reqwest::redirect::Policy::default().redirect(attempt)
@@ -219,7 +274,7 @@ fn redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-/// Redirect policy for a [`HttpCache::client_for_origin`]-scoped client.
+/// Redirect policy for a [`HttpCache::transport_for_origin`]-scoped client.
 ///
 /// Stops any hop whose URL no longer starts with `trusted_origin` — for a caller (e.g.
 /// NuGet's registration-hive paging) that already validated the *initial* request URL
@@ -264,10 +319,14 @@ enum ResolveGuardError {
 
 /// Validates every address `tokio::net::lookup_host` returned for `host`, rejecting the whole
 /// resolution if any is blocked — an attacker's public A record alongside a blocked one must not
-/// keep the probe alive (FR-003).
+/// keep the probe alive (FR-003). `guard`'s tier additionally rejects a resolved address whose
+/// class the *tier* does not allow (issue #455: an RFC1918/CGNAT-range name rebound at
+/// connect time), on top of the policy-independent [`HostClass::never_a_registry`](crate::net_policy::HostClass::never_a_registry)
+/// check every tier enforces.
 fn validate_resolved_addrs(
     host: &str,
     addrs: Vec<std::net::SocketAddr>,
+    guard: AddrGuard,
 ) -> std::result::Result<Vec<std::net::SocketAddr>, ResolveGuardError> {
     if addrs.is_empty() {
         tracing::warn!(host, "DNS resolution returned no addresses");
@@ -277,7 +336,7 @@ fn validate_resolved_addrs(
     }
     for addr in &addrs {
         let class = crate::net_policy::classify_addr(addr.ip());
-        if class.never_a_registry() {
+        if class.never_a_registry() || !guard.tier_allows(class) {
             tracing::warn!(host, addr = %addr.ip(), %class, "blocking DNS-resolved address");
             return Err(ResolveGuardError::Blocked {
                 host: host.to_string(),
@@ -289,30 +348,52 @@ fn validate_resolved_addrs(
     Ok(addrs)
 }
 
+/// The synthetic-lookup function signature [`TestLookup`] wraps.
+#[cfg(test)]
+type SyntheticLookupFn = dyn Fn(&str) -> Vec<std::net::SocketAddr> + Send + Sync;
+
+/// Test-only override for [`BlockedAddrResolver::resolve`], replacing `tokio::net::lookup_host`
+/// with a synthetic lookup — lets a test exercise the resolver-guard wiring against an address
+/// chosen by the test (e.g. an RFC1918 literal) without depending on real DNS. A newtype rather
+/// than a hand-written `Debug` directly on [`BlockedAddrResolver`], so that struct's own
+/// `#[derive(Debug)]` stays valid under both `cfg(test)` and not.
+#[cfg(test)]
+#[derive(Clone)]
+struct TestLookup(Arc<SyntheticLookupFn>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestLookup(..)")
+    }
+}
+
 /// Connect-time DNS resolver that closes the rebinding TOCTOU gap left by [`ensure_https`]/
 /// [`hop_targets_blocked_host`]'s URL-string-only classification (issue #449): those check the
 /// declared hostname, but `reqwest`'s connector resolves DNS independently, later, and an
 /// attacker who controls the hostname's DNS can rebind it to a blocked address in between.
 ///
-/// Wired into every client [`build_client`] returns, so all 11 ecosystem crates sharing this
-/// client pool inherit it with zero per-crate plumbing (FR-006/NFR-002).
+/// Wired into every client [`build_guarded_client`] returns, so all 11 ecosystem crates sharing
+/// the baseline client pool inherit it with zero per-crate plumbing (FR-006/NFR-002).
 ///
 /// # Scope
 ///
-/// A resolver only ever sees a hostname, never which [`crate::net_policy::WorkspaceRegistryAccess`]
-/// policy applies to the request that triggered it — so this enforces only the
-/// policy-independent [`crate::net_policy::HostClass::never_a_registry`] tier (loopback,
-/// link-local, cloud-metadata, unspecified), the same tier [`hop_targets_blocked_host`] already
-/// applies. It closes issue #449's filed exploit (cloud-metadata rebinding) but does **not**
-/// enforce full `PublicOnly` semantics: a hostname that legitimately resolves to
-/// `HostClass::Global` at classification time and is rebound to an RFC1918/CGNAT address at
-/// connect time is not caught here — closing that residual needs policy provenance at the
-/// connector, tracked as issue #455.
+/// This resolver's guard tier decides how much a resolved address is scrutinized: under
+/// [`AddrGuard::Baseline`] this enforces only the policy-independent
+/// [`crate::net_policy::HostClass::never_a_registry`] tier (loopback, link-local,
+/// cloud-metadata, unspecified), the same tier [`hop_targets_blocked_host`] already applies —
+/// closing issue #449's filed exploit (cloud-metadata rebinding) but not full `PublicOnly`
+/// semantics. Under [`AddrGuard::WorkspaceDeclared`], [`validate_resolved_addrs`] additionally
+/// rejects any resolved address outside the snapshotted [`crate::net_policy::WorkspaceRegistryAccess`]
+/// policy's allowed classes — closing issue #455 (a workspace-declared name that legitimately
+/// resolves to `HostClass::Global` at parse time, then rebinds to an RFC1918/CGNAT address at
+/// connect time).
 ///
 /// # Fail-closed (NFR-004)
 ///
 /// Returns `Err` — never `Ok`, never a fallback resolver — on a `lookup_host` error, zero
-/// addresses, or any resolved address [`crate::net_policy::HostClass::never_a_registry`] blocks.
+/// addresses, or any resolved address [`validate_resolved_addrs`] rejects for `self.guard`'s
+/// tier.
 ///
 /// # Known limitations
 ///
@@ -326,42 +407,148 @@ fn validate_resolved_addrs(
 /// - Never applies to an IP-literal host (`https://169.254.169.254/`): `hyper-util`'s connector
 ///   parses those directly and never calls the configured resolver, so
 ///   [`classify_host`](crate::net_policy::classify_host) (via [`ensure_https`]/
-///   [`hop_targets_blocked_host`]) remains the sole guard for literals — a disjoint domain from
-///   this resolver's name-based one, not a gap.
+///   [`hop_targets_blocked_host`]/[`redirect_policy`]'s tier term) remains the sole guard for
+///   literals — a disjoint domain from this resolver's name-based one, not a gap. This is also
+///   why the cache layer gives [`HttpCache::get_cached_workspace`] zero protection against an
+///   *initial* request URL that is itself an IP literal — see that method's docs.
 /// - Unlike [`ensure_https`]/[`hop_targets_blocked_host`], this resolver has **no** `test-util`
 ///   carve-out for `Loopback`: it blocks a `localhost`/`127.0.0.1` *name* unconditionally, in
 ///   every build. A downstream `test-util` consumer that mocks by binding an IP literal (as
 ///   this workspace's own `mockito` usage does) is unaffected — literals never reach this
 ///   resolver at all — but one that mocks via a `localhost` *name* would be newly blocked.
-#[derive(Debug, Clone, Copy)]
-struct BlockedAddrResolver;
+#[derive(Debug, Clone)]
+struct BlockedAddrResolver {
+    guard: AddrGuard,
+    #[cfg(test)]
+    lookup: Option<TestLookup>,
+}
+
+impl BlockedAddrResolver {
+    fn new(guard: AddrGuard) -> Self {
+        Self {
+            guard,
+            #[cfg(test)]
+            lookup: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_lookup(guard: AddrGuard, lookup: TestLookup) -> Self {
+        Self {
+            guard,
+            lookup: Some(lookup),
+        }
+    }
+}
 
 impl reqwest::dns::Resolve for BlockedAddrResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let guard = self.guard;
+        #[cfg(test)]
+        let lookup = self.lookup.clone();
         Box::pin(async move {
+            #[cfg(test)]
+            let addrs: Vec<std::net::SocketAddr> = match &lookup {
+                Some(lookup) => (lookup.0)(&host),
+                None => tokio::net::lookup_host((host.as_str(), 0)).await?.collect(),
+            };
+            #[cfg(not(test))]
             let addrs: Vec<std::net::SocketAddr> =
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            let addrs = validate_resolved_addrs(&host, addrs)?;
+
+            let addrs = validate_resolved_addrs(&host, addrs, guard)?;
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
         })
     }
 }
 
-/// Builds a client with `HttpCache`'s shared configuration (user agent, timeout, resolver),
-/// varying only the redirect policy — kept in one place so a future client-wide setting (proxy,
-/// connection pool sizing, etc.) added to [`HttpCache::new`] can't silently miss the pooled
-/// clients [`HttpCache::client_for_origin`] builds. This is also the workspace's only
-/// `Client::builder()` call site, so [`BlockedAddrResolver`] applies everywhere without
-/// per-crate plumbing.
-fn build_client(redirect: reqwest::redirect::Policy) -> Client {
+/// Builds a client with `HttpCache`'s shared configuration (user agent, timeout), varying the
+/// redirect policy and resolver — kept in one place so a future client-wide setting (proxy,
+/// connection pool sizing, etc.) can't silently miss any [`Transport`] this module builds. This
+/// is also the workspace's only `Client::builder()` call site.
+fn build_client_inner(
+    redirect: reqwest::redirect::Policy,
+    resolver: BlockedAddrResolver,
+) -> Client {
     Client::builder()
         .user_agent(format!("deps-lsp/{}", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .redirect(redirect)
-        .dns_resolver(BlockedAddrResolver)
+        .dns_resolver(resolver)
         .build()
         .expect("failed to create HTTP client")
+}
+
+/// Pairs one [`AddrGuard`] value with both halves it governs — its redirect policy and its
+/// resolver — so a client whose redirect policy and resolver enforce different tiers cannot be
+/// built by this function.
+fn build_guarded_client(guard: AddrGuard) -> Client {
+    build_client_inner(redirect_policy(guard), BlockedAddrResolver::new(guard))
+}
+
+/// Test-only variant of [`build_guarded_client`] that substitutes a synthetic DNS lookup for
+/// `tokio::net::lookup_host` — shares [`build_client_inner`] with the production constructor, so
+/// deleting the `.dns_resolver(...)` wiring from that shared function fails any test built on
+/// this too, not just the production path.
+#[cfg(test)]
+fn build_guarded_client_with_lookup(guard: AddrGuard, lookup: TestLookup) -> Client {
+    build_client_inner(
+        redirect_policy(guard),
+        BlockedAddrResolver::with_lookup(guard, lookup),
+    )
+}
+
+/// A `Client` welded to the [`CacheTier`] its guard enforces.
+///
+/// [`Self::baseline`], [`Self::workspace`] and [`Self::origin_pinned`] are the only sanctioned
+/// way to build one: each derives its redirect policy, its resolver and its tier from a single
+/// [`AddrGuard`] value, so a mismatched pairing (e.g. a baseline-guarded client keyed under the
+/// workspace cache namespace) never arises through normal construction — though `cache.rs` is
+/// one module, so a hand-written `Transport { .. }` literal elsewhere in this file could still
+/// mismatch them; the three constructors are what make that a deliberate act, not an accident
+/// reachable by passing the wrong argument to an existing function.
+#[derive(Clone)]
+struct Transport {
+    client: Client,
+    tier: CacheTier,
+}
+
+impl Transport {
+    /// The shared, unauthenticated transport used by every non-workspace request.
+    fn baseline() -> Self {
+        Self {
+            client: build_guarded_client(AddrGuard::Baseline),
+            tier: CacheTier::Baseline,
+        }
+    }
+
+    /// The transport for Cargo's workspace-declared-registry requests, snapshotting `policy`'s
+    /// current value once and sharing that single snapshot between the guard and the cache-key
+    /// tier — see [`AddrGuard::WorkspaceDeclared`]'s docs for why this is a value snapshot, not
+    /// a live `Arc` read, and why the guard and the tier must never snapshot independently.
+    fn workspace(policy: &Arc<RegistryAccessPolicy>) -> Self {
+        let snapshot = policy.get();
+        Self {
+            client: build_guarded_client(AddrGuard::WorkspaceDeclared(snapshot)),
+            tier: CacheTier::WorkspaceDeclared(snapshot),
+        }
+    }
+
+    /// The transport for one [`HttpCache::transport_for_origin`]-pinned origin: a plain
+    /// [`AddrGuard::Baseline`] resolver, paired with [`trusted_origin_redirect_policy`] instead
+    /// of [`redirect_policy`] — that policy pins by URL prefix, which already subsumes the
+    /// blocked-host hop check, so this is the one documented caller of [`build_client_inner`]
+    /// directly rather than [`build_guarded_client`].
+    fn origin_pinned(trusted_origin: &str) -> Self {
+        Self {
+            client: build_client_inner(
+                trusted_origin_redirect_policy(trusted_origin.to_string()),
+                BlockedAddrResolver::new(AddrGuard::Baseline),
+            ),
+            tier: CacheTier::Baseline,
+        }
+    }
 }
 
 /// Reads a response body incrementally, aborting once it exceeds `limit`.
@@ -457,7 +644,7 @@ pub struct CachedResponse {
 ///
 /// # Cache key
 ///
-/// Entries are keyed by URL alone — `extra_headers` (see
+/// Entries are keyed by URL alone (see `Self::cache_key`, private) — `extra_headers` (see
 /// [`HttpCache::get_cached_with_headers`]) play no part in the cache key.
 /// This is safe only as long as "same URL" implies "same representation":
 /// a content-negotiating header (e.g. a per-request `Accept`) that can vary
@@ -470,6 +657,11 @@ pub struct CachedResponse {
 /// produced an entry — [`HttpCache::get_cached`] and [`HttpCache::get_cached_trusted_origin`]
 /// share one entry map. No caller today requests the same URL through both, but one that did
 /// could observe the other's cached (and differently redirect-validated) body.
+///
+/// [`Self::get_cached_workspace`] is the one exception: it is namespaced under a distinct,
+/// policy-scoped key prefix (see `Self::cache_key`, private) so a body fetched under a looser
+/// [`crate::net_policy::WorkspaceRegistryAccess`] can never be served back once the policy
+/// tightens.
 pub struct HttpCache {
     entries: DashMap<String, CachedResponse>,
     /// Running total of `body.len()` across all `entries`, kept in sync by
@@ -481,46 +673,120 @@ pub struct HttpCache {
     /// check; advisory (see [`MAX_CACHE_BYTES`]), not an exact live count
     /// under concurrent access.
     total_bytes: AtomicUsize,
-    client: Client,
-    /// Per-trusted-origin client pool backing [`Self::get_cached_trusted_origin`], keyed by
+    /// The shared, unauthenticated transport used by every non-workspace request.
+    baseline: Transport,
+    /// Per-trusted-origin transport pool backing [`Self::get_cached_trusted_origin`], keyed by
     /// the exact `trusted_origin` prefix string passed to that call. reqwest's redirect
     /// policy is fixed per-`Client`, so a distinct client is unavoidable per distinct
-    /// origin; pooled here so repeated calls against the same origin reuse one client
+    /// origin; pooled here so repeated calls against the same origin reuse one transport
     /// (and its connection pool) instead of rebuilding on every call.
-    trusted_clients: DashMap<String, Client>,
+    trusted_clients: DashMap<String, Transport>,
+    /// Live-updatable Cargo workspace-registry policy the `workspace` transport field below
+    /// and cache-key namespace are derived from. Kept alongside that field (not just read once
+    /// at construction) so [`Self::cache_key`] and [`Self::set_registry_policy`] both read the
+    /// same discriminant.
+    policy: Arc<RegistryAccessPolicy>,
+    /// The transport for [`Self::get_cached_workspace`], rebuilt in place by
+    /// [`Self::set_registry_policy`] on every actual policy transition.
+    workspace: RwLock<Transport>,
+    /// Test-only counter of how many times [`Self::set_registry_policy`] has actually rebuilt
+    /// the `workspace` transport field above (as opposed to no-op'ing on an unchanged value) —
+    /// asserts C4's rebuild-only-on-change behavior directly.
+    #[cfg(test)]
+    workspace_rebuilds: AtomicUsize,
 }
 
 impl HttpCache {
-    /// Creates a new HTTP cache with default configuration.
+    /// Creates a new HTTP cache with default configuration and the default
+    /// [`crate::net_policy::WorkspaceRegistryAccess`] policy (`PublicOnly`).
     ///
     /// The cache uses a configurable timeout for all requests and identifies
     /// itself with an auto-versioned user agent.
     pub fn new() -> Self {
+        Self::with_policy(Arc::new(RegistryAccessPolicy::default()))
+    }
+
+    /// Creates a new HTTP cache whose [`Self::get_cached_workspace`] requests are governed by
+    /// `policy`'s live value.
+    ///
+    /// A later [`Self::set_registry_policy`] call rebuilds the workspace transport (and its
+    /// cache-key namespace) in place, so every caller holding this `HttpCache` sees the new
+    /// policy take effect immediately, with no need to reconstruct the cache.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::HttpCache;
+    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use std::sync::Arc;
+    ///
+    /// let policy = Arc::new(RegistryAccessPolicy::default());
+    /// let cache = HttpCache::with_policy(Arc::clone(&policy));
+    /// assert!(cache.is_empty());
+    /// ```
+    pub fn with_policy(policy: Arc<RegistryAccessPolicy>) -> Self {
+        let workspace = Transport::workspace(&policy);
         Self {
             entries: DashMap::new(),
             total_bytes: AtomicUsize::new(0),
-            client: build_client(redirect_policy()),
+            baseline: Transport::baseline(),
             trusted_clients: DashMap::new(),
+            policy,
+            workspace: RwLock::new(workspace),
+            #[cfg(test)]
+            workspace_rebuilds: AtomicUsize::new(0),
         }
     }
 
-    /// Returns the client scoped to `trusted_origin`, building and pooling one on first use.
+    /// Returns the transport scoped to `trusted_origin`, building and pooling one on first use.
     ///
     /// The `get` fast path (a shared read lock) serves the common case — a `trusted_origin`
     /// already pooled — without ever taking `trusted_clients`' write-capable `entry` lock;
     /// `entry().or_insert_with()` only runs on a miss, so two callers racing on the same new
-    /// origin still only ever build and store one `Client` for it, not one each.
-    fn client_for_origin(&self, trusted_origin: &str) -> Client {
+    /// origin still only ever build and store one [`Transport`] for it, not one each.
+    fn transport_for_origin(&self, trusted_origin: &str) -> Transport {
         if let Some(existing) = self.trusted_clients.get(trusted_origin) {
             return existing.clone();
         }
 
         self.trusted_clients
             .entry(trusted_origin.to_string())
-            .or_insert_with(|| {
-                build_client(trusted_origin_redirect_policy(trusted_origin.to_string()))
-            })
+            .or_insert_with(|| Transport::origin_pinned(trusted_origin))
             .clone()
+    }
+
+    /// The prefix marking a workspace-tier cache key, chosen as a control character that can
+    /// never appear at the start of a URL string this module writes: production code paths
+    /// only ever write keys derived from this function, which are either the bare URL (starting
+    /// `https://`, or — test cfgs only — `http://` on loopback) or this prefix followed by a
+    /// policy digit. No in-process caller other than [`Self::insert_for_bench`] (a
+    /// `#[doc(hidden)]` test/bench helper that accepts a caller-chosen key) can write an
+    /// arbitrary key, so a `Baseline`-tier and `WorkspaceDeclared`-tier entry can never collide
+    /// in production use.
+    const WS_KEY_PREFIX: char = '\u{1}';
+
+    /// Computes the cache-map key for `url` under `tier` — `Cow::Borrowed(url)` for
+    /// [`CacheTier::Baseline`] (allocation-free, and identical to every entry this cache wrote
+    /// before this policy-tier split existed), or a policy-digit-prefixed owned key for
+    /// [`CacheTier::WorkspaceDeclared`] so a policy tightening can never serve a body fetched
+    /// under a looser policy (C5): the digit comes from `tier`'s own snapshot — the exact same
+    /// value the paired [`Transport`]'s [`AddrGuard`] enforced for this request, taken together
+    /// at [`Transport::workspace`] construction time — never a separate live `self.policy` read,
+    /// which would open a read-skew window between the guard that let a fetch through and the
+    /// key that fetch's body gets stored under. `self.policy` remains this cache's live handle
+    /// for [`Self::set_registry_policy`]'s change detection and the write-through source that
+    /// method snapshots from when rebuilding the workspace transport — never consulted here.
+    ///
+    /// Callers must compute this once per request and thread the result through, never
+    /// recompute mid-request — a policy flip between two recomputations would read and write
+    /// under different keys for what should be one atomic operation.
+    fn cache_key<'a>(&self, url: &'a str, tier: CacheTier) -> Cow<'a, str> {
+        match tier {
+            CacheTier::Baseline => Cow::Borrowed(url),
+            CacheTier::WorkspaceDeclared(snapshot) => {
+                Cow::Owned(format!("{}{}{url}", Self::WS_KEY_PREFIX, snapshot.to_u8()))
+            }
+        }
     }
 
     /// Retrieves data from URL with intelligent caching.
@@ -576,6 +842,9 @@ impl HttpCache {
     /// freshness/revalidation logic entirely, so a caller that surfaces this body to
     /// the user (e.g. inserting it into a manifest edit) should treat it as
     /// arbitrarily stale, not just-expired.
+    ///
+    /// Reads the baseline (unprefixed) cache-key namespace only (see `Self::cache_key`, private) — a
+    /// body fetched via [`Self::get_cached_workspace`] is never visible through this method.
     #[must_use]
     pub fn peek_cached(&self, url: &str) -> Option<Bytes> {
         self.entries.get(url).map(|r| r.body.clone())
@@ -597,7 +866,7 @@ impl HttpCache {
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
-        self.get_cached_with_headers_via(url, extra_headers, &self.client)
+        self.get_cached_with_headers_via(url, extra_headers, &self.baseline)
             .await
     }
 
@@ -624,8 +893,8 @@ impl HttpCache {
         url: &str,
         trusted_origin: &str,
     ) -> Result<Bytes> {
-        let client = self.client_for_origin(trusted_origin);
-        self.get_cached_with_headers_via(url, &[], &client).await
+        let transport = self.transport_for_origin(trusted_origin);
+        self.get_cached_with_headers_via(url, &[], &transport).await
     }
 
     /// Like [`Self::get_cached_trusted_origin`], but additionally injects `extra_headers`
@@ -639,7 +908,7 @@ impl HttpCache {
     /// (same-scheme, any-host) redirect policy for every hop after that, which is
     /// exactly the shape a hostile or misconfigured redirect on the resolved index
     /// itself could exploit to exfiltrate a bearer token to an attacker-controlled
-    /// host. Composing `Self::client_for_origin`'s pinned-origin client with header
+    /// host. Composing `Self::transport_for_origin`'s (private) pinned-origin transport with header
     /// injection closes that by construction — no empirical redirect test is needed
     /// to prove the header cannot leak, since the client stops following before a
     /// cross-origin hop would ever be sent.
@@ -673,16 +942,92 @@ impl HttpCache {
         trusted_origin: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
-        let client = self.client_for_origin(trusted_origin);
-        self.get_cached_with_headers_via(url, extra_headers, &client)
+        let transport = self.transport_for_origin(trusted_origin);
+        self.get_cached_with_headers_via(url, extra_headers, &transport)
             .await
+    }
+
+    /// Like [`Self::get_cached`], but for Cargo's workspace-declared-registry requests: routes
+    /// through the workspace transport field, whose guard enforces the live
+    /// [`crate::net_policy::WorkspaceRegistryAccess`] policy on both the resolved connect-time
+    /// address (issue #455) and any redirect hop, and keys the entry under a
+    /// policy-scoped namespace (see `Self::cache_key`, private) distinct from every other method on
+    /// this cache.
+    ///
+    /// This gives the *resolved address* the same policy scrutiny `deps_cargo::config::RegistryIndex::new`
+    /// already gives the declared URL string at parse time — it does **not**
+    /// re-check the initial request URL itself: a caller passing an IP-literal `url` whose
+    /// class the policy would reject connects anyway, since `hyper-util`'s connector parses an
+    /// IP literal directly and never calls the configured resolver (see
+    /// `BlockedAddrResolver`'s docs, private). `RegistryIndex::new` is the sole, by-design gate for
+    /// that residual — every caller of this method already went through it.
+    ///
+    /// If an entry is already cached, a revalidation failure — including a guard rejection
+    /// from a since-rebound or since-tightened-policy address — falls back to serving the
+    /// cached body, logging only a `tracing::warn!` (pre-existing behavior, unrelated to
+    /// this method). This is not a bypass — no new connection to the blocked address is
+    /// made — but it means such a block is invisible to the caller whenever an entry already
+    /// exists for that URL.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use deps_core::HttpCache;
+    /// use deps_core::net_policy::RegistryAccessPolicy;
+    /// use std::sync::Arc;
+    ///
+    /// # async fn example() -> deps_core::error::Result<()> {
+    /// let policy = Arc::new(RegistryAccessPolicy::default());
+    /// let cache = HttpCache::with_policy(policy);
+    /// let data = cache
+    ///     .get_cached_workspace("https://index.mycorp.dev/se/rd/serde")
+    ///     .await?;
+    /// println!("Fetched {} bytes", data.len());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_cached_workspace(&self, url: &str) -> Result<Bytes> {
+        let transport = self
+            .workspace
+            .read()
+            .expect("workspace transport lock poisoned")
+            .clone();
+        self.get_cached_with_headers_via(url, &[], &transport).await
+    }
+
+    /// Updates the policy governing [`Self::get_cached_workspace`], rebuilding the workspace
+    /// transport field (and so its cache-key namespace and guard together) when
+    /// `value` actually differs from the current setting — a no-op call does not rebuild, so a
+    /// caller that re-applies an unchanged configuration does not pay for a fresh `Client` and
+    /// its connection pool.
+    ///
+    /// Effective for every [`Self::get_cached_workspace`] call after this returns. Note this
+    /// only gates *future* fetches: an `All -> PublicOnly`/`Off` tightening does not purge
+    /// already-registered `deps-cargo` alternate-registry clients resolved under the looser
+    /// policy (pre-existing, documented on [`crate::net_policy::RegistryAccessPolicy::set`]).
+    pub fn set_registry_policy(&self, value: WorkspaceRegistryAccess) {
+        if self.policy.get() == value {
+            return;
+        }
+        self.policy.set(value);
+        let rebuilt = Transport::workspace(&self.policy);
+        *self
+            .workspace
+            .write()
+            .expect("workspace transport lock poisoned") = rebuilt;
+        #[cfg(test)]
+        self.workspace_rebuilds.fetch_add(1, Ordering::Relaxed);
     }
 
     async fn get_cached_with_headers_via(
         &self,
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
-        client: &Client,
+        transport: &Transport,
     ) -> Result<Bytes> {
         if self.entries.len() >= MAX_CACHE_ENTRIES
             || self.total_bytes.load(Ordering::Relaxed) >= MAX_CACHE_BYTES
@@ -690,12 +1035,23 @@ impl HttpCache {
             self.evict_entries();
         }
 
+        // Computed once and threaded through every downstream call — never recomputed, or a
+        // policy flip mid-request would read and write under different keys (see
+        // `Self::cache_key`'s docs).
+        let cache_key = self.cache_key(url, transport.tier);
+
         // Clone and drop the DashMap Ref immediately to release the shard lock.
         // Holding a Ref across .await causes deadlocks when concurrent tasks
         // need write access to the same shard (e.g., conditional_request_with_headers → insert).
-        if let Some(cached) = self.entries.get(url).map(|r| r.clone()) {
+        if let Some(cached) = self.entries.get(cache_key.as_ref()).map(|r| r.clone()) {
             match self
-                .conditional_request_with_headers(url, &cached, extra_headers, client)
+                .conditional_request_with_headers(
+                    url,
+                    &cached,
+                    extra_headers,
+                    &transport.client,
+                    &cache_key,
+                )
                 .await
             {
                 Ok(Some(new_body)) => return Ok(new_body),
@@ -707,7 +1063,7 @@ impl HttpCache {
             }
         }
 
-        self.fetch_and_store_with_headers(url, extra_headers, client)
+        self.fetch_and_store_with_headers(url, extra_headers, &transport.client, &cache_key)
             .await
     }
 
@@ -727,6 +1083,7 @@ impl HttpCache {
         cached: &CachedResponse,
         extra_headers: &[(header::HeaderName, &str)],
         client: &Client,
+        cache_key: &str,
     ) -> Result<Option<Bytes>> {
         ensure_https(url)?;
         let mut request = client.get(url);
@@ -770,7 +1127,7 @@ impl HttpCache {
         let body = read_body_capped(url, response, BodyLimit::DEFAULT).await?;
 
         self.store_entry(
-            url.to_string(),
+            cache_key.to_string(),
             CachedResponse {
                 body: body.clone(),
                 etag,
@@ -799,6 +1156,7 @@ impl HttpCache {
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
         client: &Client,
+        cache_key: &str,
     ) -> Result<Bytes> {
         ensure_https(url)?;
         tracing::debug!(extra_headers = extra_headers.len(), "fetching fresh: {url}");
@@ -833,7 +1191,7 @@ impl HttpCache {
         let body = read_body_capped(url, response, BodyLimit::DEFAULT).await?;
 
         self.store_entry(
-            url.to_string(),
+            cache_key.to_string(),
             CachedResponse {
                 body: body.clone(),
                 etag,
@@ -863,12 +1221,17 @@ impl HttpCache {
     pub async fn post_json<T: Serialize + ?Sized>(&self, url: &str, body: &T) -> Result<Bytes> {
         ensure_https(url)?;
 
-        let response = self.client.post(url).json(body).send().await.map_err(|e| {
-            DepsError::RegistryError {
+        let response = self
+            .baseline
+            .client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| DepsError::RegistryError {
                 package: url.to_string(),
                 source: e,
-            }
-        })?;
+            })?;
 
         if !response.status().is_success() {
             return Err(DepsError::HttpStatus {
@@ -938,7 +1301,7 @@ impl HttpCache {
         extra_headers: &[(header::HeaderName, &str)],
         limit: BodyLimit,
     ) -> Result<Bytes> {
-        self.transport_only_via(url, extra_headers, limit, &self.client)
+        self.transport_only_via(url, extra_headers, limit, &self.baseline.client)
             .await
     }
 
@@ -959,11 +1322,16 @@ impl HttpCache {
         limit: BodyLimit,
         trusted_origin: &str,
     ) -> Result<Bytes> {
-        let client = self.client_for_origin(trusted_origin);
-        self.transport_only_via(url, extra_headers, limit, &client)
+        let transport = self.transport_for_origin(trusted_origin);
+        self.transport_only_via(url, extra_headers, limit, &transport.client)
             .await
     }
 
+    /// Note: "transport" here means "bypasses the entry-map cache" (see this method's
+    /// callers' docs) — a different axis from the [`Transport`] type, which pairs a `Client`
+    /// with its [`CacheTier`]. The name predates that type and is kept as-is to avoid
+    /// churning every `get_transport_only*` call site for a naming collision that causes no
+    /// actual ambiguity at the call sites themselves.
     async fn transport_only_via(
         &self,
         url: &str,
@@ -1214,7 +1582,7 @@ mod tests {
     fn test_validate_resolved_addrs_blocks_cloud_metadata() {
         let addrs = vec!["169.254.169.254:0".parse().unwrap()];
         assert!(matches!(
-            validate_resolved_addrs("evil.example", addrs),
+            validate_resolved_addrs("evil.example", addrs, AddrGuard::Baseline),
             Err(ResolveGuardError::Blocked { .. })
         ));
     }
@@ -1228,7 +1596,7 @@ mod tests {
             "169.254.169.254:0".parse().unwrap(),
         ];
         assert!(matches!(
-            validate_resolved_addrs("evil.example", addrs),
+            validate_resolved_addrs("evil.example", addrs, AddrGuard::Baseline),
             Err(ResolveGuardError::Blocked { .. })
         ));
     }
@@ -1237,7 +1605,7 @@ mod tests {
     fn test_validate_resolved_addrs_allows_global() {
         let addrs = vec!["1.1.1.1:0".parse().unwrap()];
         assert_eq!(
-            validate_resolved_addrs("index.crates.io", addrs.clone()).unwrap(),
+            validate_resolved_addrs("index.crates.io", addrs.clone(), AddrGuard::Baseline).unwrap(),
             addrs
         );
     }
@@ -1247,7 +1615,7 @@ mod tests {
     #[test]
     fn test_validate_resolved_addrs_fails_closed_on_empty() {
         assert!(matches!(
-            validate_resolved_addrs("evil.example", vec![]),
+            validate_resolved_addrs("evil.example", vec![], AddrGuard::Baseline),
             Err(ResolveGuardError::NoAddresses { .. })
         ));
     }
@@ -1256,29 +1624,118 @@ mod tests {
     fn test_validate_resolved_addrs_unwraps_mapped_v4() {
         let addrs = vec!["[::ffff:169.254.169.254]:0".parse().unwrap()];
         assert!(matches!(
-            validate_resolved_addrs("evil.example", addrs),
+            validate_resolved_addrs("evil.example", addrs, AddrGuard::Baseline),
             Err(ResolveGuardError::Blocked { .. })
         ));
+    }
+
+    // Issue #455, test-plan item 1: under `Baseline`, an RFC1918/CGNAT/unique-local address is
+    // allowed (today's pre-#455 behavior) — only `never_a_registry` classes are blocked.
+    #[test]
+    fn test_validate_resolved_addrs_baseline_allows_private_ranges() {
+        for addr_str in ["10.0.0.1:0", "100.64.0.1:0", "[fc00::1]:0"] {
+            let addrs = vec![addr_str.parse().unwrap()];
+            assert!(
+                validate_resolved_addrs("corp.example", addrs, AddrGuard::Baseline).is_ok(),
+                "{addr_str} must be allowed under Baseline"
+            );
+        }
+    }
+
+    // Issue #455, test-plan item 1: under `WorkspaceDeclared(PublicOnly)`, every RFC1918/CGNAT/
+    // unique-local address is blocked, while a `Global` address is still allowed.
+    #[test]
+    fn test_validate_resolved_addrs_workspace_public_only_blocks_private_ranges() {
+        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::PublicOnly);
+        for addr_str in ["10.0.0.1:0", "100.64.0.1:0", "[fc00::1]:0"] {
+            let addrs = vec![addr_str.parse().unwrap()];
+            assert!(
+                matches!(
+                    validate_resolved_addrs("evil.example", addrs, guard),
+                    Err(ResolveGuardError::Blocked { .. })
+                ),
+                "{addr_str} must be blocked under WorkspaceDeclared(PublicOnly)"
+            );
+        }
+
+        let global = vec!["1.1.1.1:0".parse().unwrap()];
+        assert!(validate_resolved_addrs("index.crates.io", global, guard).is_ok());
+    }
+
+    // Test-plan item 2: `WorkspaceDeclared(All)` admits a private-range address.
+    #[test]
+    fn test_validate_resolved_addrs_workspace_all_allows_private_ranges() {
+        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::All);
+        let addrs = vec!["10.0.0.1:0".parse().unwrap()];
+        assert!(validate_resolved_addrs("corp.example", addrs, guard).is_ok());
+    }
+
+    // Test-plan item 2: `WorkspaceDeclared(Off)` rejects even a `Global` address.
+    #[test]
+    fn test_validate_resolved_addrs_workspace_off_rejects_global() {
+        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::Off);
+        let addrs = vec!["1.1.1.1:0".parse().unwrap()];
+        assert!(matches!(
+            validate_resolved_addrs("index.crates.io", addrs, guard),
+            Err(ResolveGuardError::Blocked { .. })
+        ));
+    }
+
+    // Test-plan item 3: `build_guarded_client_with_lookup` shares `build_client_inner` with the
+    // production `build_guarded_client`, so deleting the `.dns_resolver(...)` wiring from that
+    // shared function fails this test too, not just the production-path wiring test above. The
+    // synthetic lookup returns an RFC1918 address, resolved (not connected — the resolver
+    // guard rejects before any TCP attempt) purely through the built `Client`.
+    #[tokio::test]
+    async fn test_build_guarded_client_with_lookup_blocks_private_range_under_workspace_tier() {
+        let lookup = TestLookup(Arc::new(|_host: &str| vec!["10.0.0.1:0".parse().unwrap()]));
+        let guard = AddrGuard::WorkspaceDeclared(WorkspaceRegistryAccess::PublicOnly);
+        let client = build_guarded_client_with_lookup(guard, lookup);
+        let result = client.get("https://corp.example/").send().await;
+        let err = result.expect_err(
+            "a private-range synthetic lookup must be rejected under WorkspaceDeclared(PublicOnly)",
+        );
+        assert!(
+            format!("{err:?}").contains("Blocked"),
+            "expected rejection at the resolver-guard step, got: {err:?}"
+        );
+    }
+
+    // Test-plan item 3, `Baseline` contrast: the same synthetic private-range lookup is not
+    // blocked at the resolver-guard step under `Baseline` — asserted directly against the
+    // resolver (not a full `Client`) to avoid depending on any real network behavior of
+    // actually connecting to the synthetic address.
+    #[tokio::test]
+    async fn test_blocked_addr_resolver_allows_private_range_under_baseline() {
+        use reqwest::dns::Resolve;
+
+        let lookup = TestLookup(Arc::new(|_host: &str| vec!["10.0.0.1:0".parse().unwrap()]));
+        let resolver = BlockedAddrResolver::with_lookup(AddrGuard::Baseline, lookup);
+        let result = resolver.resolve("corp.example".parse().unwrap()).await;
+        assert!(
+            result.is_ok(),
+            "Baseline must allow a private-range address through"
+        );
     }
 
     // Direct unit coverage of `BlockedAddrResolver::resolve` on a *name* (not an IP literal —
     // that path never reaches any resolver in production, see the struct's `# Known
     // limitations` doc). `localhost` resolves via the OS's own hosts file, no network needed.
-    // This alone does not prove the resolver is wired into `build_client` — see the sibling
-    // test below (critic S1) for that.
+    // This alone does not prove the resolver is wired into `build_guarded_client` — see the
+    // sibling test below (critic S1) for that.
     #[tokio::test]
     async fn test_blocked_addr_resolver_rejects_loopback_name_directly() {
         use reqwest::dns::Resolve;
 
-        let addrs = BlockedAddrResolver
+        let addrs = BlockedAddrResolver::new(AddrGuard::Baseline)
             .resolve("localhost".parse().unwrap())
             .await;
         assert!(addrs.is_err());
     }
 
     // Issue #449 critic S1: the previous version of this test called
-    // `BlockedAddrResolver::resolve` directly and never went through `build_client` at all —
-    // deleting `.dns_resolver(BlockedAddrResolver)` from `build_client` left it green. This
+    // `BlockedAddrResolver::resolve` directly and never went through `build_guarded_client` at
+    // all — deleting `.dns_resolver(...)` from `build_client_inner` left it green. This
     // version proves actual wiring behaviorally: a real mockito listener answers on
     // `server.socket_address()`'s port, reached here through the `localhost` *name* (so the
     // request actually reaches the configured resolver, unlike an IP literal, which
@@ -1296,7 +1753,7 @@ mod tests {
             .await;
         let port = server.socket_address().port();
 
-        let client = build_client(redirect_policy());
+        let client = build_guarded_client(AddrGuard::Baseline);
         let result = client.get(format!("http://localhost:{port}/")).send().await;
 
         let err = result.expect_err(
@@ -1365,6 +1822,86 @@ mod tests {
         let result: Bytes = cache.get_cached(&source_url).await.unwrap();
 
         assert_eq!(result.as_ref(), b"redirected data");
+    }
+
+    // Issue #455, test-plan item 4(a): loopback -> loopback. A `Baseline` transport follows the
+    // hop (the `hop_targets_blocked_host` test-cfg carve-out for `Loopback`); a
+    // `WorkspaceDeclared(PublicOnly)` transport stops it, since `PublicOnly.allows(Loopback) ==
+    // false` — this pins M1' and is the contrast proving the tier split is real. This is one of
+    // the tests exercising the documented zero-initial-URL-literal-protection residual: both
+    // mockito URLs are IP literals, so the *initial* connection to server A is never checked by
+    // policy — only the redirect hop is.
+    #[tokio::test]
+    async fn test_workspace_transport_stops_loopback_redirect_baseline_follows() {
+        let mut server_a = mockito::Server::new_async().await;
+        let mut server_b = mockito::Server::new_async().await;
+        let target_url = format!("{}/api/target", server_b.url());
+
+        let _redirect = server_a
+            .mock("GET", "/api/source")
+            .with_status(302)
+            .with_header("location", &target_url)
+            .create_async()
+            .await;
+        let _target = server_b
+            .mock("GET", "/api/target")
+            .with_status(200)
+            .with_body("redirected data")
+            .create_async()
+            .await;
+
+        let source_url = format!("{}/api/source", server_a.url());
+
+        let cache = HttpCache::new();
+        let result: Bytes = cache
+            .get_cached_with_headers_via(&source_url, &[], &Transport::baseline())
+            .await
+            .unwrap();
+        assert_eq!(result.as_ref(), b"redirected data");
+
+        let policy = Arc::new(RegistryAccessPolicy::new(
+            WorkspaceRegistryAccess::PublicOnly,
+        ));
+        let workspace_cache = HttpCache::with_policy(Arc::clone(&policy));
+        let result: Result<Bytes> = workspace_cache
+            .get_cached_with_headers_via(&source_url, &[], &Transport::workspace(&policy))
+            .await;
+        assert!(
+            matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
+            "expected the workspace transport to stop the loopback hop, got {result:?}"
+        );
+    }
+
+    // Issue #455, test-plan item 4(b): a workspace-blocked literal. Server A 302s to an
+    // RFC1918-literal target; the workspace transport under `PublicOnly` stops before
+    // connecting (the redirect-policy tier term rejects the hop from its URL string alone, no
+    // resolver involved for a literal), so the caller sees `HttpStatus{302}` with no
+    // `HTTP_TIMEOUT_SECS` stall. Also exercises the zero-initial-URL-literal-protection
+    // residual (the initial hop to server A, an IP literal, is unchecked by policy).
+    #[tokio::test]
+    async fn test_workspace_transport_stops_redirect_to_private_literal() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _redirect = server
+            .mock("GET", "/api/source")
+            .with_status(302)
+            .with_header("location", "https://10.0.0.1/x")
+            .create_async()
+            .await;
+
+        let policy = Arc::new(RegistryAccessPolicy::new(
+            WorkspaceRegistryAccess::PublicOnly,
+        ));
+        let cache = HttpCache::with_policy(Arc::clone(&policy));
+        let source_url = format!("{}/api/source", server.url());
+        let result: Result<Bytes> = cache
+            .get_cached_with_headers_via(&source_url, &[], &Transport::workspace(&policy))
+            .await;
+
+        assert!(
+            matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
+            "expected the redirect to 10.0.0.1 to be stopped, got {result:?}"
+        );
     }
 
     // Unlike the https->http downgrade case, cross-origin redirect blocking IS reachable
@@ -1877,7 +2414,7 @@ mod tests {
         let cache = HttpCache::new();
         let url = format!("{}/api/missing", server.url());
         let result: Result<Bytes> = cache
-            .fetch_and_store_with_headers(&url, &[], &cache.client)
+            .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await;
 
         assert!(result.is_err());
@@ -1905,7 +2442,7 @@ mod tests {
         let cache = HttpCache::new();
         let url = format!("{}/api/data", server.url());
         let _: Bytes = cache
-            .fetch_and_store_with_headers(&url, &[], &cache.client)
+            .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await
             .unwrap();
 
@@ -1953,7 +2490,7 @@ mod tests {
         let cache = HttpCache::new();
         let url = format!("{}/api/huge", server.url());
         let result: Result<Bytes> = cache
-            .fetch_and_store_with_headers(&url, &[], &cache.client)
+            .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await;
 
         match result {
@@ -1987,7 +2524,7 @@ mod tests {
         let cache = HttpCache::new();
         let url = format!("{}/api/exact", server.url());
         let result: Bytes = cache
-            .fetch_and_store_with_headers(&url, &[], &cache.client)
+            .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
             .await
             .unwrap();
 
@@ -2337,5 +2874,103 @@ mod tests {
             .map(|entry| entry.value().body.len())
             .sum();
         assert_eq!(cache.total_bytes(), actual);
+    }
+
+    // Issue #455, test-plan item 5: `get_cached(url)` then `get_cached_workspace(url)` do not
+    // share an entry — each is keyed under a distinct namespace (see `HttpCache::cache_key`),
+    // so the mockito mock is hit twice and the cache ends up with two entries for one URL.
+    #[tokio::test]
+    async fn test_get_cached_and_get_cached_workspace_do_not_share_an_entry() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+
+        let mock = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_body("shared url, distinct tiers")
+            .expect(2)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let baseline_result: Bytes = cache.get_cached(&url).await.unwrap();
+        let workspace_result: Bytes = cache.get_cached_workspace(&url).await.unwrap();
+
+        assert_eq!(baseline_result.as_ref(), b"shared url, distinct tiers");
+        assert_eq!(workspace_result.as_ref(), b"shared url, distinct tiers");
+        assert_eq!(cache.len(), 2);
+        mock.assert_async().await;
+    }
+
+    // Issue #455, test-plan item 6 (C5): fetch under `All`, tighten to `PublicOnly`, re-fetch
+    // the same URL — the `All`-era body must not be served, since the policy-scoped key
+    // namespace changes with the policy.
+    #[tokio::test]
+    async fn test_set_registry_policy_change_does_not_serve_stale_era_body() {
+        let mut server = mockito::Server::new_async().await;
+        let url = format!("{}/api/data", server.url());
+
+        let _first = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_body("all-era body")
+            .create_async()
+            .await;
+
+        let policy = Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All));
+        let cache = HttpCache::with_policy(Arc::clone(&policy));
+        let first: Bytes = cache.get_cached_workspace(&url).await.unwrap();
+        assert_eq!(first.as_ref(), b"all-era body");
+
+        cache.set_registry_policy(WorkspaceRegistryAccess::PublicOnly);
+
+        let _second = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_body("public-only-era body")
+            .create_async()
+            .await;
+
+        let second: Bytes = cache.get_cached_workspace(&url).await.unwrap();
+        assert_eq!(
+            second.as_ref(),
+            b"public-only-era body",
+            "the All-era cached body must not be served after tightening to PublicOnly"
+        );
+        // mockito's second mock answers request 2 regardless of which cache entry (if any) was
+        // hit, so the body assertion alone would still pass with a policy-blind cache key —
+        // this is the assertion that actually proves the two eras got distinct map entries.
+        assert_eq!(cache.len(), 2);
+    }
+
+    // Issue #455, test-plan item 7 (C4): `set_registry_policy` rebuilds the workspace transport
+    // only on an actual change, not on a no-op re-application of the same value.
+    #[test]
+    fn test_set_registry_policy_rebuilds_only_on_change() {
+        let policy = Arc::new(RegistryAccessPolicy::new(
+            WorkspaceRegistryAccess::PublicOnly,
+        ));
+        let cache = HttpCache::with_policy(policy);
+        assert_eq!(cache.workspace_rebuilds.load(Ordering::Relaxed), 0);
+
+        cache.set_registry_policy(WorkspaceRegistryAccess::PublicOnly);
+        assert_eq!(
+            cache.workspace_rebuilds.load(Ordering::Relaxed),
+            0,
+            "re-applying the unchanged policy must not rebuild the workspace transport"
+        );
+
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        assert_eq!(cache.workspace_rebuilds.load(Ordering::Relaxed), 1);
+
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        assert_eq!(
+            cache.workspace_rebuilds.load(Ordering::Relaxed),
+            1,
+            "re-applying the unchanged (new) policy must not rebuild again"
+        );
+
+        cache.set_registry_policy(WorkspaceRegistryAccess::Off);
+        assert_eq!(cache.workspace_rebuilds.load(Ordering::Relaxed), 2);
     }
 }

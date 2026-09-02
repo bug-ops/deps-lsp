@@ -280,8 +280,10 @@ impl WorkspaceRegistryAccess {
         }
     }
 
-    /// Numeric encoding for [`RegistryAccessPolicy`]'s lock-free storage.
-    const fn to_u8(self) -> u8 {
+    /// Numeric encoding for [`RegistryAccessPolicy`]'s lock-free storage, and — via
+    /// `crate::cache`'s workspace-tier cache-key computation — for the digit distinguishing
+    /// one policy era's workspace cache entries from another's.
+    pub(crate) const fn to_u8(self) -> u8 {
         match self {
             Self::Off => 0,
             Self::PublicOnly => 1,
@@ -335,6 +337,22 @@ impl RegistryAccessPolicy {
     }
 
     /// Updates the current policy, effective for every parse after this call returns.
+    ///
+    /// A tightening (e.g. `All` -> `PublicOnly`/`Off`) only gates *future* parses: it does not
+    /// purge state a looser policy already produced, such as `deps-cargo`'s
+    /// `CargoRegistry::alternates` map — an already-registered alternate-registry client for a
+    /// now-blocked host stays reachable until its owning document is next re-parsed (today,
+    /// `workspace/didChangeConfiguration` does not trigger a re-parse of open documents). This
+    /// is pre-existing behavior, unrelated to this type's own storage, and unchanged by it.
+    ///
+    /// # Warning
+    ///
+    /// Calling this directly on a handle already bound to an
+    /// [`crate::cache::HttpCache`] (via [`crate::cache::HttpCache::with_policy`]) updates this
+    /// value but does not rebuild that cache's workspace transport, leaving its `AddrGuard` and
+    /// cache-key namespace on the stale policy. For a bound cache, always mutate through
+    /// [`crate::cache::HttpCache::set_registry_policy`] instead, which updates this handle and
+    /// rebuilds the transport together.
     pub fn set(&self, value: WorkspaceRegistryAccess) {
         self.0.store(value.to_u8(), Ordering::Relaxed);
     }

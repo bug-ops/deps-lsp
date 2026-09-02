@@ -27,7 +27,7 @@
 //! }
 //! ```
 
-use crate::config::{AuthToken, RegistryIndex};
+use crate::config::{AuthToken, IndexTrust, RegistryIndex};
 use crate::types::CargoVersion;
 use deps_core::{DepsError, HttpCache, Result, lsp_helpers::warn_rejected_value};
 use semver::{Version, VersionReq};
@@ -219,6 +219,11 @@ pub struct SparseIndexClient {
     /// it is given, over an origin-pinned transport ([`deps_core::HttpCache::get_cached_trusted_origin_with_headers`])
     /// so the header cannot survive a cross-origin redirect.
     auth: Option<AuthToken>,
+    /// The [`IndexTrust`] tier `index` was validated under (issue #455, C2): governs which
+    /// transport [`Self::fetch`] routes through — a `WorkspaceDeclared` index always goes
+    /// through [`deps_core::HttpCache::get_cached_workspace`], regardless of whether `auth` is
+    /// set, so its connect-time address is scrutinized by the live workspace-registry policy.
+    trust: IndexTrust,
     /// Display name used in [`deps_core::DepsError::PackageNotFound`] messages.
     registry_display_name: &'static str,
 }
@@ -232,6 +237,7 @@ impl SparseIndexClient {
     /// skipped it.
     pub fn new(index: RegistryIndex, cache: Arc<HttpCache>) -> Self {
         Self {
+            trust: index.trust(),
             base_url: index.as_str().to_string(),
             cache,
             auth: None,
@@ -249,11 +255,27 @@ impl SparseIndexClient {
         registry_display_name: &'static str,
     ) -> Self {
         Self {
+            trust: index.trust(),
             base_url: index.as_str().to_string(),
             cache,
             auth,
             registry_display_name,
         }
+    }
+
+    /// The [`IndexTrust`] tier this client's index was validated under.
+    #[must_use]
+    pub(crate) const fn trust(&self) -> IndexTrust {
+        self.trust
+    }
+
+    /// Whether this client attaches a credential to its requests. Test/diagnostic-only: private
+    /// fields are not visible from `registry.rs`, a sibling module, so `crate::registry`'s C3
+    /// fold test needs this accessor to assert a credential was dropped, alongside
+    /// [`Self::trust`].
+    #[cfg(test)]
+    pub(crate) fn has_auth(&self) -> bool {
+        self.auth.is_some()
     }
 
     /// Fetches all versions for a crate from the sparse index.
@@ -321,15 +343,26 @@ impl SparseIndexClient {
         }))
     }
 
-    /// Routes the request through the authenticated, origin-pinned transport when
-    /// [`Self::auth`] is set, or the plain cache otherwise — the sole call site
-    /// deciding which of [`deps_core::HttpCache::get_cached`] /
-    /// [`deps_core::HttpCache::get_cached_trusted_origin_with_headers`] to use, so the
-    /// two [`Self::get_versions`]/pagination-free shape of this client never
-    /// duplicates that branch.
+    /// Routes the request through the transport matching [`Self::auth`] and [`Self::trust`]
+    /// — the sole call site deciding between [`deps_core::HttpCache::get_cached`],
+    /// [`deps_core::HttpCache::get_cached_trusted_origin_with_headers`], and (issue #455)
+    /// [`deps_core::HttpCache::get_cached_workspace`], so the two
+    /// [`Self::get_versions`]/pagination-free shape of this client never duplicates that
+    /// branch.
+    ///
+    /// `(Some(_), WorkspaceDeclared)` is a fail-closed arm, not a routed request: every current
+    /// [`RegistryIndex`] producer already prevents a `WorkspaceDeclared` index from carrying a
+    /// credential (`config::finalize_source_replacement` drops it on a folded chain,
+    /// `resolve_cargo_home_tier` only ever produces `Trusted`, and a plain workspace
+    /// `[registries]`/`registry-index` resolution never attaches one) — this arm is
+    /// defense-in-depth against a future producer regression, not a currently reachable path.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_versions`], plus `DepsError::CacheError` for the fail-closed arm.
     async fn fetch(&self, url: &str) -> Result<bytes::Bytes> {
-        match &self.auth {
-            Some(token) => {
+        match (&self.auth, self.trust) {
+            (Some(token), IndexTrust::Trusted) => {
                 let header_value = format!("Bearer {}", token.as_str());
                 self.cache
                     .get_cached_trusted_origin_with_headers(
@@ -339,7 +372,18 @@ impl SparseIndexClient {
                     )
                     .await
             }
-            None => self.cache.get_cached(url).await,
+            (None, IndexTrust::Trusted) => self.cache.get_cached(url).await,
+            (None, IndexTrust::WorkspaceDeclared) => self.cache.get_cached_workspace(url).await,
+            (Some(_), IndexTrust::WorkspaceDeclared) => {
+                tracing::error!(
+                    url = %self.base_url,
+                    "refusing to attach a credential to a workspace-declared registry index request"
+                );
+                Err(DepsError::CacheError(format!(
+                    "refusing authenticated request to workspace-declared index {}",
+                    self.base_url
+                )))
+            }
         }
     }
 }
@@ -347,7 +391,6 @@ impl SparseIndexClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::IndexTrust;
     use deps_core::net_policy::RegistryAccessPolicy;
 
     /// Wraps `raw` into a [`RegistryIndex`] for test call sites, using an all-allow policy
@@ -356,6 +399,13 @@ mod tests {
     fn test_index(raw: &str) -> RegistryIndex {
         let policy = RegistryAccessPolicy::default();
         RegistryIndex::new(raw, IndexTrust::Trusted, &policy).unwrap()
+    }
+
+    /// Like [`test_index`], but [`IndexTrust::WorkspaceDeclared`] — for issue #455's C2
+    /// fail-closed/routing tests, which need a `WorkspaceDeclared` index specifically.
+    fn test_workspace_index(raw: &str) -> RegistryIndex {
+        let policy = RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        RegistryIndex::new(raw, IndexTrust::WorkspaceDeclared, &policy).unwrap()
     }
 
     /// Live-network smoke test against the real crates.io sparse index. Restored
@@ -737,6 +787,59 @@ mod tests {
         );
         let versions = client.get_versions("serde").await.unwrap();
         assert_eq!(versions.len(), 1);
+    }
+
+    // Issue #455, test-plan item 8 (C2 fail-closed): `(Some(auth), WorkspaceDeclared)` must
+    // never send a request at all — the mockito mock asserting `expect(0)` proves no request
+    // reached the network, not just that `get_versions` returned an error.
+    #[tokio::test]
+    async fn test_fetch_refuses_authenticated_workspace_declared_request() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/se/rd/serde")
+            .with_status(200)
+            .with_body(r#"{"name":"serde","vers":"1.0.0","yanked":false,"features":{},"deps":[]}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client = SparseIndexClient::with_auth(
+            test_workspace_index(&server.url()),
+            Arc::new(HttpCache::new()),
+            Some(AuthToken::new("secret-token".to_string())),
+            "workspace index",
+        );
+        let err = client.get_versions("serde").await.unwrap_err();
+        assert!(matches!(err, DepsError::CacheError(_)));
+        mock.assert_async().await;
+    }
+
+    // Issue #455, test-plan item 9 (C2 routing): a successful `(None, WorkspaceDeclared)` fetch
+    // lands under the workspace cache-key namespace, not the baseline one — proven via the
+    // public `peek_cached` API (which only ever reads the baseline namespace) rather than by
+    // reaching into `HttpCache`'s private fields.
+    #[tokio::test]
+    async fn test_fetch_routes_workspace_declared_through_workspace_cache_namespace() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/se/rd/serde")
+            .with_status(200)
+            .with_body(r#"{"name":"serde","vers":"1.0.0","yanked":false,"features":{},"deps":[]}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let client =
+            SparseIndexClient::new(test_workspace_index(&server.url()), Arc::clone(&cache));
+        let versions = client.get_versions("serde").await.unwrap();
+        assert_eq!(versions.len(), 1);
+
+        let index_url = format!("{}/se/rd/serde", server.url());
+        assert!(
+            cache.peek_cached(&index_url).is_none(),
+            "a WorkspaceDeclared fetch must not land under the baseline (peek_cached-visible) \
+             cache-key namespace"
+        );
     }
 
     #[tokio::test]

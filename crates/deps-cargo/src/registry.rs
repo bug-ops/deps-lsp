@@ -416,26 +416,60 @@ impl CargoRegistry {
     /// Also a no-op, with a `tracing::warn!`, once `MAX_ALTERNATE_REGISTRIES` is reached
     /// and `index` is not already present (spec NFR-007) — the dependency stays
     /// unregistered rather than evicting an existing, possibly still-in-use, client.
+    ///
+    /// Issue #455, C3: a re-registration of an *already-registered* index URL now folds to
+    /// the stricter of the stored and incoming [`crate::config::IndexTrust`] tier, dropping
+    /// any stored credential when the fold actually tightens — closing the shape where a
+    /// `Trusted`+token registration of URL X (from `$CARGO_HOME`) makes a later
+    /// `WorkspaceDeclared` registration of the same X a no-op, leaving a workspace-controlled
+    /// alias fetch through the looser `Trusted`-tier client. A re-registration that does not
+    /// tighten the tier keeps the existing client (and its credential) untouched — this is a
+    /// stricter, not weaker, version of the pre-existing idempotency contract this method's
+    /// summary line above documents.
     pub fn register_alternate(&self, index: RegistryIndex, auth: Option<AuthToken>) {
+        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds a
+        // write guard on one — checking capacity from inside the `Vacant` arm below would
+        // self-deadlock on that shard.
+        let at_capacity = self.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
         let key = index.as_str().to_string();
-        if self.alternates.contains_key(&key) {
-            return;
+        let incoming_trust = index.trust();
+        let index_display = index.to_string();
+
+        match self.alternates.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut slot) => {
+                let stored_trust = slot.get().trust();
+                let folded = stored_trust.min(incoming_trust);
+                if folded != stored_trust {
+                    tracing::warn!(
+                        index = %index_display,
+                        "re-registration folds an alternate registry to the stricter trust \
+                         tier; dropping any stored credential"
+                    );
+                    slot.insert(Arc::new(SparseIndexClient::with_auth(
+                        index,
+                        Arc::clone(&self.cache),
+                        None,
+                        "alternate registry",
+                    )));
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                if at_capacity {
+                    tracing::warn!(
+                        index = %index_display,
+                        cap = MAX_ALTERNATE_REGISTRIES,
+                        "alternate registry cap reached; not registering a new index"
+                    );
+                    return;
+                }
+                slot.insert(Arc::new(SparseIndexClient::with_auth(
+                    index,
+                    Arc::clone(&self.cache),
+                    auth,
+                    "alternate registry",
+                )));
+            }
         }
-        if self.alternates.len() >= MAX_ALTERNATE_REGISTRIES {
-            tracing::warn!(
-                index = %index,
-                cap = MAX_ALTERNATE_REGISTRIES,
-                "alternate registry cap reached; not registering a new index"
-            );
-            return;
-        }
-        let client = Arc::new(SparseIndexClient::with_auth(
-            index,
-            Arc::clone(&self.cache),
-            auth,
-            "alternate registry",
-        ));
-        self.alternates.entry(key).or_insert(client);
     }
 
     /// The registered client for `index`, if any — read-only, performs no registration, no
@@ -620,6 +654,14 @@ mod tests {
     fn test_index(raw: &str) -> RegistryIndex {
         let policy = RegistryAccessPolicy::default();
         RegistryIndex::new(raw, IndexTrust::Trusted, &policy).unwrap()
+    }
+
+    /// Like [`test_index`], but takes an explicit [`IndexTrust`] — issue #455's C3 fold test
+    /// needs to construct indices at both `Trusted` and `WorkspaceDeclared`, unlike every other
+    /// test in this module.
+    fn test_index_with_trust(raw: &str, trust: IndexTrust) -> RegistryIndex {
+        let policy = RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        RegistryIndex::new(raw, trust, &policy).unwrap()
     }
 
     /// Live-network smoke test against the real crates.io search API. Restored (review
@@ -975,6 +1017,75 @@ mod tests {
         );
     }
 
+    // Issue #455, test-plan item 10 (C3 fold): a `Trusted`+token registration of index X,
+    // followed by a `WorkspaceDeclared` re-registration of the same X, folds the stored client
+    // to `WorkspaceDeclared` and drops the credential — closing the shape where the old
+    // `contains_key` no-op left the workspace alias fetching through the looser Trusted-tier
+    // client.
+    #[tokio::test]
+    async fn test_cargo_registry_register_alternate_folds_to_stricter_trust_trusted_then_workspace()
+    {
+        let cache = Arc::new(HttpCache::new());
+        let registry = CargoRegistry::new(cache);
+        let url = "https://index.mycorp.dev";
+
+        registry.register_alternate(
+            test_index_with_trust(url, IndexTrust::Trusted),
+            Some(AuthToken::new("token".to_string())),
+        );
+        let client = registry
+            .alternate_client("https://index.mycorp.dev/")
+            .expect("registered");
+        assert_eq!(client.trust(), IndexTrust::Trusted);
+        assert!(client.has_auth());
+
+        registry.register_alternate(
+            test_index_with_trust(url, IndexTrust::WorkspaceDeclared),
+            None,
+        );
+        let client = registry
+            .alternate_client("https://index.mycorp.dev/")
+            .expect("still registered");
+        assert_eq!(client.trust(), IndexTrust::WorkspaceDeclared);
+        assert!(
+            !client.has_auth(),
+            "the fold must drop the stored credential"
+        );
+    }
+
+    // Reverse order: a `WorkspaceDeclared` registration first must not be loosened by a later
+    // `Trusted` re-registration attempt for the same URL — the fold only ever moves toward
+    // `WorkspaceDeclared`, never away from it.
+    #[tokio::test]
+    async fn test_cargo_registry_register_alternate_folds_to_stricter_trust_workspace_then_trusted()
+    {
+        let cache = Arc::new(HttpCache::new());
+        let registry = CargoRegistry::new(cache);
+        let url = "https://index.mycorp.dev";
+
+        registry.register_alternate(
+            test_index_with_trust(url, IndexTrust::WorkspaceDeclared),
+            None,
+        );
+        registry.register_alternate(
+            test_index_with_trust(url, IndexTrust::Trusted),
+            Some(AuthToken::new("token".to_string())),
+        );
+
+        let client = registry
+            .alternate_client("https://index.mycorp.dev/")
+            .expect("still registered");
+        assert_eq!(client.trust(), IndexTrust::WorkspaceDeclared);
+        assert!(
+            !client.has_auth(),
+            "a WorkspaceDeclared registration must not gain a credential from a later Trusted \
+             re-registration attempt"
+        );
+    }
+
+    // The cap regression guard (D2a): the hoisted capacity check must still see each of the
+    // first MAX_ALTERNATE_REGISTRIES registrations as under capacity and the overflow one as
+    // at capacity.
     #[tokio::test]
     async fn test_cargo_registry_alternate_cap_skips_registration() {
         let cache = Arc::new(HttpCache::new());
