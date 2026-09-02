@@ -2099,9 +2099,11 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
                 total_known: 3,
+                fix_target_status: None,
                 upgrade_status: UpgradeStatus::CandidateVulnerable {
                     version: "2.0.0".into(),
                     advisory_ids: vec!["RUSTSEC-2020-0071".to_string()],
+                    total_known: 1,
                 },
             }),
         );
@@ -2177,6 +2179,7 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
                 total_known: 1,
+                fix_target_status: None,
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );

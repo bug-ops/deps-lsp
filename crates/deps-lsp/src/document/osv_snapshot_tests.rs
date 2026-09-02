@@ -71,6 +71,7 @@ async fn diagnostics_snapshot_for(
         ScanOutcome::Vulnerable(DependencyVulnerabilities {
             advisories: vec![sample_advisory()],
             total_known: 6,
+            fix_target_status: None,
             upgrade_status: UpgradeStatus::NotChecked,
         }),
     );

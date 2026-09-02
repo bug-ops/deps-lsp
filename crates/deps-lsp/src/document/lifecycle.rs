@@ -21,7 +21,7 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::in_use_version;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
@@ -527,7 +527,9 @@ async fn run_osv_scan_phase_a(
 /// Phase B: for every dependency phase A flagged [`deps_core::osv::ScanOutcome::Vulnerable`],
 /// checks whether the version currently recommended (the registry's latest,
 /// now that the registry fetch has resolved — critique S1) is itself
-/// affected, then commits the result into `DocumentState.vulnerabilities`.
+/// affected (B.1), then independently verifies each dependency's recommended
+/// *fix target* F (B.2, #462 — see [`run_osv_fix_target_verification`]),
+/// before committing the result into `DocumentState.vulnerabilities`.
 ///
 /// Must be called only *after* the registry fetch has updated
 /// `doc.cached_versions`: calling it concurrently with that fetch (as the
@@ -540,7 +542,14 @@ async fn run_osv_scan_phase_a(
 /// M4): `spawn_background_task` aborts the *previous* task only after the
 /// new `DocumentState` is already installed, so an in-flight scan from stale
 /// content could otherwise commit advisories computed against content the
-/// document no longer has.
+/// document no longer has. B.1 and B.2 share one `phase_b_deadline` (#462
+/// critic S2/M1) rather than each getting a fresh `fetch_timeout_secs`
+/// budget: B.2 is a second sequential network round-trip added *before* this
+/// guard, so giving it its own full budget would both double phase B's
+/// worst-case wall-clock time (contradicting NFR-002's singular "existing...
+/// budget" framing) and widen the window in which a mid-scan edit discards
+/// this whole result, `upgrade_status` included. Sharing one deadline caps
+/// the total at the original ceiling, same as before this fix existed.
 async fn run_osv_phase_b_and_commit(
     uri: &Uri,
     state: &Arc<ServerState>,
@@ -557,16 +566,20 @@ async fn run_osv_phase_b_and_commit(
         .collect();
 
     if !vulnerable_keys.is_empty() {
-        // TODO(critic): phase B checks registry-latest only; the fix target F is
-        // never scanned — see #216 critique D1
-        let candidates: Vec<deps_core::osv::ScanTarget> = {
+        let phase_b_deadline = Instant::now()
+            + Duration::from_secs(fetch_timeout_secs.min(OSV_SCAN_TIMEOUT_CEILING_SECS));
+
+        // B.1 (US-002, unchanged by #462): checks the registry's "latest" candidate.
+        // `latest_native_by_key` is kept for B.2 below, which needs the same native
+        // "latest" string to detect a fix target F that coincides with latest (FR-002)
+        // without re-deriving it from `doc.cached_versions` a second time.
+        let latest_native_by_key: HashMap<String, String> = {
             let Some(doc) = state.get_document(uri) else {
                 return;
             };
             vulnerable_keys
                 .iter()
                 .filter_map(|key| {
-                    let osv_name = result.osv_name_by_key.get(key)?.clone();
                     let latest = doc
                         .cached_versions
                         .get(key.as_str())
@@ -576,19 +589,27 @@ async fn run_osv_phase_b_and_commit(
                         })?
                         .latest
                         .clone();
-                    Some(deps_core::osv::ScanTarget {
-                        key: key.clone(),
-                        osv_name,
-                        version: formatter.osv_version(latest.as_str()),
-                        display_version: latest.to_string(),
-                    })
+                    Some((key.clone(), latest.to_string()))
                 })
                 .collect()
         };
 
+        let candidates: Vec<deps_core::osv::ScanTarget> = vulnerable_keys
+            .iter()
+            .filter_map(|key| {
+                let osv_name = result.osv_name_by_key.get(key)?.clone();
+                let latest_native = latest_native_by_key.get(key)?.clone();
+                Some(deps_core::osv::ScanTarget {
+                    key: key.clone(),
+                    osv_name,
+                    version: formatter.osv_version(&latest_native),
+                    display_version: latest_native,
+                })
+            })
+            .collect();
+
         if !candidates.is_empty() {
-            let timeout_duration =
-                Duration::from_secs(fetch_timeout_secs.min(OSV_SCAN_TIMEOUT_CEILING_SECS));
+            let timeout_duration = phase_b_deadline.saturating_duration_since(Instant::now());
             let statuses = state
                 .osv
                 .check_candidates(ecosystem_id, &candidates, timeout_duration)
@@ -601,6 +622,18 @@ async fn run_osv_phase_b_and_commit(
                 }
             }
         }
+
+        run_osv_fix_target_verification(
+            &mut result.vulnerabilities,
+            &vulnerable_keys,
+            &result.osv_name_by_key,
+            &latest_native_by_key,
+            ecosystem_id,
+            formatter,
+            &state.osv,
+            phase_b_deadline,
+        )
+        .await;
     }
 
     if let Some(mut doc) = state.documents.get_mut(uri) {
@@ -608,6 +641,203 @@ async fn run_osv_phase_b_and_commit(
             doc.update_vulnerabilities(result.vulnerabilities);
         } else {
             tracing::debug!("dropping stale OSV scan result: document content changed mid-scan");
+        }
+    }
+}
+
+/// Synthetic [`deps_core::osv::ScanTarget::key`] suffix marking a fix-target (F) live-check
+/// candidate as distinct from the same dependency's "latest" candidate (B.1) within the
+/// shared `VulnerabilityMap` key space — see [`run_osv_fix_target_verification`].
+const FIX_TARGET_KEY_SUFFIX: &str = "\u{0}fix";
+
+/// B.2 (#462): independently verifies each vulnerable dependency's recommended fix target F
+/// (`DependencyVulnerabilities::recommended_fix`'s `version`), which B.1 above never scans —
+/// B.1 only ever checks the registry's "latest" candidate, and F is frequently a different,
+/// older version (the minimal version that clears the advisories B.1's "latest" check did
+/// not already exclude). Without this, `generate_code_actions` could offer F as a verified
+/// fix when OSV was never asked about F itself — see
+/// `deps_core::osv::DependencyVulnerabilities::fix_target_status`'s doc, which this function
+/// populates, and the orphaned-TODO history in this function's git blame (formerly tracked
+/// only by a `// TODO(critic): ... see #216 critique D1` comment; now #462).
+///
+/// Resolution order per dependency, cheapest first:
+/// 1. F equals the already-checked "latest" candidate (FR-002) — reuse `upgrade_status`,
+///    no extra call.
+/// 2. Otherwise, queue a live [`deps_core::osv::OsvClient::check_candidates`] check for F,
+///    batched into a single call across every dependency that reaches this branch (NFR-001)
+///    — never one call per dependency. There is no data-derived shortcut here: a proof
+///    checking F against the advisories `recommended_fix()` computed F *from* is a
+///    tautology at its only call site (critic C1) — phase A only ever queries the
+///    dependency's declared version, so an advisory affecting some version strictly
+///    between declared and F, but not the declared version itself, is invisible to any
+///    check built only from `self.advisories`. Only a live query of F itself can surface
+///    that advisory (the actual gap #462 exists to close).
+///
+/// A dependency whose F fails [`deps_core::lsp_helpers::is_safe_version_string`], or whose
+/// `osv_name` is unavailable, is skipped (logged at `debug`), never crashes the scan. A
+/// dependency whose live check above times out or fails simply keeps `fix_target_status:
+/// None` (case 2's `HashMap` result never carries that key) — the safe, fail-closed
+/// degradation FR-004/NFR-002 call for: `deps_core::lsp_helpers::code_actions::fix_target_is_verified`
+/// treats an unresolved status as unverified and omits the fix action, so a stalled
+/// verification never surfaces a fix action that was never actually checked.
+#[allow(clippy::too_many_arguments)]
+async fn run_osv_fix_target_verification(
+    vulnerabilities: &mut deps_core::osv::VulnerabilityMap,
+    vulnerable_keys: &[String],
+    osv_name_by_key: &HashMap<String, String>,
+    latest_native_by_key: &HashMap<String, String>,
+    ecosystem_id: EcosystemId,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    osv: &deps_core::osv::OsvClient,
+    phase_b_deadline: Instant,
+) {
+    use deps_core::osv::ScanOutcome;
+
+    let (resolved, live_check_candidates) = collect_fix_target_resolutions(
+        vulnerabilities,
+        vulnerable_keys,
+        osv_name_by_key,
+        latest_native_by_key,
+        formatter,
+    );
+
+    for (key, status) in resolved {
+        if let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get_mut(key.as_str()) {
+            dv.fix_target_status = Some(status);
+        }
+    }
+
+    if live_check_candidates.is_empty() {
+        return;
+    }
+
+    let timeout_duration = phase_b_deadline.saturating_duration_since(Instant::now());
+    let statuses = osv
+        .check_candidates(ecosystem_id, &live_check_candidates, timeout_duration)
+        .await;
+
+    apply_live_fix_target_statuses(vulnerabilities, statuses);
+}
+
+/// Outcome of [`resolve_fix_target`] for one vulnerable dependency.
+#[derive(Debug, PartialEq, Eq)]
+enum FixTargetResolution {
+    /// No fix recommended, F failed [`deps_core::lsp_helpers::is_safe_version_string`], or no
+    /// `osv_name` is on record for this key — nothing to verify or record; `fix_target_status`
+    /// stays untouched (`None`).
+    Skip,
+    /// F's status was resolved without a network call by reusing the already-checked
+    /// "latest" candidate's result (FR-002, F == latest).
+    Resolved(deps_core::osv::UpgradeStatus),
+    /// F differs from latest and needs a live [`deps_core::osv::OsvClient::check_candidates`]
+    /// check — carries the [`deps_core::osv::ScanTarget`] to batch into the caller's single
+    /// combined call (NFR-001), keyed with [`FIX_TARGET_KEY_SUFFIX`] so its result cannot
+    /// collide with the same dependency's "latest" candidate in the same `VulnerabilityMap`
+    /// key space.
+    NeedsLiveCheck(deps_core::osv::ScanTarget),
+}
+
+/// Pure (network-free) decision logic for [`run_osv_fix_target_verification`]'s per-dependency
+/// resolution order — see that function's doc for the two cases and their rationale. Split
+/// out so each case is unit-testable without an `OsvClient`/network dependency.
+fn resolve_fix_target(
+    dv: &deps_core::osv::DependencyVulnerabilities,
+    key: &str,
+    latest_native_by_key: &HashMap<String, String>,
+    osv_name_by_key: &HashMap<String, String>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> FixTargetResolution {
+    use deps_core::lsp_helpers::is_safe_version_string;
+    use deps_core::osv::ScanTarget;
+
+    let Some(fix) = dv.recommended_fix() else {
+        return FixTargetResolution::Skip;
+    };
+    let version_native = formatter.osv_version_to_native(&fix.version);
+    if !is_safe_version_string(&version_native) {
+        tracing::debug!(
+            key,
+            version = %fix.version,
+            "OSV #462: fix-target version failed validation, skipping verification"
+        );
+        return FixTargetResolution::Skip;
+    }
+
+    if latest_native_by_key.get(key) == Some(&version_native) {
+        return FixTargetResolution::Resolved(dv.upgrade_status.clone());
+    }
+
+    let Some(osv_name) = osv_name_by_key.get(key).cloned() else {
+        tracing::debug!(
+            key,
+            "OSV #462: no osv_name on record for fix-target verification, skipping"
+        );
+        return FixTargetResolution::Skip;
+    };
+    FixTargetResolution::NeedsLiveCheck(ScanTarget {
+        key: format!("{key}{FIX_TARGET_KEY_SUFFIX}"),
+        osv_name,
+        version: fix.version,
+        display_version: version_native,
+    })
+}
+
+/// Pure aggregation step of [`run_osv_fix_target_verification`]: resolves every vulnerable
+/// dependency's fix target via [`resolve_fix_target`], splitting immediately-resolvable
+/// results (`resolved`) from the ones that need a live check (`live_check_candidates`) — the
+/// latter collected into one `Vec` across *every* dependency before the caller's single
+/// `check_candidates` call, so multiple dependencies needing a live check always batch into
+/// one network round-trip rather than one per dependency (NFR-001). Split out from the async
+/// orchestrator specifically so this batching/aggregation behavior is unit-testable without
+/// an `OsvClient`.
+fn collect_fix_target_resolutions(
+    vulnerabilities: &deps_core::osv::VulnerabilityMap,
+    vulnerable_keys: &[String],
+    osv_name_by_key: &HashMap<String, String>,
+    latest_native_by_key: &HashMap<String, String>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> (
+    Vec<(String, deps_core::osv::UpgradeStatus)>,
+    Vec<deps_core::osv::ScanTarget>,
+) {
+    use deps_core::osv::ScanOutcome;
+
+    let mut resolved = Vec::new();
+    let mut live_check_candidates = Vec::new();
+
+    for key in vulnerable_keys {
+        let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get(key.as_str()) else {
+            continue;
+        };
+        match resolve_fix_target(dv, key, latest_native_by_key, osv_name_by_key, formatter) {
+            FixTargetResolution::Skip => {}
+            FixTargetResolution::Resolved(status) => resolved.push((key.clone(), status)),
+            FixTargetResolution::NeedsLiveCheck(target) => live_check_candidates.push(target),
+        }
+    }
+
+    (resolved, live_check_candidates)
+}
+
+/// Applies a live [`deps_core::osv::OsvClient::check_candidates`] result keyed with
+/// [`FIX_TARGET_KEY_SUFFIX`] back onto the matching dependency's `fix_target_status`.
+///
+/// A key absent from `statuses` (timeout, OSV outage, or a chunk `check_candidates` itself
+/// dropped) simply leaves that dependency's `fix_target_status` untouched — `None` if it was
+/// never set, which is exactly the fail-closed degradation FR-004/NFR-002 call for (never a
+/// panic, never a fabricated "verified" status).
+fn apply_live_fix_target_statuses(
+    vulnerabilities: &mut deps_core::osv::VulnerabilityMap,
+    statuses: HashMap<String, deps_core::osv::UpgradeStatus>,
+) {
+    use deps_core::osv::ScanOutcome;
+
+    for (synthetic_key, status) in statuses {
+        let Some(key) = synthetic_key.strip_suffix(FIX_TARGET_KEY_SUFFIX) else {
+            continue;
+        };
+        if let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get_mut(key) {
+            dv.fix_target_status = Some(status);
         }
     }
 }
@@ -6562,6 +6792,279 @@ tokio = "1.0"
                 Some(&vec!["0.1.43".to_string(), "0.1.44".to_string()]),
                 "both occurrences' in-use versions must be tracked, not just the last one"
             );
+        }
+    }
+
+    /// #462: `resolve_fix_target`'s pure per-dependency decision logic (reuse / provably
+    /// clean / needs a live check / skip), and `apply_live_fix_target_statuses`'s handling of
+    /// a live-check result map that may be missing keys (timeout/outage).
+    mod fix_target_verification_tests {
+        use super::*;
+        use deps_core::lsp_helpers::EcosystemFormatter;
+        use deps_core::osv::{
+            Advisory, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+        use std::sync::Arc;
+
+        struct IdentityFormatter;
+        impl EcosystemFormatter for IdentityFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+
+        fn advisory(id: &str, fixed_versions: &[&str]) -> Arc<Advisory> {
+            Arc::new(Advisory {
+                id: id.to_string(),
+                modified: "2023-01-01T00:00:00Z".to_string(),
+                summary: None,
+                aliases: vec![],
+                severity: VulnSeverity::High,
+                cvss_vector: None,
+                fixed_versions: fixed_versions.iter().map(ToString::to_string).collect(),
+                url: String::new(),
+            })
+        }
+
+        fn dv(
+            advisories: Vec<Arc<Advisory>>,
+            upgrade_status: UpgradeStatus,
+        ) -> DependencyVulnerabilities {
+            DependencyVulnerabilities {
+                total_known: advisories.len(),
+                advisories,
+                upgrade_status,
+                fix_target_status: None,
+            }
+        }
+
+        #[test]
+        fn resolve_fix_target_skips_when_no_fix_is_recommended() {
+            // No advisory has a known fix, so `recommended_fix()` returns `None`.
+            let dv = dv(vec![advisory("A1", &[])], UpgradeStatus::NotChecked);
+            let resolution = resolve_fix_target(
+                &dv,
+                "pkg",
+                &HashMap::new(),
+                &HashMap::new(),
+                &IdentityFormatter,
+            );
+            assert_eq!(resolution, FixTargetResolution::Skip);
+        }
+
+        #[test]
+        fn resolve_fix_target_reuses_latest_when_f_equals_latest() {
+            // Case (c): F (1.2.0, the only advisory's fix) coincides with the already-checked
+            // "latest" candidate — reuse its result, no live check queued.
+            let latest_status = UpgradeStatus::CandidateClean {
+                version: "1.2.0".to_string(),
+            };
+            let dv = dv(vec![advisory("A1", &["1.2.0"])], latest_status.clone());
+            let mut latest_native_by_key = HashMap::new();
+            latest_native_by_key.insert("pkg".to_string(), "1.2.0".to_string());
+
+            let resolution = resolve_fix_target(
+                &dv,
+                "pkg",
+                &latest_native_by_key,
+                &HashMap::new(),
+                &IdentityFormatter,
+            );
+            assert_eq!(resolution, FixTargetResolution::Resolved(latest_status));
+        }
+
+        #[test]
+        fn resolve_fix_target_always_needs_live_check_when_f_differs_from_latest() {
+            // #462 critic C1: there is no data-derived shortcut. Even though every known
+            // advisory's fix (1.2.0) is already at or below F, that is a tautology — F is
+            // *computed from* these exact advisories, so this check would always pass at its
+            // only call site and prove nothing about an advisory phase A never fetched at
+            // all. F (1.2.0) differs from latest (3.0.0), so this must always queue a live
+            // check, batched under the fix-target key suffix.
+            let dv = dv(
+                vec![advisory("A1", &["1.2.0"])],
+                UpgradeStatus::CandidateClean {
+                    version: "3.0.0".to_string(),
+                },
+            );
+            let mut latest_native_by_key = HashMap::new();
+            latest_native_by_key.insert("pkg".to_string(), "3.0.0".to_string());
+            let mut osv_name_by_key = HashMap::new();
+            osv_name_by_key.insert("pkg".to_string(), "pkg".to_string());
+
+            let resolution = resolve_fix_target(
+                &dv,
+                "pkg",
+                &latest_native_by_key,
+                &osv_name_by_key,
+                &IdentityFormatter,
+            );
+            assert_eq!(
+                resolution,
+                FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget {
+                    key: format!("pkg{FIX_TARGET_KEY_SUFFIX}"),
+                    osv_name: "pkg".to_string(),
+                    version: "1.2.0".to_string(),
+                    display_version: "1.2.0".to_string(),
+                })
+            );
+        }
+
+        #[test]
+        fn resolve_fix_target_skips_when_osv_name_is_unavailable() {
+            // A live check is needed (F != latest) but no `osv_name` is on record for this
+            // key — nothing to query, so this degrades to `Skip` rather than panicking or
+            // building a `ScanTarget` with an empty name.
+            let dv = dv(vec![advisory("A1", &["1.0.0"])], UpgradeStatus::NotChecked);
+            let resolution = resolve_fix_target(
+                &dv,
+                "pkg",
+                &HashMap::new(),
+                &HashMap::new(),
+                &IdentityFormatter,
+            );
+            assert_eq!(resolution, FixTargetResolution::Skip);
+        }
+
+        #[test]
+        fn resolve_fix_target_skips_when_f_is_not_a_safe_version_string() {
+            // A malformed `fixed_versions` entry (as if it somehow reached this dependency's
+            // `advisories` despite OSV's own wire-boundary validation) must never be queued
+            // for a live check or treated as any kind of resolvable target — `is_safe_version_string`
+            // rejects it before anything else runs.
+            let dv = dv(
+                vec![advisory("A1", &["1.2.0\", \"evil\": \"true"])],
+                UpgradeStatus::NotChecked,
+            );
+            let resolution = resolve_fix_target(
+                &dv,
+                "pkg",
+                &HashMap::new(),
+                &HashMap::new(),
+                &IdentityFormatter,
+            );
+            assert_eq!(resolution, FixTargetResolution::Skip);
+        }
+
+        #[test]
+        fn collect_fix_target_resolutions_batches_multiple_dependencies_needing_live_check_into_one_vec()
+         {
+            // #462 NFR-001: three vulnerable dependencies — "reused" (F == latest, resolved
+            // without a call), "live-a" and "live-b" (F != latest, both need a live check) —
+            // must collapse into exactly one `resolved` entry and one `live_check_candidates`
+            // Vec of length 2, proving multiple dependencies needing verification are batched
+            // into a single prospective `check_candidates` call rather than one per dependency.
+            let mut vulnerabilities = VulnerabilityMap::new();
+            vulnerabilities.insert(
+                "reused".to_string(),
+                ScanOutcome::Vulnerable(dv(
+                    vec![advisory("A1", &["1.0.0"])],
+                    UpgradeStatus::CandidateClean {
+                        version: "1.0.0".to_string(),
+                    },
+                )),
+            );
+            vulnerabilities.insert(
+                "live-a".to_string(),
+                ScanOutcome::Vulnerable(dv(
+                    vec![advisory("A2", &["1.2.0"])],
+                    UpgradeStatus::NotChecked,
+                )),
+            );
+            vulnerabilities.insert(
+                "live-b".to_string(),
+                ScanOutcome::Vulnerable(dv(
+                    vec![advisory("A3", &["2.2.0"])],
+                    UpgradeStatus::NotChecked,
+                )),
+            );
+
+            let vulnerable_keys = vec![
+                "reused".to_string(),
+                "live-a".to_string(),
+                "live-b".to_string(),
+            ];
+            let mut latest_native_by_key = HashMap::new();
+            latest_native_by_key.insert("reused".to_string(), "1.0.0".to_string());
+            latest_native_by_key.insert("live-a".to_string(), "9.0.0".to_string());
+            latest_native_by_key.insert("live-b".to_string(), "9.0.0".to_string());
+            let mut osv_name_by_key = HashMap::new();
+            osv_name_by_key.insert("reused".to_string(), "reused".to_string());
+            osv_name_by_key.insert("live-a".to_string(), "live-a".to_string());
+            osv_name_by_key.insert("live-b".to_string(), "live-b".to_string());
+
+            let (resolved, live_check_candidates) = collect_fix_target_resolutions(
+                &vulnerabilities,
+                &vulnerable_keys,
+                &osv_name_by_key,
+                &latest_native_by_key,
+                &IdentityFormatter,
+            );
+
+            assert_eq!(resolved.len(), 1, "{resolved:?}");
+            assert_eq!(resolved[0].0, "reused");
+
+            assert_eq!(live_check_candidates.len(), 2, "{live_check_candidates:?}");
+            let keys: std::collections::HashSet<&str> = live_check_candidates
+                .iter()
+                .map(|t| t.key.as_str())
+                .collect();
+            assert!(keys.contains(format!("live-a{FIX_TARGET_KEY_SUFFIX}").as_str()));
+            assert!(keys.contains(format!("live-b{FIX_TARGET_KEY_SUFFIX}").as_str()));
+        }
+
+        #[test]
+        fn apply_live_fix_target_statuses_sets_only_matching_keys_leaving_others_untouched() {
+            // Case (e): a live-check batch that timed out for one dependency simply omits
+            // its key from `statuses` — that dependency's `fix_target_status` must stay
+            // `None` afterward, with no panic, while a dependency whose result did arrive
+            // gets it applied.
+            let mut vulnerabilities = VulnerabilityMap::new();
+            vulnerabilities.insert(
+                "checked".to_string(),
+                ScanOutcome::Vulnerable(dv(
+                    vec![advisory("A1", &["1.0.0"])],
+                    UpgradeStatus::NotChecked,
+                )),
+            );
+            vulnerabilities.insert(
+                "timed-out".to_string(),
+                ScanOutcome::Vulnerable(dv(
+                    vec![advisory("A2", &["1.0.0"])],
+                    UpgradeStatus::NotChecked,
+                )),
+            );
+
+            let mut statuses = HashMap::new();
+            statuses.insert(
+                format!("checked{FIX_TARGET_KEY_SUFFIX}"),
+                UpgradeStatus::CandidateClean {
+                    version: "1.0.0".to_string(),
+                },
+            );
+            // "timed-out" deliberately has no entry in `statuses`.
+
+            apply_live_fix_target_statuses(&mut vulnerabilities, statuses);
+
+            let ScanOutcome::Vulnerable(checked) = vulnerabilities.get("checked").unwrap() else {
+                panic!("expected Vulnerable");
+            };
+            assert_eq!(
+                checked.fix_target_status,
+                Some(UpgradeStatus::CandidateClean {
+                    version: "1.0.0".to_string()
+                })
+            );
+
+            let ScanOutcome::Vulnerable(timed_out) = vulnerabilities.get("timed-out").unwrap()
+            else {
+                panic!("expected Vulnerable");
+            };
+            assert_eq!(timed_out.fix_target_status, None);
         }
     }
 

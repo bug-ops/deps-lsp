@@ -247,6 +247,7 @@ impl OsvClient {
                     ScanOutcome::Vulnerable(dv) => UpgradeStatus::CandidateVulnerable {
                         version,
                         advisory_ids: dv.advisories.iter().map(|a| a.id.clone()).collect(),
+                        total_known: dv.total_known,
                     },
                     ScanOutcome::Skipped(_) => return None,
                 };
@@ -507,6 +508,7 @@ impl OsvClient {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories,
                 total_known: total,
+                fix_target_status: None,
                 upgrade_status: UpgradeStatus::NotChecked,
             })
         }
@@ -530,6 +532,7 @@ impl OsvClient {
         ScanOutcome::Vulnerable(DependencyVulnerabilities {
             advisories,
             total_known: vuln_ids.len(),
+            fix_target_status: None,
             upgrade_status: UpgradeStatus::NotChecked,
         })
     }
@@ -1236,8 +1239,8 @@ mod tests {
         ));
         assert!(matches!(
             statuses.get("bad-pkg"),
-            Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids })
-                if version == "2.0.0" && advisory_ids == &vec!["ADV-1".to_string()]
+            Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids, total_known })
+                if version == "2.0.0" && advisory_ids == &vec!["ADV-1".to_string()] && *total_known == 1
         ));
     }
 
