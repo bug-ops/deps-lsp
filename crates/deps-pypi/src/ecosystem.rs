@@ -1376,6 +1376,7 @@ dependencies = []
                 &parse_result,
                 versions,
                 &formatter,
+                parse_result.uri(),
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
                 deps_core::PublishTime::now(),
