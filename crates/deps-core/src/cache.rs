@@ -644,7 +644,7 @@ pub struct CachedResponse {
 ///
 /// # Cache key
 ///
-/// Entries are keyed by URL alone (see [`Self::cache_key`]) — `extra_headers` (see
+/// Entries are keyed by URL alone (see `Self::cache_key`, private) — `extra_headers` (see
 /// [`HttpCache::get_cached_with_headers`]) play no part in the cache key.
 /// This is safe only as long as "same URL" implies "same representation":
 /// a content-negotiating header (e.g. a per-request `Accept`) that can vary
@@ -659,7 +659,7 @@ pub struct CachedResponse {
 /// could observe the other's cached (and differently redirect-validated) body.
 ///
 /// [`Self::get_cached_workspace`] is the one exception: it is namespaced under a distinct,
-/// policy-scoped key prefix (see [`Self::cache_key`]) so a body fetched under a looser
+/// policy-scoped key prefix (see `Self::cache_key`, private) so a body fetched under a looser
 /// [`crate::net_policy::WorkspaceRegistryAccess`] can never be served back once the policy
 /// tightens.
 pub struct HttpCache {
@@ -843,7 +843,7 @@ impl HttpCache {
     /// the user (e.g. inserting it into a manifest edit) should treat it as
     /// arbitrarily stale, not just-expired.
     ///
-    /// Reads the baseline (unprefixed) cache-key namespace only (see [`Self::cache_key`]) — a
+    /// Reads the baseline (unprefixed) cache-key namespace only (see `Self::cache_key`, private) — a
     /// body fetched via [`Self::get_cached_workspace`] is never visible through this method.
     #[must_use]
     pub fn peek_cached(&self, url: &str) -> Option<Bytes> {
@@ -908,7 +908,7 @@ impl HttpCache {
     /// (same-scheme, any-host) redirect policy for every hop after that, which is
     /// exactly the shape a hostile or misconfigured redirect on the resolved index
     /// itself could exploit to exfiltrate a bearer token to an attacker-controlled
-    /// host. Composing [`Self::transport_for_origin`]'s pinned-origin transport with header
+    /// host. Composing `Self::transport_for_origin`'s (private) pinned-origin transport with header
     /// injection closes that by construction — no empirical redirect test is needed
     /// to prove the header cannot leak, since the client stops following before a
     /// cross-origin hop would ever be sent.
@@ -951,7 +951,7 @@ impl HttpCache {
     /// through the workspace transport field, whose guard enforces the live
     /// [`crate::net_policy::WorkspaceRegistryAccess`] policy on both the resolved connect-time
     /// address (issue #455) and any redirect hop, and keys the entry under a
-    /// policy-scoped namespace (see [`Self::cache_key`]) distinct from every other method on
+    /// policy-scoped namespace (see `Self::cache_key`, private) distinct from every other method on
     /// this cache.
     ///
     /// This gives the *resolved address* the same policy scrutiny `deps_cargo::config::RegistryIndex::new`
@@ -959,7 +959,7 @@ impl HttpCache {
     /// re-check the initial request URL itself: a caller passing an IP-literal `url` whose
     /// class the policy would reject connects anyway, since `hyper-util`'s connector parses an
     /// IP literal directly and never calls the configured resolver (see
-    /// [`BlockedAddrResolver`]'s docs). `RegistryIndex::new` is the sole, by-design gate for
+    /// `BlockedAddrResolver`'s docs, private). `RegistryIndex::new` is the sole, by-design gate for
     /// that residual — every caller of this method already went through it.
     ///
     /// If an entry is already cached, a revalidation failure — including a guard rejection
