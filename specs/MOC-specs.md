@@ -51,7 +51,7 @@ status: moc
 | 027 | [[027-nuget-unlisted-version-and-multiproject-lockfile/spec\|NuGet unlisted-version hover marker and multi-project lock file matching]] | specify | shipped — bug, P2 (PR #458, issue #451) |
 | 028 | [[028-pypi-requirements-documentlinks-and-directory-layout/spec\|PyPI requirements.txt -r/-c documentLinks and requirements/*.txt directory-layout recognition]] | specify | shipped — enhancement/security-hardening, P3 (PR #458, issue #452) |
 | 029 | [[029-deno-jsr-yanked-exact-pin-restriction-drop/spec\|Drop the jsr: exact-pin-only restriction on the Deno yanked diagnostic]] | specify | shipped — bug, P2 (PR #459, issue #454) |
-| 030 | [[030-gitlab-ci-ecosystem/spec\|New ecosystem: GitLab CI/CD include: version pins]] | specify | draft — research/new ecosystem, P4, 8 open `[NEEDS CLARIFICATION]` items |
+| 030 | [[030-gitlab-ci-ecosystem/spec\|New ecosystem: GitLab CI/CD include: version pins]] | specify | draft — research/new ecosystem, P4, 8 open `[NEEDS CLARIFICATION]` items, blocked on #208 (issue #466 tracks implementation) |
 
 ## Completed Specs
 

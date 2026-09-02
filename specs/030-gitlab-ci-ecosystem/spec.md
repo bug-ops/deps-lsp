@@ -280,6 +280,8 @@ No new persistent entities. Include references are parsed as dependencies (with 
 - #208 — GitHub Actions workflow `uses:` pins ecosystem candidate, spec [[014-github-actions-ecosystem/spec]]
   (still unimplemented, P4). Same git-tags-datasource pattern, sibling new-ecosystem candidate; the
   `project:`+`ref:` include form here is structurally identical to GHA's `owner/repo@ref`.
+- #466 — implementation follow-up issue for this spec, blocked on #208 shipping and on resolving the
+  8 open `[NEEDS CLARIFICATION]` items below.
 - `crates/deps-swift/src/registry.rs` (lines 12-95) — closest existing precedent for a hosted-git-platform
   REST API integration, including token env-var handling and rate-limit messaging (GitHub-specific auth
   scheme, not directly reusable for GitLab's `PRIVATE-TOKEN` header without an auth-scheme abstraction)
