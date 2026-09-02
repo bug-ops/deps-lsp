@@ -227,6 +227,7 @@ spring-boot = { module = "org.springframework.boot:spring-boot-starter", version
         &parse_result,
         VersionData::new(&cached_versions, &resolved_versions),
         &formatter,
+        parse_result.uri(),
         deps_core::FreshnessSettings::default(),
         deps_core::DiagnosticSeverities::default(),
         deps_core::PublishTime::now(),

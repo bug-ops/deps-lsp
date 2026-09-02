@@ -1045,6 +1045,22 @@ async fn fetch_latest_versions_parallel(
     let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let first_error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    // Separate from `first_error` (#480): a not-found error is deliberately excluded
+    // from `fetch_failed` below (it isn't evidence of a registry-side problem), but
+    // without this, whichever concurrent fetch happened to finish first could still win
+    // the `first_error` race and put a misleading "not found" message in the one-time
+    // toast even when the batch's real, actionable failure is e.g. a rate limit hit by
+    // 20 other dependencies. Any error that *does* count toward `fetch_failed`
+    // (including a timeout) always wins the toast over a not-found, regardless of
+    // finishing order; only a not-found-only batch falls back to `first_error`.
+    //
+    // Unlike `first_error`, this is not a shared `Arc<Mutex>` written from inside the
+    // four match arms below — each task instead returns its own `(name, message)` via
+    // `failed_name`, and the priority error is derived by folding those in completion
+    // order once every task has finished (see the loop below). `fetch_failed` and the
+    // priority error are thereby always in sync by construction: both come from the
+    // same `failed_name` value, so a future edit to one can no longer silently drift
+    // from the other, which two independently hand-maintained writes could (#480).
     let timeout = Duration::from_secs(timeout_secs);
     let wildcard_req = deps_core::VersionReq::new("*");
     let check_yanked = registry.reports_yanked();
@@ -1076,7 +1092,7 @@ async fn fetch_latest_versions_parallel(
                 .await;
 
                 let mut yanked: Option<(PackageName, ConcreteVersion, RemovalStatus)> = None;
-                let mut failed_name: Option<(PackageName, FetchFailure)> = None;
+                let mut failed_name: Option<(PackageName, FetchFailure, String)> = None;
                 let mut deprecation: Option<(PackageName, Deprecation)> = None;
                 let version = match result {
                     Ok(Ok(versions)) => {
@@ -1187,7 +1203,8 @@ async fn fetch_latest_versions_parallel(
                                     // package") is not a fetch failure — only
                                     // an unanswerable request is (#267 C1).
                                     if !e.is_not_found() {
-                                        failed_name = Some((name.clone(), e.fetch_failure()));
+                                        failed_name =
+                                            Some((name.clone(), e.fetch_failure(), e.to_string()));
                                     }
                                     None
                                 }
@@ -1198,7 +1215,14 @@ async fn fetch_latest_versions_parallel(
                                         timeout.as_secs()
                                     );
                                     failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    failed_name = Some((name.clone(), FetchFailure::Transient));
+                                    failed_name = Some((
+                                        name.clone(),
+                                        FetchFailure::Transient,
+                                        format!(
+                                            "{name}: registry request timed out after {}s",
+                                            timeout.as_secs()
+                                        ),
+                                    ));
                                     None
                                 }
                             }
@@ -1304,14 +1328,21 @@ async fn fetch_latest_versions_parallel(
                         // instead of "Unknown package", inverting the bug
                         // this field exists to fix.
                         if !e.is_not_found() {
-                            failed_name = Some((name.clone(), e.fetch_failure()));
+                            failed_name = Some((name.clone(), e.fetch_failure(), e.to_string()));
                         }
                         None
                     }
                     Err(_) => {
                         tracing::warn!(package = %name, "fetch timed out ({}s)", timeout.as_secs());
                         failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        failed_name = Some((name.clone(), FetchFailure::Transient));
+                        failed_name = Some((
+                            name.clone(),
+                            FetchFailure::Transient,
+                            format!(
+                                "{name}: registry request timed out after {}s",
+                                timeout.as_secs()
+                            ),
+                        ));
                         None
                     }
                 };
@@ -1332,6 +1363,10 @@ async fn fetch_latest_versions_parallel(
     let mut yanked_versions = HashMap::new();
     let mut fetch_failed = HashMap::new();
     let mut deprecations = HashMap::new();
+    // First actionable failure in completion order — `results` is collected from
+    // `buffer_unordered`, so its order already reflects real finishing order, the same
+    // order a shared `Arc<Mutex>` written from inside each task would have observed.
+    let mut priority_error: Option<String> = None;
     for (version, yanked, failed_name, deprecation) in results {
         if let Some((name, v)) = version {
             versions.insert(name, v);
@@ -1339,13 +1374,23 @@ async fn fetch_latest_versions_parallel(
         if let Some((name, v, status)) = yanked {
             yanked_versions.insert(name, (v, status));
         }
-        if let Some((name, failure)) = failed_name {
+        if let Some((name, failure, message)) = failed_name {
             fetch_failed.insert(name, failure);
+            if priority_error.is_none() {
+                priority_error = Some(message);
+            }
         }
         if let Some((name, d)) = deprecation {
             deprecations.insert(name, d);
         }
     }
+
+    // `priority_error` (an actual fetch failure — rate limit, timeout, outage, ...)
+    // always wins the toast over `first_error` (which may be a not-found race winner);
+    // `first_error` is the fallback only for a batch whose only failures were
+    // not-found (#480).
+    let error_message =
+        priority_error.or_else(|| first_error.lock().unwrap_or_else(|p| p.into_inner()).take());
 
     FetchResult {
         versions,
@@ -1353,7 +1398,7 @@ async fn fetch_latest_versions_parallel(
         fetch_failed,
         deprecations,
         failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
-        first_error: first_error.lock().unwrap_or_else(|p| p.into_inner()).take(),
+        first_error: error_message,
     }
 }
 
@@ -1373,13 +1418,9 @@ fn fetch_failure_toast(
     if failed_count == 0 || offline {
         return None;
     }
-    Some(first_error.map_or_else(
-        || {
-            format!(
-                "deps-lsp: {failed_count} package(s) failed to fetch (timeout or network error)"
-            )
-        },
-        |err| format!("deps-lsp: {err}"),
+    Some(format!(
+        "deps-lsp: {failed_count} package(s) failed to fetch: {}",
+        first_error.unwrap_or("timeout or network error")
     ))
 }
 
@@ -1636,7 +1677,10 @@ pub async fn handle_document_open(
         }
 
         // Notify user about failed packages — suppressed when offline, see
-        // `fetch_failure_toast`'s docs.
+        // `fetch_failure_toast`'s docs. `fetch_result.first_error` is always populated
+        // by `fetch_latest_versions_parallel` whenever `failed_count > 0` (#480: every
+        // site that increments `failed_count` also sets either `priority_error` or
+        // `first_error`, and the two are merged into this field before returning).
         match fetch_failure_toast(
             fetch_result.failed_count,
             fetch_result.first_error.as_deref(),
@@ -2045,7 +2089,10 @@ pub async fn handle_document_change(
         }
 
         // Notify user about failed packages — suppressed when offline, see
-        // `fetch_failure_toast`'s docs.
+        // `fetch_failure_toast`'s docs. `fetch_result.first_error` is always populated
+        // by `fetch_latest_versions_parallel` whenever `failed_count > 0` (#480: every
+        // site that increments `failed_count` also sets either `priority_error` or
+        // `first_error`, and the two are merged into this field before returning).
         match fetch_failure_toast(
             fetch_result.failed_count,
             fetch_result.first_error.as_deref(),
@@ -2339,7 +2386,10 @@ mod tests {
         fn test_online_failure_with_first_error_uses_it_verbatim() {
             assert_eq!(
                 fetch_failure_toast(1, Some("HTTP 503 for https://example.com"), false),
-                Some("deps-lsp: HTTP 503 for https://example.com".to_string())
+                Some(
+                    "deps-lsp: 1 package(s) failed to fetch: HTTP 503 for https://example.com"
+                        .to_string()
+                )
             );
         }
 
@@ -2348,7 +2398,7 @@ mod tests {
             assert_eq!(
                 fetch_failure_toast(5, None, false),
                 Some(
-                    "deps-lsp: 5 package(s) failed to fetch (timeout or network error)".to_string()
+                    "deps-lsp: 5 package(s) failed to fetch: timeout or network error".to_string()
                 )
             );
         }
@@ -4135,6 +4185,261 @@ mod tests {
         assert_eq!(result.failed_count, 1);
     }
 
+    #[tokio::test]
+    async fn test_first_error_prefers_actionable_error_over_not_found_regardless_of_race_order() {
+        // #480: `first_error` is the batch's one-shot toast message. Before this fix it
+        // was simply whichever concurrent fetch finished first — so a fast not-found
+        // ("Unknown package") could outrank a slower but far more actionable error
+        // (e.g. a rate limit hit by every other package in the batch). Here the
+        // not-found resolves immediately while the actionable error resolves after a
+        // short delay, so it wins the finishing race; `priority_error` must still make
+        // the actionable error win the reported `first_error`.
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+        use std::time::Duration;
+
+        struct MixedErrorRegistry;
+
+        impl Registry for MixedErrorRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    if name.as_str() == "typo-pkg" {
+                        Err(deps_core::error::DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "mock",
+                        })
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Err(deps_core::error::DepsError::CacheError(
+                            "rate limit exceeded".to_string(),
+                        ))
+                    }
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(MixedErrorRegistry);
+        let packages = vec![
+            PackageName::new("typo-pkg"),
+            PackageName::new("rate-limited"),
+        ];
+
+        let result = fetch_latest_versions_parallel(
+            registry,
+            with_registry_source(packages),
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            10,
+            None,
+        )
+        .await;
+
+        let err = result
+            .first_error
+            .expect("an actionable failure occurred and must be reported");
+        assert!(
+            err.contains("rate limit exceeded"),
+            "the actionable error must win the toast over the faster-finishing not-found, \
+             got: {err}"
+        );
+        assert!(
+            !err.contains("not found"),
+            "a not-found error must never outrank an actionable error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_error_falls_back_to_not_found_when_no_actionable_error_occurred() {
+        // #480 fallback path: `priority_error` is only populated by errors that also
+        // count toward `fetch_failed` (non-not-found). A batch whose only failures are
+        // not-found ones must still surface one via `first_error` instead of silently
+        // reporting nothing.
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct AllNotFoundRegistry;
+
+        impl Registry for AllNotFoundRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Err(deps_core::error::DepsError::PackageNotFound {
+                        package: name.to_string(),
+                        registry: "mock",
+                    })
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(AllNotFoundRegistry);
+        let packages = vec![
+            PackageName::new("typo-pkg-1"),
+            PackageName::new("typo-pkg-2"),
+        ];
+
+        let result = fetch_latest_versions_parallel(
+            registry,
+            with_registry_source(packages),
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            10,
+            None,
+        )
+        .await;
+
+        assert!(
+            result.fetch_failed.is_empty(),
+            "not-found errors must never be recorded in fetch_failed"
+        );
+        let err = result
+            .first_error
+            .expect("a not-found-only batch must still fall back to reporting one via first_error");
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_timeout_only_batch_reports_first_error_alongside_failed_count() {
+        // #480 S1: the toast used to special-case a populated `first_error` as
+        // `format!("deps-lsp: {err}")`, entirely dropping `failed_count` from the
+        // message whenever `first_error` was `Some` — so a multi-package timeout batch
+        // (which always populates `first_error` via `priority_error`, unlike the
+        // not-found-only case) silently lost its count. The toast is now built
+        // unconditionally from both fields (`"{failed_count} package(s) failed to
+        // fetch: {first_error}"`), so this asserts the `FetchResult` data that feeds
+        // it: a batch where every package times out must report `failed_count` equal
+        // to the batch size *and* a populated, actionable `first_error` — both fields
+        // together, not one masking the other.
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+        use std::time::Duration;
+
+        struct AlwaysTimesOutRegistry;
+
+        impl Registry for AlwaysTimesOutRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(vec![])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(None)
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(AlwaysTimesOutRegistry);
+        let packages = vec![
+            PackageName::new("slow-1"),
+            PackageName::new("slow-2"),
+            PackageName::new("slow-3"),
+        ];
+
+        let result = fetch_latest_versions_parallel(
+            registry,
+            with_registry_source(packages),
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            1,
+            10,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            result.failed_count, 3,
+            "all 3 packages must count toward failed_count"
+        );
+        let err = result
+            .first_error
+            .expect("a timeout is actionable and must populate first_error, not just failed_count");
+        assert!(
+            err.contains("timed out"),
+            "first_error must be the actionable timeout message, got: {err}"
+        );
+    }
+
     // Composer-specific tests
     #[cfg(feature = "composer")]
     mod composer_tests {
@@ -4816,6 +5121,7 @@ dependencies = ["requests>=2.0.0"]
                 VersionData::new(&doc.cached_versions, &doc.resolved_versions)
                     .with_outcomes(&doc.outcomes),
                 formatter,
+                &uri,
                 deps_core::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 deps_core::PublishTime::now(),

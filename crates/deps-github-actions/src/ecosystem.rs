@@ -135,7 +135,7 @@ impl Ecosystem for GithubActionsEcosystem {
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
         versions: deps_core::VersionData<'a>,
-        _uri: &'a Uri,
+        uri: &'a Uri,
         freshness: deps_core::FreshnessSettings,
         severities: deps_core::lsp_helpers::DiagnosticSeverities,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<Diagnostic>> {
@@ -144,6 +144,7 @@ impl Ecosystem for GithubActionsEcosystem {
                 parse_result,
                 versions,
                 self.formatter(),
+                uri,
                 freshness,
                 severities,
                 deps_core::PublishTime::now(),

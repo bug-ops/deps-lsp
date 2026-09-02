@@ -1,5 +1,6 @@
 use tower_lsp_server::ls_types::{
-    CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Uri,
+    CodeDescription, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location,
+    NumberOrString, Position, Range, Uri,
 };
 
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
@@ -471,6 +472,10 @@ fn requirement_matches_only_yanked(
 /// * `parse_result` - Parsed dependencies from manifest
 /// * `versions` - Latest (registry) and resolved (lock file) version maps, keyed by package name
 /// * `formatter` - Ecosystem-specific formatting and comparison logic
+/// * `uri` - Document URI, used only to anchor the [`Location`] of any
+///   [`DiagnosticRelatedInformation`] entries attached to a collapsed fetch-failure
+///   diagnostic (#479/#480 S2) — every other diagnostic here is scoped to the document
+///   it's published under implicitly and doesn't need it
 /// * `freshness` - Whether to differentiate an "outdated" diagnostic still within the
 ///   release cooldown window (severity is unaffected either way — see the "Newer version
 ///   available" message below)
@@ -483,12 +488,20 @@ pub fn generate_diagnostics_from_cache(
     parse_result: &dyn ParseResult,
     versions: VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
+    uri: &Uri,
     freshness: crate::freshness::FreshnessSettings,
     severities: DiagnosticSeverities,
     now: PublishTime,
 ) -> Vec<Diagnostic> {
     let deps = parse_result.dependencies();
     let mut diagnostics = Vec::with_capacity(deps.len());
+    // Collected separately from `diagnostics`: buffered here so 2+ near-identical
+    // fetch failures collapse into one diagnostic instead of fanning out — but each
+    // entry keeps its own name, built message, and classification, since the
+    // collapse still needs to name every affected dependency (via
+    // `related_information`) and must never silently drop an `Actionable` hint
+    // (#478/#485's whole point) just because #479's collapse kicked in.
+    let mut fetch_failed_diagnostics: Vec<(String, Diagnostic, Option<FetchFailure>)> = Vec::new();
 
     // Issue #483 S2/I2: `network.offline` silently degrades every diagnostic in this
     // function that depends on a registry/OSV fetch — vulnerabilities never queried,
@@ -701,7 +714,7 @@ pub fn generate_diagnostics_from_cache(
                 // distinctly from a genuine "not found" so a transient registry
                 // outage or a malformed response (e.g. unparseable
                 // maven-metadata.xml) doesn't masquerade as "Unknown package".
-                let fetch_failure = formatter
+                let fetch_failure: Option<&FetchFailure> = formatter
                     .can_resolve_source(&dep.source())
                     .then(|| {
                         versions
@@ -709,40 +722,64 @@ pub fn generate_diagnostics_from_cache(
                             .and_then(|o| o.fetch_failure(normalized_name.as_str()))
                     })
                     .flatten();
-                let message = match formatter.validate_package_name(dep.name().as_str()) {
-                    Err(reason) => Some(format!("Invalid package name '{}': {reason}", dep.name())),
-                    // Issue #483 I2: while offline, a per-dependency "lookup failed" WARNING
-                    // (of any `FetchFailure` kind) is misattributed — this is a deliberately
-                    // configured mode, not a registry outage — and would be strictly noisier
-                    // than the toast this same PR suppresses for being unusable offline. The
-                    // file-level informational diagnostic pushed above already covers this
-                    // dependency.
-                    Ok(()) if fetch_failure.is_some() && versions.offline => None,
-                    Ok(()) => match fetch_failure {
-                        Some(FetchFailure::Actionable(hint)) => Some(format!(
-                            "Registry lookup failed for '{}': {hint}",
-                            dep.name()
-                        )),
-                        Some(FetchFailure::Transient | FetchFailure::NotAttempted) => {
-                            Some(format!(
-                                "Registry lookup failed for '{}'; package status could not be \
-                             determined",
-                                dep.name()
-                            ))
-                        }
-                        None => formatter
-                            .can_resolve_source(&dep.source())
-                            .then(|| format!("Unknown package '{}'", dep.name())),
-                    },
-                };
-                if let Some(message) = message {
-                    diagnostics.push(Diagnostic {
-                        range: dep.name_range(),
-                        severity: Some(severities.unknown),
-                        message,
-                        source: Some("deps-lsp".into()),
-                        ..Default::default()
-                    });
+                match formatter.validate_package_name(dep.name().as_str()) {
+                    Err(reason) => {
+                        diagnostics.push(Diagnostic {
+                            range: dep.name_range(),
+                            severity: Some(severities.unknown),
+                            message: format!("Invalid package name '{}': {reason}", dep.name()),
+                            source: Some("deps-lsp".into()),
+                            ..Default::default()
+                        });
+                    }
+                    // Issue #483 I2: while offline, a per-dependency "lookup failed"
+                    // diagnostic (of any `FetchFailure` kind, collapsed or not) is
+                    // misattributed — this is a deliberately configured mode, not a
+                    // registry outage — and would be strictly noisier than the toast this
+                    // same PR suppresses for being unusable offline. The file-level
+                    // informational diagnostic pushed above already covers this
+                    // dependency, so nothing is queued into `fetch_failed_diagnostics`.
+                    Ok(()) if fetch_failure.is_some() && versions.offline => {}
+                    // Deferred to `fetch_failed_diagnostics` (collapsed below the main
+                    // loop) rather than pushed inline like the other two arms: a fetch
+                    // failure is a registry-wide condition that can hit many
+                    // dependencies identically, so it is worth collapsing into one
+                    // diagnostic when it does (#479) — without ever dropping a
+                    // per-dependency `Actionable` hint (#478/#485).
+                    Ok(()) if fetch_failure.is_some() => {
+                        let message = match fetch_failure {
+                            Some(FetchFailure::Actionable(hint)) => {
+                                format!("Registry lookup failed for '{}': {hint}", dep.name())
+                            }
+                            Some(FetchFailure::Transient | FetchFailure::NotAttempted) | None => {
+                                format!(
+                                    "Registry lookup failed for '{}'; package status could not be determined",
+                                    dep.name()
+                                )
+                            }
+                        };
+                        fetch_failed_diagnostics.push((
+                            dep.name().to_string(),
+                            Diagnostic {
+                                range: dep.name_range(),
+                                severity: Some(severities.unknown),
+                                message,
+                                source: Some("deps-lsp".into()),
+                                ..Default::default()
+                            },
+                            fetch_failure.cloned(),
+                        ));
+                    }
+                    Ok(()) if formatter.can_resolve_source(&dep.source()) => {
+                        diagnostics.push(Diagnostic {
+                            range: dep.name_range(),
+                            severity: Some(severities.unknown),
+                            message: format!("Unknown package '{}'", dep.name()),
+                            source: Some("deps-lsp".into()),
+                            ..Default::default()
+                        });
+                    }
+                    Ok(()) => {}
                 }
             }
             continue;
@@ -894,6 +931,62 @@ pub fn generate_diagnostics_from_cache(
         }
     }
 
+    // A single fetch failure keeps its own per-dependency diagnostic (same range as
+    // before, though — unlike every other diagnostic in this function — no longer
+    // necessarily at the same position in the returned `Vec` in dependency order: it's
+    // now appended after the main loop rather than interleaved with it, so an assertion
+    // keyed on vec index rather than message content could be affected). More than one
+    // collapses into one combined diagnostic (on the first failing dependency's range)
+    // rather than fanning out N near-duplicates that all trace back to the same
+    // registry-wide condition (#479) — but unlike the first cut of this collapse, every
+    // *additional* failing dependency's name and location survive via
+    // `related_information` (#480 S2) instead of being silently dropped along with their
+    // per-line diagnostic marker.
+    match fetch_failed_diagnostics.len() {
+        0 => {}
+        1 => diagnostics.extend(fetch_failed_diagnostics.into_iter().map(|(_, d, _)| d)),
+        n => {
+            let (_, first, _) = &fetch_failed_diagnostics[0];
+            let range = first.range;
+            let severity = first.severity;
+            // Surface a shared/first actionable hint across the batch if one exists,
+            // so collapsing 2+ failures into one diagnostic never drops the specific,
+            // pre-vetted remedy #478/#485 introduced — only fall back to the generic
+            // message when nothing in the batch has one.
+            let shared_hint =
+                fetch_failed_diagnostics
+                    .iter()
+                    .find_map(|(_, _, failure)| match failure {
+                        Some(FetchFailure::Actionable(hint)) => Some(hint.clone()),
+                        _ => None,
+                    });
+            let message = match shared_hint {
+                Some(hint) => format!("Registry lookup failed for {n} packages: {hint}"),
+                None => format!(
+                    "Registry lookup failed for {n} packages; package status could not be determined"
+                ),
+            };
+            let related_information = fetch_failed_diagnostics[1..]
+                .iter()
+                .map(|(name, d, _)| DiagnosticRelatedInformation {
+                    location: Location {
+                        uri: uri.clone(),
+                        range: d.range,
+                    },
+                    message: format!("'{name}' also failed"),
+                })
+                .collect();
+            diagnostics.push(Diagnostic {
+                range,
+                severity,
+                message,
+                source: Some("deps-lsp".into()),
+                related_information: Some(related_information),
+                ..Default::default()
+            });
+        }
+    }
+
     diagnostics
 }
 
@@ -1017,6 +1110,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1084,6 +1178,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1182,6 +1277,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1228,6 +1324,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1280,6 +1377,7 @@ mod tests {
                 .with_outcomes(&outcomes)
                 .with_offline(true),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1333,6 +1431,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_offline(true),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1378,6 +1477,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1391,6 +1491,254 @@ mod tests {
                 .contains("set GITHUB_TOKEN to increase the rate limit")
         );
         assert!(diagnostics[0].message.contains("rate-limited-pkg"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_multiple_fetch_failed_collapse_into_one_diagnostic() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // #479: a registry-wide condition (e.g. a rate limit tripped by one dependency)
+        // can fail every remaining dependency identically. N near-duplicate
+        // per-dependency "Registry lookup failed" diagnostics carry no more information
+        // than one combined diagnostic — this asserts the 2+ case actually collapses,
+        // on the first failing dependency's range, with the count in the message.
+        let formatter = MockFormatter;
+
+        let name_range_1 = Range::new(Position::new(0, 0), Position::new(0, 8));
+        let name_range_2 = Range::new(Position::new(1, 0), Position::new(1, 8));
+        let name_range_3 = Range::new(Position::new(2, 0), Position::new(2, 8));
+
+        let parse_result = MockParseResult {
+            deps: vec![
+                MockDep {
+                    name: "flaky-1".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: name_range_1,
+                },
+                MockDep {
+                    name: "flaky-2".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: name_range_2,
+                },
+                MockDep {
+                    name: "flaky-3".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)),
+                    name_range: name_range_3,
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let outcomes = DependencyOutcomes::new()
+            .with_fetch_failure("flaky-1", FetchFailure::Transient)
+            .with_fetch_failure("flaky-2", FetchFailure::Transient)
+            .with_fetch_failure("flaky-3", FetchFailure::Transient);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "3 fetch-failed dependencies must collapse into exactly one diagnostic, got: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Registry lookup failed for 3 packages")
+        );
+        assert_eq!(
+            diagnostics[0].range, name_range_1,
+            "the combined diagnostic must sit on the first failing dependency's range"
+        );
+
+        // #480 S2: the collapse must not silently drop the other failing dependencies —
+        // each one beyond the first survives via `related_information`, keyed to its own
+        // name and `name_range`.
+        let related_information = diagnostics[0]
+            .related_information
+            .as_ref()
+            .expect("collapsed diagnostic must carry related_information for the dropped deps");
+        assert_eq!(
+            related_information.len(),
+            2,
+            "expected one related_information entry per additional failing dependency (n - 1)"
+        );
+        assert_eq!(related_information[0].location.range, name_range_2);
+        assert_eq!(related_information[0].location.uri, *parse_result.uri());
+        assert!(related_information[0].message.contains("flaky-2"));
+        assert_eq!(related_information[1].location.range, name_range_3);
+        assert_eq!(related_information[1].location.uri, *parse_result.uri());
+        assert!(related_information[1].message.contains("flaky-3"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_two_fetch_failed_collapse_boundary() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // n==2 is the lowest n that collapses at all (n==1 stays a plain per-dependency
+        // diagnostic — see `test_generate_diagnostics_from_cache_fetch_failed_not_reported_as_unknown`
+        // above) — this confirms `related_information` is populated right at that
+        // threshold, not just once there are 3+ failures to fold in.
+        let formatter = MockFormatter;
+
+        let name_range_1 = Range::new(Position::new(0, 0), Position::new(0, 8));
+        let name_range_2 = Range::new(Position::new(1, 0), Position::new(1, 8));
+
+        let parse_result = MockParseResult {
+            deps: vec![
+                MockDep {
+                    name: "flaky-1".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: name_range_1,
+                },
+                MockDep {
+                    name: "flaky-2".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: name_range_2,
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let outcomes = DependencyOutcomes::new()
+            .with_fetch_failure("flaky-1", FetchFailure::Transient)
+            .with_fetch_failure("flaky-2", FetchFailure::Transient);
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "2 fetch-failed dependencies must already collapse into one diagnostic, got: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("Registry lookup failed for 2 packages")
+        );
+        let related_information = diagnostics[0]
+            .related_information
+            .as_ref()
+            .expect("the n==2 collapse must already carry related_information");
+        assert_eq!(
+            related_information.len(),
+            1,
+            "n==2 collapse must carry exactly one related_information entry (n - 1)"
+        );
+        assert_eq!(related_information[0].location.range, name_range_2);
+        assert_eq!(related_information[0].location.uri, *parse_result.uri());
+        assert!(related_information[0].message.contains("flaky-2"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_multiple_fetch_failed_shared_actionable_hint() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        // #478/#485 + #479: the motivating scenario for both — a rate-limit gate trips
+        // and fails every remaining dependency with the SAME `Actionable` hint. The
+        // #479 collapse must not silently drop that hint just because 2+ failures
+        // collapsed into one diagnostic.
+        let formatter = MockFormatter;
+
+        let name_range_1 = Range::new(Position::new(0, 0), Position::new(0, 8));
+        let name_range_2 = Range::new(Position::new(1, 0), Position::new(1, 8));
+        let name_range_3 = Range::new(Position::new(2, 0), Position::new(2, 8));
+
+        let parse_result = MockParseResult {
+            deps: vec![
+                MockDep {
+                    name: "flaky-1".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: name_range_1,
+                },
+                MockDep {
+                    name: "flaky-2".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: name_range_2,
+                },
+                MockDep {
+                    name: "flaky-3".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(2, 10), Position::new(2, 20)),
+                    name_range: name_range_3,
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let shared_hint = "set GITHUB_TOKEN to increase the rate limit".to_string();
+        let outcomes = DependencyOutcomes::new()
+            .with_fetch_failure("flaky-1", FetchFailure::Actionable(shared_hint.clone()))
+            .with_fetch_failure("flaky-2", FetchFailure::Actionable(shared_hint.clone()))
+            .with_fetch_failure("flaky-3", FetchFailure::Actionable(shared_hint.clone()));
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "3 fetch-failed dependencies must still collapse into exactly one diagnostic, got: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains(&shared_hint),
+            "collapsed diagnostic must surface the shared actionable hint, got: {}",
+            diagnostics[0].message
+        );
+        assert!(
+            !diagnostics[0]
+                .message
+                .contains("package status could not be determined"),
+            "the actionable hint must replace, not accompany, the generic fallback message"
+        );
+        let related_information = diagnostics[0]
+            .related_information
+            .as_ref()
+            .expect("collapsed diagnostic must carry related_information for the dropped deps");
+        assert_eq!(
+            related_information.len(),
+            2,
+            "expected one related_information entry per additional failing dependency (n - 1)"
+        );
     }
 
     #[test]
@@ -1422,6 +1770,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1466,6 +1815,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1509,6 +1859,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1545,6 +1896,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1582,6 +1934,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1631,6 +1984,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1685,6 +2039,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1731,6 +2086,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings {
                 enabled: false,
                 ..crate::freshness::FreshnessSettings::default()
@@ -1784,6 +2140,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings {
                 enabled: true,
                 cooldown_secs: COOLDOWN_SECS,
@@ -1837,6 +2194,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings {
                 enabled: true,
                 cooldown_secs: COOLDOWN_SECS,
@@ -1879,6 +2237,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1931,6 +2290,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -1978,6 +2338,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2020,6 +2381,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             severities,
             PublishTime::now(),
@@ -2059,6 +2421,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2099,6 +2462,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2142,6 +2506,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2206,6 +2571,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2261,6 +2627,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2335,6 +2702,7 @@ mod tests {
                 &parse_result,
                 versions,
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 severities,
                 PublishTime::now(),
@@ -2393,6 +2761,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &MockFormatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),
@@ -2416,6 +2785,7 @@ mod tests {
             &registry_parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &MockFormatter,
+            registry_parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2454,6 +2824,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2508,6 +2879,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2563,6 +2935,7 @@ mod tests {
                 .with_outcomes(&outcomes)
                 .with_ecosystem(crate::EcosystemId::Cargo),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2623,6 +2996,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
             &formatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2666,6 +3040,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &StrictSemverFormatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2710,6 +3085,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &StrictSemverFormatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2767,6 +3143,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
                 &ExactMatchFormatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),
@@ -2790,6 +3167,7 @@ mod tests {
             &registry_parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &ExactMatchFormatter,
+            registry_parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2825,6 +3203,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &MockFormatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2846,6 +3225,7 @@ mod tests {
             &registry_parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &MockFormatter,
+            registry_parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2882,6 +3262,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &RejectingFormatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2918,6 +3299,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &MockFormatter,
+            parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2939,6 +3321,7 @@ mod tests {
             &registry_parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
             &MockFormatter,
+            registry_parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -2987,6 +3370,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &formatter,
+            parse_result.uri(),
             crate::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -3036,6 +3420,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &formatter,
+            parse_result.uri(),
             crate::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -3122,6 +3507,7 @@ mod tests {
                 .with_vulnerabilities(&vulns)
                 .with_ecosystem(crate::EcosystemId::Cargo),
             &formatter,
+            parse_result.uri(),
             crate::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -3165,6 +3551,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &formatter,
+            parse_result.uri(),
             crate::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
             PublishTime::now(),
@@ -3867,6 +4254,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),
@@ -3930,6 +4318,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),
@@ -3994,6 +4383,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),
@@ -4065,6 +4455,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),
@@ -4128,6 +4519,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),
@@ -4206,6 +4598,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 severities,
                 PublishTime::now(),
@@ -4248,6 +4641,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),
@@ -4360,6 +4754,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),
@@ -4406,6 +4801,7 @@ mod tests {
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions),
                 &formatter,
+                parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),

@@ -918,6 +918,7 @@ mod tests {
                 &pr,
                 versions,
                 &MockFormatter,
+                pr.uri(),
                 crate::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
                 PublishTime::now(),

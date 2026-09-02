@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-swift, deps-github-actions**: extracted the duplicated GitHub tags-API client (owner/repo validation, auth-header setup, tags pagination, page parsing) into a shared `deps_core::github` module; no external behavior change (resolves #472) (#476)
 - **Breaking (pre-1.0, public API)**: `deps-core`'s `GithubTagsClient::headers()` is now crate-private; authenticated GitHub requests go through the new `fetch_authenticated` method (trusted-origin-pinned), and the auth token is wrapped in a redacting `AuthToken` type that never leaks via `Debug`/`Display` (resolves #484) (#487)
 - **Breaking (pre-1.0, public API)**: `deps-core`, `deps-lsp` consolidate the yanked/deprecation/fetch-failure maps into one `DependencyOutcome`/`DependencyOutcomes` type; `VersionData`'s three `with_yanked`/`with_deprecations`/`with_fetch_failed` builders and fields collapse into `with_outcomes`/`outcomes`, removing triplicated re-keying and pruning logic (resolves #481) (#488)
+- **Breaking (pre-1.0, public API)**: `deps_core::lsp_helpers::generate_diagnostics_from_cache` gained a required `uri: &Uri` parameter, used to anchor `DiagnosticRelatedInformation` locations for collapsed fetch-failure diagnostics (resolves #479) (#489)
 
 ### Fixed
 - **deps-github-actions**: a tags-API page with one entry missing/malformed `commit.sha` no longer aborts the whole page's parse and silently truncates later pages — only that entry is now skipped (side effect of the #472 GitHub-tags-client extraction) (#476)
@@ -41,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-lsp**: the OSV vulnerability-fix code action's recommended target version is now independently verified against OSV before being offered, instead of only ever checking the registry's "latest" version (resolves #462) (#467)
 - **deps-github-actions, deps-core**: hover no longer renders a dead empty-URL link or a misleading "Press Cmd+. to update version" footer for a non-resolvable `uses:` ref (local composite action, Docker image) (resolves #474)
 - **deps-core, deps-github-actions, deps-lsp**: a rate-limited GitHub Actions registry lookup now surfaces its actionable hint (e.g. "set GITHUB_TOKEN") in the "Registry lookup failed" diagnostic instead of the generic fallback (resolves #478) (#485)
+- **deps-lsp**: the one-shot "failed to fetch" toast no longer reports a not-found race winner over a co-occurring actionable failure (e.g. rate limit) in the same batch, and now always states the affected package count (resolves #480) (#489)
+- **deps-core, deps-github-actions**: a tripped rate-limit gate no longer fans out one near-duplicate diagnostic per remaining dependency; fetch failures now collapse into a single diagnostic per manifest, naming every affected dependency via related information and still surfacing a shared actionable hint when one applies (resolves #479) (#489)
 
 ## [0.11.1] - 2026-09-01
 
