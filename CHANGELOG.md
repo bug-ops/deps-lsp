@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking (pre-1.0, public API)**: `deps-core`, `deps-lsp` consolidate the yanked/deprecation/fetch-failure maps into one `DependencyOutcome`/`DependencyOutcomes` type; `VersionData`'s three `with_yanked`/`with_deprecations`/`with_fetch_failed` builders and fields collapse into `with_outcomes`/`outcomes`, removing triplicated re-keying and pruning logic (resolves #481) (#488)
 - **Breaking (pre-1.0, public API)**: `deps_core::lsp_helpers::generate_diagnostics_from_cache` gained a required `uri: &Uri` parameter, used to anchor `DiagnosticRelatedInformation` locations for collapsed fetch-failure diagnostics (resolves #479) (#489)
 - **deps-core**: refactored `generate_diagnostics_from_cache`'s per-dependency checks into an explicit ordered rule pipeline; no behavior change (resolves #500)
+- **deps-core**: order-sensitive diagnostics tests now pin exact `diagnostics[i]` message/code instead of presence-only checks, closing a regression-detection gap left by #500's refactor; no behavior change (resolves #508) (#509)
 
 ### Fixed
 - **deps-github-actions**: a tags-API page with one entry missing/malformed `commit.sha` no longer aborts the whole page's parse and silently truncates later pages — only that entry is now skipped (side effect of the #472 GitHub-tags-client extraction) (#476)
