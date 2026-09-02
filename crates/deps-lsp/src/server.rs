@@ -391,6 +391,11 @@ impl LanguageServer for Backend {
                 .set_registry_policy(config.cargo.workspace_registries.to_policy());
             self.state.cache.set_offline(config.network.offline);
             self.state.cache.set_cache_enabled(config.cache.enabled);
+            self.state
+                .cold_start_limiter
+                .set_min_interval(std::time::Duration::from_millis(
+                    config.cold_start.rate_limit_ms,
+                ));
             *self.config.write().await = config;
         }
 
@@ -525,6 +530,11 @@ impl LanguageServer for Backend {
         // diagnostics under the stale flag values (critic M5).
         self.state.cache.set_offline(config.network.offline);
         self.state.cache.set_cache_enabled(config.cache.enabled);
+        self.state
+            .cold_start_limiter
+            .set_min_interval(std::time::Duration::from_millis(
+                config.cold_start.rate_limit_ms,
+            ));
         *self.config.write().await = config;
 
         // Hover/completion/code actions are computed on demand and pick up the new
@@ -1679,6 +1689,38 @@ mod tests {
             let result = backend.state.cache.get_cached(&url).await.unwrap();
             assert_eq!(result.as_ref(), b"fetched after returning online");
             resumed_mock.assert_async().await;
+        }
+
+        /// Issue #499: `cold_start.rate_limit_ms` was parsed into `DepsConfig` but
+        /// never reached the live `ColdStartLimiter`, which always used the
+        /// hardcoded 100ms interval it was constructed with. A live-reloaded,
+        /// shorter interval must actually change rate-limiting behavior.
+        #[tokio::test]
+        async fn test_did_change_configuration_updates_cold_start_rate_limit() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let uri = deps_core::test_util::test_uri("/test.toml");
+
+            assert!(backend.state.cold_start_limiter.allow_cold_start(&uri));
+            assert!(
+                !backend.state.cold_start_limiter.allow_cold_start(&uri),
+                "second immediate request blocked under the default 100ms interval"
+            );
+
+            // `rate_limit_ms: 0` disables rate limiting entirely (`elapsed < ZERO` is
+            // never true), so the assertion below is deterministic regardless of
+            // scheduling jitter — no sleep, unlike a short nonzero interval would need.
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "cold_start": { "rate_limit_ms": 0 } }),
+                })
+                .await;
+            assert_eq!(backend.config.read().await.cold_start.rate_limit_ms, 0);
+
+            assert!(
+                backend.state.cold_start_limiter.allow_cold_start(&uri),
+                "rate_limit_ms: 0 should allow a cold start immediately, with no wait"
+            );
         }
 
         /// C1 regression: `did_change_configuration` makes a concurrent `config.write()`
