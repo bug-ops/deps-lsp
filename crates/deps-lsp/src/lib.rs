@@ -219,6 +219,20 @@ ecosystem!(
     ]
 );
 
+ecosystem!(
+    "github-actions",
+    deps_github_actions,
+    GithubActionsEcosystem,
+    [
+        GithubActionsDependency,
+        GithubActionsFormatter,
+        GithubActionsParseResult,
+        GithubActionsRegistry,
+        GithubActionsVersion,
+        parse_workflow_yaml,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 ///
 /// `cargo` is special-cased (spec #443/#441, plan-1b §1.6): unlike `register!`'s generic
@@ -281,6 +295,7 @@ pub fn register_ecosystems(
     register!("swift", SwiftEcosystem, registry, &cache);
     register!("composer", ComposerEcosystem, registry, &cache);
     register!("nuget", NuGetEcosystem, registry, &cache);
+    register!("github-actions", GithubActionsEcosystem, registry, &cache);
 }
 
 #[cfg(test)]
@@ -321,6 +336,8 @@ mod tests {
         assert!(registry.get("nuget").is_some());
         #[cfg(feature = "deno")]
         assert!(registry.get("deno").is_some());
+        #[cfg(feature = "github-actions")]
+        assert!(registry.get("github-actions").is_some());
     }
 
     /// Regression guard for issue #118: `EcosystemId`'s string literals (`deps-core`)
@@ -375,6 +392,12 @@ mod tests {
         assert!(registry.get(deps_core::EcosystemId::NuGet.id()).is_some());
         #[cfg(feature = "deno")]
         assert!(registry.get(deps_core::EcosystemId::Deno.id()).is_some());
+        #[cfg(feature = "github-actions")]
+        assert!(
+            registry
+                .get(deps_core::EcosystemId::GithubActions.id())
+                .is_some()
+        );
     }
 
     /// #348 regression: `select_latest_matching` must resolve an all-`AdvisoryDeprecated`

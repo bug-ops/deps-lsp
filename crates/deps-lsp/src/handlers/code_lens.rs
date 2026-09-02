@@ -732,5 +732,144 @@ let package = Package(
                 assert_guard_skips(ecosystem.as_ref(), &uri, content, cached).await;
             }
         }
+
+        /// Seeds `ecosystem`'s shared `TagIndex` for `name` with one `tag -> sha` entry,
+        /// downcasting through `Ecosystem::registry()`/`Registry::as_any()` — this test
+        /// module never drives a live registry fetch (`collect_update_all_edits` is pure
+        /// over `parse_result`/`content`/cached `VersionData`), so the index has to be
+        /// seeded directly for the SHA-pin `format_version_replacing_for` branch to have
+        /// anything to resolve.
+        #[cfg(feature = "github-actions")]
+        fn seed_gha_tag_index(
+            ecosystem: &dyn deps_core::Ecosystem,
+            name: &str,
+            tag: &str,
+            sha: &str,
+        ) {
+            let registry = ecosystem.registry();
+            let gha_registry = registry
+                .as_any()
+                .downcast_ref::<deps_github_actions::GithubActionsRegistry>()
+                .expect("github-actions ecosystem must back onto a GithubActionsRegistry");
+            let mut index = deps_github_actions::registry::TagIndex::default();
+            index.tag_to_sha.insert(tag.to_string(), sha.to_string());
+            index.sha_to_tag.insert(sha.to_string(), tag.to_string());
+            gha_registry.tag_index().insert(
+                deps_core::PackageName::new(name),
+                std::sync::Arc::new(index),
+            );
+        }
+
+        #[cfg(feature = "github-actions")]
+        #[tokio::test]
+        async fn test_github_actions_tag_pin_is_edited() {
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4.2.0\n";
+            let mut cached = HashMap::new();
+            cached.insert(
+                "actions/checkout".into(),
+                PackageVersions::latest_only("v4.3.0"),
+            );
+
+            assert_single_edit_produces_valid_declaration(
+                ecosystem.as_ref(),
+                &uri,
+                content,
+                cached,
+                "v4.3.0",
+            )
+            .await;
+        }
+
+        #[cfg(feature = "github-actions")]
+        #[tokio::test]
+        async fn test_github_actions_sha_with_comment_pin_is_edited_to_new_sha_and_tag() {
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let old_sha = "a".repeat(40);
+            let new_sha = "b".repeat(40);
+            seed_gha_tag_index(ecosystem.as_ref(), "actions/checkout", "v4.3.0", &new_sha);
+
+            let content = format!("steps:\n  - uses: actions/checkout@{old_sha} # v4.2.0\n");
+            let mut cached = HashMap::new();
+            cached.insert(
+                "actions/checkout".into(),
+                PackageVersions::latest_only("v4.3.0"),
+            );
+
+            assert_single_edit_produces_valid_declaration(
+                ecosystem.as_ref(),
+                &uri,
+                &content,
+                cached,
+                &format!("{new_sha} # v4.3.0"),
+            )
+            .await;
+        }
+
+        #[cfg(feature = "github-actions")]
+        #[tokio::test]
+        async fn test_github_actions_subdirectory_action_sha_pin_is_edited_preserving_subpath() {
+            // Critic S1 regression gate: a subdirectory action's `version_range` must
+            // start right after the full `owner/repo/sub@` prefix, not after the
+            // truncated `owner/repo@` — otherwise this edit corrupts the `/init@`
+            // segment, producing a re-parseable-but-wrong bare `owner/repo` declaration
+            // with the pin silently deleted.
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let old_sha = "a".repeat(40);
+            let new_sha = "b".repeat(40);
+            seed_gha_tag_index(
+                ecosystem.as_ref(),
+                "github/codeql-action",
+                "v3.1.0",
+                &new_sha,
+            );
+
+            let content =
+                format!("steps:\n  - uses: github/codeql-action/init@{old_sha} # v3.0.0\n");
+            let mut cached = HashMap::new();
+            cached.insert(
+                "github/codeql-action".into(),
+                PackageVersions::latest_only("v3.1.0"),
+            );
+
+            assert_single_edit_produces_valid_declaration(
+                ecosystem.as_ref(),
+                &uri,
+                &content,
+                cached,
+                &format!("codeql-action/init@{new_sha} # v3.1.0"),
+            )
+            .await;
+        }
+
+        #[cfg(feature = "github-actions")]
+        #[tokio::test]
+        async fn test_github_actions_sha_pin_tag_index_miss_is_skipped() {
+            // B1's regression gate: on a `TagIndex` miss, the formatted replacement must
+            // equal the raw declared span byte-for-byte, so the shared no-op guard
+            // suppresses the edit instead of silently downgrading the SHA pin to a bare
+            // tag.
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let old_sha = "a".repeat(40);
+            // No `seed_gha_tag_index` call: the index has no entry for "v4.3.0", so the
+            // formatter's `TagIndex` lookup misses.
+
+            let content = format!("steps:\n  - uses: actions/checkout@{old_sha} # v4.2.0\n");
+            let mut cached = HashMap::new();
+            cached.insert(
+                "actions/checkout".into(),
+                PackageVersions::latest_only("v4.3.0"),
+            );
+
+            assert_guard_skips(ecosystem.as_ref(), &uri, &content, cached).await;
+        }
     }
 }

@@ -546,6 +546,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "deps-github-actions"
+version = "0.11.1"
+dependencies = [
+ "bytes",
+ "dashmap",
+ "deps-core",
+ "mockito",
+ "reqwest",
+ "semver",
+ "serde",
+ "tokio",
+ "tokio-test",
+ "tower-lsp-server",
+ "tracing",
+ "yaml-rust2",
+]
+
+[[package]]
 name = "deps-go"
 version = "0.11.1"
 dependencies = [
@@ -594,6 +612,7 @@ dependencies = [
  "deps-core",
  "deps-dart",
  "deps-deno",
+ "deps-github-actions",
  "deps-go",
  "deps-gradle",
  "deps-maven",

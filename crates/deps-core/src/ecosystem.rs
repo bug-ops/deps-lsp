@@ -67,6 +67,8 @@ pub enum EcosystemId {
     NuGet,
     /// Deno ecosystem (`deno.json`/`deno.jsonc`), mixing `jsr:` and `npm:` specifiers.
     Deno,
+    /// GitHub Actions ecosystem (`.github/workflows/*.yml`/`*.yaml`).
+    GithubActions,
 }
 
 impl EcosystemId {
@@ -87,6 +89,7 @@ impl EcosystemId {
             Self::Swift => "swift",
             Self::NuGet => "nuget",
             Self::Deno => "deno",
+            Self::GithubActions => "github-actions",
         }
     }
 
@@ -120,6 +123,7 @@ impl EcosystemId {
             Self::Composer => "Packagist",
             Self::Swift => "SwiftURL",
             Self::NuGet => "NuGet",
+            Self::GithubActions => "GitHub Actions",
         })
     }
 }
@@ -147,6 +151,7 @@ impl std::str::FromStr for EcosystemId {
             "swift" => Ok(Self::Swift),
             "nuget" => Ok(Self::NuGet),
             "deno" => Ok(Self::Deno),
+            "github-actions" => Ok(Self::GithubActions),
             _ => Err(crate::error::DepsError::UnsupportedEcosystem(s.to_string())),
         }
     }
@@ -407,10 +412,16 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &[]
     }
 
-    /// `(directory_name, file_suffix)` pairs identifying a file solely by its
-    /// immediate parent directory and suffix (e.g. `[("requirements", ".txt")]`
-    /// for Python's `requirements/base.txt` split-file layout, where the
-    /// basename alone carries no ecosystem signal).
+    /// `(directory_path, file_suffix)` pairs identifying a file solely by its
+    /// containing directory path and suffix. `directory_path` may be a single
+    /// segment (e.g. `[("requirements", ".txt")]` for Python's
+    /// `requirements/base.txt` split-file layout) or multiple `/`-joined
+    /// segments (e.g. `[(".github/workflows", ".yml")]` for GitHub Actions
+    /// workflow files) — either way it is matched against the *tail* of the
+    /// file's directory path on segment boundaries, not just the immediate
+    /// parent, so a multi-segment pattern matches regardless of how many
+    /// ancestor directories precede it. Used when the basename alone carries
+    /// no ecosystem signal.
     ///
     /// Consulted by [`crate::EcosystemRegistry::get_for_uri`] only, after both
     /// [`manifest_patterns`](Ecosystem::manifest_patterns) and
@@ -687,6 +698,7 @@ mod tests {
             EcosystemId::Swift,
             EcosystemId::NuGet,
             EcosystemId::Deno,
+            EcosystemId::GithubActions,
         ];
 
         for id in ALL {
@@ -711,6 +723,7 @@ mod tests {
             (EcosystemId::Swift, "SwiftURL"),
             (EcosystemId::NuGet, "NuGet"),
             (EcosystemId::Deno, "npm"),
+            (EcosystemId::GithubActions, "GitHub Actions"),
         ];
 
         for (id, expected_str) in expected {

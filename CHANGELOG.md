@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-github-actions, deps-core, deps-lsp**: new GitHub Actions ecosystem — hover, inlay hints, diagnostics, code actions, and code lens for `uses:` steps in `.github/workflows/*.yml`/`*.yaml`, covering tag, commit-SHA (optionally `# vX.Y.Z`-annotated), and branch pins via the GitHub tags API (resolves #208)
 - **deps-nuget**: hover now flags an unlisted (delisted/pulled) NuGet version with a `*(unlisted)*` marker in "Recent versions", enriched from `RegistrationsBaseUrl/3.6.0` on the hover path only (resolves #451) (#458)
 - **deps-nuget**: a multi-project `packages.<project>.lock.json` lock file is now resolved by the manifest's own project name instead of picking an arbitrary `packages.*.lock.json` match from the directory (resolves #451) (#458)
 - **deps-pypi, deps-lsp**: `-r`/`-c` (and `--requirement`/`--constraint`) targets in a `requirements.txt`/`constraints.txt` file are now surfaced as clickable `documentLink`s, resolved relative to the containing file (resolves #452) (#458)

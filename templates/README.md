@@ -20,9 +20,21 @@ This directory contains template files for creating new ecosystem support in dep
 | `{LOCK_FILE}` | Lock file name | `pom.xml.lock`, `go.sum`, `packages.lock.json` |
 
 4. Implement the TODO sections in each file
-5. Add your crate to the workspace in `Cargo.toml`
-6. Add feature flag in `deps-lsp/Cargo.toml`
+5. Add your crate to the workspace in `Cargo.toml` (alphabetically — the
+   `[workspace.dependencies]` table is enforced-sorted)
+6. Add feature flag + optional dependency in `deps-lsp/Cargo.toml`
 7. Register your ecosystem in `deps-lsp/src/lib.rs` using `ecosystem!()` and `register!()` macros
+8. Add an `EcosystemId` variant in `crates/deps-core/src/ecosystem.rs`: the enum itself, the
+   `id()`/`osv_ecosystem()`/`FromStr` match arms, and both `#[cfg(test)]` tables that assert
+   over every variant — an unhandled variant there is a compile error, not a silent runtime bug
+9. Update every other exhaustive `match` on `EcosystemId` across the workspace (the compiler
+   will point you at each one): `crates/deps-lsp/src/handlers/completion.rs`'s
+   `uses_xml_tag_values`/`uses_json_quoted_keys`/`uses_toml_string_array_values`/
+   `is_in_dependencies_section`/`create_package_completion_item`, and
+   `crates/deps-lsp/src/document/state.rs`'s ecosystem-id resolution test table
+10. Update docs: root `README.md`, `crates/deps-lsp/README.md` (ecosystem count in the intro
+    sentence), `docs/ECOSYSTEM_GUIDE.md`, `CHANGELOG.md` `[Unreleased]`, and your new crate's own
+    `README.md`
 
 ## File Structure
 

@@ -7,7 +7,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.91-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, NuGet, and Deno ecosystems.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, NuGet, Deno, and GitHub Actions ecosystems.
 
 ![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
 
@@ -41,6 +41,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | Swift | SPM | `Package.swift` | Supported |
 | PHP | Composer | `composer.json` | Supported |
 | C# | NuGet | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | Supported |
+| YAML | GitHub Actions | `.github/workflows/*.yml`, `*.yaml` | Supported |
 
 > [!NOTE]
 > **Ecosystem details:**
@@ -54,6 +55,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 > - **Composer** — `require`/`require-dev` sections, Packagist v2 API with metadata de-minification, Composer-specific tilde semantics (`~1.2` = `>=1.2.0 <2.0.0`)
 > - **NuGet** — `PackageReference` (attribute and child-element form), Central Package Management (`Directory.Packages.props`), legacy `packages.config`, `packages.lock.json`; NuGet V3 registry (service index, flat container, search)
 > - **Deno** — `imports` map only (`scopes`/`importMap` not yet supported); `jsr:` specifiers via the keyless JSR API, `npm:` specifiers reuse the existing npm registry client; no `deno.lock` support yet
+> - **GitHub Actions** — `uses:` steps and reusable-workflow calls across every job; tag, commit-SHA (optionally `# vX.Y.Z`-annotated), and branch pins via the GitHub tags API; no lock file, no package-name search completion
 
 ## Installation
 
@@ -115,6 +117,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `swift` | Swift | Package.swift | Yes |
 | `composer` | PHP | composer.json | Yes |
 | `nuget` | C# | .csproj, Directory.Packages.props, packages.config | Yes |
+| `github-actions` | YAML | .github/workflows/*.yml, *.yaml | Yes |
 
 ## Usage
 
@@ -401,6 +404,7 @@ deps-lsp/
 │   ├── deps-composer/  # composer.json parser + Packagist registry
 │   ├── deps-nuget/     # .csproj/packages.config parser + NuGet V3 registry
 │   ├── deps-deno/      # deno.json parser + JSR registry (npm: delegates to deps-npm)
+│   ├── deps-github-actions/ # workflow YAML parser + GitHub tags API registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration

@@ -4,7 +4,7 @@ This guide explains how to add support for a new package ecosystem (e.g., Go mod
 
 ## Supported Ecosystems
 
-deps-lsp provides comprehensive LSP support for 12 package ecosystems:
+deps-lsp provides comprehensive LSP support for 13 package ecosystems:
 
 | Ecosystem | Language | Manifest File(s) | Lock File(s) | Features |
 |-----------|----------|-----------------|--------------|----------|
@@ -20,6 +20,7 @@ deps-lsp provides comprehensive LSP support for 12 package ecosystems:
 | **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, code lens (range-form dependencies not covered — see below), GitHub API support |
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json`, `packages.<project>.lock.json` (multi-project) | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling, hover-only unlisted-version marker |
 | **Deno** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics, code lens — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
+| **GitHub Actions** | YAML | `.github/workflows/*.yml`, `*.yaml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered — see below); tag/commit-SHA/branch `uses:` pins via the GitHub tags API; reusable-workflow calls recognized but not version-resolved — see below |
 
 ### Cargo Custom/Private Registries
 
@@ -383,8 +384,9 @@ This is distinct from `Unknown package` (the package itself was not found) and f
 latest release). The two are mutually exclusive on the same dependency — a requirement is
 either up to date, outdated-but-satisfiable, or unsatisfiable, never more than one at once.
 
-The check is always on (no configuration flag) across all 12 ecosystems, and is
-deliberately conservative:
+The check is always on (no configuration flag) across 12 of the 13 ecosystems — GitHub
+Actions does not opt in (a pin is not a range, so there is no "requirement satisfies zero
+versions" question to ask) — and is deliberately conservative:
 
 - **Suppressed while versions are still loading**, or if the registry fetch failed — an
   empty/unknown version list means "don't know yet", not "nothing published".
@@ -527,10 +529,11 @@ dependency, so only one yanked diagnostic is ever shown per dependency.
 | NuGet | No | `NuGetVersion::is_yanked` is a hardcoded `false` constant |
 | Swift | No | `SwiftVersion.yanked` is a field that is always `false` for GitHub tags (no such concept in the source) |
 | Deno | `jsr:` yes, any requirement shape; `npm:` no | JSR `meta.json` per-version `yanked` for `jsr:` specifiers; npm `deprecated` (unconditionally off, see restriction above) for `npm:` specifiers |
+| GitHub Actions | No | GitHub's tags API exposes no yank/deprecation signal for actions — `GithubActionsRegistry::reports_yanked` is hardcoded `false`, same architectural gap as Swift |
 
-5 of 12 ecosystems can produce this diagnostic today; npm is disabled by design rather than
+5 of 13 ecosystems can produce this diagnostic today; npm is disabled by design rather than
 lacking a real signal (see restriction above), and that also covers Deno's `npm:` specifiers;
-the remaining 6 have no real yanked signal to source it from (three are architecturally
+the remaining 7 have no real yanked signal to source it from (four are architecturally
 impossible — no such registry concept exists — and Go's is a fixable but separate gap).
 
 ### Package Deprecation Diagnostics (issue #205)

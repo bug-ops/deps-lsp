@@ -169,7 +169,7 @@ pub fn collect_update_all_edits(
             continue;
         }
 
-        let new_text = formatter.format_version_replacing(latest, version_req.as_str());
+        let new_text = formatter.format_version_replacing_for(dep, latest, version_req.as_str());
         // No-op guard, mirroring the REFACTOR-loop dedup and vulnerability-fix N1
         // guard in `code_actions`: a formatter can decide a declared
         // requirement has no single unambiguous rewrite (e.g. `deps-gradle`'s

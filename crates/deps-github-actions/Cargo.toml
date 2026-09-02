@@ -1,0 +1,30 @@
+[package]
+name = "deps-github-actions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GitHub Actions workflow dependency support for deps-lsp"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+dashmap = { workspace = true }
+deps-core = { workspace = true }
+reqwest = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["sync"] }
+tower-lsp-server = { workspace = true }
+tracing = { workspace = true }
+yaml-rust2 = { workspace = true }
+
+[dev-dependencies]
+deps-core = { workspace = true, features = ["test-util"] }
+mockito = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test = { workspace = true }

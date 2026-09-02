@@ -334,7 +334,8 @@ const fn uses_xml_tag_values(ecosystem_kind: EcosystemId) -> bool {
         | EcosystemId::Swift
         | EcosystemId::NuGet
         | EcosystemId::Bundler
-        | EcosystemId::Deno => false,
+        | EcosystemId::Deno
+        | EcosystemId::GithubActions => false,
     }
 }
 
@@ -391,7 +392,8 @@ const fn uses_json_quoted_keys(ecosystem_kind: EcosystemId) -> bool {
         | EcosystemId::Swift
         | EcosystemId::NuGet
         | EcosystemId::Bundler
-        | EcosystemId::Deno => false,
+        | EcosystemId::Deno
+        | EcosystemId::GithubActions => false,
     }
 }
 
@@ -419,7 +421,8 @@ const fn uses_toml_string_array_values(ecosystem_kind: EcosystemId) -> bool {
         | EcosystemId::Swift
         | EcosystemId::NuGet
         | EcosystemId::Bundler
-        | EcosystemId::Deno => false,
+        | EcosystemId::Deno
+        | EcosystemId::GithubActions => false,
     }
 }
 
@@ -486,7 +489,22 @@ fn is_in_dependencies_section(
         // such wrapper. See the Bundler arm above for why this is `false`.
         EcosystemId::NuGet => false,
         EcosystemId::Deno => is_in_json_dependencies(content, line_number, &["imports"]),
+        // A `uses:` step key can appear at any nesting depth in a workflow file
+        // (`jobs.*.steps[].uses`, `jobs.<id>.uses`), so unlike the other YAML/TOML/
+        // JSON ecosystems above there is no enclosing section header to track —
+        // the target line itself is the only signal needed.
+        EcosystemId::GithubActions => is_github_actions_uses_line(content, line_number),
     }
+}
+
+/// Whether line `line_number` of `content` is a workflow `uses:` step key
+/// (`uses: owner/repo@ref` or, as a sequence item, `- uses: owner/repo@ref`).
+fn is_github_actions_uses_line(content: &str, line_number: usize) -> bool {
+    content
+        .lines()
+        .nth(line_number)
+        .map(str::trim_start)
+        .is_some_and(|trimmed| trimmed.starts_with("uses:") || trimmed.starts_with("- uses:"))
 }
 
 /// Checks if a line is inside a TOML dependencies section.
@@ -949,6 +967,29 @@ fn create_package_completion_item(
                 format!("\"{bare}\": \"{name}\"")
             } else {
                 format!("\"{bare}\": \"{name}@^{latest}\"")
+            }
+        }
+        // GHA's `search()` always returns `Ok(vec![])` (MVP scope — see
+        // `deps-github-actions`'s registry docs), so this arm is unreachable in
+        // practice today; it exists only to keep the match exhaustive (#118) and to
+        // behave correctly if package-name search is ever added. The `owner/repo`
+        // shape check is inlined rather than calling
+        // `deps_github_actions::is_valid_github_identity` — that dependency is
+        // feature-gated, while this match (on `EcosystemId`, not a per-feature type)
+        // is compiled unconditionally.
+        EcosystemId::GithubActions => {
+            if !name.as_str().contains('/') {
+                warn_rejected_value(
+                    "owner/repo shape",
+                    "github actions package name completion item",
+                    name.as_str(),
+                );
+                return None;
+            }
+            if latest.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}@{latest}")
             }
         }
     };

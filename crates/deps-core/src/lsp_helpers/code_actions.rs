@@ -145,8 +145,11 @@ fn build_vulnerability_fix_action(
     // `^`-prefix, a range), and `deps-pypi` rewrites it in place to preserve
     // the manifest's existing pin style (`==1.0.1` -> `==1.0.2`) — the guard
     // must compare the text that would actually be written.
-    let new_text = formatter
-        .format_version_replacing(&ConcreteVersion::new(version_native.as_str()), version_req);
+    let new_text = formatter.format_version_replacing_for(
+        dep,
+        &ConcreteVersion::new(version_native.as_str()),
+        version_req,
+    );
 
     // N1: skip a no-op edit — the manifest already declares exactly the text
     // this action would write, so applying it would rewrite the text to
@@ -289,7 +292,7 @@ fn build_unsatisfiable_fix_action(
         );
         return None;
     }
-    let new_text = formatter.format_version_replacing(&latest, version_req.as_str());
+    let new_text = formatter.format_version_replacing_for(dep, &latest, version_req.as_str());
 
     // Mirrors `build_vulnerability_fix_action`'s N1 guard: compares against
     // `dep.version_literal()` rather than `version_req` when the ecosystem provides one,
@@ -673,7 +676,8 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                 );
                 continue;
             }
-            let new_text = formatter.format_version_replacing(&item.version, version_req.as_str());
+            let new_text =
+                formatter.format_version_replacing_for(dep, &item.version, version_req.as_str());
 
             if !emitted_texts.insert(strip_whitespace(&new_text)) {
                 continue;
