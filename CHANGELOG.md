@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-deno, deps-npm**: an exact-pin `npm:` dependency in `deno.json` no longer surfaces the yanked-worded diagnostic, matching the equivalent `package.json` dependency's post-#436 behavior; `jsr:` specifiers are unaffected (resolves #448)
 - **deps-core**: block DNS-rebinding to loopback/link-local/cloud-metadata/unspecified addresses at connect time, shared by every ecosystem crate (resolves #449; RFC1918/CGNAT residual tracked in #455) (#457)
 - **deps-deno**: a `jsr:` range requirement satisfiable only by yanked versions now surfaces the yanked diagnostic, matching Cargo/PyPI/Dart's behavior for the equivalent case (resolves #454)
-- **deps-core, deps-cargo, deps-lsp**: `cargo.workspace_registries`' `public_only`/`off` now enforced at connect time (resolved address) and on every redirect hop, not just the declared URL string at parse time, closing a DNS-rebinding bypass to RFC1918/CGNAT-range hosts (resolves #455) (PR TBD)
+- **deps-core, deps-cargo, deps-lsp**: `cargo.workspace_registries`' `public_only`/`off` now enforced at connect time (resolved address) and on every redirect hop, not just the declared URL string at parse time, closing a DNS-rebinding bypass to RFC1918/CGNAT-range hosts (resolves #455) (#460)
 
 ## [0.11.1] - 2026-09-01
 
