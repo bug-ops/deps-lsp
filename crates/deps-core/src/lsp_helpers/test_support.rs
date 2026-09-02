@@ -2,7 +2,10 @@
 //! this module's per-feature test suites.
 
 use super::*;
-use crate::{ConcreteVersion, PackageName, ParseResult, PublishTime, RemovalStatus, VersionReq};
+use crate::{
+    ConcreteVersion, Dependency, InvalidPackageName, PackageName, ParseResult, PublishTime,
+    RemovalStatus, VersionReq,
+};
 use std::any::Any;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind};
 
@@ -12,7 +15,9 @@ pub(crate) fn pkg(s: &str) -> PackageName {
 
 pub(crate) struct MockFormatter;
 
-impl EcosystemFormatter for MockFormatter {
+impl PackageNaming for MockFormatter {}
+
+impl PackageRendering for MockFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!("\"{}\"", version)
     }
@@ -22,11 +27,23 @@ impl EcosystemFormatter for MockFormatter {
     }
 }
 
+impl RequirementResolution for MockFormatter {}
+
+impl DiagnosticMessages for MockFormatter {}
+
+impl DiagnosticPolicy for MockFormatter {}
+
+impl SourcePolicy for MockFormatter {}
+
+impl OsvNaming for MockFormatter {}
+
 /// Formatter stub that always reports `Unresolved`, mirroring `MavenFormatter` /
 /// `GradleFormatter`'s override for `${property}` / `$var` requirements.
 pub(crate) struct MockUnresolvedFormatter;
 
-impl EcosystemFormatter for MockUnresolvedFormatter {
+impl PackageNaming for MockUnresolvedFormatter {}
+
+impl PackageRendering for MockUnresolvedFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
@@ -34,7 +51,9 @@ impl EcosystemFormatter for MockUnresolvedFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         format!("https://example.com/{}", name)
     }
+}
 
+impl RequirementResolution for MockUnresolvedFormatter {
     fn requirement_status(
         &self,
         _requirement: &VersionReq,
@@ -44,12 +63,22 @@ impl EcosystemFormatter for MockUnresolvedFormatter {
     }
 }
 
+impl DiagnosticMessages for MockUnresolvedFormatter {}
+
+impl DiagnosticPolicy for MockUnresolvedFormatter {}
+
+impl SourcePolicy for MockUnresolvedFormatter {}
+
+impl OsvNaming for MockUnresolvedFormatter {}
+
 /// Formatter stub mirroring `GoFormatter`'s override: reports the manifest
 /// version-requirement line (go.mod's `require`) as itself the resolved
 /// version, since it is already the exact MVS-selected version (#235).
 pub(crate) struct MockGoFormatter;
 
-impl EcosystemFormatter for MockGoFormatter {
+impl PackageNaming for MockGoFormatter {}
+
+impl PackageRendering for MockGoFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
@@ -57,17 +86,33 @@ impl EcosystemFormatter for MockGoFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         format!("https://pkg.go.dev/{}", name)
     }
+}
 
+impl RequirementResolution for MockGoFormatter {
     fn manifest_requirement_is_resolved_version(&self, _dep: &dyn Dependency) -> bool {
         true
     }
 }
 
+impl DiagnosticMessages for MockGoFormatter {}
+
+impl DiagnosticPolicy for MockGoFormatter {}
+
+impl SourcePolicy for MockGoFormatter {}
+
+impl OsvNaming for MockGoFormatter {}
+
 /// A formatter whose `validate_package_name` always rejects, for exercising
 /// the "Invalid package name" diagnostic path independently of "Unknown package".
 pub(crate) struct RejectingFormatter;
 
-impl EcosystemFormatter for RejectingFormatter {
+impl PackageNaming for RejectingFormatter {
+    fn validate_package_name(&self, _name: &str) -> Result<(), InvalidPackageName> {
+        Err(InvalidPackageName::new("name is rejected for testing"))
+    }
+}
+
+impl PackageRendering for RejectingFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
@@ -75,11 +120,17 @@ impl EcosystemFormatter for RejectingFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         format!("https://example.com/{}", name)
     }
-
-    fn validate_package_name(&self, _name: &str) -> Result<(), InvalidPackageName> {
-        Err(InvalidPackageName::new("name is rejected for testing"))
-    }
 }
+
+impl RequirementResolution for RejectingFormatter {}
+
+impl DiagnosticMessages for RejectingFormatter {}
+
+impl DiagnosticPolicy for RejectingFormatter {}
+
+impl SourcePolicy for RejectingFormatter {}
+
+impl OsvNaming for RejectingFormatter {}
 
 pub(crate) struct MockParseResult {
     pub(crate) deps: Vec<MockDep>,
@@ -621,7 +672,9 @@ pub(crate) fn freshness_test_parse_result(name: &str) -> MockParseResult {
 /// otherwise confound the N1 no-op-edit guard's own test.
 pub(crate) struct IdentityFormatter;
 
-impl EcosystemFormatter for IdentityFormatter {
+impl PackageNaming for IdentityFormatter {}
+
+impl PackageRendering for IdentityFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
@@ -631,13 +684,25 @@ impl EcosystemFormatter for IdentityFormatter {
     }
 }
 
+impl RequirementResolution for IdentityFormatter {}
+
+impl DiagnosticMessages for IdentityFormatter {}
+
+impl DiagnosticPolicy for IdentityFormatter {}
+
+impl SourcePolicy for IdentityFormatter {}
+
+impl OsvNaming for IdentityFormatter {}
+
 /// A formatter mimicking `deps-dart`'s non-identity
 /// `format_version_for_text_edit` (wraps the version in a caret
 /// constraint) — used to prove the N1 guard compares the *formatted*
 /// text actually written, not the bare version (critic S3).
 pub(crate) struct CaretWrappingFormatter;
 
-impl EcosystemFormatter for CaretWrappingFormatter {
+impl PackageNaming for CaretWrappingFormatter {}
+
+impl PackageRendering for CaretWrappingFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!("^{version}")
     }
@@ -647,6 +712,16 @@ impl EcosystemFormatter for CaretWrappingFormatter {
     }
 }
 
+impl RequirementResolution for CaretWrappingFormatter {}
+
+impl DiagnosticMessages for CaretWrappingFormatter {}
+
+impl DiagnosticPolicy for CaretWrappingFormatter {}
+
+impl SourcePolicy for CaretWrappingFormatter {}
+
+impl OsvNaming for CaretWrappingFormatter {}
+
 /// A formatter mimicking `deps-pypi`'s non-identity
 /// `format_version_replacing` override (preserves an `==` pin instead of
 /// falling back to `format_version_for_text_edit`) — used to prove the
@@ -654,7 +729,9 @@ impl EcosystemFormatter for CaretWrappingFormatter {
 /// the default delegation (critic S3).
 pub(crate) struct PinPreservingFormatter;
 
-impl EcosystemFormatter for PinPreservingFormatter {
+impl PackageNaming for PinPreservingFormatter {}
+
+impl PackageRendering for PinPreservingFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!(">={version}")
     }
@@ -671,6 +748,16 @@ impl EcosystemFormatter for PinPreservingFormatter {
         format!("https://example.com/{name}")
     }
 }
+
+impl RequirementResolution for PinPreservingFormatter {}
+
+impl DiagnosticMessages for PinPreservingFormatter {}
+
+impl DiagnosticPolicy for PinPreservingFormatter {}
+
+impl SourcePolicy for PinPreservingFormatter {}
+
+impl OsvNaming for PinPreservingFormatter {}
 
 /// Builds a `pkg = "<version_req>"`-shaped fixture: a dependency whose
 /// `version_range` slices `content` to exactly `version_req` (so the
@@ -717,7 +804,9 @@ pub(crate) fn refactor_titles(actions: &[CodeAction]) -> Vec<&str> {
 /// compares whitespace-insensitively rather than by raw string equality.
 pub(crate) struct TrailingSpaceFormatter;
 
-impl EcosystemFormatter for TrailingSpaceFormatter {
+impl PackageNaming for TrailingSpaceFormatter {}
+
+impl PackageRendering for TrailingSpaceFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         format!("{version} ")
     }
@@ -727,6 +816,16 @@ impl EcosystemFormatter for TrailingSpaceFormatter {
     }
 }
 
+impl RequirementResolution for TrailingSpaceFormatter {}
+
+impl DiagnosticMessages for TrailingSpaceFormatter {}
+
+impl DiagnosticPolicy for TrailingSpaceFormatter {}
+
+impl SourcePolicy for TrailingSpaceFormatter {}
+
+impl OsvNaming for TrailingSpaceFormatter {}
+
 /// A formatter that truncates every version to `==<major>.<minor>`, mirroring
 /// `deps-pypi`'s `truncate_release_to_match` collapsing several distinct
 /// registry versions (or a registry version and an OSV fix version) to the
@@ -735,7 +834,9 @@ impl EcosystemFormatter for TrailingSpaceFormatter {
 /// items matching each other's text.
 pub(crate) struct TruncatingFormatter;
 
-impl EcosystemFormatter for TruncatingFormatter {
+impl PackageNaming for TruncatingFormatter {}
+
+impl PackageRendering for TruncatingFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
@@ -751,6 +852,16 @@ impl EcosystemFormatter for TruncatingFormatter {
         format!("https://example.com/{name}")
     }
 }
+
+impl RequirementResolution for TruncatingFormatter {}
+
+impl DiagnosticMessages for TruncatingFormatter {}
+
+impl DiagnosticPolicy for TruncatingFormatter {}
+
+impl SourcePolicy for TruncatingFormatter {}
+
+impl OsvNaming for TruncatingFormatter {}
 
 pub(crate) fn sample_advisory(
     id: &str,
@@ -840,17 +951,31 @@ impl RequirementMatcher for ExactMatcher {
     }
 }
 
-impl EcosystemFormatter for ExactMatchFormatter {
+impl PackageNaming for ExactMatchFormatter {}
+
+impl PackageRendering for ExactMatchFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
+
     fn package_url(&self, name: &PackageName) -> String {
         format!("https://example.com/{}", name)
     }
+}
+
+impl RequirementResolution for ExactMatchFormatter {
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
     }
 }
+
+impl DiagnosticMessages for ExactMatchFormatter {}
+
+impl DiagnosticPolicy for ExactMatchFormatter {}
+
+impl SourcePolicy for ExactMatchFormatter {}
+
+impl OsvNaming for ExactMatchFormatter {}
 
 pub(crate) struct RealSemverMatcher(pub(crate) semver::VersionReq);
 impl RequirementMatcher for RealSemverMatcher {
@@ -868,13 +993,19 @@ impl RequirementMatcher for RealSemverMatcher {
 /// those crates. Shared by `matching_prerelease_would_satisfy_tests` and the
 /// `generate_diagnostics_from_cache` end-to-end coverage below (#299).
 pub(crate) struct StrictSemverFormatter;
-impl EcosystemFormatter for StrictSemverFormatter {
+impl PackageNaming for StrictSemverFormatter {}
+
+impl PackageRendering for StrictSemverFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.to_string()
     }
+
     fn package_url(&self, name: &PackageName) -> String {
         name.to_string()
     }
+}
+
+impl RequirementResolution for StrictSemverFormatter {
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         requirement
             .as_str()
@@ -882,7 +1013,16 @@ impl EcosystemFormatter for StrictSemverFormatter {
             .ok()
             .map(|req| Box::new(RealSemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
+}
+
+impl DiagnosticMessages for StrictSemverFormatter {}
+
+impl DiagnosticPolicy for StrictSemverFormatter {
     fn strict_semver_prerelease_exclusion(&self) -> bool {
         true
     }
 }
+
+impl SourcePolicy for StrictSemverFormatter {}
+
+impl OsvNaming for StrictSemverFormatter {}

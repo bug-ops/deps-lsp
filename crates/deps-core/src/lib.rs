@@ -41,10 +41,11 @@ pub use lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource, read_lockfile_content,
 };
 pub use lsp_helpers::{
-    DependencyOutcome, DependencyOutcomes, DiagnosticSeverities, EcosystemFormatter,
-    HOVER_RECENT_VERSIONS, LineOffsetTable, PackageVersions, RequirementMatcher, RequirementStatus,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, collect_update_all_edits,
-    generate_code_actions as lsp_generate_code_actions,
+    DependencyOutcome, DependencyOutcomes, DiagnosticMessages, DiagnosticPolicy,
+    DiagnosticSeverities, EcosystemFormatter, HOVER_RECENT_VERSIONS, LineOffsetTable, OsvNaming,
+    PackageNaming, PackageRendering, PackageVersions, RequirementMatcher, RequirementResolution,
+    RequirementStatus, SourcePolicy, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData,
+    collect_update_all_edits, generate_code_actions as lsp_generate_code_actions,
     generate_code_lenses as lsp_generate_code_lenses, generate_hover as lsp_generate_hover,
     generate_inlay_hints as lsp_generate_inlay_hints, is_dot_segment,
     is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,

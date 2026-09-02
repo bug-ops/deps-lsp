@@ -1,4 +1,7 @@
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy,
+};
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Precise npm semver range matcher, compiled once per dependency by
@@ -40,24 +43,7 @@ fn is_url_friendly_segment(segment: &str) -> bool {
 
 pub struct NpmFormatter;
 
-impl EcosystemFormatter for NpmFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        crate::registry::package_url(name.as_str())
-    }
-
-    fn yanked_message(&self) -> &'static str {
-        "This version is deprecated"
-    }
-
-    fn yanked_label(&self) -> &'static str {
-        "*(deprecated)*"
-    }
-
+impl PackageNaming for NpmFormatter {
     /// Lints `name` against npm's own `validate-npm-package-name` rules.
     ///
     /// Deliberately permissive beyond what npm hard-rejects: uppercase letters are
@@ -136,7 +122,30 @@ impl EcosystemFormatter for NpmFormatter {
 
         Ok(())
     }
+}
 
+impl PackageRendering for NpmFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
+    }
+
+    /// FR-015: suppresses the hover heading's npmjs.com link for anything but the plain
+    /// public registry — a private package's hover showing a `npmjs.com` link once live data
+    /// from the real (alternate) registry renders alongside it would read as false
+    /// confirmation the link is real. Reuses `source_is_public_registry_content`'s default
+    /// (`Registry` only, not overridden — npm has no crates.io-style verified-mirror concept
+    /// for `AlternateRegistry` to except).
+    fn suppress_package_url(&self, source: &deps_core::DependencySource) -> bool {
+        !self.source_is_public_registry_content(source)
+    }
+}
+
+impl RequirementResolution for NpmFormatter {
     /// Compiles `requirement` via `node_semver::Range`, the same crate `deps-npm`'s
     /// registry uses for matching — precise npm semver range semantics, unlike the
     /// default `version_satisfies_requirement` heuristic this method deliberately does
@@ -146,7 +155,19 @@ impl EcosystemFormatter for NpmFormatter {
             .ok()
             .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
+}
 
+impl DiagnosticMessages for NpmFormatter {
+    fn yanked_message(&self) -> &'static str {
+        "This version is deprecated"
+    }
+
+    fn yanked_label(&self) -> &'static str {
+        "*(deprecated)*"
+    }
+}
+
+impl DiagnosticPolicy for NpmFormatter {
     /// `node_semver::Range::satisfies` excludes pre-releases unless `requirement` itself pins
     /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
     fn strict_semver_prerelease_exclusion(&self) -> bool {
@@ -162,7 +183,7 @@ impl EcosystemFormatter for NpmFormatter {
     /// version of a package at once (live-verified: the `request` package has all 126/126
     /// versions marked deprecated) — common enough that this diagnostic would frequently
     /// duplicate the dedicated package-level deprecation diagnostic
-    /// ([`EcosystemFormatter::deprecated_message`], issue #205), including for an exact-pin
+    /// ([`deps_core::lsp_helpers::DiagnosticMessages::deprecated_message`], issue #205), including for an exact-pin
     /// requirement (the case this hook used to still allow through). This does not touch
     /// [`Registry::reports_yanked`](deps_core::Registry::reports_yanked), which npm keeps at
     /// its default `true`: the independent in-use-version yanked check (#263,
@@ -176,7 +197,9 @@ impl EcosystemFormatter for NpmFormatter {
     ) -> bool {
         false
     }
+}
 
+impl SourcePolicy for NpmFormatter {
     /// FR-009: a `.npmrc`-resolved `AlternateRegistry` is resolvable, alongside the default
     /// public `Registry` — gates hover/diagnostics/code-actions onto the router's per-source
     /// dispatch (`NpmRegistry::get_versions_from`) instead of the source-blind path.
@@ -188,17 +211,9 @@ impl EcosystemFormatter for NpmFormatter {
                 | deps_core::DependencySource::AlternateRegistry { .. }
         )
     }
-
-    /// FR-015: suppresses the hover heading's npmjs.com link for anything but the plain
-    /// public registry — a private package's hover showing a `npmjs.com` link once live data
-    /// from the real (alternate) registry renders alongside it would read as false
-    /// confirmation the link is real. Reuses `source_is_public_registry_content`'s default
-    /// (`Registry` only, not overridden — npm has no crates.io-style verified-mirror concept
-    /// for `AlternateRegistry` to except).
-    fn suppress_package_url(&self, source: &deps_core::DependencySource) -> bool {
-        !self.source_is_public_registry_content(source)
-    }
 }
+
+impl OsvNaming for NpmFormatter {}
 
 #[cfg(test)]
 mod tests {

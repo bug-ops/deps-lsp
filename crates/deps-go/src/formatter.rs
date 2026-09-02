@@ -1,5 +1,8 @@
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+};
 use deps_core::{ConcreteVersion, Dependency, DepsError, InvalidPackageName, PackageName};
 
 use crate::types::{GoDependency, GoDirective};
@@ -50,18 +53,7 @@ impl RequirementMatcher for ExactMatcher {
 /// - +incompatible suffix for v2+ modules without /v2 path
 pub struct GoFormatter;
 
-impl EcosystemFormatter for GoFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        // Go versions in go.mod are unquoted: v1.2.3
-        // Return version as-is since it should already have "v" prefix from registry
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        crate::registry::package_url(name.as_str())
-    }
-
+impl PackageNaming for GoFormatter {
     /// Reuses `crate::registry::validate_module_path` — the same structural rule that
     /// gates every registry request — so a malformed module path (empty, too long, or
     /// containing a `.`/`..` path segment) is reported as "Invalid package name" instead of
@@ -86,7 +78,22 @@ impl EcosystemFormatter for GoFormatter {
         };
         Err(InvalidPackageName::new(reason))
     }
+}
 
+impl PackageRendering for GoFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        // Go versions in go.mod are unquoted: v1.2.3
+        // Return version as-is since it should already have "v" prefix from registry
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        crate::registry::package_url(name.as_str())
+    }
+}
+
+impl RequirementResolution for GoFormatter {
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
         go_version_matches(version, requirement)
@@ -96,7 +103,7 @@ impl EcosystemFormatter for GoFormatter {
     /// comparison `version_satisfies_requirement` uses — Go's requirement syntax has no
     /// separate "loose" vs. "precise" distinction, so both share `go_version_matches`. Uses
     /// [`compile_requirement_unless`] (see that function and
-    /// [`EcosystemFormatter::compile_requirement`] for the shared "undecidable" contract).
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate is `crate::version::is_pseudo_version`:
     /// `proxy.golang.org/<mod>/@v/list` — the source of `available` — never lists
@@ -110,23 +117,6 @@ impl EcosystemFormatter for GoFormatter {
             crate::version::is_pseudo_version,
             ExactMatcher,
         )
-    }
-
-    fn osv_version_to_native(&self, version: &str) -> String {
-        // OSV's `fixed` events for Go are plain semver (`0.3.7`), never
-        // carrying the `v` prefix Go module versions require in go.mod.
-        if version.starts_with('v') {
-            version.to_string()
-        } else {
-            format!("v{version}")
-        }
-    }
-
-    fn osv_version(&self, version: &str) -> String {
-        // Go module versions always carry a mandatory "v" prefix
-        // (golang.org/x/mod/module convention), but OSV.dev's SEMVER range
-        // matching forbids it — strip it before sending on the wire.
-        version.strip_prefix('v').unwrap_or(version).to_string()
     }
 
     fn manifest_requirement_is_resolved_version(&self, dep: &dyn Dependency) -> bool {
@@ -146,6 +136,31 @@ impl EcosystemFormatter for GoFormatter {
         dep.as_any()
             .downcast_ref::<GoDependency>()
             .is_some_and(|go_dep| go_dep.directive == GoDirective::Require)
+    }
+}
+
+impl DiagnosticMessages for GoFormatter {}
+
+impl DiagnosticPolicy for GoFormatter {}
+
+impl SourcePolicy for GoFormatter {}
+
+impl OsvNaming for GoFormatter {
+    fn osv_version_to_native(&self, version: &str) -> String {
+        // OSV's `fixed` events for Go are plain semver (`0.3.7`), never
+        // carrying the `v` prefix Go module versions require in go.mod.
+        if version.starts_with('v') {
+            version.to_string()
+        } else {
+            format!("v{version}")
+        }
+    }
+
+    fn osv_version(&self, version: &str) -> String {
+        // Go module versions always carry a mandatory "v" prefix
+        // (golang.org/x/mod/module convention), but OSV.dev's SEMVER range
+        // matching forbids it — strip it before sending on the wire.
+        version.strip_prefix('v').unwrap_or(version).to_string()
     }
 }
 

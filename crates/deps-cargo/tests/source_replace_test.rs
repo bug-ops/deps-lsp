@@ -12,7 +12,7 @@
 use deps_cargo::config::ConfigFileCache;
 use deps_cargo::parser::CargoParseContext;
 use deps_cargo::{CargoFormatter, DependencySource};
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::lsp_helpers::{PackageRendering, SourcePolicy};
 use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 use std::sync::Arc;
 use tower_lsp_server::ls_types::Uri;
@@ -169,7 +169,7 @@ fn test_mirror_hover_link_not_suppressed() {
 
 /// (d) OSV scan targets still include the mirrored deps (F1) — `build_scan_targets`/
 /// `collect_in_use_versions` (`deps-lsp`) gate inclusion on
-/// `EcosystemFormatter::source_is_public_registry_content`, so this asserts the exact
+/// `SourcePolicy::source_is_public_registry_content`, so this asserts the exact
 /// predicate they call returns `true` for a mirror and `false` for a private registry — the
 /// F1 regression gate, since `dep.source() == DependencySource::Registry` (the pre-fix gate)
 /// would incorrectly return `false` for every mirrored dependency.

@@ -1,7 +1,10 @@
 //! GitHub Actions ecosystem formatter.
 
 use dashmap::DashMap;
-use deps_core::lsp_helpers::EcosystemFormatter;
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementResolution, SourcePolicy,
+};
 use deps_core::parser::DependencySource;
 use deps_core::{
     ConcreteVersion, Dependency, PackageName, VersionReq, lsp_helpers::warn_rejected_value,
@@ -113,7 +116,13 @@ impl GithubActionsFormatter {
     }
 }
 
-impl EcosystemFormatter for GithubActionsFormatter {
+impl PackageNaming for GithubActionsFormatter {
+    fn normalize_package_name(&self, name: &PackageName) -> String {
+        name.as_str().to_lowercase()
+    }
+}
+
+impl PackageRendering for GithubActionsFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         version.as_str().to_string()
     }
@@ -188,30 +197,9 @@ impl EcosystemFormatter for GithubActionsFormatter {
             _ => false,
         }
     }
+}
 
-    fn normalize_package_name(&self, name: &PackageName) -> String {
-        name.as_str().to_lowercase()
-    }
-
-    /// Rewrites a native tag string into the spelling OSV.dev's SEMVER range matching
-    /// expects: unprefixed (verified live against `GHSA-mrrh-fwg8-r2c3`, whose ranges
-    /// carry no `v` prefix regardless of the affected repository's own tagging
-    /// convention).
-    ///
-    /// `osv_version_to_native` is deliberately left at its default identity: adding a `v`
-    /// prefix unconditionally, the way `deps-go` does for module versions, would be wrong
-    /// for a GitHub Actions repository that tags without one — and
-    /// `format_version_replacing_for`'s `match_v_prefix_style` already reconciles the
-    /// prefix against the dependency's *own* declared pin style downstream, so no native
-    /// version ever reaches the manifest with the wrong style regardless of what this
-    /// method returns.
-    fn osv_version(&self, version: &str) -> String {
-        version
-            .strip_prefix(['v', 'V'])
-            .unwrap_or(version)
-            .to_string()
-    }
-
+impl RequirementResolution for GithubActionsFormatter {
     /// A major-only or major.minor requirement (`v4`) is up to date while `latest`'s
     /// corresponding leading components match; a full version is compared component-for-
     /// component. `v`/`V` is normalized off both sides first. An unparseable requirement
@@ -256,6 +244,33 @@ impl EcosystemFormatter for GithubActionsFormatter {
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         let req = requirement.as_str();
         is_full_sha(req) || !is_tag_shaped(req)
+    }
+}
+
+impl DiagnosticMessages for GithubActionsFormatter {}
+
+impl DiagnosticPolicy for GithubActionsFormatter {}
+
+impl SourcePolicy for GithubActionsFormatter {}
+
+impl OsvNaming for GithubActionsFormatter {
+    /// Rewrites a native tag string into the spelling OSV.dev's SEMVER range matching
+    /// expects: unprefixed (verified live against `GHSA-mrrh-fwg8-r2c3`, whose ranges
+    /// carry no `v` prefix regardless of the affected repository's own tagging
+    /// convention).
+    ///
+    /// `osv_version_to_native` is deliberately left at its default identity: adding a `v`
+    /// prefix unconditionally, the way `deps-go` does for module versions, would be wrong
+    /// for a GitHub Actions repository that tags without one — and
+    /// `format_version_replacing_for`'s `match_v_prefix_style` already reconciles the
+    /// prefix against the dependency's *own* declared pin style downstream, so no native
+    /// version ever reaches the manifest with the wrong style regardless of what this
+    /// method returns.
+    fn osv_version(&self, version: &str) -> String {
+        version
+            .strip_prefix(['v', 'V'])
+            .unwrap_or(version)
+            .to_string()
     }
 }
 

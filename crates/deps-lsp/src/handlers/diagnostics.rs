@@ -644,7 +644,7 @@ serde = "1.0.0"
     mod npm_tests {
         use super::*;
         use crate::document::DocumentState;
-        use deps_core::EcosystemFormatter;
+        use deps_core::DiagnosticMessages;
 
         #[tokio::test]
         async fn test_handle_diagnostics() {
@@ -809,7 +809,7 @@ serde = "1.0.0"
     mod deno_tests {
         use super::*;
         use crate::document::DocumentState;
-        use deps_core::EcosystemFormatter;
+        use deps_core::DiagnosticMessages;
 
         /// #448 regression: mirrors npm_tests'
         /// `test_handle_diagnostics_manifest_requirement_yanked_stays_suppressed_for_exact_pin`

@@ -3,7 +3,10 @@ use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy,
+};
 use pep440_rs::{Version, VersionSpecifiers};
 use std::str::FromStr;
 use tower_lsp_server::ls_types::Position;
@@ -21,7 +24,7 @@ impl RequirementMatcher for Pep440Matcher {
 
 pub struct PypiFormatter;
 
-impl EcosystemFormatter for PypiFormatter {
+impl PackageNaming for PypiFormatter {
     fn normalize_package_name(&self, name: &PackageName) -> String {
         crate::name::normalize(name.as_str())
     }
@@ -49,7 +52,9 @@ impl EcosystemFormatter for PypiFormatter {
             ))
         }
     }
+}
 
+impl PackageRendering for PypiFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         let version = version.as_str();
         let next_major = version
@@ -117,19 +122,6 @@ impl EcosystemFormatter for PypiFormatter {
         self.format_version_for_text_edit(&ConcreteVersion::new(version))
     }
 
-    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
-        let version = version.as_str();
-        let Ok(ver) = Version::from_str(version) else {
-            return false;
-        };
-
-        let Ok(specs) = VersionSpecifiers::from_str(requirement) else {
-            return false;
-        };
-
-        specs.contains(&ver)
-    }
-
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -149,6 +141,21 @@ impl EcosystemFormatter for PypiFormatter {
         let end_char = end_char.saturating_add(2);
 
         position.character >= start_char && position.character <= end_char
+    }
+}
+
+impl RequirementResolution for PypiFormatter {
+    fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        let version = version.as_str();
+        let Ok(ver) = Version::from_str(version) else {
+            return false;
+        };
+
+        let Ok(specs) = VersionSpecifiers::from_str(requirement) else {
+            return false;
+        };
+
+        specs.contains(&ver)
     }
 
     /// Compiles `requirement` via `pep440_rs::VersionSpecifiers` — the same crate and the
@@ -172,6 +179,14 @@ impl EcosystemFormatter for PypiFormatter {
         Some(Box::new(Pep440Matcher(specs)))
     }
 }
+
+impl DiagnosticMessages for PypiFormatter {}
+
+impl DiagnosticPolicy for PypiFormatter {}
+
+impl SourcePolicy for PypiFormatter {}
+
+impl OsvNaming for PypiFormatter {}
 
 /// Truncates `latest`'s PEP 440 release segments to the same segment count
 /// as `source_version`'s release, joined with `.`. Returns `None` if either

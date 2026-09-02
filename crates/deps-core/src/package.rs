@@ -137,13 +137,13 @@ impl PartialEq<&str> for PackageName {
     }
 }
 
-/// A package name that failed an [`EcosystemFormatter::validate_package_name`] lint.
+/// A package name that failed a [`PackageNaming::validate_package_name`] lint.
 ///
 /// This is not a construction-time gate — [`PackageName::new`] stays infallible — it
 /// only carries *why* a name looks wrong so an LSP diagnostic can say something more
 /// specific than "invalid name".
 ///
-/// [`EcosystemFormatter::validate_package_name`]: crate::lsp_helpers::EcosystemFormatter::validate_package_name
+/// [`PackageNaming::validate_package_name`]: crate::lsp_helpers::PackageNaming::validate_package_name
 ///
 /// # Examples
 ///

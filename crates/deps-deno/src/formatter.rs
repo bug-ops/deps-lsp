@@ -8,7 +8,10 @@
 //! `deps-npm`'s wording outright (yanked messages, S2).
 
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, warn_rejected_value};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, warn_rejected_value,
+};
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Precise `node-semver` range matcher, compiled once per dependency by
@@ -54,7 +57,32 @@ fn validate_jsr_segment(segment: &str) -> Result<(), InvalidPackageName> {
 /// `EcosystemFormatter` for Deno manifests (D4).
 pub struct DenoFormatter;
 
-impl EcosystemFormatter for DenoFormatter {
+impl PackageNaming for DenoFormatter {
+    /// Validates the scheme-qualified name: `jsr:` requires the scoped `@scope/name`
+    /// form (mirroring JSR's own registration rules); `npm:` delegates to npm's own
+    /// validator on the bare name (`ECOSYSTEM_GUIDE.md` "npm Package Name Validation");
+    /// any other/missing scheme is rejected outright.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        match split_scheme(name) {
+            Some((Scheme::Jsr, rest)) => {
+                let Some((scope, pkg)) = split_scoped(rest) else {
+                    return Err(InvalidPackageName::new(
+                        "jsr: packages must be scoped as @scope/name",
+                    ));
+                };
+                validate_jsr_segment(scope)?;
+                validate_jsr_segment(pkg)?;
+                Ok(())
+            }
+            Some((Scheme::Npm, rest)) => deps_npm::NpmFormatter.validate_package_name(rest),
+            None => Err(InvalidPackageName::new(
+                "unsupported specifier scheme (expected jsr: or npm:)",
+            )),
+        }
+    }
+}
+
+impl PackageRendering for DenoFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         let version = version.as_str();
         // `version_range` covers only the version text inside the specifier string — no
@@ -86,7 +114,19 @@ impl EcosystemFormatter for DenoFormatter {
             }
         }
     }
+}
 
+impl RequirementResolution for DenoFormatter {
+    /// Compiles `requirement` via `node_semver::Range`, the same crate `deps-npm` uses —
+    /// correct for JSR too, since JSR mandates semver.
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        node_semver::Range::parse(requirement.as_str())
+            .ok()
+            .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+    }
+}
+
+impl DiagnosticMessages for DenoFormatter {
     /// S2: adopts `deps-npm`'s wording for the *whole* formatter (both `jsr:` and `npm:`
     /// specifiers), rather than the `deps-core` defaults ("yanked"). Spec.md US-002/
     /// FR-013 treat cross-ecosystem wording divergence for the same npm package as a
@@ -100,38 +140,9 @@ impl EcosystemFormatter for DenoFormatter {
     fn yanked_label(&self) -> &'static str {
         "*(deprecated)*"
     }
+}
 
-    /// Validates the scheme-qualified name: `jsr:` requires the scoped `@scope/name`
-    /// form (mirroring JSR's own registration rules); `npm:` delegates to npm's own
-    /// validator on the bare name (`ECOSYSTEM_GUIDE.md` "npm Package Name Validation");
-    /// any other/missing scheme is rejected outright.
-    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
-        match split_scheme(name) {
-            Some((Scheme::Jsr, rest)) => {
-                let Some((scope, pkg)) = split_scoped(rest) else {
-                    return Err(InvalidPackageName::new(
-                        "jsr: packages must be scoped as @scope/name",
-                    ));
-                };
-                validate_jsr_segment(scope)?;
-                validate_jsr_segment(pkg)?;
-                Ok(())
-            }
-            Some((Scheme::Npm, rest)) => deps_npm::NpmFormatter.validate_package_name(rest),
-            None => Err(InvalidPackageName::new(
-                "unsupported specifier scheme (expected jsr: or npm:)",
-            )),
-        }
-    }
-
-    /// Compiles `requirement` via `node_semver::Range`, the same crate `deps-npm` uses —
-    /// correct for JSR too, since JSR mandates semver.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        node_semver::Range::parse(requirement.as_str())
-            .ok()
-            .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
-    }
-
+impl DiagnosticPolicy for DenoFormatter {
     /// Scheme-aware (#448, fixing the #436 M1 divergence): for `npm:` specifiers, returns
     /// `false` unconditionally, mirroring `NpmFormatter::yanked_diagnostic_applies_to`'s
     /// post-#436 behavior — an exact-pin `npm:` dependency in `deno.json` (e.g.
@@ -163,7 +174,11 @@ impl EcosystemFormatter for DenoFormatter {
             Some((Scheme::Jsr, _)) | None => true,
         }
     }
+}
 
+impl SourcePolicy for DenoFormatter {}
+
+impl OsvNaming for DenoFormatter {
     /// `npm:` dependencies map to OSV's `npm` ecosystem via their bare name (D5);
     /// `jsr:` dependencies return `None` — OSV has no JSR ecosystem (live-verified:
     /// `POST api.osv.dev/v1/query` with `{"ecosystem":"JSR"}` returns `code 3, invalid

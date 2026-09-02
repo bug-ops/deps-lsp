@@ -1,6 +1,9 @@
 //! Version formatting for Gradle ecosystem.
 
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, compile_requirement_unless};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+};
 use deps_core::{
     ConcreteVersion, InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment,
 };
@@ -136,46 +139,7 @@ impl RequirementMatcher for GradleMatcher {
     }
 }
 
-impl EcosystemFormatter for GradleFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        version.to_string()
-    }
-
-    /// Preserves Gradle's rich-version strict/preferred shorthand
-    /// (`{strictlyVersion}!!{preferredVersion}`) when `current` carries it — a bare
-    /// `format_version_for_text_edit` replacement would otherwise silently downgrade
-    /// a strict constraint to a normal one.
-    ///
-    /// Only the degenerate suffix form (`1.2.3!!`, no `preferredVersion`) is
-    /// rewritten — to `{version}!!` — since the strict pin itself is what "update
-    /// version" means to bump there, and there is nothing else in the requirement to
-    /// preserve. The full infix form (`[1.7,1.8[!!1.7.25`) is left unchanged rather
-    /// than rewriting the `preferredVersion` half: since Gradle's strict constraint
-    /// always wins conflict resolution, bumping the preference to a version outside
-    /// the hand-written strict range (a likely outcome for "update to latest") would
-    /// silently write a no-op edit that *looks* like an update but changes nothing —
-    /// worse than the original silently-dropped-marker bug, since the manifest now
-    /// reads as though it were updated. There is no single rewrite that is safe in
-    /// general without inspecting the strict range's bounds, which is out of scope
-    /// here. `current` is `trim`med before the marker check for the same
-    /// un-trimmed-catalog-value reason as `strip_strict_marker` above. A no-op
-    /// return here is safely excluded from `deps-core`'s `collect_update_all_edits`
-    /// ("Update N outdated dependencies" lens) by its own no-op guard.
-    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        let version = version.as_str();
-        let trimmed = current.trim();
-        match trimmed.split_once("!!") {
-            Some((_, "")) => format!("{version}!!"),
-            Some(_) => trimmed.to_string(),
-            None => self.format_version_for_text_edit(&ConcreteVersion::new(version)),
-        }
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        deps_maven::registry::package_url(name.as_str())
-    }
-
+impl PackageNaming for GradleFormatter {
     /// Validates a Gradle coordinate's `group:artifact` shape and character set.
     ///
     /// Gradle resolves through `deps_maven::MavenCentralRegistry` and shares Maven's
@@ -214,7 +178,50 @@ impl EcosystemFormatter for GradleFormatter {
         }
         Ok(())
     }
+}
 
+impl PackageRendering for GradleFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        version.to_string()
+    }
+
+    /// Preserves Gradle's rich-version strict/preferred shorthand
+    /// (`{strictlyVersion}!!{preferredVersion}`) when `current` carries it — a bare
+    /// `format_version_for_text_edit` replacement would otherwise silently downgrade
+    /// a strict constraint to a normal one.
+    ///
+    /// Only the degenerate suffix form (`1.2.3!!`, no `preferredVersion`) is
+    /// rewritten — to `{version}!!` — since the strict pin itself is what "update
+    /// version" means to bump there, and there is nothing else in the requirement to
+    /// preserve. The full infix form (`[1.7,1.8[!!1.7.25`) is left unchanged rather
+    /// than rewriting the `preferredVersion` half: since Gradle's strict constraint
+    /// always wins conflict resolution, bumping the preference to a version outside
+    /// the hand-written strict range (a likely outcome for "update to latest") would
+    /// silently write a no-op edit that *looks* like an update but changes nothing —
+    /// worse than the original silently-dropped-marker bug, since the manifest now
+    /// reads as though it were updated. There is no single rewrite that is safe in
+    /// general without inspecting the strict range's bounds, which is out of scope
+    /// here. `current` is `trim`med before the marker check for the same
+    /// un-trimmed-catalog-value reason as `strip_strict_marker` above. A no-op
+    /// return here is safely excluded from `deps-core`'s `collect_update_all_edits`
+    /// ("Update N outdated dependencies" lens) by its own no-op guard.
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        let version = version.as_str();
+        let trimmed = current.trim();
+        match trimmed.split_once("!!") {
+            Some((_, "")) => format!("{version}!!"),
+            Some(_) => trimmed.to_string(),
+            None => self.format_version_for_text_edit(&ConcreteVersion::new(version)),
+        }
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        deps_maven::registry::package_url(name.as_str())
+    }
+}
+
+impl RequirementResolution for GradleFormatter {
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
         gradle_version_matches(version, requirement)
@@ -225,7 +232,7 @@ impl EcosystemFormatter for GradleFormatter {
     }
 
     /// Uses [`compile_requirement_unless`] (see that function and
-    /// [`EcosystemFormatter::compile_requirement`] for the shared "undecidable" contract).
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate rejects a malformed range (leading `[`/`(`/`]` but
     /// `crate::range::parse_range` fails) — checked unconditionally, first, before any
@@ -273,6 +280,14 @@ impl EcosystemFormatter for GradleFormatter {
         )
     }
 }
+
+impl DiagnosticMessages for GradleFormatter {}
+
+impl DiagnosticPolicy for GradleFormatter {}
+
+impl SourcePolicy for GradleFormatter {}
+
+impl OsvNaming for GradleFormatter {}
 
 #[cfg(test)]
 mod tests {

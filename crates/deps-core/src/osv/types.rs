@@ -294,7 +294,7 @@ pub struct DependencyVulnerabilities {
 /// A single upgrade target recommended by [`DependencyVulnerabilities::recommended_fix`].
 ///
 /// `version` is in OSV's version namespace (see
-/// [`crate::lsp_helpers::EcosystemFormatter::osv_version_to_native`] for the
+/// [`crate::lsp_helpers::OsvNaming::osv_version_to_native`] for the
 /// conversion callers must apply before using it in a manifest edit or a
 /// registry lookup).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,7 +523,10 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::EcosystemFormatter;
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy,
+/// };
 /// use deps_core::osv::vulnerability_keys;
 /// use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
 /// use std::any::Any;
@@ -578,7 +581,8 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 /// }
 ///
 /// struct SimpleFormatter;
-/// impl EcosystemFormatter for SimpleFormatter {
+/// impl PackageNaming for SimpleFormatter {}
+/// impl PackageRendering for SimpleFormatter {
 ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
 ///         version.to_string()
 ///     }
@@ -586,6 +590,11 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 ///         name.to_string()
 ///     }
 /// }
+/// impl RequirementResolution for SimpleFormatter {}
+/// impl DiagnosticMessages for SimpleFormatter {}
+/// impl DiagnosticPolicy for SimpleFormatter {}
+/// impl SourcePolicy for SimpleFormatter {}
+/// impl OsvNaming for SimpleFormatter {}
 ///
 /// // `time` declared twice, pinned to two different versions.
 /// let parse_result = SimpleParseResult {

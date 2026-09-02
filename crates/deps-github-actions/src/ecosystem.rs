@@ -10,7 +10,7 @@ use tower_lsp_server::ls_types::{
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
     completion::Completions,
-    lsp_helpers::{EcosystemFormatter, markdown_code_span},
+    lsp_helpers::{EcosystemFormatter, PackageRendering, markdown_code_span},
 };
 
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;

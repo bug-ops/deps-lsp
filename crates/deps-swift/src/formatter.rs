@@ -6,7 +6,10 @@ use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::is_dot_segment;
-use deps_core::lsp_helpers::{EcosystemFormatter, RequirementMatcher, warn_rejected_value};
+use deps_core::lsp_helpers::{
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, warn_rejected_value,
+};
 
 /// Precise semver `VersionReq` matcher, compiled once per dependency by
 /// [`SwiftFormatter::compile_requirement`] — the same crate `version_satisfies_requirement`
@@ -36,25 +39,7 @@ fn is_valid_owner_repo(name: &str) -> bool {
 /// Formatter for Swift/SPM ecosystem LSP responses.
 pub struct SwiftFormatter;
 
-impl EcosystemFormatter for SwiftFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        let version = version.as_str();
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        if is_valid_owner_repo(name.as_str()) {
-            format!("https://github.com/{name}")
-        } else {
-            warn_rejected_value(
-                "is_valid_owner_repo",
-                "swift package display formatting",
-                name.as_str(),
-            );
-            String::new()
-        }
-    }
-
+impl PackageNaming for SwiftFormatter {
     fn normalize_package_name(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()
     }
@@ -90,7 +75,29 @@ impl EcosystemFormatter for SwiftFormatter {
             ))
         }
     }
+}
 
+impl PackageRendering for SwiftFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        let version = version.as_str();
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        if is_valid_owner_repo(name.as_str()) {
+            format!("https://github.com/{name}")
+        } else {
+            warn_rejected_value(
+                "is_valid_owner_repo",
+                "swift package display formatting",
+                name.as_str(),
+            );
+            String::new()
+        }
+    }
+}
+
+impl RequirementResolution for SwiftFormatter {
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
         let Ok(ver) = semver::Version::parse(version) else {
@@ -102,6 +109,22 @@ impl EcosystemFormatter for SwiftFormatter {
         req.matches(&ver)
     }
 
+    /// Compiles `requirement` via `semver::VersionReq`, the same crate
+    /// `version_satisfies_requirement` uses. `None` on parse failure is the fallible-parse
+    /// shape of `compile_requirement`'s "undecidable" contract (see
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`]) — Swift's registry client follows GitHub
+    /// tags pagination to build `available`, so a `None` here is purely "this requirement
+    /// string doesn't parse as semver," not a gap in what pagination could return.
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        requirement
+            .as_str()
+            .parse::<semver::VersionReq>()
+            .ok()
+            .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
+    }
+}
+
+impl DiagnosticMessages for SwiftFormatter {
     fn yanked_message(&self) -> &'static str {
         "This version has been yanked"
     }
@@ -109,7 +132,19 @@ impl EcosystemFormatter for SwiftFormatter {
     fn yanked_label(&self) -> &'static str {
         "*(yanked)*"
     }
+}
 
+impl DiagnosticPolicy for SwiftFormatter {
+    /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins
+    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
+    fn strict_semver_prerelease_exclusion(&self) -> bool {
+        true
+    }
+}
+
+impl SourcePolicy for SwiftFormatter {}
+
+impl OsvNaming for SwiftFormatter {
     /// Raw `dep.name()`, NOT [`Self::normalize_package_name`]: that
     /// lowercases, and OSV's `SwiftURL` matching is case-sensitive, so
     /// lowercasing would mangle mixed-case repos. Gated on the dependency's
@@ -123,26 +158,6 @@ impl EcosystemFormatter for SwiftFormatter {
         let host = reqwest::Url::parse(&swift_dep.url).ok()?;
         matches!(host.host_str(), Some("github.com" | "www.github.com"))
             .then(|| format!("github.com/{}", dep.name()))
-    }
-
-    /// Compiles `requirement` via `semver::VersionReq`, the same crate
-    /// `version_satisfies_requirement` uses. `None` on parse failure is the fallible-parse
-    /// shape of `compile_requirement`'s "undecidable" contract (see
-    /// [`EcosystemFormatter::compile_requirement`]) — Swift's registry client follows GitHub
-    /// tags pagination to build `available`, so a `None` here is purely "this requirement
-    /// string doesn't parse as semver," not a gap in what pagination could return.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        requirement
-            .as_str()
-            .parse::<semver::VersionReq>()
-            .ok()
-            .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
-    }
-
-    /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins
-    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
-    fn strict_semver_prerelease_exclusion(&self) -> bool {
-        true
     }
 }
 

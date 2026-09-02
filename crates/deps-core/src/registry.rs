@@ -723,7 +723,7 @@ pub trait Metadata: Send + Sync {
     /// for Maven/Gradle it is a `"group:artifact"` value synthesized from two
     /// separate response fields. Do not compare it to a manifest name
     /// without going through
-    /// [`EcosystemFormatter::normalize_package_name`](crate::lsp_helpers::EcosystemFormatter::normalize_package_name).
+    /// [`PackageNaming::normalize_package_name`](crate::lsp_helpers::PackageNaming::normalize_package_name).
     fn name(&self) -> &crate::PackageName;
 
     /// Short description (optional).

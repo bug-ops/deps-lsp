@@ -305,7 +305,7 @@ fn collect_in_use_versions(
 ///    negative, which is worse than not scanning at all.
 ///
 /// **Go exception** (#228 follow-up, unified with #235's
-/// [`deps_core::lsp_helpers::EcosystemFormatter::manifest_requirement_is_resolved_version`]):
+/// [`deps_core::lsp_helpers::RequirementResolution::manifest_requirement_is_resolved_version`]):
 /// step 1 is skipped entirely for a dependency whose manifest requirement is
 /// itself the resolved version (a Go `require`-directive dependency), going
 /// straight to step 2. Go's `go.mod` `require` line is already an exact
@@ -2420,7 +2420,10 @@ mod tests {
     mod dedup_by_source_collision_tests {
         use super::*;
         use deps_core::Dependency;
-        use deps_core::lsp_helpers::EcosystemFormatter;
+        use deps_core::lsp_helpers::{
+            DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+            RequirementResolution, SourcePolicy,
+        };
         use std::any::Any;
         use tower_lsp_server::ls_types::{Position, Range};
 
@@ -2428,13 +2431,25 @@ mod tests {
         /// `AlternateRegistry` as resolvable — needed so two distinct source values can
         /// both pass gate 1 (resolvability) and reach gate 2 (collision) in the same test.
         struct AlternateAwareFormatter;
-        impl EcosystemFormatter for AlternateAwareFormatter {
+        impl PackageNaming for AlternateAwareFormatter {}
+
+        impl PackageRendering for AlternateAwareFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
+        }
+
+        impl RequirementResolution for AlternateAwareFormatter {}
+
+        impl DiagnosticMessages for AlternateAwareFormatter {}
+
+        impl DiagnosticPolicy for AlternateAwareFormatter {}
+
+        impl SourcePolicy for AlternateAwareFormatter {
             fn can_resolve_source(&self, source: &DependencySource) -> bool {
                 matches!(
                     source,
@@ -2442,6 +2457,8 @@ mod tests {
                 )
             }
         }
+
+        impl OsvNaming for AlternateAwareFormatter {}
 
         struct MockDep {
             name: PackageName,
@@ -6913,20 +6930,36 @@ tokio = "1.0"
     mod osv_scan_target_tests {
         use super::*;
         use deps_core::Dependency;
-        use deps_core::lsp_helpers::EcosystemFormatter;
+        use deps_core::lsp_helpers::{
+            DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+            RequirementResolution, SourcePolicy,
+        };
         use deps_core::parser::DependencySource;
         use std::any::Any;
         use tower_lsp_server::ls_types::{Position, Range};
 
         struct MockFormatter;
-        impl EcosystemFormatter for MockFormatter {
+        impl PackageNaming for MockFormatter {}
+
+        impl PackageRendering for MockFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
         }
+
+        impl RequirementResolution for MockFormatter {}
+
+        impl DiagnosticMessages for MockFormatter {}
+
+        impl DiagnosticPolicy for MockFormatter {}
+
+        impl SourcePolicy for MockFormatter {}
+
+        impl OsvNaming for MockFormatter {}
 
         struct MockDep {
             name: PackageName,
@@ -7038,26 +7071,54 @@ tokio = "1.0"
         /// dependency's manifest requirement is itself the resolved version
         /// (#235's `manifest_requirement_is_resolved_version` unification).
         struct MockGoFormatter;
-        impl EcosystemFormatter for MockGoFormatter {
+        impl PackageNaming for MockGoFormatter {}
+
+        impl PackageRendering for MockGoFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://pkg.go.dev/{name}")
             }
+        }
+
+        impl RequirementResolution for MockGoFormatter {
             fn manifest_requirement_is_resolved_version(&self, _dep: &dyn Dependency) -> bool {
                 true
             }
         }
 
+        impl DiagnosticMessages for MockGoFormatter {}
+
+        impl DiagnosticPolicy for MockGoFormatter {}
+
+        impl SourcePolicy for MockGoFormatter {}
+
+        impl OsvNaming for MockGoFormatter {}
+
         struct MockVPrefixFormatter;
-        impl EcosystemFormatter for MockVPrefixFormatter {
+        impl PackageNaming for MockVPrefixFormatter {}
+
+        impl PackageRendering for MockVPrefixFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
+        }
+
+        impl RequirementResolution for MockVPrefixFormatter {}
+
+        impl DiagnosticMessages for MockVPrefixFormatter {}
+
+        impl DiagnosticPolicy for MockVPrefixFormatter {}
+
+        impl SourcePolicy for MockVPrefixFormatter {}
+
+        impl OsvNaming for MockVPrefixFormatter {
             fn osv_version(&self, version: &str) -> String {
                 version.strip_prefix('v').unwrap_or(version).to_string()
             }
@@ -7510,7 +7571,10 @@ tokio = "1.0"
     /// a live-check result map that may be missing keys (timeout/outage).
     mod fix_target_verification_tests {
         use super::*;
-        use deps_core::lsp_helpers::EcosystemFormatter;
+        use deps_core::lsp_helpers::{
+            DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+            RequirementResolution, SourcePolicy,
+        };
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
             VulnerabilityMap,
@@ -7518,14 +7582,27 @@ tokio = "1.0"
         use std::sync::Arc;
 
         struct IdentityFormatter;
-        impl EcosystemFormatter for IdentityFormatter {
+        impl PackageNaming for IdentityFormatter {}
+
+        impl PackageRendering for IdentityFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
+
             fn package_url(&self, name: &PackageName) -> String {
                 format!("https://example.com/{name}")
             }
         }
+
+        impl RequirementResolution for IdentityFormatter {}
+
+        impl DiagnosticMessages for IdentityFormatter {}
+
+        impl DiagnosticPolicy for IdentityFormatter {}
+
+        impl SourcePolicy for IdentityFormatter {}
+
+        impl OsvNaming for IdentityFormatter {}
 
         fn advisory(id: &str, fixed_versions: &[&str]) -> Arc<Advisory> {
             Arc::new(Advisory {

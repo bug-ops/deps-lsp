@@ -324,16 +324,25 @@ impl Default for EcosystemConfig {
 /// ```no_run
 /// use deps_core::{Ecosystem, ParseResult, Registry, EcosystemConfig, PackageName, ConcreteVersion};
 /// use deps_core::completion::Completions;
-/// use deps_core::lsp_helpers::EcosystemFormatter;
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
+///     PackageRendering, RequirementResolution, SourcePolicy,
+/// };
 /// use std::sync::Arc;
 /// use std::any::Any;
 /// use tower_lsp_server::ls_types::{Uri, CompletionItem, Position};
 ///
 /// struct MyFormatter;
-/// impl EcosystemFormatter for MyFormatter {
+/// impl PackageNaming for MyFormatter {}
+/// impl PackageRendering for MyFormatter {
 ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String { version.to_string() }
 ///     fn package_url(&self, name: &PackageName) -> String { format!("https://example.com/{name}") }
 /// }
+/// impl RequirementResolution for MyFormatter {}
+/// impl DiagnosticMessages for MyFormatter {}
+/// impl DiagnosticPolicy for MyFormatter {}
+/// impl SourcePolicy for MyFormatter {}
+/// impl OsvNaming for MyFormatter {}
 ///
 /// struct MyEcosystem {
 ///     registry: Arc<dyn Registry>,
