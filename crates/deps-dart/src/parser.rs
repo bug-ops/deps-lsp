@@ -1,9 +1,10 @@
 //! pubspec.yaml parser with position tracking.
 
 use crate::types::{DartDependency, DependencySection, DependencySource};
+use deps_core::lsp_helpers::LineOffsetTable;
 use deps_core::{DepsError, Result};
 use std::any::Any;
-use tower_lsp_server::ls_types::{Position, Range, Uri};
+use tower_lsp_server::ls_types::{Range, Uri};
 use yaml_rust2::{Yaml, YamlLoader};
 
 #[derive(Debug, Clone)]
@@ -11,37 +12,6 @@ pub struct DartParseResult {
     pub dependencies: Vec<DartDependency>,
     pub sdk_constraint: Option<String>,
     pub uri: Uri,
-}
-
-struct LineOffsetTable {
-    line_starts: Vec<usize>,
-}
-
-impl LineOffsetTable {
-    fn new(content: &str) -> Self {
-        let mut line_starts = vec![0];
-        for (i, c) in content.char_indices() {
-            if c == '\n' {
-                line_starts.push(i + 1);
-            }
-        }
-        Self { line_starts }
-    }
-
-    fn byte_offset_to_position(&self, content: &str, offset: usize) -> Position {
-        let line = self
-            .line_starts
-            .partition_point(|&start| start <= offset)
-            .saturating_sub(1);
-        let line_start = self.line_starts[line];
-
-        let character = content[line_start..offset]
-            .chars()
-            .map(|c| c.len_utf16() as u32)
-            .sum();
-
-        Position::new(line as u32, character)
-    }
 }
 
 pub fn parse_pubspec_yaml(content: &str, doc_uri: &Uri) -> Result<DartParseResult> {
@@ -463,6 +433,57 @@ dependencies:
         let pos = table.byte_offset_to_position(content, 4);
         assert_eq!(pos.line, 1);
         assert_eq!(pos.character, 0);
+    }
+
+    #[test]
+    fn test_name_range_crosses_multibyte_accented_character() {
+        // "é" is a 2-byte UTF-8 character but a single UTF-16 code unit — the name
+        // range's end offset lands immediately after it, so position computation must
+        // count UTF-16 units (not bytes) and must not panic when slicing content up to
+        // that offset (deps-npm's test_line_offset_table_emoji, deps-composer's
+        // test_find_positions_no_panic_on_multibyte_utf8_boundary; #542 dedups
+        // deps-dart onto the same shared LineOffsetTable).
+        let yaml = "dependencies:\n  café: ^1.0.0\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+
+        let dep = result
+            .dependencies
+            .iter()
+            .find(|d| d.name.as_ref() == "café")
+            .expect("café dependency should be parsed");
+
+        assert_eq!(dep.name_range.start.line, 1);
+        assert_eq!(dep.name_range.start.character, 2); // "  " indent
+        assert_eq!(dep.name_range.end.character, 6); // indent + "café" (4 UTF-16 units)
+    }
+
+    #[test]
+    fn test_version_range_crosses_multibyte_emoji_in_same_line() {
+        // The emoji is a 4-byte UTF-8 character (2 UTF-16 code units) placed before the
+        // `version` key on the same line, so computing `version_range` must walk past it
+        // using UTF-16 counting rather than byte counting, and must not panic on the
+        // subsequent slice.
+        let yaml = "dependencies:\n  http: {description: \"🚀\", version: \"^1.0.0\"}\n";
+        let result = parse_pubspec_yaml(yaml, &test_uri()).unwrap();
+
+        let dep = result
+            .dependencies
+            .iter()
+            .find(|d| d.name.as_ref() == "http")
+            .expect("http dependency should be parsed");
+        let version_range = dep.version_range.expect("version range should be found");
+
+        let line = yaml.lines().nth(1).unwrap();
+        let quoted_version = "\"^1.0.0\"";
+        let byte_offset_in_line = line.find(quoted_version).unwrap() + 1; // skip opening quote
+        let expected_character: u32 = line[..byte_offset_in_line]
+            .chars()
+            .map(|c| c.len_utf16() as u32)
+            .sum();
+
+        assert_eq!(version_range.start.line, 1);
+        assert_eq!(version_range.start.character, expected_character);
+        assert_eq!(dep.version_req, Some("^1.0.0".into()));
     }
 
     #[test]

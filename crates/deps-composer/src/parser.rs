@@ -6,40 +6,10 @@
 
 use crate::types::{ComposerDependency, ComposerSection};
 use deps_core::Result;
+use deps_core::lsp_helpers::LineOffsetTable;
 use serde_json::Value;
 use std::any::Any;
-use tower_lsp_server::ls_types::{Position, Range, Uri};
-
-/// Line offset table for O(log n) position lookups.
-struct LineOffsetTable {
-    offsets: Vec<usize>,
-}
-
-impl LineOffsetTable {
-    fn new(content: &str) -> Self {
-        let mut offsets = vec![0];
-        for (i, c) in content.char_indices() {
-            if c == '\n' {
-                offsets.push(i + 1);
-            }
-        }
-        Self { offsets }
-    }
-
-    /// Converts byte offset to LSP Position using UTF-16 code unit counting.
-    fn position_from_offset(&self, content: &str, offset: usize) -> Position {
-        let line = match self.offsets.binary_search(&offset) {
-            Ok(line) => line,
-            Err(line) => line.saturating_sub(1),
-        };
-        let line_start = self.offsets[line];
-        let character = content[line_start..offset]
-            .chars()
-            .map(|c| c.len_utf16() as u32)
-            .sum();
-        Position::new(line as u32, character)
-    }
-}
+use tower_lsp_server::ls_types::{Range, Uri};
 
 /// Result of parsing a composer.json file.
 ///
@@ -249,8 +219,8 @@ fn find_positions(
             continue;
         }
 
-        let name_start = line_table.position_from_offset(content, name_start_idx + 1);
-        let name_end = line_table.position_from_offset(content, name_start_idx + 1 + name.len());
+        let name_start = line_table.byte_offset_to_position(content, name_start_idx + 1);
+        let name_end = line_table.byte_offset_to_position(content, name_start_idx + 1 + name.len());
         name_range = Range::new(name_start, name_end);
 
         if let Some(version) = version_req {
@@ -268,9 +238,9 @@ fn find_positions(
 
             if let Some(ver_rel_idx) = search_area.find(&version_search) {
                 let version_start_idx = colon_offset + ver_rel_idx + 1;
-                let version_start = line_table.position_from_offset(content, version_start_idx);
+                let version_start = line_table.byte_offset_to_position(content, version_start_idx);
                 let version_end =
-                    line_table.position_from_offset(content, version_start_idx + version.len());
+                    line_table.byte_offset_to_position(content, version_start_idx + version.len());
                 version_range = Some(Range::new(version_start, version_end));
             }
         }
