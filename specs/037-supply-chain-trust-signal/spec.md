@@ -251,6 +251,7 @@ Use EARS notation. Prefix with FR-NNN.
 | NFR-004 | Reliability / No Linked Repo | Per FR-005, a package with no resolvable `SOURCE_REPO` project (a materially common case — many packages have no linked repo, or link to a non-canonical mirror) SHALL degrade identically to an outright deps.dev failure from the user's perspective — no distinct error state |
 | NFR-005 | Security | The `api.deps.dev` request SHALL be a plain, unauthenticated HTTPS GET with no credential, cookie, or workspace-derived value ever attached — consistent with deps.dev being keyless by design |
 | NFR-006 | Maintainability | The Scorecard/SLSA data model SHALL be represented by new, deps.dev-specific types (not force-fit into any existing ecosystem crate's registry-response types) so a future change to deps.dev's schema does not ripple into unrelated ecosystem code |
+| NFR-007 | Performance / Latency Bound | The two-call deps.dev sequence SHALL be bounded by an outer timeout (~700ms) in addition to any per-call timeout, and SHALL run concurrently with (not sequentially before or after) the dependency's own registry fetch — added 2026-09-03: the registry fetch is typically served from a warm prefetch cache (near-zero latency), making the deps.dev calls the hover's actual critical path in the common case, not a rare one; FR-006's "SHALL NOT block, delay, or degrade" is meaningless without an explicit bound |
 
 ## 5. Data Model
 
@@ -259,7 +260,7 @@ Use EARS notation. Prefix with FR-NNN.
 | `DepsDevVersionInfo` | New type — parsed subset of deps.dev's per-version endpoint response relevant to this spec | `slsa_provenances: Vec<ProvenanceEntry>`, `attestations: Vec<ProvenanceEntry>`, `related_projects: Vec<RelatedProject>` |
 | `ProvenanceEntry` | New type — one `slsaProvenances[]`/`attestations[]` entry | `verified: bool` (live-verified 2026-09-03; drives FR-004's three-state mapping) |
 | `RelatedProject` | New type — one `relatedProjects[]` entry | `project_key: String`, `relation_type: String`, `relation_provenance: String` (`"SLSA_ATTESTATION"` vs `"UNVERIFIED_METADATA"`; drives FR-002's ranked pick) |
-| `DepsDevScorecard` | New type — parsed subset of deps.dev's per-project endpoint `scorecard` object | `overall_score: f32` (from `scorecard.overallScore`, passed through as-is per FR-003), `date: String`. `checks[]` and `scorecard.version` are intentionally not parsed (FR-003) |
+| `DepsDevScorecard` | New type — parsed subset of deps.dev's per-project endpoint `scorecard` object, plus one derived field | `overall_score: Option<f32>` (from `scorecard.overallScore`; `None`, not a defaulted `0.0`, when absent/unparseable — a defaulted zero would itself be a false trust claim), `date: String`, `self_reported: bool` (derived, not wire data — `true` when FR-002's pick landed on the `UNVERIFIED_METADATA` fallback rather than an `SLSA_ATTESTATION` relation; renders as the FR-002/Edge-Cases disclosure marker). `checks[]` and `scorecard.version` are intentionally not parsed (FR-003) |
 | `ProvenanceStatus` | New, three-state enum (FR-004) | `Verified \| Unverified \| None` |
 | `SupplyChainTrustSignal` | New, ecosystem-agnostic aggregate type assembled from the two deps.dev calls, consumed by the hover-formatting layer | `scorecard: Option<DepsDevScorecard>`, `provenance: Option<ProvenanceStatus>` (`None` only when the version-level query itself failed, per FR-004/FR-006 distinction) |
 
@@ -319,10 +320,12 @@ All open questions were resolved 2026-09-03 during `/sdd specify` review; none r
 - **Low-score escalation** (FR-012) — resolved: informational-only,
   permanently, matching the [[004-release-freshness-signal/spec|004]]
   precedent. Any future escalation to a diagnostic requires a separate spec.
-- **Scorecard data TTL / revalidation cadence** (NFR-002) — resolved: reuse
-  `HttpCache`'s existing ETag-revalidate-every-time model as-is. A dedicated
-  longer revalidation-skip window is deferred unless hover latency proves
-  this insufficient in practice.
+- **Scorecard data TTL / revalidation cadence** (NFR-002) — originally
+  resolved to reuse `HttpCache`'s ETag-revalidate model as-is; **superseded**
+  2026-09-03 during `/sdd plan` (D1) once live verification showed deps.dev
+  sends no `ETag`/`Last-Modified` on either endpoint, so that model cannot
+  apply to this API at all. Current resolution: an in-process TTL memo over
+  the assembled signal (1 h success / 90 s error), see NFR-002 and FR-007.
 - **Scorecard aggregate computation** (FR-003) — resolved via live
   verification 2026-09-03: deps.dev's `scorecard.overallScore` field is a
   top-level pass-through value (confirmed present in the API response, e.g.
@@ -338,7 +341,7 @@ All open questions were resolved 2026-09-03 during `/sdd specify` review; none r
 - [[011-deprecation-replacement-diagnostics/spec|011-deprecation-replacement-diagnostics]] — the deprecation-signal precedent this spec's Out of Scope explicitly avoids duplicating from deps.dev
 - [[002-osv-vulnerability-diagnostics/spec|002-osv-vulnerability-diagnostics]] — the vulnerability-signal precedent this spec's Out of Scope explicitly avoids duplicating from deps.dev
 - `.local/testing/playbooks/competitive-parity.md` — deps.dev API v3 Reference Projects entry ("data source, not competitor", checked 2026-08-23), listing the fields this spec now acts on
-- `crates/deps-core/src/cache.rs` — `HttpCache`, its ETag/Last-Modified conditional-GET model (FR-007, NFR-002)
+- `crates/deps-core/src/cache.rs` — `HttpCache`; this feature reuses its transport/policy layer only, not its ETag/Last-Modified conditional-GET cache (deps.dev sends no validators — FR-007, NFR-002)
 - `crates/deps-core/src/net_policy.rs` — `HostClass`, `classify_host`, trusted-origin classification (FR-008)
 - `crates/deps-core/src/lsp_helpers/formatter.rs` — `EcosystemFormatter`, the hover-formatting integration point a future plan would extend
 - [deps.dev](https://deps.dev) — the project homepage
