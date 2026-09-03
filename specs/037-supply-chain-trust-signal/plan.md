@@ -106,6 +106,19 @@ pub struct SupplyChainTrustSignal {
 }
 ```
 
+> [!note] Spec §5 was reconciled on 2026-09-03
+> `ProvenanceEntry.verified`, `RelatedProject.relation_provenance`,
+> `overall_score: Option<f32>`, `self_reported: bool`, `ProvenanceStatus`, and
+> the omission of `checks[]`/`scorecard.version` are now **spec-mandated**, not
+> plan deviations — D3/D4/D5 and critic S2/S3 are absorbed into the spec's own
+> Data Model. Two naming/shape notes remain:
+> - The spec calls the type `DepsDevScorecard`; this plan calls the public,
+>   hover-facing form `ScorecardSummary` (lead's explicit call: the field lives
+>   on the Scorecard type, not on `SupplyChainTrustSignal`). Same entity.
+> - The spec's row still lists `date: String`; this plan **drops** it (M8),
+>   because O3 settled that v1 renders no age qualifier, so it would be parsed
+>   and never read — D4's own argument. One line to re-add if O3 is revisited.
+
 Deltas from spec §5, all upward in precision — each needs lead sign-off (§10):
 
 - `ScorecardCheck` / `checks: Vec<_>` / `scorecard.version` are **dropped**.
@@ -142,6 +155,7 @@ pub struct DepsDevClient {
     trusted_origin: String,      // format!("{base_url}/")
     memo:     DashMap<MemoKey, MemoEntry>,
     projects: DashMap<ProjectKeyMemo, ProjectMemoEntry>,   // §6, critic M2
+    in_flight: DashSet<MemoKey>,                           // dedup, critic N1
 }
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -158,6 +172,18 @@ struct MemoEntry {
     /// The **outcome**, negative results included — a memoized `None` is what
     /// makes "zero requests on a repeat call" hold on the failure path too.
     signal:     Option<SupplyChainTrustSignal>,
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct ProjectKeyMemo {
+    base:        String,
+    project_key: String,   // already validated per §5 before it reaches here
+}
+
+struct ProjectMemoEntry {
+    fetched_at: Instant,
+    ttl:        Duration,
+    scorecard:  Option<ScorecardSummary>,
 }
 
 impl DepsDevClient {
@@ -180,6 +206,15 @@ rejects the name first; here `name` comes from a manifest and `version` from
 and `("a", "b\0c")` would collide and **serve another package's trust signal**.
 A derived `Hash`/`Eq` over four fields cannot collide by construction, which is
 cheaper than auditing every producer's charset forever.
+
+`ProjectKeyMemo` gets the **same typed treatment** rather than a
+`format!("{base}\0{project_key}")` key. Its exposure is genuinely smaller than
+`MemoKey`'s — §5's validation already excludes control characters from
+`project_key`, so only `base_url` could carry a `\0` — but leaving the type
+undefined is what invites the naive string-join in the first place, and the
+struct costs one derive. Both memos are then collision-free for the same
+structural reason instead of one relying on a validation rule enforced
+somewhere else.
 
 `new`/`for_test`/`trusted_origin` copy `github::GithubTagsClient` (github.rs:180-218)
 verbatim in shape — the established pattern for a shared third-party API client
@@ -215,9 +250,42 @@ hover costs exactly 2 round-trips. **Two nested bounds, not one:**
 - `DEPS_DEV_CALL_TIMEOUT = 400 ms` per call, so step 3 hanging can never
   discard step 2's already-successful provenance (the partial-failure
   requirement in §4 step 3).
-- `DEPS_DEV_TOTAL_BUDGET = 700 ms` around the **whole** sequence, which is what
-  actually bounds what a hover can wait for. Without it the two per-call
-  timeouts stack to ~800 ms and the sequence has no single ceiling — critic S1.
+- The sequence's own ceiling is therefore **2 × 400 ms ≈ 800 ms**, and there is
+  deliberately **no third constant wrapping it** — see the budget note below.
+
+The per-call bound is **400 ms, not the 1.5 s this plan first proposed**: it has
+to sit below the hover's wait budget or the partial-failure guarantee is purely
+notional — if call 1 hung past 700 ms, the hover would give up with nothing to
+show. At 400 ms, call 1 fails at 400 ms and call 2 still has room to return the
+Scorecard within the wait window.
+
+> [!important] Two different bounds — do not merge them (critic N2)
+> **`DEPS_DEV_WAIT_BUDGET` (700 ms) bounds the hover's *wait*, not the fetch.**
+> It lives in `hover.rs` (§8), wrapping the `JoinHandle` await — never inside
+> `trust_signal`. An earlier draft said 700 ms wrapped "the whole sequence",
+> which would silently destroy spawn-and-warm: the detached task would die at
+> 700 ms and memoize only a *failure* under the 90 s error TTL, so the next
+> hover re-fires and the warm-memo promise never holds — invisibly, since
+> nothing would look broken. The task's own ceiling is the two per-call
+> timeouts, already bounded. NFR-007's "outer timeout ~700 ms in addition to any
+> per-call timeout" is satisfied by the wait budget; the constant is named
+> `DEPS_DEV_WAIT_BUDGET` rather than `..._TOTAL_...` so the distinction survives
+> code review.
+
+**In-flight dedup is mandatory here** (critic N1), and is new to the detached
+design: under the old `join!`, a hover cancelled by the editor cancelled the
+fetch with it. Detaching removes that brake, so dragging the cursor down a
+200-dependency manifest would leave a live task behind for every cancelled
+hover — up to 2N requests no hover will ever read — and repeat hovers on one
+dependency would duplicate its in-flight fetch, since the memo is only written
+at the end. This is exactly NFR-001's "treat conservatively" risk.
+`ReleaseDatesCache` gets away without dedup only because it is not detached.
+
+So `trust_signal` **claims the `MemoKey` before spawning**: a
+`DashSet<MemoKey>` of in-flight keys (or a `pending` state in `MemoEntry`);
+an already-claimed key skips the spawn entirely and the hover renders without
+the section; the claim is released on completion, panic included — a guard
+type, not a bare `remove` at the end of the happy path.
 
 Worst case a hover *renders* 700 ms late; see §8, which removes even that from
 the user-visible path.
@@ -365,6 +433,17 @@ policy tier, nothing to ask the user about.
 > 27 files**, 8 of them inside rustdoc examples that the CI doc-test gate would
 > fail on. The trait is dropped entirely.
 
+> [!important] Deviates from the lead's S4 instruction — needs one word to settle
+> The lead directed putting `deps_dev_system`/`deps_dev_package_name` on the
+> existing `PackageNaming` trait ("a DRY call — reuse over a new abstraction").
+> This section does something different and, I believe, strictly closer to that
+> stated goal: it adds **no** extension point at all, because neither method
+> needs one. `PackageNaming` would still cost 7 override blocks and would put
+> a third-party API's `system` identifier — not a package name — inside the
+> trait that owns internal name normalization and validation. If the lead
+> prefers the `PackageNaming` route regardless, switching is ~20 minutes and
+> nothing else in this plan depends on the choice.
+
 Both pieces the client needs turn out not to require per-ecosystem behaviour:
 
 - **`system`** does not depend on the dependency at all, only on the
@@ -437,7 +516,8 @@ Plumbing, chosen to require **no** signature change in any ecosystem crate:
    (`deps-github-actions`, `deps-nuget`) inherit the feature for free the moment
    they call `lsp_generate_hover`.
 
-**Latency: spawn-and-warm, not a bare `join!`** (critic S1). The earlier claim
+**Latency: spawn-and-warm, not a bare `join!`** (critic S1, now codified as
+**NFR-007**). The earlier claim
 that the 2 deps.dev round-trips "overlap the registry fetch and disappear from
 the common case" was **inverted**: `lifecycle.rs:1092-1095` prefetches
 `get_versions_from` for every dependency at document open, so hover's registry
@@ -448,7 +528,9 @@ return in milliseconds. `deps-nuget` compounds it, adding its own fetch *after*
 `lsp_generate_hover` (deps-nuget/src/ecosystem.rs:203-221).
 
 The fetch therefore runs in a **detached `tokio::spawn`**, and hover awaits that
-`JoinHandle` under `DEPS_DEV_TOTAL_BUDGET` (700 ms):
+`JoinHandle` under **`DEPS_DEV_WAIT_BUDGET` (700 ms)** — a bound on the *wait*,
+never passed into `trust_signal` itself (§4's budget note explains why merging
+the two would silently break this design):
 
 - Under budget → the section renders on this hover.
 - Over budget → hover returns **immediately** with the section omitted (FR-006
@@ -461,10 +543,24 @@ The fetch therefore runs in a **detached `tokio::spawn`**, and hover awaits that
   fetches to background tasks with caching." The detached task is that
   delegation; the memo is that caching.
 
-The registry fetch and the spawn are still started together, so a cold registry
-fetch overlaps rather than stacks. `Arc<DepsDevClient>` is cloned into the task;
-a hover cancelled by the editor drops the handle but not the task, so the warm
-memo survives cancellation.
+The registry fetch and the spawn are started together, so a cold registry fetch
+overlaps rather than stacks. A hover cancelled by the editor drops the handle
+but not the task, so the warm memo survives cancellation — which is exactly why
+§4's in-flight claim is mandatory rather than an optimization.
+
+Three mechanical consequences of spawning from a **library** function (critic
+N3), each worth one line in the implementation:
+
+- `tokio::spawn` panics outside a runtime. `#[tokio::test]` callers are fine,
+  but a non-tokio caller or a plain doc-test reaching `generate_hover` would
+  now panic where the old code merely awaited. Do not add a `generate_hover`
+  doc-test that reaches this path.
+- The spawned future must be `Send + 'static`, so it may capture only the
+  cloned `Arc<DepsDevClient>`, the `&'static str` system, and **owned**
+  `String` name/version — no borrows from `parse_result` or `dep`.
+- A `JoinHandle` `Err` (the task panicked) must be swallowed like any other
+  failure. It is the one path most likely to panic, and an unwrap there would
+  break FR-006 precisely where it matters most.
 
 Gating — the future is not spawned at all unless **all** of: `versions.trust`
 is `Some`, `resolvable`, `versions.ecosystem` maps through §7's
@@ -494,7 +590,10 @@ registry fetch at hover.rs:91 and must be hoisted above it to build the gate.
 Small, but it moves code in `generate_hover`'s most comment-dense region — the
 developer should hoist only these two and leave the surrounding ordering
 (config snapshot before shard guard, etc.) untouched.
-- Rendering: a new `push_trust_signal_hover_section(&mut markdown,
+
+**Rendering entry point.**
+
+- A new `push_trust_signal_hover_section(&mut markdown,
   Option<&SupplyChainTrustSignal>)` beside the existing
   `push_deprecation_hover_section` / `push_vulnerability_hover_section`
   (hover.rs:447,484), called immediately after them (hover.rs:322-323) and
@@ -579,7 +678,7 @@ None of these need a *user* decision, and the spec's §8 "Ask First" item
 
 | Finding | Change | Section |
 |---------|--------|---------|
-| S1 | Detached `tokio::spawn` + 700 ms `DEPS_DEV_TOTAL_BUDGET`, replacing the bare `join!`; 400 ms per call | §4, §8, §11 |
+| S1 | Detached `tokio::spawn` + 700 ms wait budget (renamed `DEPS_DEV_WAIT_BUDGET` by N2), replacing the bare `join!`; 400 ms per call | §4, §8, §11 |
 | S2 | Already closed before the critique landed (commit 3a8e37c8) — `ScorecardSummary.self_reported` + render branch + test | §3, §5, §8, §12 |
 | S3 | `overallScore` is `Option<f32>` with no serde default; no score ⇒ no Scorecard half | §3 |
 | S4 | `DepsDevNaming` **dropped**; exhaustive `match EcosystemId` with no `_` arm | §7, §11 |
@@ -596,6 +695,19 @@ None of these need a *user* decision, and the spec's §8 "Ask First" item
 M7 is spec/plan drift in `spec.md` (NFR-002's retired premise at :322-325 and
 :341, `RelatedProject.project_key` at :261, `scorecard` at :264) — the lead's to
 reconcile, not this plan's.
+
+### Second round (re-critique verdict `minor`)
+
+| Finding | Change | Section |
+|---------|--------|---------|
+| N1 | In-flight `DashSet<MemoKey>` claim before spawning — detaching removed `join!`'s implicit cancellation brake | §4, §12 |
+| N2 | `DEPS_DEV_TOTAL_BUDGET` → `DEPS_DEV_WAIT_BUDGET`, bounding the hover's *wait* only; "around the whole sequence" deleted | §4, §8 |
+| N3 | Runtime/`Send + 'static`/`JoinHandle` panic consequences of spawning from a library | §8 |
+| N4 | SC-001 pinned to the deterministic (warm-memo) path | §12 |
+| N5 | Rendering bullet un-glued; SC-004's stale "trait defaults" credit corrected | §8, §12 |
+| N6 | `ProjectKeyMemo`/`ProjectMemoEntry` given explicit typed definitions, closing the same S5-style collision route by construction | §4 |
+
+N5's third item (spec.md §5 rows :262/:265) is the lead's, like M7.
 
 ## 11. Alternatives considered
 
@@ -649,10 +761,13 @@ reconcile, not this plan's.
   provenance arrays, two SOURCE_REPO relations), `npm/sigstore@2.3.1`
   (`verified: true`, an `SLSA_ATTESTATION` relation), and
   `projects/github.com%2Fexpressjs%2Fexpress` (`overallScore: 8.5`).
-- Required cases: SC-001 score render; SC-002 both FR-004 branches **plus** the
+- Required cases: SC-001 score render — **pinned to the deterministic path**
+  (warm the memo first, or assert on the second call), since on a cold memo it
+  would otherwise depend on beating a 700 ms budget inside CI (critic N4); the
+  cold path stays covered by the over-budget case below. SC-002 both FR-004 branches **plus** the
   new `Unverified` branch (D3); SC-003 both endpoints failing leaves existing
   hover assertions byte-identical; SC-004 zero requests for Composer/Dart/Swift
-  (`Mock::expect(0)`, which the `None` trait defaults make trivially true);
+  (`Mock::expect(0)`, which §7's `None` match arms make trivially true);
   D2's replacement for SC-005 (second call within TTL = zero requests);
   version-endpoint 200 + project-endpoint 500 → provenance rendered, Scorecard
   absent; malformed JSON and a `text/plain` 404 body both → `None`, no panic;
@@ -663,7 +778,9 @@ reconcile, not this plan's.
   packages sharing a project key issue **one** project call (M2); a hover whose
   fetch exceeds the budget renders with no trust section **and** leaves the memo
   warm so the next call is a hit (S1 — the load-bearing test for the whole
-  latency design);
+  latency design); two concurrent `trust_signal` calls for the same key issue
+  **one** set of requests, not two (N1's in-flight claim), and the claim is
+  released even when the task fails;
   both O5 branches — an `SLSA_ATTESTATION` relation renders no marker, an
   `UNVERIFIED_METADATA`-only one renders `*(self-reported repo)*`;
   project-key validation rejecting `github.com/../../etc` with zero requests;
