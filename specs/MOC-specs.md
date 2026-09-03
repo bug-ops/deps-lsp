@@ -63,6 +63,7 @@ status: moc
 | 039 | [[039-github-rate-limit-actionable-diagnostic/spec\|Actionable rate-limit hint in registry diagnostics]] | specify | shipped — bug, P1 (PR #485, issue #478) |
 | 040 | [[040-github-token-redaction-trusted-origin-pin/spec\|GitHub auth token redaction and trusted-origin pinning]] | specify | shipped — security/hardening, P3 (PR #487, issue #484) |
 | 041 | [[041-credential-redaction-hardening/spec\|Redact user:pass@ credentials from registry-index logs and errors]] | specify | shipped — security, P2, two stages (PR #529 issue #522, PR #540 issue #536) |
+| 042 | [[042-docker-base-image-ecosystem/spec\|New ecosystem: Dockerfile FROM base-image tag/digest freshness]] | specify | draft — research/new ecosystem, P4, 5 open `[NEEDS CLARIFICATION]` items, no user demand signal (issue #557) |
 
 ## Completed Specs
 
