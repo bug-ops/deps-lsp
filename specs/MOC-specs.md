@@ -58,7 +58,7 @@ status: moc
 | 034 | [[034-go-goproxy-private-registry/spec\|Go GOPROXY/GOPRIVATE module proxy resolution]] | specify | draft — research/enhancement, P3 |
 | 035 | [[035-nuget-private-feed-support/spec\|NuGet private/custom feed support (NuGet.Config packageSources)]] | specify | research/parity, P3, 3 open `[NEEDS CLARIFICATION]` items (issue #523) |
 | 036 | [[036-composer-uppercase-v-prefix-bug/spec\|Composer requirement matching fails for uppercase-V-prefixed versions]] | specify | shipped — bug, P1 (PR #538, issue #534) |
-| 037 | [[037-supply-chain-trust-signal/spec\|Supply-chain trust signal (OpenSSF Scorecard + SLSA provenance) via deps.dev]] | specify | draft — research/parity, P3, 5 open `[NEEDS CLARIFICATION]` items |
+| 037 | [[037-supply-chain-trust-signal/spec\|Supply-chain trust signal (OpenSSF Scorecard + SLSA provenance) via deps.dev]] | plan | draft — research/parity, P3, implemented and reviewed, PR open (PR #554, issue #543) |
 | 038 | [[038-workspace-diagnostics-pull-support/spec\|Workspace Diagnostics Pull Support]] | specify | draft — research/enhancement, P4, 4 open `[NEEDS CLARIFICATION]` items (issue #547) |
 | 039 | [[039-github-rate-limit-actionable-diagnostic/spec\|Actionable rate-limit hint in registry diagnostics]] | specify | shipped — bug, P1 (PR #485, issue #478) |
 | 040 | [[040-github-token-redaction-trusted-origin-pin/spec\|GitHub auth token redaction and trusted-origin pinning]] | specify | shipped — security/hardening, P3 (PR #487, issue #484) |

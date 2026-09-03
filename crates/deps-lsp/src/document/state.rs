@@ -4,8 +4,8 @@ use deps_core::lockfile::LockFileCache;
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{
-    ConcreteVersion, DependencyOutcomes, EcosystemId, EcosystemRegistry, PackageName,
-    PackageVersions, ParseResult,
+    ConcreteVersion, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
+    PackageName, PackageVersions, ParseResult,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -472,6 +472,12 @@ pub struct ServerState {
     /// OSV.dev vulnerability scan client, shared server-lifetime so every
     /// open document's scan benefits from the same query/record cache.
     pub osv: Arc<OsvClient>,
+    /// deps.dev supply-chain trust signal client (spec 037), shared
+    /// server-lifetime so every hover benefits from the same TTL memo.
+    /// `handlers/hover.rs` is the only caller that hands this to
+    /// `VersionData::with_trust` — see that field's docs for why this is
+    /// what makes the feature hover-only by construction (FR-010).
+    pub deps_dev: Arc<DepsDevClient>,
     /// Lock file cache for parsed lock files
     pub lockfile_cache: Arc<LockFileCache>,
     /// Ecosystem registry for trait-based architecture
@@ -512,6 +518,7 @@ impl ServerState {
         // default-initialized copy.
         let cache = Arc::new(HttpCache::with_policy(Arc::clone(&registry_policy)));
         let osv = Arc::new(OsvClient::new(Arc::clone(&cache)));
+        let deps_dev = Arc::new(DepsDevClient::new(Arc::clone(&cache)));
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
 
@@ -534,6 +541,7 @@ impl ServerState {
             documents: DashMap::new(),
             cache,
             osv,
+            deps_dev,
             lockfile_cache,
             ecosystem_registry,
             registry_policy,

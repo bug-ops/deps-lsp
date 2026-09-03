@@ -487,6 +487,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "futures",
+ "insta",
  "mockito",
  "reqwest",
  "semver",

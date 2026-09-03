@@ -12,6 +12,7 @@
 
 pub mod cache;
 pub mod completion;
+pub mod deps_dev;
 pub mod ecosystem;
 pub mod ecosystem_registry;
 pub mod error;
@@ -33,6 +34,7 @@ pub mod version_matcher;
 
 // Re-export commonly used types
 pub use cache::{BodyLimit, CachedResponse, HttpCache};
+pub use deps_dev::{DepsDevClient, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal};
 pub use ecosystem::{Dependency, Ecosystem, EcosystemConfig, EcosystemId, ParseResult};
 pub use ecosystem_registry::EcosystemRegistry;
 pub use error::{DepsError, FetchFailure, Result};

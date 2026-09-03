@@ -799,6 +799,56 @@ tag-to-SHA-style index exists for branches, and adding one would require a new n
 branch; reusable-workflow calls (`owner/repo/.github/workflows/x.yml@ref`) and `./local`/
 `docker://` references are not resolvable refs and get no diagnostic either.
 
+### Supply-Chain Trust Signal (issue #543)
+
+Hover can show an additional, informational line for a dependency's upstream supply-chain
+health, sourced from [deps.dev API v3](https://docs.deps.dev/api/v3/) — a free, keyless,
+cross-ecosystem metadata API. Two independent pieces of data are shown together on one line:
+
+```
+🔐 Supply chain: OpenSSF Scorecard `8.5`/10 · Provenance: verified
+```
+
+- **OpenSSF Scorecard** — the linked source repository's aggregate score (0-10), from checks
+  like Code-Review, Dangerous-Workflow, Maintained, and Branch-Protection.
+- **Build provenance** — whether the *specific resolved version* has a verified build
+  provenance or attestation: `verified` (at least one `slsaProvenances[]`/`attestations[]`
+  entry is verified), `attested but unverified` (an entry exists but none is verified — shown
+  rather than silently omitted, so "we checked and found nothing" is never confused with "we
+  didn't check"), or `none found` (no provenance data at all for this version). Labeled plainly
+  as "Provenance", not "SLSA provenance": the two arrays are unioned, and an `attestations[]`
+  entry is not necessarily SLSA-specific.
+
+Both halves render independently — a package with a Scorecard but no provenance data (or vice
+versa) shows only the half that resolved. The section is omitted entirely, with no error or
+warning, whenever deps.dev has nothing to offer: an unsupported ecosystem, no linked source
+repository, a deps.dev outage, or no concrete in-use version for the dependency (a lock-file-
+resolved version, or an exact requirement pin — the provenance claim is version-specific, so no
+in-use version means nothing safe to query).
+
+**Self-reported repository disclosure.** A package can carry several `SOURCE_REPO` links to
+deps.dev, distinguished by whether the link is `SLSA_ATTESTATION`-backed (cryptographically
+tied to the published artifact) or merely `UNVERIFIED_METADATA` (taken from the package's own,
+unverified manifest metadata). `deps-lsp` prefers the attested link; when only a self-reported
+one exists, the score is still shown but marked `*(self-reported repo)*` — a package could
+otherwise point its metadata at an unrelated, reputable repository and borrow its Scorecard.
+
+**Coverage.** deps.dev covers **npm, Cargo, Go, Maven, PyPI, Bundler, and NuGet** — Composer,
+Dart, and Swift have no deps.dev coverage and issue zero requests for this signal. Gradle and
+Deno's `npm:` specifiers are not covered by this iteration either, though deps.dev's `maven`
+system would cover Gradle coordinates without further mapping work.
+
+**Performance.** The fetch runs as a detached background task alongside the dependency's normal
+registry fetch, bounded by a short wait budget on the hover response itself — a slow or
+first-ever (cold-cache) deps.dev lookup never delays or blocks any other hover content, and an
+over-budget fetch still finishes into an in-process cache so the *next* hover on that dependency
+is instant. Set `supply_chain.enabled` to `false` to turn the signal (and every deps.dev
+request) off entirely — see the [Configuration reference](../README.md#configuration-reference).
+
+Informational only, permanently: a low Scorecard score never becomes a diagnostic, warning, or
+blocking behavior, matching the release-freshness signal's precedent for a
+supply-chain-risk-adjacent hover addition.
+
 ### npm Package Name Validation
 
 When a dependency in `package.json` fails to resolve against the npm registry, the diagnostic distinguishes between two cases instead of always reporting "Unknown package":
