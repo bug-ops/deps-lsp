@@ -19,6 +19,18 @@ static RE_WITH_VERSION: LazyLock<Regex> = LazyLock::new(|| {
 static RE_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(\w+)\s*\(\s*"([^:"\s]+):([^:"\s]+)"\s*\)"#).expect("RE_NO_VERSION")
 });
+/// Matches: implementation(platform("group:artifact:version")) / enforcedPlatform(...)
+static RE_PLATFORM_WITH_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\w+)\s*\(\s*(?:platform|enforcedPlatform)\s*\(\s*"([^:"\s]+):([^:"\s]+):([^"]+)"\s*\)\s*\)"#)
+        .expect("RE_PLATFORM_WITH_VERSION")
+});
+/// Matches: implementation(platform("group:artifact")) — no version
+static RE_PLATFORM_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(\w+)\s*\(\s*(?:platform|enforcedPlatform)\s*\(\s*"([^:"\s]+):([^:"\s]+)"\s*\)\s*\)"#,
+    )
+    .expect("RE_PLATFORM_NO_VERSION")
+});
 
 const CONFIGURATIONS: &[&str] = &[
     "implementation",
@@ -120,6 +132,68 @@ pub fn parse_kotlin_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
             // Skip if this match overlaps with a versioned match
             let match_start = caps.get(0).map_or(0, |m| m.start());
             if already_matched.contains(&match_start) {
+                continue;
+            }
+
+            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
+            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
+            let name = format!("{group_id}:{artifact_id}");
+            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
+
+            dependencies.push(GradleDependency {
+                group_id,
+                artifact_id,
+                name: name.into(),
+                name_range,
+                version_req: None,
+                version_range: None,
+                configuration: config.to_string(),
+            });
+        }
+
+        // Same as above, for platform()/enforcedPlatform()-wrapped BOM coordinates
+        let already_matched_platform: Vec<_> = RE_PLATFORM_WITH_VERSION
+            .captures_iter(line)
+            .filter_map(|c| {
+                let config = c.get(1)?.as_str();
+                CONFIGURATIONS
+                    .contains(&config)
+                    .then_some(c.get(0)?.start())
+            })
+            .collect();
+
+        for caps in RE_PLATFORM_WITH_VERSION.captures_iter(line) {
+            let config = caps.get(1).map_or("", |m| m.as_str());
+            if !CONFIGURATIONS.contains(&config) {
+                continue;
+            }
+
+            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
+            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
+            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
+            let name = format!("{group_id}:{artifact_id}");
+
+            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
+            let version_range = find_version_range(line, line_u32, &version);
+
+            dependencies.push(GradleDependency {
+                group_id,
+                artifact_id,
+                name: name.into(),
+                name_range,
+                version_req: Some(version.into()),
+                version_range: Some(version_range),
+                configuration: config.to_string(),
+            });
+        }
+
+        for caps in RE_PLATFORM_NO_VERSION.captures_iter(line) {
+            let config = caps.get(1).map_or("", |m| m.as_str());
+            if !CONFIGURATIONS.contains(&config) {
+                continue;
+            }
+            let match_start = caps.get(0).map_or(0, |m| m.start());
+            if already_matched_platform.contains(&match_start) {
                 continue;
             }
 
@@ -265,9 +339,10 @@ mod tests {
 
     #[test]
     fn test_parens_whitespace_no_false_positive_on_nested_calls() {
-        // Nested-call forms (BOM platform imports, project/module refs, catalog
-        // accessors) are not plain "group:artifact[:version]" string literals,
-        // so they must stay unparsed even with whitespace before the parens.
+        // platform()/enforcedPlatform() BOM wrappers are surfaced as dependencies.
+        // Other nested-call forms (project/module refs, catalog accessors) are not
+        // plain "group:artifact[:version]" string literals, so they must stay
+        // unparsed even with whitespace before the parens.
         let content = r#"dependencies {
     implementation (platform("org.springframework.boot:spring-boot-dependencies:3.2.0"))
     implementation (project(":core"))
@@ -276,7 +351,68 @@ mod tests {
 }
 "#;
         let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
-        assert!(result.dependencies.is_empty());
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert_eq!(result.dependencies[0].version_req, Some("3.2.0".into()));
+    }
+
+    #[test]
+    fn test_platform_with_version() {
+        let content = r#"dependencies {
+    implementation(platform("org.springframework.boot:spring-boot-dependencies:3.2.0"))
+}
+"#;
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert_eq!(result.dependencies[0].version_req, Some("3.2.0".into()));
+        assert_eq!(result.dependencies[0].configuration, "implementation");
+    }
+
+    #[test]
+    fn test_platform_no_version() {
+        let content = r#"dependencies {
+    implementation(platform("org.springframework.boot:spring-boot-dependencies"))
+}
+"#;
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    #[test]
+    fn test_enforced_platform_with_version() {
+        let content = r#"dependencies {
+    implementation(enforcedPlatform("org.springframework.boot:spring-boot-dependencies:3.2.0"))
+}
+"#;
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert_eq!(result.dependencies[0].version_req, Some("3.2.0".into()));
+    }
+
+    #[test]
+    fn test_platform_whitespace_before_parens() {
+        let content =
+            "dependencies {\n    implementation (platform(\"junit:junit-bom:5.10.0\"))\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "junit:junit-bom");
+        assert_eq!(result.dependencies[0].version_req, Some("5.10.0".into()));
     }
 
     #[test]

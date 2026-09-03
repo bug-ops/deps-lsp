@@ -28,6 +28,30 @@ static RE_NO_VERSION_WITH_PARENS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(\w+)\s*\(\s*['"]([^:'"]+):([^:'"]+)['"]\s*\)"#)
         .expect("RE_NO_VERSION_WITH_PARENS")
 });
+/// Matches: implementation(platform('group:artifact:version')) / enforcedPlatform(...)
+static RE_PLATFORM_WITH_PARENS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(\w+)\s*\(\s*(?:platform|enforcedPlatform)\s*\(\s*['"]([^:'"]+):([^:'"]+):([^'"]+)['"]\s*\)\s*\)"#,
+    )
+    .expect("RE_PLATFORM_WITH_PARENS")
+});
+/// Matches: implementation platform('group:artifact:version') (no parens around the configuration call)
+static RE_PLATFORM_WITHOUT_PARENS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(\w+)\s+(?:platform|enforcedPlatform)\s*\(\s*['"]([^:'"]+):([^:'"]+):([^'"]+)['"]\s*\)"#,
+    )
+    .expect("RE_PLATFORM_WITHOUT_PARENS")
+});
+/// Same as RE_PLATFORM_WITH_PARENS, no version
+static RE_PLATFORM_NO_VERSION_WITH_PARENS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\w+)\s*\(\s*(?:platform|enforcedPlatform)\s*\(\s*['"]([^:'"]+):([^:'"]+)['"]\s*\)\s*\)"#)
+        .expect("RE_PLATFORM_NO_VERSION_WITH_PARENS")
+});
+/// Same as RE_PLATFORM_WITHOUT_PARENS, no version
+static RE_PLATFORM_NO_VERSION_WITHOUT_PARENS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(\w+)\s+(?:platform|enforcedPlatform)\s*\(\s*['"]([^:'"]+):([^:'"]+)['"]\s*\)"#)
+        .expect("RE_PLATFORM_NO_VERSION_WITHOUT_PARENS")
+});
 
 const CONFIGURATIONS: &[&str] = &[
     "implementation",
@@ -196,6 +220,120 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
                 configuration: config.to_string(),
             });
         }
+
+        // Pattern 5: platform()/enforcedPlatform()-wrapped BOM coordinate, with parens, with version
+        for caps in RE_PLATFORM_WITH_PARENS.captures_iter(line) {
+            let config = caps.get(1).map_or("", |m| m.as_str());
+            if !CONFIGURATIONS.contains(&config) {
+                continue;
+            }
+            let start = caps.get(0).map_or(0, |m| m.start());
+            matched_positions.push(start);
+
+            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
+            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
+            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
+            let name = format!("{group_id}:{artifact_id}");
+
+            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
+            let version_range = find_version_range(line, line_u32, &version);
+
+            dependencies.push(GradleDependency {
+                group_id,
+                artifact_id,
+                name: name.into(),
+                name_range,
+                version_req: Some(version.into()),
+                version_range: Some(version_range),
+                configuration: config.to_string(),
+            });
+        }
+
+        // Pattern 6: same, without parens around the configuration call
+        for caps in RE_PLATFORM_WITHOUT_PARENS.captures_iter(line) {
+            let config = caps.get(1).map_or("", |m| m.as_str());
+            if !CONFIGURATIONS.contains(&config) {
+                continue;
+            }
+            let start = caps.get(0).map_or(0, |m| m.start());
+            if matched_positions.contains(&start) {
+                continue;
+            }
+            matched_positions.push(start);
+
+            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
+            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
+            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
+            let name = format!("{group_id}:{artifact_id}");
+
+            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
+            let version_range = find_version_range(line, line_u32, &version);
+
+            dependencies.push(GradleDependency {
+                group_id,
+                artifact_id,
+                name: name.into(),
+                name_range,
+                version_req: Some(version.into()),
+                version_range: Some(version_range),
+                configuration: config.to_string(),
+            });
+        }
+
+        // Pattern 7: platform()/enforcedPlatform()-wrapped BOM coordinate, with parens, no version
+        for caps in RE_PLATFORM_NO_VERSION_WITH_PARENS.captures_iter(line) {
+            let config = caps.get(1).map_or("", |m| m.as_str());
+            if !CONFIGURATIONS.contains(&config) {
+                continue;
+            }
+            let start = caps.get(0).map_or(0, |m| m.start());
+            if matched_positions.contains(&start) {
+                continue;
+            }
+            matched_positions.push(start);
+
+            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
+            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
+            let name = format!("{group_id}:{artifact_id}");
+            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
+
+            dependencies.push(GradleDependency {
+                group_id,
+                artifact_id,
+                name: name.into(),
+                name_range,
+                version_req: None,
+                version_range: None,
+                configuration: config.to_string(),
+            });
+        }
+
+        // Pattern 8: same, without parens around the configuration call
+        for caps in RE_PLATFORM_NO_VERSION_WITHOUT_PARENS.captures_iter(line) {
+            let config = caps.get(1).map_or("", |m| m.as_str());
+            if !CONFIGURATIONS.contains(&config) {
+                continue;
+            }
+            let start = caps.get(0).map_or(0, |m| m.start());
+            if matched_positions.contains(&start) {
+                continue;
+            }
+
+            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
+            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
+            let name = format!("{group_id}:{artifact_id}");
+            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
+
+            dependencies.push(GradleDependency {
+                group_id,
+                artifact_id,
+                name: name.into(),
+                name_range,
+                version_req: None,
+                version_range: None,
+                configuration: config.to_string(),
+            });
+        }
     }
 
     Ok(GradleParseResult {
@@ -322,5 +460,78 @@ mod tests {
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "junit:junit");
         assert_eq!(result.dependencies[0].version_req, Some("4.13.2".into()));
+    }
+
+    #[test]
+    fn test_platform_bare_call_with_version() {
+        let content = "dependencies {\n    implementation platform('org.springframework.boot:spring-boot-dependencies:3.2.0')\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert_eq!(result.dependencies[0].version_req, Some("3.2.0".into()));
+        assert_eq!(result.dependencies[0].configuration, "implementation");
+    }
+
+    #[test]
+    fn test_platform_with_parens_with_version() {
+        let content = "dependencies {\n    implementation(platform('org.springframework.boot:spring-boot-dependencies:3.2.0'))\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert_eq!(result.dependencies[0].version_req, Some("3.2.0".into()));
+    }
+
+    #[test]
+    fn test_enforced_platform_bare_call() {
+        let content = "dependencies {\n    implementation enforcedPlatform('org.springframework.boot:spring-boot-dependencies:3.2.0')\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert_eq!(result.dependencies[0].version_req, Some("3.2.0".into()));
+    }
+
+    #[test]
+    fn test_platform_no_version_with_parens() {
+        let content = "dependencies {\n    implementation(platform('org.springframework.boot:spring-boot-dependencies'))\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    #[test]
+    fn test_platform_no_version_bare_call() {
+        let content = "dependencies {\n    implementation platform('org.springframework.boot:spring-boot-dependencies')\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    #[test]
+    fn test_platform_double_quotes() {
+        let content = "dependencies {\n    implementation platform(\"org.springframework.boot:spring-boot-dependencies:3.2.0\")\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].name,
+            "org.springframework.boot:spring-boot-dependencies"
+        );
+        assert_eq!(result.dependencies[0].version_req, Some("3.2.0".into()));
     }
 }
