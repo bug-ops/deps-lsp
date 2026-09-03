@@ -58,6 +58,7 @@ status: moc
 | 034 | [[034-go-goproxy-private-registry/spec\|Go GOPROXY/GOPRIVATE module proxy resolution]] | specify | draft — research/enhancement, P3 |
 | 035 | [[035-nuget-private-feed-support/spec\|NuGet private/custom feed support (NuGet.Config packageSources)]] | specify | research/parity, P3, 3 open `[NEEDS CLARIFICATION]` items (issue #523) |
 | 036 | [[036-composer-uppercase-v-prefix-bug/spec\|Composer requirement matching fails for uppercase-V-prefixed versions]] | specify | implemented — bug, P1, awaiting merge (issue #534) |
+| 037 | [[037-supply-chain-trust-signal/spec\|Supply-chain trust signal (OpenSSF Scorecard + SLSA provenance) via deps.dev]] | specify | draft — research/parity, P3, 5 open `[NEEDS CLARIFICATION]` items |
 
 ## Completed Specs
 

@@ -1,0 +1,356 @@
+---
+aliases:
+  - Supply-Chain Trust Signal
+  - OpenSSF Scorecard in Hover
+  - SLSA Provenance Signal
+  - deps.dev Integration
+tags:
+  - sdd
+  - spec
+  - research
+  - enhancement
+  - deps-core
+  - supply-chain-risk
+  - cross-ecosystem
+created: 2026-09-03
+status: draft
+related:
+  - "[[constitution]]"
+  - "[[MOC-specs]]"
+  - "[[004-release-freshness-signal/spec|Release-Freshness Signal for Version Recommendations]]"
+  - "[[010-license-hover-policy/spec|License in Hover + License-Policy Diagnostics]]"
+  - "[[011-deprecation-replacement-diagnostics/spec|Deprecation/Abandoned Diagnostics with Suggested Replacement]]"
+  - "[[002-osv-vulnerability-diagnostics/spec|OSV Vulnerability Diagnostics]]"
+---
+
+# Feature: Supply-Chain Trust Signal (OpenSSF Scorecard + SLSA Provenance via deps.dev)
+
+> [!info] Metadata
+> **Author**: continuous-improvement cycle (deps-lsp)
+> **Branch**: (assign at implementation time, e.g. `feat/<issue>-supply-chain-trust-signal`)
+> **Priority**: P3
+> **Type**: research/enhancement (competitive-parity gap — differentiator, not catch-up)
+
+## 1. Overview
+
+### Problem Statement
+
+deps-lsp's hover panel already surfaces version status, license, deprecation,
+and (per [[002-osv-vulnerability-diagnostics/spec|002]]) vulnerability data,
+but has zero signal about the *source repository's* supply-chain health or a
+specific published version's *build provenance*. Confirmed via grep this
+cycle: zero references to `"scorecard"`, `"provenance"`, `"deps.dev"`, or
+`"slsa"` anywhere in `crates/`.
+
+[Google's deps.dev API v3](https://docs.deps.dev/api/v3/) is a free, keyless,
+cross-ecosystem metadata API already covering 7 of deps-lsp's 10 ecosystems
+(npm, Cargo, Go, Maven, PyPI, RubyGems/Bundler, NuGet — no Composer, Dart, or
+Swift). It exposes two supply-chain-trust signals deps-lsp does not surface
+anywhere today:
+
+1. **OpenSSF Scorecard** — per-project checks (Code-Review,
+   Dangerous-Workflow, Maintained, Packaging, Branch-Protection,
+   Vulnerabilities, etc.), each scored 0-10 (or `-1` for not-applicable), via
+   `GET /v3/projects/{project-key}` where `project-key` is derived from the
+   package's linked source repository (e.g. `github.com/expressjs/express`,
+   URL-encoded as the path segment).
+2. **SLSA provenance / attestations** — per-version `slsaProvenances[]` and
+   `attestations[]` arrays via
+   `GET /v3/systems/{system}/packages/{name}/versions/{version}`, indicating
+   whether a specific published version has verified build provenance
+   (increasingly relevant post-npm/PyPI trusted-publishing rollouts).
+
+Both endpoints were live-verified this cycle, keyless, no repo source
+touched:
+
+- `curl -s -A "deps-lsp-research/1.0" "https://api.deps.dev/v3/systems/npm/packages/express/versions/4.19.2"`
+  returns `licenses`, `isDeprecated`, `advisoryKeys[]`, `slsaProvenances: []`,
+  `attestations: []`, `registries[]`, and `relatedProjects[]` — the last of
+  which links to the GitHub source repo and is the path to derive a project
+  key (`relatedProjects[].projectKey.id` where
+  `relationType == "SOURCE_REPO"`).
+- `curl -s -A "deps-lsp-research/1.0" "https://api.deps.dev/v3/projects/github.com%2Fexpressjs%2Fexpress"`
+  returns a full `scorecard` object: `date`, `repository.commit`,
+  `scorecard.version`, and a `checks[]` array with `name`/`score`
+  (0-10, or `-1` for not-applicable)/`reason`/`documentation.url` per check
+  (for `express`: Code-Review 10, Dangerous-Workflow 10, Maintained 10,
+  Packaging -1, etc.), plus top-level `starsCount`/`forksCount`/`openIssuesCount`.
+
+`.local/testing/playbooks/competitive-parity.md` already lists deps.dev API
+v3 in its Reference Projects table as a "data source, not competitor" (note
+dated 2026-08-23) enumerating `licenses[]`/`isDeprecated`/`advisoryKeys[]`/
+`slsaProvenances`/`attestations`/OpenSSF-Scorecard/stars/open-issues as
+available fields across npm/Cargo/Go/Maven/PyPI/RubyGems/NuGet. This spec is
+the first time acting on the Scorecard/SLSA half of that entry — the
+license/deprecation half is already redundant with deps-lsp's own
+registry-native data shipped via [[010-license-hover-policy/spec|010]] and
+[[011-deprecation-replacement-diagnostics/spec|011]].
+
+**Why this is a differentiator, not a catch-up item**: none of the reference
+projects already tracked in `.local/testing/playbooks/competitive-parity.md`
+(Dependi, Version Lens, crates.nvim, RHDA, JetBrains Package Checker) surface
+OpenSSF Scorecard or SLSA provenance data inline in an editor today. Every
+other row in that playbook is deps-lsp catching up to a feature a competitor
+already ships; this one would be new ground.
+
+> [!warning] Assumptions
+> - deps.dev's `relatedProjects[].relationType == "SOURCE_REPO"` reliably
+>   identifies the correct upstream repository for the vast majority of
+>   well-maintained packages; a package with no linked source repo, or one
+>   linked to a fork/mirror rather than the canonical upstream, degrades to
+>   "no trust signal available" (see Edge Cases) rather than showing
+>   incorrect or misleading data.
+> - deps.dev has no documented public rate limit, but as an unauthenticated,
+>   free, third-party dependency, deps-lsp must treat it conservatively —
+>   caching, backoff, and graceful degradation on failure are mandatory, not
+>   optional (see Non-Functional Requirements).
+> - This spec captures WHAT and WHY only. HOW (concrete Rust types, module
+>   placement, caching call sites, hover-string formatting) is deferred to a
+>   future `/sdd plan` session — per this project's convention that research
+>   findings are specified before planning begins.
+
+### Goal
+
+A dependency whose package has deps.dev coverage (npm, Cargo, Go, Maven,
+PyPI, RubyGems/Bundler, or NuGet) and a resolvable linked source repository
+gets an additional, compact, informational supply-chain trust summary in its
+hover panel — e.g. "OpenSSF Scorecard: 7.2/10 · SLSA provenance: verified" —
+with zero impact on packages/ecosystems where this data is unavailable, and
+zero new diagnostic severity introduced by this signal alone.
+
+### Out of Scope
+
+> [!danger] Explicit Exclusions
+> - **Composer, Dart, and Swift ecosystems** — deps.dev has no coverage for
+>   these three; see Open Questions for whether they get a documented "not
+>   available" hover line or silently omit the section entirely.
+> - **A new diagnostic or code-action category driven by a low Scorecard
+>   score** — see Open Questions; this spec's default assumption (pending
+>   confirmation) is informational-only, matching the precedent
+>   [[004-release-freshness-signal/spec|004]] established for release
+>   freshness (a risk signal surfaced in hover, not escalated to a blocking
+>   diagnostic).
+> - **Any deps.dev field already redundant with deps-lsp's own
+>   registry-native data** — `licenses[]`, `isDeprecated`, `advisoryKeys[]`
+>   are explicitly excluded from this spec's scope; deps-lsp already sources
+>   these natively per-ecosystem ([[010-license-hover-policy/spec|010]],
+>   [[011-deprecation-replacement-diagnostics/spec|011]],
+>   [[002-osv-vulnerability-diagnostics/spec|002]]) and duplicating them from
+>   a third-party aggregator would be a maintenance liability with no user
+>   benefit.
+> - **Historical Scorecard trend data or repository-level analytics beyond
+>   the single latest `scorecard` snapshot** deps.dev's `/v3/projects/{key}`
+>   endpoint returns.
+> - **Any write path** — this is a read-only, informational metadata
+>   addition; no code actions, no quick-fixes.
+> - **Authentication or API-key management for deps.dev** — the API is
+>   keyless by design; no vault entry, no credential handling of any kind.
+
+## 2. User Stories
+
+### US-001: Scorecard summary in hover
+
+AS A developer evaluating whether to add or keep a dependency
+I WANT to see the upstream repository's OpenSSF Scorecard score in the
+hover panel
+SO THAT I can factor supply-chain health (CI hardening, code review
+practice, branch protection) into my dependency decisions without leaving
+my editor
+
+**Acceptance criteria:**
+```
+GIVEN a dependency resolved from an ecosystem deps.dev covers (npm, Cargo,
+      Go, Maven, PyPI, RubyGems/Bundler, NuGet) whose package has a
+      resolvable SOURCE_REPO-linked project with Scorecard data
+WHEN I hover over that dependency
+THEN the hover includes a compact trust-signal line showing the aggregate
+     Scorecard score (e.g. "OpenSSF Scorecard: 7.2/10")
+```
+
+### US-002: SLSA provenance status in hover
+
+AS A developer relying on a package's specific pinned version
+I WANT to know whether that exact version has verified SLSA build
+provenance or an attestation
+SO THAT I can distinguish a trusted-publishing-backed release from one with
+no verifiable build chain
+
+**Acceptance criteria:**
+```
+GIVEN a dependency's resolved version has a non-empty slsaProvenances[] or
+      attestations[] array per deps.dev's per-version endpoint
+WHEN I hover over that dependency
+THEN the hover indicates provenance is verified for that version (and,
+     conversely, indicates its absence when both arrays are empty, rather
+     than silently omitting the line — see FR-004)
+```
+
+### US-003: Graceful absence for uncovered ecosystems/packages
+
+AS A developer using Composer, Dart, or Swift, or any ecosystem package with
+no linked source repository
+I WANT the hover to behave exactly as it does today
+SO THAT this feature never introduces a regression, error state, or
+confusing "unknown" marker for the majority of cases where the signal
+simply isn't obtainable
+
+**Acceptance criteria:**
+```
+GIVEN a dependency from an ecosystem deps.dev does not cover, or one it
+      covers but with no resolvable SOURCE_REPO project
+WHEN I hover over that dependency
+THEN the hover shows no trust-signal line (or a documented explicit
+     "not available" line — see Open Questions), and no error/warning is
+     surfaced to the user
+```
+
+### US-004: Resilience to deps.dev unavailability
+
+AS A developer working offline or when deps.dev is unreachable
+I WANT hover to continue working with all of deps-lsp's existing data
+SO THAT a third-party dependency's outage never degrades a core feature
+
+**Acceptance criteria:**
+```
+GIVEN deps.dev is unreachable, times out, or returns an error/malformed
+      response
+WHEN I hover over any dependency
+THEN all existing hover content (version, license, deprecation,
+     vulnerability data) renders unaffected, and the trust-signal line is
+     simply omitted for that hover
+```
+
+## 3. Functional Requirements
+
+Use EARS notation. Prefix with FR-NNN.
+
+| ID | Requirement | Priority |
+|----|------------|----------|
+| FR-001 | THE SYSTEM SHALL query deps.dev's per-version endpoint (`GET /v3/systems/{system}/packages/{name}/versions/{version}`) for a resolved dependency belonging to one of the 7 covered ecosystems (npm, Cargo, Go, Maven, PyPI, RubyGems/Bundler, NuGet) to obtain `slsaProvenances[]`, `attestations[]`, and `relatedProjects[]` | must |
+| FR-002 | WHEN a per-version response's `relatedProjects[]` contains an entry with `relationType == "SOURCE_REPO"` THE SYSTEM SHALL derive that entry's `projectKey.id` and query deps.dev's project endpoint (`GET /v3/projects/{project-key}`, URL-encoded) to obtain the `scorecard` object | must |
+| FR-003 | WHEN the project endpoint's `scorecard` object is present THE SYSTEM SHALL surface an aggregate Scorecard score in hover (US-001) — the aggregate value/computation to use (deps.dev's own aggregate if the API provides one, vs. a deps-lsp-computed mean of `checks[].score`, excluding `-1`/not-applicable checks) is `[NEEDS CLARIFICATION]`, see below | must |
+| FR-004 | WHEN a resolved version's `slsaProvenances[]` and `attestations[]` are both queried successfully (regardless of whether either is non-empty) THE SYSTEM SHALL surface an explicit provenance status in hover distinguishing "verified" (either array non-empty) from "none found" (both empty) — never omitting the line silently when the query itself succeeded, so a user cannot mistake "we didn't check" for "we checked and found nothing" (US-002) | must |
+| FR-005 | WHEN no `relatedProjects[]` entry with `relationType == "SOURCE_REPO"` exists, OR the ecosystem is not one of the 7 deps.dev covers THE SYSTEM SHALL omit the Scorecard portion of the trust signal entirely, with no error/warning surfaced (US-003) | must |
+| FR-006 | WHEN any deps.dev request fails (network error, timeout, non-2xx status, malformed/unparseable JSON) THE SYSTEM SHALL omit the entire trust-signal section from that hover render and SHALL NOT block, delay, or degrade any other hover content (US-004) | must |
+| FR-007 | THE SYSTEM SHALL cache deps.dev responses (both per-version and per-project) through the existing `deps_core::HttpCache` ETag/Last-Modified conditional-GET machinery rather than introducing a parallel caching mechanism | must |
+| FR-008 | THE SYSTEM SHALL classify the `api.deps.dev` host through the existing `deps_core::net_policy` classifier and treat it as a fixed, non-workspace-configurable trusted-origin endpoint (deps.dev is a deps-lsp-selected third-party API, not a user-supplied registry URL) — it is not subject to the `registries.workspace_registries` gate that governs user-declared alternate registries | must |
+| FR-009 | THE SYSTEM SHALL treat deps.dev as strictly additive to existing hover content — its data SHALL NOT replace, override, or be conflated with any registry-native field deps-lsp already sources itself (license, deprecation, vulnerability advisories per the Out of Scope exclusions) | must |
+| FR-010 | WHETHER this signal also feeds a new diagnostic or inlay-hint category, beyond hover, is `[NEEDS CLARIFICATION]`, see below — pending that answer, this spec's default scope is hover-only | must — the decision itself, not a specific mechanism, is mandatory before `/sdd plan` |
+| FR-011 | WHETHER Composer/Dart/Swift dependencies show a documented explicit "not available for this ecosystem" hover line versus silently omitting the section entirely is `[NEEDS CLARIFICATION]`, see below | must |
+| FR-012 | WHETHER a low Scorecard score should ever escalate beyond an informational hover line (e.g. into a diagnostic, matching or diverging from the [[004-release-freshness-signal/spec|004]] precedent of "informational signal, not a diagnostic") is `[NEEDS CLARIFICATION]`, see below | must |
+
+## 4. Non-Functional Requirements
+
+| ID | Category | Requirement |
+|----|----------|-------------|
+| NFR-001 | Performance / Rate Limiting | deps.dev publishes no documented public rate limit, but SHALL be treated conservatively: requests SHALL be routed through the existing `HttpCache` (FR-007) so a repeated hover for the same package/version reuses a cached or 304-revalidated response rather than issuing a fresh request every time; no fixed requests-per-second budget is assumed without further research at plan time |
+| NFR-002 | Caching Strategy | `deps_core::HttpCache`'s existing model is ETag/Last-Modified conditional-GET revalidation, not a fixed TTL that skips the network entirely (confirmed via `crates/deps-core/src/cache.rs`) — Scorecard data updates on a roughly-weekly cadence upstream, materially slower than deps-lsp's typical per-version registry data churn. Whether this warrants a dedicated longer revalidation-skip window (to avoid a conditional-GET round trip on every hover even when a 304 is virtually guaranteed) or reuses `HttpCache`'s existing revalidate-every-time model as-is is `[NEEDS CLARIFICATION]`, see below |
+| NFR-003 | Reliability / Graceful Degradation | Per FR-006, a deps.dev outage or malformed response SHALL NOT be visible to the user as an error, warning, or blank/stalled hover — existing hover content renders identically to today with the trust-signal section simply absent |
+| NFR-004 | Reliability / No Linked Repo | Per FR-005, a package with no resolvable `SOURCE_REPO` project (a materially common case — many packages have no linked repo, or link to a non-canonical mirror) SHALL degrade identically to an outright deps.dev failure from the user's perspective — no distinct error state |
+| NFR-005 | Security | The `api.deps.dev` request SHALL be a plain, unauthenticated HTTPS GET with no credential, cookie, or workspace-derived value ever attached — consistent with deps.dev being keyless by design |
+| NFR-006 | Maintainability | The Scorecard/SLSA data model SHALL be represented by new, deps.dev-specific types (not force-fit into any existing ecosystem crate's registry-response types) so a future change to deps.dev's schema does not ripple into unrelated ecosystem code |
+
+## 5. Data Model
+
+| Entity | Description | Key Attributes |
+|--------|-------------|----------------|
+| `DepsDevVersionInfo` | New type — parsed subset of deps.dev's per-version endpoint response relevant to this spec | `slsa_provenances: Vec<...>` (presence-only, count not required), `attestations: Vec<...>` (presence-only), `related_projects: Vec<RelatedProject>` |
+| `RelatedProject` | New type — one `relatedProjects[]` entry | `project_key: String`, `relation_type: String` (only `"SOURCE_REPO"` is consumed by FR-002) |
+| `DepsDevScorecard` | New type — parsed subset of deps.dev's per-project endpoint `scorecard` object | `date: String`, `version: String`, `checks: Vec<ScorecardCheck>`, `aggregate_score: <TBD pending FR-003's NEEDS CLARIFICATION>` |
+| `ScorecardCheck` | New type — one `checks[]` entry | `name: String`, `score: i8` (0-10, or `-1` for not-applicable), `reason: String` |
+| `SupplyChainTrustSignal` | New, ecosystem-agnostic aggregate type assembled from the two deps.dev calls, consumed by the hover-formatting layer | `scorecard: Option<DepsDevScorecard>`, `provenance_verified: Option<bool>` (`None` only when the version-level query itself failed, per FR-004/FR-006 distinction) |
+
+## 6. Edge Cases and Error Handling
+
+| Scenario | Expected Behavior |
+|----------|-------------------|
+| Ecosystem is Composer, Dart, or Swift | No deps.dev query attempted at all (FR-005); hover behavior per the FR-011 `[NEEDS CLARIFICATION]` resolution |
+| Package has no `relatedProjects[]` entry with `relationType == "SOURCE_REPO"` | Scorecard portion omitted; SLSA/attestation portion (version-level, independent of project linkage) still shown per FR-001/FR-004 |
+| deps.dev per-version query succeeds, per-project query fails/times out | Provenance status still shown (FR-004); Scorecard portion omitted (mirrors FR-006's per-call independence) |
+| Both deps.dev queries fail (network error, timeout, non-2xx) | Entire trust-signal section omitted; no other hover content affected (FR-006, US-004) |
+| deps.dev returns malformed/unexpected JSON shape | Treated identically to a request failure — parse error is not surfaced to the user (FR-006) |
+| `slsaProvenances[]` and `attestations[]` both empty but the query succeeded | Explicit "no provenance found" shown, distinct from "not checked" (FR-004) |
+| Same package/version hovered repeatedly in quick succession | Served from `HttpCache`'s existing ETag-revalidated cache, not re-fetched from deps.dev on every keystroke/hover (FR-007, NFR-001) |
+| deps.dev linked repo is a fork or mirror, not canonical upstream | Out of scope for this spec to detect/correct — deps-lsp trusts deps.dev's own `SOURCE_REPO` relation as given (see Assumptions) |
+
+## 7. Success Criteria
+
+| ID | Metric | Target |
+|----|--------|--------|
+| SC-001 | Hover shows a correct Scorecard score for a live, well-known package with linked source repo and Scorecard data (e.g. `npm:express`) | Manual/integration test against a live or mocked deps.dev fixture matching the session's verified `express` response |
+| SC-002 | Hover shows correct provenance status (verified vs. none-found) for a version with non-empty `slsaProvenances`/`attestations` and, separately, for one with both empty | Test asserting both branches of FR-004 |
+| SC-003 | Zero regression to existing hover content when deps.dev is offline/unreachable | Test running with deps.dev calls forced to fail; existing hover assertions unchanged |
+| SC-004 | No deps.dev request issued for Composer/Dart/Swift dependencies | Test asserting zero HTTP calls to `api.deps.dev` for those three ecosystems |
+| SC-005 | Repeated hover of the same package/version does not issue a fresh (non-conditional) deps.dev request each time | Test asserting `HttpCache` ETag revalidation (304) path is exercised, not a fresh 200 fetch |
+
+## 8. Agent Boundaries
+
+### Always (without asking)
+- Reuse `deps_core::HttpCache`'s existing ETag/Last-Modified conditional-GET machinery and `deps_core::net_policy` host classification (FR-007, FR-008) rather than introducing a parallel HTTP client or cache.
+- Treat every deps.dev call as independently failable (FR-004, FR-006) — a Scorecard failure must never suppress an already-successful provenance result, and vice versa.
+- Add the new `DepsDevVersionInfo`/`DepsDevScorecard`/etc. types to a dedicated module rather than embedding deps.dev-specific fields into any existing ecosystem crate's registry-response types (NFR-006).
+
+### Ask First
+- Whether this signal feeds any LSP surface beyond hover (diagnostics, inlay hints) — blocked on FR-010's `[NEEDS CLARIFICATION]`.
+- Whether a dedicated, longer-than-default revalidation-skip window is needed for Scorecard data specifically — blocked on NFR-002's `[NEEDS CLARIFICATION]`.
+- Any change to `deps_core::net_policy`'s trusted-origin classification mechanism to accommodate a fixed, non-workspace-configurable third-party API endpoint, if the existing mechanism does not already support this cleanly.
+
+### Never
+- Duplicate `licenses[]`, `isDeprecated`, or `advisoryKeys[]` from deps.dev when deps-lsp already sources this data natively per-ecosystem (Out of Scope, FR-009).
+- Block, delay, or degrade any existing hover content on a deps.dev failure (FR-006).
+- Attach any credential, cookie, or workspace-derived value to a deps.dev request (NFR-005) — it is keyless by design.
+- Escalate a Scorecard score into a diagnostic or blocking behavior without first resolving FR-012's `[NEEDS CLARIFICATION]`.
+
+## 9. Open Questions
+
+- `[NEEDS CLARIFICATION: hover-only vs. new diagnostic/inlay-hint category]`
+  (FR-010) — should this signal be a hover-only addition, or also feed a new
+  diagnostic (e.g. flagging a very low Scorecard score) or inlay-hint
+  category? Non-blocking for a hover-only phase 1, but must be answered
+  before `/sdd plan` scopes the implementation surface.
+- `[NEEDS CLARIFICATION: Composer/Dart/Swift treatment]` (FR-011) — should
+  these three deps.dev-uncovered ecosystems get a documented, explicit "not
+  available" hover state, or should the section silently omit itself exactly
+  as it does for any other ecosystem lacking data? An explicit state adds a
+  small UI/messaging surface but avoids user confusion about why the section
+  appears for some ecosystems and never for others.
+- `[NEEDS CLARIFICATION: low-score escalation]` (FR-012) — should a low
+  Scorecard score ever escalate to a diagnostic, or should it remain
+  informational-only in every case, matching the precedent
+  [[004-release-freshness-signal/spec|004]] established (informational
+  signal, not a diagnostic, for release-freshness risk) and the broader
+  industry precedent of Dependabot/Socket.dev treating this class of signal
+  as informational rather than blocking? Cross-reference 004's resolution
+  before deciding.
+- `[NEEDS CLARIFICATION: Scorecard data TTL / revalidation cadence]`
+  (NFR-002) — deps.dev's upstream Scorecard data updates roughly weekly,
+  materially slower than deps-lsp's typical version-data cache behavior.
+  Should this data get a dedicated, longer revalidation-skip window layered
+  on top of `HttpCache`'s existing ETag-revalidate-every-time model (to
+  avoid an unnecessary conditional-GET round trip on every hover), or is
+  reusing the existing model as-is (which already avoids re-fetching the
+  full body on a 304) sufficient? This affects whether `HttpCache` needs a
+  new capability or whether this feature is a pure consumer of the existing
+  one.
+- `[NEEDS CLARIFICATION: Scorecard aggregate computation]` (FR-003) — should
+  the hover's single Scorecard number be deps.dev's own aggregate (if the API
+  exposes one directly) or a deps-lsp-computed mean of `checks[].score`
+  excluding `-1`/not-applicable checks? This determines whether deps-lsp
+  needs any scoring logic of its own or purely passes through an upstream
+  value.
+
+## 10. See Also
+
+- [[constitution]] — project principles (not yet created for this project; cross-check against `.claude/rules/*.md` instead)
+- [[MOC-specs]] — all specifications
+- [[004-release-freshness-signal/spec|004-release-freshness-signal]] — precedent for "informational signal, not a diagnostic" applied to a supply-chain-risk-adjacent hover addition; directly relevant to FR-012's open question
+- [[010-license-hover-policy/spec|010-license-hover-policy]] — precedent for adding a new informational hover section end-to-end (formatting, policy, `EcosystemFormatter` integration points)
+- [[011-deprecation-replacement-diagnostics/spec|011-deprecation-replacement-diagnostics]] — the deprecation-signal precedent this spec's Out of Scope explicitly avoids duplicating from deps.dev
+- [[002-osv-vulnerability-diagnostics/spec|002-osv-vulnerability-diagnostics]] — the vulnerability-signal precedent this spec's Out of Scope explicitly avoids duplicating from deps.dev
+- `.local/testing/playbooks/competitive-parity.md` — deps.dev API v3 Reference Projects entry ("data source, not competitor", checked 2026-08-23), listing the fields this spec now acts on
+- `crates/deps-core/src/cache.rs` — `HttpCache`, its ETag/Last-Modified conditional-GET model (FR-007, NFR-002)
+- `crates/deps-core/src/net_policy.rs` — `HostClass`, `classify_host`, trusted-origin classification (FR-008)
+- `crates/deps-core/src/lsp_helpers/formatter.rs` — `EcosystemFormatter`, the hover-formatting integration point a future plan would extend
+- [deps.dev](https://deps.dev) — the project homepage
+- [deps.dev API v3 documentation](https://docs.deps.dev/api/v3/) — `GET /v3/systems/{system}/packages/{name}/versions/{version}` and `GET /v3/projects/{project-key}` endpoints this spec is built against
+- [OpenSSF Scorecard](https://github.com/ossf/scorecard) — the upstream project defining the checks deps.dev's `scorecard` object reports
