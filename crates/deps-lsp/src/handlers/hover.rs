@@ -26,9 +26,13 @@ pub async fn handle_hover(
 
     // Snapshot before the document lookup, matching diagnostics.rs's ordering — this
     // acquires the config RwLock before the DashMap shard guard, never the reverse.
-    let (freshness, offline) = {
+    let (freshness, offline, supply_chain_enabled) = {
         let config = config.read().await;
-        (config.freshness.to_settings(), config.network.offline)
+        (
+            config.freshness.to_settings(),
+            config.network.offline,
+            config.supply_chain.enabled,
+        )
     };
 
     // Own everything `generate_hover` needs and release the DashMap shard `Ref`
@@ -60,17 +64,21 @@ pub async fn handle_hover(
         })
         .flatten()?;
 
+    let mut versions = VersionData::new(&cached_versions, &resolved_versions)
+        .with_vulnerabilities(&vulnerabilities)
+        .with_outcomes(&outcomes)
+        .with_ecosystem(ecosystem_id)
+        .with_offline(offline);
+    // The only call site that ever sets `VersionData::trust` (deps-core's
+    // `lsp_helpers::hover` module docs) — this is what makes the supply-chain
+    // trust signal hover-only by construction (FR-010): diagnostics, code
+    // actions, inlay hints, and code lenses never reach this code path.
+    if supply_chain_enabled {
+        versions = versions.with_trust(&state.deps_dev);
+    }
+
     ecosystem
-        .generate_hover(
-            parse_result.as_ref(),
-            position,
-            VersionData::new(&cached_versions, &resolved_versions)
-                .with_vulnerabilities(&vulnerabilities)
-                .with_outcomes(&outcomes)
-                .with_ecosystem(ecosystem_id)
-                .with_offline(offline),
-            freshness,
-        )
+        .generate_hover(parse_result.as_ref(), position, versions, freshness)
         .await
 }
 

@@ -19,6 +19,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 - **Lock file support** — Reads resolved versions from Cargo.lock, package-lock.json, poetry.lock, uv.lock, go.sum, Gemfile.lock, pubspec.lock, Package.resolved, composer.lock
 - **Diagnostics** — Warnings for outdated, unknown, yanked, unsatisfiable-requirement, or deprecated/abandoned dependencies
 - **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
+- **Supply-chain trust signal** — OpenSSF Scorecard score and SLSA/attestation provenance status in hover, via deps.dev, for npm, Cargo, Go, Maven, PyPI, Bundler, and NuGet
 - **Release-freshness signal** — Flags a "latest" version still within a cooldown window in hover and completion, mirroring GitHub Dependabot's default 3-day package cooldown
 - **Hover information** — Package descriptions with resolved version from lock file
 - **Code actions** — Quick fixes to update dependencies, resolve unsatisfiable version requirements, and upgrade to a patched version for known vulnerabilities
@@ -282,6 +283,9 @@ Configure via LSP initialization options:
   },
   "network": {
     "offline": false
+  },
+  "supply_chain": {
+    "enabled": true
   }
 }
 ```
@@ -310,12 +314,16 @@ Configure via LSP initialization options:
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
 | `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`) — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#cargo-customprivate-registries) and [npm Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#npm-customprivate-registries). **Breaking rename** from `cargo.workspace_registries` — see CHANGELOG |
 | `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
+| `supply_chain` | `enabled` | `true` | Show the OpenSSF Scorecard/build-provenance hover line, backed by deps.dev requests; `false` disables the requests and the section entirely |
 
 > [!NOTE]
 > The release-freshness signal applies uniformly across all ecosystems — there is no per-ecosystem override. Coverage depth varies with what each registry exposes (e.g. Deno's `jsr:` specifiers get full coverage at no extra request cost; Swift, GitHub Actions, and Maven/Gradle have partial coverage since their APIs don't expose per-version publish dates directly). See [Swift/GitHub Actions Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#swift-and-github-actions-release-freshness-coverage) and [Maven/Gradle Release-Freshness Coverage](docs/ECOSYSTEM_GUIDE.md#mavengradle-release-freshness-coverage) for per-ecosystem details.
 
 > [!NOTE]
 > `network.offline` blocks every outbound request the server makes (registry, OSV vulnerability, and GitHub tags), across every ecosystem. Already-cached data keeps serving; an uncached dependency shows an offline marker in inlay hints, and hover appends a footer stating that version *and* vulnerability data were not checked. Toggling it via `workspace/didChangeConfiguration` takes effect immediately, with no editor restart.
+
+> [!NOTE]
+> The supply-chain trust signal only appears for **npm, Cargo, Go, Maven, PyPI, Bundler, and NuGet** (Composer, Dart, and Swift have no deps.dev coverage) and only for a dependency with a concrete in-use version — a lock-file-resolved version, or an exact requirement pin. It shows the linked source repository's OpenSSF Scorecard score and the resolved version's SLSA/attestation provenance status; a Scorecard fetched via a package-self-reported (rather than attested) repository link is marked `*(self-reported repo)*`. Informational only — a low score never becomes a diagnostic. See [Supply-Chain Trust Signal](docs/ECOSYSTEM_GUIDE.md#supply-chain-trust-signal-issue-543) for the full details.
 
 > [!TIP]
 > Increase `fetch_timeout_secs` for slower networks. The per-dependency timeout prevents slow packages from blocking others. Cold start support ensures LSP features work immediately when your IDE restores previously opened files.

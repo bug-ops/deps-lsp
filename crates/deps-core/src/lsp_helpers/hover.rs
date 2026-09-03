@@ -1,15 +1,29 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
+use crate::deps_dev::deps_dev_system;
 use crate::osv::ScanOutcome;
 use crate::{
-    ConcreteVersion, Deprecation, ParseResult, PublishTime, Registry, Version, VersionReq,
-    format_relative_age, is_within_cooldown,
+    ConcreteVersion, Deprecation, ParseResult, ProvenanceStatus, PublishTime, Registry,
+    SupplyChainTrustSignal, Version, VersionReq, format_relative_age, is_within_cooldown,
 };
 
 use super::{
-    EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, escape_markdown, markdown_code_span,
-    position_in_range,
+    EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, escape_markdown, in_use_version,
+    markdown_code_span, position_in_range,
 };
+
+/// Bounds how long [`generate_hover`] *waits* for the spawned deps.dev trust-signal
+/// fetch — never the fetch itself, which keeps running to completion and warms
+/// [`crate::deps_dev::DepsDevClient`]'s memo even after this deadline elapses
+/// (spec 037, plan.md §8's "spawn-and-warm" design). Deliberately not named
+/// `..._TOTAL_...`: merging this with the fetch's own per-call timeouts would
+/// silently kill spawn-and-warm — an over-budget fetch would then die entirely
+/// instead of finishing into the memo, and the next hover would re-fire it under
+/// the short error TTL rather than getting a memo hit.
+const DEPS_DEV_WAIT_BUDGET: Duration = Duration::from_millis(700);
 
 /// Formats the relative-age suffix for one "Recent versions" hover entry.
 ///
@@ -76,6 +90,66 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let dep_source = dep.source();
     let resolvable = formatter.can_resolve_source(&dep_source);
 
+    // Hoisted above the registry fetch below (moved from its previous position
+    // right before the `**Current**`/`**Requirement**` line) so the deps.dev gate
+    // just below can use it: both need "the normalized name", and the gate must be
+    // built and the fetch spawned *before* awaiting the registry fetch so the two
+    // requests overlap instead of stacking (spec 037, plan.md §8 M6).
+    let normalized_name = formatter.normalize_package_name(dep.name());
+
+    // Supply-chain trust signal (spec 037): spawned as a detached background task,
+    // concurrently with the registry fetch just below, so a slow or cold-memo
+    // deps.dev never adds its own latency on top of the registry fetch's. Only
+    // `handlers/hover.rs` (deps-lsp) ever sets `versions.trust`, which is what makes
+    // FR-010's hover-only scope structural: every other surface (diagnostics, code
+    // actions, inlay hints, code lenses) is never handed a client and so can never
+    // reach deps.dev.
+    //
+    // Gated on all of: a client was handed in, `network.offline` is not set, the source
+    // resolves against a **public** registry, the ecosystem is one of the seven
+    // `deps_dev_system` maps, and a concrete in-use version exists — the last two
+    // checked with **no** network I/O, so an ecosystem `deps_dev_system` excludes
+    // (Composer, Dart, Swift, ...) spawns nothing at all.
+    //
+    // `formatter.source_is_public_registry_content(&dep_source)`, not the weaker
+    // `resolvable` (`can_resolve_source`): `resolvable` is deliberately widened by some
+    // ecosystems (e.g. `deps-cargo`'s `AlternateRegistry`) to cover *any* configured
+    // registry, private/internal ones included — reusing it here would send a private
+    // package's name and version to deps.dev by default (security audit M2). `source_is_
+    // public_registry_content` is the same, stricter predicate this server's other
+    // third-party lookup (OSV) already gates on (`lifecycle.rs`).
+    //
+    // `!versions.offline`: every other network-gated hover section in this function
+    // checks `versions.offline` (the `Cmd+.` footer, the offline footer itself below) —
+    // without it here, offline mode still spawns a task per hover and writes a 90s
+    // negative memo entry, keeping the signal absent for up to 90s per package after
+    // reconnecting for no reason (critic C4).
+    //
+    // `tokio::spawn` panics outside a Tokio runtime — every caller of `generate_hover`
+    // is `#[tokio::test]`-async or the real LSP server, so this is safe here, but no
+    // doc-test may call this function directly. The spawned future captures only
+    // owned/`'static` data (`Arc<DepsDevClient>`, `&'static str`, owned `String`s) so
+    // it satisfies `Send + 'static` with no borrow from `dep`/`parse_result`.
+    let trust_handle = versions.trust.and_then(|client| {
+        let ecosystem = versions.ecosystem?;
+        let system = deps_dev_system(ecosystem)?;
+        if versions.offline || !formatter.source_is_public_registry_content(&dep_source) {
+            return None;
+        }
+        let version = in_use_version(
+            dep,
+            normalized_name.as_str(),
+            versions.resolved,
+            formatter,
+            ecosystem,
+        )?;
+        let client = Arc::clone(client);
+        let name = dep.name().to_string();
+        Some(tokio::spawn(async move {
+            client.trust_signal(system, &name, &version).await
+        }))
+    });
+
     // `now` is a caller-supplied parameter (issue #227 M4) rather than computed
     // internally via `PublishTime::now()` — this is what lets tests pin an exact
     // cooldown-boundary instant deterministically, and guarantees every age rendered
@@ -127,8 +201,6 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         ),
     }
     .unwrap();
-
-    let normalized_name = formatter.normalize_package_name(dep.name());
 
     let resolved: Option<&str> = if formatter.manifest_requirement_is_resolved_version(dep) {
         dep.version_requirement().map(VersionReq::as_str)
@@ -321,6 +393,22 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // deprecation is a property of the package, advisories of the version.
     push_deprecation_hover_section(&mut markdown, formatter, deprecation);
     push_vulnerability_hover_section(&mut markdown, vuln_outcome);
+
+    // Awaited last, after every other section above that needed no network I/O of
+    // its own, so the wait below overlaps as much of this function's own work as
+    // possible — by now `available_versions` has already resolved too. Bounds only
+    // the *wait*: over budget, the spawned task above keeps running and warms
+    // `DepsDevClient`'s memo regardless (see `DEPS_DEV_WAIT_BUDGET`'s docs). A
+    // `JoinHandle` `Err` (the task panicked) is swallowed exactly like a timeout or a
+    // fetch failure — FR-006 must hold on this path too, not just the network ones.
+    let trust_signal = match trust_handle {
+        Some(handle) => match tokio::time::timeout(DEPS_DEV_WAIT_BUDGET, handle).await {
+            Ok(Ok(signal)) => signal,
+            Ok(Err(_)) | Err(_) => None,
+        },
+        None => None,
+    };
+    push_trust_signal_hover_section(&mut markdown, trust_signal.as_ref());
 
     // `!v.is_empty()`, not just `Some(_)` (#550): a resolvable source's live fetch can
     // succeed with a genuinely empty list — e.g. a real GitHub repository whose only
@@ -566,6 +654,60 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
         }
         Some(ScanOutcome::Skipped(_)) | None => {}
     }
+}
+
+/// Appends the hover "Supply chain" line (spec 037): one line, no `###` header,
+/// deliberately lighter than the deprecation/advisory sections above — this signal
+/// is informational-only (FR-012) and carries no severity language.
+///
+/// `signal` is `None` both when no fetch was ever attempted (deps.dev disabled,
+/// unsupported ecosystem, no in-use version, ...) and when both deps.dev calls
+/// failed or the wait budget elapsed — every case renders nothing, matching
+/// FR-006/US-004. A `Some` signal whose scorecard and provenance are *both*
+/// `None` (possible only via `SupplyChainTrustSignal::default()`, never returned by
+/// `DepsDevClient::trust_signal` itself) also renders nothing, defensively.
+fn push_trust_signal_hover_section(markdown: &mut String, signal: Option<&SupplyChainTrustSignal>) {
+    use std::fmt::Write;
+
+    let Some(signal) = signal else {
+        return;
+    };
+    if signal.scorecard.is_none() && signal.provenance.is_none() {
+        return;
+    }
+
+    let mut parts: Vec<String> = Vec::with_capacity(2);
+    if let Some(scorecard) = &signal.scorecard {
+        let mut part = format!(
+            "OpenSSF Scorecard {}/10",
+            markdown_code_span(&format!("{:.1}", scorecard.overall_score))
+        );
+        if scorecard.self_reported {
+            part.push_str(" *(self-reported repo)*");
+        }
+        parts.push(part);
+    }
+    if let Some(provenance) = signal.provenance {
+        let label = match provenance {
+            ProvenanceStatus::Verified => "verified",
+            ProvenanceStatus::Unverified => "attested but unverified",
+            ProvenanceStatus::None => "none found",
+        };
+        // "Provenance", not "SLSA provenance": `classify_provenance` deliberately unions
+        // `slsaProvenances[]` with `attestations[]` (plan-mandated), and an attestation
+        // entry's `type` is not necessarily SLSA — labeling every verified entry as SLSA
+        // specifically would misrepresent which standard was actually verified for a
+        // package whose only verified entry came from `attestations[]` (critic C3).
+        parts.push(format!("Provenance: {label}"));
+    }
+
+    writeln!(
+        markdown,
+        "\u{1f510} **Supply chain**: {}",
+        parts.join(" \u{b7} ")
+    )
+    .unwrap();
+    markdown.push('\n');
 }
 
 #[cfg(test)]
@@ -2634,6 +2776,480 @@ mod tests {
             "a non-resolvable source must not show the offline footer, even with \
              versions.offline set; got: {}",
             content.value
+        );
+    }
+
+    // --- Supply-chain trust signal (spec 037) ---
+
+    async fn deps_dev_mock_client() -> (mockito::ServerGuard, crate::DepsDevClient) {
+        let server = mockito::Server::new_async().await;
+        let client =
+            crate::DepsDevClient::for_test(Arc::new(crate::HttpCache::new()), server.url());
+        (server, client)
+    }
+
+    /// A single dependency (`express@4.19.2`) whose in-use version resolves via
+    /// `resolved_versions`, ready to attach to `VersionData::with_trust`.
+    fn express_fixture() -> (
+        MockParseResult,
+        HashMap<crate::PackageName, ConcreteVersion>,
+    ) {
+        let parse_result = freshness_test_parse_result("express");
+        let resolved_versions = HashMap::from([(
+            crate::PackageName::new("express"),
+            ConcreteVersion::new("4.19.2"),
+        )]);
+        (parse_result, resolved_versions)
+    }
+
+    /// SC-001, pinned to the deterministic path per critic N4: the mock responds
+    /// instantly, so `generate_hover`'s `DEPS_DEV_WAIT_BUDGET` await reliably
+    /// completes well within budget rather than depending on a cold-memo race.
+    #[tokio::test]
+    async fn test_generate_hover_trust_signal_renders_score_and_verified_provenance() {
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/express/versions/4.19.2")
+            .with_status(200)
+            .with_body(
+                r#"{"slsaProvenances": [{"verified": true}], "attestations": [], "relatedProjects": [
+                    {"projectKey": {"id": "github.com/expressjs/express"}, "relationType": "SOURCE_REPO", "relationProvenance": "SLSA_ATTESTATION"}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+        let _project = server
+            .mock("GET", "/v3/projects/github.com%2Fexpressjs%2Fexpress")
+            .with_status(200)
+            .with_body(r#"{"scorecard": {"overallScore": 8.5}}"#)
+            .create_async()
+            .await;
+        let deps_dev = Arc::new(deps_dev);
+
+        let (parse_result, resolved_versions) = express_fixture();
+        let registry = MockRegistryWithVersions { versions: vec![] };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        let line = content
+            .value
+            .lines()
+            .find(|l| l.contains("Supply chain"))
+            .unwrap_or_else(|| panic!("expected a Supply chain line, got: {}", content.value));
+        insta::assert_snapshot!(line, @"🔐 **Supply chain**: OpenSSF Scorecard `8.5`/10 · Provenance: verified");
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_trust_signal_unverified_provenance() {
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/express/versions/4.19.2")
+            .with_status(200)
+            .with_body(
+                r#"{"slsaProvenances": [{"verified": false}], "attestations": [], "relatedProjects": []}"#,
+            )
+            .create_async()
+            .await;
+        let deps_dev = Arc::new(deps_dev);
+
+        let (parse_result, resolved_versions) = express_fixture();
+        let registry = MockRegistryWithVersions { versions: vec![] };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content
+                .value
+                .contains("Provenance: attested but unverified"),
+            "got: {}",
+            content.value
+        );
+    }
+
+    #[tokio::test]
+    async fn test_generate_hover_trust_signal_none_provenance_and_self_reported_marker() {
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/express/versions/4.19.2")
+            .with_status(200)
+            .with_body(
+                r#"{"slsaProvenances": [], "attestations": [], "relatedProjects": [
+                    {"projectKey": {"id": "github.com/expressjs/express"}, "relationType": "SOURCE_REPO", "relationProvenance": "UNVERIFIED_METADATA"}
+                ]}"#,
+            )
+            .create_async()
+            .await;
+        let _project = server
+            .mock("GET", "/v3/projects/github.com%2Fexpressjs%2Fexpress")
+            .with_status(200)
+            .with_body(r#"{"scorecard": {"overallScore": 7.2}}"#)
+            .create_async()
+            .await;
+        let deps_dev = Arc::new(deps_dev);
+
+        let (parse_result, resolved_versions) = express_fixture();
+        let registry = MockRegistryWithVersions { versions: vec![] };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("Provenance: none found"),
+            "got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("*(self-reported repo)*"),
+            "an UNVERIFIED_METADATA-only relation must be disclosed; got: {}",
+            content.value
+        );
+    }
+
+    /// SC-004: every ecosystem `deps_dev_system` does not cover (not just
+    /// Composer) must issue zero deps.dev requests — checked before any
+    /// spawn, per plan.md §8's gate.
+    #[tokio::test]
+    async fn test_generate_hover_trust_signal_skips_uncovered_ecosystems() {
+        for ecosystem in [
+            crate::EcosystemId::Composer,
+            crate::EcosystemId::Dart,
+            crate::EcosystemId::Swift,
+        ] {
+            let (mut server, deps_dev) = deps_dev_mock_client().await;
+            let never_called = server
+                .mock("GET", mockito::Matcher::Regex("^/v3/.*".into()))
+                .expect(0)
+                .create_async()
+                .await;
+            let deps_dev = Arc::new(deps_dev);
+
+            let (parse_result, resolved_versions) = express_fixture();
+            let registry = MockRegistryWithVersions { versions: vec![] };
+
+            let hover = generate_hover(
+                &parse_result,
+                Position::new(0, 2),
+                VersionData::new(&HashMap::new(), &resolved_versions)
+                    .with_ecosystem(ecosystem)
+                    .with_trust(&deps_dev),
+                &registry,
+                &MockFormatter,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await
+            .expect("hover should be generated");
+
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("expected markup hover contents");
+            };
+            assert!(
+                !content.value.contains("Supply chain"),
+                "{ecosystem:?}: got: {}",
+                content.value
+            );
+            never_called.assert_async().await;
+        }
+    }
+
+    /// Regression for security M2 / critic C2: a private/non-mirror
+    /// `AlternateRegistry` source must never reach deps.dev, even though it
+    /// resolves against this ecosystem's own registry (`resolvable` alone
+    /// is the wrong, too-permissive gate — see
+    /// `MockWidenedResolveFormatter`'s docs).
+    #[tokio::test]
+    async fn test_generate_hover_trust_signal_skips_private_registry_source() {
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let never_called = server
+            .mock("GET", mockito::Matcher::Regex("^/v3/.*".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        let deps_dev = Arc::new(deps_dev);
+
+        let parse_result = SingleDepParseResult {
+            dep: NonRegistryDep(
+                dep_at("internal-pkg"),
+                crate::parser::DependencySource::AlternateRegistry {
+                    index: "https://index.mycorp.internal".to_string(),
+                    mirrors_crates_io: false,
+                },
+            ),
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let resolved_versions = HashMap::from([(
+            crate::PackageName::new("internal-pkg"),
+            ConcreteVersion::new("1.0.0"),
+        )]);
+        let registry = MockRegistryWithVersions { versions: vec![] };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Cargo)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockWidenedResolveFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("Supply chain"),
+            "a private registry's package name/version must never reach deps.dev; got: {}",
+            content.value
+        );
+        never_called.assert_async().await;
+    }
+
+    /// Regression for review C4 / critic C4: `versions.offline` must be
+    /// checked in the same gate as every other network-gated hover section
+    /// — offline must not spawn a task or write a negative memo entry.
+    #[tokio::test]
+    async fn test_generate_hover_trust_signal_skips_when_offline() {
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let never_called = server
+            .mock("GET", mockito::Matcher::Regex("^/v3/.*".into()))
+            .expect(0)
+            .create_async()
+            .await;
+        let deps_dev = Arc::new(deps_dev);
+
+        let (parse_result, resolved_versions) = express_fixture();
+        let registry = MockRegistryWithVersions { versions: vec![] };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev)
+                .with_offline(true),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("Supply chain"),
+            "got: {}",
+            content.value
+        );
+        never_called.assert_async().await;
+    }
+
+    /// SC-003: a deps.dev outage must leave every other hover section
+    /// byte-identical to a hover generated with no trust client at all.
+    #[tokio::test]
+    async fn test_generate_hover_trust_signal_failure_leaves_other_content_unchanged() {
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/express/versions/4.19.2")
+            .with_status(500)
+            .create_async()
+            .await;
+        let deps_dev = Arc::new(deps_dev);
+
+        let (parse_result, resolved_versions) = express_fixture();
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "4.19.2".into(),
+                yanked: false,
+                published_at: None,
+            }],
+        };
+
+        let with_failing_trust = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let without_trust = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let HoverContents::Markup(a) = with_failing_trust.contents else {
+            panic!("expected markup hover contents");
+        };
+        let HoverContents::Markup(b) = without_trust.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(!a.value.contains("Supply chain"), "got: {}", a.value);
+        assert_eq!(a.value, b.value);
+    }
+
+    /// The load-bearing test for the whole spawn-and-warm latency design
+    /// (plan.md §12), exercising `generate_hover`'s own real
+    /// `tokio::time::timeout(DEPS_DEV_WAIT_BUDGET, handle)` wrap directly —
+    /// not a smaller artificial stand-in (review's flagged test gap: the
+    /// only prior test of this mechanism drove `DepsDevClient::trust_signal`
+    /// with its own 5ms timeout, never through `generate_hover` at all).
+    ///
+    /// Both deps.dev calls are delayed just under the internal
+    /// `DEPS_DEV_CALL_TIMEOUT` (400ms each) but together exceed the real
+    /// `DEPS_DEV_WAIT_BUDGET` (700ms) — the only way to reach the
+    /// hover-level timeout without either call tripping its own shorter
+    /// per-call cap first. `flavor = "multi_thread"` so the blocking
+    /// `std::thread::sleep` inside the mock handler runs on a different
+    /// worker thread than the test's own timer, matching
+    /// `deps_dev::tests::trust_signal_survives_dropped_join_handle_and_warms_memo`'s
+    /// technique.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_generate_hover_trust_signal_over_real_wait_budget_still_warms_memo_for_next_hover()
+     {
+        const CALL_DELAY: std::time::Duration = std::time::Duration::from_millis(375);
+
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/express/versions/4.19.2")
+            .with_status(200)
+            .with_body_from_request(move |_req| {
+                std::thread::sleep(CALL_DELAY);
+                r#"{"slsaProvenances": [{"verified": true}], "attestations": [], "relatedProjects": [
+                    {"projectKey": {"id": "github.com/expressjs/express"}, "relationType": "SOURCE_REPO", "relationProvenance": "SLSA_ATTESTATION"}
+                ]}"#
+                .as_bytes()
+                .to_vec()
+            })
+            .create_async()
+            .await;
+        let _project = server
+            .mock("GET", "/v3/projects/github.com%2Fexpressjs%2Fexpress")
+            .with_status(200)
+            .with_body_from_request(move |_req| {
+                std::thread::sleep(CALL_DELAY);
+                r#"{"scorecard": {"overallScore": 8.5}}"#.as_bytes().to_vec()
+            })
+            .create_async()
+            .await;
+        let deps_dev = Arc::new(deps_dev);
+
+        let (parse_result, resolved_versions) = express_fixture();
+        let registry = MockRegistryWithVersions { versions: vec![] };
+
+        let first = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+        let HoverContents::Markup(first_content) = first.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !first_content.value.contains("Supply chain"),
+            "the real ~750ms two-call sequence must exceed the 700ms wait budget on the \
+             first hover; got: {}",
+            first_content.value
+        );
+
+        // The detached task spawned by the first hover is still running (it needs the
+        // full ~750ms, the first hover only waited 700ms of it) — give it ample real
+        // time to finish and warm the memo before the second hover.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let second = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+        let HoverContents::Markup(second_content) = second.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            second_content.value.contains("Supply chain"),
+            "the memo warmed by the first hover's detached task must serve the second \
+             hover; got: {}",
+            second_content.value
         );
     }
 }

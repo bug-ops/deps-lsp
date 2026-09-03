@@ -48,6 +48,8 @@ pub struct DepsConfig {
     #[serde(default)]
     pub freshness: FreshnessConfig,
     #[serde(default)]
+    pub supply_chain: SupplyChainConfig,
+    #[serde(default)]
     pub registries: RegistriesConfig,
     #[serde(default)]
     pub network: NetworkConfig,
@@ -595,6 +597,41 @@ impl FreshnessConfig {
 
 const fn default_cooldown_secs() -> u64 {
     deps_core::DEFAULT_COOLDOWN_SECS
+}
+
+/// Configuration for the supply-chain trust signal (spec 037, issue #543).
+///
+/// Controls whether hover attempts a deps.dev OpenSSF Scorecard / SLSA
+/// provenance lookup for the hovered dependency. This is the first feature
+/// to send package names to a third party that is not the package's own
+/// registry, so it gets an off switch like every other opt-out-able signal
+/// in this server (`diagnostics.vulnerabilities_enabled`), rather than
+/// requiring a user on a locked-down network to go fully offline.
+///
+/// # Defaults
+///
+/// - `enabled`: `true`
+///
+/// # Examples
+///
+/// ```
+/// use deps_lsp::config::SupplyChainConfig;
+///
+/// let config = SupplyChainConfig::default();
+/// assert!(config.enabled);
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct SupplyChainConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+// Deliberately hand-written, mirroring `CodeLensConfig`'s rationale: a derived
+// `Default` would silently ship the feature disabled.
+impl Default for SupplyChainConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Minimum cooldown window (seconds) — 0 disables the cooldown callout
@@ -1197,6 +1234,33 @@ mod tests {
         // `enabled: false` if CodeLensConfig ever switched to a derived Default.
         let config = DepsConfig::default();
         assert!(config.code_lens.enabled);
+    }
+
+    #[test]
+    fn test_supply_chain_config_defaults() {
+        let config = SupplyChainConfig::default();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_supply_chain_config_deserialization() {
+        let json = r#"{"enabled": false}"#;
+        let config: SupplyChainConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.enabled);
+    }
+
+    #[test]
+    fn test_supply_chain_config_empty_object_defaults_to_enabled() {
+        let config: SupplyChainConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_deps_config_default_has_supply_chain_enabled() {
+        // Regression guard: DepsConfig derives Default, which would silently produce
+        // `enabled: false` if SupplyChainConfig ever switched to a derived Default.
+        let config = DepsConfig::default();
+        assert!(config.supply_chain.enabled);
     }
 
     #[test]

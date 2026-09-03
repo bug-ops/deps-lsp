@@ -5,7 +5,10 @@ use std::sync::Arc;
 use tower_lsp_server::ls_types::{Position, Range, TextEdit, Uri};
 
 use crate::osv::VulnerabilityMap;
-use crate::{ConcreteVersion, Deprecation, EcosystemId, FetchFailure, PackageName, RemovalStatus};
+use crate::{
+    ConcreteVersion, Deprecation, DepsDevClient, EcosystemId, FetchFailure, PackageName,
+    RemovalStatus,
+};
 
 mod code_actions;
 mod code_lenses;
@@ -440,6 +443,16 @@ pub struct VersionData<'a> {
     /// offline OSV skip, which would otherwise look identical to a scanned-and-clean
     /// dependency.
     pub offline: bool,
+    /// The deps.dev client to fetch a supply-chain trust signal through
+    /// (spec 037), when the caller wants hover to attempt one. `None` by
+    /// default and left `None` by every surface but `handlers/hover.rs`
+    /// (deps-lsp) — diagnostics, code actions, inlay hints, and code lenses
+    /// never set this, which is what makes FR-010's hover-only scope
+    /// structural rather than convention: those surfaces cannot reach
+    /// deps.dev because they are never handed a client. `&'a Arc<..>`, not
+    /// `&'a DepsDevClient`, so [`generate_hover`] can clone the `Arc` into a
+    /// detached background task.
+    pub trust: Option<&'a Arc<DepsDevClient>>,
 }
 
 impl<'a> VersionData<'a> {
@@ -471,6 +484,7 @@ impl<'a> VersionData<'a> {
             outcomes: None,
             ecosystem: None,
             offline: false,
+            trust: None,
         }
     }
 
@@ -554,6 +568,29 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_offline(mut self, offline: bool) -> Self {
         self.offline = offline;
+        self
+    }
+
+    /// Attaches a deps.dev client, enabling [`generate_hover`] to attempt a
+    /// supply-chain trust signal for the hovered dependency. See
+    /// [`Self::trust`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{DepsDevClient, HttpCache, VersionData};
+    /// use std::collections::HashMap;
+    /// use std::sync::Arc;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let client = Arc::new(DepsDevClient::new(Arc::new(HttpCache::new())));
+    /// let versions = VersionData::new(&cached, &resolved).with_trust(&client);
+    /// assert!(versions.trust.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_trust(mut self, client: &'a Arc<DepsDevClient>) -> Self {
+        self.trust = Some(client);
         self
     }
 }

@@ -28,7 +28,7 @@ workspace = true
 # (this crate has `publish = true`), so it must never be enabled in a
 # shipped/release build — see `cache::ensure_https` and
 # `net_policy::validate_index_url` for the full contract.
-test-util = ["dep:tracing-subscriber", "dep:urlencoding"]
+test-util = ["dep:tracing-subscriber"]
 
 [dependencies]
 bytes = { workspace = true }
@@ -45,16 +45,16 @@ tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 url = { workspace = true }
-urlencoding = { workspace = true, optional = true }
+urlencoding = { workspace = true }
 yaml-rust2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
+insta = { workspace = true }
 mockito = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 tokio-test = { workspace = true }
-urlencoding = { workspace = true }
 
 [[bench]]
 name = "core_benchmarks"

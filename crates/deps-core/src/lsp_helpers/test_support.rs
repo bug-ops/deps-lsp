@@ -102,6 +102,46 @@ impl SourcePolicy for MockGoFormatter {}
 
 impl OsvNaming for MockGoFormatter {}
 
+/// Formatter stub mirroring `deps-cargo`'s `CargoFormatter`: widens
+/// `can_resolve_source` to accept `AlternateRegistry` (any private/internal
+/// index, not just a crates.io mirror), while leaving
+/// `source_is_public_registry_content` at its default (`Registry` only) —
+/// exercises the M2/critic-C2 regression class, where a source can be
+/// resolvable without its content being safe to treat as a public
+/// registry's (e.g. for the deps.dev trust-signal gate, which must use the
+/// latter, never the former).
+pub(crate) struct MockWidenedResolveFormatter;
+
+impl PackageNaming for MockWidenedResolveFormatter {}
+
+impl PackageRendering for MockWidenedResolveFormatter {
+    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+        version.to_string()
+    }
+
+    fn package_url(&self, name: &PackageName) -> String {
+        format!("https://example.com/{name}")
+    }
+}
+
+impl RequirementResolution for MockWidenedResolveFormatter {}
+
+impl DiagnosticMessages for MockWidenedResolveFormatter {}
+
+impl DiagnosticPolicy for MockWidenedResolveFormatter {}
+
+impl SourcePolicy for MockWidenedResolveFormatter {
+    fn can_resolve_source(&self, source: &crate::parser::DependencySource) -> bool {
+        matches!(
+            source,
+            crate::parser::DependencySource::Registry
+                | crate::parser::DependencySource::AlternateRegistry { .. }
+        )
+    }
+}
+
+impl OsvNaming for MockWidenedResolveFormatter {}
+
 /// A formatter whose `validate_package_name` always rejects, for exercising
 /// the "Invalid package name" diagnostic path independently of "Unknown package".
 pub(crate) struct RejectingFormatter;
