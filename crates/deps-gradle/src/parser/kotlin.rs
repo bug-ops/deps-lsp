@@ -10,12 +10,14 @@ use std::sync::LazyLock;
 use tower_lsp_server::ls_types::Uri;
 
 /// Matches: implementation("group:artifact:version")
+/// (optional whitespace between the configuration word and the opening paren)
 static RE_WITH_VERSION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(\w+)\(\s*"([^:"\s]+):([^:"\s]+):([^"]+)"\s*\)"#).expect("RE_WITH_VERSION")
+    Regex::new(r#"(\w+)\s*\(\s*"([^:"\s]+):([^:"\s]+):([^"]+)"\s*\)"#).expect("RE_WITH_VERSION")
 });
 /// Matches: implementation("group:artifact") — no version
+/// (optional whitespace between the configuration word and the opening paren)
 static RE_NO_VERSION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(\w+)\(\s*"([^:"\s]+):([^:"\s"]+)"\s*\)"#).expect("RE_NO_VERSION")
+    Regex::new(r#"(\w+)\s*\(\s*"([^:"\s]+):([^:"\s]+)"\s*\)"#).expect("RE_NO_VERSION")
 });
 
 const CONFIGURATIONS: &[&str] = &[
@@ -222,6 +224,57 @@ mod tests {
     #[test]
     fn test_no_dependencies_block() {
         let content = "plugins {\n    id(\"java\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_parse_with_parens_whitespace_no_version() {
+        let content = "dependencies {\n    implementation (\"junit:junit\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "junit:junit");
+        assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    #[test]
+    fn test_parse_with_parens_whitespace_with_version() {
+        let content = "dependencies {\n    implementation (\"junit:junit:4.13.2\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "junit:junit");
+        assert_eq!(result.dependencies[0].version_req, Some("4.13.2".into()));
+    }
+
+    #[test]
+    fn test_parse_with_parens_multiple_spaces_and_tab() {
+        let content = "dependencies {\n    implementation   (\"junit:junit:4.13.2\")\n    api\t(\"a:b:1.0\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        assert_eq!(result.dependencies[0].name, "junit:junit");
+        assert_eq!(result.dependencies[1].name, "a:b");
+    }
+
+    #[test]
+    fn test_parse_test_implementation_with_parens_whitespace() {
+        let content = "dependencies {\n    testImplementation (\"junit:junit:4.13.2\")\n}\n";
+        let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].configuration, "testImplementation");
+    }
+
+    #[test]
+    fn test_parens_whitespace_no_false_positive_on_nested_calls() {
+        // Nested-call forms (BOM platform imports, project/module refs, catalog
+        // accessors) are not plain "group:artifact[:version]" string literals,
+        // so they must stay unparsed even with whitespace before the parens.
+        let content = r#"dependencies {
+    implementation (platform("org.springframework.boot:spring-boot-dependencies:3.2.0"))
+    implementation (project(":core"))
+    implementation (libs.junit)
+    implementation (kotlin("stdlib"))
+}
+"#;
         let result = parse_kotlin_dsl(content, &make_uri()).unwrap();
         assert!(result.dependencies.is_empty());
     }
