@@ -3225,29 +3225,48 @@ mod tests {
         );
 
         // The detached task spawned by the first hover is still running (it needs the
-        // full ~750ms, the first hover only waited 700ms of it) — give it ample real
-        // time to finish and warm the memo before the second hover.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-
-        let second = generate_hover(
-            &parse_result,
-            Position::new(0, 2),
-            VersionData::new(&HashMap::new(), &resolved_versions)
-                .with_ecosystem(crate::EcosystemId::Npm)
-                .with_trust(&deps_dev),
-            &registry,
-            &MockFormatter,
-            crate::freshness::FreshnessSettings::default(),
-            PublishTime::now(),
-        )
-        .await
-        .expect("hover should be generated");
-        let HoverContents::Markup(second_content) = second.contents else {
-            panic!("expected markup hover contents");
+        // full ~750ms, the first hover only waited 700ms of it). A single fixed sleep
+        // here raced CI's actual scheduling latency under nextest's cross-test CPU
+        // contention (thousands of tests running concurrently) and was observed to
+        // fail on shared runners even though it passed reliably on an idle local
+        // machine — poll instead of guessing a duration: each polling hover either
+        // hits the now-warm memo (fast) or, while the original task is still running,
+        // hits the in-flight claim and returns instantly with no signal (also fast,
+        // and issues no extra deps.dev request — `trust_signal`'s in-flight dedup
+        // makes a duplicate spawn a no-op), so this loop costs nothing beyond the
+        // actual wait needed on any given machine.
+        let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let second_content = loop {
+            let second = generate_hover(
+                &parse_result,
+                Position::new(0, 2),
+                VersionData::new(&HashMap::new(), &resolved_versions)
+                    .with_ecosystem(crate::EcosystemId::Npm)
+                    .with_trust(&deps_dev),
+                &registry,
+                &MockFormatter,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await
+            .expect("hover should be generated");
+            let HoverContents::Markup(content) = second.contents else {
+                panic!("expected markup hover contents");
+            };
+            if content.value.contains("Supply chain") {
+                break content;
+            }
+            assert!(
+                std::time::Instant::now() < poll_deadline,
+                "the memo warmed by the first hover's detached task never served a \
+                 later hover within 10s; last hover got: {}",
+                content.value
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
         assert!(
             second_content.value.contains("Supply chain"),
-            "the memo warmed by the first hover's detached task must serve the second \
+            "the memo warmed by the first hover's detached task must serve a later \
              hover; got: {}",
             second_content.value
         );
