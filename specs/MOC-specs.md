@@ -56,6 +56,7 @@ status: moc
 | 032 | [[032-npm-npmrc-registry-support/spec\|npm .npmrc custom/private registry support (scoped registries + top-level registry=)]] | plan | implemented — research/enhancement, P3, awaiting merge (PR #510, issue #502) |
 | 033 | [[033-pypi-private-index-support/spec\|PyPI private/custom index resolution (--index-url / --extra-index-url / Poetry source / uv index)]] | tasks | shipped — research/enhancement, P3 (PR #516, issue #513) |
 | 034 | [[034-go-goproxy-private-registry/spec\|Go GOPROXY/GOPRIVATE module proxy resolution]] | specify | draft — research/enhancement, P3 |
+| 035 | [[035-nuget-private-feed-support/spec\|NuGet private/custom feed support (NuGet.Config packageSources)]] | specify | research/parity, P3, 3 open `[NEEDS CLARIFICATION]` items (issue #523) |
 
 ## Completed Specs
 
