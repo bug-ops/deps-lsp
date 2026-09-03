@@ -16,10 +16,12 @@ pub mod ecosystem;
 pub mod ecosystem_registry;
 pub mod error;
 pub mod freshness;
+pub mod fs_probe;
 pub mod github;
 pub mod lockfile;
 pub mod lsp_helpers;
 pub mod macros;
+pub mod mtime_cache;
 pub mod net_policy;
 pub mod osv;
 pub mod package;
@@ -52,6 +54,7 @@ pub use lsp_helpers::{
     is_safe_version_string, is_same_major_minor, position_in_range, requirement_is_unsatisfiable,
     warn_rejected_value,
 };
+pub use mtime_cache::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 pub use package::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 pub use parser::{
     DependencySource, LoadingState, MAX_JSON_NESTING_DEPTH, MAX_TOML_NESTING_DEPTH,

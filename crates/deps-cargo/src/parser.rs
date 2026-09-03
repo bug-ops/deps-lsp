@@ -618,19 +618,15 @@ fn discover_workspace(doc_uri: &Uri) -> Result<WorkspaceDiscovery> {
         depth += 1;
 
         let config_candidate = dir.join(".cargo").join("config.toml");
-        #[cfg(test)]
-        crate::config::fs_probe::STAT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if config_candidate.is_file() {
+        if deps_core::fs_probe::is_file(&config_candidate) {
             config_paths.push(config_candidate);
         }
 
         if workspace_root.is_none() {
             let workspace_toml = dir.join("Cargo.toml");
 
-            #[cfg(test)]
-            crate::config::fs_probe::STAT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if workspace_toml.exists()
-                && let Ok(content) = std::fs::read_to_string(&workspace_toml)
+            if deps_core::fs_probe::is_file(&workspace_toml)
+                && let Ok(content) = deps_core::fs_probe::read_to_string(&workspace_toml)
             {
                 if deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
                     .is_err()
@@ -1458,7 +1454,7 @@ tokio = "1.0"
     /// P1 (plan-1b §4 Performance/M4, flagged missing by the tester validator): the real
     /// bound on the merged ancestor walk is "at most two stats per ancestor directory,
     /// capped at MAX_CONFIG_ANCESTOR_DEPTH" — verified here by actually counting `stat`
-    /// calls (via `crate::config::fs_probe`), not merely asserting the depth cap holds.
+    /// calls (via `deps_core::fs_probe`), not merely asserting the depth cap holds.
     /// Uses a purely synthetic chain deeper than the cap, with no `Cargo.toml`/
     /// `.cargo/config.toml` anywhere in it, so neither search ever short-circuits before the
     /// cap — pinning the count to exactly `2 * MAX_CONFIG_ANCESTOR_DEPTH` regardless of the
@@ -1482,9 +1478,9 @@ tokio = "1.0"
         // `resolve_alternate_registries`'s downstream config resolution, which may add its
         // own (unrelated, already-bounded) `$CARGO_HOME/config.toml` stat if the test
         // process happens to have a real `CARGO_HOME` set.
-        let (stats_before, _) = crate::config::fs_probe::snapshot();
+        let (stats_before, _) = deps_core::fs_probe::snapshot();
         let discovery = discover_workspace(&doc_uri).unwrap();
-        let (stats_after, _) = crate::config::fs_probe::snapshot();
+        let (stats_after, _) = deps_core::fs_probe::snapshot();
 
         assert_eq!(discovery.workspace_root, None);
         assert_eq!(
