@@ -17,6 +17,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Hover info** — Package descriptions with resolved version from lock file
 - **Diagnostics** — Warnings for outdated, unknown, yanked, or unsatisfiable-requirement dependencies
 - **Vulnerability scanning** — OSV.dev-backed advisories in diagnostics and hover, across all supported ecosystems
+- **Supply-chain trust signal** — OpenSSF Scorecard score and SLSA/attestation provenance status in hover, via deps.dev, for npm, Cargo, Go, Maven, PyPI, Bundler, and NuGet
 - **Release-freshness signal** — Flags a "latest" version still within a cooldown window in hover and completion, mirroring GitHub Dependabot's default 3-day package cooldown
 - **Code actions** — Quick fixes to update dependencies, resolve unsatisfiable version requirements, and upgrade to a patched version for known vulnerabilities
 - **Code lens** — "Update N outdated dependencies" batch update on every open manifest
@@ -61,6 +62,7 @@ deps-lsp = { version = "0.12", default-features = false, features = ["cargo", "n
 | `composer` | PHP / composer.json | Yes |
 | `nuget` | C# / .csproj, Directory.Packages.props, packages.config | Yes |
 | `deno` | Deno (JSR/npm) / deno.json, deno.jsonc | Yes |
+| `github-actions` | YAML / .github/workflows/*.yml, *.yaml | Yes |
 
 `deno` pulls in `deps-npm` transitively (`DenoRegistry` delegates `npm:` specifiers to it, per its D3 architecture), even when the `npm` feature itself is disabled.
 
