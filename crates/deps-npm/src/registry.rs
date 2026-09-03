@@ -252,7 +252,7 @@ impl NpmRegistry {
     }
 
     /// Creates an [`NpmRegistry`] client for a resolved `.npmrc` alternate registry — an
-    /// ordinary production constructor (unlike [`Self::with_registry_base`], not gated).
+    /// ordinary production constructor (unlike `Self::with_registry_base`, not gated).
     ///
     /// No `AlternateNpmClient` type exists: an alternate client *is* an [`NpmRegistry`] with
     /// a different base and `tier: WorkspaceDeclared`, so it fetches through
