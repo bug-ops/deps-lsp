@@ -70,6 +70,58 @@ const CONFIGURATIONS: &[&str] = &[
     "provided",
 ];
 
+/// Runs `re` over `line`, filters matches to known `CONFIGURATIONS`, dedups
+/// against `matched_positions` (shared across all patterns tried on this
+/// line), and pushes a [`GradleDependency`] for each surviving match.
+///
+/// All eight Groovy DSL regex variants (with/without parens, with/without
+/// version, plain/platform-wrapped) share identical capture group indices —
+/// 1: configuration, 2: group id, 3: artifact id, 4: version (when present) —
+/// so `has_version` alone distinguishes the two capture shapes.
+fn extract_matches(
+    re: &Regex,
+    line: &str,
+    line_u32: u32,
+    has_version: bool,
+    matched_positions: &mut Vec<usize>,
+    dependencies: &mut Vec<GradleDependency>,
+) {
+    for caps in re.captures_iter(line) {
+        let config = caps.get(1).map_or("", |m| m.as_str());
+        if !CONFIGURATIONS.contains(&config) {
+            continue;
+        }
+        let start = caps.get(0).map_or(0, |m| m.start());
+        if matched_positions.contains(&start) {
+            continue;
+        }
+        matched_positions.push(start);
+
+        let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
+        let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
+        let name = format!("{group_id}:{artifact_id}");
+        let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
+
+        let (version_req, version_range) = if has_version {
+            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
+            let version_range = find_version_range(line, line_u32, &version);
+            (Some(version.into()), Some(version_range))
+        } else {
+            (None, None)
+        };
+
+        dependencies.push(GradleDependency {
+            group_id,
+            artifact_id,
+            name: name.into(),
+            name_range,
+            version_req,
+            version_range,
+            configuration: config.to_string(),
+        });
+    }
+}
+
 pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
     let mut dependencies = Vec::new();
 
@@ -108,232 +160,84 @@ pub fn parse_groovy_dsl(content: &str, uri: &Uri) -> Result<GradleParseResult> {
         let mut matched_positions: Vec<usize> = Vec::new();
 
         // Pattern 1: with parens and version
-        for caps in RE_WITH_PARENS.captures_iter(line) {
-            let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
-                continue;
-            }
-            let start = caps.get(0).map_or(0, |m| m.start());
-            matched_positions.push(start);
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
-            let name = format!("{group_id}:{artifact_id}");
-
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-            let version_range = find_version_range(line, line_u32, &version);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: Some(version.into()),
-                version_range: Some(version_range),
-                configuration: config.to_string(),
-            });
-        }
+        extract_matches(
+            &RE_WITH_PARENS,
+            line,
+            line_u32,
+            true,
+            &mut matched_positions,
+            &mut dependencies,
+        );
 
         // Pattern 2: without parens and with version
-        for caps in RE_WITHOUT_PARENS.captures_iter(line) {
-            let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
-                continue;
-            }
-            let start = caps.get(0).map_or(0, |m| m.start());
-            if matched_positions.contains(&start) {
-                continue;
-            }
-            matched_positions.push(start);
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
-            let name = format!("{group_id}:{artifact_id}");
-
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-            let version_range = find_version_range(line, line_u32, &version);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: Some(version.into()),
-                version_range: Some(version_range),
-                configuration: config.to_string(),
-            });
-        }
+        extract_matches(
+            &RE_WITHOUT_PARENS,
+            line,
+            line_u32,
+            true,
+            &mut matched_positions,
+            &mut dependencies,
+        );
 
         // Pattern 3: with parens, no version
-        for caps in RE_NO_VERSION_WITH_PARENS.captures_iter(line) {
-            let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
-                continue;
-            }
-            let start = caps.get(0).map_or(0, |m| m.start());
-            if matched_positions.contains(&start) {
-                continue;
-            }
-            matched_positions.push(start);
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let name = format!("{group_id}:{artifact_id}");
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: None,
-                version_range: None,
-                configuration: config.to_string(),
-            });
-        }
+        extract_matches(
+            &RE_NO_VERSION_WITH_PARENS,
+            line,
+            line_u32,
+            false,
+            &mut matched_positions,
+            &mut dependencies,
+        );
 
         // Pattern 4: without parens, no version
-        for caps in RE_NO_VERSION_WITHOUT_PARENS.captures_iter(line) {
-            let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
-                continue;
-            }
-            let start = caps.get(0).map_or(0, |m| m.start());
-            if matched_positions.contains(&start) {
-                continue;
-            }
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let name = format!("{group_id}:{artifact_id}");
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: None,
-                version_range: None,
-                configuration: config.to_string(),
-            });
-        }
+        extract_matches(
+            &RE_NO_VERSION_WITHOUT_PARENS,
+            line,
+            line_u32,
+            false,
+            &mut matched_positions,
+            &mut dependencies,
+        );
 
         // Pattern 5: platform()/enforcedPlatform()-wrapped BOM coordinate, with parens, with version
-        for caps in RE_PLATFORM_WITH_PARENS.captures_iter(line) {
-            let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
-                continue;
-            }
-            let start = caps.get(0).map_or(0, |m| m.start());
-            matched_positions.push(start);
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
-            let name = format!("{group_id}:{artifact_id}");
-
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-            let version_range = find_version_range(line, line_u32, &version);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: Some(version.into()),
-                version_range: Some(version_range),
-                configuration: config.to_string(),
-            });
-        }
+        extract_matches(
+            &RE_PLATFORM_WITH_PARENS,
+            line,
+            line_u32,
+            true,
+            &mut matched_positions,
+            &mut dependencies,
+        );
 
         // Pattern 6: same, without parens around the configuration call
-        for caps in RE_PLATFORM_WITHOUT_PARENS.captures_iter(line) {
-            let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
-                continue;
-            }
-            let start = caps.get(0).map_or(0, |m| m.start());
-            if matched_positions.contains(&start) {
-                continue;
-            }
-            matched_positions.push(start);
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let version = caps.get(4).map_or("", |m| m.as_str()).trim().to_string();
-            let name = format!("{group_id}:{artifact_id}");
-
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-            let version_range = find_version_range(line, line_u32, &version);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: Some(version.into()),
-                version_range: Some(version_range),
-                configuration: config.to_string(),
-            });
-        }
+        extract_matches(
+            &RE_PLATFORM_WITHOUT_PARENS,
+            line,
+            line_u32,
+            true,
+            &mut matched_positions,
+            &mut dependencies,
+        );
 
         // Pattern 7: platform()/enforcedPlatform()-wrapped BOM coordinate, with parens, no version
-        for caps in RE_PLATFORM_NO_VERSION_WITH_PARENS.captures_iter(line) {
-            let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
-                continue;
-            }
-            let start = caps.get(0).map_or(0, |m| m.start());
-            if matched_positions.contains(&start) {
-                continue;
-            }
-            matched_positions.push(start);
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let name = format!("{group_id}:{artifact_id}");
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: None,
-                version_range: None,
-                configuration: config.to_string(),
-            });
-        }
+        extract_matches(
+            &RE_PLATFORM_NO_VERSION_WITH_PARENS,
+            line,
+            line_u32,
+            false,
+            &mut matched_positions,
+            &mut dependencies,
+        );
 
         // Pattern 8: same, without parens around the configuration call
-        for caps in RE_PLATFORM_NO_VERSION_WITHOUT_PARENS.captures_iter(line) {
-            let config = caps.get(1).map_or("", |m| m.as_str());
-            if !CONFIGURATIONS.contains(&config) {
-                continue;
-            }
-            let start = caps.get(0).map_or(0, |m| m.start());
-            if matched_positions.contains(&start) {
-                continue;
-            }
-
-            let group_id = caps.get(2).map_or("", |m| m.as_str()).to_string();
-            let artifact_id = caps.get(3).map_or("", |m| m.as_str()).to_string();
-            let name = format!("{group_id}:{artifact_id}");
-            let name_range = find_name_range(line, line_u32, &group_id, &artifact_id);
-
-            dependencies.push(GradleDependency {
-                group_id,
-                artifact_id,
-                name: name.into(),
-                name_range,
-                version_req: None,
-                version_range: None,
-                configuration: config.to_string(),
-            });
-        }
+        extract_matches(
+            &RE_PLATFORM_NO_VERSION_WITHOUT_PARENS,
+            line,
+            line_u32,
+            false,
+            &mut matched_positions,
+            &mut dependencies,
+        );
     }
 
     Ok(GradleParseResult {

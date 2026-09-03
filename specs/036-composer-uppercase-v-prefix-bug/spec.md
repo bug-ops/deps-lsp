@@ -7,7 +7,7 @@ tags:
   - bug
   - deps-composer
 created: 2026-09-03
-status: draft
+status: ready
 related:
   - "[[constitution]]"
 ---
@@ -52,20 +52,25 @@ unrecognized qualifier suffix — nowhere close to its real value.
 
 Notably, a *different* function in the same crate,
 `composer_version_stability_rank`/its prerelease classifier
-(`crates/deps-composer/src/types.rs`, line 434:
+(`crates/deps-composer/src/formatter.rs`, line 435:
 `version.strip_prefix(['v', 'V']).unwrap_or(version)`), already correctly strips both
 cases. The codebase already has the correct pattern established elsewhere (added for
 issue #424 critique C1, covered by `test_composer_version_stability_rank_strips_v_prefix`)
 — it just was not applied consistently to `version_satisfies_requirement` in
 `formatter.rs`.
 
-**Downstream impact**: `version_satisfies_requirement` is consumed by
-`crates/deps-core/src/lsp_helpers/in_use_version.rs` and
-`crates/deps-core/src/lsp_helpers/inlay_hints.rs` (confirmed via
-`grep -rln version_satisfies_requirement crates/`). It drives whether deps-lsp reports the
-currently-locked/in-use version as satisfying the manifest's declared requirement for
-Composer dependencies — i.e. it feeds inlay hints and outdated/up-to-date diagnostic
-classification.
+**Downstream impact**: `version_satisfies_requirement`'s real production consumers are
+`deps-core/src/lsp_helpers/formatter.rs:237` (`RequirementResolution::is_requirement_up_to_date`'s
+default, called from `requirement_status`), `ComposerMatcher::matches`
+(`crates/deps-composer/src/formatter.rs:39`, backing `compile_requirement`), and
+`crates/deps-composer/src/registry.rs:316` and `:359` (`select_latest_matching`'s and
+`select_latest_matching_for_manifest`'s match predicates). (The earlier references to
+`crates/deps-core/src/lsp_helpers/in_use_version.rs` and `inlay_hints.rs` were test-only —
+`in_use_version.rs:53` is a doc comment and `inlay_hints.rs:483-513` is inside a
+`#[cfg(test)]` block, not a production call site.) Together these drive whether deps-lsp
+reports the currently-locked/in-use version as satisfying the manifest's declared
+requirement, and which registry version is selected as "latest matching" for Composer
+dependencies — i.e. it feeds inlay hints and outdated/up-to-date diagnostic classification.
 
 ### Goal
 
@@ -164,27 +169,23 @@ comparison function. No new entities.
   behavior in `types.rs`
 - Touch other ecosystems' version-comparison logic
 
-## 9. Open Questions
+## 9. Resolved Design Decisions
 
-- [NEEDS CLARIFICATION: Should the fix centralize `v`/`V`-prefix stripping into one shared
-  helper function (e.g. `strip_v_prefix(s: &str) -> &str`) used by both
-  `version_satisfies_requirement` in `formatter.rs` and `composer_version_stability_rank`
-  in `types.rs` — consistent with the project's DRY convention (user CLAUDE.md: "Follow
-  DRY: before creating any functionality, check for existing implementations... and reuse
-  them") — or should each of the ~10 existing `strip_prefix('v')` call sites in
-  `formatter.rs` simply be changed in place to `strip_prefix(['v', 'V'])`, matching the
-  established local idiom with minimal diff? A shared helper reduces duplication across
-  two files but is a slightly larger refactor for what is otherwise a single-character
-  case-sensitivity bug.]
-- [NEEDS CLARIFICATION: Does the bare degenerate-prefix guard at formatter.rs line 152-155
-  (`Some(rest) if !rest.is_empty() => rest`, documented rationale for why a lone `"v"`
-  requirement must not collapse to `""`) need an equivalent guard for a lone `"V"`
-  requirement, or can both cases share one guard once the strip call accepts `['v', 'V']`?]
+- **No shared helper.** Each of the ~10 existing `strip_prefix('v')` call sites in
+  `formatter.rs` is changed in place to `strip_prefix(['v', 'V'])`. This matches the
+  established local idiom already used in `types.rs`, is a one-token-array change per
+  call site, and avoids introducing a new abstraction for what is a single-character
+  case-sensitivity bug (project MVP convention: no premature abstractions before v1.0.0).
+- **One shared guard.** The existing bare degenerate-prefix guard
+  (`Some(rest) if !rest.is_empty() => rest`) is prefix-value-agnostic — it only checks
+  whether the remainder after stripping is empty, regardless of whether `'v'` or `'V'`
+  was the matched prefix. Once the strip call accepts `['v', 'V']`, the same guard
+  correctly covers a bare `"V"` requirement with no separate branch needed.
 
 ## 10. See Also
 
 - [[constitution]] — project principles
 - [[MOC-specs]] — all specifications
 - `crates/deps-composer/src/formatter.rs` — `ComposerFormatter::version_satisfies_requirement` (bug site)
-- `crates/deps-composer/src/types.rs`, line 434 — `composer_version_stability_rank`'s existing correct `strip_prefix(['v', 'V'])` pattern (reference for the fix)
-- `crates/deps-core/src/lsp_helpers/in_use_version.rs`, `crates/deps-core/src/lsp_helpers/inlay_hints.rs` — downstream consumers affected by this bug
+- `crates/deps-composer/src/formatter.rs`, line 435 — `composer_version_stability_rank`'s existing correct `strip_prefix(['v', 'V'])` pattern (reference for the fix)
+- `crates/deps-core/src/lsp_helpers/formatter.rs:237` (`is_requirement_up_to_date`), `ComposerMatcher::matches` (`crates/deps-composer/src/formatter.rs:39`), `crates/deps-composer/src/registry.rs:316`/`:359` — real downstream consumers affected by this bug

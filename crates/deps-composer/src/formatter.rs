@@ -139,17 +139,19 @@ impl RequirementResolution for ComposerFormatter {
     /// - `X || Y` — OR combinator
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
-        let version = version.strip_prefix('v').unwrap_or(version);
+        let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
         let requirement = requirement.trim();
-        // Composer's own version parser strips a leading `v` from every version string it
-        // normalizes, tags and constraints alike. Mirroring that only for `version` above
-        // and not here made an exact/wildcard/caret/tilde requirement pinned with a `v`
-        // prefix (e.g. `"v1.2.3"`, `"^v1.2.0"`) never match, since `version` had already
-        // lost its `v` while `requirement` had not. Only strip when it leaves something
-        // behind — a bare `"v"` requirement is not a valid version prefix and must fall
-        // through to the exact/partial match below (which correctly rejects it), rather
-        // than collapsing to `""` and being swallowed by the empty/wildcard guard next.
-        let requirement = match requirement.strip_prefix('v') {
+        // Composer's own version parser strips a leading `v`/`V` from every version string
+        // it normalizes, tags and constraints alike (case-insensitively, per
+        // `VersionParser::normalize()`'s `#^v#i` regex). Mirroring that only for `version`
+        // above and not here made an exact/wildcard/caret/tilde requirement pinned with a
+        // `v`/`V` prefix (e.g. `"v1.2.3"`, `"^v1.2.0"`) never match, since `version` had
+        // already lost its prefix while `requirement` had not. Only strip when it leaves
+        // something behind — a bare `"v"`/`"V"` requirement is not a valid version prefix
+        // and must fall through to the exact/partial match below (which correctly rejects
+        // it), rather than collapsing to `""` and being swallowed by the empty/wildcard
+        // guard next.
+        let requirement = match requirement.strip_prefix(['v', 'V']) {
             Some(rest) if !rest.is_empty() => rest,
             _ => requirement,
         };
@@ -195,13 +197,13 @@ impl RequirementResolution for ComposerFormatter {
 
         // Caret operator
         if let Some(req) = requirement.strip_prefix('^') {
-            let req = req.strip_prefix('v').unwrap_or(req);
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
             return satisfies_caret(version, req);
         }
 
         // Tilde operator — Composer-specific semantics
         if let Some(req) = requirement.strip_prefix('~') {
-            let req = req.strip_prefix('v').unwrap_or(req);
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
             return satisfies_tilde_composer(version, req);
         }
 
@@ -210,32 +212,32 @@ impl RequirementResolution for ComposerFormatter {
         // `split_composer_core_and_suffix`'s qualifier-suffix branch and compare as core `0`.
         if let Some(req) = requirement.strip_prefix(">=") {
             let req = req.trim();
-            let req = req.strip_prefix('v').unwrap_or(req);
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
             return compare_versions(version, req) >= 0;
         }
         if let Some(req) = requirement.strip_prefix("<=") {
             let req = req.trim();
-            let req = req.strip_prefix('v').unwrap_or(req);
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
             return compare_versions(version, req) <= 0;
         }
         if let Some(req) = requirement.strip_prefix('>') {
             let req = req.trim();
-            let req = req.strip_prefix('v').unwrap_or(req);
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
             return compare_versions(version, req) > 0;
         }
         if let Some(req) = requirement.strip_prefix('<') {
             let req = req.trim();
-            let req = req.strip_prefix('v').unwrap_or(req);
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
             return compare_versions(version, req) < 0;
         }
         if let Some(req) = requirement.strip_prefix('=') {
             let req = req.trim();
-            let req = req.strip_prefix('v').unwrap_or(req);
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
             return compare_versions(version, req) == 0;
         }
         if let Some(req) = requirement.strip_prefix("!=") {
             let req = req.trim();
-            let req = req.strip_prefix('v').unwrap_or(req);
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
             return compare_versions(version, req) != 0;
         }
 
@@ -824,6 +826,70 @@ mod tests {
         assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v1.0.5"), "1.0.*"));
         assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "1.2.3"));
         assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("v2.0.0"), "^1.0"));
+    }
+
+    /// #534: an uppercase-`V`-prefixed candidate version (real Packagist tags, e.g.
+    /// `jeremykenedy/laravel2step`'s `V3.1.0`/`V4.0.0`) must be stripped identically to a
+    /// lowercase `v` prefix, across caret, tilde, comparison-operator, wildcard, and
+    /// exact/partial-match branches.
+    #[test]
+    fn test_uppercase_v_prefix_stripped() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V3.1.0"), "^3.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.24.1"), "^1.24"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.2.3"), "~1.2.3"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V4.0.0"), ">=3.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.0.5"), "1.0.*"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V3.1.0"), "3.1.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("V2.0.0"), "^1.0"));
+    }
+
+    /// #534: the requirement side may itself carry an uppercase `V` prefix (bare, or right
+    /// after an operator), and either side's case must not affect the result.
+    #[test]
+    fn test_uppercase_v_prefix_symmetric_on_requirement_side() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "V1.2.3"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.2.3"), "V1.2.3"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.2.3"), "v1.2.3"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("v1.2.3"), "V1.2.3"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^V1.2.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.9"), "~V1.2.3"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^V1.2.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.5"), "V1.0.*"));
+    }
+
+    /// #534: the wildcard branch with BOTH the candidate version and the requirement
+    /// carrying an uppercase `V` prefix simultaneously — existing coverage only exercised
+    /// one side at a time.
+    #[test]
+    fn test_uppercase_v_prefix_wildcard_both_sides() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("V1.0.5"), "V1.0.*"));
+    }
+
+    /// #534: uppercase-`V` on the plain comparison-operator branches (`>=`, `<=`, `>`, `<`,
+    /// `=`, `!=`), mirroring `test_v_prefix_on_comparison_operators` for lowercase `v`.
+    #[test]
+    fn test_uppercase_v_prefix_on_comparison_operators() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">=V1.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), ">=V1.0.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "<=V2.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.5.0"), "<V2.0.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.1"), ">V2.0.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "=V2.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "!=V2.0.0"));
+    }
+
+    /// #534: a bare uppercase `"V"` requirement must fall through to exact/partial match
+    /// unchanged, not collapse to `""` and be swallowed by the empty/wildcard guard —
+    /// mirrors `test_bare_v_requirement_does_not_match_everything` for the lowercase case.
+    #[test]
+    fn test_bare_uppercase_v_requirement_does_not_match_everything() {
+        let f = ComposerFormatter;
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "V"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), "V"));
     }
 
     #[test]

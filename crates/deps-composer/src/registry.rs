@@ -1939,6 +1939,36 @@ mod tests {
         assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
     }
 
+    // --- #534: uppercase-`V`-prefixed version satisfies a concrete requirement, end-to-end ---
+
+    /// #534: reproduces the real end-to-end regression (not just the isolated formatter unit
+    /// test) — before the fix, an uppercase-`V`-prefixed version like `V3.1.0` sent
+    /// `compare_versions` down `split_composer_core_and_suffix`'s qualifier-suffix branch with
+    /// numeric core `0` (only a lowercase `v` was stripped), so `version_satisfies_requirement`
+    /// silently never matched a concrete requirement, and `select_latest_matching` — the layer
+    /// that actually drives Composer's "latest matching version" resolution — returned `None`
+    /// even though the version is a real match.
+    #[test]
+    fn test_select_latest_matching_uppercase_v_prefixed_version_satisfies_requirement() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = PackagistRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(ComposerVersion {
+            version: "V3.1.0".into(),
+            version_normalized: "3.1.0.0".into(),
+            abandoned: false,
+            deprecation: None,
+            published_at: None,
+        })];
+        let req = VersionReq::new(">=3.0");
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req),
+            Some(0),
+            "V3.1.0 must satisfy >=3.0 through the real select_latest_matching path"
+        );
+    }
+
     // --- #424 S3: separator-less prerelease suffix consistency ---
 
     /// #424 S3: `1.0.0RC1` (no separator before `RC`) must be excluded from "latest" by the
