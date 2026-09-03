@@ -42,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle**: added a dedicated unit test for the parens-no-version dependency pattern (`RE_NO_VERSION_WITH_PARENS`); no behavior change (resolves #517)
 
 ### Fixed
-- **deps-gradle**: a Groovy DSL dependency declaration with whitespace before the opening paren (e.g. `implementation ('junit:junit:4.13.2')`) is no longer silently dropped (resolves #525)
+- **deps-gradle**: a Groovy DSL dependency declaration with whitespace before the opening paren (e.g. `implementation ('junit:junit:4.13.2')`) is no longer silently dropped (resolves #525) (#527)
 - **deps-github-actions**: a tags-API page with one entry missing/malformed `commit.sha` no longer aborts the whole page's parse and silently truncates later pages — only that entry is now skipped (side effect of the #472 GitHub-tags-client extraction) (#476)
 - **deps-core, deps-lsp**: the "requirement satisfiable only by a yanked version" diagnostic no longer lets a co-occurring package-level deprecation finding hide a genuine hard yank (resolves #437) (#438)
 - **deps-deno, deps-npm**: an exact-pin `npm:` dependency in `deno.json` no longer surfaces the yanked-worded diagnostic, matching the equivalent `package.json` dependency's post-#436 behavior; `jsr:` specifiers are unaffected (resolves #448)
