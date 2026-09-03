@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **deps-core, deps-lsp**: supply-chain trust signal in hover — OpenSSF Scorecard score and SLSA/attestation provenance status via deps.dev, for npm/Cargo/Go/Maven/PyPI/Bundler/NuGet, behind a new `supply_chain.enabled` toggle (resolves #543)
+- **deps-core, deps-lsp**: supply-chain trust signal in hover — OpenSSF Scorecard score and SLSA/attestation provenance status via deps.dev, for npm/Cargo/Go/Maven/PyPI/Bundler/NuGet, behind a new `supply_chain.enabled` toggle (resolves #543) (#554)
 
 ### Fixed
 - **deps-core, deps-github-actions, deps-swift**: fixed sequential GitHub tag-pagination fetch exceeding the per-dependency timeout for high-tag-count repos (resolves #553)
