@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **deps-core, deps-github-actions, deps-swift**: fixed sequential GitHub tag-pagination fetch exceeding the per-dependency timeout for high-tag-count repos (resolves #553)
 - **deps-core, deps-lsp, deps-github-actions**: fixed false "Unknown package" diagnostic when a dependency's tags exist but none are full-semver-shaped (e.g. `dtolnay/rust-toolchain`), and a stray hover "Press Cmd+. to update version" footer with an empty "Recent versions" section in the same case (resolves #550) (#552)
 - **deps-github-actions**: mutable-ref-pin diagnostic now fires for literal-named git tags (e.g. `taiki-e/install-action@cargo-deny`) previously misclassified as an undiagnosable branch pin (resolves #551) (#552)
 

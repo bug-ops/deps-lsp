@@ -45,6 +45,25 @@ pub const GITHUB_API: &str = "https://api.github.com";
 /// subset fixes that, since the highest real versions were never fetched at all.
 pub const MAX_TAG_PAGES: u32 = 30;
 
+/// Number of tag pages [`paginate_tags`] fetches concurrently per batch.
+///
+/// Sequential pagination (one page RTT at a time) is what made a many-tag repo (e.g. 1327
+/// tags / 14 pages) exceed `deps-lsp`'s per-dependency fetch timeout (#553). 5 keeps
+/// wall-clock time comfortably under that timeout while staying low enough to avoid
+/// tripping GitHub's secondary (abuse) rate limiter, which reacts to burst concurrency
+/// independent of the hourly quota. Total request count is unchanged for the common
+/// single-page-repo case; for multi-page repos it may grow by up to `CONCURRENCY - 1` pages
+/// (see [`paginate_tags`]'s doc comment). Negligible against the 5000/h *tokened* quota; a
+/// multi-page repo fetched *without* a `GITHUB_TOKEN` can cost up to 3x its pre-fix request
+/// count against the much smaller 60/h unauthenticated quota.
+///
+/// Known limitation: there is no process-wide cap on concurrent GitHub requests across
+/// dependencies — a workspace with many GitHub-tags-backed dependencies fetched at once can
+/// multiply this per-dependency concurrency well past `CONCURRENCY`. Evaluated and shipped
+/// as-is (see PR discussion); add a shared `Semaphore` in `GithubTagsClient` if this is ever
+/// observed as a real problem.
+const CONCURRENCY: usize = 5;
+
 /// Whether `name` matches the `owner/repo` GitHub identifier shape every GitHub-tags-backed
 /// ecosystem accepts.
 ///
@@ -357,8 +376,26 @@ pub fn warn_if_pagination_truncated(ecosystem: &str, name: &str, page: u32, page
     }
 }
 
-/// Drives the GitHub tags pagination loop, fetching pages via `fetch_page` until a partial
-/// page is seen or [`MAX_TAG_PAGES`] is reached.
+/// Drives the GitHub tags pagination loop: page 1 alone, then subsequent pages in batches
+/// of up to `CONCURRENCY` pages.
+///
+/// Page 1 is always fetched by itself before any batching starts, for two reasons: most
+/// repos fit in one page, so this keeps the common case at exactly the one request it took
+/// before this function gained concurrency; and an error on page 1 (bad auth, tripped rate
+/// limit, unknown repo) is now surfaced from a single request instead of fanning a doomed
+/// request out to `CONCURRENCY` pages at once.
+///
+/// Once page 1 is confirmed full, pages 2+ are fetched in batches of `CONCURRENCY`,
+/// stopping once a partial/empty page is seen or [`MAX_TAG_PAGES`] is reached. Pages within
+/// a batch are fetched concurrently, but always processed in page order — the pages
+/// dispatched *after* the batch's partial page are simply discarded once found, not
+/// avoided, since by the time a batch's first result comes back the rest of that batch's
+/// requests are already in flight and cannot be un-sent. This bounds, but does not
+/// eliminate, extra requests: at most `CONCURRENCY - 1` pages beyond a repo's true last page
+/// may be fetched and discarded, only when that last page doesn't land on a batch boundary.
+/// `deps-github-actions`'s tag-to-SHA index dedups "first tag wins" on page order, so
+/// out-of-order processing (not just fetching) would change which tag is picked as
+/// canonical for a shared SHA — hence ordered `buffered`, not `buffer_unordered`.
 ///
 /// `ecosystem` is forwarded to [`warn_if_pagination_truncated`] to name the caller in the
 /// truncation warning. Extracted so ecosystem crates' tests can inject a fake `fetch_page`
@@ -367,8 +404,10 @@ pub fn warn_if_pagination_truncated(ecosystem: &str, name: &str, page: u32, page
 ///
 /// # Errors
 ///
-/// Propagates any error `fetch_page` returns, or the error from [`parse_tags_page`] when a
-/// page's body is a GitHub error object.
+/// Propagates the first error seen among `fetch_page`'s results (page 1's own error, or the
+/// first in page order within a batch — any other in-flight futures in that batch are
+/// dropped), or the error from [`parse_tags_page`] when a page's body is a GitHub error
+/// object.
 pub async fn paginate_tags<F, Fut>(
     ecosystem: &str,
     name: &str,
@@ -378,16 +417,39 @@ where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<Bytes>>,
 {
+    use futures::stream::{self, StreamExt};
+
     let mut tags = Vec::new();
-    for page in 1..=MAX_TAG_PAGES {
-        let data = fetch_page(page).await?;
-        let page_tags = parse_tags_page(&data)?;
-        let page_len = page_tags.len();
-        tags.extend(page_tags);
-        if !page_has_more(page_len) {
-            break;
+
+    let first_page = fetch_page(1).await?;
+    let first_tags = parse_tags_page(&first_page)?;
+    let first_page_len = first_tags.len();
+    tags.extend(first_tags);
+    if !page_has_more(first_page_len) {
+        // No call to `warn_if_pagination_truncated` here: it only fires at
+        // `page == MAX_TAG_PAGES`, which page 1 can never equal since `MAX_TAG_PAGES > 1`.
+        return Ok(tags);
+    }
+
+    let mut page = 2u32;
+    'batches: while page <= MAX_TAG_PAGES {
+        let batch_end = (page + CONCURRENCY as u32 - 1).min(MAX_TAG_PAGES);
+        let mut stream = stream::iter(page..=batch_end)
+            .map(&mut fetch_page)
+            .buffered(CONCURRENCY);
+
+        let mut current_page = page;
+        while let Some(data) = stream.next().await {
+            let page_tags = parse_tags_page(&data?)?;
+            let page_len = page_tags.len();
+            tags.extend(page_tags);
+            if !page_has_more(page_len) {
+                break 'batches;
+            }
+            warn_if_pagination_truncated(ecosystem, name, current_page, page_len);
+            current_page += 1;
         }
-        warn_if_pagination_truncated(ecosystem, name, page, page_len);
+        page = batch_end + 1;
     }
     Ok(tags)
 }
@@ -824,9 +886,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_paginate_tags_single_page_repo_fetches_exactly_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let calls = AtomicU32::new(0);
+        let result = paginate_tags("Swift", "owner/repo", |page| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match page {
+                    1 => Ok(tags_page_json(42)),
+                    _ => panic!("page {page} must not be fetched: page 1 is fetched alone and is already partial"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the common single-page-repo case must not pay for batching"
+        );
+        assert_eq!(result.len(), 42);
+    }
+
+    #[tokio::test]
     async fn test_paginate_tags_stops_after_partial_page() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
+        // Page 2 is the partial (true last) page, but it falls inside the first batch
+        // dispatched after page 1 (pages 2-6, CONCURRENCY=5): by the time page 2's short
+        // response is processed, pages 3-6 are already in flight and get fetched too, then
+        // discarded. This is the documented, bounded overfetch tradeoff of batched
+        // concurrency (see `paginate_tags`'s doc comment) — page 7+ is a separate batch that
+        // must never be dispatched.
         let calls = AtomicU32::new(0);
         let mut tags = Vec::new();
         let output = capture_tracing_output_async(async {
@@ -836,7 +929,10 @@ mod tests {
                     match page {
                         1 => Ok(tags_page_json(100)),
                         2 => Ok(tags_page_json(42)),
-                        _ => panic!("page {page} must not be fetched after a partial page"),
+                        3..=6 => Ok(tags_page_json(0)),
+                        _ => panic!(
+                            "page {page} must not be fetched outside the batch containing the partial page"
+                        ),
                     }
                 }
             })
@@ -848,13 +944,105 @@ mod tests {
 
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
-            "must stop after the partial page 2"
+            6,
+            "page 1 fetched alone, then the whole batch containing partial page 2 (2-6)"
         );
-        assert_eq!(tags.len(), 142);
+        assert_eq!(
+            tags.len(),
+            142,
+            "only tags through the true last page (2) are kept, despite pages 3-6 being fetched"
+        );
         assert!(
             output.is_empty(),
             "must not warn below the page cap: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_paginate_tags_preserves_page_order_despite_inverted_completion() {
+        /// Builds a JSON tags page with `count` entries named `{prefix}-{i}`, so the
+        /// origin page of each output tag is identifiable.
+        fn named_page(prefix: &str, count: usize) -> Bytes {
+            let entries: Vec<String> = (0..count)
+                .map(|i| format!(r#"{{"name":"{prefix}-{i}"}}"#))
+                .collect();
+            Bytes::from(format!("[{}]", entries.join(",")))
+        }
+
+        // Pages 2-5 (one batch's full pages) resolve slowest-first (page 2 waits longest,
+        // page 5 barely waits); page 6 (the partial page ending the batch) resolves
+        // instantly. If `paginate_tags` used `buffer_unordered` instead of ordered
+        // `buffered`, the output would be ordered by this completion order (6,5,4,3,2)
+        // instead of page order (1,2,3,4,5,6) — `deps-github-actions`'s tag-to-SHA
+        // "first tag wins" dedup depends on the latter.
+        let result = paginate_tags("Swift", "owner/repo", |page| async move {
+            match page {
+                1 => Ok(named_page("page1", 100)),
+                2 => {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok(named_page("page2", 100))
+                }
+                3 => {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Ok(named_page("page3", 100))
+                }
+                4 => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(named_page("page4", 100))
+                }
+                5 => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(named_page("page5", 100))
+                }
+                6 => Ok(named_page("page6", 1)),
+                _ => panic!("page {page} must not be fetched"),
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 501);
+        for (expected_prefix, start, len) in [
+            ("page1", 0, 100),
+            ("page2", 100, 100),
+            ("page3", 200, 100),
+            ("page4", 300, 100),
+            ("page5", 400, 100),
+            ("page6", 500, 1),
+        ] {
+            for i in 0..len {
+                assert!(
+                    result[start + i].name.starts_with(expected_prefix),
+                    "expected {expected_prefix} at index {}, got {}",
+                    start + i,
+                    result[start + i].name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_paginate_tags_mid_batch_error_propagates_as_that_pages_error() {
+        // Page 4 errors while pages 5-6 (later in page order, but faster to resolve) are
+        // still in flight. The error returned must be page 4's own, not silently swapped
+        // for a sibling's outcome or swallowed into an `Ok` with a truncated result.
+        let err = paginate_tags("Swift", "owner/repo", |page| async move {
+            match page {
+                1..=3 => Ok(tags_page_json(100)),
+                4 => Err(DepsError::CacheError("boom from page 4".to_string())),
+                5..=6 => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(tags_page_json(100))
+                }
+                _ => panic!("page {page} must not be fetched"),
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("boom from page 4"),
+            "must propagate page 4's own error, got: {err}"
         );
     }
 
