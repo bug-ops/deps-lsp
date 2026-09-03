@@ -321,13 +321,17 @@ impl GithubActionsRegistry {
             return Err(Self::rate_limited_error());
         }
 
+        // `map_tags_error` is applied to the *outcome* of `paginate_tags`, not inside the
+        // per-page closure: since `paginate_tags` fetches pages in concurrent batches, a
+        // page discarded after a partial page earlier in the same batch can still resolve
+        // to a 403 here. Mapping (and tripping the rate-limit gate) inside the closure would
+        // let that discarded error poison the shared gate even though this call still
+        // returns `Ok` overall (critic S2).
         let tags = paginate_tags("GitHub Actions", name, |page| async move {
-            self.github
-                .fetch_tags_page(name, page)
-                .await
-                .map_err(|e| self.map_tags_error(name, e))
+            self.github.fetch_tags_page(name, page).await
         })
-        .await?;
+        .await
+        .map_err(|e| self.map_tags_error(name, e))?;
 
         self.populate_tag_index(&package_name, &tags);
         Ok(tags_to_versions(tags))
@@ -851,6 +855,97 @@ mod tests {
         let err = registry.get_versions("owner/repo").await.unwrap_err();
         assert!(err.to_string().contains("GITHUB_TOKEN"));
         mock.assert_async().await;
+    }
+
+    /// Regression for critic S2 (#553 review): `paginate_tags` fetches a batch's pages
+    /// concurrently via ordered `buffered`, which polls every in-flight future on each
+    /// poll regardless of which one it's currently waiting to yield. So a discarded page
+    /// that resolves *faster* than the partial page ending pagination still runs its
+    /// whole future — including, pre-fix, `map_tags_error`'s `trip()` side effect —
+    /// before that partial page is ever read. Page 1 is full (forces batching); page 2
+    /// (the true last, partial page) is held back by an artificial delay, while page 3 —
+    /// dispatched concurrently in the same batch — responds instantly with an untokened
+    /// 403, guaranteeing it completes (and, pre-fix, trips the gate) before page 2's slow
+    /// response is ever processed. Without the delay this race is timing-dependent
+    /// against a fast local mock and does not reliably reproduce the bug.
+    #[tokio::test]
+    async fn test_get_versions_discarded_overfetch_page_403_does_not_trip_gate() {
+        let sha = "a".repeat(40);
+        let mut server = mockito::Server::new_async().await;
+        let full_page: String = format!(
+            "[{}]",
+            (0..100)
+                .map(|i| format!(r#"{{"name":"{i}.0.0","commit":{{"sha":"{sha}"}}}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let _page1 = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::UrlEncoded("page".into(), "1".into()))
+            .with_status(200)
+            .with_body(full_page)
+            .create_async()
+            .await;
+        // Page 2 (the true, partial last page) is slow: it must still be unresolved when
+        // page 3's fast 403 below completes, so the discarded page really does finish
+        // (and run its whole future) before pagination ends.
+        let _page2 = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::UrlEncoded("page".into(), "2".into()))
+            .with_status(200)
+            .with_chunked_body(move |w| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                w.write_all(
+                    format!(r#"[{{"name":"v1.0.0","commit":{{"sha":"{sha}"}}}}]"#).as_bytes(),
+                )
+            })
+            .create_async()
+            .await;
+        // Page 3 completes the batch dispatched alongside page 2, responding instantly
+        // with an untokened 403 — the exact shape that, pre-fix, calls `map_tags_error`
+        // -> `trip()` inside the per-page closure regardless of whether page 2 (once it
+        // finally resolves) turns out to end pagination before page 3's result is ever
+        // read.
+        let page3 = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::UrlEncoded("page".into(), "3".into()))
+            .with_status(403)
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+        // Pages 4-6 complete the batch; status/timing don't matter for this test. Mocks
+        // stay registered on `server` independent of the returned handle's lifetime, so
+        // they don't need to be kept bound to a variable.
+        for page in 4..=6 {
+            let _ = server
+                .mock("GET", "/repos/owner/repo/tags")
+                .match_query(mockito::Matcher::UrlEncoded(
+                    "page".into(),
+                    page.to_string(),
+                ))
+                .with_status(403)
+                .with_body("{}")
+                .create_async()
+                .await;
+        }
+
+        let registry = mock_registry(&server.url(), false);
+        let result = registry.get_versions("owner/repo").await;
+
+        assert!(
+            result.is_ok(),
+            "a discarded overfetch page's error must not fail the overall call: {result:?}"
+        );
+        assert!(
+            !registry.rate_limit.is_tripped(),
+            "a discarded overfetch page's 403 must not trip the shared rate-limit gate"
+        );
+        // Confirms page 3 really was requested and resolved (proving this test exercises
+        // the overfetch-then-discard race, not a no-op), not merely that the gate is
+        // untripped for an unrelated reason.
+        page3.assert_async().await;
     }
 
     #[tokio::test]
