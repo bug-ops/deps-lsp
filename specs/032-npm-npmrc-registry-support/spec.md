@@ -10,7 +10,7 @@ tags:
   - npm
   - security
 created: 2026-09-02
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"

@@ -15,6 +15,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **TOML parsing** — Parse `Cargo.toml` with byte-accurate position tracking via `toml-span`
 - **Lock file parsing** — Extract resolved versions from `Cargo.lock`
 - **crates.io registry** — Sparse index client for version lookups and package metadata
+- **Custom/private registries** — Resolves `registry = "<alias>"`/`registry-index = "<url>"` dependencies via `.cargo/config.toml`/`$CARGO_HOME/config.toml`, and `[source.crates-io] replace-with` sparse-index mirrors
 - **Semver resolution** — Resolve `^`, `~`, `*`, and range specifiers against available versions
 - **Workspace support** — Handle `workspace.dependencies` inheritance and `version.workspace = true`
 - **Target-specific dependencies** — Parse `[target.<cfg-expr-or-triple>.dependencies]`/`.dev-dependencies`/`.build-dependencies` tables, same as top-level ones
@@ -24,7 +25,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-cargo = "0.11"
+deps-cargo = "0.12"
 ```
 
 > [!IMPORTANT]

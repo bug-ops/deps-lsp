@@ -34,7 +34,7 @@ status: moc
 | 011 | [[011-deprecation-replacement-diagnostics/spec\|Deprecation/abandoned diagnostics with suggested replacement]] | specify | draft — research/parity, P3, 9 open `[NEEDS CLARIFICATION]` items |
 | 012 | [[012-unsatisfiable-requirement-diagnostic/spec\|Diagnostic for requirements matching zero published versions]] | specify | draft — enhancement/parity, P3, 9 open `[NEEDS CLARIFICATION]` items |
 | 013 | [[013-deno-jsr-ecosystem/spec\|New ecosystem: Deno/JSR (deno.json / deno.jsonc)]] | specify | draft — research/new ecosystem, P3, 10 open `[NEEDS CLARIFICATION]` items |
-| 014 | [[014-github-actions-ecosystem/spec\|New ecosystem: GitHub Actions workflow uses: pins]] | specify | draft — research/new ecosystem, P4, 9 open `[NEEDS CLARIFICATION]` items |
+| 014 | [[014-github-actions-ecosystem/spec\|New ecosystem: GitHub Actions workflow uses: pins]] | specify | shipped — research/new ecosystem, P4 (PR #471, issue #208) |
 | 015 | [[015-lsp-3-18-diagnostic-markup-tooltip-gap/spec\|LSP 3.18 diagnostic markup / command-tooltip support blocked by ls-types 0.0.6]] | specify | draft — research/dependency-gap, P4, 3 open `[NEEDS CLARIFICATION]` items, blocked on upstream — no `/sdd plan` |
 | 016 | [[016-bundler-platform-duplicate-versions/spec\|Deduplicate RubyGems platform-variant versions in Bundler hover]] | specify | draft — bug, P1, 3 open `[NEEDS CLARIFICATION]` items |
 | 017 | [[017-hover-latest-marker-prerelease-mismatch/spec\|Hover "Recent versions" `(latest)` marker can disagree with the header's `Latest` field]] | specify | draft — bug, P2, 2 open `[NEEDS CLARIFICATION]` items |
@@ -52,12 +52,12 @@ status: moc
 | 028 | [[028-pypi-requirements-documentlinks-and-directory-layout/spec\|PyPI requirements.txt -r/-c documentLinks and requirements/*.txt directory-layout recognition]] | specify | shipped — enhancement/security-hardening, P3 (PR #458, issue #452) |
 | 029 | [[029-deno-jsr-yanked-exact-pin-restriction-drop/spec\|Drop the jsr: exact-pin-only restriction on the Deno yanked diagnostic]] | specify | shipped — bug, P2 (PR #459, issue #454) |
 | 030 | [[030-gitlab-ci-ecosystem/spec\|New ecosystem: GitLab CI/CD include: version pins]] | specify | draft — research/new ecosystem, P4, 8 open `[NEEDS CLARIFICATION]` items, blocked on #208 (issue #466 tracks implementation) |
-| 031 | [[031-github-actions-sha-pin-diagnostic/spec\|GitHub Actions mutable-ref-pin security diagnostic (SHA-pin recommendation)]] | tasks | implemented — research/parity, P2, awaiting merge (PR #477, issue #473) |
-| 032 | [[032-npm-npmrc-registry-support/spec\|npm .npmrc custom/private registry support (scoped registries + top-level registry=)]] | plan | implemented — research/enhancement, P3, awaiting merge (PR #510, issue #502) |
+| 031 | [[031-github-actions-sha-pin-diagnostic/spec\|GitHub Actions mutable-ref-pin security diagnostic (SHA-pin recommendation)]] | tasks | shipped — research/parity, P2 (PR #477, issue #473) |
+| 032 | [[032-npm-npmrc-registry-support/spec\|npm .npmrc custom/private registry support (scoped registries + top-level registry=)]] | plan | shipped — research/enhancement, P3 (PR #510, issue #502) |
 | 033 | [[033-pypi-private-index-support/spec\|PyPI private/custom index resolution (--index-url / --extra-index-url / Poetry source / uv index)]] | tasks | shipped — research/enhancement, P3 (PR #516, issue #513) |
 | 034 | [[034-go-goproxy-private-registry/spec\|Go GOPROXY/GOPRIVATE module proxy resolution]] | specify | draft — research/enhancement, P3 |
 | 035 | [[035-nuget-private-feed-support/spec\|NuGet private/custom feed support (NuGet.Config packageSources)]] | specify | research/parity, P3, 3 open `[NEEDS CLARIFICATION]` items (issue #523) |
-| 036 | [[036-composer-uppercase-v-prefix-bug/spec\|Composer requirement matching fails for uppercase-V-prefixed versions]] | specify | implemented — bug, P1, awaiting merge (issue #534) |
+| 036 | [[036-composer-uppercase-v-prefix-bug/spec\|Composer requirement matching fails for uppercase-V-prefixed versions]] | specify | shipped — bug, P1 (PR #538, issue #534) |
 | 037 | [[037-supply-chain-trust-signal/spec\|Supply-chain trust signal (OpenSSF Scorecard + SLSA provenance) via deps.dev]] | specify | draft — research/parity, P3, 5 open `[NEEDS CLARIFICATION]` items |
 | 038 | [[038-workspace-diagnostics-pull-support/spec\|Workspace Diagnostics Pull Support]] | specify | draft — research/enhancement, P4, 4 open `[NEEDS CLARIFICATION]` items (issue #547) |
 

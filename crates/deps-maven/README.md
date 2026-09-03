@@ -24,7 +24,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-maven = "0.11"
+deps-maven = "0.12"
 ```
 
 > [!IMPORTANT]
