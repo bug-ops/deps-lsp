@@ -267,6 +267,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_no_version_with_parens() {
+        let content = "dependencies {\n    implementation('com.example:lib')\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.name, "com.example:lib");
+        assert!(dep.version_req.is_none());
+        assert!(dep.version_range.is_none());
+        assert_eq!(dep.name_range.start.line, 1);
+        assert_eq!(dep.name_range.start.character, 20);
+    }
+
+    #[test]
     fn test_empty_block() {
         let content = "dependencies {\n}\n";
         let result = parse_groovy_dsl(content, &make_uri()).unwrap();
