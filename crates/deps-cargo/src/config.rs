@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use toml_span::value::Table;
 
-use deps_core::net_policy::{HostClass, RegistryAccessPolicy, classify_host};
+use deps_core::net_policy::{HostClass, PolicyGate, RegistryAccessPolicy, validate_index_url};
 
 /// Test-only filesystem-call counters (plan-1b §4 Performance/M4): `ConfigFileCache` claims
 /// "one stat, zero reads" on a cache hit, and [`crate::parser::discover_workspace`] claims
@@ -175,18 +175,6 @@ impl IndexTrust {
     }
 }
 
-/// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`) with an `http`
-/// scheme — the shape every `mockito::Server` binds to.
-///
-/// Only compiled into test builds (see [`RegistryIndex::new`]'s use of this): a
-/// non-loopback host must never be allowed to bypass the https requirement, even under
-/// `cfg(test)`/`test-util` — mirrors `deps_core::cache`'s identical `is_loopback_host`
-/// precedent for `HttpCache::ensure_https`.
-#[cfg(any(test, feature = "test-util"))]
-fn is_loopback_url(url: &url::Url) -> bool {
-    url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
-}
-
 /// A validated, `sparse+`-prefix-stripped sparse-index URL: `https` scheme, no userinfo, and
 /// (for a `WorkspaceDeclared` candidate) a host the live
 /// [`deps_core::net_policy::RegistryAccessPolicy`] allows.
@@ -207,25 +195,10 @@ pub struct RegistryIndex {
 }
 
 /// Why a candidate index URL failed [`RegistryIndex::new`]'s validation.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum RegistryIndexError {
-    /// The value did not parse as a URL at all (after stripping a `sparse+` prefix).
-    #[error("not a valid URL: {0}")]
-    InvalidUrl(String),
-    /// The URL's scheme is not `https`.
-    #[error("registry index must use https, got scheme {0:?}")]
-    NotHttps(String),
-    /// The URL carries a `user:pass@`/`user@` component.
-    #[error("registry index URL must not carry userinfo")]
-    UserInfoPresent,
-    /// A `WorkspaceDeclared` candidate's host is blocked by the current
-    /// [`deps_core::net_policy::WorkspaceRegistryAccess`] policy.
-    #[error("registry index host class {class} blocked by registries.workspace_registries policy")]
-    BlockedHost {
-        /// The blocked host's classification.
-        class: HostClass,
-    },
-}
+///
+/// An alias of the shared [`deps_core::net_policy::IndexUrlError`] — see that type's docs
+/// for the variants and their wording.
+pub use deps_core::net_policy::IndexUrlError as RegistryIndexError;
 
 impl RegistryIndex {
     /// Validates and wraps `raw` — a `registry-index` manifest value, a
@@ -272,28 +245,11 @@ impl RegistryIndex {
         policy: &RegistryAccessPolicy,
     ) -> Result<Self, RegistryIndexError> {
         let stripped = raw.strip_prefix("sparse+").unwrap_or(raw);
-        let url = url::Url::parse(stripped)
-            .map_err(|_| RegistryIndexError::InvalidUrl(stripped.to_string()))?;
-        let is_https = url.scheme() == "https";
-        #[cfg(any(test, feature = "test-util"))]
-        let is_https = is_https || is_loopback_url(&url);
-        if !is_https {
-            return Err(RegistryIndexError::NotHttps(url.scheme().to_string()));
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(RegistryIndexError::UserInfoPresent);
-        }
-        if trust == IndexTrust::WorkspaceDeclared {
-            let class = classify_host(&url);
-            if !policy.get().allows(class) {
-                tracing::warn!(
-                    url = %url,
-                    ?class,
-                    "workspace-declared registry index host blocked by registries.workspace_registries policy"
-                );
-                return Err(RegistryIndexError::BlockedHost { class });
-            }
-        }
+        let gate = match trust {
+            IndexTrust::Trusted => PolicyGate::Skip,
+            IndexTrust::WorkspaceDeclared => PolicyGate::Enforce(policy),
+        };
+        let url = validate_index_url(stripped, stripped, "cargo", gate)?;
         Ok(Self { url, trust })
     }
 

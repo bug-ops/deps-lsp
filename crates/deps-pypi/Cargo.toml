@@ -15,8 +15,9 @@ workspace = true
 [features]
 # Gates the test-only https loopback carve-out in `config::PypiIndexUrl::new` for
 # downstream crates' own test builds (`cfg(test)` alone would not apply there) —
-# mirrors `deps-npm`'s identical `test-util` feature.
-test-util = []
+# mirrors `deps-npm`'s identical `test-util` feature. The carve-out itself now lives in
+# `deps-core`, so this forwards `deps-core/test-util`.
+test-util = ["deps-core/test-util"]
 
 [dependencies]
 dashmap = { workspace = true }

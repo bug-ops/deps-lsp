@@ -117,7 +117,11 @@ impl BodyLimit {
 /// and an optional port — the shape every `mockito::Server` binds to.
 ///
 /// Only compiled into test builds (see [`ensure_https`]): a non-loopback host must never
-/// be allowed to bypass the HTTPS requirement, even under `cfg(test)`/`test-util`.
+/// be allowed to bypass the HTTPS requirement, even under `cfg(test)`/`test-util`. See
+/// [`crate::net_policy::validate_index_url`]'s own private loopback check for the
+/// counterpart used on parsed `url::Url` values — kept separate rather than merged, since
+/// this one takes a raw `&str` on `ensure_https`'s hot path and has looser (any-scheme)
+/// semantics.
 #[cfg(any(test, feature = "test-util"))]
 fn is_loopback_host(url: &str) -> bool {
     let Some(rest) = url
