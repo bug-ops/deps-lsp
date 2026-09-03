@@ -586,10 +586,7 @@ impl LineOffsetTable {
         // multi-byte character (e.g. a non-ASCII comment or marker string
         // combined with an off-by-a-byte cut). Clamp down to the nearest
         // char boundary rather than panicking on the slice below.
-        let mut offset = offset;
-        while offset > 0 && !content.is_char_boundary(offset) {
-            offset -= 1;
-        }
+        let offset = content.floor_char_boundary(offset);
         let line = self
             .line_starts
             .partition_point(|&start| start <= offset)

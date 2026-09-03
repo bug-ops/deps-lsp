@@ -41,7 +41,7 @@ implements `deps_core::Ecosystem`.
 
 ```toml
 [dependencies]
-deps-github-actions = "0.11"
+deps-github-actions = "0.12"
 ```
 
 > [!IMPORTANT]

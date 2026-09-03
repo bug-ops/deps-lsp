@@ -21,13 +21,14 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **PEP 440 versions** — Validate and compare Python version specifiers
 - **PEP 503 name normalization** — One canonical normalizer (`name::normalize`) shared by registry lookups, the formatter, and lock file parsing
 - **PyPI API client** — Fetch package metadata from the PyPI JSON API
+- **Custom/private indexes** — Resolves `requirements.txt` `--index-url`/`--extra-index-url`, Poetry `[[tool.poetry.source]]`, and uv `[tool.uv.index]`/`[tool.uv.sources]` to live registry data, checking declared extras before the implicit `pypi.org` fallback
 - **Package-name search** — Serves completion matches from a live, build-once, in-memory index of the PyPI Simple API (~882k names). Unranked (alphabetical/substring, no popularity signal — same approach as PyCharm's PyPI completion): a short prefix may not surface a well-known package if many alphabetically-earlier names share it, so keep typing to narrow the match
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-pypi = "0.11"
+deps-pypi = "0.12"
 ```
 
 > [!IMPORTANT]

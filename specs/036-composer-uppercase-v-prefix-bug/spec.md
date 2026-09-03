@@ -7,7 +7,7 @@ tags:
   - bug
   - deps-composer
 created: 2026-09-03
-status: ready
+status: shipped
 related:
   - "[[constitution]]"
 ---

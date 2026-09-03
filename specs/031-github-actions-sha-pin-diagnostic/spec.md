@@ -10,7 +10,7 @@ tags:
   - github-actions
   - deps-core
 created: 2026-09-02
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[014-github-actions-ecosystem/spec|New ecosystem: GitHub Actions workflow uses: pins]]"
