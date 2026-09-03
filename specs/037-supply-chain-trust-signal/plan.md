@@ -59,10 +59,14 @@ crates/deps-core/src/deps_dev/
   the identical argument `net_policy.rs`'s module docs already make. NFR-006 is
   satisfied by the module boundary: no deps.dev field lands in any ecosystem
   crate's registry-response types.
-- `crates/deps-core/Cargo.toml`: `urlencoding` is currently
-  `optional = true`, pulled in only by `test-util`. Production path-segment
-  encoding needs it unconditionally — move it out of `dep:` optional (leaving
-  it listed under `test-util` becomes unnecessary). One-line manifest change.
+- `crates/deps-core/Cargo.toml`: `urlencoding` must become unconditional for
+  production path-segment encoding. This is a **3-line change, not one**
+  (critic M5) — done as one line it will not compile:
+  1. `:48` `urlencoding = { workspace = true, optional = true }` → drop
+     `optional = true`;
+  2. `:31` `test-util = [.. "dep:urlencoding"]` → remove that entry, since
+     Cargo errors when `dep:` names a non-optional dependency;
+  3. `:57` the dev-dependencies entry becomes redundant and should go.
 
 ## 3. Types
 
@@ -85,17 +89,14 @@ struct RelatedProject {
 }
 struct DepsDevProject { scorecard: Option<DepsDevScorecard> }
 struct DepsDevScorecard {
-    overall_score: f32,                       // #[serde(default)]
-    date:          String,                    // #[serde(default)]
+    overall_score: Option<f32>,               // NOT #[serde(default)] — see below
 }
 
 // ---- public, ecosystem-agnostic (consumed by hover) ----
 pub enum ProvenanceStatus { Verified, Unverified, None }
 
 pub struct ScorecardSummary {
-    pub overall_score: f32,     // 0.0..=10.0, clamped on parse
-    pub date:          String,  // rendered escaped, never linked
-    pub project_id:    String,  // validated SOURCE_REPO key, escaped on render
+    pub overall_score: f32,     // only constructed from a parsed 0.0..=10.0 value
     pub self_reported: bool,    // §5's pick landed on UNVERIFIED_METADATA
 }
 
@@ -119,6 +120,18 @@ Deltas from spec §5, all upward in precision — each needs lead sign-off (§10
 - `RelatedProject` gains `relation_provenance` — load-bearing, see §5.
 - `ScorecardSummary.self_reported` carries §5's ranking outcome forward to the
   renderer, so the O5 disclosure marker costs no extra request or parse.
+- `overallScore` is **`Option<f32>` on the wire with no `#[serde(default)]`**,
+  and `ScorecardSummary` is built only when it parses to a finite value in
+  `0.0..=10.0`; anything else (absent, null, unparseable, out of range) →
+  `scorecard = None`, section half omitted. A `#[serde(default)]` `f32` would
+  render an unscored project as "**OpenSSF Scorecard `0`/10**" — maximally
+  damning for a project deps.dev simply has no Scorecard for, and the same
+  class of false trust claim D3 exists to prevent (critic S3).
+- `ScorecardSummary.date` and `.project_id` are **dropped**. O3 settled that v1
+  renders no age qualifier and §8 forbids a hyperlink, so both would be parsed
+  and never read — D4's own argument against `checks[]` applies unchanged
+  (critic M8). Re-add `date` if O3 is ever revisited; `project_id` is not
+  needed by the O5 marker, which only needs the boolean.
 
 ## 4. Client and the two-call sequence
 
@@ -127,7 +140,24 @@ pub struct DepsDevClient {
     cache:    Arc<HttpCache>,
     base_url: String,            // DEPS_DEV_API in prod; mockito URL in tests
     trusted_origin: String,      // format!("{base_url}/")
-    memo:     DashMap<String, MemoEntry>,
+    memo:     DashMap<MemoKey, MemoEntry>,
+    projects: DashMap<ProjectKeyMemo, ProjectMemoEntry>,   // §6, critic M2
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct MemoKey {
+    base:    String,
+    system:  &'static str,
+    name:    String,
+    version: String,
+}
+
+struct MemoEntry {
+    fetched_at: Instant,
+    ttl:        Duration,
+    /// The **outcome**, negative results included — a memoized `None` is what
+    /// makes "zero requests on a repeat call" hold on the failure path too.
+    signal:     Option<SupplyChainTrustSignal>,
 }
 
 impl DepsDevClient {
@@ -136,10 +166,20 @@ impl DepsDevClient {
 
     /// Infallible. `None` == nothing to render.
     pub async fn trust_signal(
-        &self, system: &str, name: &str, version: &str,
+        &self, system: &'static str, name: &str, version: &str,
     ) -> Option<SupplyChainTrustSignal>;
 }
 ```
+
+`MemoKey` is a **typed tuple, not a `\0`-joined string** (critic S5). The
+`format!("{base}\0{system}\0{name}\0{version}")` shape copied from
+`github.rs:662` is only collision-free there because `validate_owner_repo`
+rejects the name first; here `name` comes from a manifest and `version` from
+`in_use_version`, whose lockfile `ConcreteVersion` branch
+(`in_use_version.rs:306-309`) is never charset-validated — so `("a\0b", "c")`
+and `("a", "b\0c")` would collide and **serve another package's trust signal**.
+A derived `Hash`/`Eq` over four fields cannot collide by construction, which is
+cheaper than auditing every producer's charset forever.
 
 `new`/`for_test`/`trusted_origin` copy `github::GithubTagsClient` (github.rs:180-218)
 verbatim in shape — the established pattern for a shared third-party API client
@@ -147,10 +187,10 @@ in this crate.
 
 Sequence inside `trust_signal`:
 
-1. **Memo read.** Key `format!("{base_url}\0{system}\0{name}\0{version}")` —
-   `base_url` in the key for the same reason `ReleaseDatesCache` includes
-   `api_base` (github.rs:655-662): a mock-server hit must never serve a
-   real-API read. Fresh entry → return its clone, **zero requests**.
+1. **Memo read.** `base` is in the key for the same reason `ReleaseDatesCache`
+   includes `api_base` (github.rs:655-662): a mock-server hit must never serve
+   a real-API read. Fresh entry → return its clone, **zero requests** —
+   including when the memoized outcome is `None`.
 2. **Version call.** `GET {base}/v3/systems/{system}/packages/{enc(name)}/versions/{enc(version)}`.
    On success → `provenance = Some(status)` per §3's mapping, and the
    `relatedProjects[]` pick per §5. On any failure → `provenance = None` and no
@@ -161,14 +201,26 @@ Sequence inside `trust_signal`:
    Some(..)`. On failure → `scorecard = None`, `provenance` from step 2 is
    **kept** (spec §6: "version query succeeds, project query fails → provenance
    still shown").
-4. **Memo write** (success TTL or error TTL), then return.
+4. **Memo write**, then return. TTL by outcome:
+
+   | Outcome | TTL | Why |
+   |---------|-----|-----|
+   | Any signal assembled | 1 h | the server's declared `max-age=3600` |
+   | **HTTP 404** on either call | 1 h | a *definitive* "deps.dev has no record", not a transient fault — the short TTL would re-fire 1-2 requests every 90 s of hovering any private/internal/brand-new package, exactly the storm `github.rs:447-452` warns about (critic M1) |
+   | Network error, timeout, 5xx, malformed JSON | 90 s | genuinely transient; value from `RELEASE_DATES_ERROR_TTL` |
 
 Strictly sequential — step 3's URL comes out of step 2's body — so a cold
-hover costs exactly 2 round-trips. Each call gets its **own**
-`tokio::time::timeout(DEPS_DEV_CALL_TIMEOUT)` (1.5s, sibling of
-`RELEASE_DATES_FETCH_TIMEOUT = 2s`), not one timeout around the pair: a shared
-budget would discard step 2's already-successful provenance whenever step 3
-hangs, defeating the partial-failure requirement above.
+hover costs exactly 2 round-trips. **Two nested bounds, not one:**
+
+- `DEPS_DEV_CALL_TIMEOUT = 400 ms` per call, so step 3 hanging can never
+  discard step 2's already-successful provenance (the partial-failure
+  requirement in §4 step 3).
+- `DEPS_DEV_TOTAL_BUDGET = 700 ms` around the **whole** sequence, which is what
+  actually bounds what a hover can wait for. Without it the two per-call
+  timeouts stack to ~800 ms and the sequence has no single ceiling — critic S1.
+
+Worst case a hover *renders* 700 ms late; see §8, which removes even that from
+the user-visible path.
 
 **Failure representation.** Internally every step is `deps_core::Result<Bytes>`
 from `HttpCache` plus `serde_json::Result`; both are swallowed at the
@@ -207,12 +259,24 @@ without new scope. Ranked as a residual risk for the security reviewer, not
 solved by this plan.
 
 **Project-key validation before URL interpolation.** `projectKey.id` is
-third-party-controlled text spliced into a request path — the exact shape
-`deps-npm`'s `evil/../secret` regression tests exist for. Before use: reject
-unless every `/`-separated segment is non-empty, passes
-`deps_core::lsp_helpers::is_dot_segment` as false, and contains only
-`[A-Za-z0-9._-]`; require a host-like first segment and at least two segments.
-Then percent-encode the **whole key as one path segment** via
+third-party-controlled text spliced into a request path. Note precisely what
+this does and does not buy (critic M4): encoding the key as **one** segment
+already defeats traversal on its own — `evil/../secret` becomes
+`evil%2F..%2Fsecret`, which contains no `..` *segment* — so validation is not
+the traversal defence. Its real value is rejecting junk before it costs a
+request, and keeping a malformed third-party id out of a URL at all. Concretely,
+reject unless:
+
+- there are 2-4 `/`-separated segments, none empty;
+- no segment is `.` or `..` (`deps_core::lsp_helpers::is_dot_segment`);
+- the first segment is host-shaped: at least one `.`, and every dot-separated
+  label non-empty, `[A-Za-z0-9-]` only, not starting or ending with `-`;
+- every remaining segment matches `[A-Za-z0-9._-]+`.
+
+That last rule **over-rejects non-ASCII repository names**, which is
+intentional: the failure mode is one missing hover section for a rare repo,
+against the alternative of hand-auditing Unicode in a URL path. Then
+percent-encode the **whole key as one path segment** via
 `urlencoding::encode` (`github.com/expressjs/express` →
 `github.com%2Fexpressjs%2Fexpress`, live-verified). Same encoding rule for
 `name` and `version` in step 2 — required, not cosmetic: the raw-slash Go probe
@@ -241,10 +305,26 @@ identical missing-validators problem, and the same shape
 - **Caching: a TTL memo inside `DepsDevClient`**, over the *assembled*
   `SupplyChainTrustSignal`, not over response bodies. Success TTL **1 h**
   (the server's own declared `max-age=3600` — not a guessed number); error TTL
-  **90 s** (`RELEASE_DATES_ERROR_TTL`'s value, for negative caching);
-  `MAX_MEMO_ENTRIES = 512` with the percentage-eviction helper
-  `github.rs`/`osv/mod.rs` both already use. Refreshing an existing key skips
-  eviction (github.rs:696-700).
+  **90 s**, and 404 at the 1 h success TTL — the full table is in §4 step 4.
+  `MAX_MEMO_ENTRIES = 512`.
+- **Eviction: a new helper modelled on `evict_release_dates_if_full`
+  (github.rs:487-501)**, not a reused one — the "percentage-eviction helper
+  both modules already use" this plan previously claimed **does not exist**
+  (critic S6). github.rs's policy is *expired-first, then the single oldest by
+  `fetched_at`*, which is the right shape for a TTL-carrying memo. `osv`'s
+  `evict_oldest` (osv/mod.rs:101-120) is not an option: it is private to that
+  module and hardwires `MAX_CACHE_ENTRIES / CACHE_EVICTION_PERCENTAGE` = 1000
+  removals, which against a 512-entry memo empties it on every full insert.
+  Either write the 14-line equivalent beside this memo or generalize
+  github.rs's over its bound and entry type — developer's call, but it is new
+  code either way, not a call to something existing. Refreshing an existing key
+  skips eviction (github.rs:696-700).
+- **A second memo keyed by validated project key** (critic M2), holding the
+  `ScorecardSummary` from step 3. The Scorecard is a property of the *project*,
+  not the version, so without it hovering five `@babel/*` packages fires five
+  identical `GET /v3/projects/github.com%2Fbabel%2Fbabel` calls. Same TTL table,
+  same eviction policy. This is where NFR-001's "treat conservatively" is
+  actually earned on a real manifest.
 - Transport-only, not entry-cached, deliberately: the memo owns caching, so
   storing bodies in `HttpCache`'s 64 MiB entry map too would double-cache and
   evict genuinely reusable registry bodies for nothing.
@@ -260,55 +340,78 @@ fire.** `transport_for_origin` builds `Transport::origin_pinned`, which pairs
 (cache.rs:547-556). `AddrGuard::Baseline::tier_allows` returns `true`
 unconditionally (cache.rs:220-222), so `api.deps.dev` is **not** subject to
 `WorkspaceRegistryAccess` — exactly FR-008's "fixed, non-workspace-configurable
-trusted-origin endpoint", already true by construction. `net_policy`'s
-classifier still runs on every hop through `hop_targets_blocked_host`
-(cache.rs:179-186) and on the resolved address through the baseline resolver.
-No new `HostClass` variant, no new policy tier, nothing to ask the user about.
+trusted-origin endpoint", already true by construction.
+
+Correcting this plan's earlier description of the mechanism (critic M3 — the
+conclusion above is unaffected, but the reasoning misstated where the
+classifier runs): `trusted_origin_redirect_policy` (cache.rs:290-298)
+**does not call** `hop_targets_blocked_host`, because the URL-prefix pin
+already subsumes a per-hop host check — documented at cache.rs:544-546.
+`net_policy::classify_host` therefore runs on **resolved addresses** via
+`BlockedAddrResolver`, not on redirect hops, for this transport. Task #6's
+security reviewer should read it that way. No new `HostClass` variant, no new
+policy tier, nothing to ask the user about.
 
 **NFR-005** holds trivially: `extra_headers` is `&[]` at the one call site.
 
-## 7. Ecosystem mapping — a new `DepsDevNaming` formatter trait
+## 7. Ecosystem mapping — an exhaustive `match`, no new trait
 
-`formatter.rs` gains an eighth concern trait beside `OsvNaming`, added to the
-`EcosystemFormatter` supertrait list and its blanket impl (formatter.rs:762-783):
+> [!warning] Revised after critic S4
+> This section previously specified a `DepsDevNaming` concern trait added to
+> `EcosystemFormatter`'s supertrait list, and claimed the uncovered ecosystems
+> "need zero code". **That claim was wrong.** Adding an eighth supertrait
+> (formatter.rs:762-783) makes every current implementor stop satisfying the
+> blanket impl until it adds `impl DepsDevNaming for X {}` — **55 sites across
+> 27 files**, 8 of them inside rustdoc examples that the CI doc-test gate would
+> fail on. The trait is dropped entirely.
+
+Both pieces the client needs turn out not to require per-ecosystem behaviour:
+
+- **`system`** does not depend on the dependency at all, only on the
+  ecosystem — and `VersionData.ecosystem: Option<EcosystemId>` already carries
+  that, always set by `handlers/hover.rs:68`.
+- **the name** is `dep.name()` unmodified for all seven. The critic confirmed
+  each against the worktree: Maven names already are `group:artifact`; PyPI and
+  NuGet are normalized server-side (§1); Go keeps its `v` prefix through
+  `looks_like_a_single_version` (in_use_version.rs:126).
+
+So `deps_dev/mod.rs` carries one function and nothing else:
 
 ```rust
-pub trait DepsDevNaming: Send + Sync {
-    /// deps.dev `system` segment, or `None` when deps.dev has no coverage.
-    fn deps_dev_system(&self) -> Option<&'static str> { None }
-    /// deps.dev's spelling of `dep`'s name, or `None` if unmappable.
-    fn deps_dev_package_name(&self, _dep: &dyn Dependency) -> Option<String> { None }
+pub(crate) const fn deps_dev_system(id: EcosystemId) -> Option<&'static str> {
+    match id {
+        EcosystemId::Npm     => Some("npm"),
+        EcosystemId::Cargo   => Some("cargo"),
+        EcosystemId::Go      => Some("go"),
+        EcosystemId::Maven   => Some("maven"),
+        EcosystemId::Pypi    => Some("pypi"),
+        EcosystemId::Bundler => Some("rubygems"),
+        EcosystemId::NuGet   => Some("nuget"),
+        EcosystemId::Composer | EcosystemId::Dart | EcosystemId::Swift
+        | EcosystemId::Gradle | EcosystemId::Deno
+        | EcosystemId::GithubActions => None,
+    }
 }
 ```
 
-Both defaults are `None`, so **FR-005 and FR-011 hold by construction**:
-Composer, Dart, Swift, Deno and GitHub Actions need zero code and issue zero
-requests — there is no ecosystem list to keep in sync and no way to forget one.
-`OsvNaming` is the precedent for "third-party API naming lives on the
-formatter, not in a central match" (formatter.rs:676-697), including its
-rationale for taking `&dyn Dependency` rather than `&str`.
+**No `_` wildcard arm** — that is the whole point. §11 previously rejected a
+central match on the grounds that "a new ecosystem silently defaults to some
+arm"; with the uncovered variants named explicitly, adding a fourteenth
+`EcosystemId` is a **compile error** until someone decides which side it
+belongs on. That is strictly stronger than a trait default of `None`, which
+silently opts a new ecosystem out. FR-005 and FR-011 now hold by *compiler
+enforcement* rather than by inheritance, at a cost of one function instead of
+55 impl blocks.
 
-Overrides, one impl block per crate:
+The trade accepted: if an ecosystem ever needs a genuine name transform, the
+trait comes back for that method alone. Nothing today needs one, and building
+the extension point before the first real divergence is exactly the premature
+abstraction the MVP rule forbids.
 
-| Crate | `deps_dev_system` | Name |
-|-------|-------------------|------|
-| `deps-npm` | `"npm"` | as-is (scoped names encoded at the client) |
-| `deps-cargo` | `"cargo"` | as-is |
-| `deps-go` | `"go"` | as-is — deps.dev wants the `v` prefix `go.mod` already carries |
-| `deps-maven` | `"maven"` | `group:artifact`; developer must confirm `Dependency::name()` already yields that form, else join it here |
-| `deps-pypi` | `"pypi"` | as-is (server normalizes) |
-| `deps-bundler` | `"rubygems"` | as-is |
-| `deps-nuget` | `"nuget"` | as-is (server is case-insensitive) |
-
-No `deps_dev_version` hook: Go is the only ecosystem whose namespace could
-diverge and its manifests already carry `v`. Add one when a real divergence
-appears.
-
-Deliberately **not** covered, though both are one-line overrides:
-`deps-gradle` (Maven coordinates — deps.dev's `maven` system covers them) and
-Deno's `npm:` specifiers. FR-001 enumerates seven ecosystems and Gradle is not
-among them; treating that as an omission rather than a boundary is the lead's
-call (§10), and the follow-up is trivial either way.
+Deliberately **not** covered, though both would be one-line arms: `deps-gradle`
+(Maven coordinates — deps.dev's `maven` system covers them) and Deno's `npm:`
+specifiers. FR-001 enumerates seven ecosystems and Gradle is not among them
+(D8); the follow-up is trivial either way.
 
 ## 8. Hover integration
 
@@ -321,9 +424,10 @@ Plumbing, chosen to require **no** signature change in any ecosystem crate:
    beside `cache` and `osv`, built as
    `DepsDevClient::new(Arc::clone(&cache))`.
 2. `VersionData` gains one field and builder:
-   `pub trust: Option<&'a DepsDevClient>` / `with_trust(client)`. It already
-   carries non-version context (`ecosystem`, `offline`), so this fits the type
-   it actually is.
+   `pub trust: Option<&'a Arc<DepsDevClient>>` / `with_trust(client)`. It
+   already carries non-version context (`ecosystem`, `offline`), so this fits
+   the type it actually is. `&Arc`, not `&`, so the fetch can be cloned into a
+   detached task — see the latency design below.
 3. `handlers/hover.rs` is the **only** caller that sets it, gated on the config
    toggle in §9. `diagnostics.rs`, `code_actions.rs`, `inlay_hints.rs` and
    `code_lens.rs` leave it `None` — which is how **FR-010 becomes structural**:
@@ -333,25 +437,63 @@ Plumbing, chosen to require **no** signature change in any ecosystem crate:
    (`deps-github-actions`, `deps-nuget`) inherit the feature for free the moment
    they call `lsp_generate_hover`.
 
-Inside `hover.rs`:
+**Latency: spawn-and-warm, not a bare `join!`** (critic S1). The earlier claim
+that the 2 deps.dev round-trips "overlap the registry fetch and disappear from
+the common case" was **inverted**: `lifecycle.rs:1092-1095` prefetches
+`get_versions_from` for every dependency at document open, so hover's registry
+fetch is normally a warm `HttpCache` entry hit taking ~0 ms. deps.dev is
+therefore the hover's critical path in the *common* case, and a bare `join!`
+waits for it — adding up to the full budget to a hover that would otherwise
+return in milliseconds. `deps-nuget` compounds it, adding its own fetch *after*
+`lsp_generate_hover` (deps-nuget/src/ecosystem.rs:203-221).
 
-- The current `let available_versions = if resolvable { … }` (hover.rs:91-98)
-  becomes a `tokio::join!` of that same expression with the trust-signal
-  future. Concurrency is the point: sequencing 2 deps.dev round-trips *after*
-  the registry fetch would add their latency to every hover, and FR-006 forbids
-  delaying other hover content. Joined, the 1.5s-per-call bound overlaps the
-  registry fetch and disappears from the common case. `tokio::join!` of a
-  fallible registry fetch with an infallible enrichment fetch is the pattern
-  `deps-swift`'s `get_versions_with_release_dates` already uses.
-- The trust future is `None` unless **all** of: `versions.trust.is_some()`,
-  `resolvable`, `formatter.deps_dev_system()` is `Some`,
-  `formatter.deps_dev_package_name(dep)` is `Some`, and an in-use version
-  resolves. Version source: `in_use_version(..)` /
-  `concrete_pin_version(requirement, ecosystem)`
-  (`lsp_helpers/in_use_version.rs:172,294`) — never the latest available
-  version, because FR-004's provenance claim is version-specific and attaching
-  another version's provenance to this dependency would be a false statement.
-  No in-use version → no signal at all (§10 open question).
+The fetch therefore runs in a **detached `tokio::spawn`**, and hover awaits that
+`JoinHandle` under `DEPS_DEV_TOTAL_BUDGET` (700 ms):
+
+- Under budget → the section renders on this hover.
+- Over budget → hover returns **immediately** with the section omitted (FR-006
+  satisfied: the ceiling on added latency is the budget, and nothing else in
+  the hover is touched), **while the spawned task keeps running to completion
+  and writes the memo**. The next hover on that dependency is a memo hit and
+  renders instantly.
+- This is what `.claude/rules/rust-code.md` already asks for in the LSP layer:
+  "Hover and completion responses must return quickly; delegate registry
+  fetches to background tasks with caching." The detached task is that
+  delegation; the memo is that caching.
+
+The registry fetch and the spawn are still started together, so a cold registry
+fetch overlaps rather than stacks. `Arc<DepsDevClient>` is cloned into the task;
+a hover cancelled by the editor drops the handle but not the task, so the warm
+memo survives cancellation.
+
+Gating — the future is not spawned at all unless **all** of: `versions.trust`
+is `Some`, `resolvable`, `versions.ecosystem` maps through §7's
+`deps_dev_system` to `Some`, and an in-use version resolves. Checking the
+mapping *before* spawning is what makes SC-004 ("zero requests for
+Composer/Dart/Swift") hold with no HTTP mock reached at all.
+
+Version source: `in_use_version(..)` / `concrete_pin_version(requirement,
+ecosystem)` (`lsp_helpers/in_use_version.rs:172,294`) — never the latest
+available version, because FR-004's provenance claim is version-specific and
+attaching another version's provenance to this dependency would be a false
+statement. No in-use version → no signal at all (D7/O1).
+
+**Two version-resolution paths coexist, deliberately** (critic M6).
+hover.rs:133-140 already computes and renders `versions.resolved`; the trust
+signal uses `in_use_version`, which adds the `concrete_pin_version` fallback.
+They can disagree: a Cargo `=1.2.3` with no lockfile renders no in-use version
+line but *does* report provenance for `1.2.3`. That is the correct behaviour on
+both sides — the rendered line reflects the lockfile, the trust signal reflects
+what will actually be built — and the wider fallback is precisely what keeps
+D7's gate from silencing lockfile-less workspaces. Not unified on purpose;
+noted so a reviewer does not read it as an inconsistency.
+
+**Required refactor in a dense function** (also M6): the in-use-version
+computation and `normalized_name` (hover.rs:131) currently sit *below* the
+registry fetch at hover.rs:91 and must be hoisted above it to build the gate.
+Small, but it moves code in `generate_hover`'s most comment-dense region — the
+developer should hoist only these two and leave the surrounding ordering
+(config snapshot before shard guard, etc.) untouched.
 - Rendering: a new `push_trust_signal_hover_section(&mut markdown,
   Option<&SupplyChainTrustSignal>)` beside the existing
   `push_deprecation_hover_section` / `push_vulnerability_hover_section`
@@ -389,10 +531,14 @@ and, when the chosen SOURCE_REPO relation was `UNVERIFIED_METADATA`:
   on `Option<ProvenanceStatus>` vs `ProvenanceStatus::None`.
 - Scorecard half omitted when `scorecard == None`; the `·` separator only
   appears between two present halves.
-- Every third-party string (`date`, `project_id`) goes through
-  `escape_markdown`. **No hyperlink** in v1: a link would splice a
-  third-party-controlled id into a URL rendered in the editor, and the score
-  itself is the payload. Additive later if wanted.
+- **No third-party string reaches the rendered line at all** now that `date`
+  and `project_id` are dropped (§3): every token is either a fixed literal or
+  the `f32` score, so `escape_markdown` has nothing to guard here. Should a
+  future revision re-add either field, it must go through `escape_markdown`
+  like every other registry-sourced string in `hover.rs`.
+- **No hyperlink** in v1: a link would splice a third-party-controlled id into
+  a URL rendered in the editor, and the score itself is the payload. Additive
+  later if wanted.
 - `versions.offline` (hover.rs:416-418): `ensure_online` already blocks the
   fetch, so the section self-omits. The existing offline footer text mentions
   "version and vulnerability data" only — leave it; rewording it is a
@@ -429,6 +575,28 @@ network needs one that is not "go fully offline".
 None of these need a *user* decision, and the spec's §8 "Ask First" item
 (net_policy change) **does not fire** — see §6.
 
+### Revisions after critique (all within D1-D8, no new deviation)
+
+| Finding | Change | Section |
+|---------|--------|---------|
+| S1 | Detached `tokio::spawn` + 700 ms `DEPS_DEV_TOTAL_BUDGET`, replacing the bare `join!`; 400 ms per call | §4, §8, §11 |
+| S2 | Already closed before the critique landed (commit 3a8e37c8) — `ScorecardSummary.self_reported` + render branch + test | §3, §5, §8, §12 |
+| S3 | `overallScore` is `Option<f32>` with no serde default; no score ⇒ no Scorecard half | §3 |
+| S4 | `DepsDevNaming` **dropped**; exhaustive `match EcosystemId` with no `_` arm | §7, §11 |
+| S5 | Typed `MemoKey` struct instead of a `\0`-joined string | §4 |
+| S6 | Eviction is new code modelled on `evict_release_dates_if_full`, not a reused helper | §6 |
+| M1 | 404 memoized at the 1 h TTL as a definitive negative; `MemoEntry` holds the outcome | §4 |
+| M2 | Second memo keyed by validated project key | §6 |
+| M3 | net_policy mechanism description corrected (classifier runs on resolved addresses) | §6 |
+| M4 | Concrete host-shape rule; non-ASCII over-rejection stated as intentional | §5 |
+| M5 | `urlencoding` is a 3-line manifest change | §2 |
+| M6 | Two version paths documented as deliberate; hoist refactor named | §8 |
+| M8 | `ScorecardSummary.date`/`.project_id` dropped as unrendered | §3 |
+
+M7 is spec/plan drift in `spec.md` (NFR-002's retired premise at :322-325 and
+:341, `RelatedProject.project_key` at :261, `scorecard` at :264) — the lead's to
+reconcile, not this plan's.
+
 ## 11. Alternatives considered
 
 - **Prefetch all dependencies in `lifecycle.rs`, OSV-style, and pass a map via
@@ -440,16 +608,36 @@ None of these need a *user* decision, and the spec's §8 "Ask First" item
 - **Fetch in `handlers/hover.rs` and pass the finished
   `Option<&SupplyChainTrustSignal>` through `VersionData`.** Purer (no
   capability in a data struct, FR-010 still structural) but forces the fetch to
-  *precede* `generate_hover`, serializing 2 round-trips ahead of the registry
-  fetch instead of overlapping them, and duplicates the position→dependency
-  lookup (hover.rs:60-66) in the handler. Latency lost the tie.
+  *precede* `generate_hover`, so it cannot be spawned-and-abandoned the way §8
+  needs — the handler would have to block on it before hover text exists at
+  all — and it duplicates the position→dependency lookup (hover.rs:60-66) in
+  the handler. Latency lost the tie.
+- **A bare `tokio::join!` of the fetch with the registry fetch** — this plan's
+  original §8, **reversed** after critic S1: `lifecycle.rs` prefetches the
+  registry data, so there is normally no slow sibling future to hide behind and
+  `join!` just adds the deps.dev latency to every hover. §8's spawn-and-warm
+  keeps the overlap for the cold case and adds a hard ceiling for the warm one.
+- **Fire-and-forget with no await at all** (always render the section from the
+  memo only, never on the first hover). Bounds latency perfectly but a signal
+  that appears only on the *second* hover of a dependency reads as a bug.
+  Spawn-and-warm is the same mechanism with a 700 ms window to catch the common
+  case on the first hover.
 - **New parameter on `Ecosystem::generate_hover` / `lsp_generate_hover`.**
   Only 3 files override it, so the ripple is small — but `VersionData` already
   exists as the context bag for exactly this and needs no signature churn.
-- **A central `match EcosystemId { … }` for the system mapping** instead of a
-  formatter trait. Rejected: a new ecosystem silently defaults to *some* arm,
-  whereas the trait's `None` default makes non-coverage the safe, automatic
-  state (FR-005/FR-011) and keeps naming beside `OsvNaming`.
+- **A `DepsDevNaming` concern trait on `EcosystemFormatter`** — this plan's
+  original choice, **reversed** after critic S4 priced the supertrait ripple at
+  55 impl sites across 27 files including 8 doc-tests. The rejection reason
+  given here originally ("a central match lets a new ecosystem silently default
+  to some arm") was simply wrong: an exhaustive match with no `_` arm turns a
+  new ecosystem into a compile error, which is *stronger* than a `None` trait
+  default. See §7.
+- **Two methods on the existing `PackageNaming` trait** (critic's own
+  suggested fix for S4 — zero new impl blocks, since `PackageNaming` is already
+  a supertrait). Rejected in favour of §7's function: it still adds
+  per-ecosystem extension points that no ecosystem needs, and it puts
+  third-party-API naming inside the trait that owns *internal* normalization
+  and validation. §7's match needs neither.
 - **Entry-cached `get_cached_trusted_origin`** rather than transport-only.
   Rejected per §6: double-caching, and it evicts reusable registry bodies.
 - **Computing the aggregate from `checks[]`.** Explicitly forbidden by FR-003.
@@ -468,12 +656,48 @@ None of these need a *user* decision, and the spec's §8 "Ask First" item
   D2's replacement for SC-005 (second call within TTL = zero requests);
   version-endpoint 200 + project-endpoint 500 → provenance rendered, Scorecard
   absent; malformed JSON and a `text/plain` 404 body both → `None`, no panic;
+  a `scorecard` object with `overallScore` absent/null/`"x"` → Scorecard half
+  omitted and **never** rendered as `0`/10 (S3); two `MemoKey`s differing only
+  by a control character in `name`/`version` do not alias (S5); a 404 does not
+  re-request within the hour and a 5xx does re-request after 90 s (M1); two
+  packages sharing a project key issue **one** project call (M2); a hover whose
+  fetch exceeds the budget renders with no trust section **and** leaves the memo
+  warm so the next call is a hit (S1 — the load-bearing test for the whole
+  latency design);
   both O5 branches — an `SLSA_ATTESTATION` relation renders no marker, an
   `UNVERIFIED_METADATA`-only one renders `*(self-reported repo)*`;
   project-key validation rejecting `github.com/../../etc` with zero requests;
   and the percent-encoding assertions for Go, Maven and scoped npm names.
 - One `insta` snapshot for the hover line; snapshots live in
   `src/snapshots/` beside the module.
+- §7's match removes the doc-test exposure the critic flagged under S4 — there
+  are no new trait impls, so no rustdoc example needs updating.
+
+## 12a. Answers to the critic's questions
+
+1. **Added-latency budget (S1):** 700 ms is the ceiling on what a hover may
+   *wait*, and because the fetch is detached it is a ceiling on the wait only —
+   not on the fetch, which completes into the memo regardless. Practically the
+   user-visible cost is ~2 RTTs on a cold memo and 0 afterwards. This does
+   **not** reopen O2: the memo now absorbs the latency risk by construction
+   (an over-budget hover still warms it), so teaching `HttpCache` a general
+   `max-age` window would buy nothing here that the memo does not already buy,
+   and the lead's scoping call stands.
+2. **Disclosure carrier (S2):** `ScorecardSummary`, as already implemented. The
+   disclosure qualifies *the Scorecard* specifically — which repository's score
+   is being shown — and nothing about provenance, which is version-level and
+   unaffected by the relation's provenance. Putting it on
+   `SupplyChainTrustSignal` would let a signal carry `self_reported = true`
+   with `scorecard: None`, a state that cannot mean anything. Naming: the
+   critic proposed `relation_attested: bool`; the committed field is
+   `self_reported: bool` — the same bit inverted, chosen because it names the
+   user-visible concept and renders without a negation.
+3. **Trait vs. `PackageNaming` (S4):** neither — see §7. Both options assume a
+   per-ecosystem extension point, and no ecosystem needs one: the `system` is a
+   function of `EcosystemId` alone and the name is `dep.name()` verbatim for all
+   seven. The exhaustive match costs one function, zero impl blocks, zero
+   doc-test edits, and makes a future ecosystem a compile error rather than a
+   silent opt-out.
 
 ## 13. Open questions for the critic
 
