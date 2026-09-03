@@ -322,7 +322,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     push_deprecation_hover_section(&mut markdown, formatter, deprecation);
     push_vulnerability_hover_section(&mut markdown, vuln_outcome);
 
-    if let Some(available_versions) = &available_versions {
+    // `!v.is_empty()`, not just `Some(_)` (#550): a resolvable source's live fetch can
+    // succeed with a genuinely empty list — e.g. a real GitHub repository whose only
+    // tags don't parse as full semver (`dtolnay/rust-toolchain`'s sole tag `v1`) — and
+    // a "**Recent versions**:" header with no entries under it is never useful,
+    // regardless of ecosystem.
+    if let Some(available_versions) = available_versions.as_ref().filter(|v| !v.is_empty()) {
         // Matched by position against `live_latest_idx` (the header's stable-latest pick)
         // rather than raw index 0 or string equality: `available_versions` is sorted purely
         // by version number, so index 0 can be a pre-release the header itself doesn't call
@@ -398,7 +403,21 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         || cached_latest.is_some()
         || matches!(vuln_outcome, Some(ScanOutcome::Vulnerable(_)))
         || deprecation.is_some();
-    if resolvable && (!versions.offline || has_offline_actionable_data) {
+    // #550: a live fetch that genuinely succeeded with zero entries (`Some(&[])`,
+    // distinct from `None` — a fetch that errored or never ran, where an unrelated
+    // Cmd+. action such as an unsatisfiable-fix might still exist per #474's own
+    // reasoning above) is definitive proof there is nothing version-wise to update to.
+    // Combined with no cached/vulnerability/deprecation data either
+    // (`!has_offline_actionable_data`, which already folds in this same emptiness
+    // check), the footer would otherwise advertise an action that provably does not
+    // exist — the "empty Recent versions section plus a stray footer" bug reported
+    // against GHA's `dtolnay/rust-toolchain@stable` but not specific to any one
+    // ecosystem. Every other online case (a non-empty live list, or no live fetch at
+    // all) keeps the pre-#550 unconditional-when-resolvable behavior.
+    let live_fetch_definitively_empty = available_versions.as_ref().is_some_and(Vec::is_empty);
+    let footer_actionable =
+        has_offline_actionable_data || (!live_fetch_definitively_empty && !versions.offline);
+    if resolvable && footer_actionable {
         markdown.push_str(CMD_DOT_FOOTER);
     }
 

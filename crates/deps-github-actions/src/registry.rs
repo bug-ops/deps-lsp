@@ -174,6 +174,28 @@ impl GithubActionsRegistry {
         }
     }
 
+    /// Creates a registry pointed at a `mockito`-backed URL instead of the real GitHub API
+    /// (critic finding C1 regression coverage, #550) — `pub(crate)`, not module-private, so
+    /// `crate::ecosystem`'s tests can build a [`crate::ecosystem::GithubActionsEcosystem`]
+    /// around a registry whose fetches are fully mocked, letting an end-to-end
+    /// `generate_hover` test reproduce a genuinely empty-but-successful live fetch
+    /// (`available_versions == Some([])`) without a real network call.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test(
+        cache: Arc<HttpCache>,
+        api_base: impl Into<String>,
+        has_token: bool,
+    ) -> Self {
+        Self {
+            github: GithubTagsClient::for_test(cache, api_base, has_token),
+            tag_index: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
+            rate_limit: Arc::new(RateLimitGate::default()),
+            release_dates: Arc::new(ReleaseDatesCache::new()),
+        }
+    }
+
     /// Shares this registry's [`TagIndex`] map with a [`crate::formatter::GithubActionsFormatter`],
     /// so a formatted SHA-pin edit can resolve the new SHA for a given tag.
     ///
@@ -625,13 +647,7 @@ mod tests {
     }
 
     fn mock_registry(base: &str, has_token: bool) -> GithubActionsRegistry {
-        GithubActionsRegistry {
-            github: GithubTagsClient::for_test(Arc::new(HttpCache::new()), base, has_token),
-            tag_index: Arc::new(DashMap::new()),
-            in_flight: Arc::new(DashMap::new()),
-            rate_limit: Arc::new(RateLimitGate::default()),
-            release_dates: Arc::new(ReleaseDatesCache::new()),
-        }
+        GithubActionsRegistry::for_test(Arc::new(HttpCache::new()), base, has_token)
     }
 
     #[tokio::test]

@@ -167,13 +167,24 @@ pub struct DependencyOutcome {
     pub deprecation: Option<Deprecation>,
     /// Registry fetch errored, timed out, or was never attempted (#267). See [`FetchFailure`].
     pub fetch_failure: Option<FetchFailure>,
+    /// The registry fetch succeeded (no [`Self::fetch_failure`]) but produced zero
+    /// comparable versions — e.g. a real GitHub repository whose only tags don't parse
+    /// as full `major.minor.patch` semver (`dtolnay/rust-toolchain`'s sole tag `v1`,
+    /// issue #550). Distinct from both an absent [`DependencyOutcome`] entry ("never
+    /// fetched") and [`Self::fetch_failure`] ("couldn't be asked"): this package
+    /// demonstrably exists, so [R5](crate::lsp_helpers::generate_diagnostics_from_cache)
+    /// must not claim it is unknown.
+    pub no_comparable_versions: bool,
 }
 
 impl DependencyOutcome {
-    /// True when none of the three channels are set.
+    /// True when none of the four channels are set.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.yanked.is_none() && self.deprecation.is_none() && self.fetch_failure.is_none()
+        self.yanked.is_none()
+            && self.deprecation.is_none()
+            && self.fetch_failure.is_none()
+            && !self.no_comparable_versions
     }
 }
 
@@ -218,6 +229,13 @@ impl DependencyOutcomes {
         self.0.get(name)?.fetch_failure.as_ref()
     }
 
+    /// True when the registry fetch for `name` succeeded but produced zero comparable
+    /// versions (#550). See [`DependencyOutcome::no_comparable_versions`].
+    #[must_use]
+    pub fn no_comparable_versions(&self, name: &str) -> bool {
+        self.0.get(name).is_some_and(|o| o.no_comparable_versions)
+    }
+
     /// Records a yanked-version finding for `name`, creating the entry if absent.
     pub fn set_yanked(&mut self, name: String, yanked: (ConcreteVersion, RemovalStatus)) {
         self.0.entry(name).or_default().yanked = Some(yanked);
@@ -241,6 +259,21 @@ impl DependencyOutcomes {
             .or_default()
             .fetch_failure
             .get_or_insert(failure);
+    }
+
+    /// Records that `name`'s registry fetch succeeded but produced zero comparable
+    /// versions (#550), creating the entry if absent.
+    pub fn set_no_comparable_versions(&mut self, name: String) {
+        self.0.entry(name).or_default().no_comparable_versions = true;
+    }
+
+    /// Clears the no-comparable-versions channel for `name`, pruning the entry if it
+    /// becomes empty.
+    pub fn clear_no_comparable_versions(&mut self, name: &str) {
+        if let Some(entry) = self.0.get_mut(name) {
+            entry.no_comparable_versions = false;
+            self.prune(name);
+        }
     }
 
     /// Clears the yanked-version channel for `name`, pruning the entry if it becomes empty.
@@ -334,6 +367,14 @@ impl DependencyOutcomes {
     #[must_use]
     pub fn with_fetch_failure(mut self, name: impl Into<String>, failure: FetchFailure) -> Self {
         self.set_fetch_failure(name.into(), failure);
+        self
+    }
+
+    /// Chainable builder recording a no-comparable-versions finding (#550). Test/fixture
+    /// ergonomics.
+    #[must_use]
+    pub fn with_no_comparable_versions(mut self, name: impl Into<String>) -> Self {
+        self.set_no_comparable_versions(name.into());
         self
     }
 }
