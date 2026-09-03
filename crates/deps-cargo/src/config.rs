@@ -1193,6 +1193,25 @@ mod tests {
         ));
     }
 
+    /// S1: a userinfo-bearing `index = "…"` value that also fails `Url::parse` for an
+    /// unrelated reason (an invalid port here) lands in `RegistryIndexError::InvalidUrl`, not
+    /// `UserInfoPresent` — every call site here logs this error via `tracing::warn!(alias,
+    /// %error, …)`, so the credential must never survive into `InvalidUrl`'s payload or its
+    /// `Display`. Fixed once inside `deps_core::net_policy::validate_index_url`, which every
+    /// `RegistryIndex::new` call routes through — no separate redaction needed here.
+    #[test]
+    fn test_registry_index_invalid_url_error_redacts_userinfo() {
+        let policy = all_policy();
+        let err = RegistryIndex::new(
+            "https://user:hunter2@index.mycorp.dev:99999",
+            IndexTrust::Trusted,
+            &policy,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RegistryIndexError::InvalidUrl(_)));
+        assert!(!err.to_string().contains("hunter2"), "Display: {err}");
+    }
+
     #[test]
     fn test_registry_index_accepts_https_without_sparse_prefix() {
         let policy = all_policy();
