@@ -9,7 +9,7 @@
 //! Every wrapper below is a bare passthrough to its `std::fs` equivalent in a shipped build:
 //! the counters are compiled out entirely unless this crate is built for its own tests or
 //! with the `test-util` feature, so counting one function's calls costs nothing in
-//! production. `cfg(test)` alone cannot gate the public [`snapshot`] function, because
+//! production. `cfg(test)` alone cannot gate the public `snapshot` function, because
 //! `deps-core` is an ordinary (non-dev) dependency of `deps-cargo`/`deps-npm` — it is never
 //! compiled with `cfg(test)` when a downstream crate's own tests build, so the `test-util`
 //! feature is what those crates enable in their `dev-dependencies` instead.
