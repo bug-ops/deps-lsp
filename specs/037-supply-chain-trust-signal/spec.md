@@ -13,6 +13,7 @@ tags:
   - supply-chain-risk
   - cross-ecosystem
 created: 2026-09-03
+updated: 2026-09-03
 status: draft
 related:
   - "[[constitution]]"
@@ -228,23 +229,23 @@ Use EARS notation. Prefix with FR-NNN.
 |----|------------|----------|
 | FR-001 | THE SYSTEM SHALL query deps.dev's per-version endpoint (`GET /v3/systems/{system}/packages/{name}/versions/{version}`) for a resolved dependency belonging to one of the 7 covered ecosystems (npm, Cargo, Go, Maven, PyPI, RubyGems/Bundler, NuGet) to obtain `slsaProvenances[]`, `attestations[]`, and `relatedProjects[]` | must |
 | FR-002 | WHEN a per-version response's `relatedProjects[]` contains an entry with `relationType == "SOURCE_REPO"` THE SYSTEM SHALL derive that entry's `projectKey.id` and query deps.dev's project endpoint (`GET /v3/projects/{project-key}`, URL-encoded) to obtain the `scorecard` object | must |
-| FR-003 | WHEN the project endpoint's `scorecard` object is present THE SYSTEM SHALL surface an aggregate Scorecard score in hover (US-001) — the aggregate value/computation to use (deps.dev's own aggregate if the API provides one, vs. a deps-lsp-computed mean of `checks[].score`, excluding `-1`/not-applicable checks) is `[NEEDS CLARIFICATION]`, see below | must |
+| FR-003 | WHEN the project endpoint's `scorecard` object is present THE SYSTEM SHALL surface deps.dev's own `scorecard.overallScore` field as the hover's aggregate Scorecard score (US-001) — live-verified 2026-09-03 (`GET /v3/projects/github.com%2Fexpressjs%2Fexpress` returns `scorecard.overallScore: 8.5` at the top level, sibling to `checks[]`); deps-lsp SHALL NOT compute its own mean of `checks[].score` | must |
 | FR-004 | WHEN a resolved version's `slsaProvenances[]` and `attestations[]` are both queried successfully (regardless of whether either is non-empty) THE SYSTEM SHALL surface an explicit provenance status in hover distinguishing "verified" (either array non-empty) from "none found" (both empty) — never omitting the line silently when the query itself succeeded, so a user cannot mistake "we didn't check" for "we checked and found nothing" (US-002) | must |
 | FR-005 | WHEN no `relatedProjects[]` entry with `relationType == "SOURCE_REPO"` exists, OR the ecosystem is not one of the 7 deps.dev covers THE SYSTEM SHALL omit the Scorecard portion of the trust signal entirely, with no error/warning surfaced (US-003) | must |
 | FR-006 | WHEN any deps.dev request fails (network error, timeout, non-2xx status, malformed/unparseable JSON) THE SYSTEM SHALL omit the entire trust-signal section from that hover render and SHALL NOT block, delay, or degrade any other hover content (US-004) | must |
 | FR-007 | THE SYSTEM SHALL cache deps.dev responses (both per-version and per-project) through the existing `deps_core::HttpCache` ETag/Last-Modified conditional-GET machinery rather than introducing a parallel caching mechanism | must |
 | FR-008 | THE SYSTEM SHALL classify the `api.deps.dev` host through the existing `deps_core::net_policy` classifier and treat it as a fixed, non-workspace-configurable trusted-origin endpoint (deps.dev is a deps-lsp-selected third-party API, not a user-supplied registry URL) — it is not subject to the `registries.workspace_registries` gate that governs user-declared alternate registries | must |
 | FR-009 | THE SYSTEM SHALL treat deps.dev as strictly additive to existing hover content — its data SHALL NOT replace, override, or be conflated with any registry-native field deps-lsp already sources itself (license, deprecation, vulnerability advisories per the Out of Scope exclusions) | must |
-| FR-010 | WHETHER this signal also feeds a new diagnostic or inlay-hint category, beyond hover, is `[NEEDS CLARIFICATION]`, see below — pending that answer, this spec's default scope is hover-only | must — the decision itself, not a specific mechanism, is mandatory before `/sdd plan` |
-| FR-011 | WHETHER Composer/Dart/Swift dependencies show a documented explicit "not available for this ecosystem" hover line versus silently omitting the section entirely is `[NEEDS CLARIFICATION]`, see below | must |
-| FR-012 | WHETHER a low Scorecard score should ever escalate beyond an informational hover line (e.g. into a diagnostic, matching or diverging from the [[004-release-freshness-signal/spec|004]] precedent of "informational signal, not a diagnostic") is `[NEEDS CLARIFICATION]`, see below | must |
+| FR-010 | THE SYSTEM SHALL scope this signal to hover only — no new diagnostic or inlay-hint category is introduced by this spec; a diagnostic/inlay-hint surface, if ever justified, is a separate future spec | must |
+| FR-011 | WHEN the ecosystem is Composer, Dart, or Swift THE SYSTEM SHALL silently omit the trust-signal section (identical behavior to any other case of unavailable data per US-003/FR-005) — no explicit "not available" line is shown | must |
+| FR-012 | THE SYSTEM SHALL treat the Scorecard score as informational-only in hover — a low score SHALL NOT escalate to a diagnostic, warning, or any blocking behavior, matching the [[004-release-freshness-signal/spec|004]] precedent; any future escalation requires a separate spec | must |
 
 ## 4. Non-Functional Requirements
 
 | ID | Category | Requirement |
 |----|----------|-------------|
 | NFR-001 | Performance / Rate Limiting | deps.dev publishes no documented public rate limit, but SHALL be treated conservatively: requests SHALL be routed through the existing `HttpCache` (FR-007) so a repeated hover for the same package/version reuses a cached or 304-revalidated response rather than issuing a fresh request every time; no fixed requests-per-second budget is assumed without further research at plan time |
-| NFR-002 | Caching Strategy | `deps_core::HttpCache`'s existing model is ETag/Last-Modified conditional-GET revalidation, not a fixed TTL that skips the network entirely (confirmed via `crates/deps-core/src/cache.rs`) — Scorecard data updates on a roughly-weekly cadence upstream, materially slower than deps-lsp's typical per-version registry data churn. Whether this warrants a dedicated longer revalidation-skip window (to avoid a conditional-GET round trip on every hover even when a 304 is virtually guaranteed) or reuses `HttpCache`'s existing revalidate-every-time model as-is is `[NEEDS CLARIFICATION]`, see below |
+| NFR-002 | Caching Strategy | `deps_core::HttpCache`'s existing model is ETag/Last-Modified conditional-GET revalidation, not a fixed TTL that skips the network entirely (confirmed via `crates/deps-core/src/cache.rs`). Scorecard data updates on a roughly-weekly cadence upstream, but this spec reuses `HttpCache`'s existing revalidate-every-time model as-is — a 304 response already avoids re-transferring the full body, and a dedicated longer revalidation-skip window is deferred to a future spec if hover latency proves this insufficient in practice |
 | NFR-003 | Reliability / Graceful Degradation | Per FR-006, a deps.dev outage or malformed response SHALL NOT be visible to the user as an error, warning, or blank/stalled hover — existing hover content renders identically to today with the trust-signal section simply absent |
 | NFR-004 | Reliability / No Linked Repo | Per FR-005, a package with no resolvable `SOURCE_REPO` project (a materially common case — many packages have no linked repo, or link to a non-canonical mirror) SHALL degrade identically to an outright deps.dev failure from the user's perspective — no distinct error state |
 | NFR-005 | Security | The `api.deps.dev` request SHALL be a plain, unauthenticated HTTPS GET with no credential, cookie, or workspace-derived value ever attached — consistent with deps.dev being keyless by design |
@@ -256,7 +257,7 @@ Use EARS notation. Prefix with FR-NNN.
 |--------|-------------|----------------|
 | `DepsDevVersionInfo` | New type — parsed subset of deps.dev's per-version endpoint response relevant to this spec | `slsa_provenances: Vec<...>` (presence-only, count not required), `attestations: Vec<...>` (presence-only), `related_projects: Vec<RelatedProject>` |
 | `RelatedProject` | New type — one `relatedProjects[]` entry | `project_key: String`, `relation_type: String` (only `"SOURCE_REPO"` is consumed by FR-002) |
-| `DepsDevScorecard` | New type — parsed subset of deps.dev's per-project endpoint `scorecard` object | `date: String`, `version: String`, `checks: Vec<ScorecardCheck>`, `aggregate_score: <TBD pending FR-003's NEEDS CLARIFICATION>` |
+| `DepsDevScorecard` | New type — parsed subset of deps.dev's per-project endpoint `scorecard` object | `date: String`, `version: String`, `checks: Vec<ScorecardCheck>`, `overall_score: f32` (from the response's `scorecard.overallScore`, passed through as-is per FR-003) |
 | `ScorecardCheck` | New type — one `checks[]` entry | `name: String`, `score: i8` (0-10, or `-1` for not-applicable), `reason: String` |
 | `SupplyChainTrustSignal` | New, ecosystem-agnostic aggregate type assembled from the two deps.dev calls, consumed by the hover-formatting layer | `scorecard: Option<DepsDevScorecard>`, `provenance_verified: Option<bool>` (`None` only when the version-level query itself failed, per FR-004/FR-006 distinction) |
 
@@ -264,7 +265,7 @@ Use EARS notation. Prefix with FR-NNN.
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
-| Ecosystem is Composer, Dart, or Swift | No deps.dev query attempted at all (FR-005); hover behavior per the FR-011 `[NEEDS CLARIFICATION]` resolution |
+| Ecosystem is Composer, Dart, or Swift | No deps.dev query attempted at all (FR-005); trust-signal section silently omitted from hover, no explicit "not available" line (FR-011) |
 | Package has no `relatedProjects[]` entry with `relationType == "SOURCE_REPO"` | Scorecard portion omitted; SLSA/attestation portion (version-level, independent of project linkage) still shown per FR-001/FR-004 |
 | deps.dev per-version query succeeds, per-project query fails/times out | Provenance status still shown (FR-004); Scorecard portion omitted (mirrors FR-006's per-call independence) |
 | Both deps.dev queries fail (network error, timeout, non-2xx) | Entire trust-signal section omitted; no other hover content affected (FR-006, US-004) |
@@ -291,53 +292,37 @@ Use EARS notation. Prefix with FR-NNN.
 - Add the new `DepsDevVersionInfo`/`DepsDevScorecard`/etc. types to a dedicated module rather than embedding deps.dev-specific fields into any existing ecosystem crate's registry-response types (NFR-006).
 
 ### Ask First
-- Whether this signal feeds any LSP surface beyond hover (diagnostics, inlay hints) — blocked on FR-010's `[NEEDS CLARIFICATION]`.
-- Whether a dedicated, longer-than-default revalidation-skip window is needed for Scorecard data specifically — blocked on NFR-002's `[NEEDS CLARIFICATION]`.
 - Any change to `deps_core::net_policy`'s trusted-origin classification mechanism to accommodate a fixed, non-workspace-configurable third-party API endpoint, if the existing mechanism does not already support this cleanly.
 
 ### Never
 - Duplicate `licenses[]`, `isDeprecated`, or `advisoryKeys[]` from deps.dev when deps-lsp already sources this data natively per-ecosystem (Out of Scope, FR-009).
 - Block, delay, or degrade any existing hover content on a deps.dev failure (FR-006).
 - Attach any credential, cookie, or workspace-derived value to a deps.dev request (NFR-005) — it is keyless by design.
-- Escalate a Scorecard score into a diagnostic or blocking behavior without first resolving FR-012's `[NEEDS CLARIFICATION]`.
+- Escalate a Scorecard score into a diagnostic or blocking behavior (FR-012) — informational-only, permanently, for this spec's scope.
+- Introduce a new diagnostic or inlay-hint category for this signal (FR-010) — hover-only.
 
 ## 9. Open Questions
 
-- `[NEEDS CLARIFICATION: hover-only vs. new diagnostic/inlay-hint category]`
-  (FR-010) — should this signal be a hover-only addition, or also feed a new
-  diagnostic (e.g. flagging a very low Scorecard score) or inlay-hint
-  category? Non-blocking for a hover-only phase 1, but must be answered
-  before `/sdd plan` scopes the implementation surface.
-- `[NEEDS CLARIFICATION: Composer/Dart/Swift treatment]` (FR-011) — should
-  these three deps.dev-uncovered ecosystems get a documented, explicit "not
-  available" hover state, or should the section silently omit itself exactly
-  as it does for any other ecosystem lacking data? An explicit state adds a
-  small UI/messaging surface but avoids user confusion about why the section
-  appears for some ecosystems and never for others.
-- `[NEEDS CLARIFICATION: low-score escalation]` (FR-012) — should a low
-  Scorecard score ever escalate to a diagnostic, or should it remain
-  informational-only in every case, matching the precedent
-  [[004-release-freshness-signal/spec|004]] established (informational
-  signal, not a diagnostic, for release-freshness risk) and the broader
-  industry precedent of Dependabot/Socket.dev treating this class of signal
-  as informational rather than blocking? Cross-reference 004's resolution
-  before deciding.
-- `[NEEDS CLARIFICATION: Scorecard data TTL / revalidation cadence]`
-  (NFR-002) — deps.dev's upstream Scorecard data updates roughly weekly,
-  materially slower than deps-lsp's typical version-data cache behavior.
-  Should this data get a dedicated, longer revalidation-skip window layered
-  on top of `HttpCache`'s existing ETag-revalidate-every-time model (to
-  avoid an unnecessary conditional-GET round trip on every hover), or is
-  reusing the existing model as-is (which already avoids re-fetching the
-  full body on a 304) sufficient? This affects whether `HttpCache` needs a
-  new capability or whether this feature is a pure consumer of the existing
-  one.
-- `[NEEDS CLARIFICATION: Scorecard aggregate computation]` (FR-003) — should
-  the hover's single Scorecard number be deps.dev's own aggregate (if the API
-  exposes one directly) or a deps-lsp-computed mean of `checks[].score`
-  excluding `-1`/not-applicable checks? This determines whether deps-lsp
-  needs any scoring logic of its own or purely passes through an upstream
-  value.
+All open questions were resolved 2026-09-03 during `/sdd specify` review; none remain.
+
+- **Hover-only vs. new diagnostic/inlay-hint category** (FR-010) — resolved:
+  hover-only. A diagnostic/inlay-hint surface is deferred to a future spec if
+  ever justified by user demand.
+- **Composer/Dart/Swift treatment** (FR-011) — resolved: silent omission,
+  identical to any other ecosystem/package lacking data. No explicit "not
+  available" line, keeping the UI/messaging surface minimal.
+- **Low-score escalation** (FR-012) — resolved: informational-only,
+  permanently, matching the [[004-release-freshness-signal/spec|004]]
+  precedent. Any future escalation to a diagnostic requires a separate spec.
+- **Scorecard data TTL / revalidation cadence** (NFR-002) — resolved: reuse
+  `HttpCache`'s existing ETag-revalidate-every-time model as-is. A dedicated
+  longer revalidation-skip window is deferred unless hover latency proves
+  this insufficient in practice.
+- **Scorecard aggregate computation** (FR-003) — resolved via live
+  verification 2026-09-03: deps.dev's `scorecard.overallScore` field is a
+  top-level pass-through value (confirmed present in the API response, e.g.
+  `8.5` for `github.com/expressjs/express`); deps-lsp does not compute its
+  own aggregate from `checks[].score`.
 
 ## 10. See Also
 
