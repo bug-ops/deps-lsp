@@ -96,6 +96,7 @@ pub struct ScorecardSummary {
     pub overall_score: f32,     // 0.0..=10.0, clamped on parse
     pub date:          String,  // rendered escaped, never linked
     pub project_id:    String,  // validated SOURCE_REPO key, escaped on render
+    pub self_reported: bool,    // §5's pick landed on UNVERIFIED_METADATA
 }
 
 pub struct SupplyChainTrustSignal {
@@ -116,6 +117,8 @@ Deltas from spec §5, all upward in precision — each needs lead sign-off (§10
   printing nothing. Mapping: any entry `verified == true` → `Verified`;
   non-empty but none verified → `Unverified`; both arrays empty → `None`.
 - `RelatedProject` gains `relation_provenance` — load-bearing, see §5.
+- `ScorecardSummary.self_reported` carries §5's ranking outcome forward to the
+  renderer, so the O5 disclosure marker costs no extra request or parse.
 
 ## 4. Client and the two-call sequence
 
@@ -190,6 +193,10 @@ deterministic, security-aware pick:
 1. `relation_type == "SOURCE_REPO"` **and** `relation_provenance == "SLSA_ATTESTATION"` — cryptographically backed.
 2. Otherwise the first `relation_type == "SOURCE_REPO"` (typically `UNVERIFIED_METADATA`).
 3. No such entry → `scorecard = None`, provenance still rendered (FR-005, NFR-004).
+
+Case 2 sets `ScorecardSummary.self_reported = true`, which §8 renders as an
+explicit disclosure — a Scorecard for a merely-claimed repository must not carry
+the same visual confidence as one for an attested repository.
 
 This matters beyond determinism: `UNVERIFIED_METADATA` is derived from the
 package's own manifest metadata, so a hostile package can point its repository
@@ -362,7 +369,20 @@ severity language, no ⚠️.
 🔐 **Supply chain**: OpenSSF Scorecard `8.5`/10 · SLSA provenance: verified
 ```
 
+and, when the chosen SOURCE_REPO relation was `UNVERIFIED_METADATA`:
+
+```
+🔐 **Supply chain**: OpenSSF Scorecard `8.5`/10 *(self-reported repo)* · SLSA provenance: none found
+```
+
 - Score via `markdown_code_span`; `/10` outside the span.
+- `*(self-reported repo)*` renders immediately after the score whenever
+  `scorecard.self_reported` — one conditional, no extra data. Required, not
+  cosmetic (spec §6, O5): the repository behind an `UNVERIFIED_METADATA`
+  relation is claimed by the package's own metadata, so an unmarked score
+  invites a hostile package to borrow a reputable repo's reputation. An
+  attested relation renders no marker at all, which is what makes the marked
+  case legible as the weaker claim.
 - Provenance wording: `verified` / `attested but unverified` / `none found`.
   Omitted when `provenance == None` (query never made or failed) — FR-004's
   "we didn't check" vs "we checked and found nothing" distinction lands exactly
@@ -401,7 +421,7 @@ network needs one that is not "go fully offline".
 | D2 | **SC-005 retired** and replaced: assert "second `trust_signal` within TTL issues zero HTTP requests" (mockito hit count) | No `ETag` ⇒ no 304 path ⇒ the criterion can never pass | SC-005 stays permanently red |
 | D3 | `provenance_verified: Option<bool>` → `Option<ProvenanceStatus>` (3-state) | Live entries carry `verified: bool`; the 2-state model prints "verified" for unverified attestations — a false trust claim | Implement spec-literal; log the false-positive as a known issue |
 | D4 | `ScorecardCheck`, `checks[]`, `scorecard.version` dropped from the model (§3) | FR-003 mandates only `overallScore`; parsing ~20 checks to render none is unused surface | Parse and store them unrendered; expect a clippy/review dead-code flag |
-| D5 | FR-002's SOURCE_REPO pick is ranked by `relation_provenance` (§5) | Multiple SOURCE_REPO entries exist live; FR-002 assumes one, and the unranked pick inherits a spoofable Scorecard | First-match wins; spoofing residual stays unmitigated |
+| D5 | FR-002's SOURCE_REPO pick is ranked by `relation_provenance` (§5), and an unattested pick is disclosed in hover (§8) | Multiple SOURCE_REPO entries exist live; FR-002 assumes one, and the unranked pick inherits a spoofable Scorecard | First-match wins; spoofing residual stays unmitigated |
 | D6 | Config toggle added (§9) | No FR covers it; third-party egress needs an off switch | Ship always-on |
 | D7 | Signal gated on a concrete in-use version (§8) | FR-004's provenance claim is version-specific | See open question O1 |
 | D8 | Gradle and Deno-`npm:` excluded (§7) | FR-001 enumerates 7 ecosystems, Gradle is not among them | Add two one-line overrides |
@@ -448,12 +468,24 @@ None of these need a *user* decision, and the spec's §8 "Ask First" item
   D2's replacement for SC-005 (second call within TTL = zero requests);
   version-endpoint 200 + project-endpoint 500 → provenance rendered, Scorecard
   absent; malformed JSON and a `text/plain` 404 body both → `None`, no panic;
+  both O5 branches — an `SLSA_ATTESTATION` relation renders no marker, an
+  `UNVERIFIED_METADATA`-only one renders `*(self-reported repo)*`;
   project-key validation rejecting `github.com/../../etc` with zero requests;
   and the percent-encoding assertions for Go, Maven and scoped npm names.
 - One `insta` snapshot for the hover line; snapshots live in
   `src/snapshots/` beside the module.
 
 ## 13. Open questions for the critic
+
+> [!note] Resolved by the lead, 2026-09-03
+> O1 — ship the in-use-version gate as written; revisit only if live testing
+> shows it biting often. O2 — keep the transport + TTL-memo split scoped to
+> this feature; teaching `HttpCache` a general `max-age` freshness window is a
+> separate change. O3 — no age qualifier on the score for v1. O4 — keep
+> "attested but unverified". O5 — **add the disclosure marker**, now folded
+> into §3, §5, §8 and §12 and recorded as an edge case in `spec.md` §6.
+> Listed below as written, for the critic to stress-test rather than
+> re-litigate.
 
 - **O1 — no in-use version.** §8 gates the whole signal on a concrete in-use
   version, so a manifest with no lockfile and no exact pin loses the Scorecard
