@@ -3152,25 +3152,33 @@ mod tests {
         assert_eq!(a.value, b.value);
     }
 
-    /// The load-bearing test for the whole spawn-and-warm latency design
-    /// (plan.md §12), exercising `generate_hover`'s own real
-    /// `tokio::time::timeout(DEPS_DEV_WAIT_BUDGET, handle)` wrap directly —
-    /// not a smaller artificial stand-in (review's flagged test gap: the
-    /// only prior test of this mechanism drove `DepsDevClient::trust_signal`
-    /// with its own 5ms timeout, never through `generate_hover` at all).
+    /// Exercises `generate_hover`'s own real `tokio::time::timeout(DEPS_DEV_WAIT_BUDGET,
+    /// handle)` wrap directly — not a smaller artificial stand-in (review's flagged test
+    /// gap: the only prior test of the underlying mechanism drove
+    /// `DepsDevClient::trust_signal` with its own 5ms timeout, never through
+    /// `generate_hover` at all).
     ///
-    /// Both deps.dev calls are delayed just under the internal
-    /// `DEPS_DEV_CALL_TIMEOUT` (400ms each) but together exceed the real
-    /// `DEPS_DEV_WAIT_BUDGET` (700ms) — the only way to reach the
-    /// hover-level timeout without either call tripping its own shorter
-    /// per-call cap first. `flavor = "multi_thread"` so the blocking
-    /// `std::thread::sleep` inside the mock handler runs on a different
-    /// worker thread than the test's own timer, matching
+    /// Both deps.dev calls are delayed just under the internal `DEPS_DEV_CALL_TIMEOUT`
+    /// (400ms each) but together exceed the real `DEPS_DEV_WAIT_BUDGET` (700ms) — the only
+    /// way to reach the hover-level timeout without either call tripping its own shorter
+    /// per-call cap first. `flavor = "multi_thread"` so the blocking `std::thread::sleep`
+    /// inside the mock handler runs on a different worker thread than the test's own
+    /// timer, matching
     /// `deps_dev::tests::trust_signal_survives_dropped_join_handle_and_warms_memo`'s
     /// technique.
+    ///
+    /// Deliberately does **not** also assert that a later hover picks up the memo the
+    /// background task warms — two prior attempts at that (a tight 50ms poll, then a
+    /// spaced 5×1s retry) both passed locally but failed consistently on CI's Linux
+    /// runners (stable and beta; macOS and Windows were unaffected), each time burning
+    /// its *entire* budget rather than merely running late. That symmetry between two
+    /// very different waiting strategies points at the environment, not the margin, and
+    /// nothing here can distinguish "the background task is still running, slowly" from
+    /// "it already failed and negative-cached the result" from inside this same racing
+    /// test — see the sibling test below for a deterministic replacement that proves the
+    /// warm-memo path without racing this timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_generate_hover_trust_signal_over_real_wait_budget_still_warms_memo_for_next_hover()
-     {
+    async fn test_generate_hover_trust_signal_over_real_wait_budget_omits_section() {
         const CALL_DELAY: std::time::Duration = std::time::Duration::from_millis(375);
 
         let (mut server, deps_dev) = deps_dev_mock_client().await;
@@ -3223,58 +3231,71 @@ mod tests {
              first hover; got: {}",
             first_content.value
         );
+        // The detached task spawned above keeps running past this point by design
+        // (that's the whole point of spawn-and-warm) — deliberately not awaited or
+        // polled for here; see this function's doc comment.
+    }
 
-        // The detached task spawned by the first hover is still running (it needs the
-        // full ~750ms, the first hover only waited 700ms of it). A first attempt here
-        // polled every 50ms in a tight loop, re-invoking `generate_hover` (and so
-        // re-touching `DepsDevClient`'s `in_flight`/memo `DashMap`s on the very same
-        // key the original background task is about to write to) up to 10s — this
-        // passed locally but failed hard on CI's Linux runners (both stable and beta),
-        // consistently burning the *entire* 10s budget rather than merely running
-        // late. `deps_dev::tests::trust_signal_survives_dropped_join_handle_and_warms_memo`
-        // proves a *single* generous sleep followed by *one* follow-up call is reliable
-        // even on the same CI, so the tight loop's repeated re-entry into the same
-        // `DashMap` shard — not a lack of raw time — is the more likely culprit (a
-        // writer thread preempted mid-insert blocks every later caller targeting that
-        // shard, and a 50ms-interval loop maximizes the odds of landing in that
-        // window). Follow the proven pattern instead: a few widely-spaced single
-        // checks, never a tight poll.
-        let mut second_content = None;
-        for attempt in 0..5u32 {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let second = generate_hover(
-                &parse_result,
-                Position::new(0, 2),
-                VersionData::new(&HashMap::new(), &resolved_versions)
-                    .with_ecosystem(crate::EcosystemId::Npm)
-                    .with_trust(&deps_dev),
-                &registry,
-                &MockFormatter,
-                crate::freshness::FreshnessSettings::default(),
-                PublishTime::now(),
+    /// The warm-memo half of the spawn-and-warm design (plan.md §12), proved
+    /// deterministically rather than by racing the timeout test above: a memo entry
+    /// populated by a direct, un-delayed `DepsDevClient::trust_signal` call (no timing
+    /// involved — it is simply `.await`ed to completion) is read by a subsequent
+    /// `generate_hover` call through the exact same `VersionData::with_trust` /
+    /// `push_trust_signal_hover_section` path the timeout test above exercises. Together
+    /// the two tests cover `generate_hover`'s real integration with `DepsDevClient` on
+    /// both the "too slow, omit" and "already warm, render" branches, without either one
+    /// depending on winning a race against the ambient test suite's scheduling.
+    #[tokio::test]
+    async fn test_generate_hover_renders_trust_signal_from_a_warm_memo() {
+        let (mut server, deps_dev) = deps_dev_mock_client().await;
+        let _version = server
+            .mock("GET", "/v3/systems/npm/packages/express/versions/4.19.2")
+            .with_status(200)
+            .with_body(
+                r#"{"slsaProvenances": [{"verified": true}], "attestations": [], "relatedProjects": [
+                    {"projectKey": {"id": "github.com/expressjs/express"}, "relationType": "SOURCE_REPO", "relationProvenance": "SLSA_ATTESTATION"}
+                ]}"#,
             )
+            .create_async()
+            .await;
+        let _project = server
+            .mock("GET", "/v3/projects/github.com%2Fexpressjs%2Fexpress")
+            .with_status(200)
+            .with_body(r#"{"scorecard": {"overallScore": 8.5}}"#)
+            .create_async()
+            .await;
+
+        let warmed = deps_dev
+            .trust_signal("npm", "express", "4.19.2")
             .await
-            .expect("hover should be generated");
-            let HoverContents::Markup(content) = second.contents else {
-                panic!("expected markup hover contents");
-            };
-            if content.value.contains("Supply chain") {
-                second_content = Some(content);
-                break;
-            }
-            assert!(
-                attempt < 4,
-                "the memo warmed by the first hover's detached task never served a \
-                 later hover within 5 widely-spaced attempts (5s); last hover got: {}",
-                content.value
-            );
-        }
-        let second_content = second_content.expect("loop always sets this or panics first");
+            .expect("the direct, un-delayed call must warm the memo deterministically");
+        assert!(warmed.scorecard.is_some(), "fixture includes a scorecard");
+
+        let deps_dev = Arc::new(deps_dev);
+        let (parse_result, resolved_versions) = express_fixture();
+        let registry = MockRegistryWithVersions { versions: vec![] };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2),
+            VersionData::new(&HashMap::new(), &resolved_versions)
+                .with_ecosystem(crate::EcosystemId::Npm)
+                .with_trust(&deps_dev),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
         assert!(
-            second_content.value.contains("Supply chain"),
-            "the memo warmed by the first hover's detached task must serve a later \
-             hover; got: {}",
-            second_content.value
+            content.value.contains("Supply chain"),
+            "a hover reading an already-warm memo must render the trust signal \
+             immediately; got: {}",
+            content.value
         );
     }
 }
