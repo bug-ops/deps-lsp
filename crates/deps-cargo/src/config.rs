@@ -40,7 +40,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use toml_span::value::Table;
 
-use deps_core::net_policy::{HostClass, PolicyGate, RegistryAccessPolicy, validate_index_url};
+use deps_core::net_policy::{
+    HostClass, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
+};
 use deps_core::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 
 /// A registry bearer-token credential, redacted everywhere except the one call site that
@@ -747,8 +749,13 @@ fn resolve_registries(
         .filter(|aliases| aliases.len() > 1)
         .flat_map(|aliases| {
             let names: Vec<&str> = aliases.iter().map(|s| s.as_str()).collect();
+            // Same as `resolve_alternate_registries`' unresolved-alias WARN (#536): `alias`
+            // here is a raw manifest `registry-index`/`registry` value, not a config-file
+            // alias name, so it may itself carry `user:pass@` userinfo — redact each entry
+            // before logging.
+            let redacted: Vec<String> = names.iter().map(|name| redact_userinfo(name)).collect();
             tracing::warn!(
-                aliases = ?names,
+                aliases = ?redacted,
                 "two aliases derive the same CARGO_REGISTRIES_*_INDEX/_TOKEN environment \
                  variable name; ignoring the environment override for all of them"
             );

@@ -450,10 +450,11 @@ pub enum PolicyGate<'a> {
 ///
 /// `raw` failing [`url::Url::parse`] is not proof it carries no userinfo (S1 finding) — an
 /// otherwise-valid `user:pass@host` can still fail to parse for a reason unrelated to the
-/// userinfo component itself (an invalid port, a malformed IPv6 literal, a non-ASCII host), so
-/// this falls back to a parse-independent redaction rather than returning `raw` untouched.
-/// Returns `raw` unchanged only when neither path finds anything shaped like userinfo to
-/// redact — a value with no `://` at all, or one whose authority carries no `@`.
+/// userinfo component itself (an invalid port, a malformed IPv6 literal, a non-ASCII host, or
+/// simply a missing scheme — #536 C2), so this falls back to a parse-independent redaction
+/// rather than returning `raw` untouched; the fallback scans from the `://` scheme separator
+/// when one is present, or from the very start of `raw` otherwise. Returns `raw` unchanged only
+/// when that scan finds no `@` at all — nothing looks like a userinfo component to redact.
 ///
 /// # Examples
 ///
@@ -468,12 +469,25 @@ pub enum PolicyGate<'a> {
 ///     redact_userinfo("https://registry.example/simple"),
 ///     "https://registry.example/simple"
 /// );
+/// assert_eq!(
+///     redact_userinfo("user:hunter2@registry.example/simple"),
+///     "***@registry.example/simple"
+/// );
 /// ```
 #[must_use]
 pub fn redact_userinfo(raw: &str) -> String {
     let Ok(mut url) = url::Url::parse(raw) else {
         return redact_userinfo_unparseable(raw);
     };
+    // A schemeless `user:pass@host` literal (no `://`) does not fail `Url::parse` outright
+    // (#536 C2): the word before the first `:` parses as a valid opaque scheme (e.g.
+    // `"user"`), and with no `//` following it the whole rest becomes a cannot-be-a-base
+    // opaque path — `username()`/`password()` never see the literal userinfo that follows,
+    // since there is no authority component at all from the parser's point of view. Fall
+    // back to the same parse-independent scan used for an outright parse failure.
+    if url.cannot_be_a_base() {
+        return redact_userinfo_unparseable(raw);
+    }
     if url.username().is_empty() && url.password().is_none() {
         return raw.to_string();
     }
@@ -488,16 +502,16 @@ pub fn redact_userinfo(raw: &str) -> String {
 }
 
 /// [`redact_userinfo`]'s fallback for a `raw` that fails `Url::parse` outright (S1 finding):
-/// locates the `://` scheme separator, then the *last* `@` before the next `/`, `?`, or `#`
-/// (matching how a URL parser resolves multiple unescaped `@`s in the authority — everything
-/// up to it is userinfo, never part of the host), and replaces that whole userinfo span with
-/// `***@`. Returns `raw` unchanged when there is no `://` at all, or no `@` in the authority —
-/// nothing looks like a userinfo component to redact.
+/// locates the `://` scheme separator when present, then the *last* `@` before the next `/`,
+/// `?`, or `#` (matching how a URL parser resolves multiple unescaped `@`s in the authority —
+/// everything up to it is userinfo, never part of the host), and replaces that whole userinfo
+/// span with `***@`. A `raw` with no `://` at all (e.g. a schemeless `user:pass@host` literal,
+/// which fails `Url::parse` for lacking a scheme rather than for any userinfo-related reason —
+/// #536 C2) is treated the same way, scanning from the very start of `raw` instead of skipping
+/// a scheme. Returns `raw` unchanged only when no `@` is found in the searched span — nothing
+/// looks like a userinfo component to redact.
 fn redact_userinfo_unparseable(raw: &str) -> String {
-    let Some(scheme_end) = raw.find("://") else {
-        return raw.to_string();
-    };
-    let authority_start = scheme_end + 3;
+    let authority_start = raw.find("://").map_or(0, |scheme_end| scheme_end + 3);
     let authority = &raw[authority_start..];
     let host_boundary = authority.find(['/', '?', '#']).unwrap_or(authority.len());
     let Some(at) = authority[..host_boundary].rfind('@') else {
@@ -899,6 +913,17 @@ mod tests {
         assert!(!redacted.contains("hunter2"));
         assert!(!redacted.contains("user:"));
         assert_eq!(redacted, "https://***@registry.example:99999/simple");
+    }
+
+    /// #536 C2: a schemeless literal (no `://` at all) fails `Url::parse` for lacking a
+    /// scheme, not for any userinfo-related reason — the pre-fix fallback bailed out as soon
+    /// as it found no `://`, letting the credential through unredacted.
+    #[test]
+    fn test_redact_userinfo_redacts_schemeless_userinfo() {
+        let redacted = redact_userinfo("user:hunter2@registry.example/simple");
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("user:"));
+        assert_eq!(redacted, "***@registry.example/simple");
     }
 
     #[test]
