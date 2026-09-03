@@ -7,7 +7,8 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
-    ConcreteVersion, Dependency, PackageName, VersionReq, lsp_helpers::warn_rejected_value,
+    ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq,
+    lsp_helpers::warn_rejected_value,
 };
 use std::sync::Arc;
 
@@ -119,6 +120,51 @@ impl GithubActionsFormatter {
 impl PackageNaming for GithubActionsFormatter {
     fn normalize_package_name(&self, name: &PackageName) -> String {
         name.as_str().to_lowercase()
+    }
+
+    /// Accepts `crate::is_valid_github_identity`'s `owner/repo` shape, or either of the
+    /// two non-registry `uses:` forms `crate::parser::classify_uses_value` recognizes by
+    /// the same leading literals: a local composite action path (`./x`, `.\x`,
+    /// [`DependencySource::Path`]) or a Docker image reference (`docker://x`, carried as a
+    /// [`DependencySource::Url`] — GitHub Actions has no dedicated Docker source variant).
+    ///
+    /// The non-registry forms matter here for the same reason a bare local-package name
+    /// matters to `SwiftFormatter::validate_package_name` (#402 critique C1): a `Path`- or
+    /// Docker-`uses:`-sourced [`GithubActionsDependency`] keeps its raw `uses:` value as
+    /// `name()` verbatim rather than an `owner/repo` coordinate, and
+    /// `deps_core::lsp_helpers::diagnostics`'s R5a "unknown package" rule runs
+    /// `validate_package_name` unconditionally — even for a source this formatter's
+    /// `can_resolve_source` (default, unoverridden) already treats as non-resolvable.
+    /// Without accepting these two literal prefixes, every workflow step using a local
+    /// action or a Docker image would be flagged "Invalid package name" instead of
+    /// producing no diagnostic at all, as before this override existed.
+    ///
+    /// In the current codebase this method's `Err` arm is unreachable from any live call
+    /// path: `classify_uses_value` already discards a malformed `owner/repo` `uses:` value
+    /// as `Malformed` before a `Registry`- or reusable-workflow-sourced dependency is ever
+    /// constructed, and `GithubActionsFormatter`'s `supports_package_rename` (default,
+    /// unoverridden `false`) skips `deps_core::lsp_helpers::code_actions`'s
+    /// `build_replacement_action` — the only other call site — before it reaches this
+    /// method. The override exists for parity with every other GitHub-identifier-shaped
+    /// or coordinate-shaped ecosystem formatter (`deps-swift`, and the #402/#375 sweep) and
+    /// as a defensive gate for any future caller that constructs a name without going
+    /// through `classify_uses_value`, not because a malformed name reaches it today.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPackageName`] when `name` is none of the three accepted shapes.
+    fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
+        if crate::is_valid_github_identity(name)
+            || name.starts_with("./")
+            || name.starts_with(".\\")
+            || name.starts_with("docker://")
+        {
+            Ok(())
+        } else {
+            Err(InvalidPackageName::new(
+                "name must be a GitHub 'owner/repo' identifier",
+            ))
+        }
     }
 }
 
@@ -520,6 +566,55 @@ mod tests {
             fmt.normalize_package_name(&PackageName::new("Actions/Checkout")),
             "actions/checkout"
         );
+    }
+
+    // --- #544: validate_package_name override ---
+
+    #[test]
+    fn test_validate_package_name_accepts_owner_repo() {
+        let fmt = formatter();
+        assert!(fmt.validate_package_name("actions/checkout").is_ok());
+    }
+
+    /// A local composite action's `name` is its raw `./`-prefixed `uses:` value
+    /// (`crate::parser`'s `ParsedUses::Path` arm), never an `owner/repo` coordinate — it
+    /// must not be flagged as an invalid package name.
+    #[test]
+    fn test_validate_package_name_accepts_local_path_action() {
+        let fmt = formatter();
+        assert!(fmt.validate_package_name("./local-action").is_ok());
+        assert!(fmt.validate_package_name("./nested/local-action").is_ok());
+    }
+
+    /// A Docker image reference's `name` is its raw `docker://`-prefixed `uses:` value
+    /// (`crate::parser`'s `ParsedUses::Docker` arm) — same rationale as the local-path
+    /// case above.
+    #[test]
+    fn test_validate_package_name_accepts_docker_ref() {
+        let fmt = formatter();
+        assert!(fmt.validate_package_name("docker://alpine:3.18").is_ok());
+    }
+
+    /// A structurally invalid GitHub Actions reference must be reported as an invalid
+    /// package name, not forwarded to the registry lookup that produces the misleading
+    /// generic "Registry lookup failed" diagnostic.
+    #[test]
+    fn test_validate_package_name_rejects_malformed_names() {
+        let fmt = formatter();
+        for name in [
+            "",
+            ".",
+            "..",
+            "no-slash",
+            "owner/repo/extra",
+            "../../etc/passwd",
+            "owner/..",
+        ] {
+            assert!(
+                fmt.validate_package_name(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
     }
 
     #[test]
