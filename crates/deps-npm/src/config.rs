@@ -41,7 +41,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use deps_core::PackageName;
 use deps_core::net_policy::{
@@ -376,18 +375,6 @@ fn resolve_entry(
     }
 }
 
-/// One `.npmrc` file's raw entries plus its mtime, cached per file path (FR-012).
-#[derive(Debug)]
-struct ParsedNpmrc {
-    mtime: SystemTime,
-    raw: RawNpmrc,
-}
-
-/// Upper bound on [`NpmConfigCache`]'s entry count — mirrors `deps-cargo`'s
-/// `MAX_CONFIG_FILES`, generous for any realistic project tree (bounded by the number of
-/// *distinct* `.npmrc` files, not by the number of `package.json` files sharing them).
-const MAX_NPMRC_FILES: usize = 256;
-
 /// Upper bound on the project-tier ancestor walk depth, matching `deps-cargo`'s
 /// `MAX_CONFIG_ANCESTOR_DEPTH`.
 const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
@@ -395,61 +382,38 @@ const MAX_CONFIG_ANCESTOR_DEPTH: usize = 64;
 /// Per-`.npmrc`-file-path memoization (FR-012), mirroring `deps-cargo::config::ConfigFileCache`
 /// exactly in shape.
 ///
-/// Caches **raw, unvalidated** entries plus the file's mtime — `${VAR}` expansion,
-/// [`NpmRegistryIndex::new`] validation, and policy gating all re-run **per parse** against
-/// these cached entries, never cached themselves. This is what makes a
-/// `didChangeConfiguration` policy change, or an environment-variable change, take effect
-/// immediately with no cache invalidation of its own. There is no workspace-root key: npm
-/// has no workspace-root concept for config discovery (`NpmParseResult::workspace_root()`
-/// returns `None`), and neither does Cargo's config cache.
-#[derive(Debug, Default)]
-pub struct NpmConfigCache {
-    files: dashmap::DashMap<PathBuf, Arc<ParsedNpmrc>>,
+/// Caches **raw, unvalidated** entries — `${VAR}` expansion, [`NpmRegistryIndex::new`]
+/// validation, and policy gating all re-run **per parse** against these cached entries,
+/// never cached themselves. This is what makes a `didChangeConfiguration` policy change, or
+/// an environment-variable change, take effect immediately with no cache invalidation of its
+/// own. There is no workspace-root key: npm has no workspace-root concept for config
+/// discovery (`NpmParseResult::workspace_root()` returns `None`), and neither does Cargo's
+/// config cache. A thin newtype over [`deps_core::MtimeFileCache`] — the mtime-gated caching
+/// mechanism itself lives there, shared with `deps-cargo`.
+#[derive(Debug)]
+pub struct NpmConfigCache(deps_core::MtimeFileCache<RawNpmrc>);
+
+impl Default for NpmConfigCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NpmConfigCache {
     /// Creates an empty cache.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            files: dashmap::DashMap::new(),
-        }
+        Self(deps_core::MtimeFileCache::new(
+            deps_core::DEFAULT_MAX_CACHED_FILES,
+            "npm config",
+        ))
     }
 
     /// Returns `path`'s parsed contents, from cache if `path`'s mtime is unchanged, else
-    /// re-reading and re-parsing. `None` if `path` does not exist or cannot be read.
-    ///
-    /// Always performs one `stat` (the mtime check) — unavoidable, paid on every parse,
-    /// cache hit or not — but reads and parses file *content* only on a miss. Compares
-    /// mtime with `!=`, not `>` (a `git checkout` that restores an older file moves the
-    /// mtime backwards, and `>` would then keep serving the stale cached entry).
-    fn get_or_parse(&self, path: &Path) -> Option<Arc<ParsedNpmrc>> {
-        let metadata = std::fs::metadata(path).ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        let mtime = metadata.modified().ok()?;
-
-        if let Some(existing) = self.files.get(path)
-            && existing.mtime == mtime
-        {
-            return Some(Arc::clone(&existing));
-        }
-
-        let content = std::fs::read_to_string(path).ok()?;
-        let raw = parse_npmrc_raw(&content);
-        let parsed = Arc::new(ParsedNpmrc { mtime, raw });
-
-        if !self.files.contains_key(path) && self.files.len() >= MAX_NPMRC_FILES {
-            tracing::warn!(
-                path = %path.display(),
-                cap = MAX_NPMRC_FILES,
-                "npm config cache capacity reached; not caching this file (still used for this parse)"
-            );
-            return Some(parsed);
-        }
-        self.files.insert(path.to_path_buf(), Arc::clone(&parsed));
-        Some(parsed)
+    /// re-reading and re-parsing. `None` if `path` does not exist, is not a regular file, or
+    /// cannot be read.
+    fn get_or_parse(&self, path: &Path) -> Option<Arc<RawNpmrc>> {
+        self.0.get_or_parse(path, parse_npmrc_raw)
     }
 }
 
@@ -524,9 +488,9 @@ fn resolve_with_home(
             std::fs::canonicalize(&candidate).ok().as_deref() == user_canonical.as_deref();
         if !is_user_tier_duplicate && let Some(parsed) = config_cache.get_or_parse(&candidate) {
             if registry_raw.is_none() {
-                registry_raw.clone_from(&parsed.raw.registry);
+                registry_raw.clone_from(&parsed.registry);
             }
-            for (scope, raw) in &parsed.raw.scoped {
+            for (scope, raw) in &parsed.scoped {
                 scoped_raw
                     .entry(scope.clone())
                     .or_insert_with(|| raw.clone());
@@ -540,9 +504,9 @@ fn resolve_with_home(
         && let Some(parsed) = config_cache.get_or_parse(user_path)
     {
         if registry_raw.is_none() {
-            registry_raw.clone_from(&parsed.raw.registry);
+            registry_raw.clone_from(&parsed.registry);
         }
-        for (scope, raw) in &parsed.raw.scoped {
+        for (scope, raw) in &parsed.scoped {
             scoped_raw
                 .entry(scope.clone())
                 .or_insert_with(|| raw.clone());
@@ -562,6 +526,7 @@ fn resolve_with_home(
 mod tests {
     use super::*;
     use deps_core::net_policy::WorkspaceRegistryAccess;
+    use std::time::SystemTime;
 
     fn public_only_policy() -> RegistryAccessPolicy {
         RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly)
@@ -1164,10 +1129,7 @@ mod tests {
         std::fs::write(&path, "registry=https://npm.one.example\n").unwrap();
         let cache = NpmConfigCache::new();
         let first = cache.get_or_parse(&path).unwrap();
-        assert_eq!(
-            first.raw.registry.as_deref(),
-            Some("https://npm.one.example")
-        );
+        assert_eq!(first.registry.as_deref(), Some("https://npm.one.example"));
 
         // Ensure a distinguishable mtime on filesystems with coarse timestamp resolution.
         let future = SystemTime::now() + std::time::Duration::from_secs(2);
@@ -1182,20 +1144,7 @@ mod tests {
             .unwrap();
 
         let second = cache.get_or_parse(&path).unwrap();
-        assert_eq!(
-            second.raw.registry.as_deref(),
-            Some("https://npm.two.example")
-        );
+        assert_eq!(second.registry.as_deref(), Some("https://npm.two.example"));
         assert!(!Arc::ptr_eq(&first, &second));
-    }
-
-    #[test]
-    fn test_config_cache_missing_file_returns_none() {
-        let cache = NpmConfigCache::new();
-        assert!(
-            cache
-                .get_or_parse(Path::new("/nonexistent/path/.npmrc"))
-                .is_none()
-        );
     }
 }

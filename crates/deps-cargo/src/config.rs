@@ -38,49 +38,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
 use toml_span::value::Table;
 
 use deps_core::net_policy::{HostClass, PolicyGate, RegistryAccessPolicy, validate_index_url};
-
-/// Test-only filesystem-call counters (plan-1b §4 Performance/M4): `ConfigFileCache` claims
-/// "one stat, zero reads" on a cache hit, and [`crate::parser::discover_workspace`] claims
-/// "at most two stats per ancestor" — both claims need an actual call count to verify, not
-/// just `Arc::ptr_eq` (which proves the parsed *value* is reused, not that no syscall ran).
-/// Zero cost in non-test builds: every counting wrapper below compiles to a bare
-/// passthrough when this module is absent.
-#[cfg(test)]
-pub(crate) mod fs_probe {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    pub(crate) static STAT_COUNT: AtomicUsize = AtomicUsize::new(0);
-    pub(crate) static READ_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-    /// The current stat/read counts, for a test to snapshot before an operation and diff
-    /// against afterward — never a global "reset to zero", since `cargo nextest` gives each
-    /// test its own process but a bare count-from-zero would still race a hypothetical
-    /// future multi-threaded runner.
-    pub(crate) fn snapshot() -> (usize, usize) {
-        (
-            STAT_COUNT.load(Ordering::Relaxed),
-            READ_COUNT.load(Ordering::Relaxed),
-        )
-    }
-}
-
-/// Counted wrapper around [`std::fs::metadata`] — see [`fs_probe`].
-fn stat_path(path: &Path) -> std::io::Result<std::fs::Metadata> {
-    #[cfg(test)]
-    fs_probe::STAT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::fs::metadata(path)
-}
-
-/// Counted wrapper around [`std::fs::read_to_string`] — see [`fs_probe`].
-fn read_to_string_counted(path: &Path) -> std::io::Result<String> {
-    #[cfg(test)]
-    fs_probe::READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::fs::read_to_string(path)
-}
+use deps_core::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 
 /// A registry bearer-token credential, redacted everywhere except the one call site that
 /// formats it into an `Authorization` header.
@@ -549,15 +510,15 @@ fn env_var_name(alias: &str, suffix: &str) -> String {
 }
 
 /// One tier's raw registries table, plus the raw `[source]` tables from the same file —
-/// cached per config-file path (plan-1b §1.5(a)), keyed on `mtime` for invalidation.
+/// cached per config-file path by [`deps_core::MtimeFileCache`], keyed on mtime for
+/// invalidation (plan-1b §1.5(a)).
 ///
-/// **Absence is never cached** (N5): only a file that existed and parsed successfully gets
-/// an entry, so `mtime` is a plain [`SystemTime`], not an `Option` — a `.cargo/config.toml`
-/// created after the cache was first populated is picked up on the very next parse with no
-/// extra bookkeeping, since the ancestor walk re-checks existence every parse regardless.
+/// **Absence is never cached** (N5): only a file that existed, was a regular file, and
+/// parsed successfully gets an entry — a `.cargo/config.toml` created after the cache was
+/// first populated is picked up on the very next parse with no extra bookkeeping, since the
+/// ancestor walk re-checks existence every parse regardless.
 #[derive(Debug)]
 struct ParsedConfigFile {
-    mtime: SystemTime,
     tier: CachedTier,
     sources: HashMap<String, SourceEntry>,
 }
@@ -578,13 +539,6 @@ enum CachedTier {
     CargoHome(HashMap<String, (String, Option<AuthToken>)>),
 }
 
-/// Upper bound on [`ConfigFileCache`]'s entry count — generous for any realistic project
-/// tree (bounded by the number of *distinct* `.cargo/config.toml`/`$CARGO_HOME/config.toml`
-/// files, typically 1-2, not by the number of workspace members sharing them), kept only for
-/// symmetry with `MAX_ALTERNATE_REGISTRIES` and stated explicitly rather than left implied
-/// (plan-1b §1.5(a)).
-const MAX_CONFIG_FILES: usize = 256;
-
 /// Per-config-file memoization for `.cargo/config.toml`/`$CARGO_HOME/config.toml` parsing
 /// (spec NFR-005, plan-1b §1.5).
 ///
@@ -596,75 +550,42 @@ const MAX_CONFIG_FILES: usize = 256;
 ///
 /// Owned by `crate::parser::CargoParseContext` and shared across every document this
 /// ecosystem parses, so hundreds of workspace members sharing one `.cargo/config.toml`
-/// collapse to a single cached entry.
-#[derive(Debug, Default)]
-pub struct ConfigFileCache {
-    files: dashmap::DashMap<PathBuf, Arc<ParsedConfigFile>>,
+/// collapse to a single cached entry. A thin newtype over [`deps_core::MtimeFileCache`] —
+/// the mtime-gated caching mechanism itself lives there, shared with `deps-npm`.
+#[derive(Debug)]
+pub struct ConfigFileCache(MtimeFileCache<ParsedConfigFile>);
+
+impl Default for ConfigFileCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConfigFileCache {
     /// Creates an empty cache.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            files: dashmap::DashMap::new(),
-        }
+        Self(MtimeFileCache::new(
+            DEFAULT_MAX_CACHED_FILES,
+            "cargo config",
+        ))
     }
 
     /// Returns `path`'s parsed workspace-tier contents, from cache if `path`'s mtime is
     /// unchanged, else re-reading and re-parsing.
-    ///
-    /// Always performs one `stat` (the mtime check) — that cost is unavoidable and paid on
-    /// every parse, cache hit or not — but reads and parses the file's *content* only on a
-    /// miss. Compares mtime with `!=`, not `>` (plan-1b §1.5, M7): a `git checkout` that
-    /// restores an older file moves the mtime backwards, and `>` would then keep serving the
-    /// stale cached entry.
     fn get_or_parse_workspace(&self, path: &Path) -> Option<Arc<ParsedConfigFile>> {
-        self.get_or_parse(path, |content| {
-            CachedTier::Workspace(parse_workspace_registries_raw(content))
+        self.0.get_or_parse(path, |content| ParsedConfigFile {
+            tier: CachedTier::Workspace(parse_workspace_registries_raw(content)),
+            sources: parse_source_entries_raw(content),
         })
     }
 
     /// [`Self::get_or_parse_workspace`], but for `$CARGO_HOME/config.toml`.
     fn get_or_parse_cargo_home(&self, path: &Path) -> Option<Arc<ParsedConfigFile>> {
-        self.get_or_parse(path, |content| {
-            CachedTier::CargoHome(parse_cargo_home_registries_raw(content))
+        self.0.get_or_parse(path, |content| ParsedConfigFile {
+            tier: CachedTier::CargoHome(parse_cargo_home_registries_raw(content)),
+            sources: parse_source_entries_raw(content),
         })
-    }
-
-    fn get_or_parse(
-        &self,
-        path: &Path,
-        parse_tier: impl FnOnce(&str) -> CachedTier,
-    ) -> Option<Arc<ParsedConfigFile>> {
-        let metadata = stat_path(path).ok()?;
-        let mtime = metadata.modified().ok()?;
-
-        if let Some(existing) = self.files.get(path)
-            && existing.mtime == mtime
-        {
-            return Some(Arc::clone(&existing));
-        }
-
-        let content = read_to_string_counted(path).ok()?;
-        let tier = parse_tier(&content);
-        let sources = parse_source_entries_raw(&content);
-        let parsed = Arc::new(ParsedConfigFile {
-            mtime,
-            tier,
-            sources,
-        });
-
-        if !self.files.contains_key(path) && self.files.len() >= MAX_CONFIG_FILES {
-            tracing::warn!(
-                path = %path.display(),
-                cap = MAX_CONFIG_FILES,
-                "config file cache capacity reached; not caching this file (still used for this parse)"
-            );
-            return Some(parsed);
-        }
-        self.files.insert(path.to_path_buf(), Arc::clone(&parsed));
-        Some(parsed)
     }
 }
 
@@ -1644,9 +1565,9 @@ token = "secret-token"
         // Prime the cache — the first call is necessarily a miss (one stat, one read).
         cache.get_or_parse_workspace(&path).unwrap();
 
-        let (stats_before, reads_before) = fs_probe::snapshot();
+        let (stats_before, reads_before) = deps_core::fs_probe::snapshot();
         let hit = cache.get_or_parse_workspace(&path).unwrap();
-        let (stats_after, reads_after) = fs_probe::snapshot();
+        let (stats_after, reads_after) = deps_core::fs_probe::snapshot();
 
         assert_eq!(
             reads_after - reads_before,
@@ -1659,115 +1580,6 @@ token = "secret-token"
             "a cache hit still pays exactly one mtime stat"
         );
         match &hit.tier {
-            CachedTier::Workspace(map) => assert!(map.contains_key("a")),
-            CachedTier::CargoHome(_) => panic!("expected Workspace tier"),
-        }
-    }
-
-    #[test]
-    fn test_config_file_cache_mtime_bump_invalidates() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[registries.a]\nindex = \"sparse+https://a.example\"\n",
-        )
-        .unwrap();
-
-        let cache = ConfigFileCache::new();
-        let first = cache.get_or_parse_workspace(&path).unwrap();
-
-        // Ensure a distinguishable mtime on filesystems with coarse timestamp resolution.
-        let future = SystemTime::now() + std::time::Duration::from_secs(2);
-        std::fs::write(
-            &path,
-            "[registries.a]\nindex = \"sparse+https://b.example\"\n",
-        )
-        .unwrap();
-        // `File::open` is read-only, which lacks `FILE_WRITE_ATTRIBUTES` on Windows and
-        // makes `set_modified` fail with `PermissionDenied`; open for write instead.
-        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_modified(future).unwrap();
-
-        let second = cache.get_or_parse_workspace(&path).unwrap();
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "an mtime bump must invalidate the cache entry"
-        );
-        match &second.tier {
-            CachedTier::Workspace(map) => {
-                assert_eq!(
-                    map.get("a").map(String::as_str),
-                    Some("sparse+https://b.example")
-                );
-            }
-            CachedTier::CargoHome(_) => panic!("expected Workspace tier"),
-        }
-    }
-
-    /// M7: an mtime moving *backwards* (a `git checkout` restoring an older file) must also
-    /// invalidate — `!=`, not `>`.
-    #[test]
-    fn test_config_file_cache_mtime_moving_backwards_invalidates() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[registries.a]\nindex = \"sparse+https://a.example\"\n",
-        )
-        .unwrap();
-        // `File::open` is read-only, which lacks `FILE_WRITE_ATTRIBUTES` on Windows and
-        // makes `set_modified` fail with `PermissionDenied`; open for write instead.
-        let future = SystemTime::now() + std::time::Duration::from_secs(10);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(future)
-            .unwrap();
-
-        let cache = ConfigFileCache::new();
-        let first = cache.get_or_parse_workspace(&path).unwrap();
-
-        // Move the mtime backwards relative to the cached entry.
-        std::fs::write(
-            &path,
-            "[registries.a]\nindex = \"sparse+https://b.example\"\n",
-        )
-        .unwrap();
-        let past = SystemTime::now();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(past)
-            .unwrap();
-
-        let second = cache.get_or_parse_workspace(&path).unwrap();
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "a backwards mtime move must still invalidate the cache entry"
-        );
-    }
-
-    /// N5: absence is never cached — a `.cargo/config.toml` created after the cache was
-    /// first consulted (and found nothing) must resolve on the very next call, with no
-    /// invalidation bookkeeping needed.
-    #[test]
-    fn test_config_file_cache_picks_up_previously_absent_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-
-        let cache = ConfigFileCache::new();
-        assert!(cache.get_or_parse_workspace(&path).is_none());
-
-        std::fs::write(
-            &path,
-            "[registries.a]\nindex = \"sparse+https://a.example\"\n",
-        )
-        .unwrap();
-        let parsed = cache.get_or_parse_workspace(&path).unwrap();
-        match &parsed.tier {
             CachedTier::Workspace(map) => assert!(map.contains_key("a")),
             CachedTier::CargoHome(_) => panic!("expected Workspace tier"),
         }
