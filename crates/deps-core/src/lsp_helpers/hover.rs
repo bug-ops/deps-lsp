@@ -3225,18 +3225,23 @@ mod tests {
         );
 
         // The detached task spawned by the first hover is still running (it needs the
-        // full ~750ms, the first hover only waited 700ms of it). A single fixed sleep
-        // here raced CI's actual scheduling latency under nextest's cross-test CPU
-        // contention (thousands of tests running concurrently) and was observed to
-        // fail on shared runners even though it passed reliably on an idle local
-        // machine — poll instead of guessing a duration: each polling hover either
-        // hits the now-warm memo (fast) or, while the original task is still running,
-        // hits the in-flight claim and returns instantly with no signal (also fast,
-        // and issues no extra deps.dev request — `trust_signal`'s in-flight dedup
-        // makes a duplicate spawn a no-op), so this loop costs nothing beyond the
-        // actual wait needed on any given machine.
-        let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let second_content = loop {
+        // full ~750ms, the first hover only waited 700ms of it). A first attempt here
+        // polled every 50ms in a tight loop, re-invoking `generate_hover` (and so
+        // re-touching `DepsDevClient`'s `in_flight`/memo `DashMap`s on the very same
+        // key the original background task is about to write to) up to 10s — this
+        // passed locally but failed hard on CI's Linux runners (both stable and beta),
+        // consistently burning the *entire* 10s budget rather than merely running
+        // late. `deps_dev::tests::trust_signal_survives_dropped_join_handle_and_warms_memo`
+        // proves a *single* generous sleep followed by *one* follow-up call is reliable
+        // even on the same CI, so the tight loop's repeated re-entry into the same
+        // `DashMap` shard — not a lack of raw time — is the more likely culprit (a
+        // writer thread preempted mid-insert blocks every later caller targeting that
+        // shard, and a 50ms-interval loop maximizes the odds of landing in that
+        // window). Follow the proven pattern instead: a few widely-spaced single
+        // checks, never a tight poll.
+        let mut second_content = None;
+        for attempt in 0..5u32 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let second = generate_hover(
                 &parse_result,
                 Position::new(0, 2),
@@ -3254,16 +3259,17 @@ mod tests {
                 panic!("expected markup hover contents");
             };
             if content.value.contains("Supply chain") {
-                break content;
+                second_content = Some(content);
+                break;
             }
             assert!(
-                std::time::Instant::now() < poll_deadline,
+                attempt < 4,
                 "the memo warmed by the first hover's detached task never served a \
-                 later hover within 10s; last hover got: {}",
+                 later hover within 5 widely-spaced attempts (5s); last hover got: {}",
                 content.value
             );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        };
+        }
+        let second_content = second_content.expect("loop always sets this or panics first");
         assert!(
             second_content.value.contains("Supply chain"),
             "the memo warmed by the first hover's detached task must serve a later \
