@@ -436,6 +436,76 @@ pub enum PolicyGate<'a> {
     Enforce(&'a RegistryAccessPolicy),
 }
 
+/// Replaces any embedded `user:pass@`/`user@` userinfo component in `raw` with a fixed
+/// `***@` marker, for a caller to log or retain instead of the raw credential-bearing value.
+///
+/// A userinfo-bearing index URL is always rejected ([`IndexUrlError::UserInfoPresent`]), but
+/// the *raw* value naming what was rejected must never itself carry the credential through to
+/// a `tracing::warn!` line or an `InvalidEntry`-shaped struct's `raw` field a user might see
+/// surfaced as `DependencySource::CustomRegistry`'s `url` in hover/diagnostics text. A fixed
+/// marker (rather than stripping the component outright) keeps the redacted value visibly
+/// distinct from a URL that never carried userinfo at all, so a user can still tell *that* a
+/// credential was present and removed, without ever seeing what it was. Shared by
+/// `deps-npm`'s and `deps-pypi`'s `resolve_entry` (M1 fix).
+///
+/// `raw` failing [`url::Url::parse`] is not proof it carries no userinfo (S1 finding) — an
+/// otherwise-valid `user:pass@host` can still fail to parse for a reason unrelated to the
+/// userinfo component itself (an invalid port, a malformed IPv6 literal, a non-ASCII host), so
+/// this falls back to a parse-independent redaction rather than returning `raw` untouched.
+/// Returns `raw` unchanged only when neither path finds anything shaped like userinfo to
+/// redact — a value with no `://` at all, or one whose authority carries no `@`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::redact_userinfo;
+///
+/// assert_eq!(
+///     redact_userinfo("https://user:hunter2@registry.example/simple"),
+///     "https://***@registry.example/simple"
+/// );
+/// assert_eq!(
+///     redact_userinfo("https://registry.example/simple"),
+///     "https://registry.example/simple"
+/// );
+/// ```
+#[must_use]
+pub fn redact_userinfo(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return redact_userinfo_unparseable(raw);
+    };
+    if url.username().is_empty() && url.password().is_none() {
+        return raw.to_string();
+    }
+    // `set_username`/`set_password` only fail for a cannot-be-a-base URL — never true here,
+    // since a URL with `username()`/`password()` set is always base-having by construction —
+    // but a hardcoded fallback marker is used instead of ever risking the original,
+    // credential-bearing string leaking through an unexpected `Err` path.
+    if url.set_username("***").is_err() || url.set_password(None).is_err() {
+        return "<redacted: index URL contained userinfo>".to_string();
+    }
+    url.as_str().to_string()
+}
+
+/// [`redact_userinfo`]'s fallback for a `raw` that fails `Url::parse` outright (S1 finding):
+/// locates the `://` scheme separator, then the *last* `@` before the next `/`, `?`, or `#`
+/// (matching how a URL parser resolves multiple unescaped `@`s in the authority — everything
+/// up to it is userinfo, never part of the host), and replaces that whole userinfo span with
+/// `***@`. Returns `raw` unchanged when there is no `://` at all, or no `@` in the authority —
+/// nothing looks like a userinfo component to redact.
+fn redact_userinfo_unparseable(raw: &str) -> String {
+    let Some(scheme_end) = raw.find("://") else {
+        return raw.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority = &raw[authority_start..];
+    let host_boundary = authority.find(['/', '?', '#']).unwrap_or(authority.len());
+    let Some(at) = authority[..host_boundary].rfind('@') else {
+        return raw.to_string();
+    };
+    format!("{}***@{}", &raw[..authority_start], &authority[at + 1..])
+}
+
 /// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`) with an `http`
 /// scheme — the shape every `mockito::Server` binds to.
 ///
@@ -461,6 +531,14 @@ fn is_loopback_url(url: &url::Url) -> bool {
 /// load-bearing: userinfo is rejected *before* the policy gate runs, which is what lets a
 /// caller safely log `raw_for_log` unredacted on a [`IndexUrlError::BlockedHost`] warning,
 /// since a userinfo-bearing candidate can never reach that point. Do not reorder.
+///
+/// [`IndexUrlError::InvalidUrl`] is the one variant this invariant can't cover — `candidate`
+/// failed to parse *before* any userinfo check could run, so `raw_for_log` might still carry
+/// one (S1 finding: an otherwise-valid `user:pass@host` URL can fail to parse for an unrelated
+/// reason, e.g. an invalid port). [`redact_userinfo`] is applied to `raw_for_log` before it is
+/// wrapped in [`IndexUrlError::InvalidUrl`], so every caller — `deps-cargo`, `deps-npm`,
+/// `deps-pypi` — gets this for free, whether or not it separately redacts its own `raw` before
+/// logging.
 ///
 /// # Errors
 ///
@@ -494,7 +572,7 @@ pub fn validate_index_url(
     gate: PolicyGate<'_>,
 ) -> Result<url::Url, IndexUrlError> {
     let url = url::Url::parse(candidate)
-        .map_err(|_| IndexUrlError::InvalidUrl(raw_for_log.to_string()))?;
+        .map_err(|_| IndexUrlError::InvalidUrl(redact_userinfo(raw_for_log)))?;
     let is_https = url.scheme() == "https";
     #[cfg(any(test, feature = "test-util"))]
     let is_https = is_https || is_loopback_url(&url);
@@ -793,5 +871,56 @@ mod tests {
             ),
             Err(IndexUrlError::BlockedHost { .. })
         ));
+    }
+
+    #[test]
+    fn test_redact_userinfo_noop_cases() {
+        assert_eq!(
+            redact_userinfo("https://registry.example/simple"),
+            "https://registry.example/simple"
+        );
+        assert_eq!(redact_userinfo("not-a-valid-url"), "not-a-valid-url");
+    }
+
+    #[test]
+    fn test_redact_userinfo_strips_username_and_password() {
+        let redacted = redact_userinfo("https://user:hunter2@registry.example/simple");
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("user:"));
+        assert_eq!(redacted, "https://***@registry.example/simple");
+    }
+
+    /// S1: an otherwise-userinfo-bearing URL that fails `Url::parse` for an unrelated reason
+    /// (an invalid port here) must still be redacted — `redact_userinfo` cannot rely on
+    /// `Url::parse` succeeding to find the userinfo component.
+    #[test]
+    fn test_redact_userinfo_redacts_unparseable_url_with_userinfo() {
+        let redacted = redact_userinfo("https://user:hunter2@registry.example:99999/simple");
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("user:"));
+        assert_eq!(redacted, "https://***@registry.example:99999/simple");
+    }
+
+    #[test]
+    fn test_redact_userinfo_unparseable_no_userinfo_is_noop() {
+        assert_eq!(
+            redact_userinfo("https://registry.example:99999/simple"),
+            "https://registry.example:99999/simple"
+        );
+    }
+
+    /// S1: `IndexUrlError::InvalidUrl`'s payload is where the leak actually surfaced — every
+    /// caller (`deps-cargo`, `deps-npm`, `deps-pypi`) logs/retains this error's `%error`/
+    /// `Display`, so the redaction must happen inside `validate_index_url` itself, not rely on
+    /// each caller to redact separately.
+    #[test]
+    fn test_validate_index_url_redacts_userinfo_in_invalid_url_error() {
+        let raw = "https://user:hunter2@registry.example:99999/simple";
+        let err = validate_index_url(raw, raw, "cargo", PolicyGate::Skip).unwrap_err();
+        let IndexUrlError::InvalidUrl(redacted) = &err else {
+            panic!("expected InvalidUrl, got {err:?}");
+        };
+        assert!(!redacted.contains("hunter2"), "redacted: {redacted}");
+        assert!(!err.to_string().contains("hunter2"), "Display: {err}");
     }
 }

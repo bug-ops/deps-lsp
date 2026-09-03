@@ -34,7 +34,9 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy, validate_index_url};
+use deps_core::net_policy::{
+    PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
+};
 use deps_core::parser::DependencySource;
 
 /// Why a candidate index URL failed [`PypiIndexUrl::new`]'s validation.
@@ -98,7 +100,7 @@ impl std::fmt::Display for PypiIndexUrl {
 /// well-formed-but-non-https/userinfo-bearing value.
 ///
 /// Carries the raw value as written, **with any embedded userinfo redacted** (M1 fix — see
-/// `redact_userinfo`), so [`PypiIndexConfig::resolve_source_for`] can build
+/// [`deps_core::net_policy::redact_userinfo`]), so [`PypiIndexConfig::resolve_source_for`] can build
 /// [`DependencySource::CustomRegistry`] for an explicit primary/named source, or log a warning
 /// naming what the user wrote for a dropped extra, without ever holding or surfacing the
 /// credential itself: a `CustomRegistry.url` can reach hover/diagnostics text, and a
@@ -113,40 +115,9 @@ pub struct InvalidEntry {
     pub reason: PypiIndexUrlError,
 }
 
-/// Replaces any embedded `user:pass@`/`user@` userinfo component in `raw` with a fixed
-/// `***@` marker before it is ever logged or stored (M1 fix, FR-011/NFR-001, spec's exact
-/// `https://***@host/path` example).
-///
-/// A userinfo-bearing index URL is always rejected ([`PypiIndexUrlError::UserInfoPresent`]),
-/// but the *raw* value naming what was rejected must never itself carry the credential through
-/// to a `tracing::warn!` line or an [`InvalidEntry::raw`] a user might see surfaced as
-/// [`DependencySource::CustomRegistry`]'s `url` in hover/diagnostics text. A fixed marker
-/// (rather than stripping the component outright) keeps the redacted value visibly distinct
-/// from a URL that never carried userinfo at all, so a user can still tell *that* a credential
-/// was present and removed, without ever seeing what it was.
-///
-/// Returns `raw` unchanged when it doesn't parse as a URL, or parses but carries no userinfo —
-/// there is nothing to redact in either case, so every other [`PypiIndexUrlError`] variant's
-/// `raw` value is unaffected by this function.
-fn redact_userinfo(raw: &str) -> String {
-    let Ok(mut url) = url::Url::parse(raw) else {
-        return raw.to_string();
-    };
-    if url.username().is_empty() && url.password().is_none() {
-        return raw.to_string();
-    }
-    // `set_username`/`set_password` only fail for a cannot-be-a-base URL — never true here,
-    // since a URL with `username()`/`password()` set is always base-having by construction —
-    // but a hardcoded fallback marker is used instead of ever risking the original,
-    // credential-bearing string leaking through an unexpected `Err` path.
-    if url.set_username("***").is_err() || url.set_password(None).is_err() {
-        return "<redacted: index URL contained userinfo>".to_string();
-    }
-    url.as_str().to_string()
-}
-
 /// Validates and normalizes one raw index value, logging a `tracing::warn!` naming the raw
-/// value (userinfo redacted — see [`redact_userinfo`]) on failure. `pub(crate)`: every parser
+/// value (userinfo redacted — see [`deps_core::net_policy::redact_userinfo`]) on failure.
+/// `pub(crate)`: every parser
 /// surface (`requirements.rs`, `pyproject.rs`) that discovers a candidate index value calls
 /// this before handing the result to a [`PypiIndexConfig`] setter.
 pub(crate) fn resolve_entry(
@@ -829,7 +800,10 @@ mod tests {
     }
 
     /// [`redact_userinfo`] is a no-op for a value with no userinfo component (the common
-    /// case), and for a value that doesn't even parse as a URL (nothing to redact from).
+    /// case), and for `"not-a-valid-url"` specifically — no `://` at all, so there is no
+    /// authority for even the parse-independent fallback to inspect (see
+    /// `deps_core::net_policy`'s own `test_redact_userinfo_redacts_unparseable_url_with_userinfo`
+    /// for the case where an unparseable value *does* still carry userinfo).
     #[test]
     fn test_redact_userinfo_noop_cases() {
         assert_eq!(
@@ -847,5 +821,33 @@ mod tests {
         // Spec's exact example format: a fixed `***@` marker, not a bare stripped host — this
         // keeps a redacted value visibly distinct from a URL that never carried userinfo.
         assert_eq!(redacted, "https://***@pypi.example/simple");
+    }
+
+    /// S1: a userinfo-bearing index value that also fails `Url::parse` for an unrelated reason
+    /// (an invalid port here) lands in `PypiIndexUrlError::InvalidUrl`, not `UserInfoPresent` —
+    /// the shape `redact_userinfo`'s original parse-gated no-op missed. Checks every channel:
+    /// `InvalidEntry::raw`, the `%reason` `Display`, and the captured log.
+    #[test]
+    fn test_resolve_entry_redacts_literal_userinfo_from_unparseable_raw() {
+        let policy = all_policy();
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let invalid = resolve_entry("https://user:hunter2@pypi.example:99999/simple", &policy)
+                .unwrap_err();
+            assert!(matches!(invalid.reason, PypiIndexUrlError::InvalidUrl(_)));
+            assert!(
+                !invalid.raw.contains("hunter2"),
+                "InvalidEntry::raw leaked the credential: {}",
+                invalid.raw
+            );
+            assert!(
+                !invalid.reason.to_string().contains("hunter2"),
+                "reason Display leaked the credential: {}",
+                invalid.reason
+            );
+        });
+        assert!(
+            !log.contains("hunter2"),
+            "tracing output leaked the credential: {log:?}"
+        );
     }
 }

@@ -21,6 +21,13 @@
 //!   in this module for an `_authToken`/`_auth`/`_password`/`_authIdent`/`always-auth`/
 //!   `//host/:_*` value to land in even accidentally. This is a structural guarantee, not a
 //!   runtime filter — verified by this module's own NFR-001 test.
+//! - **A literal `user:pass@`/`user@` written directly in a `registry=`/`@scope:registry=`
+//!   value is redacted before it can leak** (M1 fix, mirroring `deps-pypi`'s own M1). No
+//!   `${VAR}` expansion is needed for this case — a hostile `.npmrc` can write the credential
+//!   straight into the raw value — so `resolve_entry` redacts it (see
+//!   [`deps_core::net_policy::redact_userinfo`]) before it ever reaches a `tracing::warn!`
+//!   call or [`InvalidEntry::raw`], which [`NpmConfig::resolve_source_for`] can surface as
+//!   [`DependencySource::CustomRegistry`]'s `url` in hover/diagnostics text.
 //! - **Internal-network reachability (SSRF-adjacent).** [`NpmRegistryIndex::new`] requires a
 //!   [`deps_core::net_policy::RegistryAccessPolicy`] and checks every candidate against it —
 //!   unlike Cargo's `$CARGO_HOME`-is-trusted split, npm's project and user tiers are
@@ -38,7 +45,7 @@ use std::time::SystemTime;
 
 use deps_core::PackageName;
 use deps_core::net_policy::{
-    HostClass, IndexUrlError, PolicyGate, RegistryAccessPolicy, validate_index_url,
+    HostClass, IndexUrlError, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
 };
 use deps_core::parser::DependencySource;
 
@@ -157,13 +164,14 @@ impl std::fmt::Display for NpmRegistryIndex {
 /// A `registry=`/`@scope:registry=` entry that was present in `.npmrc` but unusable.
 ///
 /// Invalid URL, non-https, an undefined `${VAR}`, or policy-blocked. Carries the raw value
-/// as written (never the expanded form) so [`NpmConfig::resolve_source_for`] can build
+/// as written (never the expanded form, and with any literal userinfo redacted — see
+/// [`deps_core::net_policy::redact_userinfo`]) so [`NpmConfig::resolve_source_for`] can build
 /// [`DependencySource::CustomRegistry`] and so a warning can name what the user actually
 /// wrote, never an expanded-but-rejected value that could leak an environment variable's
-/// contents into the log.
+/// contents into the log, and never a literal credential the user wrote directly in `.npmrc`.
 #[derive(Debug, Clone)]
 pub struct InvalidEntry {
-    /// The raw `.npmrc` value, unexpanded.
+    /// The raw `.npmrc` value, unexpanded, with any literal userinfo redacted.
     pub raw: String,
     /// Why it was rejected.
     pub reason: NpmRegistryIndexError,
@@ -336,27 +344,32 @@ fn expand_env_vars_with(
 /// Expands and validates one raw `.npmrc` value, producing the [`NpmConfig`] entry FR-006's
 /// fail-closed state needs on failure — a `tracing::warn!` naming the **raw**, unexpanded
 /// value either way (an expanded-but-rejected value must never leak an environment
-/// variable's contents into the log).
+/// variable's contents into the log), with any literal `user:pass@`/`user@` userinfo written
+/// directly in that raw value redacted first (M1 fix — see
+/// [`deps_core::net_policy::redact_userinfo`]) — a hostile `.npmrc` can write a credential
+/// straight into `registry=`/`@scope:registry=` with no `${VAR}` expansion involved.
 fn resolve_entry(
     raw: &str,
     policy: &RegistryAccessPolicy,
 ) -> Result<NpmRegistryIndex, InvalidEntry> {
     match expand_env_vars(raw) {
         Ok(expanded) => NpmRegistryIndex::new_for_log(&expanded, raw, policy).map_err(|reason| {
-            tracing::warn!(raw, %reason, "npm registry index failed validation");
+            let redacted = redact_userinfo(raw);
+            tracing::warn!(raw = %redacted, %reason, "npm registry index failed validation");
             InvalidEntry {
-                raw: raw.to_string(),
+                raw: redacted,
                 reason,
             }
         }),
         Err(var) => {
+            let redacted = redact_userinfo(raw);
             tracing::warn!(
-                raw,
+                raw = %redacted,
                 var,
                 "npm registry value references an undefined environment variable"
             );
             Err(InvalidEntry {
-                raw: raw.to_string(),
+                raw: redacted,
                 reason: NpmRegistryIndexError::UndefinedEnvVar(var),
             })
         }
@@ -827,6 +840,71 @@ mod tests {
             NpmRegistryIndexError::InvalidUrl(raw_placeholder.to_string())
         );
         assert!(!err.to_string().contains("super-secret-value"));
+    }
+
+    /// #522: a literal `user:pass@` written directly in `.npmrc` (no `${VAR}` expansion
+    /// involved) must never reach `resolve_entry`'s `tracing::warn!` line or
+    /// `InvalidEntry::raw` unredacted — mirrors `deps-pypi`'s M1 fix test.
+    #[test]
+    fn test_resolve_entry_redacts_literal_userinfo_from_raw_and_log() {
+        let policy = all_policy();
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let invalid = resolve_entry("https://user:hunter2@npm.example/", &policy).unwrap_err();
+            assert!(matches!(
+                invalid.reason,
+                NpmRegistryIndexError::UserInfoPresent
+            ));
+            assert!(
+                !invalid.raw.contains("hunter2"),
+                "InvalidEntry::raw leaked the credential: {}",
+                invalid.raw
+            );
+            assert!(
+                !invalid.raw.contains("user:"),
+                "InvalidEntry::raw leaked the username: {}",
+                invalid.raw
+            );
+            assert!(
+                invalid.raw.contains("npm.example"),
+                "host should survive redaction"
+            );
+        });
+        assert!(
+            !log.contains("hunter2"),
+            "tracing output leaked the credential: {log:?}"
+        );
+    }
+
+    /// S1: a userinfo-bearing `.npmrc` value that also fails `Url::parse` for an unrelated
+    /// reason (an invalid port here) lands in `NpmRegistryIndexError::InvalidUrl`, not
+    /// `UserInfoPresent` — this is the shape `redact_userinfo`'s original parse-gated no-op
+    /// missed, so the credential must be checked in every channel: `InvalidEntry::raw`, the
+    /// `%reason` `Display`, and the captured log.
+    #[test]
+    fn test_resolve_entry_redacts_literal_userinfo_from_unparseable_raw() {
+        let policy = all_policy();
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let invalid =
+                resolve_entry("https://user:hunter2@npm.example:99999/", &policy).unwrap_err();
+            assert!(matches!(
+                invalid.reason,
+                NpmRegistryIndexError::InvalidUrl(_)
+            ));
+            assert!(
+                !invalid.raw.contains("hunter2"),
+                "InvalidEntry::raw leaked the credential: {}",
+                invalid.raw
+            );
+            assert!(
+                !invalid.reason.to_string().contains("hunter2"),
+                "reason Display leaked the credential: {}",
+                invalid.reason
+            );
+        });
+        assert!(
+            !log.contains("hunter2"),
+            "tracing output leaked the credential: {log:?}"
+        );
     }
 
     #[test]
