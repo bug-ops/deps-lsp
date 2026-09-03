@@ -247,6 +247,48 @@ fn merge_deprecations_after_fetch(
     }
 }
 
+/// Merges a partial fetch's #550 no-comparable-versions findings into `doc.outcomes`'
+/// corresponding channel (incremental didChange path).
+///
+/// Package-level, like [`merge_deprecations_after_fetch`] (not tied to the declared
+/// version, unlike `yanked`/`fetch_failure` — see the `diff.version_changed` pruning
+/// loop in [`handle_document_change`] for why those two, but not this one, are cleared
+/// on a version-only edit): if a package's registry situation improves between fetches
+/// (a real tag gets published), a stale marker must not survive for the document's
+/// lifetime.
+///
+/// `attempted_names` — every raw package name a fetch was actually attempted for this
+/// round (`dep_sources`' keys, captured before it is consumed) — rather than
+/// [`merge_deprecations_after_fetch`]'s `fetched_names` (`fetch_result.versions`'
+/// keys): a no-comparable-versions package is by definition never a member of
+/// `fetch_result.versions`, so deriving "attempted" from that map's keys would miss
+/// every package this function exists to clear or set.
+fn merge_no_comparable_versions_after_fetch(
+    doc: &mut DocumentState,
+    attempted_names: &[PackageName],
+    mut fetched_no_comparable_versions: HashSet<PackageName>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) {
+    // Same normalized-name dedup rationale as `merge_deprecations_after_fetch` (I2):
+    // decided per normalized name in one pass so two raw names sharing a normalized
+    // key can't flip the outcome based on `attempted_names`' unspecified iteration
+    // order.
+    let mut per_normalized: HashMap<String, bool> = HashMap::new();
+    for name in attempted_names {
+        let normalized = formatter.normalize_package_name(name);
+        let found = fetched_no_comparable_versions.remove(name);
+        let entry = per_normalized.entry(normalized).or_insert(false);
+        *entry = *entry || found;
+    }
+    for (normalized, found) in per_normalized {
+        if found {
+            doc.outcomes.set_no_comparable_versions(normalized);
+        } else {
+            doc.outcomes.clear_no_comparable_versions(&normalized);
+        }
+    }
+}
+
 /// Ceiling on the OSV scan timeout, independent of the configured
 /// `fetch_timeout_secs`: the shared `reqwest` client behind `HttpCache`
 /// already imposes its own client-wide 30s timeout (`cache.rs`), so a
@@ -975,6 +1017,13 @@ struct FetchResult {
     /// package doesn't exist" from "the registry couldn't be asked" instead
     /// of conflating both into a misleading "Unknown package" diagnostic.
     fetch_failed: HashMap<PackageName, FetchFailure>,
+    /// Packages whose registry fetch succeeded but produced zero comparable versions
+    /// (#550), keyed by **raw** package name (same raw/normalized split as
+    /// `yanked_versions` above). Distinct from `fetch_failed`: the registry was
+    /// successfully asked and the package demonstrably exists — it just has nothing a
+    /// version-comparison rule can use — so `generate_diagnostics_from_cache` must
+    /// report neither "Registry lookup failed" nor "Unknown package" for it.
+    no_comparable_versions: HashSet<PackageName>,
     /// Number of packages whose registry fetch did not succeed, counting both a genuine
     /// fetch failure (timeout, error — recorded in `fetch_failed` above) and a not-found
     /// lookup (the registry answered "no such package", never recorded in `fetch_failed`,
@@ -1098,6 +1147,10 @@ async fn fetch_latest_versions_parallel(
                 let mut yanked: Option<(PackageName, ConcreteVersion, RemovalStatus)> = None;
                 let mut failed_name: Option<(PackageName, FetchFailure, String)> = None;
                 let mut deprecation: Option<(PackageName, Deprecation)> = None;
+                // Set only when the fetch (and its `get_latest_matching` fallback) both
+                // genuinely succeeded yet resolved to no version at all (#550) — see the
+                // `Ok(Ok(None))` fallback arm below.
+                let mut no_comparable_versions = false;
                 let version = match result {
                     Ok(Ok(versions)) => {
                         let available: Arc<[ConcreteVersion]> = versions
@@ -1187,6 +1240,15 @@ async fn fetch_latest_versions_parallel(
                                 }
                                 Ok(Ok(None)) => {
                                     tracing::debug!(package = %name, "no version found");
+                                    // Both the list-based pick and this fallback
+                                    // genuinely succeeded and found nothing — the
+                                    // package demonstrably exists (the fetch itself
+                                    // never errored), it just has zero versions this
+                                    // registry can compare against (#550), e.g. a
+                                    // repository whose only tags don't parse as full
+                                    // semver. Distinct from every branch below that
+                                    // sets `failed_name`.
+                                    no_comparable_versions = true;
                                     None
                                 }
                                 Ok(Err(e)) => {
@@ -1356,7 +1418,14 @@ async fn fetch_latest_versions_parallel(
                     sender.send(count);
                 }
 
-                (version, yanked, failed_name, deprecation)
+                let no_comparable_versions_name = no_comparable_versions.then(|| name.clone());
+                (
+                    version,
+                    yanked,
+                    failed_name,
+                    deprecation,
+                    no_comparable_versions_name,
+                )
             }
         })
         .buffer_unordered(max_concurrent)
@@ -1367,11 +1436,12 @@ async fn fetch_latest_versions_parallel(
     let mut yanked_versions = HashMap::new();
     let mut fetch_failed = HashMap::new();
     let mut deprecations = HashMap::new();
+    let mut no_comparable_versions = HashSet::new();
     // First actionable failure in completion order — `results` is collected from
     // `buffer_unordered`, so its order already reflects real finishing order, the same
     // order a shared `Arc<Mutex>` written from inside each task would have observed.
     let mut priority_error: Option<String> = None;
-    for (version, yanked, failed_name, deprecation) in results {
+    for (version, yanked, failed_name, deprecation, no_comparable_versions_name) in results {
         if let Some((name, v)) = version {
             versions.insert(name, v);
         }
@@ -1387,6 +1457,9 @@ async fn fetch_latest_versions_parallel(
         if let Some((name, d)) = deprecation {
             deprecations.insert(name, d);
         }
+        if let Some(name) = no_comparable_versions_name {
+            no_comparable_versions.insert(name);
+        }
     }
 
     // `priority_error` (an actual fetch failure — rate limit, timeout, outage, ...)
@@ -1401,6 +1474,7 @@ async fn fetch_latest_versions_parallel(
         yanked_versions,
         fetch_failed,
         deprecations,
+        no_comparable_versions,
         failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
         first_error: error_message,
     }
@@ -1660,6 +1734,9 @@ pub async fn handle_document_open(
             }
             for (name, failure) in fetch_result.fetch_failed {
                 outcomes.set_fetch_failure(formatter.normalize_package_name(&name), failure);
+            }
+            for name in fetch_result.no_comparable_versions {
+                outcomes.set_no_comparable_versions(formatter.normalize_package_name(&name));
             }
             // `collided_names` (spec FR-011) are merged in alongside genuine fetch
             // failures so `generate_diagnostics_from_cache` reports "lookup could not
@@ -2037,6 +2114,16 @@ pub async fn handle_document_change(
         };
 
         // Fetch latest versions only for NEW dependencies
+        //
+        // Captured before `dep_sources` is moved into the call below: every raw name a
+        // fetch was actually attempted for this round, used by the #550
+        // no-comparable-versions merge further down to distinguish "attempted and
+        // resolved fine this round" (clear any stale marker) from "not attempted this
+        // round" (leave any existing marker untouched) — unlike `fetched_names` below,
+        // this can't be derived from `fetch_result.versions`'s keys, since a
+        // no-comparable-versions package is by definition never one of them.
+        let attempted_names: Vec<PackageName> =
+            dep_sources.iter().map(|(name, _)| name.clone()).collect();
         let registry = ecosystem_clone.registry();
         let fetch_result = fetch_latest_versions_parallel(
             registry,
@@ -2085,6 +2172,12 @@ pub async fn handle_document_change(
                 &mut doc,
                 &fetched_names,
                 fetch_result.deprecations,
+                formatter,
+            );
+            merge_no_comparable_versions_after_fetch(
+                &mut doc,
+                &attempted_names,
+                fetch_result.no_comparable_versions,
                 formatter,
             );
             if success {
@@ -3977,6 +4070,85 @@ mod tests {
             "a genuine not-found must not be recorded in fetch_failed, or \
              generate_diagnostics_from_cache would report it as a registry \
              error instead of Unknown package"
+        );
+    }
+
+    /// Regression for #550: a registry fetch that genuinely succeeds (no error at
+    /// either the list-based pick or the `get_latest_matching` fallback) but resolves
+    /// to zero versions must be recorded in `no_comparable_versions`, distinct from
+    /// both a normal successful fetch (`versions`) and a real failure
+    /// (`fetch_failed`). Mirrors `GithubActionsRegistry::get_versions("dtolnay/rust-toolchain")`,
+    /// whose sole tag `v1` doesn't parse as full semver, so `tags_to_versions` filters
+    /// it out and returns `Ok(vec![])`.
+    #[tokio::test]
+    async fn test_fetch_success_with_zero_versions_is_recorded_as_no_comparable_versions() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct EmptyButRealRegistry;
+
+        impl Registry for EmptyButRealRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry: Arc<dyn Registry> = Arc::new(EmptyButRealRegistry);
+        let packages = vec![PackageName::new("dtolnay/rust-toolchain")];
+
+        let result = fetch_latest_versions_parallel(
+            registry,
+            with_registry_source(packages),
+            &HashMap::new(),
+            None,
+            deps_core::freshness::FreshnessSettings::default(),
+            5,
+            10,
+            None,
+        )
+        .await;
+
+        assert!(result.versions.is_empty());
+        assert!(
+            result.fetch_failed.is_empty(),
+            "a genuine empty-but-successful fetch must not be recorded as a fetch \
+             failure, or generate_diagnostics_from_cache would report a registry \
+             error instead of nothing"
+        );
+        assert!(
+            result
+                .no_comparable_versions
+                .contains(&PackageName::new("dtolnay/rust-toolchain")),
+            "a package whose fetch succeeded with zero comparable versions must be \
+             recorded in no_comparable_versions, or R5 would misreport it as Unknown \
+             package; got: {:?}",
+            result.no_comparable_versions
         );
     }
 
@@ -6138,6 +6310,102 @@ time = "0.1.43"
                      regardless of fetch order: {names:?}"
                 );
             }
+        }
+
+        /// Regression for critic finding C3 (#550): `merge_no_comparable_versions_after_fetch`'s
+        /// `found == true` branch (`set_no_comparable_versions`) had zero coverage — mirrors
+        /// `test_merge_deprecations_after_fetch_retains_finding_for_name_not_refetched`, but
+        /// for the *first-time-set* case: a package attempted this round whose fetch
+        /// genuinely found zero comparable versions must be recorded, and an unrelated
+        /// package not attempted this round must be left untouched either way.
+        #[test]
+        fn test_merge_no_comparable_versions_after_fetch_sets_finding_for_newly_flagged_name() {
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let formatter = ecosystem.formatter();
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+
+            // "vendor/b" was attempted this round (e.g. a new dependency added by the
+            // edit) and its fetch genuinely succeeded with zero comparable versions;
+            // "vendor/a" was not attempted at all.
+            let mut fetched = HashSet::new();
+            fetched.insert(PackageName::new("vendor/b"));
+            merge_no_comparable_versions_after_fetch(
+                &mut doc,
+                &[PackageName::new("vendor/b")],
+                fetched,
+                formatter,
+            );
+
+            assert!(
+                doc.outcomes.no_comparable_versions("vendor/b"),
+                "a package whose fetch was attempted and found zero comparable versions \
+                 this round must be recorded"
+            );
+            assert!(
+                !doc.outcomes.no_comparable_versions("vendor/a"),
+                "a package never attempted this round must not be flagged"
+            );
+        }
+
+        /// Regression for critic finding C3 (#550): the literal "package no longer has
+        /// zero-comparable-versions on a subsequent fetch" scenario — e.g.
+        /// `dtolnay/rust-toolchain` eventually publishes a real `v1.2.3` tag. Mirrors
+        /// `test_merge_deprecations_after_fetch_clears_finding_when_refetched_clean`.
+        #[test]
+        fn test_merge_no_comparable_versions_after_fetch_clears_finding_when_refetched_with_versions()
+         {
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let formatter = ecosystem.formatter();
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.outcomes
+                .set_no_comparable_versions("vendor/a".to_string());
+
+            // "vendor/a" was re-fetched this round and this time resolved a real
+            // version, so it's absent from the fetched-flags set.
+            merge_no_comparable_versions_after_fetch(
+                &mut doc,
+                &[PackageName::new("vendor/a")],
+                HashSet::new(),
+                formatter,
+            );
+
+            assert!(
+                !doc.outcomes.no_comparable_versions("vendor/a"),
+                "a package that was attempted and this time resolved a real version must \
+                 have its stale marker cleared, or R5e would keep suppressing Unknown \
+                 package diagnostics for a name that could now legitimately need one"
+            );
+        }
+
+        /// A finding for a name not attempted this round (e.g. an unrelated dependency
+        /// untouched by a partial didChange fetch) must survive untouched — distinct
+        /// from the clear-on-refetch case above.
+        #[test]
+        fn test_merge_no_comparable_versions_after_fetch_retains_finding_for_name_not_attempted() {
+            let state = ServerState::new();
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let formatter = ecosystem.formatter();
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.outcomes
+                .set_no_comparable_versions("vendor/a".to_string());
+
+            // Only "vendor/b" was attempted this round; "vendor/a" was untouched.
+            merge_no_comparable_versions_after_fetch(
+                &mut doc,
+                &[PackageName::new("vendor/b")],
+                HashSet::new(),
+                formatter,
+            );
+
+            assert!(
+                doc.outcomes.no_comparable_versions("vendor/a"),
+                "a finding for a name not attempted this round must survive untouched"
+            );
         }
 
         #[tokio::test]

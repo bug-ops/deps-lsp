@@ -364,9 +364,9 @@ mod tests {
         assert!(!fmt.suppress_package_url(&DependencySource::Registry));
     }
 
-    /// A registry mock whose `get_versions` always succeeds with an empty list — enough
-    /// to drive `generate_hover`'s `resolvable && available_versions.is_some()` footer
-    /// gate (#474) without needing a real `Box<dyn Version>` fixture.
+    /// A registry mock whose `get_versions` always succeeds with an empty list — a real
+    /// GitHub repository whose only tags don't parse as full semver
+    /// (`dtolnay/rust-toolchain`'s sole tag `v1`, issue #550), not a fetch failure.
     struct EmptyRegistry;
 
     impl deps_core::Registry for EmptyRegistry {
@@ -518,8 +518,13 @@ mod tests {
         );
     }
 
+    /// #550: a resolvable Registry source whose live fetch genuinely succeeds with zero
+    /// entries (e.g. `dtolnay/rust-toolchain`, whose only tag `v1` isn't full semver)
+    /// must keep its link but must NOT show the update footer — there's nothing to
+    /// update to, so advertising `Cmd+.` would be misleading. Supersedes this test's
+    /// pre-#550 name and assertion, which locked in exactly that bug.
     #[tokio::test]
-    async fn test_hover_registry_action_keeps_link_and_footer() {
+    async fn test_hover_registry_action_keeps_link_no_footer_when_versions_empty() {
         let markdown = hover_markdown_for("steps:\n  - uses: actions/checkout@v4\n").await;
         assert!(
             markdown.starts_with(&format!(
@@ -529,9 +534,121 @@ mod tests {
             "non-regression: a normal Registry-sourced action keeps its link; got: {markdown}"
         );
         assert!(
-            markdown.contains("Press `Cmd+.`"),
-            "a resolvable Registry source with version data must still show the update \
-             footer; got: {markdown}"
+            !markdown.contains("**Recent versions**"),
+            "an empty live version list must not render an empty section header; got: {markdown}"
+        );
+        assert!(
+            !markdown.contains("Press `Cmd+.`"),
+            "a resolvable Registry source with zero live versions and nothing cached has \
+             no update code action to advertise; got: {markdown}"
+        );
+    }
+
+    /// Non-regression companion to the above (#474's original contract): a resolvable
+    /// Registry source whose live fetch returns real version data must still show the
+    /// update footer.
+    #[tokio::test]
+    async fn test_hover_registry_action_keeps_footer_when_versions_present() {
+        use deps_core::freshness::FreshnessSettings;
+        use deps_core::lsp_helpers::generate_hover;
+        use deps_core::{PublishTime, VersionData};
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::HoverContents;
+
+        struct OneVersionRegistry;
+
+        impl deps_core::Registry for OneVersionRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = deps_core::Result<Vec<Box<dyn deps_core::Version>>>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(vec![Box::new(crate::types::GithubActionsVersion {
+                        version: "v4.2.0".into(),
+                        sha: "a".repeat(40),
+                        prerelease: false,
+                        published_at: None,
+                    }) as Box<dyn deps_core::Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move { Ok(Vec::new()) })
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let fmt = formatter();
+        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+            .name_range()
+            .start;
+
+        let hover = generate_hover(
+            &parse_result,
+            position,
+            VersionData::new(&cached, &resolved),
+            &OneVersionRegistry,
+            &fmt,
+            FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for the dependency on this line");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("**Recent versions**"),
+            "a non-empty live version list must render the section; got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("Press `Cmd+.`"),
+            "a resolvable Registry source with real live version data must still show \
+             the update footer; got: {}",
+            content.value
         );
     }
 

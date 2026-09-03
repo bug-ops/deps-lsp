@@ -1,5 +1,6 @@
 //! GitHub Actions ecosystem implementation for deps-lsp.
 
+use dashmap::DashMap;
 use std::any::Any;
 use std::sync::Arc;
 use tower_lsp_server::ls_types::{
@@ -8,7 +9,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
+    Ecosystem, PackageName, ParseResult as ParseResultTrait, Registry, Result,
     completion::Completions,
     lsp_helpers::{EcosystemFormatter, PackageRendering, markdown_code_span},
 };
@@ -16,8 +17,40 @@ use deps_core::{
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
 use crate::formatter::GithubActionsFormatter;
-use crate::registry::GithubActionsRegistry;
+use crate::registry::{GithubActionsRegistry, TagIndex};
 use crate::types::{GithubActionsDependency, PinStyle};
+
+/// Whether `gha_dep`'s ref is diagnosable as a tag — either because
+/// [`crate::parser::classify_uses_value`] already classified it as [`PinStyle::Tag`] from
+/// its text shape, or because `tag_index`'s live `/tags` fetch confirms the ref is a
+/// literal member of the repository's tag list even though it doesn't *look*
+/// tag-shaped (issue #551, e.g. `taiki-e/install-action@cargo-deny`).
+///
+/// [`crate::parser::is_tag_shaped`] is a pure, registry-blind heuristic — it cannot tell
+/// a literal tool-name tag from a genuinely moving branch, since both fail the same
+/// "starts with `v`/a digit" test. Once the registry has actually answered (`tag_index`
+/// carries this repository's entry), the real answer is available and takes priority
+/// over the static guess; before that (`tag_index` cache miss), a [`PinStyle::Branch`]
+/// step stays classified as the "honest unknown" — exactly the pre-#551 behavior — until
+/// a fetch resolves it one way or the other.
+fn is_registry_confirmed_tag(
+    gha_dep: &GithubActionsDependency,
+    tag_index: &DashMap<PackageName, Arc<TagIndex>>,
+) -> bool {
+    match &gha_dep.pin {
+        Some(PinStyle::Tag) => true,
+        Some(PinStyle::Branch) => gha_dep
+            .version_req
+            .as_ref()
+            .map(deps_core::VersionReq::as_str)
+            .is_some_and(|ref_text| {
+                tag_index
+                    .get(&gha_dep.name)
+                    .is_some_and(|index| index.tag_to_sha.contains_key(ref_text))
+            }),
+        Some(PinStyle::Sha { .. }) | None => false,
+    }
+}
 
 /// GitHub Actions ecosystem implementation.
 ///
@@ -153,6 +186,7 @@ impl Ecosystem for GithubActionsEcosystem {
                 diagnostics.extend(mutable_ref_pin_diagnostics(
                     parse_result,
                     severities.mutable_ref_pin,
+                    &self.formatter.tag_index,
                 ));
             }
             diagnostics
@@ -246,21 +280,36 @@ impl Ecosystem for GithubActionsEcosystem {
                 return Some(hover);
             };
 
-            // #501 gap (tester finding): the shared `has_offline_actionable_data` gate in
-            // `deps_core::generate_hover` only sees `VersionData` and cannot see
-            // `formatter.tag_index` — GHA's "Pin to commit SHA" quickfix
-            // (`build_sha_pin_action`, wired into `generate_code_actions` above) is driven
-            // entirely by that separately-populated index, independent of `versions`. So a
-            // `PinStyle::Tag` step with a warm `TagIndex` entry has a real `Cmd+.` action
-            // while offline, even when the shared gate suppressed the footer for lack of any
-            // `VersionData` signal. Restores it post-hoc using the shared `CMD_DOT_FOOTER`
-            // constant (not a hand-copied literal) so the two can never drift apart.
+            // #501 gap (tester finding), widened by critic finding C1 (#550): the shared
+            // `has_offline_actionable_data`/footer gate in `deps_core::generate_hover` only
+            // sees `VersionData` and cannot see `formatter.tag_index` — GHA's "Pin to commit
+            // SHA" quickfix (`build_sha_pin_action`, wired into `generate_code_actions`
+            // above) is driven entirely by that separately-populated index, independent of
+            // `versions`. So a `PinStyle::Tag` step with a warm `TagIndex` entry has a real
+            // `Cmd+.` action even when the shared gate suppressed the footer for lack of any
+            // `VersionData` signal — originally observed offline (#501), but #550's
+            // empty-live-fetch footer gate reintroduced the identical gap *online* too: a
+            // bare-major tag (`@v4`) whose repo tags entirely fail the full-semver filter
+            // (`tags_to_versions`) makes `available_versions == Some([])`, which the shared
+            // gate now (correctly, for the general case) treats as "nothing to update" — but
+            // `populate_tag_index` still indexes bare-major tags (`v4 -> sha`) independent of
+            // that filter, so the quickfix is still genuinely available. Restores the footer
+            // post-hoc in both modes using the shared `CMD_DOT_FOOTER` constant (not a
+            // hand-copied literal) so the two can never drift apart; the
+            // `!content.value.contains(CMD_DOT_FOOTER)` guard below makes this idempotent
+            // when the shared gate already rendered it, so dropping the online/offline split
+            // cannot double-append.
             // `is_plain_scalar` mirrors `build_sha_pin_action`'s own guard (FR-010, spec
             // 031): for a quoted `uses:` scalar, `version_range` sits inside the quotes, so
             // the quickfix withholds itself rather than corrupt the value — the footer must
             // not advertise an action that was never actually offered.
-            if versions.offline
-                && gha_dep.pin == Some(PinStyle::Tag)
+            //
+            // Deliberately keyed on the raw `PinStyle::Tag` check, not
+            // `is_registry_confirmed_tag` (#551 plan): this footer only ever advertises
+            // `build_sha_pin_action`, which itself stays on the stricter, pre-#551 guard
+            // (see that function's doc comment) — the footer must never promise an action
+            // that withholds itself.
+            if gha_dep.pin == Some(PinStyle::Tag)
                 && gha_dep.is_plain_scalar
                 && let Some(tag) = gha_dep
                     .version_req
@@ -356,10 +405,12 @@ fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String
     format!("{markdown}{line}")
 }
 
-/// Builds one mutable-ref-pin [`Diagnostic`] (issue #473) per `PinStyle::Tag` step in
-/// `parse_result` — `PinStyle::Sha`, `PinStyle::Branch`, and `None` steps produce no
-/// diagnostic (FR-003; `PinStyle::Branch` is out of scope for this iteration, see spec
-/// 031 §"Out of Scope").
+/// Builds one mutable-ref-pin [`Diagnostic`] (issue #473) per diagnosable-as-tag step in
+/// `parse_result` — every `PinStyle::Tag` step, plus a `PinStyle::Branch` step
+/// `tag_index` confirms is actually a real tag (issue #551, e.g.
+/// `taiki-e/install-action@cargo-deny`: see [`is_registry_confirmed_tag`]).
+/// `PinStyle::Sha` and a `PinStyle::Branch` `tag_index` cannot (yet) confirm produce no
+/// diagnostic (FR-003).
 /// Maximum character count of `mutable_ref_pin_diagnostics`' interpolated `name`/`tag`
 /// values before truncation (security audit finding). Mirrors
 /// `deps_core::lsp_helpers::diagnostics`' `MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`
@@ -371,13 +422,14 @@ const MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS: usize = 128;
 fn mutable_ref_pin_diagnostics(
     parse_result: &dyn ParseResultTrait,
     severity: tower_lsp_server::ls_types::DiagnosticSeverity,
+    tag_index: &DashMap<PackageName, Arc<TagIndex>>,
 ) -> Vec<Diagnostic> {
     parse_result
         .dependencies()
         .into_iter()
         .filter_map(|dep| {
             let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
-            if gha_dep.pin != Some(PinStyle::Tag) {
+            if !is_registry_confirmed_tag(gha_dep, tag_index) {
                 return None;
             }
             let range = gha_dep.version_range?;
@@ -393,13 +445,30 @@ fn mutable_ref_pin_diagnostics(
                 tag,
                 MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS,
             );
+            // Critic finding C2 (#551): `build_sha_pin_action` deliberately stays
+            // restricted to a statically-classified `PinStyle::Tag` (FR-005/plan §11 —
+            // see that function's doc comment on the branch/tag name-collision risk), so
+            // a registry-confirmed-but-`PinStyle::Branch` ref has no automated fix behind
+            // `Cmd+.` here. The message must say so rather than imply one is a keystroke
+            // away, matching every other resolvable-but-unactionable case in this
+            // codebase (e.g. `deps_core`'s own "Registry lookup failed" wording never
+            // promises a quickfix it can't offer).
+            let message = if gha_dep.pin == Some(PinStyle::Tag) {
+                format!(
+                    "{name} is pinned to the mutable tag ref `{tag}`; pin to a full commit \
+                     SHA to guard against tag mutation"
+                )
+            } else {
+                format!(
+                    "{name} is pinned to the mutable tag ref `{tag}`; pin to a full commit \
+                     SHA to guard against tag mutation (manual edit — no automated fix \
+                     available for this ref)"
+                )
+            };
             Some(Diagnostic {
                 range,
                 severity: Some(severity),
-                message: format!(
-                    "{name} is pinned to the mutable tag ref `{tag}`; pin to a full commit \
-                     SHA to guard against tag mutation"
-                ),
+                message,
                 code: Some(NumberOrString::String(
                     MUTABLE_REF_PIN_DIAGNOSTIC_CODE.into(),
                 )),
@@ -417,6 +486,17 @@ fn mutable_ref_pin_diagnostics(
 /// Returns `None` (no destructive/no-op edit, FR-005) when the dependency at `position`
 /// is not `PinStyle::Tag`, has no `version_range`, or the `TagIndex` lookup misses (cache
 /// miss — e.g. the document was opened before the registry fetch completed).
+///
+/// Deliberately **not** widened to [`is_registry_confirmed_tag`]'s `PinStyle::Branch`
+/// case the way [`mutable_ref_pin_diagnostics`] is (#551 plan): FR-005/plan §11 (see
+/// `test_build_sha_pin_action_no_quickfix_for_branch_pin`) already forbids this
+/// quickfix for a `PinStyle::Branch` step even when a same-named `TagIndex` entry
+/// exists, since git permits a branch and a tag to share one name and GitHub's own
+/// `uses:` ref resolution for that collision is undocumented — an *automated edit*
+/// that silently pins to the tag's commit could pin to a different commit than the
+/// ref actually resolves to at run time. A diagnostic's advisory text carries no such
+/// risk (pinning to *some* SHA is safer than a moving ref either way), but this
+/// destructive edit keeps the stricter, pre-#551 guard.
 fn build_sha_pin_action(
     parse_result: &dyn ParseResultTrait,
     position: Position,
@@ -593,6 +673,106 @@ mod tests {
             !diagnostics
                 .iter()
                 .any(|d| d.code == Some(mutable_ref_pin_code()))
+        );
+    }
+
+    /// Regression for #551: `taiki-e/install-action@cargo-deny` is a literal-named ref
+    /// that parses as `PinStyle::Branch` (`is_tag_shaped` requires a leading `v`/digit)
+    /// even though it's a real, resolvable git tag — the registry's own tags fetch is
+    /// the only thing that can tell. Before any fetch has ever populated `TagIndex` for
+    /// this repository (cold cache — the same state a fresh document open starts in),
+    /// the mutable-ref-pin diagnostic must stay withheld: the "honest unknown" state is
+    /// unchanged from before #551, since nothing has confirmed the ref one way or
+    /// another yet.
+    #[tokio::test]
+    async fn test_generate_diagnostics_no_mutable_ref_pin_for_literal_tag_with_cold_tag_index() {
+        let diagnostics =
+            diagnostics_for("steps:\n  - uses: taiki-e/install-action@cargo-deny\n").await;
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == Some(mutable_ref_pin_code())),
+            "a literal-named ref with no TagIndex entry yet must stay the honest \
+             unknown, not assumed a tag; got: {diagnostics:?}"
+        );
+    }
+
+    /// Regression for #551: once a fetch has actually populated `TagIndex` for
+    /// `taiki-e/install-action` — tag data mixing a literal tool-selector tag
+    /// (`cargo-deny`, alongside its siblings `nextest`/`cross`/`wasm-pack` in the real
+    /// repository) with a real `vN` release tag (`v2`) — `cargo-deny` must now be
+    /// diagnosable: it's confirmed a real tag, not a moving branch, so the
+    /// mutable-ref-pin hint applies (arguably more relevant here, since these ARE
+    /// mutable reassignable tags). `v2` (statically `PinStyle::Tag` already, unaffected
+    /// by #551) keeps getting its own diagnostic exactly as before.
+    #[tokio::test]
+    async fn test_generate_diagnostics_mutable_ref_pin_for_registry_confirmed_literal_tag() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n\
+             \x20 - uses: taiki-e/install-action@cargo-deny\n\
+             \x20 - uses: taiki-e/install-action@v2\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+        let mut index = crate::registry::TagIndex::default();
+        index
+            .tag_to_sha
+            .insert("cargo-deny".to_string(), "a".repeat(40));
+        index
+            .tag_to_sha
+            .insert("nextest".to_string(), "b".repeat(40));
+        index.tag_to_sha.insert("v2".to_string(), "c".repeat(40));
+        eco.formatter.tag_index.insert(
+            deps_core::PackageName::new("taiki-e/install-action"),
+            Arc::new(index),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let diagnostics = eco
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                deps_core::VersionData::new(&cached, &resolved),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        let mutable_ref_pin_messages: Vec<&str> = diagnostics
+            .iter()
+            .filter(|d| d.code == Some(mutable_ref_pin_code()))
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            mutable_ref_pin_messages.len(),
+            2,
+            "both the registry-confirmed literal tag and the statically-classified \
+             tag must get the diagnostic; got: {diagnostics:?}"
+        );
+        let cargo_deny_message = *mutable_ref_pin_messages
+            .iter()
+            .find(|m| m.contains("cargo-deny"))
+            .expect("expected a diagnostic naming the confirmed literal tag");
+        let v2_message = *mutable_ref_pin_messages
+            .iter()
+            .find(|m| m.contains("`v2`"))
+            .expect("expected a diagnostic naming the statically-classified tag");
+
+        // Critic finding C2 (#551): `build_sha_pin_action` has no automated fix for the
+        // registry-confirmed-but-`PinStyle::Branch` case (FR-005/plan §11), so its
+        // message must say so — unlike the statically-classified `v2` tag, which does
+        // have the "Pin to commit SHA" quickfix behind `Cmd+.`.
+        assert!(
+            cargo_deny_message.contains("no automated fix available"),
+            "a registry-confirmed literal tag has no SHA-pin quickfix, so the message \
+             must not imply one; got: {cargo_deny_message}"
+        );
+        assert!(
+            !v2_message.contains("no automated fix available"),
+            "a statically-classified tag DOES have the SHA-pin quickfix, so the message \
+             must not claim otherwise; got: {v2_message}"
         );
     }
 
@@ -1003,6 +1183,76 @@ mod tests {
             !content.value.contains("Press `Cmd+.` to update version"),
             "no TagIndex entry exists, so there is no quickfix to restore the footer for; \
              got: {}",
+            content.value
+        );
+    }
+
+    /// Regression for critic finding C1 (#550): a bare-major tag pin (`@v4`, "the most
+    /// common real-world GitHub Actions pinning convention" per `populate_tag_index`'s own
+    /// docs) whose repository's tags are *all* bare-major fails `tags_to_versions`' full
+    /// `major.minor.patch` semver filter entirely, so the live hover fetch genuinely
+    /// succeeds with `available_versions == Some([])` — the #550 hover fix correctly
+    /// suppresses the shared footer for that case in general, but `populate_tag_index`
+    /// indexes bare-major tags independently of that filter, so the SHA-pin quickfix is
+    /// still genuinely available here. Unlike the offline-only sibling test above, this
+    /// drives a real (mocked) network fetch through the actual `GithubActionsRegistry` to
+    /// prove the restore now fires **online** too, not just offline.
+    #[tokio::test]
+    async fn test_generate_hover_restores_footer_online_for_bare_major_tag_with_empty_live_list() {
+        let sha = "a".repeat(40);
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/actions/checkout/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v4", "commit": {{"sha": "{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = crate::registry::GithubActionsRegistry::for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+            false,
+        );
+        let formatter = GithubActionsFormatter::new(registry.tag_index());
+        let eco = GithubActionsEcosystem {
+            registry: Arc::new(registry),
+            formatter,
+        };
+
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let content = "steps:\n  - uses: actions/checkout@v4\n";
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let position = parse_result.dependencies()[0].name_range().start;
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+
+        let hover = eco
+            .generate_hover(
+                parse_result.as_ref(),
+                position,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings::default(),
+            )
+            .await
+            .expect("hover should be generated for the dependency on this line");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !content.value.contains("**Recent versions**"),
+            "an all-bare-major tag list has zero full-semver entries, so the section \
+             must stay omitted; got: {}",
+            content.value
+        );
+        assert!(
+            content.value.contains("Press `Cmd+.` to update version"),
+            "a Tag-pinned step whose live fetch genuinely succeeded empty still has a \
+             real SHA-pin quickfix via TagIndex, so the footer must be restored online \
+             too, not just offline; got: {}",
             content.value
         );
     }

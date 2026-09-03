@@ -941,8 +941,14 @@ fn apply_in_use_yanked_rule(
 ///    (deferred, collapsed by [`push_collapsed_fetch_failures`] — R8) rather than
 ///    pushed inline, since a fetch failure is a registry-wide condition that can hit
 ///    many dependencies identically.
-/// 4. `Ok(())` + `can_resolve_source` -> R5d `Unknown package '{name}'`.
-/// 5. `Ok(())` -> nothing (#248: unresolvable source, absent cache entry means "never
+/// 4. `Ok(())` + `no_comparable_versions` -> R5e emits nothing (#550): the registry
+///    fetch succeeded and the package demonstrably exists, it just has zero versions
+///    comparable to the declared requirement (e.g. `dtolnay/rust-toolchain`'s only tag
+///    `v1` isn't full semver) — reported by neither R5c ("couldn't be asked") nor R5d
+///    ("no evidence it exists"). Checked before R5d so it takes priority over the
+///    "absent cache entry" heuristic that would otherwise misclassify it.
+/// 5. `Ok(())` + `can_resolve_source` -> R5d `Unknown package '{name}'`.
+/// 6. `Ok(())` -> nothing (#248: unresolvable source, absent cache entry means "never
 ///    fetched").
 fn apply_unknown_package_rule(
     diagnostics: &mut Vec<Diagnostic>,
@@ -956,15 +962,19 @@ fn apply_unknown_package_rule(
         return;
     }
 
-    let fetch_failure: Option<&FetchFailure> = ctx
-        .formatter
-        .can_resolve_source(&dep.source())
+    let can_resolve_source = ctx.formatter.can_resolve_source(&dep.source());
+    let fetch_failure: Option<&FetchFailure> = can_resolve_source
         .then(|| {
             ctx.versions
                 .outcomes
                 .and_then(|o| o.fetch_failure(ctx.normalized_name))
         })
         .flatten();
+    let no_comparable_versions = can_resolve_source
+        && ctx
+            .versions
+            .outcomes
+            .is_some_and(|o| o.no_comparable_versions(ctx.normalized_name));
     match ctx.formatter.validate_package_name(dep.name().as_str()) {
         Err(reason) => {
             diagnostics.push(Diagnostic {
@@ -1000,7 +1010,8 @@ fn apply_unknown_package_rule(
                 failure: fetch_failure.cloned(),
             });
         }
-        Ok(()) if ctx.formatter.can_resolve_source(&dep.source()) => {
+        Ok(()) if no_comparable_versions => {}
+        Ok(()) if can_resolve_source => {
             diagnostics.push(Diagnostic {
                 range: dep.name_range(),
                 severity: Some(ctx.severities.unknown),
@@ -1416,6 +1427,50 @@ mod tests {
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
         assert!(diagnostics[0].message.contains("Unknown package"));
         assert!(diagnostics[0].message.contains("unknown-pkg"));
+    }
+
+    /// Regression for #550: a package whose registry fetch succeeded but produced zero
+    /// comparable versions (e.g. `dtolnay/rust-toolchain`, whose only tag `v1` isn't
+    /// full semver, so `GithubActionsRegistry::get_versions` returns `Ok(vec![])`) must
+    /// not be reported "Unknown package" — the package demonstrably exists; there is
+    /// simply nothing derivable from it. No cache entry AND no `no_comparable_versions`
+    /// outcome would still (correctly) produce "Unknown package" — this asserts the
+    /// outcome alone suppresses it.
+    #[test]
+    fn test_generate_diagnostics_from_cache_no_comparable_versions_is_not_unknown_package() {
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "dtolnay/rust-toolchain".into(),
+                version_req: "stable".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 23)),
+            }],
+            uri: crate::test_util::test_uri("/repo/.github/workflows/ci.yml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let outcomes =
+            DependencyOutcomes::new().with_no_comparable_versions("dtolnay/rust-toolchain");
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            diagnostics.is_empty(),
+            "expected no diagnostic for a package with no comparable versions, got: {diagnostics:?}"
+        );
     }
 
     /// S3 (impl-critic): `generate_diagnostics_from_cache` must actually emit the
