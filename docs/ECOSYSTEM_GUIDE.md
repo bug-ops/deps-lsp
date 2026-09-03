@@ -774,6 +774,10 @@ independently on the same step with distinct codes:
 actions/checkout is pinned to the mutable tag ref `v4`; pin to a full commit SHA to guard against tag mutation
 ```
 
+The diagnostic fires for two kinds of tags:
+- **Semantic-version-shaped tags** (`v1.2.3`, `v4.0`, etc.) — detected by text pattern and confirmed via the registry.
+- **Literal-named tags** (non-version-like names such as `cargo-deny`, `latest-stable`) — these do not look tag-shaped to the parser, but when the registry confirms they are real tags, they become eligible for this diagnostic too (issue #551).
+
 Unlike every other diagnostic in this project, severity alone cannot silence this one —
 `DiagnosticSeverity` has no suppression value. Set `diagnostics.mutable_ref_pin_enabled` to
 `false` in initialization options to turn it off entirely for teams that intentionally accept
@@ -783,12 +787,13 @@ tag pinning.
 `<sha> # <tag>` — the exact same `{sha} # {tag}` shape the outdated-SHA-update quick fix already
 produces for a SHA-pinned step, reusing the tag/SHA cross-reference already populated by the
 existing outdated-version check (zero new network calls). The quick fix is withheld, not offered
-with a wrong or destructive edit, in two cases:
+with a wrong or destructive edit, in three cases:
 
 - The tag's commit SHA is not yet known — e.g. the document was opened before the registry fetch
   completed, or the tag was moved/deleted/is not a full `major.minor.patch` release the registry
   indexes (a moving major-version ref like `v4` itself is frequently in this category — GitHub's
   tags API lists `v4.3.1`, not a synthetic `v4` tag object).
+- **For literal-named tags**, even if the SHA is known, the quick fix is deliberately withheld (safety boundary FR-005) — a literal tag name like `cargo-deny` could in principle be a typo for a branch name, and silently replacing it with an auto-rewritten SHA would lock workflow behavior in place without the author's explicit intent. The diagnostic still fires so you know the tag is mutable, but the fix requires manual intervention to avoid accidental branch/tag confusion.
 - The `uses:` value is a **quoted YAML scalar** (`uses: "actions/checkout@v4"`). The ref text
   sits inside the quotes there, so appending `# <tag>` would place a `#` inside the string rather
   than starting a YAML comment — a `uses:` value GitHub Actions rejects. Re-pin a quoted step by
@@ -798,6 +803,17 @@ with a wrong or destructive edit, in two cases:
 tag-to-SHA-style index exists for branches, and adding one would require a new network call per
 branch; reusable-workflow calls (`owner/repo/.github/workflows/x.yml@ref`) and `./local`/
 `docker://` references are not resolvable refs and get no diagnostic either.
+
+### GitHub Actions: Non-Semver Tag Handling (issue #550)
+
+When a GitHub Action repository has only tags that don't parse as full semantic versions — such as
+`dtolnay/rust-toolchain` with its sole tag `v1`, or literal-named tags like `cargo-deny` — the
+hover and diagnostics now handle these gracefully instead of showing a false "Unknown package"
+diagnostic.
+
+- **Hover**: shows the package as resolvable (not unknown), but with an empty "Recent versions" list since no tag matches the standard semver filter. The mutable-ref-pin diagnostic still fires for the tag ref even though no update-to-latest is available.
+- **Diagnostics**: the package is recognized as resolvable, not reported as "Unknown package" — this is a real action, just not one with a conventional semver release train.
+- **Literal-named tags** (non-version-like names): are now recognized as actual tags (when confirmed by the registry) and qualify for the mutable-ref-pin diagnostic, even though they don't follow the `major.minor.patch` or `v\d+` patterns the parser heuristic would normally detect.
 
 ### Supply-Chain Trust Signal (issue #543)
 

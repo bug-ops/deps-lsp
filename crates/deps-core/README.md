@@ -26,6 +26,7 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 - **`check_yaml_nesting_depth`** — single-pass structural guard rejecting pathologically nested YAML (flow bracket depth and block-style indentation/dash-chain nesting) before it reaches the recursive-descent `yaml-rust2` parser
 - **`check_yaml_expansion`** — streaming pre-pass over `yaml-rust2`'s own parser event stream rejecting YAML whose anchor/alias references would expand to an excessive number of allocated bytes (billion-laughs-style), independent of nesting depth
 - **`lockfile::read_lockfile_content`** — shared read-and-error-wrap helper for lock file parsers
+- **`deps_dev::DepsDevClient`** — supply-chain trust signal client for the [deps.dev](https://deps.dev) API, resolving a dependency's linked source repository, OpenSSF Scorecard score, and SLSA/attestation provenance status (`SupplyChainTrustSignal`, `ScorecardSummary`, `ProvenanceStatus`)
 - **Error types** — Unified error handling with `thiserror`
 
 ## Installation

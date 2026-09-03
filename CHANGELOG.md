@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-03
+
 ### Added
 - **deps-core, deps-lsp**: supply-chain trust signal in hover — OpenSSF Scorecard score and SLSA/attestation provenance status via deps.dev, for npm/Cargo/Go/Maven/PyPI/Bundler/NuGet, behind a new `supply_chain.enabled` toggle (resolves #543) (#554)
 
 ### Fixed
-- **deps-core, deps-github-actions, deps-swift**: fixed sequential GitHub tag-pagination fetch exceeding the per-dependency timeout for high-tag-count repos (resolves #553)
+- **deps-core, deps-github-actions, deps-swift**: fixed sequential GitHub tag-pagination fetch exceeding the per-dependency timeout for high-tag-count repos (resolves #553) (#555)
 - **deps-core, deps-lsp, deps-github-actions**: fixed false "Unknown package" diagnostic when a dependency's tags exist but none are full-semver-shaped (e.g. `dtolnay/rust-toolchain`), and a stray hover "Press Cmd+. to update version" footer with an empty "Recent versions" section in the same case (resolves #550) (#552)
 - **deps-github-actions**: mutable-ref-pin diagnostic now fires for literal-named git tags (e.g. `taiki-e/install-action@cargo-deny`) previously misclassified as an undiagnosable branch pin (resolves #551) (#552)
 
@@ -726,7 +728,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/bug-ops/deps-lsp/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/bug-ops/deps-lsp/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/bug-ops/deps-lsp/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/bug-ops/deps-lsp/compare/v0.10.1...v0.11.0

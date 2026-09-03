@@ -14,7 +14,7 @@ tags:
   - cross-ecosystem
 created: 2026-09-03
 updated: 2026-09-03
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
