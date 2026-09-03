@@ -10,8 +10,9 @@ use std::sync::LazyLock;
 use tower_lsp_server::ls_types::Uri;
 
 /// Matches: implementation('group:artifact:version') or implementation("group:artifact:version")
+/// (optional whitespace between the configuration word and the opening paren)
 static RE_WITH_PARENS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(\w+)\(\s*['"]([^:'"]+):([^:'"]+):([^'"]+)['"]\s*\)"#).expect("RE_WITH_PARENS")
+    Regex::new(r#"(\w+)\s*\(\s*['"]([^:'"]+):([^:'"]+):([^'"]+)['"]\s*\)"#).expect("RE_WITH_PARENS")
 });
 /// Matches: implementation 'group:artifact:version' or implementation "group:artifact:version"
 static RE_WITHOUT_PARENS: LazyLock<Regex> = LazyLock::new(|| {
@@ -22,8 +23,10 @@ static RE_NO_VERSION_WITHOUT_PARENS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(\w+)\s+['"]([^:'"]+):([^:'"]+)['"]"#).expect("RE_NO_VERSION_WITHOUT_PARENS")
 });
 /// Matches: implementation('group:artifact') (no version, with parens)
+/// (optional whitespace between the configuration word and the opening paren)
 static RE_NO_VERSION_WITH_PARENS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(\w+)\(\s*['"]([^:'"]+):([^:'"]+)['"]\s*\)"#).expect("RE_NO_VERSION_WITH_PARENS")
+    Regex::new(r#"(\w+)\s*\(\s*['"]([^:'"]+):([^:'"]+)['"]\s*\)"#)
+        .expect("RE_NO_VERSION_WITH_PARENS")
 });
 
 const CONFIGURATIONS: &[&str] = &[
@@ -301,5 +304,23 @@ mod tests {
         let content = "apply plugin: 'java'\n";
         let result = parse_groovy_dsl(content, &make_uri()).unwrap();
         assert!(result.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_parse_with_parens_whitespace_no_version() {
+        let content = "dependencies {\n    implementation ('junit:junit')\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "junit:junit");
+        assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    #[test]
+    fn test_parse_with_parens_whitespace_with_version() {
+        let content = "dependencies {\n    implementation ('junit:junit:4.13.2')\n}\n";
+        let result = parse_groovy_dsl(content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "junit:junit");
+        assert_eq!(result.dependencies[0].version_req, Some("4.13.2".into()));
     }
 }
