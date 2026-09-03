@@ -85,7 +85,6 @@ pub fn exists(path: &Path) -> bool {
 /// "reset to zero", since `cargo nextest` gives each test its own process but a bare
 /// count-from-zero would still race a hypothetical future multi-threaded runner.
 #[cfg(feature = "test-util")]
-#[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
 #[must_use]
 pub fn snapshot() -> (usize, usize) {
     (
