@@ -321,8 +321,13 @@ fn resolve_alternate_registries(
         } else if let Some(class) = config.blocked_class(alias) {
             blocked_by_raw_value.insert(alias.clone(), class);
         } else {
+            // `alias` here is the raw `registry-index`/`registry` value from the manifest,
+            // not a config-file alias name — it may itself be a URL carrying `user:pass@`
+            // credentials (e.g. `RegistryIndexError::UserInfoPresent` fell through to alias
+            // resolution). Redact before logging (see `deps_core::net_policy::redact_userinfo`).
+            let redacted = deps_core::net_policy::redact_userinfo(alias);
             tracing::warn!(
-                alias,
+                alias = %redacted,
                 "registry alias did not resolve via the .cargo/config.toml \
                  hierarchy or $CARGO_HOME/config.toml; dependency stays unresolved"
             );
@@ -931,6 +936,82 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         assert_eq!(*range, result.dependencies[0].name_range);
         assert_eq!(*class, deps_core::net_policy::HostClass::CloudMetadata);
         assert_eq!(raw_value, "my-corp");
+    }
+
+    /// #536: a `registry-index` value carrying literal `user:pass@` userinfo fails
+    /// `RegistryIndex::new` with `UserInfoPresent`, so `resolve_alternate_registries` falls
+    /// through to alias resolution (spec: an `InvalidUrl`/`UserInfoPresent` literal is
+    /// treated as a possible `.cargo/config.toml` alias name). When that "alias" then fails
+    /// to resolve too, the unresolved-alias `tracing::warn!` must never log the raw,
+    /// credential-bearing value — it must be redacted first (see
+    /// `deps_core::net_policy::redact_userinfo`), matching the #529 precedent already applied
+    /// to `validate_index_url`'s own error `Display`.
+    #[test]
+    fn test_parse_registry_index_userinfo_alias_fallback_redacts_credential_in_log() {
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter2@index.crates.io/" }"#;
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = parse_cargo_toml(toml, &test_url()).unwrap();
+            assert_eq!(result.dependencies.len(), 1);
+            assert!(
+                matches!(
+                    &result.dependencies[0].source,
+                    DependencySource::CustomRegistry { url }
+                        if url == "sparse+https://user:hunter2@index.crates.io/"
+                ),
+                "a userinfo-bearing index that fails alias resolution must stay unresolved"
+            );
+        });
+
+        assert!(
+            !log.contains("hunter2"),
+            "tracing output leaked the credential: {log:?}"
+        );
+        assert!(
+            !log.contains("user:"),
+            "tracing output leaked the username: {log:?}"
+        );
+        assert!(
+            log.contains("index.crates.io"),
+            "host should survive redaction: {log:?}"
+        );
+    }
+
+    /// #536 C1: two `registry-index` userinfo literals differing only by case (Cargo's
+    /// env-var naming uppercases the whole alias, so `user:...` and `USER:...` collide on
+    /// the same `CARGO_REGISTRIES_*_INDEX` name — spec FR-015) fall through to alias
+    /// resolution and trip `resolve_registries`' env-collision `tracing::warn!`
+    /// (`config.rs`), which logs the full raw value list. That WARN is a second call site
+    /// (distinct from the unresolved-alias WARN covered above) that must also redact each
+    /// entry before logging.
+    #[test]
+    fn test_parse_registry_index_env_collision_redacts_credential_in_log() {
+        let toml = r#"[dependencies]
+a = { version = "1.0", registry-index = "sparse+https://user:hunter2@index.mycorp.dev/" }
+b = { version = "1.0", registry-index = "sparse+https://USER:hunter2@index.mycorp.dev/" }"#;
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = parse_cargo_toml(toml, &test_url()).unwrap();
+            assert_eq!(result.dependencies.len(), 2);
+        });
+
+        assert!(
+            log.contains("two aliases derive the same"),
+            "expected the env-collision WARN to fire: {log:?}"
+        );
+        assert!(
+            !log.contains("hunter2"),
+            "tracing output leaked the credential: {log:?}"
+        );
+        assert!(
+            !log.to_lowercase().contains("user:"),
+            "tracing output leaked the username: {log:?}"
+        );
+        assert!(
+            log.contains("index.mycorp.dev"),
+            "host should survive redaction: {log:?}"
+        );
     }
 
     #[test]

@@ -879,6 +879,12 @@ pub enum DependencySource {
     /// `url` may hold a bare alias (`"my-corp"`) or a URL string, but never a value this LSP
     /// has validated and can fetch against. See [`AlternateRegistry`](Self::AlternateRegistry)
     /// for the resolved counterpart.
+    ///
+    /// `url` is never redacted (unlike every `tracing::warn!` naming the same raw value —
+    /// see `deps_core::net_policy::redact_userinfo`'s doc, #536): a literal `registry-index`
+    /// carrying `user:pass@` userinfo that fails to resolve lands here verbatim. Currently
+    /// latent — nothing renders `CustomRegistry::url` in hover/diagnostics text today — but a
+    /// future caller surfacing it must redact first, matching every logging call site.
     CustomRegistry { url: String },
 
     /// A custom/alternative registry resolved to a concrete, fetchable index URL.
