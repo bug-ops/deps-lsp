@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle**: Groovy DSL's eight dependency-pattern matchers consolidated into one shared extraction helper, fixing a latent dedup-bookkeeping gap that skipped `matched_positions` tracking in two of them (resolves #533) (#537)
 
 ### Fixed
+- **deps-composer**: an uppercase-`V`-prefixed version (e.g. `V3.1.0`) now correctly satisfies its declared requirement instead of always failing, matching the existing lowercase-`v` behavior (resolves #534) (#538)
 - **deps-gradle**: a Groovy DSL dependency declaration with whitespace before the opening paren (e.g. `implementation ('junit:junit:4.13.2')`) is no longer silently dropped (resolves #525) (#527)
 - **deps-gradle**: a Kotlin DSL dependency declaration with whitespace before the opening paren (e.g. `implementation ("junit:junit:4.13.2")`) is no longer silently dropped, matching the Groovy DSL fix (resolves #526)
 - **deps-gradle**: `platform(...)`/`enforcedPlatform(...)`-wrapped BOM dependency coordinates (e.g. `implementation(platform("org.springframework.boot:spring-boot-dependencies:3.2.0"))`) are no longer silently dropped in Groovy and Kotlin DSL parsing (resolves #531) (#532)
