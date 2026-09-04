@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **deps-go, deps-core, deps-lsp**: `$GOENV` `GOPROXY`/`GOPRIVATE` support — a `GOPROXY` proxy chain (with `direct`/`off` sentinels) or a `GOPRIVATE`-matched module path now resolves to live hover/diagnostic/completion data from the configured private proxy (or fails closed with no data for `direct`/`off`) instead of always querying `proxy.golang.org`, failing closed on a bad hop rather than falling back to the public proxy (resolves #519)
+
 ## [0.12.1] - 2026-09-03
 
 ### Added

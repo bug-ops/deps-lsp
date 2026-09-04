@@ -12,7 +12,9 @@ description = "Go module support for deps-lsp"
 workspace = true
 
 [dependencies]
+dashmap.workspace = true
 deps-core = { workspace = true }
+dirs.workspace = true
 regex.workspace = true
 semver.workspace = true
 serde.workspace = true
@@ -26,6 +28,7 @@ urlencoding.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 deps-core = { workspace = true, features = ["test-util"] }
+mockito.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tokio-test.workspace = true

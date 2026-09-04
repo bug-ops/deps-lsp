@@ -19,6 +19,9 @@ pub struct GoDependency {
     pub directive: GoDirective,
     /// Whether this is an indirect dependency (// indirect comment)
     pub indirect: bool,
+    /// Resolved source (spec 034): `Registry` unless `$GOENV` declares a `GOPROXY`/`GOPRIVATE`
+    /// override applicable to this module path.
+    pub source: DependencySource,
 }
 
 /// Go module directive types.
@@ -89,7 +92,7 @@ impl deps_core::ecosystem::Dependency for GoDependency {
     }
 
     fn source(&self) -> DependencySource {
-        DependencySource::Registry
+        self.source.clone()
     }
 
     fn features(&self) -> &[String] {
@@ -158,6 +161,7 @@ mod tests {
             version_range: Some(Range::new(Position::new(0, 11), Position::new(0, 17))),
             directive: GoDirective::Require,
             indirect: false,
+            source: DependencySource::Registry,
         };
 
         assert_eq!(dep.name(), "github.com/gin-gonic/gin");

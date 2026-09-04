@@ -91,6 +91,19 @@ impl PackageRendering for GoFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
+
+    /// S4 (spec 034 review): suppresses the `pkg.go.dev` hover link for anything but a plain
+    /// public-registry dependency, reusing `SourcePolicy::source_is_public_registry_content`'s
+    /// default (`Registry` only — Go has no crates.io-style verified-mirror concept for
+    /// `AlternateRegistry` to except, mirroring `deps-pypi`'s identical reasoning). Without
+    /// this, a `GOPRIVATE`-matched module's hover still rendered a clickable
+    /// `pkg.go.dev/<private-path>` link, undermining the confidentiality guarantee FR-008/
+    /// NFR-003(2) exist for — the module path never reaches `pkg.go.dev` over the network
+    /// either way (this is a display link only, see `crate::registry::package_url`'s doc),
+    /// but the link itself named the private path in the rendered hover text.
+    fn suppress_package_url(&self, source: &deps_core::parser::DependencySource) -> bool {
+        !self.source_is_public_registry_content(source)
+    }
 }
 
 impl RequirementResolution for GoFormatter {
@@ -143,7 +156,20 @@ impl DiagnosticMessages for GoFormatter {}
 
 impl DiagnosticPolicy for GoFormatter {}
 
-impl SourcePolicy for GoFormatter {}
+impl SourcePolicy for GoFormatter {
+    /// FR-012 (spec 034): accepts `Registry` (default) and `AlternateRegistry` (a `$GOENV`
+    /// `GOPROXY`-chain or `GOPRIVATE`-bypass resolution) so hover/diagnostics/code-actions
+    /// gate correctly; `CustomRegistry` (FR-009's fail-closed state, every hop invalid) is
+    /// deliberately not accepted — falls through to the default `is_version_resolvable() ==
+    /// false`, keeping the existing fail-closed gate intact.
+    fn can_resolve_source(&self, source: &deps_core::parser::DependencySource) -> bool {
+        matches!(
+            source,
+            deps_core::parser::DependencySource::Registry
+                | deps_core::parser::DependencySource::AlternateRegistry { .. }
+        )
+    }
+}
 
 impl OsvNaming for GoFormatter {
     fn osv_version_to_native(&self, version: &str) -> String {
@@ -177,6 +203,7 @@ mod tests {
             version_range: Some(Range::new(Position::new(0, 0), Position::new(0, 1))),
             directive,
             indirect: false,
+            source: deps_core::parser::DependencySource::Registry,
         }
     }
 
@@ -462,6 +489,45 @@ mod tests {
                 .is_err()
         );
         assert!(formatter.validate_package_name("./evil").is_err());
+    }
+
+    /// FR-012 (spec 034): `can_resolve_source` accepts `Registry`/`AlternateRegistry`,
+    /// rejects `CustomRegistry` (FR-009's fail-closed state).
+    #[test]
+    fn test_can_resolve_source() {
+        let formatter = GoFormatter;
+        assert!(formatter.can_resolve_source(&deps_core::parser::DependencySource::Registry));
+        assert!(formatter.can_resolve_source(
+            &deps_core::parser::DependencySource::AlternateRegistry {
+                index: "go-proxy:deadbeef".to_string(),
+                mirrors_crates_io: false,
+            }
+        ));
+        assert!(!formatter.can_resolve_source(
+            &deps_core::parser::DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            }
+        ));
+    }
+
+    /// S4 (spec 034 review): the `pkg.go.dev` hover link is suppressed for anything but a
+    /// plain public-registry dependency — a `GOPRIVATE`/`GOPROXY`-resolved module's hover
+    /// must not render a clickable link naming its own (potentially private) module path.
+    #[test]
+    fn test_suppress_package_url() {
+        let formatter = GoFormatter;
+        assert!(!formatter.suppress_package_url(&deps_core::parser::DependencySource::Registry));
+        assert!(formatter.suppress_package_url(
+            &deps_core::parser::DependencySource::AlternateRegistry {
+                index: "go-proxy:deadbeef".to_string(),
+                mirrors_crates_io: false,
+            }
+        ));
+        assert!(formatter.suppress_package_url(
+            &deps_core::parser::DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            }
+        ));
     }
 
     #[test]

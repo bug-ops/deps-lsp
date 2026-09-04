@@ -314,7 +314,21 @@ pub fn register_ecosystems(
         Arc::clone(&policy),
     )));
 
-    register!("go", GoEcosystem, registry, &cache);
+    // go is written out explicitly rather than via `register!` (spec 034, mirroring npm's
+    // spec 032 S3 precedent): that macro's `GoEcosystem::new(cache)` would give Go a
+    // default, disconnected `GoParseContext` — its `$GOENV` reachability policy would never
+    // see a live `initialize`/`didChangeConfiguration` update.
+    #[cfg(feature = "go")]
+    {
+        let go_context = deps_go::config::GoParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(deps_go::config::GoEnvCache::new()),
+        };
+        registry.register(Arc::new(GoEcosystem::with_context(
+            Arc::new(GoRegistry::new(Arc::clone(&cache))),
+            go_context,
+        )));
+    }
     register!("bundler", BundlerEcosystem, registry, &cache);
     register!("dart", DartEcosystem, registry, &cache);
     register!("maven", MavenEcosystem, registry, &cache);
