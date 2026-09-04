@@ -45,24 +45,11 @@ pub const GITHUB_API: &str = "https://api.github.com";
 /// subset fixes that, since the highest real versions were never fetched at all.
 pub const MAX_TAG_PAGES: u32 = 30;
 
-/// Number of tag pages [`paginate_tags`] fetches concurrently per batch.
-///
-/// Sequential pagination (one page RTT at a time) is what made a many-tag repo (e.g. 1327
-/// tags / 14 pages) exceed `deps-lsp`'s per-dependency fetch timeout (#553). 5 keeps
-/// wall-clock time comfortably under that timeout while staying low enough to avoid
-/// tripping GitHub's secondary (abuse) rate limiter, which reacts to burst concurrency
-/// independent of the hourly quota. Total request count is unchanged for the common
-/// single-page-repo case; for multi-page repos it may grow by up to `CONCURRENCY - 1` pages
-/// (see [`paginate_tags`]'s doc comment). Negligible against the 5000/h *tokened* quota; a
-/// multi-page repo fetched *without* a `GITHUB_TOKEN` can cost up to 3x its pre-fix request
-/// count against the much smaller 60/h unauthenticated quota.
-///
-/// Known limitation: there is no process-wide cap on concurrent GitHub requests across
-/// dependencies — a workspace with many GitHub-tags-backed dependencies fetched at once can
-/// multiply this per-dependency concurrency well past `CONCURRENCY`. Evaluated and shipped
-/// as-is (see PR discussion); add a shared `Semaphore` in `GithubTagsClient` if this is ever
-/// observed as a real problem.
-const CONCURRENCY: usize = 5;
+// [`paginate_tags`]'s page-fetch concurrency now lives in
+// [`crate::pagination::paginate_pages`]'s internal `CONCURRENCY` constant, which this
+// crate's tags pagination delegates to (see that module's doc comment for the batching
+// rationale — a many-tag repo's request count/latency tradeoff, and the known limitation
+// that there is no process-wide cap on concurrent GitHub requests across dependencies).
 
 /// Whether `name` matches the `owner/repo` GitHub identifier shape every GitHub-tags-backed
 /// ecosystem accepts.
@@ -363,28 +350,25 @@ struct GithubErrorResponse {
 /// Returns `true` when a fetched page came back full (`per_page=100` entries), meaning a
 /// subsequent page may exist and should be fetched too. A page with fewer entries is
 /// necessarily the last one.
-#[must_use]
-pub const fn page_has_more(page_len: usize) -> bool {
-    page_len >= 100
-}
+pub use crate::pagination::page_has_more;
 
 /// Logs a warning when tag pagination for `name` stops at [`MAX_TAG_PAGES`] while GitHub
 /// still had more pages available (`page_has_more(page_len)`).
 ///
-/// Without this, hitting the safety ceiling on a pathological repo is indistinguishable in
-/// logs from "the repo genuinely has no matching version" — this makes truncation
-/// diagnosable. `ecosystem` names the caller (e.g. `"Swift"`, `"GitHub Actions"`) in the
-/// warning text.
+/// A thin, GitHub-specific wrapper over [`crate::pagination::warn_if_pagination_truncated`]
+/// (provider `"GitHub"`, cap [`MAX_TAG_PAGES`]) kept so every existing call site's warning
+/// text stays byte-identical after the #472/GitLab-CI-plan §4.4 extraction. `ecosystem`
+/// names the caller (e.g. `"Swift"`, `"GitHub Actions"`) in the warning text.
 pub fn warn_if_pagination_truncated(ecosystem: &str, name: &str, page: u32, page_len: usize) {
-    if page == MAX_TAG_PAGES && page_has_more(page_len) {
-        tracing::warn!(
-            package = name,
-            pages_fetched = MAX_TAG_PAGES,
-            "{ecosystem} tags pagination for '{name}' stopped at the {MAX_TAG_PAGES}-page cap \
-             while GitHub reported more pages available; the fetched version list may be \
-             truncated"
-        );
-    }
+    crate::pagination::warn_if_pagination_truncated(
+        "GitHub",
+        ecosystem,
+        "tags",
+        name,
+        page,
+        page_len,
+        MAX_TAG_PAGES,
+    );
 }
 
 /// Drives the GitHub tags pagination loop: page 1 alone, then subsequent pages in batches
@@ -422,47 +406,27 @@ pub fn warn_if_pagination_truncated(ecosystem: &str, name: &str, page: u32, page
 pub async fn paginate_tags<F, Fut>(
     ecosystem: &str,
     name: &str,
-    mut fetch_page: F,
+    fetch_page: F,
 ) -> Result<Vec<GithubTag>>
 where
     F: FnMut(u32) -> Fut,
     Fut: Future<Output = Result<Bytes>>,
 {
-    use futures::stream::{self, StreamExt};
-
-    let mut tags = Vec::new();
-
-    let first_page = fetch_page(1).await?;
-    let first_tags = parse_tags_page(&first_page)?;
-    let first_page_len = first_tags.len();
-    tags.extend(first_tags);
-    if !page_has_more(first_page_len) {
-        // No call to `warn_if_pagination_truncated` here: it only fires at
-        // `page == MAX_TAG_PAGES`, which page 1 can never equal since `MAX_TAG_PAGES > 1`.
-        return Ok(tags);
-    }
-
-    let mut page = 2u32;
-    'batches: while page <= MAX_TAG_PAGES {
-        let batch_end = (page + CONCURRENCY as u32 - 1).min(MAX_TAG_PAGES);
-        let mut stream = stream::iter(page..=batch_end)
-            .map(&mut fetch_page)
-            .buffered(CONCURRENCY);
-
-        let mut current_page = page;
-        while let Some(data) = stream.next().await {
-            let page_tags = parse_tags_page(&data?)?;
-            let page_len = page_tags.len();
-            tags.extend(page_tags);
-            if !page_has_more(page_len) {
-                break 'batches;
-            }
-            warn_if_pagination_truncated(ecosystem, name, current_page, page_len);
-            current_page += 1;
-        }
-        page = batch_end + 1;
-    }
-    Ok(tags)
+    crate::pagination::paginate_pages(
+        "GitHub",
+        ecosystem,
+        "tags",
+        name,
+        MAX_TAG_PAGES,
+        fetch_page,
+        // Not redundant despite clippy's suggestion: `parse_tags_page` takes `&[u8]`, and
+        // `paginate_pages`'s `P` bound is `FnMut(&Bytes) -> _` — passing the bare function
+        // item fails to unify (deref coercion applies inside a closure body, not across a
+        // bare function-item's own argument type).
+        #[allow(clippy::redundant_closure)]
+        |data| parse_tags_page(data),
+    )
+    .await
 }
 
 /// Parses a single GitHub tags API response page into raw tag entries.

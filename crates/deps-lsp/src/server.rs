@@ -64,6 +64,38 @@ fn parse_config(value: serde_json::Value) -> Option<DepsConfig> {
     }
 }
 
+/// Validates a newly configured `registries.gitlab_instance_host` value and, when it is
+/// rejected, surfaces the rejection to the user via `window/showMessage` rather than only
+/// `tracing::warn` (security review, issue #466) — an invalid value silently redirecting
+/// `PRIVATE-TOKEN` to `gitlab.com` (or disabling instance-host resolution entirely) with no
+/// visible signal was the exact failure mode that review flagged.
+///
+/// `deps_gitlab_ci::host::GitlabInstanceHost::get` re-validates (and logs at `warn`) the
+/// same value lazily on every read, since `EcosystemRuntime` is feature-agnostic and can't
+/// hold a `GitlabHost` directly (see that struct's docs) — this duplicates just the
+/// validation call, once per config update, to turn it into a one-time, user-visible
+/// notice instead of a read that never surfaces past the log.
+#[cfg(feature = "gitlab-ci")]
+async fn warn_if_gitlab_instance_host_invalid(
+    client: &Client,
+    raw: &str,
+    policy: &deps_core::net_policy::RegistryAccessPolicy,
+) {
+    if let Err(error) = deps_gitlab_ci::GitlabHost::parse(raw, policy) {
+        client
+            .show_message(
+                MessageType::WARNING,
+                format!(
+                    "deps-lsp: registries.gitlab_instance_host value '{raw}' is invalid \
+                     ({error}) and will be ignored — instance-host resolution stays \
+                     unresolved and GITLAB_TOKEN will not be sent to gitlab.com or any other \
+                     host until this is corrected"
+                ),
+            )
+            .await;
+    }
+}
+
 pub struct Backend {
     pub(crate) client: Client,
     state: Arc<ServerState>,
@@ -477,6 +509,22 @@ impl LanguageServer for Backend {
                 config.registries.nuget_user_profile_sources,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            let gitlab_instance_host = (!config.registries.gitlab_instance_host.is_empty())
+                .then(|| config.registries.gitlab_instance_host.clone());
+            #[cfg(feature = "gitlab-ci")]
+            if let Some(raw) = &gitlab_instance_host {
+                warn_if_gitlab_instance_host_invalid(
+                    &self.client,
+                    raw,
+                    &self.state.registry_policy,
+                )
+                .await;
+            }
+            *self
+                .state
+                .gitlab_instance_host
+                .write()
+                .expect("gitlab_instance_host lock poisoned") = gitlab_instance_host;
             self.state.cache.set_offline(config.network.offline);
             self.state.cache.set_cache_enabled(config.cache.enabled);
             self.state
@@ -622,6 +670,18 @@ impl LanguageServer for Backend {
             config.registries.nuget_user_profile_sources,
             std::sync::atomic::Ordering::Relaxed,
         );
+        let gitlab_instance_host = (!config.registries.gitlab_instance_host.is_empty())
+            .then(|| config.registries.gitlab_instance_host.clone());
+        #[cfg(feature = "gitlab-ci")]
+        if let Some(raw) = &gitlab_instance_host {
+            warn_if_gitlab_instance_host_invalid(&self.client, raw, &self.state.registry_policy)
+                .await;
+        }
+        *self
+            .state
+            .gitlab_instance_host
+            .write()
+            .expect("gitlab_instance_host lock poisoned") = gitlab_instance_host;
         // Must land before `workspace_diagnostic_refresh` below, or the refresh re-renders
         // diagnostics under the stale flag values (critic M5).
         self.state.cache.set_offline(config.network.offline);

@@ -872,7 +872,62 @@ pub async fn complete_versions_generic(
     operator_chars: &[char],
     freshness: FreshnessSettings,
 ) -> Vec<CompletionItem> {
-    let versions = match registry.get_versions_with(package_name, freshness).await {
+    complete_versions_generic_from(
+        registry,
+        package_name,
+        &crate::parser::DependencySource::Registry,
+        prefix,
+        operator_chars,
+        freshness,
+    )
+    .await
+}
+
+/// Like [`complete_versions_generic`], but resolves through [`crate::Registry::get_versions_from`].
+///
+/// Routes on `source`, so a registry that routes a dependency's fetch across more than one
+/// underlying index (e.g. a per-instance-host `AlternateRegistry`, GitLab CI's
+/// `deps-gitlab-ci`) completes against the correct index instead of falling back to a
+/// source-unaware default.
+///
+/// [`complete_versions_generic`] delegates to this with
+/// [`crate::parser::DependencySource::Registry`] — behavior-preserving for every one of its
+/// 18 existing call sites, all of which pass a plain registry-resolved dependency: this is
+/// exactly the source [`crate::Registry::get_versions_from`]'s default implementation
+/// forwards to [`crate::Registry::get_versions_with`] for, so nothing observable changes for
+/// them.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::completion::complete_versions_generic_from;
+/// use deps_core::parser::DependencySource;
+/// use deps_core::PackageName;
+///
+/// # async fn example(registry: &dyn deps_core::Registry) {
+/// let freshness = deps_core::FreshnessSettings::default();
+/// let items = complete_versions_generic_from(
+///     registry,
+///     &PackageName::new("gitlab.com/org/proj"),
+///     &DependencySource::Registry,
+///     "1.",
+///     &[],
+///     freshness,
+/// ).await;
+/// # }
+/// ```
+pub async fn complete_versions_generic_from(
+    registry: &dyn crate::Registry,
+    package_name: &PackageName,
+    source: &crate::parser::DependencySource,
+    prefix: &str,
+    operator_chars: &[char],
+    freshness: FreshnessSettings,
+) -> Vec<CompletionItem> {
+    let versions = match registry
+        .get_versions_from(package_name, source, freshness)
+        .await
+    {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
@@ -2839,6 +2894,135 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.0.1");
+    }
+
+    /// GitLab CI ecosystem plan §7a.1: `complete_versions_generic` must produce
+    /// byte-identical items before and after becoming a thin delegation to
+    /// [`complete_versions_generic_from`] with a plain [`crate::parser::DependencySource::Registry`].
+    #[tokio::test]
+    async fn test_complete_versions_generic_delegates_to_from_byte_identical() {
+        let registry = MockRegistry {
+            versions: vec![MockVersion {
+                version: "1.0.0".into(),
+                yanked: false,
+                prerelease: false,
+            }],
+        };
+
+        let via_generic = complete_versions_generic(
+            &registry,
+            &pkg("test-pkg"),
+            "1.0",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+        let via_from = complete_versions_generic_from(
+            &registry,
+            &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
+            "1.0",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert_eq!(via_generic.len(), via_from.len());
+        assert_eq!(via_generic[0].label, via_from[0].label);
+    }
+
+    /// A registry stub whose `get_versions_from` override returns a distinct version list
+    /// per [`crate::parser::DependencySource`] — proves
+    /// [`complete_versions_generic_from`] genuinely threads `source` through to
+    /// `Registry::get_versions_from` rather than silently dropping it to the
+    /// source-unaware `get_versions_with` default (the class of bug M10 flagged: a stub
+    /// that ignores `source`, like [`MockRegistry`] above, would never catch this).
+    struct RoutingMockRegistry;
+
+    impl crate::Registry for RoutingMockRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a crate::PackageName,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move {
+                Ok(vec![Box::new(MockVersion {
+                    version: "9.9.9".into(),
+                    yanked: false,
+                    prerelease: false,
+                }) as Box<dyn crate::Version>])
+            })
+        }
+
+        fn get_versions_from<'a>(
+            &'a self,
+            _name: &'a crate::PackageName,
+            source: &'a crate::parser::DependencySource,
+            _freshness: FreshnessSettings,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+        {
+            let version = if matches!(
+                source,
+                crate::parser::DependencySource::AlternateRegistry { .. }
+            ) {
+                "2.0.0"
+            } else {
+                "1.0.0"
+            };
+            Box::pin(async move {
+                Ok(vec![Box::new(MockVersion {
+                    version: version.into(),
+                    yanked: false,
+                    prerelease: false,
+                }) as Box<dyn crate::Version>])
+            })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a crate::PackageName,
+            _req: &'a crate::VersionReq,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+        {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+        {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_generic_from_routes_source_to_get_versions_from() {
+        let registry = RoutingMockRegistry;
+        let alternate = crate::parser::DependencySource::AlternateRegistry {
+            index: "gitlab-ci:deadbeef".into(),
+            mirrors_crates_io: false,
+        };
+
+        let items = complete_versions_generic_from(
+            &registry,
+            &pkg("test-pkg"),
+            &alternate,
+            "",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+        assert_eq!(items[0].label, "2.0.0 (latest)");
+
+        // The source-unaware `get_versions` override (returning "9.9.9") must never be
+        // reached by the source-aware helper.
+        assert_ne!(items[0].label, "9.9.9 (latest)");
     }
 
     #[tokio::test]

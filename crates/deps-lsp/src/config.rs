@@ -696,6 +696,17 @@ pub struct RegistriesConfig {
     /// unless explicitly opted in.
     #[serde(default)]
     pub nuget_user_profile_sources: bool,
+    /// Issue #466, spec FR-005a/FR-011a: the GitLab instance host that `project:` includes
+    /// and `$CI_SERVER_FQDN`-relative `component:` includes resolve against, and — replacing,
+    /// not joined with, `gitlab.com` — the *only* host `GITLAB_TOKEN` may be sent to.
+    /// `#[serde(default)]`: additive-safe, same rationale as `nuget_user_profile_sources`
+    /// above. Default `""` (unset); an empty string is written through as `None` into the
+    /// shared `Arc<RwLock<Option<String>>>` handle. **No validation happens here** —
+    /// `deps-lsp` must not depend on `deps-gitlab-ci` for host semantics; an invalid value is
+    /// rejected on read by `deps_gitlab_ci::host::GitlabInstanceHost::get`, which also
+    /// documents the already-open-document limitation of a live change to this setting.
+    #[serde(default)]
+    pub gitlab_instance_host: String,
 }
 
 /// Controls which workspace-declared registry index hosts this LSP will ever fetch.
@@ -839,6 +850,18 @@ mod tests {
             config.registries.workspace_registries,
             WorkspaceRegistriesSetting::Off
         );
+    }
+
+    /// Issue #466: `gitlab_instance_host` defaults to `""` (unset), and a payload omitting
+    /// it still parses (additive-safety, mirroring the section above).
+    #[test]
+    fn test_gitlab_instance_host_defaults_to_empty_and_deserializes() {
+        let default_config: DepsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(default_config.registries.gitlab_instance_host, "");
+
+        let json = r#"{"registries": {"gitlab_instance_host": "gitlab.mycorp.dev"}}"#;
+        let config: DepsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.registries.gitlab_instance_host, "gitlab.mycorp.dev");
     }
 
     /// The renamed key: a client still sending the old `cargo` section fails the whole

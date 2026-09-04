@@ -564,6 +564,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "deps-gitlab-ci"
+version = "0.12.1"
+dependencies = [
+ "bytes",
+ "dashmap",
+ "deps-core",
+ "mockito",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-test",
+ "tower-lsp-server",
+ "tracing",
+ "url",
+ "urlencoding",
+ "yaml-rust2",
+ "zeroize",
+]
+
+[[package]]
 name = "deps-go"
 version = "0.12.1"
 dependencies = [
@@ -616,6 +638,7 @@ dependencies = [
  "deps-dart",
  "deps-deno",
  "deps-github-actions",
+ "deps-gitlab-ci",
  "deps-go",
  "deps-gradle",
  "deps-maven",

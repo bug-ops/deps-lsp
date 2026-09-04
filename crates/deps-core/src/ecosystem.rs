@@ -69,6 +69,8 @@ pub enum EcosystemId {
     Deno,
     /// GitHub Actions ecosystem (`.github/workflows/*.yml`/`*.yaml`).
     GithubActions,
+    /// GitLab CI/CD ecosystem (`.gitlab-ci.yml`, `.gitlab/ci/*.yml`/`*.yaml`).
+    GitlabCi,
 }
 
 impl EcosystemId {
@@ -90,6 +92,7 @@ impl EcosystemId {
             Self::NuGet => "nuget",
             Self::Deno => "deno",
             Self::GithubActions => "github-actions",
+            Self::GitlabCi => "gitlab-ci",
         }
     }
 
@@ -112,19 +115,22 @@ impl EcosystemId {
     /// ```
     #[must_use]
     pub const fn osv_ecosystem(self) -> Option<&'static str> {
-        Some(match self {
-            Self::Cargo => "crates.io",
-            Self::Npm | Self::Deno => "npm",
-            Self::Pypi => "PyPI",
-            Self::Go => "Go",
-            Self::Bundler => "RubyGems",
-            Self::Dart => "Pub",
-            Self::Maven | Self::Gradle => "Maven",
-            Self::Composer => "Packagist",
-            Self::Swift => "SwiftURL",
-            Self::NuGet => "NuGet",
-            Self::GithubActions => "GitHub Actions",
-        })
+        match self {
+            Self::Cargo => Some("crates.io"),
+            Self::Npm | Self::Deno => Some("npm"),
+            Self::Pypi => Some("PyPI"),
+            Self::Go => Some("Go"),
+            Self::Bundler => Some("RubyGems"),
+            Self::Dart => Some("Pub"),
+            Self::Maven | Self::Gradle => Some("Maven"),
+            Self::Composer => Some("Packagist"),
+            Self::Swift => Some("SwiftURL"),
+            Self::NuGet => Some("NuGet"),
+            Self::GithubActions => Some("GitHub Actions"),
+            // A git-tag/release pin has no OSV coordinate by name (mirrors
+            // `deps_gitlab_ci::formatter::GitlabCiFormatter`'s `OsvNaming` docs).
+            Self::GitlabCi => None,
+        }
     }
 }
 
@@ -152,6 +158,7 @@ impl std::str::FromStr for EcosystemId {
             "nuget" => Ok(Self::NuGet),
             "deno" => Ok(Self::Deno),
             "github-actions" => Ok(Self::GithubActions),
+            "gitlab-ci" => Ok(Self::GitlabCi),
             _ => Err(crate::error::DepsError::UnsupportedEcosystem(s.to_string())),
         }
     }
@@ -730,6 +737,7 @@ mod tests {
             EcosystemId::NuGet,
             EcosystemId::Deno,
             EcosystemId::GithubActions,
+            EcosystemId::GitlabCi,
         ];
 
         for id in ALL {
@@ -764,6 +772,9 @@ mod tests {
                 "unexpected OSV ecosystem string for {id:?}"
             );
         }
+
+        // A git-tag/release pin has no OSV coordinate by name (see `osv_ecosystem`'s doc).
+        assert_eq!(EcosystemId::GitlabCi.osv_ecosystem(), None);
     }
 
     #[test]

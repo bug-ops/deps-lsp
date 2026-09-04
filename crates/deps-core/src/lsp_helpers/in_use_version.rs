@@ -48,6 +48,15 @@ enum BareRequirementPolicy {
 /// correct "honest unknown" outcome: resolving a SHA to its tag would need registry
 /// access this pure function does not have.
 ///
+/// GitLab CI gets the identical policy for the identical reason: a `component:`
+/// include's partial-semver pin (`1`, `1.2`) is a range exactly like GitHub Actions'
+/// moving-major tag ([`is_full_semver_shape`] correctly rejects it, since it requires
+/// all three components), while a full `1.2.3`/`v1.2.3` tag or release-name pin is
+/// concrete. A SHA pin (`project:`'s or `component:`'s) falls to the same honest
+/// "unknown" `None` as GitHub Actions' bare SHA, and `~latest`/a branch-shaped ref
+/// never look like a full version shape either, so both also correctly fall through
+/// to `None`.
+///
 /// Gradle is deliberately excluded: a bare Gradle coordinate version (e.g.
 /// `"2.14.1"`) is an exact match under `GradleFormatter`'s own
 /// `version_satisfies_requirement` unless it uses the `+` dynamic-version
@@ -59,7 +68,9 @@ const fn bare_requirement_policy(ecosystem: EcosystemId) -> BareRequirementPolic
         EcosystemId::Cargo | EcosystemId::Npm | EcosystemId::Composer | EcosystemId::Deno => {
             BareRequirementPolicy::AlwaysRange
         }
-        EcosystemId::GithubActions => BareRequirementPolicy::ConcreteIfFullVersion,
+        EcosystemId::GithubActions | EcosystemId::GitlabCi => {
+            BareRequirementPolicy::ConcreteIfFullVersion
+        }
         _ => BareRequirementPolicy::Concrete,
     }
 }
@@ -514,6 +525,44 @@ mod tests {
             concrete_pin_version(
                 "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
                 EcosystemId::GithubActions
+            ),
+            None
+        );
+    }
+
+    // --- concrete_pin_version: BareRequirementPolicy::ConcreteIfFullVersion (GitLab CI) ---
+
+    #[test]
+    fn concrete_pin_version_gitlab_ci_full_tag_is_concrete() {
+        assert_eq!(
+            concrete_pin_version("1.2.3", EcosystemId::GitlabCi),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            concrete_pin_version("v1.2.3", EcosystemId::GitlabCi),
+            Some("v1.2.3")
+        );
+    }
+
+    #[test]
+    fn concrete_pin_version_gitlab_ci_partial_pin_is_a_range() {
+        // H2 regression (#466 review): a `component:` partial-semver pin (`1`, `1.2`)
+        // is a range under GitLab's own documented `~{raw}` semantics, not a single
+        // version — must not be queried as if it were the concrete version `1.2`.
+        assert_eq!(concrete_pin_version("1.2", EcosystemId::GitlabCi), None);
+        assert_eq!(concrete_pin_version("1", EcosystemId::GitlabCi), None);
+    }
+
+    #[test]
+    fn concrete_pin_version_gitlab_ci_digit_leading_sha_is_not_concrete() {
+        // A 40-hex SHA that happens to start with a digit must still fall to the
+        // honest "unknown" `None` rather than being misread as a version — it has no
+        // dots, so it fails `is_full_semver_shape` regardless of its leading
+        // character.
+        assert_eq!(
+            concrete_pin_version(
+                "1234567890abcdef1234567890abcdef12345678",
+                EcosystemId::GitlabCi
             ),
             None
         );

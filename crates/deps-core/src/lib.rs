@@ -26,6 +26,7 @@ pub mod mtime_cache;
 pub mod net_policy;
 pub mod osv;
 pub mod package;
+pub mod pagination;
 pub mod parser;
 pub mod registry;
 pub mod secret;

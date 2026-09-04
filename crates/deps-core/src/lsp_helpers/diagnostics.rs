@@ -1193,9 +1193,9 @@ fn apply_outdated_rule(
     let latest = &package_versions.latest;
 
     let status = match dep.version_requirement() {
-        Some(version_req) if ctx.formatter.can_resolve_source(&dep.source()) => {
-            ctx.formatter.requirement_status(version_req, latest)
-        }
+        Some(version_req) if ctx.formatter.can_resolve_source(&dep.source()) => ctx
+            .formatter
+            .requirement_status_for(dep, version_req, latest),
         _ => RequirementStatus::Unresolved,
     };
 
