@@ -1128,304 +1128,22 @@ async fn fetch_latest_versions_parallel(
             let wildcard_req = &wildcard_req;
             let in_use_versions = in_use.get(&name).cloned().unwrap_or_default();
             async move {
-                // Single round trip: the full version list is fetched once, and "latest"
-                // is a pure in-memory pick over it (`Registry::select_latest_matching`) —
-                // no second registry call, so the retained full list costs nothing extra
-                // over the network (see `PackageVersions`). `get_versions_from` (source-
-                // aware, spec FR-001) rather than `get_versions`: this populates
-                // `published_at` for registries that support it (#339), matching hover's
-                // existing freshness-aware call, AND routes a resolved
-                // `DependencySource::AlternateRegistry` to its own index instead of the
-                // ecosystem's default registry — registries with no override forward
-                // straight to `get_versions` at zero extra cost either way.
-                let result = tokio::time::timeout(
+                fetch_and_classify_package(
+                    registry.as_ref(),
+                    name,
+                    source,
+                    in_use_versions,
+                    wildcard_req,
+                    freshness,
                     timeout,
-                    registry.get_versions_from(&name, &source, freshness),
+                    minimum_stability,
+                    check_yanked,
+                    &fetched,
+                    &failed,
+                    &first_error,
+                    progress_sender.as_ref(),
                 )
-                .await;
-
-                let mut yanked: Option<(PackageName, ConcreteVersion, RemovalStatus)> = None;
-                let mut failed_name: Option<(PackageName, FetchFailure, String)> = None;
-                let mut deprecation: Option<(PackageName, Deprecation)> = None;
-                // Set only when the fetch (and its `get_latest_matching` fallback) both
-                // genuinely succeeded yet resolved to no version at all (#550) — see the
-                // `Ok(Ok(None))` fallback arm below.
-                let mut no_comparable_versions = false;
-                let version = match result {
-                    Ok(Ok(versions)) => {
-                        let available: Arc<[ConcreteVersion]> = versions
-                            .iter()
-                            .map(|v| v.version_string().clone())
-                            .collect();
-                        // Retained alongside `available` so `generate_diagnostics_from_cache`
-                        // can flag a requirement satisfiable only by a yanked version — see
-                        // `PackageVersions::yanked`. Gated on `check_yanked`: a registry that
-                        // cannot answer `removal_status()` (§#298) must not populate this list
-                        // with an untrustworthy always-`Available` signal. Carries each
-                        // entry's own `RemovalStatus` (#437) so the #247 diagnostic path can
-                        // gate its package-level-deprecation suppression on `AdvisoryDeprecated`
-                        // specifically, never on a genuine `Yanked` finding.
-                        let yanked_list: Arc<[(ConcreteVersion, RemovalStatus)]> = if check_yanked {
-                            versions
-                                .iter()
-                                .filter_map(|v| {
-                                    let status = v.removal_status();
-                                    status
-                                        .is_flagged()
-                                        .then(|| (v.version_string().clone(), status))
-                                })
-                                .collect()
-                        } else {
-                            Arc::from([])
-                        };
-                        // `.get(idx)` rather than `versions[idx]`: `select_latest_matching`
-                        // is a public `Registry` trait method, so an out-of-tree
-                        // implementation returning a stale index must not panic this task.
-                        // `_with_context` (not the plain method) so a registry with
-                        // manifest-level stability state (Composer's `minimum-stability`,
-                        // #424 S1) can apply it — every other registry's default
-                        // implementation just forwards to the plain method unchanged.
-                        let resolved = if let Some(v) = registry
-                            .select_latest_matching_with_context(
-                                &versions,
-                                wildcard_req,
-                                minimum_stability,
-                            )
-                            .and_then(|idx| versions.get(idx))
-                        {
-                            let latest = v.version_string().clone();
-                            tracing::debug!(package = %name, version = %latest, "fetched");
-                            Some((
-                                latest,
-                                v.removal_status(),
-                                v.published_at(),
-                                v.deprecation().cloned(),
-                            ))
-                        } else {
-                            // The pure list-based pick found nothing — for most
-                            // ecosystems this genuinely means "no version found", but
-                            // for a registry whose list endpoint can be incomplete
-                            // (e.g. Go's `/@v/list`, which never enumerates
-                            // pseudo-versions and can be entirely empty for an
-                            // untagged module) it may just mean the list alone isn't
-                            // enough. Fall back to the registry's own
-                            // `get_latest_matching`, which some registries answer from
-                            // a different, more complete source (Go's `/@latest`). This
-                            // costs a second network call, but only in this already-rare
-                            // "list-based pick failed" case, not the common path.
-                            let fallback = tokio::time::timeout(
-                                timeout,
-                                registry.get_latest_matching_from(
-                                    &name,
-                                    &source,
-                                    wildcard_req,
-                                    minimum_stability,
-                                ),
-                            )
-                            .await;
-                            match fallback {
-                                Ok(Ok(Some(v))) => {
-                                    let latest = v.version_string().clone();
-                                    tracing::debug!(
-                                        package = %name,
-                                        version = %latest,
-                                        "fetched via get_latest_matching fallback"
-                                    );
-                                    Some((
-                                        latest,
-                                        v.removal_status(),
-                                        v.published_at(),
-                                        v.deprecation().cloned(),
-                                    ))
-                                }
-                                Ok(Ok(None)) => {
-                                    tracing::debug!(package = %name, "no version found");
-                                    // Both the list-based pick and this fallback
-                                    // genuinely succeeded and found nothing — the
-                                    // package demonstrably exists (the fetch itself
-                                    // never errored), it just has zero versions this
-                                    // registry can compare against (#550), e.g. a
-                                    // repository whose only tags don't parse as full
-                                    // semver. Distinct from every branch below that
-                                    // sets `failed_name`.
-                                    no_comparable_versions = true;
-                                    None
-                                }
-                                Ok(Err(e)) => {
-                                    tracing::warn!(
-                                        package = %name,
-                                        error = %e,
-                                        "fetch fallback failed"
-                                    );
-                                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    let mut fe =
-                                        first_error.lock().unwrap_or_else(|p| p.into_inner());
-                                    if fe.is_none() {
-                                        *fe = Some(e.to_string());
-                                    }
-                                    drop(fe);
-                                    // A genuine not-found (the registry was
-                                    // successfully asked and said "no such
-                                    // package") is not a fetch failure — only
-                                    // an unanswerable request is (#267 C1).
-                                    if !e.is_not_found() {
-                                        failed_name =
-                                            Some((name.clone(), e.fetch_failure(), e.to_string()));
-                                    }
-                                    None
-                                }
-                                Err(_) => {
-                                    tracing::warn!(
-                                        package = %name,
-                                        "fetch fallback timed out ({}s)",
-                                        timeout.as_secs()
-                                    );
-                                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    failed_name = Some((
-                                        name.clone(),
-                                        FetchFailure::Transient,
-                                        format!(
-                                            "{name}: registry request timed out after {}s",
-                                            timeout.as_secs()
-                                        ),
-                                    ));
-                                    None
-                                }
-                            }
-                        };
-
-                        if check_yanked {
-                            // Row 1 (§4.7): the picked "latest" itself yanked —
-                            // zero extra cost, since it's already in hand.
-                            // Unreachable in production for an *enabled*
-                            // registry under today's hardcoded wildcard (one
-                            // never returns a yanked version for `*`), but
-                            // stays correct as a defense-in-depth check.
-                            if let Some((latest, status, _, _)) = &resolved
-                                && status.is_flagged()
-                            {
-                                yanked = Some((name.clone(), latest.clone(), *status));
-                            }
-
-                            // Row 2/3 (§4.7, revised under #206): `versions`
-                            // is the full, already-fetched, unfiltered list —
-                            // no second registry round trip is needed to
-                            // check whether the in-use version was yanked,
-                            // unlike the pre-#206 probe design. Checked for
-                            // every dependency with a known in-use version,
-                            // not just when it differs from `latest`, since
-                            // it's now a free in-memory lookup either way. A
-                            // yanked in-use version wins over an already
-                            // -recorded yanked `latest` — it's the version
-                            // the user actually has.
-                            //
-                            // Multiple occurrences of the same name (#394,
-                            // e.g. under both `[dependencies]` and
-                            // `[target.*.dependencies]`) can carry different
-                            // in-use versions — every one is checked so a
-                            // yanked pin on any occurrence is never missed
-                            // just because another occurrence happens to
-                            // share the registry lookup.
-                            // Filters on `is_flagged()` inside the `find` predicate itself
-                            // (not via a separate `.filter()` on the first version-string
-                            // match) so a registry response with more than one entry sharing
-                            // `iv`'s version string still finds a flagged one if any exists —
-                            // mirroring the pre-#205 `.any(matches && flagged)` scan rather
-                            // than narrowing to "is the *first* same-string entry flagged".
-                            if let Some((iv, status)) = in_use_versions.iter().find_map(|iv| {
-                                versions
-                                    .iter()
-                                    .find(|v| {
-                                        v.version_string() == iv.as_str()
-                                            && v.removal_status().is_flagged()
-                                    })
-                                    .map(|v| (iv, v.removal_status()))
-                            }) {
-                                yanked = Some((name.clone(), iv.as_str().into(), status));
-                            }
-                        }
-
-                        // #205: the package-level deprecation finding is derived from the
-                        // same `Version` `resolved` already picked as "latest" — covering
-                        // the `get_latest_matching_with_context` fallback branch above too,
-                        // whose returned `Version` is not a member of `versions` at all. See
-                        // `FetchResult::deprecations`'s docs for why this must not instead
-                        // scan `versions`.
-                        if let Some((_, _, _, dep_info)) = &resolved
-                            && let Some(dep_info) = dep_info
-                        {
-                            deprecation = Some((name.clone(), dep_info.clone()));
-                        }
-
-                        resolved.map(|(latest, _, published_at, _)| {
-                            (
-                                name.clone(),
-                                PackageVersions {
-                                    latest,
-                                    available,
-                                    yanked: yanked_list,
-                                    published_at,
-                                },
-                            )
-                        })
-                    }
-                    Ok(Err(e)) => {
-                        // Issue #483: while offline, every fetch fails by design — this
-                        // would otherwise log a per-dependency WARNING for every open/edit,
-                        // contradicting the toast suppression two call sites away in this
-                        // same file for being "unusable".
-                        if e.is_offline() {
-                            tracing::debug!(package = %name, "fetch skipped: offline");
-                        } else {
-                            tracing::warn!(package = %name, error = %e, "fetch failed");
-                        }
-                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let mut fe = first_error.lock().unwrap_or_else(|p| p.into_inner());
-                        if fe.is_none() {
-                            *fe = Some(e.to_string());
-                        }
-                        drop(fe);
-                        // A genuine not-found (the registry was successfully
-                        // asked and said "no such package") is not a fetch
-                        // failure — only an unanswerable request is (#267
-                        // C1). Marking it `fetch_failed` here would make
-                        // `generate_diagnostics_from_cache` report "Registry
-                        // lookup failed" for the common typo'd-name case
-                        // instead of "Unknown package", inverting the bug
-                        // this field exists to fix.
-                        if !e.is_not_found() {
-                            failed_name = Some((name.clone(), e.fetch_failure(), e.to_string()));
-                        }
-                        None
-                    }
-                    Err(_) => {
-                        tracing::warn!(package = %name, "fetch timed out ({}s)", timeout.as_secs());
-                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        failed_name = Some((
-                            name.clone(),
-                            FetchFailure::Transient,
-                            format!(
-                                "{name}: registry request timed out after {}s",
-                                timeout.as_secs()
-                            ),
-                        ));
-                        None
-                    }
-                };
-
-                let count = fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if let Some(ref sender) = progress_sender {
-                    sender.send(count);
-                }
-
-                let no_comparable_versions_name = no_comparable_versions.then(|| name.clone());
-                (
-                    version,
-                    yanked,
-                    failed_name,
-                    deprecation,
-                    no_comparable_versions_name,
-                )
+                .await
             }
         })
         .buffer_unordered(max_concurrent)
@@ -1478,6 +1196,340 @@ async fn fetch_latest_versions_parallel(
         failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
         first_error: error_message,
     }
+}
+
+/// Per-package outcome returned by [`fetch_and_classify_package`]: the resolved
+/// `(name, PackageVersions)` entry, a yanked finding, a fetch failure, a package-level
+/// deprecation finding, and a name whose fetch succeeded with no comparable versions
+/// (#550) — folded into [`fetch_latest_versions_parallel`]'s aggregate `FetchResult`
+/// once every package in the stream has finished.
+type PackageFetchOutcome = (
+    Option<(PackageName, PackageVersions)>,
+    Option<(PackageName, ConcreteVersion, RemovalStatus)>,
+    Option<(PackageName, FetchFailure, String)>,
+    Option<(PackageName, Deprecation)>,
+    Option<PackageName>,
+);
+
+/// Fetches, classifies, and version-selects a single package within
+/// [`fetch_latest_versions_parallel`]'s concurrent stream: one round trip for the full
+/// version list, an in-memory "latest" pick with a `get_latest_matching_from` fallback
+/// when the list-based pick fails on a non-empty list, yanked/deprecation extraction,
+/// and updates to the shared `fetched`/`failed`/`first_error` counters the stream
+/// aggregates across every package.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the per-package async closure this was extracted from — every \
+              parameter is either call-site fetch tuning already threaded through \
+              fetch_latest_versions_parallel or a counter/sender shared across the \
+              whole stream; grouping into a struct would only move, not reduce, churn"
+)]
+async fn fetch_and_classify_package(
+    registry: &dyn Registry,
+    name: PackageName,
+    source: deps_core::parser::DependencySource,
+    in_use_versions: Vec<String>,
+    wildcard_req: &VersionReq,
+    freshness: deps_core::freshness::FreshnessSettings,
+    timeout: Duration,
+    minimum_stability: Option<&str>,
+    check_yanked: bool,
+    fetched: &std::sync::atomic::AtomicUsize,
+    failed: &std::sync::atomic::AtomicUsize,
+    first_error: &std::sync::Mutex<Option<String>>,
+    progress_sender: Option<&ProgressSender>,
+) -> PackageFetchOutcome {
+    // Single round trip: the full version list is fetched once, and "latest"
+    // is a pure in-memory pick over it (`Registry::select_latest_matching`) —
+    // no second registry call, so the retained full list costs nothing extra
+    // over the network (see `PackageVersions`). `get_versions_from` (source-
+    // aware, spec FR-001) rather than `get_versions`: this populates
+    // `published_at` for registries that support it (#339), matching hover's
+    // existing freshness-aware call, AND routes a resolved
+    // `DependencySource::AlternateRegistry` to its own index instead of the
+    // ecosystem's default registry — registries with no override forward
+    // straight to `get_versions` at zero extra cost either way.
+    let result = tokio::time::timeout(
+        timeout,
+        registry.get_versions_from(&name, &source, freshness),
+    )
+    .await;
+
+    let mut yanked: Option<(PackageName, ConcreteVersion, RemovalStatus)> = None;
+    let mut failed_name: Option<(PackageName, FetchFailure, String)> = None;
+    let mut deprecation: Option<(PackageName, Deprecation)> = None;
+    // Set only when the fetch (and its `get_latest_matching` fallback) both
+    // genuinely succeeded yet resolved to no version at all (#550) — see the
+    // `Ok(Ok(None))` fallback arm below.
+    let mut no_comparable_versions = false;
+    let version = match result {
+        Ok(Ok(versions)) => {
+            let available: Arc<[ConcreteVersion]> = versions
+                .iter()
+                .map(|v| v.version_string().clone())
+                .collect();
+            // Retained alongside `available` so `generate_diagnostics_from_cache`
+            // can flag a requirement satisfiable only by a yanked version — see
+            // `PackageVersions::yanked`. Gated on `check_yanked`: a registry that
+            // cannot answer `removal_status()` (§#298) must not populate this list
+            // with an untrustworthy always-`Available` signal. Carries each
+            // entry's own `RemovalStatus` (#437) so the #247 diagnostic path can
+            // gate its package-level-deprecation suppression on `AdvisoryDeprecated`
+            // specifically, never on a genuine `Yanked` finding.
+            let yanked_list: Arc<[(ConcreteVersion, RemovalStatus)]> = if check_yanked {
+                versions
+                    .iter()
+                    .filter_map(|v| {
+                        let status = v.removal_status();
+                        status
+                            .is_flagged()
+                            .then(|| (v.version_string().clone(), status))
+                    })
+                    .collect()
+            } else {
+                Arc::from([])
+            };
+            // `.get(idx)` rather than `versions[idx]`: `select_latest_matching`
+            // is a public `Registry` trait method, so an out-of-tree
+            // implementation returning a stale index must not panic this task.
+            // `_with_context` (not the plain method) so a registry with
+            // manifest-level stability state (Composer's `minimum-stability`,
+            // #424 S1) can apply it — every other registry's default
+            // implementation just forwards to the plain method unchanged.
+            let resolved = if let Some(v) = registry
+                .select_latest_matching_with_context(&versions, wildcard_req, minimum_stability)
+                .and_then(|idx| versions.get(idx))
+            {
+                let latest = v.version_string().clone();
+                tracing::debug!(package = %name, version = %latest, "fetched");
+                Some((
+                    latest,
+                    v.removal_status(),
+                    v.published_at(),
+                    v.deprecation().cloned(),
+                ))
+            } else {
+                // The pure list-based pick found nothing — for most
+                // ecosystems this genuinely means "no version found", but
+                // for a registry whose list endpoint can be incomplete
+                // (e.g. Go's `/@v/list`, which never enumerates
+                // pseudo-versions and can be entirely empty for an
+                // untagged module) it may just mean the list alone isn't
+                // enough. Fall back to the registry's own
+                // `get_latest_matching`, which some registries answer from
+                // a different, more complete source (Go's `/@latest`). This
+                // costs a second network call, but only in this already-rare
+                // "list-based pick failed" case, not the common path.
+                let fallback = tokio::time::timeout(
+                    timeout,
+                    registry.get_latest_matching_from(
+                        &name,
+                        &source,
+                        wildcard_req,
+                        minimum_stability,
+                    ),
+                )
+                .await;
+                match fallback {
+                    Ok(Ok(Some(v))) => {
+                        let latest = v.version_string().clone();
+                        tracing::debug!(
+                            package = %name,
+                            version = %latest,
+                            "fetched via get_latest_matching fallback"
+                        );
+                        Some((
+                            latest,
+                            v.removal_status(),
+                            v.published_at(),
+                            v.deprecation().cloned(),
+                        ))
+                    }
+                    Ok(Ok(None)) => {
+                        tracing::debug!(package = %name, "no version found");
+                        // Both the list-based pick and this fallback
+                        // genuinely succeeded and found nothing — the
+                        // package demonstrably exists (the fetch itself
+                        // never errored), it just has zero versions this
+                        // registry can compare against (#550), e.g. a
+                        // repository whose only tags don't parse as full
+                        // semver. Distinct from every branch below that
+                        // sets `failed_name`.
+                        no_comparable_versions = true;
+                        None
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            package = %name,
+                            error = %e,
+                            "fetch fallback failed"
+                        );
+                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut fe = first_error.lock().unwrap_or_else(|p| p.into_inner());
+                        if fe.is_none() {
+                            *fe = Some(e.to_string());
+                        }
+                        drop(fe);
+                        // A genuine not-found (the registry was
+                        // successfully asked and said "no such
+                        // package") is not a fetch failure — only
+                        // an unanswerable request is (#267 C1).
+                        if !e.is_not_found() {
+                            failed_name = Some((name.clone(), e.fetch_failure(), e.to_string()));
+                        }
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            package = %name,
+                            "fetch fallback timed out ({}s)",
+                            timeout.as_secs()
+                        );
+                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        failed_name = Some((
+                            name.clone(),
+                            FetchFailure::Transient,
+                            format!(
+                                "{name}: registry request timed out after {}s",
+                                timeout.as_secs()
+                            ),
+                        ));
+                        None
+                    }
+                }
+            };
+
+            if check_yanked {
+                // Row 1 (§4.7): the picked "latest" itself yanked —
+                // zero extra cost, since it's already in hand.
+                // Unreachable in production for an *enabled*
+                // registry under today's hardcoded wildcard (one
+                // never returns a yanked version for `*`), but
+                // stays correct as a defense-in-depth check.
+                if let Some((latest, status, _, _)) = &resolved
+                    && status.is_flagged()
+                {
+                    yanked = Some((name.clone(), latest.clone(), *status));
+                }
+
+                // Row 2/3 (§4.7, revised under #206): `versions`
+                // is the full, already-fetched, unfiltered list —
+                // no second registry round trip is needed to
+                // check whether the in-use version was yanked,
+                // unlike the pre-#206 probe design. Checked for
+                // every dependency with a known in-use version,
+                // not just when it differs from `latest`, since
+                // it's now a free in-memory lookup either way. A
+                // yanked in-use version wins over an already
+                // -recorded yanked `latest` — it's the version
+                // the user actually has.
+                //
+                // Multiple occurrences of the same name (#394,
+                // e.g. under both `[dependencies]` and
+                // `[target.*.dependencies]`) can carry different
+                // in-use versions — every one is checked so a
+                // yanked pin on any occurrence is never missed
+                // just because another occurrence happens to
+                // share the registry lookup.
+                // Filters on `is_flagged()` inside the `find` predicate itself
+                // (not via a separate `.filter()` on the first version-string
+                // match) so a registry response with more than one entry sharing
+                // `iv`'s version string still finds a flagged one if any exists —
+                // mirroring the pre-#205 `.any(matches && flagged)` scan rather
+                // than narrowing to "is the *first* same-string entry flagged".
+                if let Some((iv, status)) = in_use_versions.iter().find_map(|iv| {
+                    versions
+                        .iter()
+                        .find(|v| {
+                            v.version_string() == iv.as_str() && v.removal_status().is_flagged()
+                        })
+                        .map(|v| (iv, v.removal_status()))
+                }) {
+                    yanked = Some((name.clone(), iv.as_str().into(), status));
+                }
+            }
+
+            // #205: the package-level deprecation finding is derived from the
+            // same `Version` `resolved` already picked as "latest" — covering
+            // the `get_latest_matching_with_context` fallback branch above too,
+            // whose returned `Version` is not a member of `versions` at all. See
+            // `FetchResult::deprecations`'s docs for why this must not instead
+            // scan `versions`.
+            if let Some((_, _, _, dep_info)) = &resolved
+                && let Some(dep_info) = dep_info
+            {
+                deprecation = Some((name.clone(), dep_info.clone()));
+            }
+
+            resolved.map(|(latest, _, published_at, _)| {
+                (
+                    name.clone(),
+                    PackageVersions {
+                        latest,
+                        available,
+                        yanked: yanked_list,
+                        published_at,
+                    },
+                )
+            })
+        }
+        Ok(Err(e)) => {
+            // Issue #483: while offline, every fetch fails by design — this
+            // would otherwise log a per-dependency WARNING for every open/edit,
+            // contradicting the toast suppression two call sites away in this
+            // same file for being "unusable".
+            if e.is_offline() {
+                tracing::debug!(package = %name, "fetch skipped: offline");
+            } else {
+                tracing::warn!(package = %name, error = %e, "fetch failed");
+            }
+            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut fe = first_error.lock().unwrap_or_else(|p| p.into_inner());
+            if fe.is_none() {
+                *fe = Some(e.to_string());
+            }
+            drop(fe);
+            // A genuine not-found (the registry was successfully
+            // asked and said "no such package") is not a fetch
+            // failure — only an unanswerable request is (#267
+            // C1). Marking it `fetch_failed` here would make
+            // `generate_diagnostics_from_cache` report "Registry
+            // lookup failed" for the common typo'd-name case
+            // instead of "Unknown package", inverting the bug
+            // this field exists to fix.
+            if !e.is_not_found() {
+                failed_name = Some((name.clone(), e.fetch_failure(), e.to_string()));
+            }
+            None
+        }
+        Err(_) => {
+            tracing::warn!(package = %name, "fetch timed out ({}s)", timeout.as_secs());
+            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            failed_name = Some((
+                name.clone(),
+                FetchFailure::Transient,
+                format!(
+                    "{name}: registry request timed out after {}s",
+                    timeout.as_secs()
+                ),
+            ));
+            None
+        }
+    };
+
+    let count = fetched.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if let Some(sender) = progress_sender {
+        sender.send(count);
+    }
+
+    let no_comparable_versions_name = no_comparable_versions.then(|| name.clone());
+    (
+        version,
+        yanked,
+        failed_name,
+        deprecation,
+        no_comparable_versions_name,
+    )
 }
 
 /// Decides whether a fetch-failure toast should be shown for this fetch cycle, and what
@@ -1570,274 +1622,294 @@ pub async fn handle_document_open(
     };
 
     // Spawn background task to fetch versions
-    let uri_clone = uri.clone();
-    let state_clone = Arc::clone(&state);
-    let ecosystem_clone = Arc::clone(&ecosystem);
-    let client_clone = client.clone();
-
-    let task = tokio::spawn(async move {
-        tracing::debug!("background task started");
-
-        // Load resolved versions from lock file first (instant, no network)
-        let resolved_versions =
-            load_resolved_versions(&uri_clone, &state_clone, ecosystem_clone.as_ref()).await;
-
-        // Update document state with resolved versions immediately
-        if !resolved_versions.is_empty()
-            && let Some(mut doc) = state_clone.documents.get_mut(&uri_clone)
-        {
-            doc.update_resolved_versions(resolved_versions.clone());
-
-            // Use resolved versions as cached versions for instant display,
-            // except for a dependency whose manifest requirement is itself
-            // already the resolved version (Go's `require` lines) — for
-            // those, go.sum can hold a stale, no-longer-selected version
-            // (#235), so seeding it as the "latest" comparison operand would
-            // desync hover/inlay-hint status against the go.mod-accurate
-            // `resolved` value during the cold-open window before the
-            // registry fetch completes (critique S1).
-            let formatter = ecosystem_clone.formatter();
-            let instant_resolved: HashMap<PackageName, ConcreteVersion> = match doc.parse_result() {
-                Some(parse_result) => {
-                    let deps = parse_result.dependencies();
-                    resolved_versions
-                        .iter()
-                        .filter(|(name, _)| {
-                            deps.iter().find(|d| d.name() == *name).is_none_or(|d| {
-                                !formatter.manifest_requirement_is_resolved_version(*d)
-                            })
-                        })
-                        .map(|(name, version)| (name.clone(), version.clone()))
-                        .collect()
-                }
-                None => resolved_versions.clone(),
-            };
-            doc.update_cached_versions(cached_versions_from_lockfile(&instant_resolved));
-        }
-
-        // Phase A OSV scan, spawned so it runs concurrently with the
-        // registry fetch below rather than gating the inlay-hint refresh
-        // that must happen immediately after it (critique S2).
-        let osv_task = vulnerabilities_enabled.then(|| {
-            tokio::spawn(run_osv_scan_phase_a(
-                uri_clone.clone(),
-                Arc::clone(&state_clone),
-                Arc::clone(&ecosystem_clone),
-                cache_config.fetch_timeout_secs,
-            ))
-        });
-
-        // Collect dependency names+sources and the in-use-version map (§4.6) in one
-        // pass while holding the reference (can't hold across await).
-        let (dep_sources, in_use, minimum_stability, collided_names): (
-            DepSources,
-            HashMap<PackageName, Vec<String>>,
-            Option<String>,
-            HashSet<PackageName>,
-        ) = {
-            let doc = match state_clone.get_document(&uri_clone) {
-                Some(d) => d,
-                None => {
-                    tracing::warn!("document not found, aborting fetch");
-                    return;
-                }
-            };
-            let parse_result = match doc.parse_result() {
-                Some(p) => p,
-                None => {
-                    tracing::warn!("no parse result, aborting fetch");
-                    return;
-                }
-            };
-            // Deduped by name (critique M3): a duplicated name shares one
-            // registry fetch across all its occurrences — the result is
-            // name-keyed anyway (`FetchResult::versions`), so fetching it
-            // more than once would only issue wasted extra registry calls
-            // and inflate `RegistryProgress`'s total. A non-resolvable source is
-            // dropped entirely, and two occurrences of the same name resolving to
-            // *different* sources are dropped and recorded as collided instead
-            // (spec FR-011) — see `dedup_dependencies_by_source`.
-            let (sources_map, collided_names) =
-                dedup_dependencies_by_source(parse_result, ecosystem_clone.formatter());
-            let dep_sources: Vec<_> = sources_map.into_iter().collect();
-            let in_use = collect_in_use_versions(
-                parse_result,
-                &resolved_versions,
-                ecosystem_clone.formatter(),
-                resolve_ecosystem_id(ecosystem_clone.as_ref()),
-            );
-            let minimum_stability = composer_minimum_stability(parse_result);
-            (dep_sources, in_use, minimum_stability, collided_names)
-        };
-
-        tracing::debug!(count = dep_sources.len(), "starting registry fetch");
-
-        // Mark as loading and start progress
-        if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
-            doc.set_loading();
-        }
-
-        let (progress, progress_sender) = if state_clone.supports_progress() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                RegistryProgress::start(
-                    client_clone.clone(),
-                    uri_clone.as_str(),
-                    dep_sources.len(),
-                ),
-            )
-            .await
-            {
-                Ok(Ok((p, s))) => (Some(p), Some(s)),
-                _ => (None, None),
-            }
-        } else {
-            (None, None)
-        };
-
-        tracing::debug!("progress started, fetching versions");
-
-        // Fetch latest versions from registry in parallel (for update hints)
-        let registry = ecosystem_clone.registry();
-        let fetch_result = fetch_latest_versions_parallel(
-            registry,
-            dep_sources,
-            &in_use,
-            progress_sender,
-            freshness_settings,
-            cache_config.fetch_timeout_secs,
-            cache_config.max_concurrent_fetches,
-            minimum_stability.as_deref(),
-        )
-        .await;
-
-        let success = !fetch_result.versions.is_empty();
-        tracing::debug!(
-            fetched = fetch_result.versions.len(),
-            failed = fetch_result.failed_count,
-            yanked = fetch_result.yanked_versions.len(),
-            "registry fetch complete"
-        );
-
-        // Update document state with cached versions (latest from registry)
-        if let Some(mut doc) = state_clone.documents.get_mut(&uri_clone) {
-            doc.update_cached_versions(fetch_result.versions);
-            // Re-key raw -> normalized (§3.1): `FetchResult`'s three fields are
-            // raw-keyed, `DocumentState::outcomes` is normalized.
-            let formatter = ecosystem_clone.formatter();
-            let mut outcomes = DependencyOutcomes::new();
-            for (name, d) in fetch_result.deprecations {
-                outcomes.set_deprecation(formatter.normalize_package_name(&name), d);
-            }
-            for (name, v) in fetch_result.yanked_versions {
-                outcomes.set_yanked(formatter.normalize_package_name(&name), v);
-            }
-            for (name, failure) in fetch_result.fetch_failed {
-                outcomes.set_fetch_failure(formatter.normalize_package_name(&name), failure);
-            }
-            for name in fetch_result.no_comparable_versions {
-                outcomes.set_no_comparable_versions(formatter.normalize_package_name(&name));
-            }
-            // `collided_names` (spec FR-011) are merged in alongside genuine fetch
-            // failures so `generate_diagnostics_from_cache` reports "lookup could not
-            // be determined" rather than a false "Unknown package" for a name that
-            // was deliberately never queried, not one that doesn't exist. Genuine
-            // failures are inserted first and `collided_names` uses
-            // `set_fetch_failure_if_absent` so a collided name that normalizes to the
-            // same key as a genuine `Actionable`/`Transient` failure never clobbers it
-            // (impl-critic M2).
-            for name in collided_names {
-                outcomes.set_fetch_failure_if_absent(
-                    formatter.normalize_package_name(&name),
-                    FetchFailure::NotAttempted,
-                );
-            }
-            doc.replace_outcomes(outcomes);
-            if success {
-                doc.set_loaded();
-            } else {
-                doc.set_failed();
-            }
-        }
-
-        // End progress
-        if let Some(progress) = progress {
-            progress.end(success).await;
-        }
-
-        // Notify user about failed packages — suppressed when offline, see
-        // `fetch_failure_toast`'s docs. `fetch_result.first_error` is always populated
-        // by `fetch_latest_versions_parallel` whenever `failed_count > 0` (#480: every
-        // site that increments `failed_count` also sets either `priority_error` or
-        // `first_error`, and the two are merged into this field before returning).
-        match fetch_failure_toast(
-            fetch_result.failed_count,
-            fetch_result.first_error.as_deref(),
-            state_clone.cache.is_offline(),
-        ) {
-            Some(message) => {
-                client_clone
-                    .show_message(MessageType::WARNING, message)
-                    .await;
-            }
-            None if fetch_result.failed_count > 0 => {
-                tracing::debug!(
-                    failed_count = fetch_result.failed_count,
-                    "suppressing fetch-failure toast: offline"
-                );
-            }
-            None => {}
-        }
-
-        // Kick off inlay hint / code lens refresh as soon as loading completes, so
-        // clients see updated hints as early as possible — typically before
-        // diagnostics, which may take longer due to additional network calls, though
-        // that ordering is scheduler-dependent, not guaranteed, since the requests
-        // are detached (issue #493: nothing downstream depends on their result, and a
-        // client that never declared refresh support, or stops replying, must not
-        // hang this task's critical path — including the OSV commit and diagnostics
-        // publish below — forever).
-        state_clone.spawn_refresh_requests(&client_clone);
-
-        // Join phase A (already running concurrently since it was spawned
-        // above) and, only now that `cached_versions` holds the registry's
-        // actual latest (not the lockfile-seeded placeholder — critique S1),
-        // run phase B and commit before generating diagnostics.
-        if let Some(osv_task) = osv_task {
-            match osv_task.await {
-                Ok(Some(phase_a_result)) => {
-                    let ecosystem_id = resolve_ecosystem_id(ecosystem_clone.as_ref());
-                    run_osv_phase_b_and_commit(
-                        &uri_clone,
-                        &state_clone,
-                        ecosystem_id,
-                        ecosystem_clone.formatter(),
-                        cache_config.fetch_timeout_secs,
-                        phase_a_result,
-                    )
-                    .await;
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("OSV scan task failed: {e}"),
-            }
-        }
-
-        // Publish diagnostics (may be slower, runs after hints are already visible)
-        let diags = diagnostics::generate_diagnostics_internal(
-            Arc::clone(&state_clone),
-            &uri_clone,
-            freshness_settings,
-            diagnostic_severities,
-            offline,
-        )
-        .await;
-
-        client_clone
-            .publish_diagnostics(uri_clone.clone(), diags, None)
-            .await;
-    });
+    let task = tokio::spawn(run_document_open_background_task(
+        uri.clone(),
+        Arc::clone(&state),
+        Arc::clone(&ecosystem),
+        client.clone(),
+        cache_config,
+        vulnerabilities_enabled,
+        freshness_settings,
+        diagnostic_severities,
+        offline,
+    ));
 
     Ok(task)
+}
+
+/// The background task [`handle_document_open`] spawns: loads lockfile-resolved
+/// versions instantly (no network), seeds them as cached versions, kicks off the OSV
+/// Phase A scan concurrently with the registry fetch, runs the registry fetch,
+/// commits its results (cached versions, outcomes, loading state), then refreshes
+/// inlay hints, joins OSV Phase B, and publishes diagnostics.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the async move closure this was extracted from — every parameter \
+              is config already read (and thus fixed) before the task was spawned in \
+              handle_document_open, so a config struct here would only relocate, not \
+              reduce, the parameter list"
+)]
+async fn run_document_open_background_task(
+    uri: Uri,
+    state: Arc<ServerState>,
+    ecosystem: Arc<dyn Ecosystem>,
+    client: Client,
+    cache_config: crate::config::CacheConfig,
+    vulnerabilities_enabled: bool,
+    freshness_settings: deps_core::freshness::FreshnessSettings,
+    diagnostic_severities: deps_core::DiagnosticSeverities,
+    offline: bool,
+) {
+    tracing::debug!("background task started");
+
+    // Load resolved versions from lock file first (instant, no network)
+    let resolved_versions = load_resolved_versions(&uri, &state, ecosystem.as_ref()).await;
+
+    // Update document state with resolved versions immediately
+    if !resolved_versions.is_empty()
+        && let Some(mut doc) = state.documents.get_mut(&uri)
+    {
+        doc.update_resolved_versions(resolved_versions.clone());
+
+        // Use resolved versions as cached versions for instant display,
+        // except for a dependency whose manifest requirement is itself
+        // already the resolved version (Go's `require` lines) — for
+        // those, go.sum can hold a stale, no-longer-selected version
+        // (#235), so seeding it as the "latest" comparison operand would
+        // desync hover/inlay-hint status against the go.mod-accurate
+        // `resolved` value during the cold-open window before the
+        // registry fetch completes (critique S1).
+        let formatter = ecosystem.formatter();
+        let instant_resolved: HashMap<PackageName, ConcreteVersion> = match doc.parse_result() {
+            Some(parse_result) => {
+                let deps = parse_result.dependencies();
+                resolved_versions
+                    .iter()
+                    .filter(|(name, _)| {
+                        deps.iter()
+                            .find(|d| d.name() == *name)
+                            .is_none_or(|d| !formatter.manifest_requirement_is_resolved_version(*d))
+                    })
+                    .map(|(name, version)| (name.clone(), version.clone()))
+                    .collect()
+            }
+            None => resolved_versions.clone(),
+        };
+        doc.update_cached_versions(cached_versions_from_lockfile(&instant_resolved));
+    }
+
+    // Phase A OSV scan, spawned so it runs concurrently with the
+    // registry fetch below rather than gating the inlay-hint refresh
+    // that must happen immediately after it (critique S2).
+    let osv_task = vulnerabilities_enabled.then(|| {
+        tokio::spawn(run_osv_scan_phase_a(
+            uri.clone(),
+            Arc::clone(&state),
+            Arc::clone(&ecosystem),
+            cache_config.fetch_timeout_secs,
+        ))
+    });
+
+    // Collect dependency names+sources and the in-use-version map (§4.6) in one
+    // pass while holding the reference (can't hold across await).
+    let (dep_sources, in_use, minimum_stability, collided_names): (
+        DepSources,
+        HashMap<PackageName, Vec<String>>,
+        Option<String>,
+        HashSet<PackageName>,
+    ) = {
+        let doc = match state.get_document(&uri) {
+            Some(d) => d,
+            None => {
+                tracing::warn!("document not found, aborting fetch");
+                return;
+            }
+        };
+        let parse_result = match doc.parse_result() {
+            Some(p) => p,
+            None => {
+                tracing::warn!("no parse result, aborting fetch");
+                return;
+            }
+        };
+        // Deduped by name (critique M3): a duplicated name shares one
+        // registry fetch across all its occurrences — the result is
+        // name-keyed anyway (`FetchResult::versions`), so fetching it
+        // more than once would only issue wasted extra registry calls
+        // and inflate `RegistryProgress`'s total. A non-resolvable source is
+        // dropped entirely, and two occurrences of the same name resolving to
+        // *different* sources are dropped and recorded as collided instead
+        // (spec FR-011) — see `dedup_dependencies_by_source`.
+        let (sources_map, collided_names) =
+            dedup_dependencies_by_source(parse_result, ecosystem.formatter());
+        let dep_sources: Vec<_> = sources_map.into_iter().collect();
+        let in_use = collect_in_use_versions(
+            parse_result,
+            &resolved_versions,
+            ecosystem.formatter(),
+            resolve_ecosystem_id(ecosystem.as_ref()),
+        );
+        let minimum_stability = composer_minimum_stability(parse_result);
+        (dep_sources, in_use, minimum_stability, collided_names)
+    };
+
+    tracing::debug!(count = dep_sources.len(), "starting registry fetch");
+
+    // Mark as loading and start progress
+    if let Some(mut doc) = state.documents.get_mut(&uri) {
+        doc.set_loading();
+    }
+
+    let (progress, progress_sender) = if state.supports_progress() {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            RegistryProgress::start(client.clone(), uri.as_str(), dep_sources.len()),
+        )
+        .await
+        {
+            Ok(Ok((p, s))) => (Some(p), Some(s)),
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    tracing::debug!("progress started, fetching versions");
+
+    // Fetch latest versions from registry in parallel (for update hints)
+    let registry = ecosystem.registry();
+    let fetch_result = fetch_latest_versions_parallel(
+        registry,
+        dep_sources,
+        &in_use,
+        progress_sender,
+        freshness_settings,
+        cache_config.fetch_timeout_secs,
+        cache_config.max_concurrent_fetches,
+        minimum_stability.as_deref(),
+    )
+    .await;
+
+    let success = !fetch_result.versions.is_empty();
+    tracing::debug!(
+        fetched = fetch_result.versions.len(),
+        failed = fetch_result.failed_count,
+        yanked = fetch_result.yanked_versions.len(),
+        "registry fetch complete"
+    );
+
+    // Update document state with cached versions (latest from registry)
+    if let Some(mut doc) = state.documents.get_mut(&uri) {
+        doc.update_cached_versions(fetch_result.versions);
+        // Re-key raw -> normalized (§3.1): `FetchResult`'s three fields are
+        // raw-keyed, `DocumentState::outcomes` is normalized.
+        let formatter = ecosystem.formatter();
+        let mut outcomes = DependencyOutcomes::new();
+        for (name, d) in fetch_result.deprecations {
+            outcomes.set_deprecation(formatter.normalize_package_name(&name), d);
+        }
+        for (name, v) in fetch_result.yanked_versions {
+            outcomes.set_yanked(formatter.normalize_package_name(&name), v);
+        }
+        for (name, failure) in fetch_result.fetch_failed {
+            outcomes.set_fetch_failure(formatter.normalize_package_name(&name), failure);
+        }
+        for name in fetch_result.no_comparable_versions {
+            outcomes.set_no_comparable_versions(formatter.normalize_package_name(&name));
+        }
+        // `collided_names` (spec FR-011) are merged in alongside genuine fetch
+        // failures so `generate_diagnostics_from_cache` reports "lookup could not
+        // be determined" rather than a false "Unknown package" for a name that
+        // was deliberately never queried, not one that doesn't exist. Genuine
+        // failures are inserted first and `collided_names` uses
+        // `set_fetch_failure_if_absent` so a collided name that normalizes to the
+        // same key as a genuine `Actionable`/`Transient` failure never clobbers it
+        // (impl-critic M2).
+        for name in collided_names {
+            outcomes.set_fetch_failure_if_absent(
+                formatter.normalize_package_name(&name),
+                FetchFailure::NotAttempted,
+            );
+        }
+        doc.replace_outcomes(outcomes);
+        if success {
+            doc.set_loaded();
+        } else {
+            doc.set_failed();
+        }
+    }
+
+    // End progress
+    if let Some(progress) = progress {
+        progress.end(success).await;
+    }
+
+    // Notify user about failed packages — suppressed when offline, see
+    // `fetch_failure_toast`'s docs. `fetch_result.first_error` is always populated
+    // by `fetch_latest_versions_parallel` whenever `failed_count > 0` (#480: every
+    // site that increments `failed_count` also sets either `priority_error` or
+    // `first_error`, and the two are merged into this field before returning).
+    match fetch_failure_toast(
+        fetch_result.failed_count,
+        fetch_result.first_error.as_deref(),
+        state.cache.is_offline(),
+    ) {
+        Some(message) => {
+            client.show_message(MessageType::WARNING, message).await;
+        }
+        None if fetch_result.failed_count > 0 => {
+            tracing::debug!(
+                failed_count = fetch_result.failed_count,
+                "suppressing fetch-failure toast: offline"
+            );
+        }
+        None => {}
+    }
+
+    // Kick off inlay hint / code lens refresh as soon as loading completes, so
+    // clients see updated hints as early as possible — typically before
+    // diagnostics, which may take longer due to additional network calls, though
+    // that ordering is scheduler-dependent, not guaranteed, since the requests
+    // are detached (issue #493: nothing downstream depends on their result, and a
+    // client that never declared refresh support, or stops replying, must not
+    // hang this task's critical path — including the OSV commit and diagnostics
+    // publish below — forever).
+    state.spawn_refresh_requests(&client);
+
+    // Join phase A (already running concurrently since it was spawned
+    // above) and, only now that `cached_versions` holds the registry's
+    // actual latest (not the lockfile-seeded placeholder — critique S1),
+    // run phase B and commit before generating diagnostics.
+    if let Some(osv_task) = osv_task {
+        match osv_task.await {
+            Ok(Some(phase_a_result)) => {
+                let ecosystem_id = resolve_ecosystem_id(ecosystem.as_ref());
+                run_osv_phase_b_and_commit(
+                    &uri,
+                    &state,
+                    ecosystem_id,
+                    ecosystem.formatter(),
+                    cache_config.fetch_timeout_secs,
+                    phase_a_result,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("OSV scan task failed: {e}"),
+        }
+    }
+
+    // Publish diagnostics (may be slower, runs after hints are already visible)
+    let diags = diagnostics::generate_diagnostics_internal(
+        Arc::clone(&state),
+        &uri,
+        freshness_settings,
+        diagnostic_severities,
+        offline,
+    )
+    .await;
+
+    client.publish_diagnostics(uri.clone(), diags, None).await;
 }
 
 /// Parses the freshly-edited manifest content and diffs its dependencies against the

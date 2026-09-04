@@ -6,8 +6,9 @@ use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind
 use crate::deps_dev::deps_dev_system;
 use crate::osv::ScanOutcome;
 use crate::{
-    ConcreteVersion, Deprecation, ParseResult, ProvenanceStatus, PublishTime, Registry,
-    SupplyChainTrustSignal, Version, VersionReq, format_relative_age, is_within_cooldown,
+    ConcreteVersion, Dependency, DependencySource, Deprecation, ParseResult, ProvenanceStatus,
+    PublishTime, Registry, SupplyChainTrustSignal, Version, VersionReq, format_relative_age,
+    is_within_cooldown,
 };
 
 use super::{
@@ -69,8 +70,6 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
 ) -> Option<Hover> {
-    use std::fmt::Write;
-
     let dep = parse_result.dependencies().into_iter().find(|d| {
         let on_name = position_in_range(position, d.name_range());
         let on_version = d
@@ -97,58 +96,15 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // requests overlap instead of stacking (spec 037, plan.md §8 M6).
     let normalized_name = formatter.normalize_package_name(dep.name());
 
-    // Supply-chain trust signal (spec 037): spawned as a detached background task,
-    // concurrently with the registry fetch just below, so a slow or cold-memo
-    // deps.dev never adds its own latency on top of the registry fetch's. Only
-    // `handlers/hover.rs` (deps-lsp) ever sets `versions.trust`, which is what makes
-    // FR-010's hover-only scope structural: every other surface (diagnostics, code
-    // actions, inlay hints, code lenses) is never handed a client and so can never
-    // reach deps.dev.
-    //
-    // Gated on all of: a client was handed in, `network.offline` is not set, the source
-    // resolves against a **public** registry, the ecosystem is one of the seven
-    // `deps_dev_system` maps, and a concrete in-use version exists — the last two
-    // checked with **no** network I/O, so an ecosystem `deps_dev_system` excludes
-    // (Composer, Dart, Swift, ...) spawns nothing at all.
-    //
-    // `formatter.source_is_public_registry_content(&dep_source)`, not the weaker
-    // `resolvable` (`can_resolve_source`): `resolvable` is deliberately widened by some
-    // ecosystems (e.g. `deps-cargo`'s `AlternateRegistry`) to cover *any* configured
-    // registry, private/internal ones included — reusing it here would send a private
-    // package's name and version to deps.dev by default (security audit M2). `source_is_
-    // public_registry_content` is the same, stricter predicate this server's other
-    // third-party lookup (OSV) already gates on (`lifecycle.rs`).
-    //
-    // `!versions.offline`: every other network-gated hover section in this function
-    // checks `versions.offline` (the `Cmd+.` footer, the offline footer itself below) —
-    // without it here, offline mode still spawns a task per hover and writes a 90s
-    // negative memo entry, keeping the signal absent for up to 90s per package after
-    // reconnecting for no reason (critic C4).
-    //
-    // `tokio::spawn` panics outside a Tokio runtime — every caller of `generate_hover`
-    // is `#[tokio::test]`-async or the real LSP server, so this is safe here, but no
-    // doc-test may call this function directly. The spawned future captures only
-    // owned/`'static` data (`Arc<DepsDevClient>`, `&'static str`, owned `String`s) so
-    // it satisfies `Send + 'static` with no borrow from `dep`/`parse_result`.
-    let trust_handle = versions.trust.and_then(|client| {
-        let ecosystem = versions.ecosystem?;
-        let system = deps_dev_system(ecosystem)?;
-        if versions.offline || !formatter.source_is_public_registry_content(&dep_source) {
-            return None;
-        }
-        let version = in_use_version(
-            dep,
-            normalized_name.as_str(),
-            versions.resolved,
-            formatter,
-            ecosystem,
-        )?;
-        let client = Arc::clone(client);
-        let name = dep.name().to_string();
-        Some(tokio::spawn(async move {
-            client.trust_signal(system, &name, &version).await
-        }))
-    });
+    // Spawned concurrently with the registry fetch just below, so a slow or
+    // cold-memo deps.dev never adds its own latency on top of the registry fetch's.
+    let trust_handle = spawn_trust_signal_fetch(
+        dep,
+        &dep_source,
+        &versions,
+        formatter,
+        normalized_name.as_str(),
+    );
 
     // `now` is a caller-supplied parameter (issue #227 M4) rather than computed
     // internally via `PublishTime::now()` — this is what lets tests pin an exact
@@ -187,20 +143,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     // Pre-allocate with estimated capacity to reduce allocations
     let mut markdown = String::with_capacity(512);
-    match &url {
-        Some(url) => write!(
-            &mut markdown,
-            "# [{}]({})\n\n",
-            escape_markdown(dep.name().as_str()),
-            url
-        ),
-        None => write!(
-            &mut markdown,
-            "# {}\n\n",
-            escape_markdown(dep.name().as_str())
-        ),
-    }
-    .unwrap();
+    push_header_hover_section(&mut markdown, dep, url.as_deref());
 
     let resolved: Option<&str> = if formatter.manifest_requirement_is_resolved_version(dep) {
         dep.version_requirement().map(VersionReq::as_str)
@@ -211,30 +154,9 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             .or_else(|| versions.resolved.get(dep.name()))
             .map(ConcreteVersion::as_str)
     };
-    if let Some(resolved_ver) = resolved {
-        write!(
-            &mut markdown,
-            "**Current**: {}\n\n",
-            markdown_code_span(resolved_ver)
-        )
-        .unwrap();
-    } else if let Some(version_req) = dep.version_requirement() {
-        write!(
-            &mut markdown,
-            "**Requirement**: {}\n\n",
-            markdown_code_span(version_req.as_str())
-        )
-        .unwrap();
-    }
+    push_current_or_requirement_hover_section(&mut markdown, dep, resolved);
 
-    if let Some(marker_expr) = dep.markers() {
-        write!(
-            &mut markdown,
-            "**Active when**: {}\n\n",
-            markdown_code_span(marker_expr)
-        )
-        .unwrap();
-    }
+    push_markers_hover_section(&mut markdown, dep);
 
     // The `**Latest**` line prefers the just-fetched Ch2 list (`available_versions`) over
     // the Ch1 cache (`versions.cached`, populated by the lifecycle's background fetch)
@@ -346,31 +268,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             }),
         _ => cached_latest.map(|v| (v.latest.as_str(), v.published_at)),
     };
-    if let Some((latest_ver, raw_published_at)) = latest_line {
-        let published_at = freshness.enabled.then_some(raw_published_at).flatten();
-        let age_secs = published_at.map(|p| p.age_secs_from(now));
-        write!(
-            &mut markdown,
-            "**Latest**: {}",
-            markdown_code_span(latest_ver)
-        )
-        .unwrap();
-        if let Some(age_secs) = age_secs {
-            write!(
-                &mut markdown,
-                " *(published {})*",
-                format_relative_age(age_secs)
-            )
-            .unwrap();
-        }
-        markdown.push_str("\n\n");
-        if age_secs.is_some_and(|age| is_within_cooldown(age, freshness.cooldown_secs)) {
-            markdown.push_str(
-                "> ⏳ **Recently published** — this release is still within the cooldown window.\n\
-                 > It may still be yanked or superseded; consider verifying before upgrading.\n\n",
-            );
-        }
-    }
+    push_latest_hover_section(&mut markdown, latest_line, freshness, now);
 
     // #394 S2: prefer the version-qualified key so a hover on one occurrence
     // of a duplicated name never shows another occurrence's OSV result. See
@@ -416,113 +314,27 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // a "**Recent versions**:" header with no entries under it is never useful,
     // regardless of ecosystem.
     if let Some(available_versions) = available_versions.as_ref().filter(|v| !v.is_empty()) {
-        // Matched by position against `live_latest_idx` (the header's stable-latest pick)
-        // rather than raw index 0 or string equality: `available_versions` is sorted purely
-        // by version number, so index 0 can be a pre-release the header itself doesn't call
-        // "latest" (issue #313), and matching by version string instead of index could tag
-        // more than one entry if two ever shared a version string. No match in the rendered
-        // top-N slice simply omits the marker.
-        markdown.push_str("**Recent versions**:\n");
-        for (i, version) in available_versions
-            .iter()
-            .take(HOVER_RECENT_VERSIONS)
-            .enumerate()
-        {
-            let version_span = markdown_code_span(version.version_string().as_str());
-            let age_suffix = if freshness.enabled {
-                version_age_suffix(version.as_ref(), now)
-            } else {
-                String::new()
-            };
-            if Some(i) == live_latest_idx {
-                if version.removal_status().is_flagged() {
-                    // The resolved "latest" can itself be flagged (e.g. npm's ranking
-                    // preference falls through to a deprecated version when no clean one
-                    // exists) — the deprecation/yank warning must not silently vanish just
-                    // because this entry also carries the `(latest)` marker (#347/#348 S1).
-                    writeln!(
-                        &mut markdown,
-                        "- {version_span} *(latest)* {}{age_suffix}",
-                        formatter.yanked_label()
-                    )
-                    .unwrap();
-                } else {
-                    writeln!(&mut markdown, "- {version_span} *(latest)*{age_suffix}").unwrap();
-                }
-            } else if version.removal_status().is_flagged() {
-                writeln!(
-                    &mut markdown,
-                    "- {} {}{}",
-                    version_span,
-                    formatter.yanked_label(),
-                    age_suffix
-                )
-                .unwrap();
-            } else {
-                writeln!(&mut markdown, "- {version_span}{age_suffix}").unwrap();
-            }
-        }
+        push_recent_versions_hover_section(
+            &mut markdown,
+            available_versions,
+            live_latest_idx,
+            freshness,
+            now,
+            formatter,
+        );
     }
 
-    // The footer advertises a `Cmd+.` code action — none is ever offered for a source that
-    // is deliberately non-resolvable (e.g. a local composite action or a Docker image ref),
-    // so rendering it unconditionally is misleading there (#474). Gated on `resolvable`
-    // alone, not on `available_versions`/`cached_latest` also being populated: a
-    // vulnerability-fix or unsatisfiable-fix code action (`code_actions.rs`) can exist from
-    // `versions.vulnerabilities` — populated independently of the registry fetch
-    // (`lifecycle.rs`) — even when both of those are empty (e.g. a registry fetch failure),
-    // so requiring them too would silently drop the footer while `Cmd+.` still offers a fix.
-    //
-    // Also gated on offline data availability (#501): `HttpCache` deliberately serves warm
-    // entries while offline (it force-enables caching in that mode), and doc-state fields —
-    // `versions.vulnerabilities`/`cached_latest`/deprecation — survive an online-to-offline
-    // transition via `preserve_cache`, so `Cmd+.` can still produce a real REFACTOR/fix/
-    // replacement action offline as long as *some* version, vulnerability, or deprecation
-    // data was actually rendered above. Only suppress when offline AND none of that data is
-    // present — a cold process with nothing cached yet, where no producer in
-    // `generate_code_actions` has anything to act on.
-    //
-    // `matches!(vuln_outcome, Some(ScanOutcome::Vulnerable(_)))`, not `vuln_outcome.is_some()`
-    // (#501 C5): offline does not skip the OSV scan, it lets it run and fail, which writes
-    // `ScanOutcome::Skipped(_)` for every dependency — `is_some()` would be true in exactly
-    // #501's own cold-start repro and only `Vulnerable` ever backs
-    // `build_vulnerability_fix_action` (`code_actions.rs`).
-    let has_offline_actionable_data = available_versions.as_ref().is_some_and(|v| !v.is_empty())
-        || cached_latest.is_some()
-        || matches!(vuln_outcome, Some(ScanOutcome::Vulnerable(_)))
-        || deprecation.is_some();
-    // #550: a live fetch that genuinely succeeded with zero entries (`Some(&[])`,
-    // distinct from `None` — a fetch that errored or never ran, where an unrelated
-    // Cmd+. action such as an unsatisfiable-fix might still exist per #474's own
-    // reasoning above) is definitive proof there is nothing version-wise to update to.
-    // Combined with no cached/vulnerability/deprecation data either
-    // (`!has_offline_actionable_data`, which already folds in this same emptiness
-    // check), the footer would otherwise advertise an action that provably does not
-    // exist — the "empty Recent versions section plus a stray footer" bug reported
-    // against GHA's `dtolnay/rust-toolchain@stable` but not specific to any one
-    // ecosystem. Every other online case (a non-empty live list, or no live fetch at
-    // all) keeps the pre-#550 unconditional-when-resolvable behavior.
-    let live_fetch_definitively_empty = available_versions.as_ref().is_some_and(Vec::is_empty);
-    let footer_actionable =
-        has_offline_actionable_data || (!live_fetch_definitively_empty && !versions.offline);
-    if resolvable && footer_actionable {
-        markdown.push_str(CMD_DOT_FOOTER);
-    }
+    push_cmd_dot_footer_hover_section(
+        &mut markdown,
+        resolvable,
+        available_versions.as_deref(),
+        cached_latest,
+        vuln_outcome,
+        deprecation,
+        versions.offline,
+    );
 
-    // `versions.offline` (issue #483): the OSV lookup that produced `ScanOutcome::Skipped`
-    // for this dependency renders nothing above (the `Some(ScanOutcome::Skipped(_)) | None`
-    // arm below), which would otherwise be visually indistinguishable from a scanned,
-    // vulnerability-free dependency — this footer must explicitly call out that
-    // vulnerability data specifically was not checked, not just version data (S2).
-    //
-    // Gated on `resolvable` too, matching the `Cmd+.` footer immediately above (#474/#475):
-    // a dependency that is never network-resolved under any setting (a local composite
-    // action, a Docker image ref, a Git/path dependency) must not claim its version or
-    // vulnerability data went unchecked *because of* `network.offline` — nothing there was
-    // ever going to be checked regardless.
-    if versions.offline && resolvable {
-        markdown.push_str("\n---\n📴 *Offline: version and vulnerability data not checked*");
-    }
+    push_offline_footer_hover_section(&mut markdown, resolvable, versions.offline);
 
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -531,6 +343,301 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         }),
         range: Some(dep.name_range()),
     })
+}
+
+/// Spawns the deps.dev supply-chain trust-signal fetch (spec 037) as a detached
+/// background task. Only `handlers/hover.rs` (deps-lsp) ever sets `versions.trust`,
+/// which is what makes FR-010's hover-only scope structural: every other surface
+/// (diagnostics, code actions, inlay hints, code lenses) is never handed a client and
+/// so can never reach deps.dev.
+///
+/// Gated on all of: a client was handed in, `network.offline` is not set, the source
+/// resolves against a **public** registry, the ecosystem is one of the seven
+/// `deps_dev_system` maps, and a concrete in-use version exists — the last two
+/// checked with **no** network I/O, so an ecosystem `deps_dev_system` excludes
+/// (Composer, Dart, Swift, ...) spawns nothing at all.
+///
+/// `formatter.source_is_public_registry_content(dep_source)`, not the weaker
+/// `EcosystemFormatter::can_resolve_source`: that predicate is deliberately widened
+/// by some ecosystems (e.g. `deps-cargo`'s `AlternateRegistry`) to cover *any*
+/// configured registry, private/internal ones included — reusing it here would send
+/// a private package's name and version to deps.dev by default (security audit M2).
+/// `source_is_public_registry_content` is the same, stricter predicate this server's
+/// other third-party lookup (OSV) already gates on (`lifecycle.rs`).
+///
+/// `!versions.offline`: every other network-gated hover section [`generate_hover`]
+/// builds checks `versions.offline` (the `Cmd+.` footer, the offline footer) —
+/// without it here, offline mode still spawns a task per hover and writes a 90s
+/// negative memo entry, keeping the signal absent for up to 90s per package after
+/// reconnecting for no reason (critic C4).
+///
+/// `tokio::spawn` panics outside a Tokio runtime — every caller of [`generate_hover`]
+/// is `#[tokio::test]`-async or the real LSP server, so this is safe here, but no
+/// doc-test may call it directly. The spawned future captures only owned/`'static`
+/// data (`Arc<DepsDevClient>`, `&'static str`, owned `String`s) so it satisfies
+/// `Send + 'static` with no borrow from `dep`.
+fn spawn_trust_signal_fetch(
+    dep: &dyn Dependency,
+    dep_source: &DependencySource,
+    versions: &VersionData<'_>,
+    formatter: &dyn EcosystemFormatter,
+    normalized_name: &str,
+) -> Option<tokio::task::JoinHandle<Option<SupplyChainTrustSignal>>> {
+    versions.trust.and_then(|client| {
+        let ecosystem = versions.ecosystem?;
+        let system = deps_dev_system(ecosystem)?;
+        if versions.offline || !formatter.source_is_public_registry_content(dep_source) {
+            return None;
+        }
+        let version = in_use_version(
+            dep,
+            normalized_name,
+            versions.resolved,
+            formatter,
+            ecosystem,
+        )?;
+        let client = Arc::clone(client);
+        let name = dep.name().to_string();
+        Some(tokio::spawn(async move {
+            client.trust_signal(system, &name, &version).await
+        }))
+    })
+}
+
+/// Appends the hover header: the dependency name, linked to its registry page when
+/// `url` (from [`EcosystemFormatter::package_url`]) is present.
+fn push_header_hover_section(markdown: &mut String, dep: &dyn Dependency, url: Option<&str>) {
+    use std::fmt::Write as _;
+
+    match url {
+        Some(url) => write!(
+            markdown,
+            "# [{}]({})\n\n",
+            escape_markdown(dep.name().as_str()),
+            url
+        ),
+        None => write!(markdown, "# {}\n\n", escape_markdown(dep.name().as_str())),
+    }
+    .unwrap();
+}
+
+/// Appends the hover "Current"/"Requirement" line. `resolved` — already selecting
+/// between an ecosystem's resolved manifest requirement and the lockfile-resolved
+/// version, per [`EcosystemFormatter::manifest_requirement_is_resolved_version`] —
+/// wins over the bare manifest requirement when present.
+fn push_current_or_requirement_hover_section(
+    markdown: &mut String,
+    dep: &dyn Dependency,
+    resolved: Option<&str>,
+) {
+    use std::fmt::Write as _;
+
+    if let Some(resolved_ver) = resolved {
+        write!(
+            markdown,
+            "**Current**: {}\n\n",
+            markdown_code_span(resolved_ver)
+        )
+        .unwrap();
+    } else if let Some(version_req) = dep.version_requirement() {
+        write!(
+            markdown,
+            "**Requirement**: {}\n\n",
+            markdown_code_span(version_req.as_str())
+        )
+        .unwrap();
+    }
+}
+
+/// Appends the hover "Active when" line for an environment-marker-gated dependency
+/// (e.g. PEP 508's `python_version >= '3.8'`). Ecosystem-specific; renders nothing
+/// when [`Dependency::markers`] is `None`.
+fn push_markers_hover_section(markdown: &mut String, dep: &dyn Dependency) {
+    use std::fmt::Write as _;
+
+    if let Some(marker_expr) = dep.markers() {
+        write!(
+            markdown,
+            "**Active when**: {}\n\n",
+            markdown_code_span(marker_expr)
+        )
+        .unwrap();
+    }
+}
+
+/// Appends the hover "Latest" line and, when the version is still within the
+/// configured cooldown window, the "Recently published" callout beneath it.
+///
+/// `latest_line` renders nothing when `None` — no header, matching an empty "Recent
+/// versions" list below. See [`generate_hover`]'s derivation of `latest_line` for the
+/// full Ch1/Ch2/fallback precedence rules (issue #227 F5, #313, #373).
+fn push_latest_hover_section(
+    markdown: &mut String,
+    latest_line: Option<(&str, Option<PublishTime>)>,
+    freshness: crate::freshness::FreshnessSettings,
+    now: PublishTime,
+) {
+    use std::fmt::Write as _;
+
+    let Some((latest_ver, raw_published_at)) = latest_line else {
+        return;
+    };
+    let published_at = freshness.enabled.then_some(raw_published_at).flatten();
+    let age_secs = published_at.map(|p| p.age_secs_from(now));
+    write!(markdown, "**Latest**: {}", markdown_code_span(latest_ver)).unwrap();
+    if let Some(age_secs) = age_secs {
+        write!(markdown, " *(published {})*", format_relative_age(age_secs)).unwrap();
+    }
+    markdown.push_str("\n\n");
+    if age_secs.is_some_and(|age| is_within_cooldown(age, freshness.cooldown_secs)) {
+        markdown.push_str(
+            "> ⏳ **Recently published** — this release is still within the cooldown window.\n\
+             > It may still be yanked or superseded; consider verifying before upgrading.\n\n",
+        );
+    }
+}
+
+/// Appends the "Recent versions" list: the top [`HOVER_RECENT_VERSIONS`] entries of
+/// `available_versions`, each optionally aged (freshness-gated) and marked
+/// `*(latest)*` at `live_latest_idx` — matched by position against the header's
+/// stable-latest pick rather than raw index 0 or string equality: `available_versions`
+/// is sorted purely by version number, so index 0 can be a pre-release the header
+/// itself doesn't call "latest" (issue #313), and matching by version string instead
+/// of index could tag more than one entry if two ever shared a version string. No
+/// match in the rendered top-N slice simply omits the marker.
+///
+/// Renders nothing when `available_versions` is empty (issue #550): an empty
+/// "Recent versions" header with no entries under it is never useful.
+fn push_recent_versions_hover_section(
+    markdown: &mut String,
+    available_versions: &[Box<dyn Version>],
+    live_latest_idx: Option<usize>,
+    freshness: crate::freshness::FreshnessSettings,
+    now: PublishTime,
+    formatter: &dyn EcosystemFormatter,
+) {
+    use std::fmt::Write as _;
+
+    if available_versions.is_empty() {
+        return;
+    }
+
+    markdown.push_str("**Recent versions**:\n");
+    for (i, version) in available_versions
+        .iter()
+        .take(HOVER_RECENT_VERSIONS)
+        .enumerate()
+    {
+        let version_span = markdown_code_span(version.version_string().as_str());
+        let age_suffix = if freshness.enabled {
+            version_age_suffix(version.as_ref(), now)
+        } else {
+            String::new()
+        };
+        if Some(i) == live_latest_idx {
+            if version.removal_status().is_flagged() {
+                // The resolved "latest" can itself be flagged (e.g. npm's ranking
+                // preference falls through to a deprecated version when no clean one
+                // exists) — the deprecation/yank warning must not silently vanish just
+                // because this entry also carries the `(latest)` marker (#347/#348 S1).
+                writeln!(
+                    markdown,
+                    "- {version_span} *(latest)* {}{age_suffix}",
+                    formatter.yanked_label()
+                )
+                .unwrap();
+            } else {
+                writeln!(markdown, "- {version_span} *(latest)*{age_suffix}").unwrap();
+            }
+        } else if version.removal_status().is_flagged() {
+            writeln!(
+                markdown,
+                "- {} {}{}",
+                version_span,
+                formatter.yanked_label(),
+                age_suffix
+            )
+            .unwrap();
+        } else {
+            writeln!(markdown, "- {version_span}{age_suffix}").unwrap();
+        }
+    }
+}
+
+/// Appends the `Cmd+.` code-action footer — advertised only when a fix action could
+/// actually exist for this dependency, since none is ever offered for a source that
+/// is deliberately non-resolvable (e.g. a local composite action or a Docker image
+/// ref), so rendering it unconditionally is misleading there (#474).
+///
+/// Gated on `resolvable` alone, not on `available_versions`/`cached_latest` also
+/// being populated: a vulnerability-fix or unsatisfiable-fix code action
+/// (`code_actions.rs`) can exist from `vuln_outcome` — populated independently of the
+/// registry fetch (`lifecycle.rs`) — even when both of those are empty (e.g. a
+/// registry fetch failure), so requiring them too would silently drop the footer
+/// while `Cmd+.` still offers a fix.
+///
+/// Also gated on offline data availability (#501): `HttpCache` deliberately serves
+/// warm entries while offline (it force-enables caching in that mode), and doc-state
+/// fields — vulnerabilities/cached latest/deprecation — survive an online-to-offline
+/// transition via `preserve_cache`, so `Cmd+.` can still produce a real
+/// REFACTOR/fix/replacement action offline as long as *some* version, vulnerability,
+/// or deprecation data was actually rendered above. Only suppress when offline AND
+/// none of that data is present — a cold process with nothing cached yet, where no
+/// producer in `generate_code_actions` has anything to act on.
+///
+/// `matches!(vuln_outcome, Some(ScanOutcome::Vulnerable(_)))`, not
+/// `vuln_outcome.is_some()` (#501 C5): offline does not skip the OSV scan, it lets it
+/// run and fail, which writes `ScanOutcome::Skipped(_)` for every dependency —
+/// `is_some()` would be true in exactly #501's own cold-start repro and only
+/// `Vulnerable` ever backs `build_vulnerability_fix_action` (`code_actions.rs`).
+///
+/// A live fetch that genuinely succeeded with zero entries (`Some(&[])`, distinct
+/// from `None` — a fetch that errored or never ran, where an unrelated Cmd+. action
+/// such as an unsatisfiable-fix might still exist per the reasoning above) is
+/// definitive proof there is nothing version-wise to update to (#550): combined with
+/// no cached/vulnerability/deprecation data either, the footer would otherwise
+/// advertise an action that provably does not exist — the "empty Recent versions
+/// section plus a stray footer" bug reported against GHA's
+/// `dtolnay/rust-toolchain@stable` but not specific to any one ecosystem. Every other
+/// online case (a non-empty live list, or no live fetch at all) keeps the pre-#550
+/// unconditional-when-resolvable behavior.
+fn push_cmd_dot_footer_hover_section(
+    markdown: &mut String,
+    resolvable: bool,
+    available_versions: Option<&[Box<dyn Version>]>,
+    cached_latest: Option<&super::PackageVersions>,
+    vuln_outcome: Option<&ScanOutcome>,
+    deprecation: Option<&Deprecation>,
+    offline: bool,
+) {
+    let has_offline_actionable_data = available_versions.is_some_and(|v| !v.is_empty())
+        || cached_latest.is_some()
+        || matches!(vuln_outcome, Some(ScanOutcome::Vulnerable(_)))
+        || deprecation.is_some();
+    let live_fetch_definitively_empty = available_versions.is_some_and(<[_]>::is_empty);
+    let footer_actionable =
+        has_offline_actionable_data || (!live_fetch_definitively_empty && !offline);
+    if resolvable && footer_actionable {
+        markdown.push_str(CMD_DOT_FOOTER);
+    }
+}
+
+/// Appends the "Offline: version and vulnerability data not checked" footer (issue
+/// #483) — the OSV lookup that produced `ScanOutcome::Skipped` for this dependency
+/// renders nothing in the vulnerability section, which would otherwise be visually
+/// indistinguishable from a scanned, vulnerability-free dependency; this footer calls
+/// out that vulnerability data specifically was not checked, not just version data
+/// (S2).
+///
+/// Gated on `resolvable` too, matching the `Cmd+.` footer (#474/#475): a dependency
+/// that is never network-resolved under any setting (a local composite action, a
+/// Docker image ref, a Git/path dependency) must not claim its version or
+/// vulnerability data went unchecked *because of* `network.offline` — nothing there
+/// was ever going to be checked regardless.
+fn push_offline_footer_hover_section(markdown: &mut String, resolvable: bool, offline: bool) {
+    if offline && resolvable {
+        markdown.push_str("\n---\n📴 *Offline: version and vulnerability data not checked*");
+    }
 }
 
 /// Lowercase display label for a [`crate::osv::VulnSeverity`], used only in hover text.
