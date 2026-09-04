@@ -32,7 +32,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use deps_core::net_policy::{
     PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
@@ -237,21 +237,21 @@ pub const GOPRIVATE_CHAIN_KEY: &str = "go-private:direct";
 /// [`GoProxyChain::separators`] preserves Go's own distinction between the two — a manual
 /// scan rather than `str::split([',', '|'])`, which would discard exactly that information.
 ///
-/// **Known limitation** (spec 034 follow-up C1, issue #559 — documented, not fixed here; see
-/// `docs/ECOSYSTEM_GUIDE.md`'s GOPROXY section): when one or more invalid entries (FR-009)
-/// are dropped between two surviving hops, only the separator immediately preceding the
-/// *surviving* hop is kept — a separator that preceded a *dropped* entry is discarded, not
-/// merged. E.g. `a|invalid,c` records `,` (the separator after the dropped entry), not `|`
-/// (the separator the user actually wrote before it). Pre-existing since PR #558; the
-/// underlying carry-over behavior is out of scope for this PR (tracked as a separate
-/// follow-up) — only the doc/test gap around it is closed here.
+/// When one or more invalid entries (FR-009) are dropped between two surviving hops, the
+/// separators spanning them are merged rather than the surviving-hop-adjacent one silently
+/// winning: the more permissive separator (`AnyError`/`|`) wins the merged transition (issue
+/// #564). E.g. `a|invalid,c` records `|` (the separator the user wrote before the dropped
+/// entry), not `,` (the separator that happened to follow it) — a user-written `|` must never
+/// be silently downgraded to `,` just because the entry it preceded turned out invalid.
 fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChain, InvalidEntry> {
     let mut hops: Vec<GoProxyHop> = Vec::new();
     let mut separators: Vec<ChainSeparator> = Vec::new();
     let mut first_invalid: Option<InvalidEntry> = None;
-    // The separator that preceded the entry about to be processed this iteration — `None`
-    // for the first entry (nothing precedes it).
-    let mut sep_before_current: Option<ChainSeparator> = None;
+    // The separator(s) spanning every entry seen since the last surviving hop (or the start
+    // of the chain) — `None` until the first separator is seen. When this spans one or more
+    // dropped invalid entries, it accumulates via most-permissive-wins (`AnyError` beats
+    // `NotFoundOnly`) rather than being overwritten by the latest separator seen.
+    let mut pending_sep: Option<ChainSeparator> = None;
 
     let mut remaining = raw;
     loop {
@@ -273,8 +273,10 @@ fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChai
                 Ok(hop) => {
                     let terminal = matches!(hop, GoProxyHop::Direct | GoProxyHop::Off);
                     if !hops.is_empty() {
-                        separators.push(sep_before_current.unwrap_or(ChainSeparator::NotFoundOnly));
+                        separators.push(pending_sep.unwrap_or(ChainSeparator::NotFoundOnly));
                     }
+                    // Fresh start for the transition leading out of this surviving hop.
+                    pending_sep = None;
                     hops.push(hop);
                     if terminal {
                         // FR-004/FR-006: everything after a terminal hop is unreachable.
@@ -292,7 +294,10 @@ fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChai
         let Some(sep) = trailing_sep else {
             break;
         };
-        sep_before_current = Some(sep);
+        pending_sep = Some(match pending_sep {
+            Some(ChainSeparator::AnyError) => ChainSeparator::AnyError,
+            _ => sep,
+        });
         remaining = rest;
     }
 
@@ -565,15 +570,23 @@ impl GoEnvConfig {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .map(|raw| parse_goproxy(raw, policy)),
+            // Compiled once per distinct `RawGoEnv` (memoized on `raw` itself, see its
+            // `compiled_goprivate` doc) rather than on every `from_raw` call — GOPRIVATE glob
+            // compilation never depends on `policy`, unlike GOPROXY hop validation above, so
+            // there is nothing here that needs to re-run just because `from_raw` does.
             goprivate: raw
-                .goprivate
-                .as_deref()
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(GlobPattern::new)
-                .collect(),
+                .compiled_goprivate
+                .get_or_init(|| {
+                    raw.goprivate
+                        .as_deref()
+                        .unwrap_or_default()
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(GlobPattern::new)
+                        .collect()
+                })
+                .clone(),
         }
     }
 
@@ -618,18 +631,28 @@ impl GoEnvConfig {
         self.goproxy.as_ref().and_then(|r| r.as_ref().ok())
     }
 
-    /// Whether any `GOPRIVATE` pattern is declared — gates whether the caller must also
-    /// register the fixed [`GOPRIVATE_CHAIN_KEY`] chain.
+    /// Whether at least one declared `GOPRIVATE` pattern actually compiled into a usable
+    /// matcher — gates whether the caller must also register the fixed
+    /// [`GOPRIVATE_CHAIN_KEY`] chain.
+    ///
+    /// Checks `tokens.is_some()` rather than mere presence in `self.goprivate` (issue #566): a
+    /// pattern rejected by F6's oversized-pattern guard is still stored with `tokens: None`
+    /// (see `GlobPattern::tokens`'s doc) rather than removed, and can never match anything, so
+    /// counting it here would register a [`GOPRIVATE_CHAIN_KEY`] chain nothing can ever route
+    /// to.
     #[must_use]
     pub fn has_goprivate(&self) -> bool {
-        !self.goprivate.is_empty()
+        self.goprivate
+            .iter()
+            .any(|pattern| pattern.tokens.is_some())
     }
 
     /// Every chain this config implies, ready for `GoRegistry::register_chain` — the resolved
-    /// `GOPROXY` chain (if any), plus the fixed [`GOPRIVATE_CHAIN_KEY`] bypass chain when any
-    /// `GOPRIVATE` pattern is declared (registered regardless of whether `GOPROXY` itself is
-    /// also declared — FR-008 applies independently of `GOPROXY`). Empty when `$GOENV`
-    /// declares no override at all (US-005: nothing to register).
+    /// `GOPROXY` chain (if any), plus the fixed [`GOPRIVATE_CHAIN_KEY`] bypass chain when
+    /// [`Self::has_goprivate`] holds (registered regardless of whether `GOPROXY` itself is also
+    /// declared — FR-008 applies independently of `GOPROXY`). Empty when `$GOENV` declares no
+    /// override at all, or when every declared `GOPRIVATE` pattern was rejected (US-005/#566:
+    /// nothing usable to register).
     #[must_use]
     pub fn resolved_chains(&self) -> Vec<GoProxyChain> {
         let mut chains = Vec::new();
@@ -659,6 +682,17 @@ struct RawGoEnv {
     /// output ever leaves this module.
     goproxy: Option<String>,
     goprivate: Option<String>,
+    /// Memoizes [`GlobPattern::new`]'s compilation of `goprivate` (and thus any `tracing::warn!`
+    /// it logs for an oversized pattern) exactly once per distinct `RawGoEnv` instance.
+    ///
+    /// [`GoEnvCache`] hands out the *same* `Arc<RawGoEnv>` for repeat calls against an
+    /// unchanged file (mtime-gated), so `from_raw`'s `get_or_init` on this field runs the
+    /// compile-and-possibly-warn work only on the first call per distinct content — fixing the
+    /// F6 warning firing once per LSP re-parse (`did_change` -> ... -> `from_raw`) instead of
+    /// once per resolved config (issue #565). A freshly-`parse_goenv_raw`'d `RawGoEnv` (e.g.
+    /// from [`GoEnvConfig::parse`], which has no cache) always starts with an empty
+    /// `OnceLock`, so that entry point's behavior — warn on every call — is unchanged.
+    compiled_goprivate: OnceLock<Vec<GlobPattern>>,
 }
 
 /// Parses `$GOENV` file content into its raw `GOPROXY`/`GOPRIVATE` values (FR-001).
@@ -993,6 +1027,49 @@ mod tests {
         );
     }
 
+    /// Issue #565: `from_raw`'s GOPRIVATE compilation (and the F6 oversized-pattern warning it
+    /// triggers) is memoized on the cached `RawGoEnv`, so repeated resolves against unchanged
+    /// `$GOENV` content (e.g. LSP `did_change` re-parsing an unrelated part of `go.mod`) log
+    /// the warning once, not once per resolve.
+    #[test]
+    fn test_goenv_oversized_goprivate_warning_debounced_across_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        let long_pattern = "*".repeat(MAX_GLOB_PATTERN_LENGTH + 1);
+        std::fs::write(&path, format!("GOPRIVATE={long_pattern}\n")).unwrap();
+
+        let cache = GoEnvCache::new();
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            for _ in 0..4 {
+                let _ = resolve_at(&cache, &all_policy(), Some(path.clone()));
+            }
+
+            // A genuine content change (distinguishable mtime) must re-trigger the warning
+            // exactly once more, not once per subsequent resolve — proving the debounce
+            // tracks content freshness rather than suppressing the warning forever.
+            let another_long_pattern = "?".repeat(MAX_GLOB_PATTERN_LENGTH + 1);
+            let future = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+            std::fs::write(&path, format!("GOPRIVATE={another_long_pattern}\n")).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(future)
+                .unwrap();
+
+            for _ in 0..2 {
+                let _ = resolve_at(&cache, &all_policy(), Some(path.clone()));
+            }
+        });
+
+        assert_eq!(
+            log.matches("GOPRIVATE pattern exceeds max length").count(),
+            2,
+            "expected one warning for the original content and one more after a genuine \
+             content change: {log:?}"
+        );
+    }
+
     // --- GoEnvConfig::parse / resolve_source_for (FR-001-FR-009) ---
 
     #[test]
@@ -1236,23 +1313,44 @@ mod tests {
         );
     }
 
-    /// C1 (spec 034 follow-up, issue #559) — **known limitation, pinned deliberately, not a
-    /// desired behavior**: a separator preceding a *dropped* invalid hop is discarded rather
-    /// than carried onto the merged transition between the two surviving hops. Here the
-    /// user's `|` (fall through on any error) before the invalid entry is lost, and the `,`
-    /// (fall through on not-found only) that happened to follow the dropped entry wins
-    /// instead — see `parse_goproxy`'s doc and `docs/ECOSYSTEM_GUIDE.md`'s GOPROXY section.
-    /// Pre-existing since PR #558; fixing the underlying carry-over behavior is out of scope
-    /// for this PR and tracked as a separate follow-up.
+    /// Issue #564 (fixed): a separator preceding a *dropped* invalid hop is merged onto the
+    /// transition between the two surviving hops, with the more permissive separator
+    /// (`AnyError`/`|`) winning rather than being silently discarded. Here the user's `|`
+    /// (fall through on any error) before the invalid entry wins over the `,` (fall through
+    /// on not-found only) that happened to follow the dropped entry — see `parse_goproxy`'s
+    /// doc.
     #[test]
-    fn test_goproxy_separator_before_dropped_hop_is_not_carried_over() {
+    fn test_goproxy_separator_before_dropped_hop_is_merged_most_permissive_wins() {
         let config = GoEnvConfig::parse(
             "GOPROXY=https://a.example|not-a-valid-url,https://c.example",
             &all_policy(),
         );
         let chain = config.goproxy_chain().unwrap();
         assert_eq!(chain.hops.len(), 2);
-        assert_eq!(chain.separators, vec![ChainSeparator::NotFoundOnly]);
+        assert_eq!(chain.separators, vec![ChainSeparator::AnyError]);
+    }
+
+    /// Issue #566: a GOPRIVATE pattern rejected by F6 (oversized) never becomes a usable
+    /// matcher, so `has_goprivate()` must not report `true` for it, and no unreachable
+    /// `GOPRIVATE_CHAIN_KEY` chain should be registered.
+    #[test]
+    fn test_has_goprivate_false_when_all_patterns_rejected() {
+        let long_pattern = "*".repeat(MAX_GLOB_PATTERN_LENGTH + 1);
+        let config = GoEnvConfig::parse(&format!("GOPRIVATE={long_pattern}"), &all_policy());
+        assert!(!config.has_goprivate());
+        assert!(config.resolved_chains().is_empty());
+    }
+
+    /// Issue #566: as long as at least one declared GOPRIVATE pattern compiles into a usable
+    /// matcher, `has_goprivate()` still reports `true` and the bypass chain is still
+    /// registered, even alongside a sibling pattern that was rejected.
+    #[test]
+    fn test_has_goprivate_true_when_at_least_one_pattern_usable() {
+        let long_pattern = "*".repeat(MAX_GLOB_PATTERN_LENGTH + 1);
+        let content = format!("GOPRIVATE={long_pattern},git.mycorp.example/*");
+        let config = GoEnvConfig::parse(&content, &all_policy());
+        assert!(config.has_goprivate());
+        assert_eq!(config.resolved_chains().len(), 1);
     }
 
     // --- redaction (FR-014/NFR-001) ---
