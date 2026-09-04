@@ -99,12 +99,12 @@ a host that classifies as public at parse time (`https://evil.example/`) but
 resolves to a blocked address (an RFC1918/CGNAT range, or one rebound after parse
 time) at actual fetch time.
 
-*Residual risk*: tightening the setting (e.g. `all` -> `public_only`/`off`) only
-gates *future* parses. An alternate-registry client already registered while the
-policy was looser stays reachable after the tightening, because
-`workspace/didChangeConfiguration` does not re-parse already-open documents, so
-the registry client that URL produced is never purged. It goes away only once
-its owning document is next re-parsed (edited, or reopened).
+Tightening the setting (e.g. `all` -> `public_only`/`off`) now takes effect on
+already-open documents immediately: `workspace/didChangeConfiguration` re-parses
+every open document whose ecosystem consults this policy and forces a full
+version refetch, purging any cached version obtained through the now-untrusted
+registry rather than requiring the document to be edited or reopened first
+(issue #592).
 
 **Known limitations**:
 - Editing `.cargo/config.toml` does not take effect until the affected `Cargo.toml`
@@ -574,9 +574,11 @@ now closed, not accepted risk:
 - Editing `NuGet.Config` does not take effect until the affected manifest is
   next reparsed — no dedicated file watcher. A user-profile config created
   after server start is picked up only on restart (discovered once, not
-  re-walked per parse). Flipping `registries.nuget_user_profile_sources` off
-  does not retroactively purge an already-registered `AlternateRegistry`
-  chain either — same non-purge shape, takes effect on next reparse.
+  re-walked per parse). Flipping `registries.nuget_user_profile_sources` via
+  `workspace/didChangeConfiguration`, in contrast, re-parses already-open
+  manifests immediately and purges an already-registered `AlternateRegistry`
+  chain (issue #592) — only a direct `NuGet.Config` file edit still needs a
+  reparse to be picked up.
 - `<packageSourceMapping><clear/>` is not honored — mapping rules only ever
   accumulate across the ancestor chain, never reset, even by a leaf file's own
   `<clear/>` inside that element. Deliberate: undoing the merge-not-nearest-wins
@@ -1189,11 +1191,10 @@ include names is always fetched unauthenticated, subject to the same
 `registries.workspace_registries` `HostClass` policy gate every other ecosystem's
 workspace-declared host goes through.
 
-**Known limitation.** A `workspace/didChangeConfiguration` that changes
-`registries.gitlab_instance_host` does not re-parse a document already open — the
-change takes effect on that document's next edit or reopen (the same limitation
-`registries.workspace_registries` and `registries.nuget_user_profile_sources` already
-have; tracked in [#592](https://github.com/bug-ops/deps-lsp/issues/592)).
+A `workspace/didChangeConfiguration` that changes `registries.gitlab_instance_host`
+re-parses every already-open GitLab CI document immediately, the same as
+`registries.workspace_registries` and `registries.nuget_user_profile_sources`
+(issue #592) — no edit or reopen needed for the new host to take effect.
 
 **Per-document host cap.** At most 8 distinct literal `component:` hosts are resolved
 per document; a further distinct host is logged once and left unresolved — this bounds
