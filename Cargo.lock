@@ -504,6 +504,7 @@ dependencies = [
  "url",
  "urlencoding",
  "yaml-rust2",
+ "zeroize",
 ]
 
 [[package]]
@@ -705,6 +706,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+ "zeroize",
 ]
 
 [[package]]

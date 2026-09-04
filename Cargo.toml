@@ -58,6 +58,7 @@ url = "2.5"
 urlencoding = "2.1"
 yaml-rust2 = "0.12"
 zed_extension_api = "0.7"
+zeroize = "1.9"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

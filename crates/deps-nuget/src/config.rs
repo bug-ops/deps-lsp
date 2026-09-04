@@ -53,6 +53,7 @@ use deps_core::net_policy::{
 use deps_core::parser::DependencySource;
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use zeroize::Zeroizing;
 
 /// Upper bound on the in-repo `NuGet.Config` ancestor walk, matching `deps-npm`'s/
 /// `deps-cargo`'s identical `MAX_CONFIG_ANCESTOR_DEPTH`.
@@ -196,22 +197,37 @@ pub enum ConfigTier {
 /// module's security-model doc) and deliberately does **not** derive `Hash` — making "a
 /// credential value inside a hash key" a compile error rather than a review item
 /// (NFR-001/FR-016). Never stores the username/password separately once constructed.
+///
+/// A thin wrapper over [`deps_core::secret::Redacted`] rather than a bare type alias:
+/// `Debug` prints `NuGetAuth(***)`, not `Redacted(***)`, so a panic message or log line
+/// still names which credential leaked its type.
 #[derive(Clone, PartialEq, Eq)]
-pub struct NuGetAuth(String);
+pub struct NuGetAuth(deps_core::secret::Redacted);
 
 impl NuGetAuth {
     /// Formats `username`/`password` into a `Basic` header value. `pub(crate)`: only
     /// [`resolve_with_context`]'s final C2 pass, gated on [`ConfigTier::UserProfile`], ever constructs one.
+    ///
+    /// Every intermediate (the raw `user:pass` string, and the base64 encoding of it —
+    /// reversible, not encryption) is held in [`Zeroizing`] from the point of construction,
+    /// not just the final header value, so no un-zeroized plaintext copy is left behind.
     pub(crate) fn new(username: &str, password: &str) -> Self {
-        let encoded =
-            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
-        Self(format!("Basic {encoded}"))
+        let mut user_pass =
+            Zeroizing::new(String::with_capacity(username.len() + 1 + password.len()));
+        user_pass.push_str(username);
+        user_pass.push(':');
+        user_pass.push_str(password);
+        let encoded = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(&*user_pass));
+        Self(deps_core::secret::Redacted::new(format!(
+            "Basic {}",
+            *encoded
+        )))
     }
 
     /// The pre-formatted header value. Never logged, printed, or otherwise surfaced — callers
     /// must not pass this to anything but an `Authorization` header.
     pub(crate) fn header_value(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
@@ -230,12 +246,19 @@ impl std::fmt::Display for NuGetAuth {
 /// A `<packageSourceCredentials>` `Username`/`ClearTextPassword` literal, held **pre-%ENV_VAR%-
 /// expansion** (issue #561, FR-002) — redacted everywhere except [`resolve_with_context`]'s final pass,
 /// which expands and consumes it into a [`NuGetAuth`].
+///
+/// A thin wrapper over [`deps_core::secret::Redacted`] rather than a bare type alias:
+/// `Debug` prints `RedactedSecret(***)`, not `Redacted(***)`.
 #[derive(Clone, PartialEq, Eq)]
-struct RedactedSecret(String);
+struct RedactedSecret(deps_core::secret::Redacted);
 
 impl RedactedSecret {
+    fn new(value: String) -> Self {
+        Self(deps_core::secret::Redacted::new(value))
+    }
+
     fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
@@ -885,10 +908,10 @@ fn parse_nuget_config_raw(content: &str) -> RawNuGetConfigFile {
                         if let Some(cred) = out.credentials.last_mut() {
                             match attr_key.as_str() {
                                 "Username" => {
-                                    cred.username = Some(RedactedSecret(attr_value));
+                                    cred.username = Some(RedactedSecret::new(attr_value));
                                 }
                                 "ClearTextPassword" => {
-                                    cred.password = Some(RedactedSecret(attr_value));
+                                    cred.password = Some(RedactedSecret::new(attr_value));
                                 }
                                 "Password" => cred.encrypted = true,
                                 _ => {}
@@ -1486,8 +1509,11 @@ fn expand_credential(credential: &RawCredential) -> Result<NuGetAuth, NuGetFeedU
 /// variable being unset fails the *whole* expansion closed (FR-002) — never a partial
 /// substitution. `%` sequences that don't form a well-formed `%NAME%` reference (empty name, a
 /// non-alphanumeric/underscore character, or an unterminated `%`) are left as literal text.
-fn expand_env_vars(raw: &str) -> Result<String, NuGetFeedUrlError> {
-    expand_env_vars_with(raw, |name| std::env::var(name).ok())
+///
+/// Returns [`Zeroizing`], not a bare `String` — the caller (`expand_credential`) only ever
+/// expands a secret (`RedactedSecret` username/password), never an ordinary value.
+fn expand_env_vars(raw: &str) -> Result<Zeroizing<String>, NuGetFeedUrlError> {
+    expand_env_vars_with(raw, |name| std::env::var(name).ok().map(Zeroizing::new))
 }
 
 /// [`expand_env_vars`], but reading variables through `lookup` instead of [`std::env::var`]
@@ -1495,27 +1521,61 @@ fn expand_env_vars(raw: &str) -> Result<String, NuGetFeedUrlError> {
 /// environment (this workspace forbids `unsafe`, and Rust 2024 made `std::env::set_var` an
 /// `unsafe fn`, so a test cannot do that mutation at all; mirrors
 /// `deps_npm::config::expand_env_vars_with`'s identical rationale).
+///
+/// Scans `raw` (and each looked-up value) by `&str` slice, never collecting the secret into
+/// an intermediate `Vec<char>` copy, and precomputes the exact output length from the
+/// resolved segments before allocating — so the returned [`Zeroizing`] buffer is never grown
+/// past its initial capacity. `zeroize`'s own docs note it cannot guarantee a `Vec`/`String`
+/// reallocation didn't leave a stale copy on the heap; sizing exactly once, up front, is what
+/// avoids that reallocation in the first place, rather than merely zeroizing after the fact.
 fn expand_env_vars_with(
     raw: &str,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Result<String, NuGetFeedUrlError> {
-    let chars: Vec<char> = raw.chars().collect();
-    let mut out = String::with_capacity(raw.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '%'
-            && let Some(end) = chars[i + 1..].iter().position(|&c| c == '%')
-        {
-            let name: String = chars[i + 1..i + 1 + end].iter().collect();
+    lookup: impl Fn(&str) -> Option<Zeroizing<String>>,
+) -> Result<Zeroizing<String>, NuGetFeedUrlError> {
+    enum Segment<'a> {
+        Literal(&'a str),
+        Value(Zeroizing<String>),
+    }
+
+    let mut segments = Vec::new();
+    let mut rest = raw;
+    while let Some(pct) = rest.find('%') {
+        let literal = &rest[..pct];
+        let after = &rest[pct + 1..];
+        if let Some(end) = after.find('%') {
+            let name = &after[..end];
             if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                let value = lookup(&name).ok_or(NuGetFeedUrlError::HasCredentials)?;
-                out.push_str(&value);
-                i += end + 2;
+                if !literal.is_empty() {
+                    segments.push(Segment::Literal(literal));
+                }
+                let value = lookup(name).ok_or(NuGetFeedUrlError::HasCredentials)?;
+                segments.push(Segment::Value(value));
+                rest = &after[end + 1..];
                 continue;
             }
         }
-        out.push(chars[i]);
-        i += 1;
+        // Not a well-formed `%NAME%` reference: keep everything up to and including this
+        // `%` as literal text, then keep scanning from just past it.
+        segments.push(Segment::Literal(&rest[..=pct]));
+        rest = &rest[pct + 1..];
+    }
+    if !rest.is_empty() {
+        segments.push(Segment::Literal(rest));
+    }
+
+    let total_len: usize = segments
+        .iter()
+        .map(|segment| match segment {
+            Segment::Literal(s) => s.len(),
+            Segment::Value(v) => v.len(),
+        })
+        .sum();
+    let mut out = Zeroizing::new(String::with_capacity(total_len));
+    for segment in &segments {
+        match segment {
+            Segment::Literal(s) => out.push_str(s),
+            Segment::Value(v) => out.push_str(v.as_str()),
+        }
     }
     Ok(out)
 }
@@ -2670,12 +2730,53 @@ mod tests {
     #[test]
     fn test_env_var_expansion_set_and_unset() {
         let set = expand_env_vars_with("%CORP_FEED_PAT%", |name| {
-            (name == "CORP_FEED_PAT").then(|| "secret-pat".to_string())
+            (name == "CORP_FEED_PAT").then(|| Zeroizing::new("secret-pat".to_string()))
         });
-        assert_eq!(set.unwrap(), "secret-pat");
+        assert_eq!(set.unwrap().as_str(), "secret-pat");
 
         let unset = expand_env_vars_with("%CORP_FEED_PAT%", |_| None);
         assert!(matches!(unset, Err(NuGetFeedUrlError::HasCredentials)));
+    }
+
+    /// Regression coverage for the `&str`-slice rewrite of `expand_env_vars_with` (it no
+    /// longer collects `raw` into an intermediate `Vec<char>`): surrounding literal text,
+    /// back-to-back substitutions with no literal between them, a malformed name (non
+    /// alphanumeric/underscore character) left as literal text, and an unterminated `%` at
+    /// end-of-string left as literal text — all must behave exactly as the prior
+    /// char-by-char scan did.
+    #[test]
+    fn test_env_var_expansion_edge_cases() {
+        let lookup = |name: &str| match name {
+            "A" => Some(Zeroizing::new("1".to_string())),
+            "B" => Some(Zeroizing::new("2".to_string())),
+            _ => None,
+        };
+
+        assert_eq!(
+            expand_env_vars_with("pre-%A%-post", lookup)
+                .unwrap()
+                .as_str(),
+            "pre-1-post"
+        );
+        assert_eq!(
+            expand_env_vars_with("%A%%B%", lookup).unwrap().as_str(),
+            "12"
+        );
+        assert_eq!(
+            expand_env_vars_with("abc%1bad!name%def", lookup)
+                .unwrap()
+                .as_str(),
+            "abc%1bad!name%def"
+        );
+        assert_eq!(
+            expand_env_vars_with("abc%A", lookup).unwrap().as_str(),
+            "abc%A"
+        );
+        assert_eq!(expand_env_vars_with("%%", lookup).unwrap().as_str(), "%%");
+        assert!(matches!(
+            expand_env_vars_with("pre-%UNSET%-post", lookup),
+            Err(NuGetFeedUrlError::HasCredentials)
+        ));
     }
 
     /// SC-002 end-to-end: the same expansion wired through `resolve`'s credential-binding
@@ -2686,7 +2787,7 @@ mod tests {
     fn test_expand_credential_missing_password_fails_closed() {
         let credential = RawCredential {
             key: "CorpFeed".to_string(),
-            username: Some(RedactedSecret("user".to_string())),
+            username: Some(RedactedSecret::new("user".to_string())),
             password: None,
             encrypted: false,
         };
@@ -2705,7 +2806,7 @@ mod tests {
         assert!(!format!("{auth:?}").contains("super-secret-pat"));
         assert!(!format!("{auth}").contains("super-secret-pat"));
 
-        let secret = RedactedSecret("super-secret-pat".to_string());
+        let secret = RedactedSecret::new("super-secret-pat".to_string());
         assert!(!format!("{secret:?}").contains("super-secret-pat"));
         assert!(!format!("{secret}").contains("super-secret-pat"));
     }
@@ -2759,7 +2860,7 @@ mod tests {
     fn test_expand_credential_encrypted_password_is_distinct_reason() {
         let credential = RawCredential {
             key: "CorpFeed".to_string(),
-            username: Some(RedactedSecret("user".to_string())),
+            username: Some(RedactedSecret::new("user".to_string())),
             password: None,
             encrypted: true,
         };
