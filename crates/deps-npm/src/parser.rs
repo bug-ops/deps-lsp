@@ -901,9 +901,8 @@ mod tests {
         let uri: Uri = "untitled:package.json"
             .parse()
             .expect("untitled: must still parse as a valid Uri");
-        assert_eq!(
-            uri.to_file_path().as_deref(),
-            Some(std::path::Path::new("package.json")),
+        assert!(
+            uri.to_file_path().is_some_and(|p| p.is_relative()),
             "test premise: to_file_path resolves this to a relative path, not None"
         );
 
@@ -1010,7 +1009,7 @@ mod tests {
     fn test_parse_with_context_no_catalog_dependency_skips_workspace_lookup() {
         // FR-008/NFR-002: no `catalog:`-prefixed value anywhere in the manifest, so the
         // gate never fires — a bogus/nonexistent workspace path must not affect the result.
-        let uri = Uri::from_file_path("/nonexistent/path/package.json").unwrap();
+        let uri = deps_core::test_util::test_uri("/nonexistent/path/package.json");
         let json = r#"{"dependencies": {"express": "^4.18.2"}}"#;
         let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
 
