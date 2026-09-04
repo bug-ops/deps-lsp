@@ -49,24 +49,25 @@ use deps_core::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 /// formats it into an `Authorization` header.
 ///
 /// Constructible only from within this module (see the module-level security-model docs) —
-/// no other code path in this crate has the means to produce one. `Debug`/`Display` are
-/// hand-implemented to redact the value so it cannot leak via a log line, a panic message,
-/// or an error's `Display` output.
+/// no other code path in this crate has the means to produce one. A thin wrapper over
+/// [`deps_core::secret::Redacted`] rather than a bare type alias: `Debug` prints
+/// `AuthToken(***)`, not `Redacted(***)`, so a panic message or log line still names which
+/// credential leaked its type.
 #[derive(Clone, PartialEq, Eq)]
-pub struct AuthToken(String);
+pub struct AuthToken(deps_core::secret::Redacted);
 
 impl AuthToken {
     /// Wraps `token`. Kept `pub(crate)` rather than `pub`: the module-level security-model
     /// docs above are the enforcement, and widening this to `pub` would let any other crate
     /// construct one with no [`Provenance`]/[`IndexTrust`] to account for at all.
     pub(crate) fn new(token: String) -> Self {
-        Self(token)
+        Self(deps_core::secret::Redacted::new(token))
     }
 
     /// The raw token value, for building an `Authorization` header. Never logged, printed,
     /// or otherwise surfaced — callers must not pass this to anything but a header value.
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 

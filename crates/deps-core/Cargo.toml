@@ -47,6 +47,7 @@ tracing-subscriber = { workspace = true, optional = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 yaml-rust2 = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }

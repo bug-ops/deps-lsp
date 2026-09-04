@@ -137,17 +137,22 @@ pub fn github_rate_limit_error() -> DepsError {
 /// A `GITHUB_TOKEN` bearer-header value, redacted everywhere except the one call site
 /// ([`GithubTagsClient::headers`]) that hands it to a request as a header value.
 ///
-/// `Debug`/`Display` are hand-implemented to redact the value so it cannot leak via a log
-/// line, a panic message, or a future `#[derive(Debug)]` added to [`GithubTagsClient`] or a
-/// struct embedding it — mirrors `deps_cargo::config::AuthToken`.
+/// A thin wrapper over [`crate::secret::Redacted`] rather than a bare type alias: `Debug`
+/// prints `AuthToken(***)`, not `Redacted(***)`, so a panic message or log line still names
+/// which credential leaked its type — mirrors `deps_cargo::config::AuthToken`.
 #[derive(Clone, PartialEq, Eq)]
-struct AuthToken(String);
+struct AuthToken(crate::secret::Redacted);
 
 impl AuthToken {
+    /// Wraps `value`.
+    fn new(value: String) -> Self {
+        Self(crate::secret::Redacted::new(value))
+    }
+
     /// The raw header value, for attaching to a request. Never logged, printed, or
     /// otherwise surfaced — callers must not pass this to anything but a header value.
     fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
@@ -197,12 +202,15 @@ impl GithubTagsClient {
     /// ```
     #[must_use]
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        let token = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty());
+        let token = std::env::var("GITHUB_TOKEN")
+            .ok()
+            .map(zeroize::Zeroizing::new)
+            .filter(|t| !t.is_empty());
         let has_token = token.is_some();
         let auth_headers = token
             .map(|token| {
                 tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
-                vec![(AUTHORIZATION, AuthToken(format!("Bearer {token}")))]
+                vec![(AUTHORIZATION, AuthToken::new(format!("Bearer {}", *token)))]
             })
             .unwrap_or_default();
 
@@ -225,7 +233,10 @@ impl GithubTagsClient {
     #[must_use]
     pub fn for_test(cache: Arc<HttpCache>, api_base: impl Into<String>, has_token: bool) -> Self {
         let auth_headers = if has_token {
-            vec![(AUTHORIZATION, AuthToken("Bearer test-token".to_string()))]
+            vec![(
+                AUTHORIZATION,
+                AuthToken::new("Bearer test-token".to_string()),
+            )]
         } else {
             Vec::new()
         };
@@ -1123,13 +1134,13 @@ mod tests {
 
     #[test]
     fn test_auth_token_debug_redacts_value() {
-        let token = AuthToken("Bearer super-secret-value".to_string());
+        let token = AuthToken::new("Bearer super-secret-value".to_string());
         assert_eq!(format!("{token:?}"), "AuthToken(***)");
     }
 
     #[test]
     fn test_auth_token_display_redacts_value() {
-        let token = AuthToken("Bearer super-secret-value".to_string());
+        let token = AuthToken::new("Bearer super-secret-value".to_string());
         assert_eq!(format!("{token}"), "***");
     }
 
@@ -1139,7 +1150,7 @@ mod tests {
         // embedding it) accidentally printing a raw `GITHUB_TOKEN` value: exercises the
         // exact shape `GithubTagsClient::auth_headers` stores, `Vec<(HeaderName,
         // AuthToken)>`, not just a bare `AuthToken`.
-        let token = AuthToken("Bearer super-secret-value".to_string());
+        let token = AuthToken::new("Bearer super-secret-value".to_string());
         let headers = vec![(AUTHORIZATION, token)];
         let debug_output = format!("{headers:?}");
         assert!(
