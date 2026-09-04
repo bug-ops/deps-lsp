@@ -66,8 +66,8 @@ impl AuthToken {
 
     /// The raw token value, for building an `Authorization` header. Never logged, printed,
     /// or otherwise surfaced — callers must not pass this to anything but a header value.
-    pub(crate) fn as_str(&self) -> &str {
-        self.0.as_str()
+    pub(crate) fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
     }
 }
 
@@ -1276,7 +1276,7 @@ token = "secret-token"
         let result = parse_cargo_home_registries_raw(content);
         let (raw_index, token) = result.get("my-corp").unwrap();
         assert_eq!(raw_index, "sparse+https://index.mycorp.dev");
-        assert_eq!(token.as_ref().unwrap().as_str(), "secret-token");
+        assert_eq!(token.as_ref().unwrap().expose_secret(), "secret-token");
     }
 
     #[test]
@@ -1379,7 +1379,7 @@ token = "secret-token"
         assert_eq!(entry.index.as_str(), "https://real.example/");
         assert_eq!(entry.provenance, Provenance::CargoHome);
         assert_eq!(
-            entry.auth.as_ref().map(AuthToken::as_str),
+            entry.auth.as_ref().map(AuthToken::expose_secret),
             Some("real-token"),
             "the CARGO_HOME token must not be lost just because the project lives \
              under $HOME"
@@ -1408,7 +1408,7 @@ token = "secret-token"
 
         let entry = config.get("my-corp").unwrap();
         assert_eq!(entry.index.as_str(), "https://real.example/");
-        assert_eq!(entry.auth.as_ref().unwrap().as_str(), "real-token");
+        assert_eq!(entry.auth.as_ref().unwrap().expose_secret(), "real-token");
         assert_eq!(entry.provenance, Provenance::CargoHome);
     }
 
@@ -1437,7 +1437,7 @@ token = "secret-token"
         let (config, _) = resolve_with_env(&aliases, &[], None, &cache, &policy, &env);
         let entry = config.get("env-only-corp").unwrap();
         assert_eq!(entry.index.as_str(), "https://env.example/");
-        assert_eq!(entry.auth.as_ref().unwrap().as_str(), "env-token");
+        assert_eq!(entry.auth.as_ref().unwrap().expose_secret(), "env-token");
         assert_eq!(entry.provenance, Provenance::CargoHome);
     }
 
@@ -1972,7 +1972,10 @@ token = "secret-token"
 
         match replacement {
             SourceReplacement::SparseMirror { auth, .. } => {
-                assert_eq!(auth.as_ref().map(AuthToken::as_str), Some("real-token"));
+                assert_eq!(
+                    auth.as_ref().map(AuthToken::expose_secret),
+                    Some("real-token")
+                );
             }
             SourceReplacement::None => panic!("expected the fully-trusted chain to resolve"),
         }

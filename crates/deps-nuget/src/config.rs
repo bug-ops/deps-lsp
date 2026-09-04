@@ -231,7 +231,7 @@ impl NuGetAuth {
     /// The pre-formatted header value. Never logged, printed, or otherwise surfaced — callers
     /// must not pass this to anything but an `Authorization` header.
     pub(crate) fn header_value(&self) -> &str {
-        self.0.as_str()
+        self.0.expose_secret()
     }
 }
 
@@ -272,8 +272,8 @@ impl RedactedSecret {
         Self(deps_core::secret::Redacted::new(value))
     }
 
-    fn as_str(&self) -> &str {
-        self.0.as_str()
+    fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
     }
 }
 
@@ -1736,10 +1736,10 @@ fn expand_credential(credential: &RawCredential) -> Result<NuGetAuth, NuGetFeedU
     let username = credential
         .username
         .as_ref()
-        .map(RedactedSecret::as_str)
+        .map(RedactedSecret::expose_secret)
         .unwrap_or("");
     let username = expand_env_vars(username)?;
-    let password = expand_env_vars(password.as_str())?;
+    let password = expand_env_vars(password.expose_secret())?;
     Ok(NuGetAuth::new(&username, &password))
 }
 
