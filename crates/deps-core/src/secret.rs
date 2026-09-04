@@ -76,6 +76,17 @@ impl<T: Zeroize + PartialEq> PartialEq for Redacted<T> {
 
 impl<T: Zeroize + Eq> Eq for Redacted<T> {}
 
+/// Hashes the wrapped value, not the redaction wrapper — so `Redacted<T>` can be used as (or
+/// inside) a hash-map/set key exactly when `T` itself could be. Opt-in via `T: Hash`, same
+/// shape as the `PartialEq`/`Eq` impls above: a caller that needs this must ask for it by
+/// bounding on `Hash`, so embedding a secret in a hash key stays a deliberate choice at each
+/// call site rather than something a blanket impl would make automatic.
+impl<T: Zeroize + std::hash::Hash> std::hash::Hash for Redacted<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (*self.0).hash(state);
+    }
+}
+
 /// Marker confirming [`Redacted<T>`] zeroizes its backing memory on drop — the actual
 /// zeroing is performed by the wrapped [`Zeroizing<T>`] field's own [`Drop`] impl.
 impl<T: Zeroize> zeroize::ZeroizeOnDrop for Redacted<T> {}

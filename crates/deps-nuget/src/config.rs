@@ -180,7 +180,7 @@ impl std::fmt::Display for NuGetFeedUrl {
 /// is **not** consulted by the credential-binding logic in [`resolve_with_context`] (see that function's
 /// docs, §C2) — only by the [`resolve_with_context`] accumulation loop's own gate (which contribution half
 /// applies) and by `tracing::debug!` output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigTier {
     /// A user-profile-tier `NuGet.Config` (issue #561, FR-001) — not something a cloned
     /// repository controls.
@@ -194,9 +194,13 @@ pub enum ConfigTier {
 ///
 /// Redacted everywhere except the one call site (`crate::registry::NuGetRegistry::fetch`) that
 /// reads it into a request header. Constructible only from within this crate (see this
-/// module's security-model doc) and deliberately does **not** derive `Hash` — making "a
-/// credential value inside a hash key" a compile error rather than a review item
-/// (NFR-001/FR-016). Never stores the username/password separately once constructed.
+/// module's security-model doc) and deliberately does **not** derive `Hash` — making "a fully
+/// expanded, ready-to-send `Authorization` credential inside a hash key" a compile error rather
+/// than a review item for *this type specifically* (NFR-001/FR-016), not a blanket
+/// no-credential-derives-`Hash` rule for the module — see this module's private
+/// `RedactedSecret` type's own `Hash` derive for the (deliberately different, and
+/// narrower-risk) case that one exists for. Never stores the username/password separately once
+/// constructed.
 ///
 /// A thin wrapper over [`deps_core::secret::Redacted`] rather than a bare type alias:
 /// `Debug` prints `NuGetAuth(***)`, not `Redacted(***)`, so a panic message or log line
@@ -247,9 +251,20 @@ impl std::fmt::Display for NuGetAuth {
 /// expansion** (issue #561, FR-002) — redacted everywhere except [`resolve_with_context`]'s final pass,
 /// which expands and consumes it into a [`NuGetAuth`].
 ///
+/// Unlike [`NuGetAuth`] (which deliberately does not derive `Hash`, see its doc), this type
+/// does — exempt from that concern because its only `Hash` use is
+/// `resolve_with_context`'s `config_fingerprint` (via `RawCredential`/`RawNuGetConfigFile`),
+/// a process-local `u64` debounce key for [`fail_closed`]'s warning dedup. That key is never
+/// logged, serialized, sent over the wire, or compared across processes — only inserted into an
+/// in-memory `DashSet` for the lifetime of one server run — so hashing a still-unexpanded,
+/// pre-`%ENV_VAR%` literal into it carries none of the "credential reaches a place it
+/// shouldn't" risk the `NuGetAuth` restriction guards against.
+///
 /// A thin wrapper over [`deps_core::secret::Redacted`] rather than a bare type alias:
-/// `Debug` prints `RedactedSecret(***)`, not `Redacted(***)`.
-#[derive(Clone, PartialEq, Eq)]
+/// `Debug` prints `RedactedSecret(***)`, not `Redacted(***)`. `Redacted<T>`'s own `Hash` impl
+/// (opt-in via `T: Hash`) is what makes the derive below possible without reaching around the
+/// wrapper's redaction/zeroize guarantees.
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct RedactedSecret(deps_core::secret::Redacted);
 
 impl RedactedSecret {
@@ -732,7 +747,7 @@ fn no_source(package: &PackageName) -> DependencySource {
 }
 
 /// One `<add key="..." value="..." protocolVersion="...">` entry, unvalidated.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Hash)]
 struct RawSourceAdd {
     key: String,
     value: String,
@@ -742,7 +757,7 @@ struct RawSourceAdd {
 /// One `<packageSourceCredentials>` child element's raw, pre-expansion credential values
 /// (issue #561, FR-002) — parsed unconditionally (parsing is tier-blind and memoized), but only
 /// ever read by [`resolve_with_context`]'s final pass when the owning file is [`ConfigTier::UserProfile`].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Hash)]
 struct RawCredential {
     /// The credential element's raw (undecoded) name — a source key, compared via
     /// [`key_candidates_overlap`] like every other source key in this module.
@@ -756,7 +771,15 @@ struct RawCredential {
 }
 
 /// One `NuGet.Config` file's raw, unvalidated, un-cross-referenced contents.
-#[derive(Debug, Default, Clone)]
+///
+/// Derives `Hash` (C1 fix, impl-critic follow-up on issue #576's logging) so
+/// `resolve_with_context`'s `config_fingerprint` can hash the parsed *content* of every
+/// ancestor file directly (`Arc<T>`'s `Hash` impl forwards to `T`, not the pointer) rather than
+/// each file's `Arc` pointer address — the latter is vulnerable to allocator address reuse:
+/// once an ancestor's cached `Arc` is dropped (replaced on a genuine mtime change in
+/// `MtimeFileCache`), a later, *differently-content* `Arc` can be allocated at the exact same
+/// address, silently colliding two distinct config states onto one fingerprint.
+#[derive(Debug, Default, Clone, Hash)]
 struct RawNuGetConfigFile {
     sources_cleared: bool,
     sources: Vec<RawSourceAdd>,
@@ -1061,8 +1084,35 @@ fn upsert_source(
 /// entries — URL validation and policy gating re-run per parse against these cached entries,
 /// so a `didChangeConfiguration` policy change takes effect immediately with no cache
 /// invalidation of its own.
+/// Caps [`NuGetConfigCache::warned`] — unlike `files` (evicted per-path by
+/// [`deps_core::MtimeFileCache`]'s own capacity), nothing here ever removes an individual
+/// entry, since a `(config state, source, reason)` triple isn't tied to a single path that
+/// could later get its own eviction hook. Reusing `DEFAULT_MAX_CACHED_FILES` as the bound keeps
+/// the two caches' working-set sizes comparable without inventing a second tuning knob.
+const WARNED_CAPACITY: usize = deps_core::DEFAULT_MAX_CACHED_FILES;
+
 #[derive(Debug)]
-pub struct NuGetConfigCache(deps_core::MtimeFileCache<RawNuGetConfigFile>);
+pub struct NuGetConfigCache {
+    files: deps_core::MtimeFileCache<RawNuGetConfigFile>,
+    /// Dedups the fail-closed credential-binding warning (impl-critic S2 follow-up, issue
+    /// #576) to once per distinct config state. Keyed on a hash combining
+    /// `resolve_with_context`'s content-derived `config_fingerprint` (see
+    /// [`RawNuGetConfigFile`]'s doc) with the source key and
+    /// [`FailClosedCause`]/[`NuGetFeedUrlError`] discriminants — see `fail_closed`'s doc.
+    ///
+    /// Capped at [`WARNED_CAPACITY`] (impl-critic C1 follow-up): this set has no natural upper
+    /// bound the way `files` does (one entry per path), since it grows one entry per distinct
+    /// `(config state, source, reason)` triple ever observed, which for a long-lived server
+    /// process is unbounded in principle. On overflow the whole set is cleared rather than
+    /// LRU-evicted — simpler, and the only visible cost is a handful of warnings re-firing once
+    /// after the clear, an acceptable tradeoff for a diagnostic-only signal.
+    ///
+    /// Deliberate, documented consequence of "once per distinct state" (impl-critic M2 note):
+    /// reverting a config from X to Y and back to X does not re-warn on the revert to X, since
+    /// that exact state was already seen and its hash is still in this set — only ever seeing
+    /// a *new* state re-warns, not returning to an old one.
+    warned: dashmap::DashSet<u64>,
+}
 
 impl Default for NuGetConfigCache {
     fn default() -> Self {
@@ -1074,14 +1124,26 @@ impl NuGetConfigCache {
     /// Creates an empty cache.
     #[must_use]
     pub fn new() -> Self {
-        Self(deps_core::MtimeFileCache::new(
-            deps_core::DEFAULT_MAX_CACHED_FILES,
-            "nuget config",
-        ))
+        Self {
+            files: deps_core::MtimeFileCache::new(
+                deps_core::DEFAULT_MAX_CACHED_FILES,
+                "nuget config",
+            ),
+            warned: dashmap::DashSet::new(),
+        }
     }
 
     fn get_or_parse(&self, path: &Path) -> Option<Arc<RawNuGetConfigFile>> {
-        self.0.get_or_parse(path, parse_nuget_config_raw)
+        self.files.get_or_parse(path, parse_nuget_config_raw)
+    }
+
+    /// Returns `true` the first time `key` is seen, `false` on every repeat — see
+    /// [`Self::warned`]'s doc for the capacity/eviction policy.
+    fn should_warn_once(&self, key: u64) -> bool {
+        if self.warned.len() >= WARNED_CAPACITY && !self.warned.contains(&key) {
+            self.warned.clear();
+        }
+        self.warned.insert(key)
     }
 }
 
@@ -1277,6 +1339,25 @@ pub fn resolve_with_context(
     let user_profile_sources_enabled =
         user_profile_sources.load(std::sync::atomic::Ordering::Relaxed);
 
+    // S2 fix (impl-critic, issue #576 follow-up): identity of the exact config state this
+    // resolve is built from, derived from *content* rather than `Arc` pointer address (C1 fix,
+    // impl-critic follow-up — pointer identity collides once an old `Arc` is dropped and a
+    // later, differently-content `Arc` is allocated at the same freed address; see
+    // `RawNuGetConfigFile`'s doc). `Arc<T>`'s own `Hash` impl already forwards to `T`'s `Hash`
+    // rather than hashing the pointer, so this is stable across repeat calls that hit
+    // `config_cache` for every ancestor (same content, same hash) and changes the instant any
+    // ancestor's parsed content actually differs. Lets `fail_closed` below debounce its warning
+    // to once per distinct config state instead of once per resolve call (this pass isn't
+    // itself cached, unlike the per-file raw parse).
+    let config_fingerprint = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (tier, file) in &ancestors {
+            tier.hash(&mut hasher);
+            file.hash(&mut hasher);
+        }
+        hasher.finish()
+    };
+
     let mut sources: Vec<PackageSourceEntry> = Vec::new();
     let mut cleared = false;
     let mut nuget_org_removed = false;
@@ -1387,11 +1468,23 @@ pub fn resolve_with_context(
         // `<packageSourceCredentials>` still fails closed, exactly as it did before this
         // feature).
         if is_repo_credentialed {
-            fail_closed(entry, NuGetFeedUrlError::HasCredentials);
+            fail_closed(
+                entry,
+                NuGetFeedUrlError::HasCredentials,
+                FailClosedCause::RepoTierCredentialed,
+                config_cache,
+                config_fingerprint,
+            );
             continue;
         }
         if is_disabled {
-            fail_closed(entry, NuGetFeedUrlError::Disabled);
+            fail_closed(
+                entry,
+                NuGetFeedUrlError::Disabled,
+                FailClosedCause::MachineDisabled,
+                config_cache,
+                config_fingerprint,
+            );
             continue;
         }
         // FR-008: the public-index carve-out — a user-profile-derived credentialed-key match
@@ -1408,9 +1501,17 @@ pub fn resolve_with_context(
             &resolved_url,
         ) {
             Some(Ok(auth)) => entry.auth = Some(auth),
-            Some(Err(reason)) => fail_closed(entry, reason),
+            Some(Err((reason, cause))) => {
+                fail_closed(entry, reason, cause, config_cache, config_fingerprint);
+            }
             None if is_user_credentialed => {
-                fail_closed(entry, NuGetFeedUrlError::HasCredentials);
+                fail_closed(
+                    entry,
+                    NuGetFeedUrlError::HasCredentials,
+                    FailClosedCause::AmbiguousCredentialKeyMatch,
+                    config_cache,
+                    config_fingerprint,
+                );
             }
             None => {}
         }
@@ -1424,29 +1525,125 @@ pub fn resolve_with_context(
     }
 }
 
+/// Why a source failed closed during the C2 credential-binding pass — logging-only detail,
+/// deliberately separate from [`NuGetFeedUrlError`] (issue #576 S1 follow-up, impl-critic).
+///
+/// Several structurally different C2 sub-conditions all resolve to the same
+/// [`NuGetFeedUrlError::HasCredentials`] reason (by design — it stays the single, hover/
+/// diagnostic-safe, user-facing error), so logging `reason` alone makes issue #576's own repro
+/// (a user-profile `<packageSourceCredentials>` entry with no matching same-file
+/// `<packageSources><add>`, condition (2)) byte-identical in the log to an unrelated cause like
+/// a plain repo-tier `<packageSourceCredentials>` declaration. This enum exists only to break
+/// that tie in `fail_closed`'s log line.
+#[derive(Debug, Clone, Copy, Hash)]
+enum FailClosedCause {
+    /// FR-004: the source itself is named under a repo-tier `<packageSourceCredentials>`.
+    RepoTierCredentialed,
+    /// FR-004: the source is named in `<disabledPackageSources>` with a `true` value —
+    /// intentional, expected configuration, not a misconfiguration (see `fail_closed`'s level
+    /// choice for this cause).
+    MachineDisabled,
+    /// C2 condition (0): a user-profile credential's key overlaps a key the user profile
+    /// itself suppresses via `<disabledPackageSources>`.
+    UserProfileSuppressed,
+    /// C2 condition (2): the credential's own key does not resolve to exactly one
+    /// `user_profile_add` entry (zero or ambiguous matches) — issue #576's own repro shape.
+    NoMatchingUserProfileAdd,
+    /// C2 condition (2): the one matched `user_profile_add` entry's own value failed URL
+    /// validation, so there is no URL to compare under condition (3).
+    UserProfileAddEntryInvalid,
+    /// C2 condition (3): the matched `user_profile_add` entry's URL does not equal the
+    /// resolved entry's URL (not origin equality — see `bind_user_profile_credential`'s doc).
+    UserProfileUrlMismatch,
+    /// Condition (1)'s `unique_overlap` found more than one user-profile credential whose key
+    /// overlaps `entry.key` (M2 fix, impl-critic: this is only ever reached via the
+    /// `is_user_credentialed` guard at this cause's one call site, which already establishes at
+    /// least one raw-declared credential key overlaps `entry.key` — so a `None` here can only
+    /// mean *ambiguous*, never *zero*, and this variant is named accordingly, not shared with a
+    /// zero-match case).
+    AmbiguousCredentialKeyMatch,
+    /// The matched credential itself failed to expand (missing `ClearTextPassword`, an unset
+    /// `%ENV_VAR%` reference, or a DPAPI-encrypted `<Password>` — the last of which
+    /// `expand_credential` already logs itself; see `fail_closed`'s double-log guard).
+    CredentialExpansionFailed,
+}
+
 /// Overwrites `entry.value` with `Err(InvalidEntry { reason, .. })`, preserving whatever raw
 /// text was already resolvable (the URL if valid, or the prior `InvalidEntry::raw` if not).
-fn fail_closed(entry: &mut PackageSourceEntry, reason: NuGetFeedUrlError) {
+///
+/// Issue #576: this is the C2 credential-binding pass's own fail-closed path — unlike
+/// `resolve_source_entry`'s URL-validation failures (which already `tracing::warn!`), this path
+/// previously dropped a source from resolution with zero log output at any level, making a
+/// misconfigured `<packageSourceCredentials>` binding indistinguishable from "package simply has
+/// no versions" in the logs.
+///
+/// Severity mirrors `resolve_source_entry`'s existing debug!/warn! split (impl-critic S3 follow-
+/// up), not a blanket `warn!`: [`NuGetFeedUrlError::Disabled`] is an intentional, expected
+/// config state (analogous to a `protocolVersion="2"` or local-feed source there), so it logs
+/// at `debug!`; every other reason is a genuine, actionable misconfiguration and logs at
+/// `warn!`. [`NuGetFeedUrlError::EncryptedPasswordUnsupported`] logs nothing here at all —
+/// `expand_credential` already emits its own `debug!` for that case, and warning again here
+/// would double-log the identical event.
+///
+/// Debounced via `config_cache`'s dedup set (impl-critic S2 follow-up): without this, the
+/// warning would re-fire on every `resolve_with_context` call (e.g. every LSP `did_change`
+/// re-parse) even when the underlying config chain hasn't changed at all, unlike every other
+/// warning in this module (naturally debounced by `MtimeFileCache` only re-parsing, and thus
+/// only re-logging, on a genuine mtime change).
+fn fail_closed(
+    entry: &mut PackageSourceEntry,
+    reason: NuGetFeedUrlError,
+    cause: FailClosedCause,
+    config_cache: &NuGetConfigCache,
+    config_fingerprint: u64,
+) {
     let raw = match &entry.value {
         Ok(url) => url.as_str().to_string(),
         Err(invalid) => invalid.raw.clone(),
     };
+
+    if !matches!(reason, NuGetFeedUrlError::EncryptedPasswordUnsupported) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        config_fingerprint.hash(&mut hasher);
+        entry.key.hash(&mut hasher);
+        cause.hash(&mut hasher);
+        std::mem::discriminant(&reason).hash(&mut hasher);
+        if config_cache.should_warn_once(hasher.finish()) {
+            if matches!(reason, NuGetFeedUrlError::Disabled) {
+                tracing::debug!(
+                    key = %entry.key,
+                    %reason,
+                    ?cause,
+                    "NuGet package source fails closed on credential binding"
+                );
+            } else {
+                tracing::warn!(
+                    key = %entry.key,
+                    %reason,
+                    ?cause,
+                    "NuGet package source fails closed on credential binding"
+                );
+            }
+        }
+    }
+
     entry.value = Err(InvalidEntry { raw, reason });
 }
 
 /// §3.2/FR-007: attempts to bind a user-profile credential to `entry` (whose resolved URL is
 /// `resolved_url`). Returns `None` when no user-profile credential key matches `entry.key` at
 /// all (nothing to bind, not an error — the caller decides separately whether that's fine).
-/// Returns `Some(Err(reason))` when a credential key matched but conditions (0)-(3) failed, or
-/// the matched credential itself failed to expand (unset `%ENV_VAR%`, DPAPI-encrypted). Returns
-/// `Some(Ok(auth))` on a successful bind.
+/// Returns `Some(Err((reason, cause)))` when a credential key matched but conditions (0)-(3)
+/// failed, or the matched credential itself failed to expand (unset `%ENV_VAR%`,
+/// DPAPI-encrypted) — `cause` is a logging-only detail (see [`FailClosedCause`]), never part of
+/// the user-facing `reason`. Returns `Some(Ok(auth))` on a successful bind.
 fn bind_user_profile_credential(
     entry: &PackageSourceEntry,
     user_credentials: &[RawCredential],
     user_profile_add: &[PackageSourceEntry],
     suppressed: &HashSet<String>,
     resolved_url: &str,
-) -> Option<Result<NuGetAuth, NuGetFeedUrlError>> {
+) -> Option<Result<NuGetAuth, (NuGetFeedUrlError, FailClosedCause)>> {
     // (0): suppression — union match, the fail-closed direction for an exclusion. Checked here
     // rather than short-circuiting on it alone, because (0) only matters once (1) below has
     // established that a credential actually exists to suppress — otherwise there is nothing to
@@ -1458,25 +1655,40 @@ fn bind_user_profile_credential(
     let credential = unique_overlap(&entry.key, user_credentials, |c| c.key.as_str())?;
 
     if suppressed_match {
-        return Some(Err(NuGetFeedUrlError::HasCredentials));
+        return Some(Err((
+            NuGetFeedUrlError::HasCredentials,
+            FailClosedCause::UserProfileSuppressed,
+        )));
     }
 
     // (2): exactly one `user_profile_add` entry's key-candidates overlap the credential's own
     // key.
     let Some(add_entry) = unique_overlap(&credential.key, user_profile_add, |e| e.key.as_str())
     else {
-        return Some(Err(NuGetFeedUrlError::HasCredentials));
+        return Some(Err((
+            NuGetFeedUrlError::HasCredentials,
+            FailClosedCause::NoMatchingUserProfileAdd,
+        )));
     };
 
     // (3): normalized full-URL equality — not origin equality (see §3.2's rationale).
     let Ok(add_url) = add_entry.value.as_ref() else {
-        return Some(Err(NuGetFeedUrlError::HasCredentials));
+        return Some(Err((
+            NuGetFeedUrlError::HasCredentials,
+            FailClosedCause::UserProfileAddEntryInvalid,
+        )));
     };
     if add_url.as_str() != resolved_url {
-        return Some(Err(NuGetFeedUrlError::HasCredentials));
+        return Some(Err((
+            NuGetFeedUrlError::HasCredentials,
+            FailClosedCause::UserProfileUrlMismatch,
+        )));
     }
 
-    Some(expand_credential(credential))
+    Some(
+        expand_credential(credential)
+            .map_err(|reason| (reason, FailClosedCause::CredentialExpansionFailed)),
+    )
 }
 
 /// FR-002/FR-003: expands `%ENV_VAR%` references (post-cache, credential values only) and
@@ -2900,6 +3112,279 @@ mod tests {
         assert!(
             config.resolved_chains().is_empty(),
             "repo-tier credentialed source must fail closed regardless of C2"
+        );
+    }
+
+    /// Issue #576: `fail_closed` must log, not silently drop the source — a user-profile
+    /// `<packageSourceCredentials>` entry for a key with no matching `<packageSources><add>` in
+    /// that same user-profile file fails condition (2), so the repo-declared source is dropped
+    /// with no other observable signal anywhere (no hover `Latest`, no diagnostic).
+    #[test]
+    fn test_fail_closed_logs_warning_with_key_and_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="user" />
+                        <add key="ClearTextPassword" value="pat" />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+            assert!(
+                config.resolved_chains().is_empty(),
+                "unresolvable credential binding must still fail the source closed"
+            );
+        });
+
+        assert!(
+            log.contains("CorpFeed") && log.contains("packageSourceCredentials"),
+            "expected fail-closed warning naming the source key and reason in log: {log:?}"
+        );
+        // S1 fix (impl-critic): this specific C2 sub-condition (2) must be distinguishable in
+        // the log from an unrelated cause that maps to the same `HasCredentials` reason (e.g. a
+        // plain repo-tier `<packageSourceCredentials>` declaration, asserted separately below).
+        assert!(
+            log.contains("NoMatchingUserProfileAdd"),
+            "expected the specific C2 sub-condition cause in log: {log:?}"
+        );
+    }
+
+    /// S1 fix (impl-critic): a repo-tier `<packageSourceCredentials>` declaration and issue
+    /// #576's user-profile-condition-(2) repro (tested above) both resolve to the same
+    /// `NuGetFeedUrlError::HasCredentials` reason, but must log a different `cause` — proving
+    /// the two are no longer byte-identical in the log.
+    #[test]
+    fn test_fail_closed_repo_tier_and_c2_causes_are_distinguishable() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        write_config(
+            &repo,
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="repo-user" />
+                        <add key="ClearTextPassword" value="repo-pass" />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let _ = resolve_ctx(&repo, &cache, &policy, None, false);
+        });
+
+        assert!(
+            log.contains("RepoTierCredentialed"),
+            "expected the repo-tier cause, distinct from NoMatchingUserProfileAdd, in log: {log:?}"
+        );
+        assert!(
+            !log.contains("NoMatchingUserProfileAdd"),
+            "repo-tier cause must not be conflated with the C2 sub-condition cause: {log:?}"
+        );
+    }
+
+    /// S2 fix (impl-critic, issue #576 follow-up): the fail-closed warning must debounce to
+    /// once per distinct config state, not once per `resolve_with_context` call (e.g. every LSP
+    /// `did_change` re-parse against unchanged `NuGet.Config` content).
+    #[test]
+    fn test_fail_closed_warning_debounced_across_repeat_resolves() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config_path = repo.join("NuGet.Config");
+        write_config(
+            &repo,
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="repo-user" />
+                        <add key="ClearTextPassword" value="repo-pass" />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            for _ in 0..4 {
+                let _ = resolve_ctx(&repo, &cache, &policy, None, false);
+            }
+
+            // C1/S2 fix (impl-critic): a genuine content change (distinguishable mtime) must
+            // re-trigger the warning exactly once more, not once per subsequent resolve —
+            // proving the debounce tracks config *content* rather than suppressing the warning
+            // forever once fired. Mirrors deps-go's
+            // `test_goenv_oversized_goprivate_warning_debounced_across_resolves` precedent.
+            //
+            // M1 fix (impl-critic follow-up): the source `key` (`CorpFeed`) and `cause`
+            // (`RepoTierCredentialed`) are held deliberately constant across the change — only
+            // the `value=` URL differs. `fail_closed`'s dedup hash also includes `entry.key`
+            // and `cause` independently of `config_fingerprint`, so changing the key here too
+            // (as an earlier version of this test did) would pass even against a broken,
+            // pointer-identity-based fingerprint that never changes on real content edits — the
+            // key change alone would already produce a fresh hash. Holding everything else
+            // constant makes `config_fingerprint` the *only* thing that can distinguish the two
+            // rounds, so this test actually regression-guards the C1 fix.
+            let future = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+            write_config(
+                &repo,
+                r#"<configuration>
+                    <packageSources>
+                        <add key="CorpFeed" value="https://corp.example/v3/index-v2.json" />
+                    </packageSources>
+                    <packageSourceCredentials>
+                        <CorpFeed>
+                            <add key="Username" value="repo-user" />
+                            <add key="ClearTextPassword" value="repo-pass" />
+                        </CorpFeed>
+                    </packageSourceCredentials>
+                </configuration>"#,
+            );
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&config_path)
+                .unwrap()
+                .set_modified(future)
+                .unwrap();
+
+            for _ in 0..2 {
+                let _ = resolve_ctx(&repo, &cache, &policy, None, false);
+            }
+        });
+
+        assert_eq!(
+            log.matches("fails closed on credential binding").count(),
+            2,
+            "expected one warning for the original content and one more after a genuine \
+             content change: {log:?}"
+        );
+    }
+
+    /// M1 fix (impl-critic follow-up): a machine-disabled source (`<disabledPackageSources>`)
+    /// must still fail closed (unchanged behavior), but per S3 must log at `debug!`, not
+    /// `warn!`. Captured at `DEBUG` (not the vacuous `INFO`-only capture, under which a
+    /// `debug!` line is invisible regardless of whether the code is correct) so this test can
+    /// positively assert the message fired, at the right level, rather than merely asserting
+    /// its absence at a level that would hide it either way.
+    #[test]
+    fn test_disabled_source_fails_closed_at_debug_level_not_warn() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        write_config(
+            &repo,
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <disabledPackageSources>
+                    <add key="CorpFeed" value="true" />
+                </disabledPackageSources>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let config = resolve_ctx(&repo, &cache, &policy, None, false);
+            assert_eq!(
+                config.resolve_source_for(&pkg("CorpFeed.Package")),
+                DependencySource::Registry,
+                "a disabled-but-not-cleared source still leaves the implicit nuget.org tail reachable"
+            );
+        });
+
+        let line = log
+            .lines()
+            .find(|l| l.contains("fails closed on credential binding"))
+            .unwrap_or_else(|| panic!("expected a fail-closed log line at DEBUG level: {log:?}"));
+        assert!(
+            line.contains("MachineDisabled"),
+            "expected the MachineDisabled cause on the fail-closed line: {line}"
+        );
+        assert!(
+            line.contains("DEBUG"),
+            "MachineDisabled must log at debug!: {line}"
+        );
+        assert!(
+            !line.contains("WARN"),
+            "MachineDisabled must not log at warn!: {line}"
+        );
+    }
+
+    /// M1 fix (impl-critic follow-up): a DPAPI-encrypted `<Password>` must not double-log —
+    /// `expand_credential` already emits its own `debug!` for this case, so `fail_closed` must
+    /// not also emit a line for the same event, at any level. Captured at `DEBUG` so both the
+    /// expected `debug!` line's presence and `fail_closed`'s line's absence are meaningfully
+    /// asserted (at the old `INFO`-only capture, both would be invisible regardless of whether
+    /// `fail_closed` incorrectly emitted a second `debug!`).
+    #[test]
+    fn test_dpapi_encrypted_password_does_not_double_log() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="user" />
+                        <add key="Password" value="AQAAANCM...encrypted..." />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let _ = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        });
+
+        assert_eq!(
+            log.matches("DPAPI-encrypted <Password> is not supported")
+                .count(),
+            1,
+            "expected exactly one debug! from expand_credential: {log:?}"
+        );
+        assert!(
+            !log.contains("fails closed on credential binding"),
+            "fail_closed must not double-log the DPAPI case at any level: {log:?}"
         );
     }
 
