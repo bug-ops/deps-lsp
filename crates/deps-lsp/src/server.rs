@@ -252,6 +252,90 @@ impl Backend {
         self.state.spawn_refresh_requests(&self.client);
     }
 
+    /// Reacts to a change in one of `ecosystem_id`'s
+    /// [`deps_core::Ecosystem::watched_config_filenames`] (issue #590) by fully re-parsing
+    /// every currently open document of that ecosystem.
+    ///
+    /// Unlike [`Self::handle_lockfile_change`], this cannot get away with refreshing only
+    /// `resolved_versions` and re-running diagnostics on the existing `ParseResult`: a
+    /// watched config file (e.g. npm's `pnpm-workspace.yaml` catalog, `.npmrc` registry
+    /// override) is resolved *inside* `parse_manifest` itself, so its effect is already
+    /// baked into the cached `ParseResult` and only a real re-parse picks up a change. Every
+    /// open document of the ecosystem is reparsed rather than only those under the changed
+    /// file's directory tree — the per-document "which config file did this resolve against"
+    /// walk each ecosystem does internally (e.g. `deps_npm::catalog::find_workspace_file`)
+    /// isn't exposed through the [`deps_core::Ecosystem`] trait the way
+    /// [`deps_core::lockfile::LockFileProvider::locate_lockfile`] is for lock files, and
+    /// re-parsing an already-open document is cheap.
+    ///
+    /// Each reparse is version-guarded ([`handle_document_change_guarded`]'s
+    /// `expected_version`): the content/version pair is snapshotted once, up front, but the
+    /// actual reparse for a given document is awaited one at a time — a concurrent
+    /// `did_change` for that same document can land and commit newer content while an earlier
+    /// document's reparse in this loop is still in flight. Without the guard, this call's
+    /// (now-stale) commit would silently overwrite that newer edit (impl-critic S1).
+    async fn handle_watched_config_change(&self, ecosystem_id: &str) {
+        let affected: Vec<(Uri, String, Option<i32>)> = self
+            .state
+            .documents
+            .iter()
+            .filter(|entry| entry.value().ecosystem_id() == ecosystem_id)
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.value().content.clone(),
+                    entry.value().version,
+                )
+            })
+            .collect();
+
+        if affected.is_empty() {
+            tracing::debug!(
+                "No open {} documents affected by watched config file change",
+                ecosystem_id
+            );
+            return;
+        }
+
+        tracing::info!(
+            "Reparsing {} document(s) affected by watched config file change",
+            affected.len()
+        );
+
+        for (uri, content, version) in affected {
+            match crate::document::handle_document_change_guarded(
+                uri.clone(),
+                content,
+                version,
+                crate::document::CommitGuard::ExpectVersion(version),
+                Arc::clone(&self.state),
+                self.client.clone(),
+                Arc::clone(&self.config),
+            )
+            .await
+            {
+                Ok(Some(task)) => self.state.spawn_background_task(uri, task).await,
+                // A skip (superseded by a concurrent `did_change`) must never touch the task
+                // registry for this URI — `spawn_background_task` unconditionally aborts
+                // whatever task is already registered there, which would cancel the
+                // concurrent edit's own, already-installed background task (impl-critic S3).
+                Ok(None) => tracing::debug!(
+                    "skipped stale reparse for {:?}: superseded by a concurrent edit",
+                    uri
+                ),
+                Err(e) => tracing::error!(
+                    "failed to reparse {:?} after watched config file change: {}",
+                    uri,
+                    e
+                ),
+            }
+        }
+
+        // Detached, capability-gated, timeout-bounded (issue #493): see
+        // `ServerState::spawn_refresh_requests` for rationale.
+        self.state.spawn_refresh_requests(&self.client);
+    }
+
     /// Check if client supports work done progress.
     async fn supports_progress(&self) -> bool {
         let caps = self.client_capabilities.read().await;
@@ -449,11 +533,15 @@ impl LanguageServer for Backend {
             tracing::error!("Cold start rate limiter cleanup task exited unexpectedly: {e}");
         });
 
-        // Register lock file watchers using patterns from all ecosystems. Timeout-bounded
-        // (issue #493 S1): tower-lsp-server 0.23.0 dispatches handlers via
-        // `buffer_unordered(4)`, so an unresponsive client hanging this await would
-        // permanently burn one of only 4 concurrent message slots for the session.
-        let patterns = self.state.ecosystem_registry.all_lockfile_patterns();
+        // Register lock file watchers using patterns from all ecosystems, plus each
+        // ecosystem's non-lockfile watched config files (e.g. npm's pnpm-workspace.yaml
+        // and .npmrc, issue #590) — one registration, since both are just glob-pattern
+        // watches to the client. Timeout-bounded (issue #493 S1): tower-lsp-server 0.23.0
+        // dispatches handlers via `buffer_unordered(4)`, so an unresponsive client hanging
+        // this await would permanently burn one of only 4 concurrent message slots for the
+        // session.
+        let mut patterns = self.state.ecosystem_registry.all_lockfile_patterns();
+        patterns.extend(self.state.ecosystem_registry.all_watched_config_patterns());
         match tokio::time::timeout(
             CLIENT_REFRESH_TIMEOUT,
             file_watcher::register_lock_file_watchers(&self.client, &patterns),
@@ -623,19 +711,38 @@ impl LanguageServer for Backend {
                 continue;
             };
 
-            let Some(ecosystem) = self.state.ecosystem_registry.get_for_lockfile(filename) else {
-                tracing::debug!("Skipping non-lock-file change: {}", filename);
+            if let Some(ecosystem) = self.state.ecosystem_registry.get_for_lockfile(filename) {
+                tracing::info!(
+                    "Lock file changed: {} (ecosystem: {})",
+                    filename,
+                    ecosystem.id()
+                );
+
+                self.state.lockfile_cache.invalidate(&path);
+                self.handle_lockfile_change(&path, ecosystem.id()).await;
                 continue;
-            };
+            }
 
-            tracing::info!(
-                "Lock file changed: {} (ecosystem: {})",
-                filename,
-                ecosystem.id()
-            );
+            if let Some(ecosystem) = self
+                .state
+                .ecosystem_registry
+                .get_for_watched_config(filename)
+            {
+                tracing::info!(
+                    "Watched config file changed: {} (ecosystem: {})",
+                    filename,
+                    ecosystem.id()
+                );
 
-            self.state.lockfile_cache.invalidate(&path);
-            self.handle_lockfile_change(&path, ecosystem.id()).await;
+                // No cache invalidation here (unlike the lock-file branch above): every
+                // `MtimeFileCache`-backed config cache (e.g. `PnpmWorkspaceCache`,
+                // `NpmConfigCache`) already invalidates itself by mtime on its next
+                // `get_or_parse` — the reparse below is what triggers that next call.
+                self.handle_watched_config_change(ecosystem.id()).await;
+                continue;
+            }
+
+            tracing::debug!("Skipping unrecognized watched-file change: {}", filename);
         }
     }
 
@@ -1146,6 +1253,94 @@ mod tests {
 
         let config = backend.config.read().await;
         assert!(config.inlay_hints.enabled);
+    }
+
+    /// Issue #590 end-to-end: an on-disk `pnpm-workspace.yaml` change, delivered via
+    /// `workspace/didChangeWatchedFiles`, must reparse an already-open `package.json` that
+    /// references its catalog — not just refresh cached resolved versions the way a lock
+    /// file change does (`Self::handle_lockfile_change`), since catalog resolution is baked
+    /// into the parse result itself (see `Self::handle_watched_config_change`'s doc).
+    #[tokio::test]
+    async fn test_watched_config_change_reparses_open_document_with_catalog_dependency() {
+        use tower_lsp_server::ls_types::{
+            FileChangeType, FileEvent, HoverContents, Position, TextDocumentIdentifier,
+            TextDocumentItem, TextDocumentPositionParams,
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_path = temp_dir.path().join("pnpm-workspace.yaml");
+        std::fs::write(&workspace_path, "catalog:\n  react: ^17.0.0\n").unwrap();
+
+        let manifest_path = temp_dir.path().join("package.json");
+        let content = r#"{"dependencies": {"react": "catalog:"}}"#;
+        std::fs::write(&manifest_path, content).unwrap();
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "json".to_string(),
+                    version: 1,
+                    text: content.to_string(),
+                },
+            })
+            .await;
+
+        let hover_params = |uri: Uri| HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position::new(0, 20), // inside "react"'s name
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let hover = backend
+            .hover(hover_params(uri.clone()))
+            .await
+            .unwrap()
+            .expect("hover must fire for a catalog-resolved dependency");
+        let HoverContents::Markup(before) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(before.value.contains("^17.0.0"), "{}", before.value);
+
+        // Ensure a distinguishable mtime on filesystems with coarse timestamp resolution
+        // (matches `mtime_cache::tests::forward_mtime_bump_invalidates`).
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::write(&workspace_path, "catalog:\n  react: ^18.3.0\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&workspace_path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Uri::from_file_path(&workspace_path).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        let hover = backend
+            .hover(hover_params(uri))
+            .await
+            .unwrap()
+            .expect("hover must still fire after reparse");
+        let HoverContents::Markup(after) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            after.value.contains("^18.3.0"),
+            "watched config file change did not trigger a reparse of the open document: {}",
+            after.value
+        );
     }
 
     #[test]
