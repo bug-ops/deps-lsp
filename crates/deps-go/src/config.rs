@@ -380,20 +380,29 @@ pub struct GlobPattern {
     /// `Self::tokens`.
     raw: String,
     /// Precompiled once at construction (see `compile_glob`). `None` for a malformed
-    /// (unterminated `[`) or oversized (see `MAX_GLOB_PATTERN_LENGTH`) pattern — never
-    /// matches any text, mirroring `path.Match`'s own `ErrBadPattern` degrading to "no match".
+    /// (unterminated `[` character class, issue #568; or a trailing unescaped `\`) or
+    /// oversized (see `MAX_GLOB_PATTERN_LENGTH`) pattern — never matches any text, mirroring
+    /// `path.Match`'s own `ErrBadPattern` degrading to "no match". A reversed `[lo-hi]`
+    /// character-class range (`lo > hi`, issue #570) does **not** invalidate the whole
+    /// pattern — verified empirically against go1.25.5's own `path.Match`, which returns
+    /// `err == nil` for a reversed range and treats it as an always-empty (never-matching)
+    /// range while the rest of the class and pattern are still evaluated normally; `tokens`
+    /// stays `Some(...)` in that case, only a `tracing::warn!` fires for observability.
     tokens: Option<Vec<GlobToken>>,
 }
 
 impl GlobPattern {
     /// Wraps and compiles `raw` — no validation surfaced to the caller, matching
     /// `path.Match`'s own behavior (a malformed or oversized pattern simply never matches, per
-    /// `Self::tokens`'s doc). Both rejection paths log a `tracing::warn!`: an oversized pattern
+    /// `Self::tokens`'s doc). Rejection paths log a `tracing::warn!`: an oversized pattern
     /// (spec 034 follow-up F6, issue #559) here, and a malformed pattern (unterminated `[`
-    /// character class, issue #568) inside `compile_glob`. Unlike a malformed `GOPROXY` hop, a
-    /// `GOPRIVATE` pattern that never matches fails **open** on confidentiality (the module it
-    /// should have hidden from the public proxy routes there instead), so either failure must
-    /// be visible rather than silent.
+    /// character class, issue #568) inside `compile_glob` — both invalidate the whole pattern.
+    /// A reversed `[lo-hi]` range (issue #570) also logs a `tracing::warn!` inside
+    /// `compile_glob`, but — matching Go's own `path.Match` — does not invalidate the
+    /// pattern; see `Self::tokens`'s doc. Unlike a malformed `GOPROXY` hop, a `GOPRIVATE`
+    /// pattern that never matches fails **open** on confidentiality (the module it should
+    /// have hidden from the public proxy routes there instead), so these cases must be
+    /// visible rather than silent.
     #[must_use]
     pub fn new(raw: &str) -> Self {
         let tokens = if raw.len() > MAX_GLOB_PATTERN_LENGTH {
@@ -452,12 +461,29 @@ impl GlobPattern {
 }
 
 /// Compiles `pattern` (Go's `path.Match` glob syntax) into a token sequence for
-/// `tokens_match`. Returns `None` for an unterminated `[...]` character class — the whole
-/// pattern is then permanently non-matching (see `GlobPattern::tokens`'s doc), the same
-/// outcome the old recursive matcher produced for this case (it just failed the match at that
-/// point instead of failing to compile). Also logs a `tracing::warn!` in that case (issue
-/// #568), for the same fail-open-on-confidentiality reason `GlobPattern::new`'s
-/// oversized-pattern guard already logs one — this rejection path previously failed silently.
+/// `tokens_match`. Returns `None` for an unterminated `[...]` character class (issue #568) or
+/// a trailing unescaped `\` — the whole pattern is then permanently non-matching (see
+/// `GlobPattern::tokens`'s doc), the same outcome the old recursive matcher produced for the
+/// unterminated-class case (it just failed the match at that point instead of failing to
+/// compile). Also logs a `tracing::warn!` in each case, for the same
+/// fail-open-on-confidentiality reason `GlobPattern::new`'s oversized-pattern guard already
+/// logs one — these rejection paths previously failed silently.
+///
+/// A reversed `[lo-hi]` range where `lo > hi` (issue #570 — e.g. `[c-a]`) does **not** reject
+/// the pattern: empirically, go1.25.5's own `path.Match` returns `err == nil` for a reversed
+/// range too, parsing it as an always-empty range (no character ever satisfies `lo <= c <=
+/// hi`) while the rest of the class — other entries, negation — is evaluated normally (e.g.
+/// `[^c-a]` still matches every character, since its one, always-empty, entry never matches).
+/// Rust's own `(lo..=hi).contains` is equally empty for `lo > hi`, so `matches_char` already
+/// gets this right without special-casing; `compile_glob` only adds a `tracing::warn!` here
+/// for observability. A degenerate `lo == hi` single-char range (e.g. `[a-a]`) is valid and
+/// unaffected.
+///
+/// A `\` escapes the next character, matching it literally (`path.Match` semantics) — both
+/// outside a class (this loop) and inside one (`read_class_char`, so `\]`, `\-`, `\\` etc.
+/// work as literals rather than a class terminator, range separator, or bare backslash). This
+/// also fixes a #568 side effect where `repo\[x` (a literal `[` per Go) was misparsed as an
+/// unterminated class.
 fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut tokens = Vec::with_capacity(chars.len());
@@ -472,19 +498,51 @@ fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
                 tokens.push(GlobToken::Any);
                 i += 1;
             }
+            '\\' => {
+                let Some(&escaped) = chars.get(i + 1) else {
+                    tracing::warn!(
+                        pattern = redact_userinfo(pattern),
+                        "GOPRIVATE pattern ends with a trailing unescaped '\\'; it will never \
+                         match, so affected modules route to the public proxy instead of being \
+                         treated as private"
+                    );
+                    return None; // dangling escape -> whole pattern invalid
+                };
+                tokens.push(GlobToken::Literal(escaped));
+                i += 2;
+            }
             '[' => {
                 let negate = chars.get(i + 1) == Some(&'^');
                 let class_start = if negate { i + 2 } else { i + 1 };
                 let mut j = class_start;
                 let mut entries = Vec::new();
                 while j < chars.len() && (chars[j] != ']' || j == class_start) {
-                    if chars.get(j + 1) == Some(&'-') && chars.get(j + 2).is_some_and(|&c| c != ']')
+                    let (lo, lo_len) = read_class_char(&chars, j);
+                    let after_lo = j + lo_len;
+                    if chars.get(after_lo) == Some(&'-')
+                        && chars.get(after_lo + 1).is_some_and(|&c| c != ']')
                     {
-                        entries.push(ClassEntry::Range(chars[j], chars[j + 2]));
-                        j += 3;
+                        let (hi, hi_len) = read_class_char(&chars, after_lo + 1);
+                        if lo > hi {
+                            // Go's own `path.Match` (verified empirically against go1.25.5)
+                            // does not reject a reversed range either: it's parsed as an
+                            // always-empty range that simply never matches any character,
+                            // while the rest of the class (other entries, negation) still
+                            // behaves normally — so this only logs for observability rather
+                            // than invalidating the whole pattern.
+                            tracing::warn!(
+                                pattern = redact_userinfo(pattern),
+                                "GOPRIVATE pattern has a reversed '[' character-class range \
+                                 (lo > hi); that range can never match any character, but the \
+                                 rest of the pattern is still evaluated normally, matching Go's \
+                                 own path.Match behavior"
+                            );
+                        }
+                        entries.push(ClassEntry::Range(lo, hi));
+                        j = after_lo + 1 + hi_len;
                     } else {
-                        entries.push(ClassEntry::Char(chars[j]));
-                        j += 1;
+                        entries.push(ClassEntry::Char(lo));
+                        j = after_lo;
                     }
                 }
                 if chars.get(j) != Some(&']') {
@@ -506,6 +564,22 @@ fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
         }
     }
     Some(tokens)
+}
+
+/// Reads one character-class member starting at `chars[j]`, honoring a `\`-escape (`path.Match`
+/// semantics apply inside `[...]` too — e.g. `\]`, `\-`, `\\` are literal, not a class
+/// terminator, range separator, or bare backslash respectively). Returns the member's char and
+/// how many source chars it consumed (1, or 2 for an escape pair). A trailing `\` with nothing
+/// left to escape is returned as a literal `\` of length 1 — the enclosing loop then reaches
+/// end-of-input without a closing `]`, which the caller's existing unterminated-class check
+/// already handles.
+fn read_class_char(chars: &[char], j: usize) -> (char, usize) {
+    if chars[j] == '\\'
+        && let Some(&escaped) = chars.get(j + 1)
+    {
+        return (escaped, 2);
+    }
+    (chars[j], 1)
 }
 
 /// Iterative glob matcher (spec 034 perf fix) — the classic two-pointer "wildcard matching"
@@ -979,6 +1053,134 @@ mod tests {
     }
 
     #[test]
+    fn test_glob_pattern_degenerate_range_class_still_matches() {
+        let pattern = GlobPattern::new("git.mycorp.example/repo[a-a]");
+        assert!(pattern.matches("git.mycorp.example/repoa"));
+        assert!(!pattern.matches("git.mycorp.example/repob"));
+    }
+
+    /// Issue #570: a reversed range like `[c-a]` (`lo > hi`) is Go-valid, not malformed —
+    /// verified empirically against go1.25.5's `path.Match`, which returns `err == nil` and
+    /// treats it as an always-empty range. `GlobPattern` mirrors that: the reversed entry
+    /// itself never matches any character, but `tokens` stays `Some(...)` (the pattern is
+    /// still usable — `has_goprivate()` must not fail open just because it warned).
+    #[test]
+    fn test_glob_pattern_reversed_range_entry_never_matches_but_pattern_still_compiles() {
+        let pattern = GlobPattern::new("git.mycorp.example/repo[c-a]");
+        assert!(!pattern.matches("git.mycorp.example/repoa"));
+        assert!(!pattern.matches("git.mycorp.example/repob"));
+        assert!(!pattern.matches("git.mycorp.example/repoc"));
+    }
+
+    #[test]
+    fn test_glob_pattern_reversed_range_class_logs_warning() {
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let _ = GlobPattern::new("git.corp.example/[c-a]");
+        });
+        assert!(
+            log.contains("reversed '[' character-class range"),
+            "expected reversed-range warning in log: {log:?}"
+        );
+    }
+
+    /// A reversed range does not poison the rest of its class: other, valid entries in the
+    /// same `[...]` still match normally (matches Go's `path.Match`).
+    #[test]
+    fn test_glob_pattern_reversed_range_among_valid_entries_others_still_match() {
+        let pattern = GlobPattern::new("git.mycorp.example/repo[xc-a1]");
+        assert!(pattern.matches("git.mycorp.example/repox"));
+        assert!(pattern.matches("git.mycorp.example/repo1"));
+        assert!(!pattern.matches("git.mycorp.example/repoy"));
+    }
+
+    /// A negated class whose only entry is an always-empty reversed range matches every
+    /// character, since no entry ever matches and negation flips that (matches Go's
+    /// `path.Match`).
+    #[test]
+    fn test_glob_pattern_negated_reversed_range_matches_everything() {
+        let pattern = GlobPattern::new("git.mycorp.example/repo[^c-a]");
+        assert!(pattern.matches("git.mycorp.example/repox"));
+        assert!(pattern.matches("git.mycorp.example/repo9"));
+    }
+
+    #[test]
+    fn test_glob_pattern_escaped_bracket_is_literal() {
+        let pattern = GlobPattern::new(r"git.mycorp.example/repo\[x");
+        assert!(pattern.matches("git.mycorp.example/repo[x"));
+        assert!(!pattern.matches("git.mycorp.example/repox"));
+    }
+
+    #[test]
+    fn test_glob_pattern_escaped_bracket_does_not_log_unterminated_warning() {
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let pattern = GlobPattern::new(r"git.corp.example/repo\[x");
+            assert!(pattern.matches("git.corp.example/repo[x"));
+        });
+        assert!(
+            !log.contains("unterminated"),
+            "escaped '[' must not be treated as a class start: {log:?}"
+        );
+    }
+
+    #[test]
+    fn test_glob_pattern_trailing_backslash_never_matches() {
+        let pattern = GlobPattern::new(r"git.mycorp.example/repo\");
+        assert!(!pattern.matches("git.mycorp.example/repo"));
+        assert!(!pattern.matches(r"git.mycorp.example/repo\"));
+    }
+
+    /// S1: `\]` inside a class is a literal `]` range bound (here, the lo bound of a
+    /// `]`-to-`a` range), not the class terminator — `]` is 0x5D, `a` is 0x61, so `_` (0x5F)
+    /// falls inside the range and `A` (0x41) does not.
+    #[test]
+    fn test_glob_pattern_escaped_bracket_inside_class_as_range_bound() {
+        let pattern = GlobPattern::new(r"git.mycorp.example/repo[\]-a]");
+        assert!(pattern.matches("git.mycorp.example/repo_"));
+        assert!(!pattern.matches("git.mycorp.example/repoA"));
+    }
+
+    /// S1: `\]` as a standalone (non-range) class member doesn't close the class early —
+    /// `[a\]b]` has three literal members (`a`, `]`, `b`), not `[a\]` followed by a stray `b]`.
+    #[test]
+    fn test_glob_pattern_escaped_bracket_as_class_member_does_not_close_class_early() {
+        let pattern = GlobPattern::new(r"git.mycorp.example/repo[a\]b]");
+        assert!(pattern.matches("git.mycorp.example/repoa"));
+        assert!(pattern.matches("git.mycorp.example/repo]"));
+        assert!(pattern.matches("git.mycorp.example/repob"));
+        assert!(!pattern.matches("git.mycorp.example/repoc"));
+    }
+
+    /// S1: `\-` inside a class is a literal `-` range bound, not the range separator —
+    /// `[\--a]` is the range `-` (0x2D) to `a` (0x61), covering digits and more.
+    #[test]
+    fn test_glob_pattern_escaped_dash_inside_class_as_range_bound() {
+        let pattern = GlobPattern::new(r"git.mycorp.example/repo[\--a]");
+        assert!(pattern.matches("git.mycorp.example/repo-"));
+        assert!(pattern.matches("git.mycorp.example/repo0"));
+        assert!(pattern.matches("git.mycorp.example/repoa"));
+        assert!(!pattern.matches("git.mycorp.example/repob"));
+    }
+
+    /// S1 regression guard: without in-class escape handling, `\--a`'s escaped `-` lo bound
+    /// misparses as `Range('\\', '-')` — the naive scan sees `chars[j] == '\\'` followed by a
+    /// literal `-` and takes the next char (`-`) as `hi`, instead of recognizing `\-` as one
+    /// escaped literal `-`. Since `\\` is `0x5C` and `-` is `0x2D`, `0x5C > 0x2D` makes that a
+    /// reversed range, spuriously warning even though the intended range (`-` to `a`, an
+    /// escaped literal lo bound) is valid and ascending.
+    #[test]
+    fn test_glob_pattern_escaped_dash_inside_class_does_not_spuriously_warn_reversed() {
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let pattern = GlobPattern::new(r"git.corp.example/repo[\--a]");
+            assert!(pattern.matches("git.corp.example/repo-"));
+        });
+        assert!(
+            !log.contains("reversed"),
+            "escaped '-' as lo bound must not be misread as a backslash literal forming a \
+             reversed range: {log:?}"
+        );
+    }
+
+    #[test]
     fn test_glob_pattern_malformed_class_never_panics_no_match() {
         let pattern = GlobPattern::new("git.mycorp.example/repo[unterminated");
         assert!(!pattern.matches("git.mycorp.example/repo1"));
@@ -1392,6 +1594,18 @@ mod tests {
             config.resolve_source_for("git.corp.example/abc"),
             DependencySource::Registry
         );
+    }
+
+    /// Issue #570 (corrected): unlike the oversized/unterminated rejection paths above, a
+    /// reversed `[lo-hi]` character-class range only warns — `compile_glob` keeps
+    /// `tokens: Some(...)` (see `GlobPattern::tokens`'s doc), so `has_goprivate()` must still
+    /// report `true` and the bypass chain must still be registered for a pattern containing
+    /// one.
+    #[test]
+    fn test_has_goprivate_true_for_pattern_with_reversed_range() {
+        let config = GoEnvConfig::parse("GOPRIVATE=git.corp.example/repo[c-a]", &all_policy());
+        assert!(config.has_goprivate());
+        assert_eq!(config.resolved_chains().len(), 1);
     }
 
     // --- redaction (FR-014/NFR-001) ---
