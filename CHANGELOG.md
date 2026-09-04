@@ -24,10 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **deps-nuget**: `NuGetSourceChain.hops`/`NuGetRegistry::with_base` now carry per-hop credential/slot data (`ResolvedHop`) instead of a bare feed URL; `deps_lsp::register_ecosystems` now takes an `&EcosystemRuntime` instead of a bare `Arc<RegistryAccessPolicy>` — both breaking, pre-1.0, no alias (#572)
-- **deps-core, deps-cargo, deps-nuget**: consolidated four independently hand-implemented "redact this secret from `Debug`/`Display`" wrapper types into a single `deps_core::secret::Redacted<T>` newtype (#573)
+- **deps-core, deps-cargo, deps-nuget**: consolidated four independently hand-implemented "redact this secret from `Debug`/`Display`" wrapper types into a single `deps_core::secret::Redacted<T>` newtype (resolves #573) (#577)
 
 ### Security
-- **deps-core, deps-nuget**: credential material and its construction intermediates now zeroize on drop (#574)
+- **deps-core, deps-nuget**: credential material and its construction intermediates now zeroize on drop (resolves #574) (#577)
 
 ## [0.12.1] - 2026-09-03
 
