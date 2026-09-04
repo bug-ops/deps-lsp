@@ -419,6 +419,63 @@ impl EcosystemRegistry {
         }
         patterns
     }
+
+    /// Get ecosystem for a [`Ecosystem::watched_config_filenames`] entry — mirrors
+    /// [`Self::get_for_lockfile`] exactly, reusing the same exact/single-`*`-wildcard
+    /// matching, but scanning the *config* list instead of the lockfile one.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use deps_core::EcosystemRegistry;
+    ///
+    /// let registry = EcosystemRegistry::new();
+    /// // registry.register(npm_ecosystem);
+    ///
+    /// if let Some(ecosystem) = registry.get_for_watched_config("pnpm-workspace.yaml") {
+    ///     println!("pnpm-workspace.yaml handled by: {}", ecosystem.display_name());
+    /// }
+    /// ```
+    pub fn get_for_watched_config(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
+        for entry in self.ecosystems.iter() {
+            let ecosystem = entry.value();
+            let matches = ecosystem
+                .watched_config_filenames()
+                .iter()
+                .any(|pattern| lockfile_pattern_matches(pattern, filename));
+            if matches {
+                return Some(Arc::clone(ecosystem));
+            }
+        }
+        None
+    }
+
+    /// Get all [`Ecosystem::watched_config_filenames`] glob patterns for file watching —
+    /// mirrors [`Self::all_lockfile_patterns`], scanning the *config* list instead.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use deps_core::EcosystemRegistry;
+    ///
+    /// let registry = EcosystemRegistry::new();
+    /// // registry.register(npm_ecosystem);
+    ///
+    /// let patterns = registry.all_watched_config_patterns();
+    /// for pattern in patterns {
+    ///     println!("Watching pattern: {}", pattern);
+    /// }
+    /// ```
+    pub fn all_watched_config_patterns(&self) -> Vec<String> {
+        let mut patterns = Vec::new();
+        for entry in self.ecosystems.iter() {
+            let ecosystem = entry.value();
+            for filename in ecosystem.watched_config_filenames() {
+                patterns.push(format!("**/{}", filename));
+            }
+        }
+        patterns
+    }
 }
 
 impl Default for EcosystemRegistry {
@@ -556,6 +613,7 @@ mod tests {
         display_name: &'static str,
         filenames: &'static [&'static str],
         lockfiles: &'static [&'static str],
+        watched_configs: &'static [&'static str],
     }
 
     impl crate::ecosystem::private::Sealed for MockEcosystem {}
@@ -575,6 +633,10 @@ mod tests {
 
         fn lockfile_filenames(&self) -> &[&'static str] {
             self.lockfiles
+        }
+
+        fn watched_config_filenames(&self) -> &[&'static str] {
+            self.watched_configs
         }
 
         fn parse_manifest<'a>(
@@ -851,6 +913,7 @@ mod tests {
             display_name: "Exact",
             filenames: &["requirements.txt"],
             lockfiles: &[],
+            watched_configs: &[],
         }));
         registry.register(Arc::new(MockPatternEcosystem {
             id: "pattern",
@@ -912,6 +975,7 @@ mod tests {
             display_name: "Test Ecosystem",
             filenames: &["test.toml"],
             lockfiles: &[],
+            watched_configs: &[],
         });
 
         registry.register(ecosystem);
@@ -928,6 +992,7 @@ mod tests {
             display_name: "Test Ecosystem",
             filenames: &["test.toml"],
             lockfiles: &[],
+            watched_configs: &[],
         });
 
         registry.register(ecosystem);
@@ -945,6 +1010,7 @@ mod tests {
             display_name: "Test Ecosystem",
             filenames: &["test.toml", "test.json"],
             lockfiles: &[],
+            watched_configs: &[],
         });
 
         registry.register(ecosystem);
@@ -966,6 +1032,7 @@ mod tests {
             display_name: "Test Ecosystem",
             filenames: &["test.toml"],
             lockfiles: &[],
+            watched_configs: &[],
         });
 
         registry.register(ecosystem);
@@ -1060,6 +1127,7 @@ mod tests {
             display_name: "Cargo",
             filenames: &["Cargo.toml"],
             lockfiles: &["Cargo.lock"],
+            watched_configs: &[],
         });
 
         let eco2 = Arc::new(MockEcosystem {
@@ -1067,6 +1135,7 @@ mod tests {
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
+            watched_configs: &[],
         });
 
         registry.register(eco1);
@@ -1092,6 +1161,7 @@ mod tests {
             display_name: "Cargo",
             filenames: &["Cargo.toml"],
             lockfiles: &["Cargo.lock"],
+            watched_configs: &[],
         });
 
         registry.register(ecosystem);
@@ -1112,6 +1182,7 @@ mod tests {
             display_name: "PyPI",
             filenames: &["pyproject.toml"],
             lockfiles: &["poetry.lock", "uv.lock"],
+            watched_configs: &[],
         });
 
         registry.register(ecosystem);
@@ -1136,6 +1207,7 @@ mod tests {
             display_name: "NuGet",
             filenames: &["Directory.Packages.props"],
             lockfiles: &["packages.lock.json", "packages.*.lock.json"],
+            watched_configs: &[],
         });
 
         registry.register(ecosystem);
@@ -1171,6 +1243,7 @@ mod tests {
             display_name: "Cargo",
             filenames: &["Cargo.toml"],
             lockfiles: &["Cargo.lock"],
+            watched_configs: &[],
         });
 
         registry.register(ecosystem);
@@ -1189,6 +1262,7 @@ mod tests {
             display_name: "Cargo",
             filenames: &["Cargo.toml"],
             lockfiles: &["Cargo.lock"],
+            watched_configs: &[],
         });
 
         let eco2 = Arc::new(MockEcosystem {
@@ -1196,6 +1270,7 @@ mod tests {
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
+            watched_configs: &[],
         });
 
         let eco3 = Arc::new(MockEcosystem {
@@ -1203,6 +1278,7 @@ mod tests {
             display_name: "PyPI",
             filenames: &["pyproject.toml"],
             lockfiles: &["poetry.lock", "uv.lock"],
+            watched_configs: &[],
         });
 
         registry.register(eco1);
@@ -1225,12 +1301,73 @@ mod tests {
             display_name: "Test",
             filenames: &["test.toml"],
             lockfiles: &[],
+            watched_configs: &[],
         });
 
         registry.register(ecosystem);
 
         let patterns = registry.all_lockfile_patterns();
         assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn test_get_for_watched_config() {
+        let registry = EcosystemRegistry::new();
+        let ecosystem = Arc::new(MockEcosystem {
+            id: "npm",
+            display_name: "npm",
+            filenames: &["package.json"],
+            lockfiles: &["package-lock.json"],
+            watched_configs: &["pnpm-workspace.yaml", ".npmrc"],
+        });
+
+        registry.register(ecosystem);
+
+        let retrieved = registry
+            .get_for_watched_config("pnpm-workspace.yaml")
+            .unwrap();
+        assert_eq!(retrieved.id(), "npm");
+        let retrieved = registry.get_for_watched_config(".npmrc").unwrap();
+        assert_eq!(retrieved.id(), "npm");
+
+        // A lockfile is not a watched config, and vice versa.
+        assert!(
+            registry
+                .get_for_watched_config("package-lock.json")
+                .is_none()
+        );
+        assert!(registry.get_for_watched_config("unknown.yaml").is_none());
+    }
+
+    #[test]
+    fn test_all_watched_config_patterns() {
+        let registry = EcosystemRegistry::new();
+        let ecosystem = Arc::new(MockEcosystem {
+            id: "npm",
+            display_name: "npm",
+            filenames: &["package.json"],
+            lockfiles: &["package-lock.json"],
+            watched_configs: &["pnpm-workspace.yaml", ".npmrc"],
+        });
+
+        registry.register(ecosystem);
+
+        let patterns = registry.all_watched_config_patterns();
+        assert_eq!(patterns.len(), 2);
+        assert!(patterns.contains(&"**/pnpm-workspace.yaml".to_string()));
+        assert!(patterns.contains(&"**/.npmrc".to_string()));
+
+        // Lockfile patterns are a disjoint set, unaffected by watched-config registration.
+        assert_eq!(
+            registry.all_lockfile_patterns(),
+            vec!["**/package-lock.json"]
+        );
+    }
+
+    #[test]
+    fn test_all_watched_config_patterns_empty() {
+        let registry = EcosystemRegistry::new();
+        assert!(registry.all_watched_config_patterns().is_empty());
     }
 
     #[test]

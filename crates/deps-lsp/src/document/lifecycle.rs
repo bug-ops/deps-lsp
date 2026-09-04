@@ -1952,19 +1952,62 @@ async fn parse_and_diff_manifest(
     (parse_result, diff)
 }
 
+/// Whether [`commit_parsed_document`] should verify the document's current version before
+/// committing — see that function's doc for why this exists.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CommitGuard {
+    /// Always commit — a real edit's own version is authoritative, nothing to guard against.
+    Unconditional,
+    /// Commit only if the document's *current* version in `state` still equals this value;
+    /// otherwise skip the commit entirely (impl-critic S1).
+    ExpectVersion(Option<i32>),
+}
+
+/// Bundles [`commit_parsed_document`]'s two commit-behavior parameters — kept as one struct
+/// (rather than two more positional parameters) to stay under `clippy::too_many_arguments`.
+struct CommitOptions<'a> {
+    diff: &'a DependencyDiff,
+    guard: CommitGuard,
+}
+
 /// Builds the new `DocumentState` from the parsed manifest (or a parse-result-less
 /// placeholder when parsing failed), carries over cache entries the previous state already
-/// held, prunes/invalidates entries the diff says are now stale, and commits the result
-/// into `state`.
+/// held, prunes/invalidates entries `options.diff` says are now stale, and commits the result
+/// into `state` — unless `options.guard` is [`CommitGuard::ExpectVersion`] and the document's
+/// *current* version in `state` no longer matches, in which case the commit is skipped
+/// entirely and `false` is returned.
+///
+/// The guard exists for a reparse whose trigger is *not* the document's own edit stream —
+/// e.g. [`crate::server::Backend::handle_watched_config_change`] (issue #590), which reparses
+/// every open document of an ecosystem using content it snapshotted before the (awaited)
+/// re-parse ran. Without this check, a `did_change` notification landing while that reparse
+/// is in flight gets silently reverted: this function would otherwise commit unconditionally,
+/// overwriting the newer edit with the older, watched-config-triggered content (impl-critic
+/// S1). [`handle_document_change`] passes [`CommitGuard::Unconditional`] — a real edit's own
+/// version is authoritative, there is nothing to guard against.
 fn commit_parsed_document(
     uri: &Uri,
     ecosystem: &dyn Ecosystem,
     content: String,
     parse_result: Option<Box<dyn deps_core::ParseResult>>,
     version: Option<i32>,
-    diff: &DependencyDiff,
     state: &ServerState,
-) {
+    options: CommitOptions<'_>,
+) -> bool {
+    let diff = options.diff;
+    if let CommitGuard::ExpectVersion(expected) = options.guard {
+        let current = state.with_document(uri, |doc| doc.version);
+        if current != Some(expected) {
+            tracing::debug!(
+                ?uri,
+                ?expected,
+                ?current,
+                "skipping stale reparse commit: document version changed since this reparse started"
+            );
+            return false;
+        }
+    }
+
     let mut doc_state = if let Some(pr) = parse_result {
         DocumentState::new_from_parse_result(resolve_ecosystem_id(ecosystem), content, pr)
     } else {
@@ -2015,6 +2058,7 @@ fn commit_parsed_document(
     }
 
     state.update_document(uri.clone(), doc_state);
+    true
 }
 
 /// Generic document change handler using ecosystem registry.
@@ -2029,6 +2073,47 @@ pub async fn handle_document_change(
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
 ) -> Result<JoinHandle<()>> {
+    let task = handle_document_change_guarded(
+        uri,
+        content,
+        version,
+        CommitGuard::Unconditional,
+        state,
+        client,
+        config,
+    )
+    .await?;
+    Ok(task.expect("CommitGuard::Unconditional never skips the commit"))
+}
+
+/// Like [`handle_document_change`], but skips committing the reparse — and spawning its
+/// diagnostics-refresh background task — if `guard` is [`CommitGuard::ExpectVersion`] and the
+/// document's version in `state` no longer matches by the time this reparse finishes; see
+/// [`commit_parsed_document`]'s doc for why.
+///
+/// Returns `Ok(None)` on a skip, never a sentinel/no-op `JoinHandle` (impl-critic S3): the
+/// caller ([`crate::server::Backend::handle_watched_config_change`]) feeds the returned handle
+/// straight into [`ServerState::spawn_background_task`], which unconditionally **aborts** any
+/// existing task registered for the URI before installing the new one. A sentinel handle for
+/// a skipped, superseded reparse would therefore abort the concurrent edit's *real* background
+/// task (registry fetch, OSV rescan, `publish_diagnostics`) that a matching-version commit
+/// already installed — silently dropping that newer edit's diagnostics until the next
+/// keystroke. The caller must treat `None` as "do not touch the task registry for this URI at
+/// all", not as "install a no-op task".
+///
+/// [`handle_document_change`] passes [`CommitGuard::Unconditional`] and unwraps the `Some`
+/// unconditionally (preserving its exact prior behavior and `Result<JoinHandle<()>>` return
+/// type) — only a reparse triggered by something other than the document's own edit stream
+/// needs a real guard, and therefore ever observes `None`.
+pub(crate) async fn handle_document_change_guarded(
+    uri: Uri,
+    content: String,
+    version: Option<i32>,
+    guard: CommitGuard,
+    state: Arc<ServerState>,
+    client: Client,
+    config: Arc<RwLock<DepsConfig>>,
+) -> Result<Option<JoinHandle<()>>> {
     // Find appropriate ecosystem for this URI
     let ecosystem = match state.ecosystem_registry.get_for_uri(&uri) {
         Some(e) => e,
@@ -2045,15 +2130,17 @@ pub async fn handle_document_change(
     let (parse_result, diff) =
         parse_and_diff_manifest(&uri, &content, &state, ecosystem.as_ref()).await;
 
-    commit_parsed_document(
+    if !commit_parsed_document(
         &uri,
         ecosystem.as_ref(),
         content,
         parse_result,
         version,
-        &diff,
         &state,
-    );
+        CommitOptions { diff: &diff, guard },
+    ) {
+        return Ok(None);
+    }
 
     // Clone cache, diagnostics, and freshness config before spawning background task
     // (all read here, before any OSV request is built — FR-011).
@@ -2093,7 +2180,7 @@ pub async fn handle_document_change(
         deps_to_fetch,
     ));
 
-    Ok(task)
+    Ok(Some(task))
 }
 
 /// Config values snapshotted from `DepsConfig` before spawning [`run_document_change_task`]
@@ -5525,6 +5612,185 @@ tokio = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(doc.ecosystem_id(), "npm");
+        }
+
+        /// Impl-critic S1 regression: a version-guarded reparse whose `expected_version` no
+        /// longer matches the document's *current* version (a concurrent `did_change` already
+        /// landed) must not commit — the older, guarded reparse would otherwise silently
+        /// revert the newer edit.
+        #[tokio::test]
+        async fn test_handle_document_change_guarded_skips_commit_when_version_changed() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let original_content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
+            let (client, config) = create_test_client_and_config();
+
+            handle_document_open(
+                uri.clone(),
+                original_content,
+                Some(1),
+                Arc::clone(&state),
+                client.clone(),
+                Arc::clone(&config),
+            )
+            .await
+            .unwrap();
+
+            // A real, concurrent `did_change` lands and commits version 2 — simulating this
+            // landing while a watched-config-triggered reparse (still snapshotted at version
+            // 1) is in flight.
+            let concurrent_content = r#"{"dependencies": {"express": "^4.19.0"}}"#.to_string();
+            handle_document_change(
+                uri.clone(),
+                concurrent_content.clone(),
+                Some(2),
+                Arc::clone(&state),
+                client.clone(),
+                Arc::clone(&config),
+            )
+            .await
+            .unwrap();
+
+            // The watched-config-triggered reparse now runs, still expecting version 1 (its
+            // stale pre-race snapshot) and carrying content from before the concurrent edit.
+            let stale_content =
+                r#"{"dependencies": {"express": "^4.18.0", "lodash": "^4.0.0"}}"#.to_string();
+            let task = handle_document_change_guarded(
+                uri.clone(),
+                stale_content,
+                Some(3),
+                CommitGuard::ExpectVersion(Some(1)),
+                Arc::clone(&state),
+                client,
+                config,
+            )
+            .await
+            .unwrap();
+            assert!(
+                task.is_none(),
+                "a version mismatch must skip the commit and return None, never a sentinel \
+                 task (impl-critic S3)"
+            );
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.content, concurrent_content,
+                "a stale guarded reparse must not overwrite content committed after its snapshot"
+            );
+            assert_eq!(doc.version, Some(2));
+        }
+
+        /// The mirror case: `expected_version` still matches the document's current version,
+        /// so the guarded reparse must commit normally.
+        #[tokio::test]
+        async fn test_handle_document_change_guarded_commits_when_version_matches() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let original_content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
+            let (client, config) = create_test_client_and_config();
+
+            handle_document_open(
+                uri.clone(),
+                original_content,
+                Some(1),
+                Arc::clone(&state),
+                client.clone(),
+                Arc::clone(&config),
+            )
+            .await
+            .unwrap();
+
+            let new_content = r#"{"dependencies": {"express": "^4.19.0"}}"#.to_string();
+            let task = handle_document_change_guarded(
+                uri.clone(),
+                new_content.clone(),
+                Some(1),
+                CommitGuard::ExpectVersion(Some(1)),
+                Arc::clone(&state),
+                client,
+                config,
+            )
+            .await
+            .unwrap();
+            task.expect("a matching version must commit and spawn a real task")
+                .await
+                .unwrap();
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(doc.content, new_content);
+        }
+
+        /// Impl-critic S3 regression: a skipped guarded reparse must never register a
+        /// sentinel task via `spawn_background_task` — doing so would abort whatever real
+        /// background task (e.g. a concurrent edit's own registry fetch + diagnostics
+        /// publish) is already registered for that URI. Unlike the two tests above, this one
+        /// exercises the actual task registry (`ServerState::spawn_background_task`), not
+        /// just the returned handle directly.
+        #[tokio::test]
+        async fn test_guarded_reparse_skip_does_not_abort_pre_existing_background_task() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let original_content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
+            let (client, config) = create_test_client_and_config();
+
+            handle_document_open(
+                uri.clone(),
+                original_content,
+                Some(1),
+                Arc::clone(&state),
+                client.clone(),
+                Arc::clone(&config),
+            )
+            .await
+            .unwrap();
+
+            // Stands in for the real background task a concurrent `did_change` would already
+            // have installed by the time a stale, guarded reparse runs.
+            let ran_to_completion = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&ran_to_completion);
+            let pre_existing_task = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                flag.store(true, Ordering::SeqCst);
+            });
+            state
+                .spawn_background_task(uri.clone(), pre_existing_task)
+                .await;
+
+            // A guarded reparse whose expected version no longer matches — must skip. Mirrors
+            // `Backend::handle_watched_config_change`'s exact branching: `spawn_background_task`
+            // is called only on `Some`, never on a skip.
+            let stale_content = r#"{"dependencies": {"express": "^4.19.0"}}"#.to_string();
+            let result = handle_document_change_guarded(
+                uri.clone(),
+                stale_content,
+                Some(2),
+                CommitGuard::ExpectVersion(Some(999)),
+                Arc::clone(&state),
+                client,
+                config,
+            )
+            .await
+            .unwrap();
+            assert!(result.is_none(), "a version mismatch must skip the commit");
+            if let Some(task) = result {
+                state.spawn_background_task(uri.clone(), task).await;
+            }
+
+            // If the pre-existing task had instead been aborted, it would never reach the
+            // `store(true, ...)` line above; give it well past its 50ms sleep to prove it ran
+            // to completion undisturbed.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                ran_to_completion.load(Ordering::SeqCst),
+                "the pre-existing background task must not be aborted by a skipped guarded reparse"
+            );
         }
     }
 

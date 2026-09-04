@@ -204,6 +204,10 @@ impl Ecosystem for NpmEcosystem {
         &["package-lock.json"]
     }
 
+    fn watched_config_filenames(&self) -> &[&'static str] {
+        &["pnpm-workspace.yaml", ".npmrc"]
+    }
+
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
@@ -463,6 +467,16 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
         assert_eq!(ecosystem.lockfile_filenames(), &["package-lock.json"]);
+    }
+
+    #[test]
+    fn test_ecosystem_watched_config_filenames() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(cache);
+        assert_eq!(
+            ecosystem.watched_config_filenames(),
+            &["pnpm-workspace.yaml", ".npmrc"]
+        );
     }
 
     #[test]

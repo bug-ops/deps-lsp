@@ -460,6 +460,19 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &[]
     }
 
+    /// Non-lockfile config filenames this ecosystem resolves *during* [`Self::parse_manifest`]
+    /// (e.g. `["pnpm-workspace.yaml", ".npmrc"]` for npm's catalog and registry resolution),
+    /// whose values end up baked into a manifest's `ParseResult` rather than looked up
+    /// separately the way a [`Self::lockfile_provider`] is.
+    ///
+    /// Used for file watching alongside [`Self::lockfile_filenames`] — LSP monitors changes
+    /// to these files too, but reacts by fully re-parsing every open document of this
+    /// ecosystem (not merely refreshing cached resolved versions, since the value isn't kept
+    /// separately from the parse result to refresh in place). Returns empty slice by default.
+    fn watched_config_filenames(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Parse a manifest file and return parsed result
     ///
     /// # Arguments
