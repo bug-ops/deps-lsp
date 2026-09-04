@@ -331,6 +331,34 @@ falling through to the next hop, mirroring PyPI's identical trade-off (see
 above) for the same reason: falling through would risk resolving a private
 module through a fallback the reachability state does not actually support.
 
+**`,` vs `|` separator semantics**: the two `GOPROXY` separators are not
+interchangeable — each governs a different fallback trigger for the hop
+transition it precedes, matching `go help goproxy`/`modfetch/proxy.go`:
+- `,` falls through to the next hop **only on an explicit not-found
+  response** (`404`/`410`) — a transport failure (timeout, 5xx, connection
+  refused) on that hop halts resolution for the dependency instead (see
+  above).
+- `|` falls through to the next hop on **any** error from that hop,
+  including a transport failure.
+
+A single `GOPROXY` value may mix both (e.g.
+`GOPROXY=https://a.example|https://b.example,direct`); each transition
+between two consecutive, *valid* hops keeps the separator that preceded
+it, so a chain can combine "skip on any failure" and "skip only when
+genuinely absent" hop-to-hop as needed.
+
+**Known limitation**: when an invalid hop is dropped (per the fail-closed
+rule above) between two surviving hops, only the separator immediately
+preceding the surviving hop is kept — a separator that preceded the
+*dropped* entry is discarded rather than carried over. For example,
+`GOPROXY=https://a.example|not-a-valid-url,https://c.example` records the
+`,` after the dropped entry, not the `|` the user actually wrote before
+it, so a "skip on any failure" the user intended for the `a` -> `c`
+fallback can be silently narrowed to "skip only when not found" whenever
+the hop in between happens to be invalid. Pinned by a test rather than
+fixed here — see issue #559's follow-up tracking for the underlying
+separator-carryover fix.
+
 **Reachability policy**: governed by the same `registries.workspace_registries`
 setting documented above for Cargo/npm/PyPI. The default public chain
 (`https://proxy.golang.org,direct`) used when `$GOENV` declares no

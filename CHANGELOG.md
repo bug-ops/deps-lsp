@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **deps-go, deps-core, deps-lsp**: `$GOENV` `GOPROXY`/`GOPRIVATE` support — a `GOPROXY` proxy chain (with `direct`/`off` sentinels) or a `GOPRIVATE`-matched module path now resolves to live hover/diagnostic/completion data from the configured private proxy (or fails closed with no data for `direct`/`off`) instead of always querying `proxy.golang.org`, failing closed on a bad hop rather than falling back to the public proxy (#558)
 - **deps-nuget, deps-lsp**: NuGet private/custom feed support — in-repo `NuGet.Config` `<packageSources>`/`<clear/>`/`<disabledPackageSources>`/`<packageSourceCredentials>`/`<packageSourceMapping>` are now resolved to live hover/diagnostic/completion data instead of always querying `api.nuget.org`, failing closed on a bad/disabled/credentialed entry rather than falling back to the public feed (resolves #523) (#560)
+- **deps-go**: `$GOENV` `GOPROXY`/`GOPRIVATE` follow-up hardening — test-injectable `$GOENV` path, oversized-`GOPRIVATE`-pattern warning, expanded edge-case/integration test coverage, and `GOPROXY` `,`/`|` separator docs (resolves #559)
 
 ## [0.12.1] - 2026-09-03
 

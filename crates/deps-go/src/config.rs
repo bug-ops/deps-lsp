@@ -236,6 +236,15 @@ pub const GOPRIVATE_CHAIN_KEY: &str = "go-private:direct";
 /// Tracks which separator (`,`/`|`) preceded each entry (spec 034 S2) so the resulting
 /// [`GoProxyChain::separators`] preserves Go's own distinction between the two — a manual
 /// scan rather than `str::split([',', '|'])`, which would discard exactly that information.
+///
+/// **Known limitation** (spec 034 follow-up C1, issue #559 — documented, not fixed here; see
+/// `docs/ECOSYSTEM_GUIDE.md`'s GOPROXY section): when one or more invalid entries (FR-009)
+/// are dropped between two surviving hops, only the separator immediately preceding the
+/// *surviving* hop is kept — a separator that preceded a *dropped* entry is discarded, not
+/// merged. E.g. `a|invalid,c` records `,` (the separator after the dropped entry), not `|`
+/// (the separator the user actually wrote before it). Pre-existing since PR #558; the
+/// underlying carry-over behavior is out of scope for this PR (tracked as a separate
+/// follow-up) — only the doc/test gap around it is closed here.
 fn parse_goproxy(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyChain, InvalidEntry> {
     let mut hops: Vec<GoProxyHop> = Vec::new();
     let mut separators: Vec<ChainSeparator> = Vec::new();
@@ -374,10 +383,20 @@ pub struct GlobPattern {
 impl GlobPattern {
     /// Wraps and compiles `raw` — no validation surfaced to the caller, matching
     /// `path.Match`'s own behavior (a malformed or oversized pattern simply never matches, per
-    /// `Self::tokens`'s doc).
+    /// `Self::tokens`'s doc). An oversized pattern also logs a `tracing::warn!` (spec 034
+    /// follow-up F6, issue #559): unlike a malformed `GOPROXY` hop, a `GOPRIVATE` pattern that
+    /// never matches fails **open** on confidentiality (the module it should have hidden from
+    /// the public proxy routes there instead), so this failure must be visible rather than
+    /// silent.
     #[must_use]
     pub fn new(raw: &str) -> Self {
         let tokens = if raw.len() > MAX_GLOB_PATTERN_LENGTH {
+            tracing::warn!(
+                pattern_length = raw.len(),
+                max_length = MAX_GLOB_PATTERN_LENGTH,
+                "GOPRIVATE pattern exceeds max length; it will never match, so affected modules \
+                 route to the public proxy instead of being treated as private"
+            );
             None
         } else {
             compile_glob(raw)
@@ -632,6 +651,12 @@ impl GoEnvConfig {
 /// [`parse_goenv_raw`]'s doc for exactly which keys this can ever contain.
 #[derive(Debug, Default)]
 struct RawGoEnv {
+    /// Raw, unvalidated `GOPROXY` value, which may carry embedded userinfo until
+    /// [`GoProxyUrl::new`] rejects it per-hop. Retained for the process lifetime by
+    /// [`GoEnvCache`]'s memoization, mirroring `deps_npm::config::NpmConfigCache`'s identical
+    /// shape exactly — precedent-consistent, not a regression to fix (spec 034 security
+    /// review, F4). Never logged or transmitted as-is (FR-014); only [`redact_userinfo`]'d
+    /// output ever leaves this module.
     goproxy: Option<String>,
     goprivate: Option<String>,
 }
@@ -699,6 +724,13 @@ pub struct GoParseContext {
     pub policy: Arc<RegistryAccessPolicy>,
     /// Memoizes `$GOENV`'s raw, unvalidated contents across every parse that reads it.
     pub config_cache: Arc<GoEnvCache>,
+    /// The resolved `$GOENV` path to consult, if any — resolved once by the caller rather
+    /// than looked up internally, so nothing in this crate reads the live host environment
+    /// implicitly (spec 034 follow-up C3/C4, issue #559). Production callers
+    /// (`crate::lib::register_ecosystems`) pass [`goenv_path`]'s result; tests pass a fixture
+    /// path. `None` — the [`Default`] value — means "no `$GOENV` file", the same hermetic,
+    /// zero-host-read behavior [`crate::parser::parse_go_mod`]'s doc already promises.
+    pub goenv_path: Option<PathBuf>,
 }
 
 /// Resolves `$GOENV`'s path (FR-001).
@@ -744,6 +776,17 @@ fn goenv_path_with_env(env_value: Option<String>) -> Option<PathBuf> {
 #[must_use]
 pub fn resolve(cache: &GoEnvCache, policy: &RegistryAccessPolicy) -> GoEnvConfig {
     resolve_at(cache, policy, goenv_path())
+}
+
+/// Resolves `$GOENV` into a [`GoEnvConfig`], reading the already-resolved
+/// [`GoParseContext::goenv_path`] instead of calling [`goenv_path`] itself.
+///
+/// This is the seam `crate::parser::parse_go_mod_with_context` calls in production, and the
+/// way tests exercise the full parse -> resolve -> `register_chain` -> `get_versions_from`
+/// path without depending on the real host `$GOENV`.
+#[must_use]
+pub fn resolve_with_context(ctx: &GoParseContext) -> GoEnvConfig {
+    resolve_at(&ctx.config_cache, &ctx.policy, ctx.goenv_path.clone())
 }
 
 /// [`resolve`], but taking the `$GOENV` path explicitly instead of [`goenv_path`] — lets tests
@@ -936,6 +979,20 @@ mod tests {
         assert!(!pattern.matches(&"a".repeat(100)));
     }
 
+    /// F6 (spec 034 follow-up, issue #559 C2): an oversized `GOPRIVATE` pattern's silent
+    /// fail-open must actually log a `tracing::warn!`, not just be non-matching.
+    #[test]
+    fn test_glob_pattern_oversized_pattern_logs_warning() {
+        let long_pattern = "*".repeat(MAX_GLOB_PATTERN_LENGTH + 1);
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let _ = GlobPattern::new(&long_pattern);
+        });
+        assert!(
+            log.contains("GOPRIVATE pattern exceeds max length"),
+            "expected oversized-pattern warning in log: {log:?}"
+        );
+    }
+
     // --- GoEnvConfig::parse / resolve_source_for (FR-001-FR-009) ---
 
     #[test]
@@ -1118,6 +1175,84 @@ mod tests {
             config.resolve_source_for("github.com/other/repo"),
             DependencySource::Registry
         );
+    }
+
+    /// Edge case (issue #559): `GOPROXY=`/`GOPRIVATE=` with nothing after the `=` parse
+    /// successfully but resolve exactly as if the key were absent — no phantom empty-string
+    /// hop/pattern, no panic.
+    #[test]
+    fn test_goenv_empty_goproxy_and_goprivate_values_are_absent() {
+        let config = GoEnvConfig::parse("GOPROXY=\nGOPRIVATE=\n", &all_policy());
+        assert!(config.goproxy_chain().is_none());
+        assert!(!config.has_goprivate());
+        assert_eq!(
+            config.resolve_source_for("github.com/gin-gonic/gin"),
+            DependencySource::Registry
+        );
+    }
+
+    /// Edge case (issue #559): a `$GOENV` line with no `=` at all (not a comment, not blank)
+    /// is silently ignored rather than panicking or corrupting the previous/next key.
+    #[test]
+    fn test_goenv_malformed_line_without_equals_is_ignored() {
+        let content = "GARBAGE LINE WITH NO EQUALS\nGOPROXY=https://goproxy.mycorp.example\n";
+        let config = GoEnvConfig::parse(content, &all_policy());
+        assert!(config.goproxy_chain().is_some());
+    }
+
+    /// Edge case (issue #559): the same `GOPRIVATE` glob pattern declared twice still matches
+    /// (no dedup requirement, no panic) — duplicates are just redundant, not invalid.
+    #[test]
+    fn test_goenv_duplicate_goprivate_patterns_still_match() {
+        let config = GoEnvConfig::parse(
+            "GOPRIVATE=git.mycorp.example/*,git.mycorp.example/*",
+            &all_policy(),
+        );
+        assert!(config.has_goprivate());
+        assert_eq!(
+            config.resolve_source_for("git.mycorp.example/internal/auth"),
+            DependencySource::AlternateRegistry {
+                index: GOPRIVATE_CHAIN_KEY.to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+    }
+
+    /// Edge case (issue #559): a chain mixing `|` before `,` (rather than the `,`-then-`|`
+    /// order `test_goproxy_separators_recorded_distinctly` already covers) still records each
+    /// transition with its own real semantics, not the first separator seen in the value.
+    #[test]
+    fn test_goproxy_mixed_pipe_then_comma_separators() {
+        let config = GoEnvConfig::parse(
+            "GOPROXY=https://a.example|https://b.example,direct",
+            &all_policy(),
+        );
+        let chain = config.goproxy_chain().unwrap();
+        assert_eq!(chain.hops.len(), 3);
+        assert!(matches!(chain.hops[2], GoProxyHop::Direct));
+        assert_eq!(
+            chain.separators,
+            vec![ChainSeparator::AnyError, ChainSeparator::NotFoundOnly]
+        );
+    }
+
+    /// C1 (spec 034 follow-up, issue #559) — **known limitation, pinned deliberately, not a
+    /// desired behavior**: a separator preceding a *dropped* invalid hop is discarded rather
+    /// than carried onto the merged transition between the two surviving hops. Here the
+    /// user's `|` (fall through on any error) before the invalid entry is lost, and the `,`
+    /// (fall through on not-found only) that happened to follow the dropped entry wins
+    /// instead — see `parse_goproxy`'s doc and `docs/ECOSYSTEM_GUIDE.md`'s GOPROXY section.
+    /// Pre-existing since PR #558; fixing the underlying carry-over behavior is out of scope
+    /// for this PR and tracked as a separate follow-up.
+    #[test]
+    fn test_goproxy_separator_before_dropped_hop_is_not_carried_over() {
+        let config = GoEnvConfig::parse(
+            "GOPROXY=https://a.example|not-a-valid-url,https://c.example",
+            &all_policy(),
+        );
+        let chain = config.goproxy_chain().unwrap();
+        assert_eq!(chain.hops.len(), 2);
+        assert_eq!(chain.separators, vec![ChainSeparator::NotFoundOnly]);
     }
 
     // --- redaction (FR-014/NFR-001) ---
