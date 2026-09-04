@@ -56,7 +56,7 @@ status: moc
 | 032 | [[032-npm-npmrc-registry-support/spec\|npm .npmrc custom/private registry support (scoped registries + top-level registry=)]] | plan | shipped — research/enhancement, P3 (PR #510, issue #502) |
 | 033 | [[033-pypi-private-index-support/spec\|PyPI private/custom index resolution (--index-url / --extra-index-url / Poetry source / uv index)]] | tasks | shipped — research/enhancement, P3 (PR #516, issue #513) |
 | 034 | [[034-go-goproxy-private-registry/spec\|Go GOPROXY/GOPRIVATE module proxy resolution]] | specify | shipped — research/enhancement, P3 (PR #558, issue #519) |
-| 035 | [[035-nuget-private-feed-support/spec\|NuGet private/custom feed support (NuGet.Config packageSources)]] | specify | research/parity, P3, all `[NEEDS CLARIFICATION]` items resolved, implemented pending PR (issue #523) |
+| 035 | [[035-nuget-private-feed-support/spec\|NuGet private/custom feed support (NuGet.Config packageSources)]] | specify | shipped — research/parity, P3 (PR #560, issue #523) |
 | 036 | [[036-composer-uppercase-v-prefix-bug/spec\|Composer requirement matching fails for uppercase-V-prefixed versions]] | specify | shipped — bug, P1 (PR #538, issue #534) |
 | 037 | [[037-supply-chain-trust-signal/spec\|Supply-chain trust signal (OpenSSF Scorecard + SLSA provenance) via deps.dev]] | plan | shipped — research/parity, P3 (PR #554, issue #543) |
 | 038 | [[038-workspace-diagnostics-pull-support/spec\|Workspace Diagnostics Pull Support]] | specify | draft — research/enhancement, P4, 4 open `[NEEDS CLARIFICATION]` items (issue #547) |
