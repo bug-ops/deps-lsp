@@ -15,7 +15,7 @@
 //!   `<clear/>` that removes the implicit `nuget.org` hop must stay removed for every
 //!   descendant project, even one whose own `NuGet.Config` adds a feed without repeating the
 //!   `<clear/>` — otherwise a leaf file would silently resurrect the public hop the root
-//!   explicitly cleared (the #248 bug class). See [`resolve`]'s accumulation loop.
+//!   explicitly cleared (the #248 bug class). See [`resolve_with_context`]'s accumulation loop.
 //! - **`<packageSourceMapping>` is merged across every level too**, not "nearest file wins":
 //!   a root mapping `{CorpFeed: ["MyCompany.*"], nuget.org: ["*"]}` combined with a leaf
 //!   mapping `{nuget.org: ["*"]}` must still route `MyCompany.Internal` to `CorpFeed` — taking
@@ -43,7 +43,9 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
+use base64::Engine;
 use deps_core::PackageName;
 use deps_core::net_policy::{
     IndexUrlError, PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
@@ -102,6 +104,11 @@ pub enum NuGetFeedUrlError {
     /// malformed value), so a normal local-feed setup doesn't warn on every parse.
     #[error("local/UNC feed paths are not supported")]
     LocalFeedUnsupported,
+    /// A DPAPI-encrypted `<Password>` credential value (issue #561, FR-003) — Windows-only,
+    /// `CryptUnprotectData`-dependent, not portably decryptable. Permanently out of scope;
+    /// rejected at parse time rather than attempting decryption or silently dropping it.
+    #[error("DPAPI-encrypted <Password> credentials are not supported")]
+    EncryptedPasswordUnsupported,
 }
 
 impl From<IndexUrlError> for NuGetFeedUrlError {
@@ -165,6 +172,85 @@ impl std::fmt::Display for NuGetFeedUrl {
     }
 }
 
+/// Which tier a parsed `NuGet.Config` file came from (issue #561, FR-001).
+///
+/// Diagnostics/gating metadata only — mirrors `deps_cargo::config::Provenance`'s "nothing
+/// branches on this to *widen* trust" invariant. In particular, [`PackageSourceEntry::tier`]
+/// is **not** consulted by the credential-binding logic in [`resolve_with_context`] (see that function's
+/// docs, §C2) — only by the [`resolve_with_context`] accumulation loop's own gate (which contribution half
+/// applies) and by `tracing::debug!` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigTier {
+    /// A user-profile-tier `NuGet.Config` (issue #561, FR-001) — not something a cloned
+    /// repository controls.
+    UserProfile,
+    /// An in-repo `NuGet.Config`, discovered by the ancestor walk (spec 035 FR-001) —
+    /// attacker-controlled the moment a hostile repository is opened.
+    Repo,
+}
+
+/// A pre-formatted `Basic base64(username:password)` `Authorization` header value (issue #561).
+///
+/// Redacted everywhere except the one call site (`crate::registry::NuGetRegistry::fetch`) that
+/// reads it into a request header. Constructible only from within this crate (see this
+/// module's security-model doc) and deliberately does **not** derive `Hash` — making "a
+/// credential value inside a hash key" a compile error rather than a review item
+/// (NFR-001/FR-016). Never stores the username/password separately once constructed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NuGetAuth(String);
+
+impl NuGetAuth {
+    /// Formats `username`/`password` into a `Basic` header value. `pub(crate)`: only
+    /// [`resolve_with_context`]'s final C2 pass, gated on [`ConfigTier::UserProfile`], ever constructs one.
+    pub(crate) fn new(username: &str, password: &str) -> Self {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        Self(format!("Basic {encoded}"))
+    }
+
+    /// The pre-formatted header value. Never logged, printed, or otherwise surfaced — callers
+    /// must not pass this to anything but an `Authorization` header.
+    pub(crate) fn header_value(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for NuGetAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NuGetAuth(***)")
+    }
+}
+
+impl std::fmt::Display for NuGetAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+/// A `<packageSourceCredentials>` `Username`/`ClearTextPassword` literal, held **pre-%ENV_VAR%-
+/// expansion** (issue #561, FR-002) — redacted everywhere except [`resolve_with_context`]'s final pass,
+/// which expands and consumes it into a [`NuGetAuth`].
+#[derive(Clone, PartialEq, Eq)]
+struct RedactedSecret(String);
+
+impl RedactedSecret {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedactedSecret(***)")
+    }
+}
+
+impl std::fmt::Display for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
 /// A present-but-unusable `<add>` entry — an invalid URL, a policy-blocked host, a
 /// disabled/credentialed source, or an unsupported protocol/local-feed value.
 #[derive(Debug, Clone)]
@@ -183,18 +269,46 @@ pub struct InvalidEntry {
 pub struct PackageSourceEntry {
     pub key: String,
     pub value: Result<NuGetFeedUrl, InvalidEntry>,
+    /// Which tier's file last set [`Self::value`] (issue #561) — diagnostics/gating metadata
+    /// only, see [`ConfigTier`]'s doc for the "never a credential gate" invariant.
+    pub tier: ConfigTier,
+    /// Set only by [`resolve_with_context`]'s final C2 pass, gated on [`ConfigTier::UserProfile`] — never
+    /// during accumulation (`upsert_source` always writes `None` here; see its doc).
+    pub auth: Option<NuGetAuth>,
+}
+
+/// One resolved hop in a [`NuGetSourceChain`] (issue #561, FR-016).
+///
+/// Replaces the plain `NuGetFeedUrl` a hop used to be, so `NuGetConfig::resolve_source_for` and
+/// `NuGetConfig::resolved_chains` (both of which reach `NuGetSourceChain::chain` exclusively
+/// through `NuGetConfig::valid_hops`/`NuGetConfig::hops_for_mapping_keys`) necessarily agree on
+/// each hop's credential data — there is no second, independently-maintained argument for it to
+/// disagree with.
+#[derive(Debug, Clone)]
+pub struct ResolvedHop {
+    pub url: NuGetFeedUrl,
+    /// The lowercased declared `<add key>` that supplied [`Self::auth`], or `None` when this
+    /// hop carries no credential. Used (not the credential value) by
+    /// `NuGetSourceChain::chain`'s hash and by `NuGetRegistry::register_chain`'s
+    /// rotation-detection, so a chain's identity is stable across a credential *value*
+    /// rotation under the same declared key.
+    pub slot: Option<String>,
+    /// Never hashed (see `NuGetSourceChain::chain`) and never fully `Debug`-printed
+    /// ([`NuGetAuth`] redacts).
+    pub auth: Option<NuGetAuth>,
 }
 
 /// One fully-resolved routing chain, produced by [`NuGetConfig::resolved_chains`], consumed by
 /// `NuGetRegistry::register_chain`. Mirrors `deps_pypi::config::ResolvedChain` exactly.
 #[derive(Debug, Clone)]
 pub struct NuGetSourceChain {
-    /// Opaque, hashed identity — `format!("nuget-chain:{:016x}", digest)` over the ordered hop
-    /// strings plus [`Self::implicit_public_fallback`]. [`NuGetConfig::resolve_source_for`] and
+    /// Opaque, hashed identity — `format!("nuget-chain:{:016x}", digest)` over each hop's URL
+    /// and [`ResolvedHop::slot`] (**never** [`ResolvedHop::auth`] — FR-016) plus
+    /// [`Self::implicit_public_fallback`]. [`NuGetConfig::resolve_source_for`] and
     /// [`NuGetConfig::resolved_chains`] recompute this independently and must agree.
     pub key: String,
     /// Ordered, already-validated hops. Never empty.
-    pub hops: Vec<NuGetFeedUrl>,
+    pub hops: Vec<ResolvedHop>,
     /// `true` only for the plain (non-mapping) chain when no ancestor `<clear/>` removed the
     /// implicit public fallback — the public hop is appended at registration time, never
     /// present in [`Self::hops`]. Always `false` for a `<packageSourceMapping>`-derived
@@ -205,10 +319,11 @@ pub struct NuGetSourceChain {
 }
 
 impl NuGetSourceChain {
-    fn chain(hops: Vec<NuGetFeedUrl>, implicit_public_fallback: bool) -> Self {
+    fn chain(hops: Vec<ResolvedHop>, implicit_public_fallback: bool) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for hop in &hops {
-            hop.as_str().hash(&mut hasher);
+            hop.url.as_str().hash(&mut hasher);
+            hop.slot.hash(&mut hasher);
         }
         implicit_public_fallback.hash(&mut hasher);
         Self {
@@ -356,6 +471,27 @@ fn key_candidates_overlap(a: &str, b: &str) -> bool {
     ca.iter().any(|x| cb.contains(x))
 }
 
+/// Resolves `key` to *exactly one* item of `items` whose `key_of` overlaps it (§3.6, FR-009).
+/// Zero matches and more-than-one match (an ambiguous union collision) both return `None` —
+/// contributing nothing, rather than fanning out to every candidate. Used at exactly three
+/// *inclusion* lookup sites: [`resolve_mapping_source_key`] (R2), and — in `resolve`'s final
+/// C2 pass — condition (1) (credential key -> resolved entry) and condition (2) (credential key
+/// -> `user_profile_add` entry). Every other [`key_candidates_overlap`] use in this module is an
+/// *exclusion* lookup (disabled/credentialed membership, the §3.4 suppression set,
+/// `file.removed`'s `retain`) and correctly stays a plain union match — union is the
+/// fail-closed direction for an exclusion, exactly-one is the fail-closed direction for an
+/// inclusion.
+fn unique_overlap<'s, T>(key: &str, items: &'s [T], key_of: impl Fn(&T) -> &str) -> Option<&'s T> {
+    let mut matches = items
+        .iter()
+        .filter(|t| key_candidates_overlap(key_of(t), key));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 /// R2 fix: resolves a `<packageSourceMapping>` key to *exactly one* declared source. Zero
 /// matches (the key names a source absent from `<packageSources>`, e.g. because it was never
 /// declared or was filtered out as disabled/credentialed) and more-than-one match (an
@@ -367,18 +503,18 @@ fn resolve_mapping_source_key<'s>(
     mapping_key: &str,
     sources: &'s [PackageSourceEntry],
 ) -> Option<&'s PackageSourceEntry> {
-    let mut matches = sources
-        .iter()
-        .filter(|s| key_candidates_overlap(&s.key, mapping_key));
-    let first = matches.next()?;
-    if matches.next().is_some() {
+    let resolved = unique_overlap(mapping_key, sources, |s| s.key.as_str());
+    if resolved.is_none()
+        && sources
+            .iter()
+            .any(|s| key_candidates_overlap(&s.key, mapping_key))
+    {
         tracing::debug!(
             key = mapping_key,
             "packageSourceMapping key resolves to more than one declared source; treating as unresolvable"
         );
-        return None;
     }
-    Some(first)
+    resolved
 }
 
 /// Resolved `NuGet.Config` view for one manifest's directory — the merged result of every
@@ -419,7 +555,7 @@ impl NuGetConfig {
         if hops.is_empty() {
             return no_source(package);
         }
-        if hops.len() == 1 && crate::registry::is_public_registry_url(hops[0].as_str()) {
+        if hops.len() == 1 && crate::registry::is_public_registry_url(hops[0].url.as_str()) {
             return DependencySource::Registry;
         }
         DependencySource::AlternateRegistry {
@@ -439,22 +575,30 @@ impl NuGetConfig {
     /// forbids trusting the *key* of a source that **is** declared and points elsewhere;
     /// here nothing is declared under that key at all, so there is no spoofable entry to
     /// misidentify.
-    fn hops_for_mapping_keys(&self, keys: &[&str]) -> Vec<NuGetFeedUrl> {
+    fn hops_for_mapping_keys(&self, keys: &[&str]) -> Vec<ResolvedHop> {
         let mut hops = Vec::new();
         for key in keys {
             let resolved = resolve_mapping_source_key(key, &self.sources)
-                .and_then(|entry| entry.value.as_ref().ok())
-                .cloned()
+                .and_then(|entry| {
+                    entry.value.as_ref().ok().map(|url| ResolvedHop {
+                        url: url.clone(),
+                        slot: entry.auth.is_some().then(|| entry.key.to_lowercase()),
+                        auth: entry.auth.clone(),
+                    })
+                })
                 .or_else(|| {
-                    key.eq_ignore_ascii_case("nuget.org")
-                        .then(NuGetFeedUrl::trusted_public)
+                    key.eq_ignore_ascii_case("nuget.org").then(|| ResolvedHop {
+                        url: NuGetFeedUrl::trusted_public(),
+                        slot: None,
+                        auth: None,
+                    })
                 });
-            if let Some(url) = resolved
+            if let Some(hop) = resolved
                 && !hops
                     .iter()
-                    .any(|h: &NuGetFeedUrl| h.as_str() == url.as_str())
+                    .any(|h: &ResolvedHop| h.url.as_str() == hop.url.as_str())
             {
-                hops.push(url);
+                hops.push(hop);
             }
         }
         hops
@@ -486,7 +630,8 @@ impl NuGetConfig {
         // (Microsoft's own canonical source-pinning pattern) resolves to plain `Registry`,
         // keeping OSV/deps.dev/hover-trust, rather than an `AlternateRegistry` chain whose
         // only hop happens to be the same URL.
-        if valid_hops.len() == 1 && crate::registry::is_public_registry_url(valid_hops[0].as_str())
+        if valid_hops.len() == 1
+            && crate::registry::is_public_registry_url(valid_hops[0].url.as_str())
         {
             return DependencySource::Registry;
         }
@@ -504,10 +649,17 @@ impl NuGetConfig {
         !self.cleared && !self.nuget_org_removed
     }
 
-    fn valid_hops(&self) -> Vec<NuGetFeedUrl> {
+    fn valid_hops(&self) -> Vec<ResolvedHop> {
         self.sources
             .iter()
-            .filter_map(|s| s.value.as_ref().ok().cloned())
+            .filter_map(|s| {
+                let url = s.value.as_ref().ok()?.clone();
+                Some(ResolvedHop {
+                    url,
+                    slot: s.auth.is_some().then(|| s.key.to_lowercase()),
+                    auth: s.auth.clone(),
+                })
+            })
             .collect()
     }
 
@@ -523,7 +675,7 @@ impl NuGetConfig {
         if self.mapping.is_empty() {
             let valid_hops = self.valid_hops();
             let is_public_only = valid_hops.len() == 1
-                && crate::registry::is_public_registry_url(valid_hops[0].as_str());
+                && crate::registry::is_public_registry_url(valid_hops[0].url.as_str());
             if !valid_hops.is_empty() && !is_public_only {
                 chains.push(NuGetSourceChain::chain(
                     valid_hops,
@@ -536,7 +688,7 @@ impl NuGetConfig {
                 let hops = self.hops_for_mapping_keys(&keys);
                 if hops.is_empty()
                     || (hops.len() == 1
-                        && crate::registry::is_public_registry_url(hops[0].as_str()))
+                        && crate::registry::is_public_registry_url(hops[0].url.as_str()))
                 {
                     continue;
                 }
@@ -564,6 +716,22 @@ struct RawSourceAdd {
     protocol_version: Option<String>,
 }
 
+/// One `<packageSourceCredentials>` child element's raw, pre-expansion credential values
+/// (issue #561, FR-002) — parsed unconditionally (parsing is tier-blind and memoized), but only
+/// ever read by [`resolve_with_context`]'s final pass when the owning file is [`ConfigTier::UserProfile`].
+#[derive(Debug, Default, Clone)]
+struct RawCredential {
+    /// The credential element's raw (undecoded) name — a source key, compared via
+    /// [`key_candidates_overlap`] like every other source key in this module.
+    key: String,
+    username: Option<RedactedSecret>,
+    /// `<ClearTextPassword>`.
+    password: Option<RedactedSecret>,
+    /// Whether a DPAPI-encrypted `<Password>` child was present (FR-003) — a distinct fail
+    /// reason from a missing/absent password, never itself held as a value.
+    encrypted: bool,
+}
+
 /// One `NuGet.Config` file's raw, unvalidated, un-cross-referenced contents.
 #[derive(Debug, Default, Clone)]
 struct RawNuGetConfigFile {
@@ -582,6 +750,10 @@ struct RawNuGetConfigFile {
     credentialed_keys: Vec<String>,
     /// `(packageSource key, patterns)` from `<packageSourceMapping>`.
     mapping: Vec<(String, Vec<String>)>,
+    /// Per-credential-element raw `Username`/`ClearTextPassword` literals (issue #561, FR-002)
+    /// — one entry per element under `<packageSourceCredentials>` that had a `Start` (not
+    /// self-closing) tag, in document order.
+    credentials: Vec<RawCredential>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -688,7 +860,39 @@ fn parse_nuget_config_raw(content: &str) -> RawNuGetConfigFile {
                     (Some(ConfigSection::Credentials), _) if credential_source.is_none() => {
                         out.credentialed_keys.push(local.clone());
                         if is_start {
+                            out.credentials.push(RawCredential {
+                                key: local.clone(),
+                                ..Default::default()
+                            });
                             credential_source = Some(local);
+                        }
+                    }
+                    // Issue #561, FR-002/FR-003: `Username`/`ClearTextPassword`/`Password`
+                    // children of an already-open credential element. Values are held
+                    // pre-expansion (`RedactedSecret`) — `%ENV_VAR%` expansion happens only in
+                    // `resolve`, never here (S5: the memoized raw-file parse must never hold an
+                    // expanded secret, so env-var rotation is visible without an mtime change).
+                    (Some(ConfigSection::Credentials), "add") if credential_source.is_some() => {
+                        let mut attr_key = String::new();
+                        let mut attr_value = String::new();
+                        for attr in e.attributes().flatten() {
+                            match attr.key.local_name().as_ref() {
+                                "key" => attr_key = decode_attr(&attr.value),
+                                "value" => attr_value = decode_attr(&attr.value),
+                                _ => {}
+                            }
+                        }
+                        if let Some(cred) = out.credentials.last_mut() {
+                            match attr_key.as_str() {
+                                "Username" => {
+                                    cred.username = Some(RedactedSecret(attr_value));
+                                }
+                                "ClearTextPassword" => {
+                                    cred.password = Some(RedactedSecret(attr_value));
+                                }
+                                "Password" => cred.encrypted = true,
+                                _ => {}
+                            }
                         }
                     }
                     (Some(ConfigSection::Mapping), "packageSource") => {
@@ -795,6 +999,7 @@ fn upsert_source(
     sources: &mut Vec<PackageSourceEntry>,
     add: &RawSourceAdd,
     policy: &RegistryAccessPolicy,
+    tier: ConfigTier,
 ) {
     let value = resolve_source_entry(add, policy);
     // LOW (security review): use the same `key_candidates_overlap` union funnel as every
@@ -806,11 +1011,23 @@ fn upsert_source(
         .iter_mut()
         .find(|s| key_candidates_overlap(&s.key, &add.key))
     {
-        existing.value = value;
+        // S1 (issue #561): whole-struct assignment — a future field addition is a compile
+        // error to miss, not a silent gap. `key` is deliberately NOT rewritten (not
+        // security-load-bearing; rewriting would perturb shipped `<packageSourceMapping>`
+        // resolution). `auth` stays `None` here unconditionally — only `resolve`'s final C2
+        // pass ever sets it, after every file's accumulation has already run.
+        *existing = PackageSourceEntry {
+            key: existing.key.clone(),
+            value,
+            tier,
+            auth: None,
+        };
     } else {
         sources.push(PackageSourceEntry {
             key: add.key.clone(),
             value,
+            tier,
+            auth: None,
         });
     }
 }
@@ -852,17 +1069,140 @@ pub struct NuGetParseContext {
     pub policy: Arc<RegistryAccessPolicy>,
     /// Memoizes each distinct `NuGet.Config` file's raw, unvalidated contents.
     pub config_cache: Arc<NuGetConfigCache>,
+    /// The resolved user-profile-tier `NuGet.Config` path (issue #561, FR-001), resolved once
+    /// at construction — never re-walked per parse (a profile created after server start is
+    /// picked up only on restart, a documented limitation, not a bug). `None` when no
+    /// candidate exists; [`NuGetParseContext::default`] leaves this `None`, so tests that
+    /// don't care about the user-profile tier are unaffected.
+    pub user_profile_config: Option<PathBuf>,
+    /// Live-updatable `registries.nuget_user_profile_sources` setting (FR-006) — gates only the
+    /// *routing* half of a user-profile file's contribution (see [`resolve_with_context`]'s doc); the
+    /// credential half always applies regardless of this flag.
+    pub user_profile_sources: Arc<AtomicBool>,
 }
 
-/// Resolves `manifest_dir`'s in-repo `NuGet.Config` ancestor chain into a merged
-/// [`NuGetConfig`] (FR-001/FR-002, C1's root-to-leaf accumulation).
+impl NuGetParseContext {
+    /// Production constructor: discovers the user-profile-tier config path once (FR-001) and
+    /// wires it alongside `policy`/`config_cache`/`user_profile_sources`.
+    #[must_use]
+    pub fn new(
+        policy: Arc<RegistryAccessPolicy>,
+        config_cache: Arc<NuGetConfigCache>,
+        user_profile_sources: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            policy,
+            config_cache,
+            user_profile_config: discover_user_profile_config(),
+            user_profile_sources,
+        }
+    }
+}
+
+/// FR-001: the first-existing user-profile-tier `NuGet.Config` candidate, in order — Windows
+/// `%APPDATA%\NuGet\NuGet.Config`; Unix `$XDG_CONFIG_HOME/NuGet/NuGet.Config` (if set) ->
+/// `~/.config/NuGet/NuGet.Config` -> `~/.nuget/NuGet/NuGet.Config`. Exactly one file, never
+/// merged — mirrors [`CONFIG_FILENAMES`]'s existing first-match idiom.
+fn user_profile_config_candidates(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if cfg!(windows) {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            candidates.push(PathBuf::from(appdata).join("NuGet").join("NuGet.Config"));
+        }
+    } else {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+            && !xdg.is_empty()
+        {
+            candidates.push(PathBuf::from(xdg).join("NuGet").join("NuGet.Config"));
+        }
+        if let Some(home) = home {
+            candidates.push(home.join(".config").join("NuGet").join("NuGet.Config"));
+            candidates.push(home.join(".nuget").join("NuGet").join("NuGet.Config"));
+        }
+    }
+    candidates
+}
+
+/// [`discover_user_profile_config`], but taking `home` explicitly instead of [`dirs::home_dir`]
+/// — lets tests inject a fixture home directory, mirroring `deps_npm::config::resolve_with_home`.
+fn discover_user_profile_config_with_home(home: Option<PathBuf>) -> Option<PathBuf> {
+    user_profile_config_candidates(home.as_deref())
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// Resolves the user-profile-tier `NuGet.Config` path once (FR-001) — call at
+/// [`NuGetParseContext`] construction, never per manifest parse.
 #[must_use]
-pub fn resolve(
+fn discover_user_profile_config() -> Option<PathBuf> {
+    discover_user_profile_config_with_home(dirs::home_dir())
+}
+
+/// Test-only convenience: [`NuGetEcosystem::parse_manifest`] calls [`resolve_with_context`]
+/// directly, so this 3-arg form (no user-profile tier, flag off) has no production caller —
+/// it exists solely to keep the 28 tests that don't exercise the user-profile path from
+/// repeating its two extra always-`None`/`false` arguments. See [`resolve_with_context`] for
+/// the full resolution algorithm this delegates to.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn resolve(
     manifest_dir: &Path,
     config_cache: &NuGetConfigCache,
     policy: &RegistryAccessPolicy,
 ) -> NuGetConfig {
-    let mut ancestors: Vec<Arc<RawNuGetConfigFile>> = Vec::new();
+    resolve_with_context(
+        manifest_dir,
+        config_cache,
+        policy,
+        None,
+        &AtomicBool::new(false),
+    )
+}
+
+/// Resolves `manifest_dir`'s in-repo `NuGet.Config` ancestor chain, plus the user-profile tier
+/// (issue #561), into a merged [`NuGetConfig`] (FR-001/FR-002, C1's root-to-leaf accumulation).
+///
+/// The form `NuGetEcosystem::parse_manifest` calls, threading [`NuGetParseContext`]'s
+/// `user_profile_config`/`user_profile_sources` fields through.
+///
+/// # Credential half vs. routing half (§3.8, FR-005/FR-006)
+///
+/// A [`ConfigTier::UserProfile`] file's contribution splits into two halves:
+///
+/// - **Credential half — always applied, regardless of `user_profile_sources`**:
+///   `credentialed_keys`, the §3.4 credential-suppression set (from its own
+///   `<disabledPackageSources>`), its raw `<packageSourceCredentials>` values, and
+///   `user_profile_add` (its own `<clear/>`/`<add>`/`<remove>` batch, tracked separately from
+///   the shared `sources` routing state).
+/// - **Routing half — skipped entirely when `user_profile_sources` is false**: `sources`,
+///   `sources_cleared`, `removed`/`nuget_org_removed`, `disabled`, `mapping` — all six,
+///   together. With the flag off, a user-profile file's `<clear/>`/`<remove>`/
+///   `<disabledPackageSources>`/`<packageSourceMapping>` reach no project at all (NFR-005).
+///
+/// A repo-tier file's contribution is unaffected by `user_profile_sources` and always applies
+/// in full — byte-identical to spec 035.
+///
+/// # Credential binding (§3.2, FR-007)
+///
+/// The final pass below binds a user-profile credential to a resolved entry `E` iff all of:
+/// (0) `E.key` does not overlap the credential-suppression set (union, exclusion); (1) exactly
+/// one user-profile credential's key-candidates overlap `E.key`; (2) exactly one
+/// `user_profile_add` entry's key-candidates overlap that credential's own key; (3) `E`'s URL
+/// equals `user_profile_add`'s URL, by normalized full-URL string equality (not origin
+/// equality — see §3.2's rationale). Any credential-key match on `E` failing any condition
+/// fails `E` closed as `HasCredentials`, except the FR-008 public-index carve-out. Repo-tier
+/// `<packageSourceCredentials>` (FR-004) is checked first and wins unconditionally,
+/// independent of any C2 outcome.
+#[must_use]
+pub fn resolve_with_context(
+    manifest_dir: &Path,
+    config_cache: &NuGetConfigCache,
+    policy: &RegistryAccessPolicy,
+    user_profile_config: Option<&Path>,
+    user_profile_sources: &AtomicBool,
+) -> NuGetConfig {
+    let mut repo_ancestors: Vec<Arc<RawNuGetConfigFile>> = Vec::new();
+    let mut repo_paths: Vec<PathBuf> = Vec::new();
     let mut current: Option<&Path> = Some(manifest_dir);
     let mut depth = 0usize;
     while let Some(dir) = current {
@@ -875,7 +1215,8 @@ pub fn resolve(
             let candidate: PathBuf = dir.join(name);
             if candidate.is_file() {
                 if let Some(parsed) = config_cache.get_or_parse(&candidate) {
-                    ancestors.push(parsed);
+                    repo_ancestors.push(parsed);
+                    repo_paths.push(candidate);
                 }
                 break;
             }
@@ -884,22 +1225,90 @@ pub fn resolve(
         current = dir.parent();
     }
 
+    // FR-001: a user-profile candidate reachable at both tiers (canonicalized) is treated as
+    // Repo (lower trust wins) — dropped here rather than loaded a second time under the
+    // higher-trust tier. A `canonicalize` failure on the user-profile candidate itself drops
+    // it entirely (fail closed).
+    let user_profile_file: Option<Arc<RawNuGetConfigFile>> = user_profile_config.and_then(|upc| {
+        let canon = std::fs::canonicalize(upc).ok()?;
+        let is_repo_dup = repo_paths
+            .iter()
+            .any(|p| std::fs::canonicalize(p).ok().as_deref() == Some(canon.as_path()));
+        if is_repo_dup {
+            return None;
+        }
+        config_cache.get_or_parse(&canon)
+    });
+
+    // Leaf-to-root discovery order (matching `repo_ancestors`'s own order), with the
+    // user-profile file appended last — so after `.rev()` below it is processed *first*,
+    // giving any repo-tier file the ability to override it (§3.8).
+    let mut ancestors: Vec<(ConfigTier, Arc<RawNuGetConfigFile>)> = repo_ancestors
+        .into_iter()
+        .map(|f| (ConfigTier::Repo, f))
+        .collect();
+    if let Some(user_file) = user_profile_file {
+        ancestors.push((ConfigTier::UserProfile, user_file));
+    }
+
+    let user_profile_sources_enabled =
+        user_profile_sources.load(std::sync::atomic::Ordering::Relaxed);
+
     let mut sources: Vec<PackageSourceEntry> = Vec::new();
     let mut cleared = false;
     let mut nuget_org_removed = false;
     let mut disabled_raw: Vec<(String, String)> = Vec::new();
-    let mut credentialed_raw: Vec<String> = Vec::new();
+    let mut repo_credentialed_raw: Vec<String> = Vec::new();
+    let mut user_credentialed_raw: Vec<String> = Vec::new();
     let mut mapping = PackageSourceMapping::default();
+
+    // Credential-half accumulators (§3.8) — populated identically regardless of the flag.
+    let mut user_credentials: Vec<RawCredential> = Vec::new();
+    let mut user_profile_add: Vec<PackageSourceEntry> = Vec::new();
+    let mut user_profile_credential_suppressed: HashSet<String> = HashSet::new();
 
     // C1: apply root -> leaf (reverse of the leaf-to-root discovery order above). `cleared`
     // is sticky for the rest of the walk once set — see this module's doc.
-    for file in ancestors.iter().rev() {
+    for (tier, file) in ancestors.iter().rev() {
+        let tier = *tier;
+
+        if tier == ConfigTier::UserProfile {
+            // Credential half — always runs, regardless of `user_profile_sources` (§3.8).
+            user_credentialed_raw.extend(file.credentialed_keys.iter().cloned());
+            user_credentials.extend(file.credentials.iter().cloned());
+            for (key, value) in &file.disabled {
+                if value.eq_ignore_ascii_case("true") {
+                    user_profile_credential_suppressed.extend(key_candidates(key));
+                }
+            }
+            if file.sources_cleared {
+                user_profile_add.clear();
+            }
+            for add in &file.sources {
+                upsert_source(&mut user_profile_add, add, policy, ConfigTier::UserProfile);
+            }
+            for key in &file.removed {
+                user_profile_add.retain(|e| !key_candidates_overlap(&e.key, key));
+            }
+
+            if !user_profile_sources_enabled {
+                // Routing half skipped entirely for this file (FR-006).
+                continue;
+            }
+        } else {
+            repo_credentialed_raw.extend(file.credentialed_keys.iter().cloned());
+        }
+
+        // Routing half: repo tier always; user-profile tier only when the flag is on. Note
+        // `file.disabled` is deliberately NOT added to `disabled_raw` for a user-profile-tier
+        // file even here — §3.4 keeps user-profile `<disabledPackageSources>` out of the
+        // machine-wide set unconditionally; it only ever feeds the suppression set above.
         if file.sources_cleared {
             sources.clear();
             cleared = true;
         }
         for add in &file.sources {
-            upsert_source(&mut sources, add, policy);
+            upsert_source(&mut sources, add, policy, tier);
         }
         // S4 fix (impl-critic): `<remove key="..."/>` removes a source accumulated so far
         // (this file's own `<add>`s or an inherited ancestor entry) — without this, an
@@ -911,8 +1320,9 @@ pub fn resolve(
                 nuget_org_removed = true;
             }
         }
-        disabled_raw.extend(file.disabled.iter().cloned());
-        credentialed_raw.extend(file.credentialed_keys.iter().cloned());
+        if tier == ConfigTier::Repo {
+            disabled_raw.extend(file.disabled.iter().cloned());
+        }
         for (source_key, patterns) in &file.mapping {
             mapping.extend(source_key, patterns);
         }
@@ -924,29 +1334,62 @@ pub fn resolve(
             disabled_keys.extend(key_candidates(key));
         }
     }
-    let mut credentialed_keys: HashSet<String> = HashSet::new();
-    for key in &credentialed_raw {
-        credentialed_keys.extend(key_candidates(key));
-    }
+    let repo_credentialed_keys: HashSet<String> = repo_credentialed_raw
+        .iter()
+        .flat_map(|k| key_candidates(k))
+        .collect();
+    let user_credentialed_keys: HashSet<String> = user_credentialed_raw
+        .iter()
+        .flat_map(|k| key_candidates(k))
+        .collect();
 
     for entry in &mut sources {
-        if entry.value.is_err() {
+        let Ok(url) = entry.value.as_ref() else {
+            continue;
+        };
+        let resolved_url = url.as_str().to_string();
+        let candidates = key_candidates(&entry.key);
+        let is_disabled = candidates.iter().any(|c| disabled_keys.contains(c));
+        let is_repo_credentialed = candidates
+            .iter()
+            .any(|c| repo_credentialed_keys.contains(c));
+        let is_user_credentialed = candidates
+            .iter()
+            .any(|c| user_credentialed_keys.contains(c));
+        let is_public = crate::registry::is_public_registry_url(&resolved_url);
+
+        // FR-004: repo-tier `<packageSourceCredentials>` always wins, unconditionally —
+        // matching spec 035 FR-009 verbatim, independent of any C2 outcome and of the FR-008
+        // public-index carve-out (a repo declaring `nuget.org` under
+        // `<packageSourceCredentials>` still fails closed, exactly as it did before this
+        // feature).
+        if is_repo_credentialed {
+            fail_closed(entry, NuGetFeedUrlError::HasCredentials);
             continue;
         }
-        let candidates = key_candidates(&entry.key);
-        let is_credentialed = candidates.iter().any(|c| credentialed_keys.contains(c));
-        let is_disabled = candidates.iter().any(|c| disabled_keys.contains(c));
-        if is_credentialed || is_disabled {
-            let raw = match &entry.value {
-                Ok(url) => url.as_str().to_string(),
-                Err(invalid) => invalid.raw.clone(),
-            };
-            let reason = if is_credentialed {
-                NuGetFeedUrlError::HasCredentials
-            } else {
-                NuGetFeedUrlError::Disabled
-            };
-            entry.value = Err(InvalidEntry { raw, reason });
+        if is_disabled {
+            fail_closed(entry, NuGetFeedUrlError::Disabled);
+            continue;
+        }
+        // FR-008: the public-index carve-out — a user-profile-derived credentialed-key match
+        // never forces `HasCredentials`, and never attaches, for the real public index.
+        if is_public {
+            continue;
+        }
+
+        match bind_user_profile_credential(
+            entry,
+            &user_credentials,
+            &user_profile_add,
+            &user_profile_credential_suppressed,
+            &resolved_url,
+        ) {
+            Some(Ok(auth)) => entry.auth = Some(auth),
+            Some(Err(reason)) => fail_closed(entry, reason),
+            None if is_user_credentialed => {
+                fail_closed(entry, NuGetFeedUrlError::HasCredentials);
+            }
+            None => {}
         }
     }
 
@@ -956,6 +1399,125 @@ pub fn resolve(
         nuget_org_removed,
         mapping,
     }
+}
+
+/// Overwrites `entry.value` with `Err(InvalidEntry { reason, .. })`, preserving whatever raw
+/// text was already resolvable (the URL if valid, or the prior `InvalidEntry::raw` if not).
+fn fail_closed(entry: &mut PackageSourceEntry, reason: NuGetFeedUrlError) {
+    let raw = match &entry.value {
+        Ok(url) => url.as_str().to_string(),
+        Err(invalid) => invalid.raw.clone(),
+    };
+    entry.value = Err(InvalidEntry { raw, reason });
+}
+
+/// §3.2/FR-007: attempts to bind a user-profile credential to `entry` (whose resolved URL is
+/// `resolved_url`). Returns `None` when no user-profile credential key matches `entry.key` at
+/// all (nothing to bind, not an error — the caller decides separately whether that's fine).
+/// Returns `Some(Err(reason))` when a credential key matched but conditions (0)-(3) failed, or
+/// the matched credential itself failed to expand (unset `%ENV_VAR%`, DPAPI-encrypted). Returns
+/// `Some(Ok(auth))` on a successful bind.
+fn bind_user_profile_credential(
+    entry: &PackageSourceEntry,
+    user_credentials: &[RawCredential],
+    user_profile_add: &[PackageSourceEntry],
+    suppressed: &HashSet<String>,
+    resolved_url: &str,
+) -> Option<Result<NuGetAuth, NuGetFeedUrlError>> {
+    // (0): suppression — union match, the fail-closed direction for an exclusion. Checked here
+    // rather than short-circuiting on it alone, because (0) only matters once (1) below has
+    // established that a credential actually exists to suppress — otherwise there is nothing to
+    // bind and the correct return is `None`, not `Some(Err(..))`.
+    let candidates = key_candidates(&entry.key);
+    let suppressed_match = candidates.iter().any(|c| suppressed.contains(c));
+
+    // (1): exactly one user-profile credential's key-candidates overlap `entry.key`.
+    let credential = unique_overlap(&entry.key, user_credentials, |c| c.key.as_str())?;
+
+    if suppressed_match {
+        return Some(Err(NuGetFeedUrlError::HasCredentials));
+    }
+
+    // (2): exactly one `user_profile_add` entry's key-candidates overlap the credential's own
+    // key.
+    let Some(add_entry) = unique_overlap(&credential.key, user_profile_add, |e| e.key.as_str())
+    else {
+        return Some(Err(NuGetFeedUrlError::HasCredentials));
+    };
+
+    // (3): normalized full-URL equality — not origin equality (see §3.2's rationale).
+    let Ok(add_url) = add_entry.value.as_ref() else {
+        return Some(Err(NuGetFeedUrlError::HasCredentials));
+    };
+    if add_url.as_str() != resolved_url {
+        return Some(Err(NuGetFeedUrlError::HasCredentials));
+    }
+
+    Some(expand_credential(credential))
+}
+
+/// FR-002/FR-003: expands `%ENV_VAR%` references (post-cache, credential values only) and
+/// formats the result into a [`NuGetAuth`]. A DPAPI-encrypted `<Password>` fails closed as
+/// [`NuGetFeedUrlError::EncryptedPasswordUnsupported`]; a missing `ClearTextPassword`, or any
+/// referenced environment variable being unset, fails closed as
+/// [`NuGetFeedUrlError::HasCredentials`].
+fn expand_credential(credential: &RawCredential) -> Result<NuGetAuth, NuGetFeedUrlError> {
+    if credential.encrypted {
+        tracing::debug!(
+            key = %credential.key,
+            "DPAPI-encrypted <Password> is not supported; dropping credential"
+        );
+        return Err(NuGetFeedUrlError::EncryptedPasswordUnsupported);
+    }
+    let Some(password) = &credential.password else {
+        return Err(NuGetFeedUrlError::HasCredentials);
+    };
+    let username = credential
+        .username
+        .as_ref()
+        .map(RedactedSecret::as_str)
+        .unwrap_or("");
+    let username = expand_env_vars(username)?;
+    let password = expand_env_vars(password.as_str())?;
+    Ok(NuGetAuth::new(&username, &password))
+}
+
+/// Expands every `%NAME%` reference in `raw` against the process environment. Any referenced
+/// variable being unset fails the *whole* expansion closed (FR-002) — never a partial
+/// substitution. `%` sequences that don't form a well-formed `%NAME%` reference (empty name, a
+/// non-alphanumeric/underscore character, or an unterminated `%`) are left as literal text.
+fn expand_env_vars(raw: &str) -> Result<String, NuGetFeedUrlError> {
+    expand_env_vars_with(raw, |name| std::env::var(name).ok())
+}
+
+/// [`expand_env_vars`], but reading variables through `lookup` instead of [`std::env::var`]
+/// directly — lets tests inject a fake environment instead of mutating the real process
+/// environment (this workspace forbids `unsafe`, and Rust 2024 made `std::env::set_var` an
+/// `unsafe fn`, so a test cannot do that mutation at all; mirrors
+/// `deps_npm::config::expand_env_vars_with`'s identical rationale).
+fn expand_env_vars_with(
+    raw: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, NuGetFeedUrlError> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%'
+            && let Some(end) = chars[i + 1..].iter().position(|&c| c == '%')
+        {
+            let name: String = chars[i + 1..i + 1 + end].iter().collect();
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let value = lookup(&name).ok_or(NuGetFeedUrlError::HasCredentials)?;
+                out.push_str(&value);
+                i += end + 2;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1036,6 +1598,8 @@ mod tests {
                 raw: url.to_string(),
                 reason,
             }),
+            tier: ConfigTier::Repo,
+            auth: None,
         }
     }
 
@@ -1177,11 +1741,11 @@ mod tests {
         assert!(!chains[0].implicit_public_fallback);
         assert_eq!(chains[0].hops.len(), 2);
         assert_eq!(
-            chains[0].hops[0].as_str(),
+            chains[0].hops[0].url.as_str(),
             "https://corp.example/v3/index.json"
         );
         assert_eq!(
-            chains[0].hops[1].as_str(),
+            chains[0].hops[1].url.as_str(),
             "https://second.example/v3/index.json"
         );
     }
@@ -1328,7 +1892,10 @@ mod tests {
         let chains = config.resolved_chains();
         let chain = chains.iter().find(|c| c.key == index).unwrap();
         assert_eq!(chain.hops.len(), 1);
-        assert_eq!(chain.hops[0].as_str(), "https://corp.example/v3/index.json");
+        assert_eq!(
+            chain.hops[0].url.as_str(),
+            "https://corp.example/v3/index.json"
+        );
         assert!(!chain.implicit_public_fallback);
     }
 
@@ -1434,7 +2001,10 @@ mod tests {
         };
         let chains = config.resolved_chains();
         let chain = chains.iter().find(|c| c.key == index).unwrap();
-        assert_eq!(chain.hops[0].as_str(), "https://corp.example/v3/index.json");
+        assert_eq!(
+            chain.hops[0].url.as_str(),
+            "https://corp.example/v3/index.json"
+        );
 
         // The unrelated public package must still resolve via the merged `*` -> nuget.org
         // mapping, unaffected by the merge.
@@ -1945,8 +2515,422 @@ mod tests {
             "XML-name-equivalent keys must upsert into one entry, not two"
         );
         assert_eq!(
-            chains[0].hops[0].as_str(),
+            chains[0].hops[0].url.as_str(),
             "https://new.example/v3/index.json"
         );
+    }
+
+    // --- issue #561: user-profile credentials, C2 binding, %ENV_VAR% expansion ---
+
+    fn write_user_profile(dir: &Path, content: &str) -> PathBuf {
+        let path = dir.join("UserProfile.NuGet.Config");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn resolve_ctx(
+        repo_dir: &Path,
+        cache: &NuGetConfigCache,
+        policy: &RegistryAccessPolicy,
+        user_profile: Option<&Path>,
+        flag_on: bool,
+    ) -> NuGetConfig {
+        resolve_with_context(
+            repo_dir,
+            cache,
+            policy,
+            user_profile,
+            &AtomicBool::new(flag_on),
+        )
+    }
+
+    const CORP_CRED_USER_PROFILE: &str = r#"<configuration>
+        <packageSources>
+            <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+        </packageSources>
+        <packageSourceCredentials>
+            <CorpFeed>
+                <add key="Username" value="user" />
+                <add key="ClearTextPassword" value="pat-value" />
+            </CorpFeed>
+        </packageSourceCredentials>
+    </configuration>"#;
+
+    /// SC-001/SC-006: a repo `<add key="CorpFeed">` at the exact URL the user-profile config
+    /// declares gets the credential attached.
+    #[test]
+    fn test_c2_exact_url_match_attaches_credential() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(root.path(), CORP_CRED_USER_PROFILE);
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+
+        let chains = config.resolved_chains();
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].hops.len(), 1);
+        assert!(
+            chains[0].hops[0].auth.is_some(),
+            "matching-URL repo entry must receive the user-profile credential"
+        );
+        assert_eq!(chains[0].hops[0].slot.as_deref(), Some("corpfeed"));
+    }
+
+    /// SC-006: same-origin-different-path repo entry must fail closed as `HasCredentials` —
+    /// condition (3) is full-URL equality, not origin equality.
+    #[test]
+    fn test_c2_same_origin_different_path_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://pkgs.dev.azure.com/real-org/_packaging/x/nuget/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="user" />
+                        <add key="ClearTextPassword" value="pat" />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://pkgs.dev.azure.com/attacker-org/_packaging/x/nuget/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+
+        assert!(
+            config.resolved_chains().is_empty(),
+            "URL mismatch must fail the source closed, not attach nor route it"
+        );
+    }
+
+    /// SC-007/§3.4: a user-profile-disabled key never receives a credential on a matching
+    /// repo-declared source, while the repo source is still queried (just unauthenticated is
+    /// impossible here since it has real credentials configured — so it must fail closed, not
+    /// merely "unauthenticated", per condition (0)).
+    #[test]
+    fn test_c2_condition_0_suppressed_key_fails_closed_not_machine_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="user" />
+                        <add key="ClearTextPassword" value="pat" />
+                    </CorpFeed>
+                </packageSourceCredentials>
+                <disabledPackageSources>
+                    <add key="CorpFeed" value="true" />
+                </disabledPackageSources>
+            </configuration>"#,
+        );
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+
+        // The repo's CorpFeed is not machine-wide disabled by a user-profile suppression —
+        // only the credential binding is refused, which here means the entry fails closed
+        // (HasCredentials) since it *did* match a credential key.
+        assert!(config.resolved_chains().is_empty());
+    }
+
+    /// SC-002: `%ENV_VAR%` expansion — set resolves, unset fails closed, and the unexpanded
+    /// literal is never leaked into the result. Exercises `expand_env_vars_with` directly
+    /// (this workspace forbids `unsafe`, so a test cannot mutate the real process
+    /// environment — see that function's doc).
+    #[test]
+    fn test_env_var_expansion_set_and_unset() {
+        let set = expand_env_vars_with("%CORP_FEED_PAT%", |name| {
+            (name == "CORP_FEED_PAT").then(|| "secret-pat".to_string())
+        });
+        assert_eq!(set.unwrap(), "secret-pat");
+
+        let unset = expand_env_vars_with("%CORP_FEED_PAT%", |_| None);
+        assert!(matches!(unset, Err(NuGetFeedUrlError::HasCredentials)));
+    }
+
+    /// SC-002 end-to-end: the same expansion wired through `resolve`'s credential-binding
+    /// pass — a credential whose `RawCredential` has no `password` (the shape an unset env
+    /// var's literal string alone cannot distinguish from a real missing `ClearTextPassword`
+    /// at this layer) fails closed via `expand_credential`.
+    #[test]
+    fn test_expand_credential_missing_password_fails_closed() {
+        let credential = RawCredential {
+            key: "CorpFeed".to_string(),
+            username: Some(RedactedSecret("user".to_string())),
+            password: None,
+            encrypted: false,
+        };
+        assert!(matches!(
+            expand_credential(&credential),
+            Err(NuGetFeedUrlError::HasCredentials)
+        ));
+    }
+
+    /// SC-002/NFR-001: `Debug`/`Display` on the credential-holding types never leak the
+    /// literal secret.
+    #[test]
+    fn test_nuget_auth_and_redacted_secret_never_debug_print_the_literal() {
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        let auth = NuGetAuth::new("user", "super-secret-pat");
+        assert!(!format!("{auth:?}").contains("super-secret-pat"));
+        assert!(!format!("{auth}").contains("super-secret-pat"));
+
+        let secret = RedactedSecret("super-secret-pat".to_string());
+        assert!(!format!("{secret:?}").contains("super-secret-pat"));
+        assert!(!format!("{secret}").contains("super-secret-pat"));
+    }
+
+    /// FR-003: a DPAPI-encrypted `<Password>` fails closed with a distinct reason, never
+    /// `HasCredentials`.
+    #[test]
+    fn test_dpapi_encrypted_password_rejected_distinctly() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="user" />
+                        <add key="Password" value="AQAAANCM...encrypted..." />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+
+        assert!(config.resolved_chains().is_empty());
+        // No `<clear/>` anywhere in the chain, so the dropped CorpFeed leaves the implicit
+        // `nuget.org` tail reachable exactly as if nothing had been configured (NFR-004,
+        // matching `test_disabled_source_case_insensitive_key_match`'s identical shape) — the
+        // distinct-reason assertion is in `expand_credential`'s own unit test below instead.
+        assert_eq!(
+            config.resolve_source_for(&pkg("Any.Package")),
+            DependencySource::Registry
+        );
+    }
+
+    /// FR-003: the distinct-reason assertion for a DPAPI-encrypted credential, at the
+    /// `expand_credential` unit level (see the end-to-end test above for the resolve()-level
+    /// fail-closed behavior).
+    #[test]
+    fn test_expand_credential_encrypted_password_is_distinct_reason() {
+        let credential = RawCredential {
+            key: "CorpFeed".to_string(),
+            username: Some(RedactedSecret("user".to_string())),
+            password: None,
+            encrypted: true,
+        };
+        assert!(matches!(
+            expand_credential(&credential),
+            Err(NuGetFeedUrlError::EncryptedPasswordUnsupported)
+        ));
+    }
+
+    /// FR-004/SC-010: repo-tier `<packageSourceCredentials>` fails closed unconditionally,
+    /// independent of any C2 binding outcome — even when the user-profile config *also*
+    /// credentials the exact same URL.
+    #[test]
+    fn test_repo_tier_credential_always_fails_closed_even_with_matching_user_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(root.path(), CORP_CRED_USER_PROFILE);
+        write_config(
+            &repo,
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="repo-user" />
+                        <add key="ClearTextPassword" value="repo-pass" />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+
+        assert!(
+            config.resolved_chains().is_empty(),
+            "repo-tier credentialed source must fail closed regardless of C2"
+        );
+    }
+
+    /// SC-012/FR-008: a user-profile credential named for `nuget.org` never attaches to, nor
+    /// blocks, a repo entry resolving to the real public index.
+    #[test]
+    fn test_public_index_carve_out_never_blocks_or_authenticates() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <nuget.org>
+                        <add key="Username" value="user" />
+                        <add key="ClearTextPassword" value="upstream-pat" />
+                    </nuget.org>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+
+        // Resolves to plain `Registry` (public index), never `HasCredentials`.
+        assert_eq!(
+            config.resolve_source_for(&pkg("Newtonsoft.Json")),
+            DependencySource::Registry
+        );
+    }
+
+    /// SC-005/NFR-005: with the flag off, a user-profile file's `<clear/>`/
+    /// `<packageSourceMapping>`/`<disabledPackageSources>` produce byte-identical
+    /// `valid_hops`/routing to a run with no user-profile file at all.
+    #[test]
+    fn test_flag_off_user_profile_routing_directives_have_zero_effect() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSources>
+                    <clear />
+                    <add key="EvilFeed" value="https://evil.example/v3/index.json" />
+                </packageSources>
+                <disabledPackageSources>
+                    <add key="CorpFeed" value="true" />
+                </disabledPackageSources>
+                <packageSourceMapping>
+                    <packageSource key="EvilFeed">
+                        <package pattern="*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+
+        let with_profile = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        let without_profile = resolve_ctx(&repo, &cache, &policy, None, false);
+
+        let hops_of = |c: &NuGetConfig| -> Vec<String> {
+            c.valid_hops()
+                .into_iter()
+                .map(|h| h.url.as_str().to_string())
+                .collect()
+        };
+        assert_eq!(hops_of(&with_profile), hops_of(&without_profile));
+        assert_eq!(
+            with_profile.resolve_source_for(&pkg("Any.Package")),
+            without_profile.resolve_source_for(&pkg("Any.Package"))
+        );
+    }
+
+    /// SC-005/US-005: with the flag on, a user-profile-only `<add>` (no repo `NuGet.Config`
+    /// declaring it) becomes an `AlternateRegistry` routing hop.
+    #[test]
+    fn test_flag_on_user_profile_only_source_becomes_routing_hop() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+
+        let flag_off = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+        assert!(flag_off.resolved_chains().is_empty());
+
+        let flag_on = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), true);
+        assert!(matches!(
+            flag_on.resolve_source_for(&pkg("Any.Package")),
+            DependencySource::AlternateRegistry { .. }
+        ));
+    }
+
+    /// FR-009: the non-transitive key-aliasing counterexample from the critic review —
+    /// `"Corp_x005f_x0020_Feed"` and `"Corp Feed"` don't overlap each other directly, but both
+    /// overlap `"Corp_x0020_Feed"`. `unique_overlap` must resolve this as ambiguous (>=2
+    /// matches), not silently pick one.
+    #[test]
+    fn test_unique_overlap_non_transitive_aliasing_is_ambiguous() {
+        let policy = all_policy();
+        let items = [
+            source(
+                "Corp_x005f_x0020_Feed",
+                "https://a.example/v3/index.json",
+                &policy,
+            ),
+            source("Corp Feed", "https://b.example/v3/index.json", &policy),
+        ];
+        assert!(unique_overlap("Corp_x0020_Feed", &items, |s| s.key.as_str()).is_none());
     }
 }

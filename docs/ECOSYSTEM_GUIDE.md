@@ -439,10 +439,52 @@ case-insensitive and additionally compares against NuGet's `_xHHHH_`-encoded
 child-element-name form (a source named `Corp Feed` appears as
 `<Corp_x0020_Feed>` under `<packageSourceCredentials>`).
 
-**Authentication**: phase 1 carries **no** authentication at all, the same
-Cargo/npm/PyPI precedent — a credentialed source fails closed per the previous
-paragraph rather than being queried anonymously; `ClearTextPassword`/DPAPI-encrypted
-`Password` values are never parsed into any retained field.
+**Authentication (issue #561)**: a **user-profile-tier** `NuGet.Config`
+(Windows `%APPDATA%\NuGet\NuGet.Config`; Unix `$XDG_CONFIG_HOME/NuGet/NuGet.Config`
+if set, else `~/.config/NuGet/NuGet.Config`, else `~/.nuget/NuGet/NuGet.Config` —
+the first-existing candidate, never merged) is now discovered once at server
+start and its `<packageSourceCredentials>` `ClearTextPassword`/`Username`
+values are parsed and expanded (`%ENV_VAR%` syntax, re-evaluated on every
+resolve so rotating the variable's value takes effect without a file edit). A
+credential declared there under key `K` attaches as a `Basic` `Authorization`
+header to a repo-declared source **only when all of**: the repo entry's own
+key overlaps exactly one user-profile credential; that credential's key
+overlaps exactly one user-profile `<add>`; and the repo entry's URL is
+**byte-identical** to that `<add>`'s URL (origin-level matching is
+deliberately not enough — see below). Any partial match — same key, different
+URL; an ambiguous double-match; a `%ENV_VAR%` that is unset; a DPAPI-encrypted
+`<Password>` — fails the source closed exactly like an unauthenticated
+credentialed source always has, **never** queried anonymously. A repo-tier
+`<packageSourceCredentials>` block still forces the same unconditional
+fail-closed behavior as before this feature, regardless of any user-profile
+match.
+
+Why full-URL equality, not origin equality: `pkgs.dev.azure.com` and
+`nuget.pkg.github.com` are shared by every tenant/organization on that host. A
+hostile repository could otherwise declare its *own* project's URL under the
+same `key` your user profile trusts and receive your PAT on a same-origin,
+different-project request. Requiring the exact URL closes that; it also means
+the credential is never sent anywhere off the declared feed's origin, even
+via a redirect a compromised or misconfigured service index tries to induce.
+
+A credential named for the real `api.nuget.org` (e.g. an Azure-Artifacts
+upstreaming setup) never forces a source closed and never attaches — that
+lookup was already unauthenticated before this feature and stays that way,
+since it is not the leak this feature closes (see "Corrections" below).
+
+**`registries.nuget_user_profile_sources`** (default `false`): with the
+setting off, a user-profile file contributes **credentials only** — its own
+`<clear/>`/`<remove>`/`<disabledPackageSources>`/`<packageSourceMapping>`
+reach no project, and a user-profile-only `<add>` (nothing in the repo names
+it) is inert. Turning it on additionally makes such an `<add>` a routing hop
+— covering the common `dotnet nuget add source` workflow with no
+repo-committed `NuGet.Config` — at the cost of downgrading every dependency
+resolved through it to `AlternateRegistry` (OSV/deps.dev/hover-trust
+suppressed, same tradeoff any private feed already carries). A
+`<disabledPackageSources>` entry in your own profile still withholds your
+credential from a matching repo-declared source even with the setting off —
+it only ever suppresses the credential, never machine-wide-disables that
+source for other projects.
 
 **Fail-closed on misconfiguration**: an invalid feed URL (non-https, userinfo,
 malformed, a local/UNC filesystem path, or `protocolVersion="2"`) shows no
@@ -462,23 +504,48 @@ resource URLs) with no equivalent in Cargo's/npm's/PyPI's single-URL registry
 model, so a validated top-level host could otherwise redirect resolution to an
 internal host via its own service index.
 
+**Corrections (issue #561/#562)**: two limitations previously listed here are
+now closed, not accepted risk:
+- A workspace-declared/alternate feed's flat-container, service-index, and
+  registration-hive fetches now go through an origin-pinned,
+  connect-address-guarded transport — a redirect off the resolved
+  `PackageBaseAddress`/`RegistrationsBaseUrl` to a different host is stopped,
+  matching the guarantee `api.nuget.org` itself already had. Registration-hive
+  enrichment (publish-time freshness, the hover-only `*(unlisted)*` marker) is
+  no longer skipped for these feeds.
+- **Wording fix, not a new claim**: the FR-008 public-index carve-out (a
+  user-profile credential named for `nuget.org` never forces a source
+  closed) is *not* a claim that querying `api.nuget.org` by package name is
+  leak-free — it already leaks the name to Microsoft, which is the exact
+  leak class #561 exists to close for a genuinely private feed. The
+  carve-out exists only because `deps-lsp` already performs this
+  unauthenticated public-index lookup today, and this feature must not
+  regress that already-shipped behavior. A user who wants the public index
+  itself treated as private should not declare it in `<packageSources>`.
+
 **Known limitations**:
 - Editing `NuGet.Config` does not take effect until the affected manifest is
-  next reparsed — no dedicated file watcher.
+  next reparsed — no dedicated file watcher. A user-profile config created
+  after server start is picked up only on restart (discovered once, not
+  re-walked per parse). Flipping `registries.nuget_user_profile_sources` off
+  does not retroactively purge an already-registered `AlternateRegistry`
+  chain either — same non-purge shape, takes effect on next reparse.
 - `<packageSourceMapping><clear/>` is not honored — mapping rules only ever
   accumulate across the ancestor chain, never reset, even by a leaf file's own
   `<clear/>` inside that element. Deliberate: undoing the merge-not-nearest-wins
   fix for this one element needs its own empirical verification against real
   NuGet first.
-- No authentication of any kind (see above) — an auth-gated private feed (Azure
-  DevOps PAT, GitHub Packages token) is not reachable end-to-end until a
-  follow-up auth spec ships.
-- A workspace-declared feed's flat-container/service-index fetch loses
-  origin-pinning (a redirect off the resolved `PackageBaseAddress` to another
-  public host is permitted under `public_only`, unlike the origin-pinned
-  transport `api.nuget.org` itself uses) and skips registration-hive
-  enrichment entirely — no publish-time freshness data and no hover-only
-  `*(unlisted)*` marker for a private-feed-resolved package.
+- Authentication is user-profile-tier only (see above) — a repo-tier
+  `NuGet.Config` can never carry a credential, even opt-in: a cloned
+  repository controls both the credential-shaped value and the destination
+  URL it would be sent to, an arbitrary-secret-exfiltration primitive no
+  settings key can safely gate.
+- DPAPI-encrypted `<Password>` values are permanently out of scope
+  (Windows-only, not portably decryptable) — rejected at parse time, never
+  silently dropped.
+- The machine-wide config tier (`/etc/opt/NuGet/Config`,
+  `%ProgramFiles(x86)%\NuGet\Config`) is not read — explicit non-goal, same
+  cut as the user-profile-vs-repo boundary above.
 - A dependency resolved to a private feed drops out of OSV vulnerability
   scanning, the deps.dev supply-chain signal, and the hover trust badge, and
   its hover heading omits the `nuget.org` package-page link (it would be

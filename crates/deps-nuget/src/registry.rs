@@ -6,7 +6,7 @@
 //! ("RegistrationsBaseUrl") resource URLs — the last one backs both publish-time freshness
 //! and [`NuGetRegistry::unlisted_versions_for_hover`]'s hover-only unlisted enrichment (D1).
 
-use crate::config::{NuGetFeedUrl, NuGetSourceChain};
+use crate::config::{NuGetAuth, NuGetSourceChain, ResolvedHop};
 use crate::types::{NuGetVersion, PackageInfo};
 use crate::version::compare_versions;
 use dashmap::DashMap;
@@ -18,8 +18,74 @@ use deps_core::{
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::OnceCell;
+
+/// Per-process salt for [`own_auth_digest`]/[`chain_auth_digest`] (issue #561, FR-014). The
+/// salt matters because a chain's `key` is `tracing::debug!`-logged and surfaces as
+/// `DependencySource::AlternateRegistry.index`: an unsalted 64-bit non-cryptographic hash of a
+/// credential header value in a log file is a brute-force target.
+fn digest_salt() -> u64 {
+    static SALT: OnceLock<u64> = OnceLock::new();
+    *SALT.get_or_init(|| {
+        use std::collections::hash_map::RandomState;
+        use std::hash::BuildHasher;
+        let mut hasher = RandomState::new().build_hasher();
+        std::process::id().hash(&mut hasher);
+        std::time::SystemTime::now().hash(&mut hasher);
+        hasher.finish()
+    })
+}
+
+/// A per-request auth identity for [`HttpCache::get_cached_pinned_with_headers`]'s `auth_id`
+/// argument (FR-014) — `0` when `auth` is `None`, otherwise a salted hash of `declared_origin`
+/// and the credential's header value. Deliberately scoped to *one hop's own* credential, not
+/// the whole chain's (see [`chain_auth_digest`] for the distinct, chain-wide value
+/// `register_chain` uses for rotation detection): each hop's own cache-key correctness depends
+/// only on its own credential, independent of whether some other hop in the same chain also
+/// rotated.
+fn own_auth_digest(declared_origin: &str, auth: Option<&NuGetAuth>) -> u64 {
+    let Some(auth) = auth else { return 0 };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    digest_salt().hash(&mut hasher);
+    declared_origin.hash(&mut hasher);
+    auth.header_value().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A chain-wide digest over every hop's `(url, auth)` pair, in order (issue #561, S3) — used
+/// only by `NuGetRegistry::register_chain` to detect whether *any* hop's credential in a
+/// re-resolved chain differs from what is currently registered, never as a per-request
+/// `auth_id` (see [`own_auth_digest`] for that, distinct, purpose).
+fn chain_auth_digest(hops: &[ResolvedHop]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    digest_salt().hash(&mut hasher);
+    for hop in hops {
+        hop.url.as_str().hash(&mut hasher);
+        match &hop.auth {
+            Some(auth) => {
+                1u8.hash(&mut hasher);
+                auth.header_value().hash(&mut hasher);
+            }
+            None => 0u8.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
+/// `Url::parse(s).ok().map(|u| u.origin().ascii_serialization() + "/")` (issue #561, §3.1/M1)
+/// — the sole comparison helper for C1's origin-binding rule, used at both comparison points in
+/// [`NuGetRegistry::fetch`]. Normalization-immune (host case, default port, IDN) — a plain
+/// string `starts_with` against a feed-supplied, un-reparsed value is not sufficient, and would
+/// not defeat a suffix trick like `https://pkgs.dev.azure.com.evil.test/`. A parse failure on
+/// either side is `None`, which [`NuGetRegistry::fetch`] treats as a mismatch — fail closed,
+/// unauthenticated, never an error.
+fn origin_of(s: &str) -> Option<String> {
+    url::Url::parse(s)
+        .ok()
+        .map(|u| format!("{}/", u.origin().ascii_serialization()))
+}
 
 /// The real public NuGet service index — used both as the default root registry's own feed
 /// and, via [`is_public_registry_url`], to identify "the nuget.org source" by normalized URL
@@ -383,6 +449,23 @@ pub struct NuGetRegistry {
     /// *head* client [`Self::register_chain`] builds for a multi-hop chain. Never looked up by
     /// string key at fetch time; `Self::get_versions_chained` walks this `Vec` positionally.
     fallback_chain: Vec<Arc<Self>>,
+    /// This hop's own credential (issue #561), or `None` for an unauthenticated hop and always
+    /// for a `Public`-tier instance. Attached to a request only when [`Self::fetch`]'s C1
+    /// origin-binding rule holds for that specific request — never unconditionally.
+    auth: Option<NuGetAuth>,
+    /// `origin_of(&self.service_index_url)` (or `""` on a parse failure — fail closed: an
+    /// empty string can never equal a real request's origin), computed once at construction.
+    /// The declared source origin C1 pins both comparison sides to (§3.1).
+    declared_origin: String,
+    /// This hop's own [`own_auth_digest`] — the per-request `auth_id` [`Self::fetch`] passes
+    /// to `HttpCache::get_cached_pinned_with_headers`. `0` when [`Self::auth`] is `None`.
+    own_auth_id: u64,
+    /// Meaningful only on a chain's *head* client (the one `root.alternates` maps a
+    /// [`NuGetSourceChain::key`] to) — the chain-wide [`chain_auth_digest`] `register_chain`
+    /// last registered it under, used purely for O(1) rotation detection. `0` on every other
+    /// instance (a fallback hop, or a not-yet-registered client); never consulted by
+    /// [`Self::fetch`].
+    chain_auth_digest: u64,
 }
 
 impl NuGetRegistry {
@@ -391,6 +474,7 @@ impl NuGetRegistry {
     }
 
     pub(crate) fn with_service_index_url(cache: Arc<HttpCache>, service_index_url: String) -> Self {
+        let declared_origin = origin_of(&service_index_url).unwrap_or_default();
         Self {
             cache,
             service_index_url,
@@ -399,97 +483,196 @@ impl NuGetRegistry {
             policy: Arc::new(RegistryAccessPolicy::default()),
             alternates: Arc::new(DashMap::new()),
             fallback_chain: Vec::new(),
+            auth: None,
+            declared_origin,
+            own_auth_id: 0,
+            chain_auth_digest: 0,
         }
     }
 
     /// Creates a [`NuGetRegistry`] client for one resolved `NuGet.Config`-declared feed
     /// (issue #523) — `WorkspaceDeclared`-tier so it fetches through
-    /// `HttpCache::get_cached_workspace` and validates each service-index resource `@id`
-    /// against `policy`.
+    /// `Self::fetch`'s origin-pinned transport and validates each service-index resource
+    /// `@id` against `policy`.
     ///
     /// `fallback_chain` is empty for every call except the *head* client
     /// [`Self::register_chain`] builds for a multi-hop chain — every other hop is a dead end
     /// with nothing further to fall through to. Its own `alternates` map starts empty and is
     /// never populated — only the root ever registers a chain.
+    ///
+    /// Takes `hop: &ResolvedHop`, not a bare `NuGetFeedUrl` (issue #561, FR-016) — carrying the
+    /// hop's own credential and slot identity is unrepresentable to omit, closing the trap
+    /// where `NuGetConfig::resolve_source_for`/`resolved_chains` could independently disagree
+    /// on a hop's credential data (both reach `NuGetSourceChain::chain` exclusively through
+    /// `NuGetConfig::valid_hops`/`hops_for_mapping_keys`, which now build this same type).
     #[must_use]
     pub fn with_base(
         cache: Arc<HttpCache>,
-        feed: &NuGetFeedUrl,
+        hop: &ResolvedHop,
         policy: Arc<RegistryAccessPolicy>,
         fallback_chain: Vec<Arc<Self>>,
     ) -> Self {
+        let declared_origin = origin_of(hop.url.as_str()).unwrap_or_default();
+        let own_auth_id = own_auth_digest(&declared_origin, hop.auth.as_ref());
         Self {
             cache,
-            service_index_url: feed.as_str().to_string(),
+            service_index_url: hop.url.as_str().to_string(),
             service_index: Arc::new(OnceCell::new()),
             tier: NuGetRegistryTier::WorkspaceDeclared,
             policy,
             alternates: Arc::new(DashMap::new()),
             fallback_chain,
+            auth: hop.auth.clone(),
+            declared_origin,
+            own_auth_id,
+            chain_auth_digest: 0,
         }
     }
 
+    /// FR-011: routes every HTTP fetch for a `WorkspaceDeclared`-tier or credentialed source
+    /// through this single decision point (§3.9's four call sites). `trusted_prefix` is the
+    /// caller's already-validated prefix for this specific resource.
+    ///
+    /// Dispatches to:
+    /// 1. The authenticated, origin-pinned transport — iff [`Self::auth`] is `Some` **and**
+    ///    both `url`'s origin and `trusted_prefix`'s origin equal [`Self::declared_origin`]
+    ///    (C1, §3.1). A parse failure on either side of that comparison is a mismatch, never an
+    ///    error — fails closed to arm 2/3, unauthenticated.
+    /// 2. The unauthenticated, origin-pinned workspace transport (#562) — when [`Self::tier`]
+    ///    is [`NuGetRegistryTier::WorkspaceDeclared`] and arm 1 declined.
+    /// 3. Today's public `get_cached_trusted_origin` path — otherwise, byte-identical to spec
+    ///    035.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying `HttpCache` fetch returns.
+    async fn fetch(&self, url: &str, trusted_prefix: &str) -> Result<bytes::Bytes> {
+        let declared = self.declared_origin.as_str();
+        let can_authenticate = origin_of(url).as_deref() == Some(declared)
+            && origin_of(trusted_prefix).as_deref() == Some(declared);
+
+        if let Some(auth) = self.auth.as_ref()
+            && can_authenticate
+        {
+            return self
+                .cache
+                .get_cached_pinned_with_headers(
+                    url,
+                    trusted_prefix,
+                    true,
+                    Some(self.own_auth_id),
+                    &[(reqwest::header::AUTHORIZATION, auth.header_value())],
+                )
+                .await;
+        }
+
+        if self.tier == NuGetRegistryTier::WorkspaceDeclared {
+            return self
+                .cache
+                .get_cached_pinned(url, trusted_prefix, false, None)
+                .await;
+        }
+
+        self.cache
+            .get_cached_trusted_origin(url, trusted_prefix)
+            .await
+    }
+
     /// Builds the full hop tree for one [`NuGetSourceChain`] and inserts the head into
-    /// `root.alternates` under `chain.key`. Idempotent per key, capacity-capped at
-    /// `MAX_ALTERNATE_REGISTRIES`. Called only from `NuGetEcosystem::parse_manifest`, at
-    /// parse time.
+    /// `root.alternates` under `chain.key`. Called only from `NuGetEcosystem::parse_manifest`,
+    /// at parse time.
     ///
     /// The implicit-public final hop (when `chain.implicit_public_fallback` is set) is a
     /// **freshly-constructed `Public`-tier client** pointed at `root`'s own
     /// `service_index_url` (never `Arc::clone(root)`, which would create a
     /// root→alternates→head→fallback_chain→root reference cycle).
+    ///
+    /// Issue #561 (S3/FR-016): a vacant slot is capacity-capped at `MAX_ALTERNATE_REGISTRIES`
+    /// as before. An **occupied** slot whose currently-registered
+    /// `Self::chain_auth_digest` differs from `chain`'s freshly-computed
+    /// `chain_auth_digest` is **replaced in place** — rebuilt exactly like the vacant arm,
+    /// then inserted over the old `Arc`. This is deliberately **not** gated by the
+    /// capacity check (M4): replacing an already-occupied slot does not grow the map, and
+    /// gating it would silently strand a credential rotation once the cap is hit — reintroducing
+    /// the revoked-PAT staleness bug this replace arm exists to fix. Not LRU: `chain.key` is
+    /// stored as `DependencySource::AlternateRegistry.index` inside already-parsed documents,
+    /// and `Self::alternate_client` is a pure lookup with no re-registration path — evicting a
+    /// key a live document still references would degrade that document's every hover to
+    /// `PackageNotFound` until re-parse.
     pub fn register_chain(
         root: &Arc<Self>,
         chain: &NuGetSourceChain,
         policy: &Arc<RegistryAccessPolicy>,
     ) {
-        let Some((first_hop, rest_hops)) = chain.hops.split_first() else {
+        let Some((first_hop, _)) = chain.hops.split_first() else {
             return;
         };
+        let new_digest = chain_auth_digest(&chain.hops);
 
         // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds a
         // write guard on one — checking capacity from inside the `Vacant` arm would
         // self-deadlock on that shard.
         let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
 
-        if let dashmap::mapref::entry::Entry::Vacant(slot) =
-            root.alternates.entry(chain.key.clone())
-        {
-            if at_capacity {
-                tracing::warn!(
-                    key = %chain.key,
-                    cap = MAX_ALTERNATE_REGISTRIES,
-                    "NuGet alternate registry cap reached; not registering a new chain"
-                );
-                return;
+        match root.alternates.entry(chain.key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                if occupied.get().chain_auth_digest != new_digest {
+                    let head = Self::build_head(root, chain, first_hop, policy, new_digest);
+                    occupied.insert(Arc::new(head));
+                }
             }
-
-            let mut fallback_chain: Vec<Arc<Self>> = rest_hops
-                .iter()
-                .map(|hop| {
-                    Arc::new(Self::with_base(
-                        Arc::clone(&root.cache),
-                        hop,
-                        Arc::clone(policy),
-                        Vec::new(),
-                    ))
-                })
-                .collect();
-            if chain.implicit_public_fallback {
-                fallback_chain.push(Arc::new(Self::with_service_index_url(
-                    Arc::clone(&root.cache),
-                    root.service_index_url.clone(),
-                )));
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                if at_capacity {
+                    tracing::warn!(
+                        key = %chain.key,
+                        cap = MAX_ALTERNATE_REGISTRIES,
+                        "NuGet alternate registry cap reached; not registering a new chain"
+                    );
+                    return;
+                }
+                let head = Self::build_head(root, chain, first_hop, policy, new_digest);
+                slot.insert(Arc::new(head));
             }
-
-            let head = Self::with_base(
-                Arc::clone(&root.cache),
-                first_hop,
-                Arc::clone(policy),
-                fallback_chain,
-            );
-            slot.insert(Arc::new(head));
         }
+    }
+
+    /// Constructs the head client (and its full `fallback_chain`) for `chain`, stamping
+    /// `chain_auth_digest` on the head only — factored out of [`Self::register_chain`]'s two
+    /// insertion arms (Vacant and the occupied-with-differing-digest replace arm), which must
+    /// build an identical hop tree.
+    fn build_head(
+        root: &Arc<Self>,
+        chain: &NuGetSourceChain,
+        first_hop: &ResolvedHop,
+        policy: &Arc<RegistryAccessPolicy>,
+        chain_auth_digest: u64,
+    ) -> Self {
+        let mut fallback_chain: Vec<Arc<Self>> = chain.hops[1..]
+            .iter()
+            .map(|hop| {
+                Arc::new(Self::with_base(
+                    Arc::clone(&root.cache),
+                    hop,
+                    Arc::clone(policy),
+                    Vec::new(),
+                ))
+            })
+            .collect();
+        if chain.implicit_public_fallback {
+            fallback_chain.push(Arc::new(Self::with_service_index_url(
+                Arc::clone(&root.cache),
+                root.service_index_url.clone(),
+            )));
+        }
+
+        let mut head = Self::with_base(
+            Arc::clone(&root.cache),
+            first_hop,
+            Arc::clone(policy),
+            fallback_chain,
+        );
+        head.chain_auth_digest = chain_auth_digest;
+        head
     }
 
     /// The registered client for `index` (a [`NuGetSourceChain::key`]), if any — read-only,
@@ -550,16 +733,11 @@ impl NuGetRegistry {
     async fn service_index(&self) -> Result<&ServiceIndex> {
         self.service_index
             .get_or_try_init(|| async {
-                let data = match self.tier {
-                    NuGetRegistryTier::Public => {
-                        self.cache.get_cached(&self.service_index_url).await?
-                    }
-                    NuGetRegistryTier::WorkspaceDeclared => {
-                        self.cache
-                            .get_cached_workspace(&self.service_index_url)
-                            .await?
-                    }
-                };
+                // FR-011, §3.9: `trusted_prefix` is the declared source origin itself — no
+                // resource has been resolved yet to derive a narrower one from.
+                let data = self
+                    .fetch(&self.service_index_url, &self.declared_origin)
+                    .await?;
                 let response: ServiceIndexResponse = deps_core::parse_json_checked(&data)?;
                 ServiceIndex::resolve(&response, self.tier, &self.policy)
             })
@@ -616,20 +794,6 @@ impl NuGetRegistry {
         reject_dot_segment(name)?;
         let index = self.service_index().await?;
         let flat_url = flat_container_url(&index.package_base_address, name);
-
-        if self.tier == NuGetRegistryTier::WorkspaceDeclared {
-            // Q3/M2 (issue #523): workspace-gated transport, so every redirect hop is
-            // re-classified against the live policy — but this trades away
-            // `get_cached_trusted_origin`'s origin-pinning (a redirect off the resolved
-            // `PackageBaseAddress` to any other `Global` host is permitted under
-            // `public_only`), and registration-hive enrichment (publish times, hover-only
-            // unlisted markers) is deliberately not attempted for alternate feeds in phase 1
-            // — see `Self::unlisted_versions_for_hover`'s identical tier gate. Both are
-            // documented residual-risk/scope reductions, not oversights.
-            let data = self.cache.get_cached_workspace(&flat_url).await?;
-            return parse_flat_container(&data);
-        }
-
         let flat_trusted_prefix = format!("{}/", index.package_base_address);
         let registration_base = if freshness_enabled {
             index.registrations_base_url.clone()
@@ -637,14 +801,17 @@ impl NuGetRegistry {
             None
         };
 
+        // Issue #561/#562, FR-012: both tiers route through `Self::fetch` (§3.9) — for a
+        // `WorkspaceDeclared`-tier or credentialed source this is the origin-pinned,
+        // connect-address-guarded transport (closing the residual risk the prior early return
+        // here used to document); registration-hive enrichment (publish times, hover-only
+        // unlisted markers) is no longer skipped for alternate feeds.
         if let Some(base) = registration_base {
             let registration_url = registration_index_url(&base, name);
             let registration_trusted_prefix = format!("{base}/");
             let (flat_result, registration_result) = tokio::join!(
-                self.cache
-                    .get_cached_trusted_origin(&flat_url, &flat_trusted_prefix),
-                self.cache
-                    .get_cached_trusted_origin(&registration_url, &registration_trusted_prefix),
+                self.fetch(&flat_url, &flat_trusted_prefix),
+                self.fetch(&registration_url, &registration_trusted_prefix),
             );
             let mut versions = parse_flat_container(&flat_result?)?;
             match registration_result {
@@ -663,10 +830,7 @@ impl NuGetRegistry {
             }
             Ok(versions)
         } else {
-            let data = self
-                .cache
-                .get_cached_trusted_origin(&flat_url, &flat_trusted_prefix)
-                .await?;
+            let data = self.fetch(&flat_url, &flat_trusted_prefix).await?;
             parse_flat_container(&data)
         }
     }
@@ -709,8 +873,8 @@ impl NuGetRegistry {
                 }
                 None => {
                     // A page `@id` outside the resolved registration base is skipped, not
-                    // trusted — the feed chooses `@id` values. `get_cached_trusted_origin`
-                    // additionally stops any redirect that would otherwise escape
+                    // trusted — the feed chooses `@id` values. `Self::fetch`'s underlying
+                    // transport additionally stops any redirect that would otherwise escape
                     // `trusted_prefix` after this initial check passes (S2/M2).
                     if !page.id.starts_with(trusted_prefix) {
                         continue;
@@ -719,11 +883,7 @@ impl NuGetRegistry {
                         break;
                     }
                     external_fetches += 1;
-                    let Ok(body) = self
-                        .cache
-                        .get_cached_trusted_origin(&page.id, trusted_prefix)
-                        .await
-                    else {
+                    let Ok(body) = self.fetch(&page.id, trusted_prefix).await else {
                         continue;
                     };
                     let Ok(parsed) = deps_core::parse_json_checked::<RegistrationPageBody>(&body)
@@ -763,13 +923,9 @@ impl NuGetRegistry {
     /// itself cannot be resolved — both of which also fail the hover response's main
     /// version fetch, so this never surfaces a *distinct* failure mode to the caller.
     pub async fn unlisted_versions_for_hover(&self, name: &str) -> Result<HashSet<String>> {
-        // Issue #523, M2: registration-hive enrichment is deliberately not attempted for
-        // alternate feeds in phase 1 (`Transport::origin_pinned` and the workspace-gated
-        // guard are mutually exclusive in today's `HttpCache`) — see
-        // `Self::get_versions_typed_with`'s identical tier gate.
-        if self.tier == NuGetRegistryTier::WorkspaceDeclared {
-            return Ok(HashSet::new());
-        }
+        // Issue #562, FR-012: registration-hive enrichment is no longer skipped for
+        // `WorkspaceDeclared`-tier feeds — routed through `Self::fetch` (§3.9) like every
+        // other site, closing spec 035's NFR-003(3) residual risk.
         reject_dot_segment(name)?;
         let index = self.service_index().await?;
         let Some(base) = index.registrations_base_url.clone() else {
@@ -777,11 +933,7 @@ impl NuGetRegistry {
         };
         let registration_url = registration_index_url(&base, name);
         let trusted_prefix = format!("{base}/");
-        let Ok(body) = self
-            .cache
-            .get_cached_trusted_origin(&registration_url, &trusted_prefix)
-            .await
-        else {
+        let Ok(body) = self.fetch(&registration_url, &trusted_prefix).await else {
             return Ok(HashSet::new());
         };
         Ok(self
@@ -814,16 +966,19 @@ impl NuGetRegistry {
     /// Returns an error if the service index cannot be resolved or the search request fails.
     pub async fn search_typed(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
         let index = self.service_index().await?;
-        // FR-016: a feed may omit `SearchQueryService` entirely (e.g. GitHub Packages).
+        // FR-016 (spec 035): a feed may omit `SearchQueryService` entirely (e.g. GitHub
+        // Packages).
         let Some(search_base) = index.search_query_service.as_deref() else {
             return Ok(Vec::new());
         };
         let url = search_url(search_base, query, limit);
+        // §3.9: the `SearchQueryService`'s own *origin*, not `{search_base}/` — `search_url`
+        // appends a `?q=...` query string to `search_base`, so `{search_base}/` would not be a
+        // prefix of `url` at all. Falls back to the un-origin-narrowed `search_base` itself on
+        // an (unreachable in practice) parse failure — still a specific, safe pin.
+        let trusted_prefix = origin_of(search_base).unwrap_or_else(|| search_base.to_string());
 
-        let data = match self.tier {
-            NuGetRegistryTier::Public => self.cache.get_cached(&url).await?,
-            NuGetRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await?,
-        };
+        let data = self.fetch(&url, &trusted_prefix).await?;
         parse_search_response(&data, limit)
     }
 }
@@ -1179,6 +1334,7 @@ impl deps_core::Registry for NuGetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::NuGetFeedUrl;
 
     fn service_index_body(package_base_address: &str, search_query_service: &str) -> String {
         format!(
@@ -2557,11 +2713,21 @@ mod tests {
         ))
     }
 
+    /// Wraps `feed` in an unauthenticated [`ResolvedHop`] — the shape every
+    /// `NuGetRegistry::with_base` test call site below needs post-FR-016.
+    fn hop(feed: &NuGetFeedUrl) -> ResolvedHop {
+        ResolvedHop {
+            url: feed.clone(),
+            slot: None,
+            auth: None,
+        }
+    }
+
     fn workspace_client(base: &str, policy: &Arc<RegistryAccessPolicy>) -> NuGetRegistry {
         let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), policy).unwrap();
         NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
-            &feed,
+            &hop(&feed),
             Arc::clone(policy),
             Vec::new(),
         )
@@ -2607,13 +2773,17 @@ mod tests {
         let hop1_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop1.url()), &policy).unwrap();
         let hop1_client = Arc::new(NuGetRegistry::with_base(
             Arc::clone(&cache),
-            &hop1_feed,
+            &hop(&hop1_feed),
             Arc::clone(&policy),
             Vec::new(),
         ));
         let hop0_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
-        let head =
-            NuGetRegistry::with_base(cache, &hop0_feed, Arc::clone(&policy), vec![hop1_client]);
+        let head = NuGetRegistry::with_base(
+            cache,
+            &hop(&hop0_feed),
+            Arc::clone(&policy),
+            vec![hop1_client],
+        );
 
         let versions = head.get_versions_chained("pkg").await.unwrap();
         assert_eq!(versions.len(), 1);
@@ -2662,7 +2832,7 @@ mod tests {
         let hop1_client = Arc::new(workspace_client(&hop1.url(), &policy));
         let head = {
             let feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
-            NuGetRegistry::with_base(cache, &feed, Arc::clone(&policy), vec![hop1_client])
+            NuGetRegistry::with_base(cache, &hop(&feed), Arc::clone(&policy), vec![hop1_client])
         };
 
         let versions = head.get_versions_chained("pkg").await.unwrap();
@@ -2700,7 +2870,7 @@ mod tests {
         let hop1_client = Arc::new(workspace_client(&hop1.url(), &policy));
         let head = {
             let feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
-            NuGetRegistry::with_base(cache, &feed, Arc::clone(&policy), vec![hop1_client])
+            NuGetRegistry::with_base(cache, &hop(&feed), Arc::clone(&policy), vec![hop1_client])
         };
 
         let err = head.get_versions_chained("pkg").await.unwrap_err();
@@ -2775,7 +2945,7 @@ mod tests {
         let hop1_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop1.url()), &policy).unwrap();
         let chain = NuGetSourceChain {
             key: "nuget-chain:test-multi-hop".to_string(),
-            hops: vec![hop0_feed, hop1_feed],
+            hops: vec![hop(&hop0_feed), hop(&hop1_feed)],
             implicit_public_fallback: true,
         };
         NuGetRegistry::register_chain(&root, &chain, &policy);
@@ -2792,5 +2962,349 @@ mod tests {
         let versions = client.get_versions_chained("pkg").await.unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version.as_str(), "9.0.0");
+    }
+
+    // --- issue #561: authenticated fetch (C1 origin-binding, four-site routing) ---
+
+    fn auth_hop(feed: &NuGetFeedUrl, slot: &str, username: &str, password: &str) -> ResolvedHop {
+        ResolvedHop {
+            url: feed.clone(),
+            slot: Some(slot.to_string()),
+            auth: Some(NuGetAuth::new(username, password)),
+        }
+    }
+
+    /// SC-001/SC-011: an authenticated `WorkspaceDeclared` client attaches the credential to
+    /// both the service-index fetch and the flat-container fetch — two of the four §3.9 sites,
+    /// same origin as declared.
+    #[tokio::test]
+    async fn test_fetch_attaches_credential_on_service_index_and_flat_container() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        let auth = NuGetAuth::new("user", "pat");
+
+        let _index = server
+            .mock("GET", "/index.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{base}/flat"),
+                &format!("{base}/search"),
+            ))
+            .create_async()
+            .await;
+        let _flat = server
+            .mock("GET", "/flat/pkg/index.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let client = NuGetRegistry::with_base(
+            Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            &auth_hop(&feed, "corpfeed", "user", "pat"),
+            Arc::clone(&policy),
+            Vec::new(),
+        );
+
+        let versions = client.get_versions_typed("pkg").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        _index.assert_async().await;
+        _flat.assert_async().await;
+    }
+
+    /// SC-011: `search_typed` is covered by the same authenticated routing as the other three
+    /// sites — a 401 on `SearchQueryService` (mocked here as a 200-with-header-assertion) must
+    /// not be a site the credential skips.
+    #[tokio::test]
+    async fn test_fetch_attaches_credential_on_search_query_service() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        let auth = NuGetAuth::new("user", "pat");
+
+        let _index = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{base}/flat"),
+                &format!("{base}/search"),
+            ))
+            .create_async()
+            .await;
+        let _search = server
+            .mock("GET", "/search")
+            .match_query(mockito::Matcher::Any)
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(r#"{"data": []}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let client = NuGetRegistry::with_base(
+            Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            &auth_hop(&feed, "corpfeed", "user", "pat"),
+            Arc::clone(&policy),
+            Vec::new(),
+        );
+
+        let results = client.search_typed("query", 10).await.unwrap();
+        assert!(results.is_empty());
+        _search.assert_async().await;
+    }
+
+    /// SC-011: the registration-hive fetch site (§3.9's third `Self::fetch` call site, inside
+    /// `get_versions_typed_with`) **and** its external-page-walk fetch (inside
+    /// `registration_enrichment_from_index`) both attach the credential — distinct from the
+    /// service-index/flat-container coverage above, since a call-site-local regression at
+    /// either (wrong hop or trusted-prefix passed into that specific `self.fetch` call) would
+    /// otherwise go undetected.
+    #[tokio::test]
+    async fn test_fetch_attaches_credential_on_registration_hive() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        let auth = NuGetAuth::new("user", "pat");
+        let reg_base = format!("{base}/registrations");
+
+        let _index = server
+            .mock("GET", "/index.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(service_index_body_with_registrations(
+                &format!("{base}/flat"),
+                &format!("{base}/search"),
+                &reg_base,
+            ))
+            .create_async()
+            .await;
+        let _flat = server
+            .mock("GET", "/flat/pkg/index.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0"]}"#)
+            .create_async()
+            .await;
+        let index_body = format!(
+            r#"{{"count": 1, "items": [{{"@id": "{reg_base}/pkg/page/0.json", "count": 1}}]}}"#
+        );
+        let _reg = server
+            .mock("GET", "/registrations/pkg/index.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(index_body)
+            .create_async()
+            .await;
+        let _reg_page = server
+            .mock("GET", "/registrations/pkg/page/0.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(
+                r#"{"items": [{"catalogEntry": {"version": "1.0.0", "published": "2020-01-01T00:00:00Z"}}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let client = NuGetRegistry::with_base(
+            Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            &auth_hop(&feed, "corpfeed", "user", "pat"),
+            Arc::clone(&policy),
+            Vec::new(),
+        );
+
+        let versions = client.get_versions_typed_with("pkg", true).await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(versions[0].published_at.is_some());
+        _index.assert_async().await;
+        _flat.assert_async().await;
+        _reg.assert_async().await;
+        _reg_page.assert_async().await;
+    }
+
+    /// SC-011: `unlisted_versions_for_hover`'s registration-hive fetch (§3.9's fourth site)
+    /// also attaches the credential — a distinct call site from
+    /// `get_versions_typed_with`'s, per hover's own dedicated enrichment path.
+    #[tokio::test]
+    async fn test_fetch_attaches_credential_on_unlisted_versions_for_hover() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        let auth = NuGetAuth::new("user", "pat");
+        let reg_base = format!("{base}/registrations");
+
+        let _index = server
+            .mock("GET", "/index.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(service_index_body_with_registrations(
+                &format!("{base}/flat"),
+                &format!("{base}/search"),
+                &reg_base,
+            ))
+            .create_async()
+            .await;
+        let _reg = server
+            .mock("GET", "/registrations/pkg/index.json")
+            .match_header("authorization", auth.header_value())
+            .with_status(200)
+            .with_body(r#"{"count": 0, "items": []}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let client = NuGetRegistry::with_base(
+            Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            &auth_hop(&feed, "corpfeed", "user", "pat"),
+            Arc::clone(&policy),
+            Vec::new(),
+        );
+
+        let unlisted = client.unlisted_versions_for_hover("pkg").await.unwrap();
+        assert!(unlisted.is_empty());
+        _index.assert_async().await;
+        _reg.assert_async().await;
+    }
+
+    /// SC-003/FR-010: a compromised service index resolving `PackageBaseAddress` off the
+    /// declared origin gets the flat-container request served, but never with the credential
+    /// attached — `Matcher::Missing` fails the mock (and so the test) if an `Authorization`
+    /// header is present.
+    #[tokio::test]
+    async fn test_fetch_withholds_credential_when_resolved_resource_is_off_origin() {
+        let mut declared = mockito::Server::new_async().await;
+        let mut attacker = mockito::Server::new_async().await;
+        let attacker_base = attacker.url();
+
+        let _index = declared
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{attacker_base}/flat"),
+                &format!("{attacker_base}/search"),
+            ))
+            .create_async()
+            .await;
+        let _attacker_flat = attacker
+            .mock("GET", "/flat/pkg/index.json")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let feed = NuGetFeedUrl::new(&format!("{}/index.json", declared.url()), &policy).unwrap();
+        let client = NuGetRegistry::with_base(
+            Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            &auth_hop(&feed, "corpfeed", "user", "pat"),
+            Arc::clone(&policy),
+            Vec::new(),
+        );
+
+        let versions = client.get_versions_typed("pkg").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        _index.assert_async().await;
+        _attacker_flat.assert_async().await;
+    }
+
+    /// SC-008/FR-016: a credential rotation on an already-registered chain replaces the head
+    /// client in place even when `alternates` is at `MAX_ALTERNATE_REGISTRIES` — the replace
+    /// arm must not be gated by the capacity check that governs only the Vacant-insertion arm.
+    #[tokio::test]
+    async fn test_register_chain_credential_rotation_at_capacity_replaces_in_place() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        let auth_v2 = NuGetAuth::new("user", "pat-v2");
+
+        let _index = server
+            .mock("GET", "/index.json")
+            .match_header("authorization", auth_v2.header_value())
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{base}/flat"),
+                &format!("{base}/search"),
+            ))
+            .create_async()
+            .await;
+        let _flat = server
+            .mock("GET", "/flat/pkg/index.json")
+            .match_header("authorization", auth_v2.header_value())
+            .with_status(200)
+            .with_body(r#"{"versions": ["2.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(NuGetRegistry::with_service_index_url(
+            Arc::clone(&cache),
+            NUGET_ORG_INDEX_URL.to_string(),
+        ));
+        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let chain_key = "nuget-chain:rotation-test".to_string();
+
+        // Fill to one under capacity, register `chain_v1` to reach capacity exactly, then
+        // rotate — proving the *replace* arm (occupied, differing digest) is reachable and
+        // unblocked even when the map is genuinely at `MAX_ALTERNATE_REGISTRIES`.
+        for i in 0..MAX_ALTERNATE_REGISTRIES - 1 {
+            let dummy = NuGetRegistry::with_base(
+                Arc::clone(&cache),
+                &hop(&feed),
+                Arc::clone(&policy),
+                Vec::new(),
+            );
+            root.alternates
+                .insert(format!("dummy-{i}"), Arc::new(dummy));
+        }
+        assert_eq!(root.alternates.len(), MAX_ALTERNATE_REGISTRIES - 1);
+
+        let chain_v1 = NuGetSourceChain {
+            key: chain_key.clone(),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            hops: vec![auth_hop(&feed, "corpfeed", "user", "pat-v1")],
+            implicit_public_fallback: false,
+        };
+        NuGetRegistry::register_chain(&root, &chain_v1, &policy);
+        assert_eq!(
+            root.alternates.len(),
+            MAX_ALTERNATE_REGISTRIES,
+            "the vacant-slot arm must still be allowed to insert its own new key up to the cap"
+        );
+
+        let chain_v2 = NuGetSourceChain {
+            key: chain_key.clone(),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            hops: vec![auth_hop(&feed, "corpfeed", "user", "pat-v2")],
+            implicit_public_fallback: false,
+        };
+        NuGetRegistry::register_chain(&root, &chain_v2, &policy);
+        assert_eq!(
+            root.alternates.len(),
+            MAX_ALTERNATE_REGISTRIES,
+            "the replace arm must not grow the map, and must not be blocked by the cap either"
+        );
+
+        let client = root
+            .alternate_client(&chain_key)
+            .expect("chain must remain registered after rotation");
+        let versions = client.get_versions_chained("pkg").await.unwrap();
+        assert_eq!(versions[0].version.as_str(), "2.0.0");
+        _index.assert_async().await;
+        _flat.assert_async().await;
     }
 }

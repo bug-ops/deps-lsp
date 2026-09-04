@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-nuget, deps-core, deps-lsp**: NuGet credentialed private feed authentication — a user-profile `NuGet.Config` `<packageSourceCredentials>` (`ClearTextPassword`, with `%ENV_VAR%` expansion) now attaches as a `Basic` `Authorization` header when it binds to a repo-declared source at the exact same URL, over a new origin-pinned, connect-address-guarded transport; a revoked credential's cached response is evicted on the next 401/403 (resolves #561) (#572)
+- **deps-nuget, deps-core**: origin-pinned transport and registration-hive enrichment (publish-time freshness, hover-only unlisted marker) for workspace-declared/alternate NuGet feeds — closes spec 035's NFR-003(3) residual risk (resolves #562) (#572)
+- **deps-lsp**: new `registries.nuget_user_profile_sources` setting (default `false`) opting a NuGet user-profile-only source (no repo `NuGet.Config` declaring it) into becoming an `AlternateRegistry` routing hop, trading away OSV/deps.dev/hover-trust for that feed's packages (#572)
 - **deps-go, deps-core, deps-lsp**: `$GOENV` `GOPROXY`/`GOPRIVATE` support — a `GOPROXY` proxy chain (with `direct`/`off` sentinels) or a `GOPRIVATE`-matched module path now resolves to live hover/diagnostic/completion data from the configured private proxy (or fails closed with no data for `direct`/`off`) instead of always querying `proxy.golang.org`, failing closed on a bad hop rather than falling back to the public proxy (#558)
 - **deps-nuget, deps-lsp**: NuGet private/custom feed support — in-repo `NuGet.Config` `<packageSources>`/`<clear/>`/`<disabledPackageSources>`/`<packageSourceCredentials>`/`<packageSourceMapping>` are now resolved to live hover/diagnostic/completion data instead of always querying `api.nuget.org`, failing closed on a bad/disabled/credentialed entry rather than falling back to the public feed (resolves #523) (#560)
 - **deps-go**: `$GOENV` `GOPROXY`/`GOPRIVATE` follow-up hardening — test-injectable `$GOENV` path, oversized-`GOPRIVATE`-pattern warning, expanded edge-case/integration test coverage, and `GOPROXY` `,`/`|` separator docs (#563)
@@ -18,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: `has_goprivate()` now reflects whether a usable (compiled) `GOPRIVATE` matcher exists, instead of true whenever any raw pattern was declared — even a rejected one (resolves #566) (#567)
 - **deps-go**: a malformed `GOPRIVATE` pattern (unterminated `[` character class) now logs a `tracing::warn!`, matching the existing oversized-pattern warning instead of silently never matching (resolves #568)
 - **deps-go**: a `GOPRIVATE` character-class range with reversed bounds (e.g. `[c-a]`) now logs a `tracing::warn!` instead of silently compiling as an always-empty range with no observability, and `\`-escapes (`\]`, `\-`, `\\`) inside a character class now parse correctly instead of being misread as literal range bounds or terminating the class early (resolves #570)
+
+### Changed
+- **deps-nuget**: `NuGetSourceChain.hops`/`NuGetRegistry::with_base` now carry per-hop credential/slot data (`ResolvedHop`) instead of a bare feed URL; `deps_lsp::register_ecosystems` now takes an `&EcosystemRuntime` instead of a bare `Arc<RegistryAccessPolicy>` — both breaking, pre-1.0, no alias (#572)
 
 ## [0.12.1] - 2026-09-03
 

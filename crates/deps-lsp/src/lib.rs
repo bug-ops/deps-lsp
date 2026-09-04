@@ -9,9 +9,25 @@ pub mod server;
 mod test_utils;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 pub use deps_core::{DepsError, EcosystemRegistry, HttpCache, Result};
 pub use server::Backend;
+
+/// Live-updatable settings [`register_ecosystems`] threads into every ecosystem that needs them.
+///
+/// Bundled into one struct (issue #561, M3) rather than growing that function's arity again
+/// for each new cross-ecosystem live flag.
+#[derive(Debug, Clone)]
+pub struct EcosystemRuntime {
+    /// Gates every workspace-declared registry index host (spec #443,
+    /// `registries.workspace_registries`).
+    pub policy: Arc<deps_core::net_policy::RegistryAccessPolicy>,
+    /// `registries.nuget_user_profile_sources` (issue #561, FR-006) — whether a NuGet
+    /// user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a
+    /// routing hop, not just a credential source. Default `false`.
+    pub nuget_user_profile_sources: Arc<AtomicBool>,
+}
 
 /// Declares an ecosystem: re-exports types and registers at runtime.
 macro_rules! ecosystem {
@@ -253,8 +269,9 @@ ecosystem!(
 pub fn register_ecosystems(
     registry: &EcosystemRegistry,
     cache: Arc<HttpCache>,
-    policy: Arc<deps_core::net_policy::RegistryAccessPolicy>,
+    runtime: &EcosystemRuntime,
 ) {
+    let policy = Arc::clone(&runtime.policy);
     // Keeps `policy` used even when the `cargo` feature (its only consumer) is compiled out.
     let _ = &policy;
 
@@ -343,10 +360,11 @@ pub fn register_ecosystems(
     // policy would never see a live `initialize`/`didChangeConfiguration` update.
     #[cfg(feature = "nuget")]
     {
-        let nuget_context = deps_nuget::config::NuGetParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(deps_nuget::config::NuGetConfigCache::new()),
-        };
+        let nuget_context = deps_nuget::config::NuGetParseContext::new(
+            Arc::clone(&policy),
+            Arc::new(deps_nuget::config::NuGetConfigCache::new()),
+            Arc::clone(&runtime.nuget_user_profile_sources),
+        );
         registry.register(Arc::new(NuGetEcosystem::with_context(
             Arc::new(NuGetRegistry::new(Arc::clone(&cache))),
             nuget_context,
@@ -360,15 +378,18 @@ pub fn register_ecosystems(
 mod tests {
     use super::*;
 
+    fn test_runtime() -> EcosystemRuntime {
+        EcosystemRuntime {
+            policy: Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            nuget_user_profile_sources: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     #[test]
     fn test_register_ecosystems() {
         let registry = Arc::new(EcosystemRegistry::new());
         let cache = Arc::new(HttpCache::new());
-        register_ecosystems(
-            &registry,
-            Arc::clone(&cache),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
+        register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
 
         #[cfg(feature = "cargo")]
         assert!(registry.get("cargo").is_some());
@@ -409,11 +430,7 @@ mod tests {
     fn test_ecosystem_id_matches_registered_ecosystems() {
         let registry = Arc::new(EcosystemRegistry::new());
         let cache = Arc::new(HttpCache::new());
-        register_ecosystems(
-            &registry,
-            Arc::clone(&cache),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
+        register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
 
         for id in registry.ecosystem_ids() {
             let parsed: deps_core::EcosystemId = id.parse().unwrap_or_else(|_| {
@@ -548,11 +565,7 @@ mod tests {
 
         let registry = Arc::new(EcosystemRegistry::new());
         let cache = Arc::new(HttpCache::new());
-        register_ecosystems(
-            &registry,
-            Arc::clone(&cache),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
+        register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
 
         let req = VersionReq::new("*");
         for id in registry.ecosystem_ids() {

@@ -3,7 +3,7 @@
 //! # Private/custom feeds (issue #523)
 //!
 //! `NuGetEcosystem::parse_manifest` resolves the manifest directory's in-repo `NuGet.Config`
-//! ancestor chain (`crate::config::resolve`) after parsing, stamps each dependency's
+//! ancestor chain (`crate::config::resolve_with_context`) after parsing, stamps each dependency's
 //! [`deps_core::parser::DependencySource`] from it, and registers every implied routing chain
 //! against the shared [`NuGetRegistry`] — see `crate::config`'s module doc for the full
 //! `<packageSources>`/`<packageSourceMapping>` resolution model. Parsers in `parser.rs` stay
@@ -243,7 +243,13 @@ impl Ecosystem for NuGetEcosystem {
                 .to_file_path()
                 .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
                 .map(|dir| {
-                    crate::config::resolve(&dir, &self.context.config_cache, &self.context.policy)
+                    crate::config::resolve_with_context(
+                        &dir,
+                        &self.context.config_cache,
+                        &self.context.policy,
+                        self.context.user_profile_config.as_deref(),
+                        &self.context.user_profile_sources,
+                    )
                 })
                 .unwrap_or_default();
 
@@ -357,17 +363,27 @@ impl Ecosystem for NuGetEcosystem {
                 return base_hover.await;
             };
 
-            // C1 fix (issue #523): never issue the unlisted-versions fetch — which always
-            // runs against `self.registry`, the `Public`-tier root — for a dependency that
-            // did not resolve to plain `Registry`. See this method's doc comment.
-            if dep.source() != DependencySource::Registry {
+            // C1 fix (issue #523), widened by #562/FR-012: an `AlternateRegistry` dependency
+            // now routes the unlisted-versions fetch through its own registered alternate
+            // client (registration-hive enrichment is no longer skipped for alternate feeds) —
+            // never against `self.registry` (the `Public`-tier root), which would send a
+            // private-feed dependency's real package name to `api.nuget.org`. An unregistered
+            // (unresolvable) alternate index, or any other source kind, skips the fetch
+            // entirely rather than risk that leak.
+            let unlisted_client: Option<Arc<NuGetRegistry>> = match dep.source() {
+                DependencySource::Registry => Some(Arc::clone(&self.registry)),
+                DependencySource::AlternateRegistry { index, .. } => {
+                    self.registry.alternate_client(&index)
+                }
+                _ => None,
+            };
+            let Some(unlisted_client) = unlisted_client else {
                 return base_hover.await;
-            }
+            };
 
             let unlisted_fetch = tokio::time::timeout(
                 HOVER_UNLISTED_TIMEOUT,
-                self.registry
-                    .unlisted_versions_for_hover(dep.name().as_str()),
+                unlisted_client.unlisted_versions_for_hover(dep.name().as_str()),
             );
 
             let (hover, unlisted_result) = tokio::join!(base_hover, unlisted_fetch);
@@ -1026,6 +1042,8 @@ mod tests {
         let context = crate::config::NuGetParseContext {
             policy: Arc::clone(&policy),
             config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+            user_profile_config: None,
+            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
 
@@ -1111,6 +1129,8 @@ mod tests {
         let context = crate::config::NuGetParseContext {
             policy: Arc::clone(&policy),
             config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+            user_profile_config: None,
+            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
 
@@ -1137,5 +1157,99 @@ mod tests {
             "expected a hover render for a resolvable in-range dependency"
         );
         _public_index_mock.assert_async().await;
+    }
+
+    /// SC-004/US-004 (issue #562, FR-012): a package resolved via a workspace-declared
+    /// (`AlternateRegistry`) feed now gets the same hover-only `*(unlisted)*` marker a
+    /// public-registry dependency gets — registration-hive enrichment is no longer skipped for
+    /// alternate feeds.
+    #[tokio::test]
+    async fn test_generate_hover_marks_unlisted_for_alternate_registry_dependency() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _corp_index_mock = server
+            .mock("GET", "/corp/index.json")
+            .with_status(200)
+            .with_body(nuget_service_index_body(&format!("{base}/corp")))
+            .create_async()
+            .await;
+        let _corp_flat_mock = server
+            .mock("GET", "/corp/flatcontainer/mycompany.internal/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.2.3"]}"#)
+            .create_async()
+            .await;
+        let _corp_reg_mock = server
+            .mock("GET", "/corp/registrations/mycompany.internal/index.json")
+            .with_status(200)
+            .with_body(
+                r#"{"count": 1, "items": [{"@id": "x", "count": 1, "items": [
+                    {"catalogEntry": {"version": "1.2.3", "listed": false}}
+                ]}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("NuGet.Config"),
+            format!(
+                r#"<configuration><packageSources>
+                    <clear />
+                    <add key="CorpFeed" value="{base}/corp/index.json" />
+                </packageSources></configuration>"#
+            ),
+        )
+        .unwrap();
+        let manifest_path = dir.path().join("App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.2.3" /></ItemGroup></Project>"#;
+        std::fs::write(&manifest_path, content).unwrap();
+        let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{base}/public/index.json"),
+        );
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        ));
+        let context = crate::config::NuGetParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+            user_profile_config: None,
+            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
+
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let position = Position::new(0, 49); // inside "MyCompany.Internal"
+
+        let cached = std::collections::HashMap::new();
+        let resolved = std::collections::HashMap::new();
+        let hover = eco
+            .generate_hover(
+                parse_result.as_ref(),
+                position,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings {
+                    enabled: false,
+                    cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
+                },
+            )
+            .await
+            .expect("hover for a resolvable alternate-feed dependency must not be None");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("- `1.2.3` *(unlisted)*"),
+            "expected the alternate-feed dependency's unlisted marker, got: {}",
+            content.value
+        );
+        _corp_index_mock.assert_async().await;
+        _corp_flat_mock.assert_async().await;
+        _corp_reg_mock.assert_async().await;
     }
 }
