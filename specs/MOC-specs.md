@@ -65,6 +65,7 @@ status: moc
 | 041 | [[041-credential-redaction-hardening/spec\|Redact user:pass@ credentials from registry-index logs and errors]] | specify | shipped — security, P2, two stages (PR #529 issue #522, PR #540 issue #536) |
 | 042 | [[042-docker-base-image-ecosystem/spec\|New ecosystem: Dockerfile FROM base-image tag/digest freshness]] | specify | draft — research/new ecosystem, P4, 5 open `[NEEDS CLARIFICATION]` items, no user demand signal (issue #557) |
 | 043 | [[043-nuget-feed-authentication/spec\|NuGet Feed Authentication (credentialed NuGet.Config sources)]] | specify | draft — enhancement/security, P3, design finalized via 3-round architect/critic review, no open clarifications (issues #561, #562) |
+| 044 | [[044-precommit-hooks-ecosystem/spec\|New ecosystem: pre-commit hooks (.pre-commit-config.yaml repo/rev pins)]] | specify | draft — research/new ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, no tracking issue filed yet |
 
 ## Completed Specs
 
