@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: oversized-`GOPRIVATE`-pattern warning now logs once per distinct `$GOENV` file content instead of once per LSP re-parse (resolves #565) (#567)
 - **deps-go**: a `GOPROXY` separator preceding a dropped invalid hop is now merged onto the surviving transition with most-permissive-wins, instead of being silently discarded (resolves #564) (#567)
 - **deps-go**: `has_goprivate()` now reflects whether a usable (compiled) `GOPRIVATE` matcher exists, instead of true whenever any raw pattern was declared — even a rejected one (resolves #566) (#567)
+- **deps-go**: a malformed `GOPRIVATE` pattern (unterminated `[` character class) now logs a `tracing::warn!`, matching the existing oversized-pattern warning instead of silently never matching (resolves #568)
 
 ## [0.12.1] - 2026-09-03
 
