@@ -347,17 +347,14 @@ between two consecutive, *valid* hops keeps the separator that preceded
 it, so a chain can combine "skip on any failure" and "skip only when
 genuinely absent" hop-to-hop as needed.
 
-**Known limitation**: when an invalid hop is dropped (per the fail-closed
-rule above) between two surviving hops, only the separator immediately
-preceding the surviving hop is kept — a separator that preceded the
-*dropped* entry is discarded rather than carried over. For example,
-`GOPROXY=https://a.example|not-a-valid-url,https://c.example` records the
-`,` after the dropped entry, not the `|` the user actually wrote before
-it, so a "skip on any failure" the user intended for the `a` -> `c`
-fallback can be silently narrowed to "skip only when not found" whenever
-the hop in between happens to be invalid. Pinned by a test rather than
-fixed here — see issue #559's follow-up tracking for the underlying
-separator-carryover fix.
+When an invalid hop is dropped (per the fail-closed rule above) between
+two surviving hops, the separators on either side of the dropped entry
+are merged, with the more permissive one (`|`) winning: for example,
+`GOPROXY=https://a.example|not-a-valid-url,https://c.example` records `|`
+for the `a` -> `c` fallback, not the `,` that happened to follow the
+dropped entry — a "skip on any failure" the user wrote is never silently
+narrowed to "skip only when not found" just because the hop in between
+turned out invalid.
 
 **Reachability policy**: governed by the same `registries.workspace_registries`
 setting documented above for Cargo/npm/PyPI. The default public chain
