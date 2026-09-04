@@ -13,6 +13,7 @@ publish = true
 workspace = true
 
 [dependencies]
+dashmap = { workspace = true }
 deps-core = { workspace = true }
 quick-xml = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

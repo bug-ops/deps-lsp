@@ -26,8 +26,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tower_lsp_server::ls_types::Uri;
 
-const NUGET_ORG_URL: &str = "https://api.nuget.org/v3/index.json";
-
 /// Mirrors `deps_core::lockfile::locate_lockfile_for_manifest`'s workspace-root search
 /// depth, so the multi-project fallback below walks exactly the same directories the
 /// exact-name search already tried.
@@ -144,7 +142,12 @@ impl LockFileProvider for NuGetLockParser {
                         name,
                         version,
                         source: ResolvedSource::Registry {
-                            url: NUGET_ORG_URL.into(),
+                            // Informational only — nothing in `deps-lsp`/`deps-core::lsp_helpers`
+                            // reads `ResolvedSource`, and this path makes no network request, so
+                            // it never routes a lockfile-resolved version against a private feed
+                            // (issue #523's config resolution intentionally stops at
+                            // `NuGetDependency::source`, not `ResolvedPackage::source`).
+                            url: crate::registry::NUGET_ORG_INDEX_URL.into(),
                             checksum: content_hash.unwrap_or_default(),
                         },
                         dependencies: vec![],

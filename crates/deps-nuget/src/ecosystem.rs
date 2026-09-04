@@ -1,11 +1,19 @@
 //! NuGet ecosystem implementation for deps-lsp.
 //!
+//! # Private/custom feeds (issue #523)
+//!
+//! `NuGetEcosystem::parse_manifest` resolves the manifest directory's in-repo `NuGet.Config`
+//! ancestor chain (`crate::config::resolve`) after parsing, stamps each dependency's
+//! [`deps_core::parser::DependencySource`] from it, and registers every implied routing chain
+//! against the shared [`NuGetRegistry`] — see `crate::config`'s module doc for the full
+//! `<packageSources>`/`<packageSourceMapping>` resolution model. Parsers in `parser.rs` stay
+//! config-blind (always construct `DependencySource::Registry`); only this module threads
+//! config resolution in, mirroring `deps-pypi`'s/`deps-cargo`'s split.
+//!
 //! # Unknown/unresolvable packages
 //!
-//! Only `api.nuget.org` is queried — private feeds (`NuGet.config` `<packageSources>`,
-//! Azure Artifacts, GitHub Packages, internal Artifactory) are out of scope (D4). A 404 or
-//! otherwise-unknown package must degrade to **no diagnostic, no inlay hint, no error
-//! marker** (S4) — this already falls out of `deps-lsp`'s generic error handling around
+//! A 404 or otherwise-unknown package must degrade to **no diagnostic, no inlay hint, no
+//! error marker** (S4) — this already falls out of `deps-lsp`'s generic error handling around
 //! `Registry::get_latest_matching` (a fetch error or `Ok(None)` both simply omit the
 //! package from `cached_versions`), so no special-casing is needed here.
 
@@ -16,9 +24,10 @@ use tower_lsp_server::ls_types::{CompletionItem, Hover, HoverContents, Position,
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter,
+    lsp_helpers::EcosystemFormatter, parser::DependencySource,
 };
 
+use crate::config::NuGetParseContext;
 use crate::formatter::NuGetFormatter;
 use crate::lockfile::NuGetLockParser;
 use crate::registry::NuGetRegistry;
@@ -30,6 +39,45 @@ use crate::types::NuGetParseResult;
 /// bound a pathological feed's registration-hive walk could run unbounded.
 const HOVER_UNLISTED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
+/// manifest's already-parsed dependencies. Mirrors `deps-npm`'s/`deps-pypi`'s identical
+/// `CompletionSource` (issue #523's FR-017-shaped requirement: version completion must route
+/// through the same private-feed resolution hover/diagnostics use, never a blind
+/// api.nuget.org lookup for a private package name).
+enum CompletionSource {
+    /// No dependency in the manifest has this exact name yet.
+    NotInManifest,
+    /// Every occurrence of this name in the manifest agrees on one resolved source.
+    Resolved(DependencySource),
+    /// Two or more occurrences of this name resolve to different sources — offer no
+    /// completions rather than picking one arbitrarily.
+    Ambiguous,
+}
+
+fn resolve_completion_source(
+    parse_result: &dyn ParseResultTrait,
+    package_name: &deps_core::PackageName,
+) -> CompletionSource {
+    let mut sources = parse_result
+        .dependencies()
+        .into_iter()
+        .filter(|d| d.name() == package_name)
+        .map(deps_core::Dependency::source);
+
+    let Some(first) = sources.next() else {
+        return CompletionSource::NotInManifest;
+    };
+    if sources.all(|s| s == first) {
+        CompletionSource::Resolved(first)
+    } else {
+        tracing::warn!(
+            package = %package_name,
+            "ambiguous dependency source for version completion; offering none"
+        );
+        CompletionSource::Ambiguous
+    }
+}
+
 /// NuGet/.NET ecosystem implementation.
 ///
 /// Provides LSP functionality for `.csproj`/`.fsproj`/`.vbproj`, `Directory.Packages.props`,
@@ -38,17 +86,40 @@ pub struct NuGetEcosystem {
     registry: Arc<NuGetRegistry>,
     formatter: NuGetFormatter,
     lockfile_provider: Arc<NuGetLockParser>,
+    context: NuGetParseContext,
 }
 
 impl NuGetEcosystem {
     pub fn new(cache: Arc<deps_core::HttpCache>) -> Self {
+        Self::with_context(
+            Arc::new(NuGetRegistry::new(cache)),
+            NuGetParseContext::default(),
+        )
+    }
+
+    /// Creates a new NuGet ecosystem sharing `context`'s reachability policy and
+    /// `NuGet.Config` memoization cache, around an existing [`NuGetRegistry`] instance — the
+    /// production constructor, used by `deps-lsp`'s `register_ecosystems` so
+    /// `initialize`/`workspace/didChangeConfiguration` can update the same
+    /// `Arc<RegistryAccessPolicy>` this ecosystem's every parse reads (mirrors `deps-npm`'s/
+    /// `deps-pypi`'s identical split — `Self::new`'s default, disconnected policy would never
+    /// see a live update).
+    #[must_use]
+    pub fn with_context(registry: Arc<NuGetRegistry>, context: NuGetParseContext) -> Self {
         Self {
-            registry: Arc::new(NuGetRegistry::new(cache)),
+            registry,
             formatter: NuGetFormatter,
             lockfile_provider: Arc::new(NuGetLockParser),
+            context,
         }
     }
 
+    /// Completes package names by searching the NuGet registry.
+    ///
+    /// Deliberately source-blind (mirrors `deps-npm::ecosystem::NpmEcosystem::
+    /// complete_package_names`'s identical rationale): the string here is a prefix the user
+    /// typed into the name field, not a resolved private dependency name, so it is safe to
+    /// send to api.nuget.org unconditionally — unlike [`Self::complete_versions`].
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
@@ -59,31 +130,54 @@ impl NuGetEcosystem {
         .await
     }
 
+    /// Completes version requirements for `package_name`, routed by the source that name
+    /// resolves to in `parse_result` (issue #523). An ambiguous, unresolved, or
+    /// unregistered-alternate source offers no completions rather than risking a private
+    /// package name lookup against api.nuget.org.
     async fn complete_versions(
         &self,
+        parse_result: &dyn ParseResultTrait,
         package_name: &deps_core::PackageName,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_generic(
-            self.registry.as_ref(),
-            package_name,
-            prefix,
-            &[],
-            freshness,
-        )
-        .await
+        match resolve_completion_source(parse_result, package_name) {
+            CompletionSource::Ambiguous => vec![],
+            CompletionSource::NotInManifest
+            | CompletionSource::Resolved(DependencySource::Registry) => {
+                deps_core::completion::complete_versions_generic(
+                    self.registry.as_ref(),
+                    package_name,
+                    prefix,
+                    &[],
+                    freshness,
+                )
+                .await
+            }
+            CompletionSource::Resolved(DependencySource::AlternateRegistry { index, .. }) => {
+                match self.registry.alternate_client(&index) {
+                    Some(client) => {
+                        deps_core::completion::complete_versions_generic(
+                            client.as_ref(),
+                            package_name,
+                            prefix,
+                            &[],
+                            freshness,
+                        )
+                        .await
+                    }
+                    None => vec![],
+                }
+            }
+            CompletionSource::Resolved(_) => vec![],
+        }
     }
 
     /// Test-only hook to inject a [`NuGetRegistry`] pointed at a mock service index
     /// (`NuGetRegistry::new`/`Self::new` always resolve the real `api.nuget.org`).
     #[cfg(test)]
     fn with_registry(registry: NuGetRegistry) -> Self {
-        Self {
-            registry: Arc::new(registry),
-            formatter: NuGetFormatter,
-            lockfile_provider: Arc::new(NuGetLockParser),
-        }
+        Self::with_context(Arc::new(registry), NuGetParseContext::default())
     }
 
     /// Dispatches to the manifest-kind-specific parser based on the URI's basename.
@@ -138,7 +232,29 @@ impl Ecosystem for NuGetEcosystem {
         uri: &'a Uri,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result = Self::parse_by_filename(content, uri)?;
+            let mut result = Self::parse_by_filename(content, uri)?;
+
+            // Issue #523: a non-file URI (or one `Uri::to_file_path` cannot resolve) has no
+            // directory to walk `NuGet.Config` discovery from — falls back to the default
+            // (empty) `NuGetConfig`, which resolves every dependency to
+            // `DependencySource::Registry` (byte-identical to pre-feature behavior), rather
+            // than failing the whole parse.
+            let config = uri
+                .to_file_path()
+                .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                .map(|dir| {
+                    crate::config::resolve(&dir, &self.context.config_cache, &self.context.policy)
+                })
+                .unwrap_or_default();
+
+            for dep in &mut result.dependencies {
+                dep.source = config.resolve_source_for(&dep.name);
+            }
+            result.resolved_chains = config.resolved_chains();
+            for chain in &result.resolved_chains {
+                NuGetRegistry::register_chain(&self.registry, chain, &self.context.policy);
+            }
+
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
     }
@@ -173,7 +289,7 @@ impl Ecosystem for NuGetEcosystem {
                     package_name,
                     prefix,
                 } => {
-                    self.complete_versions(&package_name, &prefix, freshness)
+                    self.complete_versions(parse_result, &package_name, &prefix, freshness)
                         .await
                 }
                 CompletionContext::Feature { .. } | CompletionContext::None => vec![],
@@ -200,6 +316,17 @@ impl Ecosystem for NuGetEcosystem {
     /// `HOVER_FALLBACK_TIMEOUT` exists to prevent for its analogous fallback fetch. `dep` is
     /// resolved once, up front, and reused for the unlisted lookup rather than re-derived
     /// from the rendered hover afterward.
+    ///
+    /// **Issue #523 fix**: the unlisted fetch is only issued when `dep.source()` is plain
+    /// `DependencySource::Registry` — `self.registry` here is always the `Public`-tier root,
+    /// so calling `unlisted_versions_for_hover` unconditionally would send a private-feed
+    /// dependency's real package name to `api.nuget.org`, defeating the entire feature
+    /// (`NuGetRegistry::unlisted_versions_for_hover`'s own tier gate only fires when the
+    /// *callee* instance is `WorkspaceDeclared`, which the root never is). A private-feed
+    /// dependency simply renders without the `*(unlisted)*` decoration — registration-hive
+    /// enrichment is already skipped entirely for alternate feeds in phase 1 (see that
+    /// method's own tier gate), so this loses nothing a private-feed hover would have shown
+    /// anyway.
     fn generate_hover<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -229,6 +356,13 @@ impl Ecosystem for NuGetEcosystem {
             let Some(dep) = dep else {
                 return base_hover.await;
             };
+
+            // C1 fix (issue #523): never issue the unlisted-versions fetch — which always
+            // runs against `self.registry`, the `Public`-tier root — for a dependency that
+            // did not resolve to plain `Registry`. See this method's doc comment.
+            if dep.source() != DependencySource::Registry {
+                return base_hover.await;
+            }
 
             let unlisted_fetch = tokio::time::timeout(
                 HOVER_UNLISTED_TIMEOUT,
@@ -833,5 +967,175 @@ mod tests {
         assert!(hover.is_none());
         // `.expect(0)` above already asserts this, but check() surfaces a clear message.
         _service_index_mock.assert_async().await;
+    }
+
+    // --- private feed end-to-end (issue #523) ---
+
+    /// C1 end-to-end: a root `NuGet.Config` `<clear/>` + CorpFeed must resolve a private
+    /// package's versions from CorpFeed alone — the root registry's own service index (the
+    /// production api.nuget.org stand-in here) must receive **zero** requests, proving the
+    /// resurrection bug (#248 class) is closed at the real `parse_manifest`/`Registry`
+    /// call path, not just at `NuGetConfig`'s own unit-test level.
+    #[tokio::test]
+    async fn test_private_feed_clear_resolves_zero_requests_to_public_registry() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _public_index_mock = server
+            .mock("GET", "/public/index.json")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let _corp_index_mock = server
+            .mock("GET", "/corp/index.json")
+            .with_status(200)
+            .with_body(nuget_service_index_body(&format!("{base}/corp")))
+            .create_async()
+            .await;
+        let _corp_flat_mock = server
+            .mock("GET", "/corp/flatcontainer/mycompany.internal/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.2.3"]}"#)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("NuGet.Config"),
+            format!(
+                r#"<configuration><packageSources>
+                    <clear />
+                    <add key="CorpFeed" value="{base}/corp/index.json" />
+                </packageSources></configuration>"#
+            ),
+        )
+        .unwrap();
+        let manifest_path = dir.path().join("App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+        std::fs::write(&manifest_path, content).unwrap();
+        let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{base}/public/index.json"),
+        );
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        ));
+        let context = crate::config::NuGetParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+        };
+        let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
+
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let dep = parse_result
+            .dependencies()
+            .into_iter()
+            .find(|d| d.name().as_str() == "MyCompany.Internal")
+            .expect("dependency must be present");
+        let source = dep.source();
+        assert!(
+            matches!(source, DependencySource::AlternateRegistry { .. }),
+            "expected AlternateRegistry, got {source:?}"
+        );
+        let name = dep.name().clone();
+
+        let versions = eco
+            .registry
+            .as_ref()
+            .get_versions_from(&name, &source, deps_core::FreshnessSettings::default())
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+
+        _public_index_mock.assert_async().await;
+        _corp_index_mock.assert_async().await;
+        _corp_flat_mock.assert_async().await;
+    }
+
+    /// C1 regression (impl-critic): `generate_hover`'s unlisted-versions decoration must
+    /// never fire against the public root registry for a dependency that resolved to a
+    /// private feed — before the fix, `unlisted_versions_for_hover` was called unconditionally
+    /// on `self.registry` (always `Public`-tier), sending the private package's real name to
+    /// the mocked-as-public-registry endpoint regardless of which feed it actually resolved
+    /// to. The `.expect(0)` mock fails the test if that endpoint is ever hit.
+    #[tokio::test]
+    async fn test_generate_hover_skips_unlisted_fetch_for_private_feed_dependency() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+
+        let _public_index_mock = server
+            .mock("GET", "/public/index.json")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let _corp_index_mock = server
+            .mock("GET", "/corp/index.json")
+            .with_status(200)
+            .with_body(nuget_service_index_body(&format!("{base}/corp")))
+            .create_async()
+            .await;
+        let _corp_flat_mock = server
+            .mock("GET", "/corp/flatcontainer/mycompany.internal/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.2.3"]}"#)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("NuGet.Config"),
+            format!(
+                r#"<configuration><packageSources>
+                    <clear />
+                    <add key="CorpFeed" value="{base}/corp/index.json" />
+                </packageSources></configuration>"#
+            ),
+        )
+        .unwrap();
+        let manifest_path = dir.path().join("App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+        std::fs::write(&manifest_path, content).unwrap();
+        let uri = tower_lsp_server::ls_types::Uri::from_file_path(&manifest_path).unwrap();
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{base}/public/index.json"),
+        );
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        ));
+        let context = crate::config::NuGetParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+        };
+        let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
+
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        // Position inside "MyCompany.Internal" in the Include attribute.
+        let position = Position::new(0, 49);
+
+        let cached = std::collections::HashMap::new();
+        let resolved = std::collections::HashMap::new();
+        let hover = eco
+            .generate_hover(
+                parse_result.as_ref(),
+                position,
+                deps_core::VersionData::new(&cached, &resolved),
+                deps_core::FreshnessSettings {
+                    enabled: false,
+                    cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
+                },
+            )
+            .await;
+
+        assert!(
+            hover.is_some(),
+            "expected a hover render for a resolvable in-range dependency"
+        );
+        _public_index_mock.assert_async().await;
     }
 }

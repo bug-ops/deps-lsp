@@ -10,7 +10,8 @@ tags:
   - nuget
   - security
 created: 2026-09-03
-status: draft
+updated: 2026-09-04
+status: implemented
 related:
   - "[[constitution]]"
   - "[[MOC-specs]]"
@@ -193,10 +194,15 @@ wiring deferred, see Out of Scope).
 >   `ClearTextPassword` vs. `Password` (DPAPI-encrypted, Windows-only, not
 >   portably decryptable) distinction now, or leave that entirely for
 >   whoever picks up the follow-up?]`
-> - **Multi-level config merge** (solution-dir → user-profile
->   `%APPDATA%\NuGet\NuGet.Config` / `~/.nuget/NuGet/NuGet.Config` →
->   machine-wide config, with `<clear/>` semantics across levels) — see
->   Open Questions; phase 1's default assumption is project-local-only.
+> - **User-profile and machine-wide config tiers** (`%APPDATA%\NuGet\NuGet.Config`
+>   / `~/.nuget/NuGet/NuGet.Config`, machine-wide config) — see the resolved
+>   Open Questions below. **Narrowed during implementation**: the in-repo
+>   ancestor chain itself (every `NuGet.Config` between the manifest and the
+>   filesystem root) is now merged root-to-leaf and fully in scope (FR-001) —
+>   only the tiers outside the repository remain excluded, deliberately
+>   (that is where `<packageSourceCredentials>` most commonly lives, and a
+>   global `<clear/>` there would silently re-route every project on the
+>   machine).
 > - **Checksum/signature verification** (NuGet package signing, `nuget.org`
 >   trust chains) — no integrity verification exists in `deps-nuget` today,
 >   or in any other ecosystem crate in this project; out of scope entirely,
@@ -328,30 +334,32 @@ Use EARS notation. Prefix with FR-NNN.
 
 | ID | Requirement | Priority |
 |----|------------|----------|
-| FR-001 | THE SYSTEM SHALL locate and parse the nearest project-local `NuGet.Config` file, discovered by walking upward from the manifest's directory toward the repository root (mirroring `deps_core::lockfile::locate_lockfile_for_manifest`'s existing upward-search pattern already used by `crates/deps-nuget/src/lockfile.rs`'s `MAX_WORKSPACE_DEPTH` search) | must |
-| FR-002 | THE SYSTEM SHALL parse `<packageSources>` `<add key="..." value="..." />` entries in document order, and SHALL honor a `<clear/>` element by discarding any implicit default source list (i.e. the implicit `nuget.org` inclusion) that would otherwise apply from that point in the file | must |
-| FR-003 | WHEN a `NuGet.Config` declares `<packageSources>` without a `<clear/>` THE SYSTEM SHALL treat the declared sources as additive to the existing default `api.nuget.org` source, matching `nuget.exe`'s own default-source-preservation behavior (US-002) | must |
-| FR-004 | THE SYSTEM SHALL parse `<disabledPackageSources>` `<add key="..." value="true" />` entries and exclude the matching named source from resolution entirely (US-003), regardless of its position in `<packageSources>` | must |
-| FR-005 | WHEN no project-local `NuGet.Config` is found, or one is found but declares no `<packageSources>` override THE SYSTEM SHALL use the existing hardcoded `api.nuget.org` behavior unchanged — this is the existing `SERVICE_INDEX_URL`/`NUGET_ORG_URL` behavior, now expressed as the default of an overridable source list rather than an unconditional constant | must |
-| FR-006 | THE SYSTEM SHALL resolve each configured source through the existing two-hop service-index indirection (`ServiceIndexResponse`/`ServiceResource` in `crates/deps-nuget/src/registry.rs`) identically for a private feed as for `api.nuget.org` — no separate resolution code path for alternate feeds | must |
-| FR-007 | WHEN a package is absent from one configured source (an explicit not-found response) and additional enabled sources remain (per FR-003) THE SYSTEM SHALL attempt resolution against the next configured source. A transport failure (connection error, timeout, 5xx) on a source SHALL be treated as terminal for that source — not silently skipped in favor of a fallback the user did not request for the reachability state they are actually in — mirroring PyPI's FR-005(c) precedent (033) and Go's FR-005 (034) | must |
-| FR-008 | WHEN a `<packageSources>` entry's `value` fails validation (non-https, contains userinfo, or is not a well-formed URL) or is blocked by FR-010's policy THE SYSTEM SHALL treat that entry as invalid: represent the affected package's source as `DependencySource::CustomRegistry { url: <the raw value as written> }` if it is the only remaining viable source, or drop the invalid entry and continue with the remaining valid sources otherwise — mirroring PyPI's FR-006 (033) and Go's FR-009 (034) per-entry-fail-closed rule, logging a `tracing::warn!` naming the raw value, and SHALL NOT fall back to `api.nuget.org` for a package whose resolution the user explicitly overrode via `<clear/>` | must |
-| FR-009 | THE SYSTEM SHALL detect a `<packageSourceCredentials>` block associated with a configured source and treat that source as invalid per FR-008 (fails closed, never attempts unauthenticated access to a feed the user has configured credentials for) rather than silently attempting an anonymous request against it | must — security-relevant, not merely functional |
-| FR-010 | THE SYSTEM SHALL classify every explicitly-declared `<packageSources>` entry's host through `deps_core::net_policy::classify_host` and gate the fetch behind the existing shared `registries.workspace_registries` setting (`off` / `public_only` / `all`, default `public_only`) — the same setting Cargo/npm/PyPI already gate on, reused as-is with no new `nuget.*` key. The default `api.nuget.org` source used when `NuGet.Config` declares no override is never subject to this gate — it is the same ungated public-tier client `deps-nuget` already uses today | must |
-| FR-011 | THE SYSTEM SHALL add `NuGetFormatter`'s implementation of the `SourcePolicy` supertrait's `can_resolve_source` hook (overriding the existing defaulted `EcosystemFormatter::can_resolve_source`) so hover/diagnostics/code-actions correctly gate on a resolved `AlternateRegistry` source — no `deps-core` trait change required | must |
+| FR-001 | THE SYSTEM SHALL locate every in-repo `NuGet.Config` ancestor file by walking upward from the manifest's directory toward the filesystem root (cap 64 directories), checking `["NuGet.Config", "nuget.config", "NuGet.config"]` per directory, and SHALL merge every file found **root-to-leaf** — not "nearest file wins" — accumulating `<packageSources>`/`<disabledPackageSources>`/`<packageSourceCredentials>`/`<packageSourceMapping>` across the whole chain. **Corrected during implementation** (superseding the original "nearest file wins" draft): a root `<clear/>` must stay in effect for every descendant project even when a leaf file adds a feed without repeating `<clear/>` — nearest-wins would silently resurrect the public hop the root explicitly cleared, reproducing the #248 bug class this feature exists to close. No user-profile/machine-wide tier is read (Open Questions, resolved below) | must |
+| FR-002 | THE SYSTEM SHALL parse `<packageSources>` `<add key="..." value="..." />` entries in document order, and SHALL honor a `<clear/>` element by discarding every source accumulated so far in the FR-001 walk; `cleared` is **sticky** for the remainder of the root-to-leaf walk — once set, a later file's `<add>` with no `<clear/>` of its own does not resurrect the implicit `nuget.org` tail | must |
+| FR-003 | WHEN the merged FR-001/FR-002 chain contains no `<clear/>` THE SYSTEM SHALL treat the declared sources as additive to the existing default `api.nuget.org` source, matching `nuget.exe`'s own default-source-preservation behavior (US-002) | must |
+| FR-004 | THE SYSTEM SHALL parse `<disabledPackageSources>` `<add key="..." value="..." />` entries (value compared case-insensitively against `"true"`) and exclude the matching named source from resolution entirely (US-003), regardless of its position in `<packageSources>` — key matching goes through the FR-009 union funnel | must |
+| FR-005 | WHEN no in-repo `NuGet.Config` is found, or the merged chain declares no `<packageSources>` override THE SYSTEM SHALL use the existing hardcoded `api.nuget.org` behavior unchanged — this is the existing `SERVICE_INDEX_URL`/`NUGET_ORG_URL` behavior, now expressed as the default of an overridable source list rather than an unconditional constant | must |
+| FR-006 | THE SYSTEM SHALL resolve each configured source through the existing two-hop service-index indirection (`ServiceIndexResponse`/`ServiceResource` in `crates/deps-nuget/src/registry.rs`) identically for a private feed as for `api.nuget.org` — no separate resolution code path for alternate feeds. The service index's `@type` field SHALL tolerate a JSON-LD array or a malformed non-string scalar (degrading the resource to "matches nothing" rather than failing the whole document), and a `protocolVersion="2"` source SHALL be rejected as an explicit unsupported-protocol reason at config-parse time rather than surfacing as a confusing missing-resource error later | must |
+| FR-007 | WHEN a package is absent from one configured source (an explicit not-found response, or an empty version listing) and additional enabled sources remain (per FR-003) THE SYSTEM SHALL attempt resolution against the next configured source. A transport failure (connection error, timeout, 5xx) on a source SHALL be treated as terminal for that source — reported as `DepsError::ChainResolutionHalted`, not silently skipped in favor of a fallback the user did not request for the reachability state they are actually in — mirroring PyPI's FR-005(c) precedent (033) and Go's FR-005 (034) | must |
+| FR-008 | WHEN a `<packageSources>` entry's `value` fails validation (non-https, contains userinfo, not a well-formed URL, a local/UNC filesystem path, or `protocolVersion="2"`) or is blocked by FR-010's policy THE SYSTEM SHALL treat that entry as invalid: represent the affected package's source as `DependencySource::CustomRegistry` if it is the only remaining viable source (or if the merged chain's `<clear/>` state leaves zero usable hops at all, per the R4 correction below), or drop the invalid entry and continue with the remaining valid sources otherwise — mirroring PyPI's FR-006 (033) and Go's FR-009 (034) per-entry-fail-closed rule, logging a `tracing::warn!` (or `debug!` for a legitimate-but-unsupported local-feed/V2 shape) naming the raw value, and SHALL NOT fall back to `api.nuget.org` for a package whose resolution the user explicitly overrode via `<clear/>`. **R4 correction**: a merged chain whose `<clear/>` state removes every source down to zero — whether or not there is an invalid entry left to name — is an explicit fail-closed `CustomRegistry` state (a distinct sentinel when no entry can be named), never a silent fall-through to plain `Registry` | must |
+| FR-009 | THE SYSTEM SHALL detect a `<packageSourceCredentials>` block associated with a configured source and treat that source as invalid per FR-008 (fails closed, never attempts unauthenticated access to a feed the user has configured credentials for) rather than silently attempting an anonymous request against it. **Corrected during implementation**: source-key matching (for both `<disabledPackageSources>` and `<packageSourceCredentials>`) is case-insensitive and additionally compares against the XML-name-decoded form of a `<packageSourceCredentials>` child element name (NuGet XML-encodes non-alphanumerics there, e.g. `<Corp_x0020_Feed>` for a source named `Corp Feed`) — a union of the raw-lowercased and decoded-lowercased candidates on both sides of the comparison, since exact-only matching left FR-004/FR-009 failing open on a case or encoding mismatch | must — security-relevant, not merely functional |
+| FR-010 | THE SYSTEM SHALL classify every explicitly-declared `<packageSources>` entry's host through `deps_core::net_policy::classify_host` and gate the fetch behind the existing shared `registries.workspace_registries` setting (`off` / `public_only` / `all`, default `public_only`) — the same setting Cargo/npm/PyPI already gate on, reused as-is with no new `nuget.*` key. The default `api.nuget.org` source used when `NuGet.Config` declares no override is never subject to this gate — it is the same ungated public-tier client `deps-nuget` already uses today. Additionally (resolving the net_policy second-hop Open Question, see below), a workspace-declared feed's own resolved service-index resource URLs (`PackageBaseAddress`/`SearchQueryService`/`RegistrationsBaseUrl`) are re-validated against this same policy before being trusted: a rejected `PackageBaseAddress` fails the whole feed, a rejected `RegistrationsBaseUrl`/`SearchQueryService` degrades to absent | must |
+| FR-011 | THE SYSTEM SHALL add `NuGetFormatter`'s implementation of the `SourcePolicy` supertrait's `can_resolve_source` hook (overriding the existing defaulted `EcosystemFormatter::can_resolve_source`) so hover/diagnostics/code-actions correctly gate on a resolved `AlternateRegistry` source — no `deps-core` trait change required. **4th correction (M1, added during implementation)**: `NuGetFormatter` SHALL also override `PackageRendering::suppress_package_url` to omit the nuget.org package-page link for any dependency that is not `source_is_public_registry_content` — otherwise a nuget.org link would render alongside live private-feed data, reading as false confirmation the link is real | must |
 | FR-012 | THE SYSTEM SHALL add `Registry::get_versions_from` / `get_latest_matching_from` overrides on `NuGetRegistry`, routing fetches for `AlternateRegistry`-sourced dependencies to the resolved source list instead of unconditional `SERVICE_INDEX_URL` — reuses the existing defaulted `deps-core::Registry` trait methods | must |
-| FR-013 | THE SYSTEM SHALL apply FR-001's resolved `NuGet.Config` source list to `crates/deps-nuget/src/lockfile.rs`'s lockfile-matching path identically to the hover/diagnostic path — the crate's second hardcoded constant (`NUGET_ORG_URL`) must not be left as a stale, unconverted duplicate once `SERVICE_INDEX_URL` gains override support | must |
+| FR-013 | **Corrected during implementation** (the original draft misread the call graph): `crates/deps-nuget/src/lockfile.rs`'s `NUGET_ORG_URL` constant feeds only the informational `ResolvedSource::Registry.url` field, which nothing in `deps-lsp`/`deps-core::lsp_helpers` reads and which triggers no network request — there is no silent-mismatch risk to fix. THE SYSTEM SHALL dedupe the constant (`registry.rs`'s `NUGET_ORG_INDEX_URL` becomes the single source of truth, referenced by `lockfile.rs`) rather than thread FR-001's config resolution into the lockfile-matching path | must |
 | FR-014 | THE SYSTEM SHALL NOT read, log, or transmit any credential value from a `<packageSourceCredentials>` block — detection per FR-009 SHALL identify that a credential block exists (by source key) without parsing its `Username`/`ClearTextPassword`/`Password` child values into any retained field, so no code path ever holds a credential value in memory | must — security-blocking |
 | FR-015 | THE SYSTEM SHALL document `NuGet.Config` staleness as a known limitation (edits take effect on next reparse of the affected manifest) rather than add a dedicated file watcher, mirroring Cargo's FR-013, npm's FR-016, PyPI's FR-012, and Go's FR-015 resolution | must — the choice itself, not a specific mechanism, is mandatory |
-| FR-016 | Package-name search/completion for a dependency resolved to a non-default source without a working `SearchQueryService` resource SHALL no-op rather than error or query `api.nuget.org`, mirroring 032's FR-011, 033's FR-014, and 034's FR-016 | must |
+| FR-016 | Package-name search/completion for a dependency resolved to a non-default source without a working `SearchQueryService` resource SHALL no-op rather than error or query `api.nuget.org`. `complete_package_names` itself stays source-blind (the typed string is a prefix, not a resolved private id) and always queries `api.nuget.org`, mirroring 032's FR-011, 033's FR-014, and 034's FR-016 | must |
+| FR-017 | **5th correction, added during implementation** — absent from the original spec entirely: THE SYSTEM SHALL parse `<packageSourceMapping>` (`<packageSource key="..."><package pattern="..." /></packageSource>`, NuGet 6.0+'s recommended dependency-confusion defense) and, when present with at least one pattern, route every dependency through it instead of the FR-002/FR-003 chain. Matching is case-insensitive against a bare `*`, a trailing-`*` prefix glob, or an exact id; the longest/most-specific match wins (exact beats prefix regardless of character length, longer prefix beats shorter), and a tie makes every tied pattern's source keys eligible. A package matching no pattern becomes `CustomRegistry` (fail closed — real NuGet fails restore with NU1100 in this case, never falls through to an unmapped registry). A package whose winning pattern resolves only to the real `nuget.org` source (identified by normalized URL, never by a source's `key` — see FR-010's second-hop URL comparison) resolves to plain `Registry`, preserving OSV/deps.dev/hover-trust signals; otherwise it resolves to an `AlternateRegistry` chain with `implicit_public_fallback: false` **unconditionally** — the mapping is authoritative and never appends the public hop even when `<clear/>` is absent, which is the dependency-confusion leak this FR exists to close. **Merge strategy (R1, resolving a critic-caught defect in an earlier draft of this correction)**: mapping rules are merged root-to-leaf across every ancestor file (grouped by pattern, accumulating every source key that ever named it), never "nearest file wins" — a root mapping `{CorpFeed: MyCompany.*, nuget.org: *}` combined with a leaf mapping `{nuget.org: *}` must still route `MyCompany.Internal` to CorpFeed; taking the leaf's `*` alone would leak the private id to nuget.org, the exact attack this FR exists to prevent. A mapping key's resolution to a declared `<packageSources>` entry goes through the same FR-009 union key-matching funnel, but **unlike** FR-004/FR-009's exclusion-set matching, an ambiguous union match here (resolving to more than one distinct declared source) is treated as unresolvable and contributes nothing — growing an *inclusion* set on a union match is fail-open, not fail-closed. **S1 correction (impl-critic)**: a mapping key that is the literal `nuget.org` and resolves to **no** declared `<packageSources>` entry falls back to the real public feed rather than contributing nothing — the near-universal real-world shape is a `<packageSourceMapping>` naming `nuget.org` for its `*` pattern while `nuget.org` itself lives in the machine/user-profile config this feature deliberately never reads; without this, every public package in such a project would fail closed project-wide. This does not weaken FR-010's URL-identification rule: that rule governs a source that **is** declared and might be lying about its identity, not a key with no declared entry to spoof | must — security-relevant |
+| FR-018 | **6th correction, added during implementation (S4, impl-critic)** — absent from the original spec entirely: THE SYSTEM SHALL parse `<packageSources><remove key="..."/></packageSources>` and exclude the matching accumulated source (via the same FR-009 union key funnel), applied per-file after that file's own `<add>`s during the FR-001 root-to-leaf accumulation. `<remove key="nuget.org"/>` additionally suppresses the implicit public tail hop (sticky across the remaining walk, same rationale as `<clear/>`), so an explicitly removed public source cannot be resurrected as the implicit default — without this, `<remove>` was silently unparsed and an explicitly removed source (public or private) stayed reachable, the #248 bug class in the opposite direction. `<packageSourceMapping><clear/>` is explicitly **out of scope**: mapping rules are unconditionally merged root-to-leaf (FR-017/R1) and never reset by a leaf-level `<clear/>` — a documented scope cut, not an oversight, since undoing R1's merge for this one element needs its own empirical verification against real NuGet before it can be added safely | must — security-relevant |
 
 ## 4. Non-Functional Requirements
 
 | ID | Category | Requirement |
 |----|----------|-------------|
 | NFR-001 | Security | No credential-shaped value (`<packageSourceCredentials>` child element content, URL userinfo) is ever parsed into a retained field, held in memory beyond the immediate detection check, logged, or transmitted in phase 1 — verified by a structural test asserting the parsed config type has no field capable of holding such a value, matching the pattern Cargo's NFR-001, npm's NFR-001, PyPI's NFR-001, and Go's NFR-001 established |
-| NFR-002 | Security | Every resolved `<packageSources>` entry URL is validated (https-only, no userinfo, with the same test-only loopback carve-out precedent as Cargo/npm/PyPI/Go) and normalized before any network request — this applies to the top-level configured feed URL; whether it must additionally apply to the resolved `PackageBaseAddress`/`SearchQueryService`/`RegistrationsBaseUrl` resource URLs returned by that feed's own service index is `[NEEDS CLARIFICATION]` (see below) |
-| NFR-003 | Security | Two residual risks, both must be stated for security-reviewer sign-off before implementation merges. **(1) Inbound reachability**: an unauthenticated HTTPS GET to a workspace-declared feed still occurs, which is reachability into the user's internal network usable for existence probing by a hostile repository — mitigated identically to Cargo/npm/PyPI/Go by `registries.workspace_registries` defaulting to `public_only`. **(2) Two-hop indirection**: unlike Cargo/npm/PyPI's single-URL registries, a NuGet feed's service index can itself redirect a validated top-level host to an arbitrary second-hop resource URL (`PackageBaseAddress` et al.) — if that second hop is not independently classified, a validated public-tier feed could still respond with resource URLs pointing at an internal host, defeating the FR-010 gate. This is the subject of the third `[NEEDS CLARIFICATION]` item below and must be resolved (not merely noted) before implementation |
+| NFR-002 | Security | Every resolved `<packageSources>` entry URL is validated (https-only, no userinfo, with the same test-only loopback carve-out precedent as Cargo/npm/PyPI/Go) and normalized before any network request — this applies to the top-level configured feed URL, and, per FR-010's resolution of the net_policy second-hop question, also to the resolved `PackageBaseAddress`/`SearchQueryService`/`RegistrationsBaseUrl` resource URLs returned by a workspace-declared feed's own service index |
+| NFR-003 | Security | Three residual risks, all stated for security-reviewer sign-off. **(1) Inbound reachability**: an unauthenticated HTTPS GET to a workspace-declared feed still occurs, which is reachability into the user's internal network usable for existence probing by a hostile repository — mitigated identically to Cargo/npm/PyPI/Go by `registries.workspace_registries` defaulting to `public_only`. **(2) Two-hop indirection**: unlike Cargo/npm/PyPI's single-URL registries, a NuGet feed's service index can itself redirect a validated top-level host to an arbitrary second-hop resource URL (`PackageBaseAddress` et al.) — resolved by FR-010's per-`@id` `validate_index_url` re-check for a workspace-declared feed (this Open Question is now closed, see below). **(3) Origin-pinning loss for alternate feeds**: the flat-container fetch for the default `api.nuget.org` source uses `HttpCache::get_cached_trusted_origin`, which stops any redirect leaving the resolved `PackageBaseAddress` prefix; a workspace-declared feed instead routes through `HttpCache::get_cached_workspace` (needed for FR-010's live per-redirect-hop policy re-check), which permits a redirect to any other `Global`-classified host under `public_only` — a data-fidelity risk (a redirected response could differ from what the configured feed itself would have served), not a credential-exfiltration one, since no credential is ever attached in phase 1. Combining origin-pinning with the workspace-policy guard needs a policy-tiered, purge-on-policy-change `trusted_clients` pool in `HttpCache` that does not exist today (`Transport::origin_pinned` hardcodes `AddrGuard::Baseline`); tracked as a follow-up ("policy-tiered origin-pinned transport in `HttpCache`"), not a phase-1 blocker — the same reduction phase 1 already accepts for registration-hive enrichment (publish times, hover-only unlisted markers), which is skipped entirely for alternate feeds for the identical root-cause reason |
 | NFR-004 | Performance | No additional filesystem/network activity for a project declaring no `NuGet.Config` override, or a `NuGet.Config` that declares neither `<packageSources>` nor `<disabledPackageSources>` — zero regression path, verified by existing test suite |
 | NFR-005 | Reliability | Zero behavior change for any project declaring no `<packageSources>`/`<disabledPackageSources>` override — verified by the existing `deps-nuget` test suite producing unchanged results |
 | NFR-006 | Maintainability | FR-003's additive-source rule, FR-004's disabled-source exclusion, and FR-007's fallback ordering are each verified by dedicated tests: (a) an additive source resolves alongside the implicit default; (b) a disabled source is never queried even though declared; (c) a transport failure on a source is terminal, not silently skipped |
@@ -362,13 +370,47 @@ Use EARS notation. Prefix with FR-NNN.
 |--------|-------------|----------------|
 | `DependencySource::AlternateRegistry` | Existing `deps-core` variant, reused as-is — the FR-002/FR-006 resolved state | `index: String` — for NuGet, an opaque routing key identifying the resolved source (mirrors PyPI's `ResolvedChain::key` / Go's `GoProxyChain` routing-key precedent for multi-source ecosystems), `mirrors_crates_io: bool` (always `false`) |
 | `DependencySource::CustomRegistry` | Existing `deps-core` variant, reused as NuGet's FR-008 fail-closed state — no new variant introduced | `url: String` — the raw value as written; `is_version_resolvable()` already `false` |
-| `NuGetConfig` | New `deps-nuget` type — parsed `NuGet.Config` file contents | `sources: Vec<PackageSourceEntry>` (declaration order preserved, `<clear/>` position recorded per FR-002), `disabled: HashSet<String>` (source keys from `<disabledPackageSources>`, FR-004), `credentialed_keys: HashSet<String>` (source keys with an associated `<packageSourceCredentials>` block, FR-009/FR-014 — key presence only, no credential values retained) |
-| `PackageSourceEntry` | New `deps-nuget` type — one `<packageSources>` entry | `key: String` (the `key` attribute, used for `<disabledPackageSources>`/`<packageSourceCredentials>` cross-referencing), `value: Result<NuGetFeedUrl, InvalidEntry>` |
+| `NuGetConfig` | New `deps-nuget` type (`crates/deps-nuget/src/config.rs`) — the merged, root-to-leaf-accumulated view of every in-repo `NuGet.Config` ancestor file | `sources: Vec<PackageSourceEntry>` (post-accumulation, post-remove/disabled/credentialed-filtering), `cleared: bool` (sticky across the FR-001 walk), `nuget_org_removed: bool` (sticky, FR-018's `<remove key="nuget.org"/>`), `mapping: PackageSourceMapping` (FR-017) |
+| `PackageSourceEntry` | New `deps-nuget` type — one resolved `<packageSources>` entry after accumulation | `key: String` (as declared; every comparison against it goes through the FR-009 union funnel), `value: Result<NuGetFeedUrl, InvalidEntry>` |
+| `PackageSourceMapping` | New `deps-nuget` type (5th correction, FR-017) — merged `<packageSourceMapping>` rules | `patterns: Vec<(String, Vec<String>)>` — normalized pattern -> every source key that ever named it across the ancestor chain (R1's merge) |
 | `NuGetFeedUrl` | Validated, normalized feed URL newtype, new and `deps-nuget`-local (mirrors `RegistryIndex`/`NpmRegistryIndex`/`PypiIndexUrl`/`GoProxyUrl` rather than promoting a shared type, per the same "wait for a third+ near-identical implementation" principle 033/034 applied — this would be the fifth) | https-only, no userinfo |
-| `InvalidEntry` | New `deps-nuget` type — a present-but-unusable source entry, carrying what FR-008 needs to build `CustomRegistry` and to warn | `raw: String` (as written), `reason` (validation failure kind, including `HasCredentials` per FR-009) |
-| `NuGetRegistry` | Existing `deps-nuget` `Registry` impl, extended into a multi-source-aware router mirroring `PypiRegistry`'s `fallback_chain` structure (033) | `+ resolved_sources: <map keyed by opaque routing key>` (root-owned only) |
+| `InvalidEntry` | New `deps-nuget` type — a present-but-unusable source entry, carrying what FR-008 needs to build `CustomRegistry` and to warn | `raw: String` (as written, userinfo-redacted), `reason: NuGetFeedUrlError` (validation failure kind — `HasCredentials`/`Disabled`/`UnsupportedProtocolVersion`/`LocalFeedUnsupported` alongside the shared `IndexUrlError` variants) |
+| `NuGetSourceChain` | New `deps-nuget` type (mirrors `deps_pypi::config::ResolvedChain`) — one fully-resolved routing chain | `key: String` (hashed identity — `resolve_source_for` and `resolved_chains` recompute it independently and must agree), `hops: Vec<NuGetFeedUrl>`, `implicit_public_fallback: bool` (always `false` for an FR-017 mapping-derived chain) |
+| `NuGetDependency::source` | New field on the existing manifest-dependency type (hand-written `Dependency` impl, not `impl_dependency!` — the macro's `source: $source:expr` arm cannot express `self.source.clone()`) | `DependencySource`, stamped by `NuGetEcosystem::parse_manifest` after parsing (parsers in `parser.rs` stay config-blind) |
+| `NuGetRegistry` | Existing `deps-nuget` `Registry` impl, extended into a multi-source-aware router mirroring `PypiRegistry`'s `fallback_chain`/`alternates` structure (033) | `+ tier: NuGetRegistryTier` (`Public`/`WorkspaceDeclared`), `+ policy: Arc<RegistryAccessPolicy>`, `+ alternates: Arc<DashMap<String, Arc<Self>>>` (root-owned only), `+ fallback_chain: Vec<Arc<Self>>` |
 | `Registry::get_versions_from` / `get_latest_matching_from` | Existing defaulted `deps-core::Registry` trait methods | Overridden by `NuGetRegistry`, no signature change |
 | `EcosystemFormatter`'s `SourcePolicy` supertrait / `can_resolve_source` | Existing defaulted `deps-core` trait method (part of the seven-supertrait split from #515) | Implemented/overridden by `NuGetFormatter`, no signature change |
+| `PackageRendering::suppress_package_url` | Existing defaulted `deps-core` trait method (4th correction, FR-011/M1) | Overridden by `NuGetFormatter` |
+
+### 5a. Known Limitations (added during implementation)
+
+- **OSV/deps.dev/hover-trust signal suppression for `AlternateRegistry` dependencies.**
+  `SourcePolicy::source_is_public_registry_content` defaults to `Registry`-only,
+  so any dependency resolved to an `AlternateRegistry` chain loses OSV
+  vulnerability scanning, the deps.dev supply-chain signal, and the hover
+  trust badge. This is deliberate privacy protection (reusing a weaker
+  resolvability check there would send a private package's name and version
+  to deps.dev by default), and FR-017's `<packageSourceMapping>` support
+  substantially narrows its blast radius: with a mapping declared, only
+  genuinely-private ids (those that don't resolve to the real `nuget.org`
+  source) lose the signals. **Without** a mapping, NuGet's additive-by-default
+  model means the mere presence of one extra `<add>` (no `<clear/>` needed)
+  suppresses these signals for every dependency in the project, including
+  ones still resolving from `api.nuget.org` via the implicit fallback hop —
+  more likely to trigger than the equivalent PyPI precedent (033), since
+  adding one internal feed is the common real-world case. Accepted as
+  consistent with PyPI's identical trade-off, not a regression.
+- **Origin-pinning loss / publish-time and hover-unlisted-marker loss for
+  alternate feeds** — see NFR-003(3).
+- **`<packageSourceMapping><clear/>` is not honored** (FR-018) — mapping rules
+  accumulate root-to-leaf and are never reset, even by a leaf file's own
+  `<clear/>` inside that element. This is the correct direction for R1's
+  security-critical merge fix (a leaf `<clear/>` must not be usable to silently
+  discard an ancestor's private-routing mapping either), but means a project
+  that genuinely wants a leaf subproject to opt out of an inherited mapping
+  cannot do so today. Deliberately deferred pending empirical verification
+  against real NuGet (`dotnet nuget list source` on a two-level fixture) before
+  changing R1's merge semantics for this one element.
 
 ## 6. Edge Cases and Error Handling
 
@@ -377,15 +419,16 @@ Use EARS notation. Prefix with FR-NNN.
 | No `NuGet.Config` file, or it exists but declares no `<packageSources>`/`<disabledPackageSources>` | Byte-identical to today's behavior (US-004) |
 | `<packageSources><clear/><add key="CorpFeed" value="https://nuget.mycorp.example/v3/index.json" /></packageSources>` | Every dependency routes to CorpFeed only; `api.nuget.org` is never queried (FR-002, US-001) |
 | `<packageSources><add key="CorpFeed" value="..." /></packageSources>` (no `<clear/>`) | CorpFeed and the implicit default `api.nuget.org` both resolve (FR-003, US-002) |
-| `<disabledPackageSources><add key="CorpFeed" value="true" /></disabledPackageSources>` | CorpFeed excluded from resolution entirely even though declared in `<packageSources>` (FR-004, US-003) |
-| `<packageSourceCredentials><CorpFeed><add key="Username" .../></CorpFeed></packageSourceCredentials>` present for a declared source | That source treated as invalid per FR-008/FR-009 — never queried unauthenticated, no credential value read into memory (FR-014) |
-| `<add key="Bad" value="not-a-valid-url" />` (sole remaining source) | Source becomes `CustomRegistry { url: "not-a-valid-url" }`; warn logged; no `api.nuget.org` fallback (FR-008, US-005) |
+| `<disabledPackageSources><add key="CorpFeed" value="true" /></disabledPackageSources>` (CorpFeed is the only declared source, no `<clear/>`) | CorpFeed excluded from resolution (FR-004, US-003); **S3 correction**: with no `<clear/>` in effect, this degrades to the implicit default `api.nuget.org`, matching FR-003's additive-source model exactly as if CorpFeed had never been declared at all — not `CustomRegistry`. Only a chain with `<clear/>` in effect (so there is no implicit tail to fall back to) turns a disabled/credentialed-to-zero state into `CustomRegistry` (FR-008's R4 correction) |
+| `<packageSourceCredentials><CorpFeed><add key="Username" .../></CorpFeed></packageSourceCredentials>` present for a declared source | That source treated as invalid per FR-008/FR-009 — never queried unauthenticated, no credential value read into memory (FR-014). Same additive-vs-`<clear/>` distinction as the disabled-source row above governs what the *rest* of the chain resolves to |
+| `<add key="Bad" value="not-a-valid-url" />` (sole remaining source, `<clear/>` in effect) | Source becomes `CustomRegistry { url: "not-a-valid-url" }`; warn logged; no `api.nuget.org` fallback (FR-008, US-005) |
 | `<add key="Bad" value="not-a-valid-url" />` alongside another valid source | Invalid entry dropped (warn logged); resolution proceeds via the remaining valid source (FR-008) |
 | Package absent from a configured private source, present on `api.nuget.org` (additive, no `<clear/>`) | Resolved via `api.nuget.org` after the private source's explicit not-found response (FR-007) |
 | A configured source is unreachable (connection error/timeout) with further sources declared | Resolution halts at that source rather than silently skipping to the next — a distinguishable outcome, not a generic failure (FR-007, mirrors PyPI's 033 FR-005(c) / Go's 034 FR-005 trade-off) |
 | `workspace_registries = off`, `NuGet.Config` declares a private source | That source is blocked by FR-010's policy → dropped/fails closed per FR-008, same as an invalid entry |
 | `NuGet.Config` edited after initial resolution | Stale until the affected manifest is next reparsed (FR-015, documented limitation) |
-| A validated public-tier feed's service index resolves `PackageBaseAddress`/`SearchQueryService` to an internal-network host | Behavior depends on resolution of the second `[NEEDS CLARIFICATION]` item below — currently undefined pending that decision |
+| A workspace-declared feed's service index resolves `PackageBaseAddress` to an internal-network host | Resolution of that hop fails per FR-010's per-`@id` policy check, failing the whole feed closed (`CustomRegistry`) — never fetched |
+| A workspace-declared feed's service index resolves `SearchQueryService`/`RegistrationsBaseUrl` to an internal-network host | That one resource degrades to absent (search no-ops per FR-016; freshness/hover-unlisted enrichment is unavailable), the feed as a whole still resolves normally via `PackageBaseAddress` |
 | Lockfile matching (`packages.lock.json`) for a package resolved via a private source | Must use the same resolved source list as hover/diagnostics (FR-013) — a stale `NUGET_ORG_URL`-only lockfile path would silently mismatch a private-feed-resolved package's lockfile-pinned version against public `nuget.org` data |
 
 ## 7. Success Criteria
@@ -396,7 +439,8 @@ Use EARS notation. Prefix with FR-NNN.
 | SC-002 | Credentialed source is never queried unauthenticated, and no credential value is ever held in memory | Structural test per NFR-001/FR-014, plus a behavioral test asserting zero requests to a `<packageSourceCredentials>`-guarded source |
 | SC-003 | Zero regression on projects declaring no `NuGet.Config` override | Every existing `deps-nuget` test produces unchanged results |
 | SC-004 | Misconfigured/unreachable source never silently falls back to `api.nuget.org` ahead of a valid remaining/declared source | Test mirroring the #248/032/033/034 regression pattern, adapted for NuGet's additive-source model |
-| SC-005 | Lockfile-matching path (`packages.lock.json`) resolves consistently with the hover/diagnostic path for a private-feed-sourced package | Test asserting `crates/deps-nuget/src/lockfile.rs` and `crates/deps-nuget/src/registry.rs` agree on which source a given package resolves through |
+
+**SC-005 dropped during implementation**: the original criterion assumed the lockfile path threads live config resolution and must agree with the registry path on "which source a package resolves through". Verified false: `lockfile.rs`'s `NUGET_ORG_URL` (now deduped to `registry.rs`'s `NUGET_ORG_INDEX_URL`) feeds only the informational `ResolvedSource::Registry.url` field, which nothing downstream reads and which triggers no network request — see FR-013's correction. There is nothing for this criterion to test.
 
 ## 8. Agent Boundaries
 
@@ -414,43 +458,57 @@ Use EARS notation. Prefix with FR-NNN.
 
 ### Never
 - Parse, log, or transmit any credential-shaped value (`<packageSourceCredentials>` child content, URL userinfo) in this phase (FR-014).
-- Fall back to `api.nuget.org` when an explicit `<clear/>`+`<packageSources>` override is present but fails to resolve (FR-008), or when a source is disabled via `<disabledPackageSources>` (FR-004) — the exact bug class issue #248 fixed for Cargo and 032/033/034 fixed for npm/PyPI/Go.
+- Fall back to `api.nuget.org` when an explicit `<clear/>`+`<packageSources>` override is present but resolves to zero usable hops (FR-008/R4) — the exact bug class issue #248 fixed for Cargo and 032/033/034 fixed for npm/PyPI/Go. **S3 correction**: this "never" is scoped to a chain with `<clear/>` in effect. A source disabled via `<disabledPackageSources>` (FR-004) or credentialed (FR-009) with **no** `<clear/>` in the chain correctly degrades to the implicit `api.nuget.org` default per FR-003's additive-source model — the same answer as if that source had simply never been declared. This is not the #248 bug class: #248 was a `<clear/>` override being silently ignored, not an additive config's own already-implicit default staying implicit.
 - Widen the `deps-core` `Registry`/`EcosystemFormatter` **trait** surface — every hook this spec needs already exists generically from the Cargo/npm/PyPI/Go work.
 - Leave `crates/deps-nuget/src/lockfile.rs`'s `NUGET_ORG_URL` constant as a stale, unconverted duplicate once `registry.rs`'s `SERVICE_INDEX_URL` gains override support (FR-013).
 
-## 9. Open Questions
+## 9. Open Questions (all resolved)
 
-- `[NEEDS CLARIFICATION: auth/credential handling]` — should NuGet's
-  `<packageSourceCredentials>` handling (including the `ClearTextPassword`
-  vs. DPAPI-encrypted `Password` distinction) be addressed by a dedicated
-  follow-up spec immediately after this one ships, or left entirely
-  unscheduled like npm's/PyPI's/Go's equivalent deferrals? Non-blocking for
-  phase 1 either way — phase 1 fails closed on any credentialed source per
-  FR-008/FR-009/FR-014. Flagged explicitly (per the task brief) as a new
-  auth-config shape for this project, not a reuse of an existing deferred
-  pattern.
-- `[NEEDS CLARIFICATION: config discovery scope]` — does phase 1's
-  project-local-only `NuGet.Config` discovery (FR-001) provide enough
-  real-world coverage, or does NuGet's own multi-level precedence model
-  (solution dir → `%APPDATA%\NuGet\NuGet.Config` / `~/.nuget/NuGet/NuGet.Config`
-  → machine-wide config, merged with `<clear/>` semantics across levels)
-  need to be implemented for this feature to be useful in practice? NuGet's
-  precedence model is more layered than Cargo's/npm's/PyPI's single-file
-  phase-1 scope, so the "just match existing precedent" answer may not
-  transfer directly — needs an explicit decision before `/sdd plan`.
-- `[NEEDS CLARIFICATION: net_policy second-hop coverage]` — does
-  `deps_core::net_policy`'s SSRF-hardening gate (built for Cargo's
-  alt-registries in #443/#453/#457/#460, reused by npm/PyPI) need to
-  validate a resolved feed's second-hop resource URLs
-  (`PackageBaseAddress`/`SearchQueryService`/`RegistrationsBaseUrl` from the
-  service-index response), not just the top-level `<packageSources>` value
-  a user configures? NuGet's two-hop indirection (service-index JSON ->
-  per-capability resource URLs) has no equivalent in Cargo's/npm's/PyPI's
-  single-URL registry model, so this is a materially new question for
-  `net_policy`, not a restatement of prior coverage. This must be resolved
-  before implementation per NFR-003(2) — a validated public-tier feed
-  could otherwise redirect resolution to an internal host via its own
-  service index, defeating the top-level gate.
+- **Auth/credential handling — resolved: fail closed, no follow-up spec scheduled yet.**
+  `<packageSourceCredentials>` is parsed for child element names only (into a
+  set), never for `Username`/`ClearTextPassword`/`Password` values — any
+  named source becomes `InvalidEntry { reason: HasCredentials }`, fail
+  closed (FR-009/FR-014). `%VAR%`-style expansion is deliberately not
+  implemented: an unexpanded placeholder value fails URL validation and
+  fails closed naturally, so phase 1 needs zero code for it. The follow-up
+  spec's scope, when someone picks it up, should cover `ClearTextPassword`
+  plus NuGet credential providers only — **DPAPI-encrypted `Password` is
+  permanently out of scope**, not merely deferred (Windows-only, requires
+  `CryptUnprotectData`; deps-lsp must never decrypt a credential blob). Not
+  scheduled as of this implementation.
+- **Config discovery scope — resolved: in-repo upward walk, root-to-leaf
+  accumulation across every ancestor file found, no user-profile/machine
+  tier.** Superseding the original "nearest file wins" draft (FR-001):
+  discovery still walks from the manifest's directory toward the filesystem
+  root (cap 64), but now collects **every** `NuGet.Config` it finds and
+  applies them in root-to-leaf order, with `cleared` sticky across the
+  whole walk — this is what makes a root `<clear/>` survive a leaf file
+  that adds a feed without repeating it (the C1 fix, closing the specific
+  #248-shaped bug the original "nearest file wins" draft would have
+  reproduced). The user-profile tier (`%APPDATA%\NuGet\NuGet.Config` /
+  `~/.nuget/NuGet/NuGet.Config`) is still not read — deliberately, on
+  purpose: that is exactly where `<packageSourceCredentials>` most commonly
+  lives and where a global `<clear/>` would silently re-route every project
+  on the machine, an escalation that belongs with the auth follow-up, not
+  this phase. This is inconsistent with npm's `~/.npmrc` tier (npm does
+  read the user tier, simply never parsing auth keys from it) — accepted as
+  a deliberate scope cut since it degrades safely (extra `api.nuget.org`
+  queries, never wrong data), not a gap.
+- **net_policy second-hop coverage — resolved: yes, required, and now
+  implemented (FR-010).** `HttpCache::get_cached_workspace`'s own doc states
+  it does not re-check the initial request URL's host class, only
+  DNS-resolved addresses and redirect hops — and `classify_addr` can never
+  produce `HostClass::InternalName`, so a workspace-declared feed's *name*
+  resolving to an internal address at the service-index-resource level
+  would otherwise slip past the top-level gate. `ServiceIndex::resolve` now
+  runs `validate_index_url(id, id, "nuget", PolicyGate::Enforce(policy))`
+  on each picked resource `@id`, for workspace-declared feeds only (the
+  default `api.nuget.org` keeps `PolicyGate::Skip` per FR-010's carve-out).
+  A rejected `PackageBaseAddress` fails the whole feed (fail closed); a
+  rejected `RegistrationsBaseUrl`/`SearchQueryService` degrades to absent —
+  the same degradation an omitted resource already receives. See NFR-003(2)
+  (resolved) and NFR-003(3) (the accepted origin-pinning-loss follow-up
+  this fix's transport choice implies).
 
 Non-blocking, deliberately deferred:
 

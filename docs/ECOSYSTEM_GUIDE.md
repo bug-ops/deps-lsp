@@ -18,7 +18,7 @@ deps-lsp provides comprehensive LSP support for 13 package ecosystems:
 | **Gradle** | Kotlin/Groovy | `build.gradle`, `build.gradle.kts`, `gradle/libs.versions.toml` | — | Hover with corrected version ordering (same as Maven), inlay hints, completion, code actions, diagnostics, code lens (variable/catalog-versioned dependencies not covered — see below), variable resolution (`gradle.properties`) |
 | **Composer** | PHP | `composer.json` | `composer.lock` | Hover, inlay hints, completion, code actions, diagnostics, code lens (requirement matching and "latest version" selection both use corrected stability-qualifier ordering — see below) |
 | **Swift** | Swift | `Package.swift` | `Package.resolved` | Hover, inlay hints, completion, code actions, diagnostics, code lens (range-form dependencies not covered — see below), GitHub API support |
-| **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json`, `packages.<project>.lock.json` (multi-project) | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling, hover-only unlisted-version marker |
+| **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json`, `packages.<project>.lock.json` (multi-project) | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling, hover-only unlisted-version marker, private/custom feed resolution via `NuGet.Config` (see below) |
 | **Deno** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics, code lens — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
 | **GitHub Actions** | YAML | `.github/workflows/*.yml`, `*.yaml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered — see below); tag/commit-SHA/branch `uses:` pins via the GitHub tags API; reusable-workflow calls recognized but not version-resolved — see below; release-age hint and cooldown diagnostic require `GITHUB_TOKEN` — see below |
 
@@ -66,11 +66,13 @@ worse than the pre-existing crates.io answer.
 workspace-declared registry index (the `registry`/`registry-index` alias path, or a
 `[source]` mirror) is checked against this setting before it is ever fetched — a
 hostile cloned repository can write both, and this LSP parses on file open, before
-any build runs. This setting is shared with npm's `.npmrc` resolution and PyPI's
-custom-index resolution below (one process-wide `HttpCache` policy governs every
-ecosystem's workspace-declared registry fetches — see
-[npm Custom/Private Registries](#npm-customprivate-registries) and
-[PyPI Custom/Private Indexes](#pypi-customprivate-indexes) for what that sharing
+any build runs. This setting is shared with npm's `.npmrc` resolution, PyPI's
+custom-index resolution, and NuGet's `NuGet.Config` resolution below (one
+process-wide `HttpCache` policy governs every ecosystem's workspace-declared
+registry fetches — see
+[npm Custom/Private Registries](#npm-customprivate-registries),
+[PyPI Custom/Private Indexes](#pypi-customprivate-indexes), and
+[NuGet Private/Custom Feeds](#nuget-privatecustom-feeds) for what that sharing
 means in practice). Three values:
 
 | Value | Behavior |
@@ -348,6 +350,124 @@ ungated public-tier client `deps-go` already uses today.
   resolved to a non-default `GOPROXY` chain or a `GOPRIVATE`-routed
   module — Go has no package-name search endpoint in its module-proxy
   protocol at all.
+
+### NuGet Private/Custom Feeds
+
+A NuGet dependency whose applicable feed is overridden via a repository's
+`NuGet.Config` `<packageSources>` (Azure Artifacts, GitHub Packages, an internal
+Artifactory/BaGet/ProGet instance) gets the same hover/diagnostic/completion
+value a plain `api.nuget.org` dependency gets, instead of always querying the
+public feed regardless of what the project actually configures.
+
+**Discovery — every in-repo ancestor file, merged root-to-leaf**: `deps-nuget`
+walks upward from the manifest's directory toward the filesystem root (capped at
+64 directories), checking `NuGet.Config`/`nuget.config`/`NuGet.config` at each
+level, and merges **every** file it finds — not just the nearest one — applying
+them in root-to-leaf order. A `<clear/>` anywhere in that chain is sticky for
+every file below it: a repo-root `NuGet.Config` with `<clear/>` plus a private
+feed stays cleared even for a subproject whose own `NuGet.Config` adds a second
+feed without repeating `<clear/>`. User-profile and machine-wide config
+(`%APPDATA%\NuGet\NuGet.Config`, `~/.nuget/NuGet/NuGet.Config`) are not read —
+deliberately: that is exactly where `<packageSourceCredentials>` most commonly
+lives, and a global `<clear/>` there would silently re-route every project on
+the machine.
+
+**Additive by default**: a `NuGet.Config` with no `<clear/>` adds its declared
+sources alongside the implicit `api.nuget.org` source, matching `nuget.exe`'s
+own default-source-preservation behavior — a package present only on the new
+feed and a package present only on `api.nuget.org` both keep resolving
+correctly.
+
+**`<packageSourceMapping>` (dependency-confusion defense) takes priority when
+present**: NuGet 6.0+'s recommended `<packageSourceMapping>` element
+(`<packageSource key="..."><package pattern="..." /></packageSource>`) is
+honored when declared with at least one pattern — every dependency is then
+routed by pattern match (bare `*`, a trailing-`*` prefix glob, or an exact id;
+longest/most-specific match wins, exact beats prefix, ties make every tied
+source eligible) instead of the additive chain above. A package matching no
+pattern shows no version data (real NuGet fails restore with `NU1100` in this
+case) rather than falling through to an unmapped feed — this is what actually
+closes the dependency-confusion attack `<packageSourceMapping>` exists for:
+without honoring it, an internal package name could still be looked up against
+`api.nuget.org` on a cache miss. `<packageSourceMapping>` rules are merged
+across the same root-to-leaf ancestor chain as `<packageSources>` — a broader
+ancestor mapping rule is never silently dropped by a narrower leaf file's own
+mapping (a leaf-level `<clear/>` inside `<packageSourceMapping>` itself is not
+honored — see Known Limitations below). A mapping key that is the literal
+`nuget.org` and names no declared `<packageSources>` entry resolves to the
+real public feed rather than failing closed — the common real-world shape,
+since `nuget.org` itself typically lives in the machine/user-profile config
+this feature does not read.
+
+**`<disabledPackageSources>`/`<packageSourceCredentials>`/`<remove>` are
+respected**: a source disabled via `<disabledPackageSources><add key="..."
+value="true" />`, removed via `<packageSources><remove key="..."/>`, or with an
+associated `<packageSourceCredentials>` block is excluded from resolution
+entirely. Excluding a source does **not** by itself mean the affected
+dependency shows no data: with no `<clear/>` in the chain, the exclusion just
+falls back to the implicit `api.nuget.org` default — the same additive-source
+model FR-003 already documents, since the excluded source is simply treated as
+if it had never been declared. It becomes a hard failure only when the chain
+also has a `<clear/>` (or an explicit `<remove key="nuget.org"/>`) in effect,
+leaving nothing for the exclusion to fall back to. Key matching is
+case-insensitive and additionally compares against NuGet's `_xHHHH_`-encoded
+child-element-name form (a source named `Corp Feed` appears as
+`<Corp_x0020_Feed>` under `<packageSourceCredentials>`).
+
+**Authentication**: phase 1 carries **no** authentication at all, the same
+Cargo/npm/PyPI precedent — a credentialed source fails closed per the previous
+paragraph rather than being queried anonymously; `ClearTextPassword`/DPAPI-encrypted
+`Password` values are never parsed into any retained field.
+
+**Fail-closed on misconfiguration**: an invalid feed URL (non-https, userinfo,
+malformed, a local/UNC filesystem path, or `protocolVersion="2"`) shows no
+version data if it is the only remaining viable source, or is dropped (with a
+logged warning) if other valid sources remain. A `<clear/>` that removes every
+source down to zero — with or without an invalid entry left to name — is an
+explicit fail-closed state, never a silent fallback to `api.nuget.org` (the
+same issue #248/#502/#513 regression class Cargo/npm/PyPI already closed).
+
+**Reachability policy**: governed by the same `registries.workspace_registries`
+setting documented above for Cargo/npm/PyPI. Additionally, a workspace-declared
+feed's own service-index resource URLs (`PackageBaseAddress`/
+`SearchQueryService`/`RegistrationsBaseUrl`) are re-validated against this same
+policy before being trusted — NuGet's service index is a two-hop indirection
+(a top-level feed URL resolves to a JSON document naming further per-capability
+resource URLs) with no equivalent in Cargo's/npm's/PyPI's single-URL registry
+model, so a validated top-level host could otherwise redirect resolution to an
+internal host via its own service index.
+
+**Known limitations**:
+- Editing `NuGet.Config` does not take effect until the affected manifest is
+  next reparsed — no dedicated file watcher.
+- `<packageSourceMapping><clear/>` is not honored — mapping rules only ever
+  accumulate across the ancestor chain, never reset, even by a leaf file's own
+  `<clear/>` inside that element. Deliberate: undoing the merge-not-nearest-wins
+  fix for this one element needs its own empirical verification against real
+  NuGet first.
+- No authentication of any kind (see above) — an auth-gated private feed (Azure
+  DevOps PAT, GitHub Packages token) is not reachable end-to-end until a
+  follow-up auth spec ships.
+- A workspace-declared feed's flat-container/service-index fetch loses
+  origin-pinning (a redirect off the resolved `PackageBaseAddress` to another
+  public host is permitted under `public_only`, unlike the origin-pinned
+  transport `api.nuget.org` itself uses) and skips registration-hive
+  enrichment entirely — no publish-time freshness data and no hover-only
+  `*(unlisted)*` marker for a private-feed-resolved package.
+- A dependency resolved to a private feed drops out of OSV vulnerability
+  scanning, the deps.dev supply-chain signal, and the hover trust badge, and
+  its hover heading omits the `nuget.org` package-page link (it would be
+  misleading next to live private-feed data). Declaring
+  `<packageSourceMapping>` narrows this considerably: only genuinely-private
+  ids (ones that don't resolve to the real `api.nuget.org` source, identified
+  by URL, never by a source's `key`) lose the signals. Without a mapping,
+  adding one internal feed suppresses these signals for every dependency in
+  the project, including ones still resolving from `api.nuget.org` via the
+  implicit fallback hop.
+- `complete_package_names` stays source-blind and always queries
+  `api.nuget.org` — the typed string is a prefix, not a resolved private
+  package name, so this is safe but not feed-aware (mirrors npm's/PyPI's
+  identical choice).
 
 ### Yanked-Version Diagnostics
 
