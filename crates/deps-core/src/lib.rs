@@ -28,6 +28,7 @@ pub mod osv;
 pub mod package;
 pub mod parser;
 pub mod registry;
+pub mod secret;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 pub mod version_matcher;
