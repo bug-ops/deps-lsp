@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-nuget**: renamed the secret-exposing `as_str()` accessor on `Redacted<T>` and its delegating wrapper types (`AuthToken`, `RedactedSecret`) to `expose_secret()`, so it can no longer be confused with an ordinary string conversion in a grep or code review (resolves #581) (#582)
 - **deps-lsp, deps-nuget**: decomposed `handle_document_change` and `resolve_with_context` into named, independently-testable phase helpers — pure refactor, no behavior change (resolves #580) (#583)
 - **deps-core, deps-pypi, deps-nuget, deps-go**: consolidated three independently hand-rolled "hash an ordered routing chain into an opaque identity key" implementations into a single `deps_core::hash_routing_key` helper; resulting chain-key digest values change (process-local cache keys only, never persisted or compared cross-process, so this is not observable); `deps_go::config::ChainSeparator` no longer derives `Hash` (breaking, pre-1.0, no alias) (resolves #579) (#584)
-- **deps-core, deps-lsp**: decomposed `generate_hover` and `fetch_latest_versions_parallel`/`handle_document_open` into named, independently-testable helpers — pure refactor, no behavior change (resolves #586, #585)
+- **deps-core, deps-lsp**: decomposed `generate_hover` and `fetch_latest_versions_parallel`/`handle_document_open` into named, independently-testable helpers — pure refactor, no behavior change (resolves #586, #585) (#588)
 
 ### Security
 - **deps-core, deps-nuget**: credential material and its construction intermediates now zeroize on drop (resolves #574) (#577)
