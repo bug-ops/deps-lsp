@@ -2981,6 +2981,7 @@ mod tests {
     async fn test_fetch_attaches_credential_on_service_index_and_flat_container() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
         let auth = NuGetAuth::new("user", "pat");
 
         let _index = server
@@ -3005,6 +3006,7 @@ mod tests {
         let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
             &auth_hop(&feed, "corpfeed", "user", "pat"),
             Arc::clone(&policy),
             Vec::new(),
@@ -3023,6 +3025,7 @@ mod tests {
     async fn test_fetch_attaches_credential_on_search_query_service() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
         let auth = NuGetAuth::new("user", "pat");
 
         let _index = server
@@ -3047,6 +3050,7 @@ mod tests {
         let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
             &auth_hop(&feed, "corpfeed", "user", "pat"),
             Arc::clone(&policy),
             Vec::new(),
@@ -3067,6 +3071,7 @@ mod tests {
     async fn test_fetch_attaches_credential_on_registration_hive() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
         let auth = NuGetAuth::new("user", "pat");
         let reg_base = format!("{base}/registrations");
 
@@ -3112,6 +3117,7 @@ mod tests {
         let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
             &auth_hop(&feed, "corpfeed", "user", "pat"),
             Arc::clone(&policy),
             Vec::new(),
@@ -3133,6 +3139,7 @@ mod tests {
     async fn test_fetch_attaches_credential_on_unlisted_versions_for_hover() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
         let auth = NuGetAuth::new("user", "pat");
         let reg_base = format!("{base}/registrations");
 
@@ -3159,6 +3166,7 @@ mod tests {
         let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
             &auth_hop(&feed, "corpfeed", "user", "pat"),
             Arc::clone(&policy),
             Vec::new(),
@@ -3201,6 +3209,7 @@ mod tests {
         let feed = NuGetFeedUrl::new(&format!("{}/index.json", declared.url()), &policy).unwrap();
         let client = NuGetRegistry::with_base(
             Arc::new(HttpCache::new()),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
             &auth_hop(&feed, "corpfeed", "user", "pat"),
             Arc::clone(&policy),
             Vec::new(),
@@ -3219,6 +3228,7 @@ mod tests {
     async fn test_register_chain_credential_rotation_at_capacity_replaces_in_place() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
         let auth_v2 = NuGetAuth::new("user", "pat-v2");
 
         let _index = server
@@ -3265,6 +3275,7 @@ mod tests {
 
         let chain_v1 = NuGetSourceChain {
             key: chain_key.clone(),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
             hops: vec![auth_hop(&feed, "corpfeed", "user", "pat-v1")],
             implicit_public_fallback: false,
         };
@@ -3277,6 +3288,7 @@ mod tests {
 
         let chain_v2 = NuGetSourceChain {
             key: chain_key.clone(),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
             hops: vec![auth_hop(&feed, "corpfeed", "user", "pat-v2")],
             implicit_public_fallback: false,
         };

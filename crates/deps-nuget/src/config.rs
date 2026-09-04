@@ -2700,6 +2700,7 @@ mod tests {
     /// literal secret.
     #[test]
     fn test_nuget_auth_and_redacted_secret_never_debug_print_the_literal() {
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
         let auth = NuGetAuth::new("user", "super-secret-pat");
         assert!(!format!("{auth:?}").contains("super-secret-pat"));
         assert!(!format!("{auth}").contains("super-secret-pat"));
