@@ -151,8 +151,8 @@ impl AuthToken {
 
     /// The raw header value, for attaching to a request. Never logged, printed, or
     /// otherwise surfaced — callers must not pass this to anything but a header value.
-    fn as_str(&self) -> &str {
-        self.0.as_str()
+    fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
     }
 }
 
@@ -273,7 +273,7 @@ impl GithubTagsClient {
     pub(crate) fn headers(&self) -> Vec<(HeaderName, &str)> {
         self.auth_headers
             .iter()
-            .map(|(k, v)| (k.clone(), v.as_str()))
+            .map(|(k, v)| (k.clone(), v.expose_secret()))
             .collect()
     }
 

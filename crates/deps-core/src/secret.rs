@@ -32,7 +32,7 @@ use zeroize::{Zeroize, Zeroizing};
 /// use deps_core::secret::Redacted;
 ///
 /// let token = Redacted::new("super-secret-value".to_string());
-/// assert_eq!(token.as_str(), "super-secret-value");
+/// assert_eq!(token.expose_secret(), "super-secret-value");
 /// assert_eq!(format!("{token:?}"), "Redacted(***)");
 /// assert_eq!(format!("{token}"), "***");
 /// ```
@@ -40,7 +40,7 @@ use zeroize::{Zeroize, Zeroizing};
 pub struct Redacted<T: Zeroize = String>(Zeroizing<T>);
 
 impl<T: Zeroize> Redacted<T> {
-    /// Wraps `value`. The only way to recover it is [`Self::as_str`] (for `T: AsRef<str>`).
+    /// Wraps `value`. The only way to recover it is [`Self::expose_secret`] (for `T: AsRef<str>`).
     pub fn new(value: T) -> Self {
         Self(Zeroizing::new(value))
     }
@@ -50,8 +50,14 @@ impl<T: Zeroize + AsRef<str>> Redacted<T> {
     /// The raw secret value. Never pass this to anything but the one call site that needs
     /// it (e.g. attaching a header value to a request) — never to a log, error message, or
     /// anything `Debug`/`Display`-formatted downstream.
+    ///
+    /// Named `expose_secret()` rather than `as_str()` deliberately, mirroring the `secrecy`
+    /// crate's `ExposeSecret::expose_secret()` convention: a name shared with hundreds of
+    /// ordinary string-conversion methods across the workspace cannot be grepped for in
+    /// isolation, while a distinctive name lets a reviewer or a future automated lint find
+    /// every place a secret's plaintext crosses its wrapper boundary with a single search.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub fn expose_secret(&self) -> &str {
         self.0.as_ref()
     }
 }
@@ -108,9 +114,9 @@ mod tests {
     }
 
     #[test]
-    fn as_str_recovers_the_value() {
+    fn expose_secret_recovers_the_value() {
         let secret = Redacted::new("hunter2".to_string());
-        assert_eq!(secret.as_str(), "hunter2");
+        assert_eq!(secret.expose_secret(), "hunter2");
     }
 
     #[test]
@@ -134,7 +140,7 @@ mod tests {
         let wrapper = Wrapper {
             token: Redacted::new("hunter2".to_string()),
         };
-        assert_eq!(wrapper.token.as_str(), "hunter2");
+        assert_eq!(wrapper.token.expose_secret(), "hunter2");
         let debug_output = format!("{wrapper:?}");
         assert!(debug_output.contains("Redacted(***)"), "{debug_output}");
         assert!(!debug_output.contains("hunter2"), "{debug_output}");

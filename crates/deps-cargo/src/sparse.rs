@@ -363,7 +363,7 @@ impl SparseIndexClient {
     async fn fetch(&self, url: &str) -> Result<bytes::Bytes> {
         match (&self.auth, self.trust) {
             (Some(token), IndexTrust::Trusted) => {
-                let header_value = format!("Bearer {}", token.as_str());
+                let header_value = format!("Bearer {}", token.expose_secret());
                 self.cache
                     .get_cached_trusted_origin_with_headers(
                         url,
