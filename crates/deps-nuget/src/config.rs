@@ -1269,7 +1269,8 @@ pub(crate) fn resolve(
 ///
 /// # Credential binding (§3.2, FR-007)
 ///
-/// The final pass below binds a user-profile credential to a resolved entry `E` iff all of:
+/// The final pass, in `bind_credentials_and_finalize`, binds a user-profile credential to a
+/// resolved entry `E` iff all of:
 /// (0) `E.key` does not overlap the credential-suppression set (union, exclusion); (1) exactly
 /// one user-profile credential's key-candidates overlap `E.key`; (2) exactly one
 /// `user_profile_add` entry's key-candidates overlap that credential's own key; (3) `E`'s URL
@@ -1286,6 +1287,37 @@ pub fn resolve_with_context(
     user_profile_config: Option<&Path>,
     user_profile_sources: &AtomicBool,
 ) -> NuGetConfig {
+    let ancestors = collect_config_ancestors(manifest_dir, config_cache, user_profile_config);
+
+    let user_profile_sources_enabled =
+        user_profile_sources.load(std::sync::atomic::Ordering::Relaxed);
+
+    // S2 fix (impl-critic, issue #576 follow-up): identity of the exact config state this
+    // resolve is built from — see `config_ancestors_fingerprint`'s doc. Computed before the
+    // tier-accumulation walk so `bind_credentials_and_finalize` can debounce its fail-closed
+    // warnings against it below.
+    let config_fingerprint = config_ancestors_fingerprint(&ancestors);
+
+    let accumulated = accumulate_config_tiers(&ancestors, policy, user_profile_sources_enabled);
+
+    bind_credentials_and_finalize(accumulated, config_cache, config_fingerprint)
+}
+
+/// Walks `manifest_dir`'s ancestor directories collecting each `NuGet.Config` found (FR-001),
+/// then resolves the user-profile-tier file, if any, dropping it when it is the same file
+/// (by canonicalized path) as one already found in the repo walk — a user-profile candidate
+/// reachable at both tiers is treated as `Repo` (lower trust wins) rather than loaded a
+/// second time under the higher-trust tier. A `canonicalize` failure on the user-profile
+/// candidate itself drops it entirely (fail closed).
+///
+/// Returns the merged chain in leaf-to-root discovery order with the user-profile file
+/// appended last, so reversing it (as [`accumulate_config_tiers`] does) processes the
+/// user-profile tier first and lets any repo-tier file override it (§3.8).
+fn collect_config_ancestors(
+    manifest_dir: &Path,
+    config_cache: &NuGetConfigCache,
+    user_profile_config: Option<&Path>,
+) -> Vec<(ConfigTier, Arc<RawNuGetConfigFile>)> {
     let mut repo_ancestors: Vec<Arc<RawNuGetConfigFile>> = Vec::new();
     let mut repo_paths: Vec<PathBuf> = Vec::new();
     let mut current: Option<&Path> = Some(manifest_dir);
@@ -1310,10 +1342,6 @@ pub fn resolve_with_context(
         current = dir.parent();
     }
 
-    // FR-001: a user-profile candidate reachable at both tiers (canonicalized) is treated as
-    // Repo (lower trust wins) — dropped here rather than loaded a second time under the
-    // higher-trust tier. A `canonicalize` failure on the user-profile candidate itself drops
-    // it entirely (fail closed).
     let user_profile_file: Option<Arc<RawNuGetConfigFile>> = user_profile_config.and_then(|upc| {
         let canon = std::fs::canonicalize(upc).ok()?;
         let is_repo_dup = repo_paths
@@ -1325,9 +1353,6 @@ pub fn resolve_with_context(
         config_cache.get_or_parse(&canon)
     });
 
-    // Leaf-to-root discovery order (matching `repo_ancestors`'s own order), with the
-    // user-profile file appended last — so after `.rev()` below it is processed *first*,
-    // giving any repo-tier file the ability to override it (§3.8).
     let mut ancestors: Vec<(ConfigTier, Arc<RawNuGetConfigFile>)> = repo_ancestors
         .into_iter()
         .map(|f| (ConfigTier::Repo, f))
@@ -1335,29 +1360,65 @@ pub fn resolve_with_context(
     if let Some(user_file) = user_profile_file {
         ancestors.push((ConfigTier::UserProfile, user_file));
     }
+    ancestors
+}
 
-    let user_profile_sources_enabled =
-        user_profile_sources.load(std::sync::atomic::Ordering::Relaxed);
+/// Content-derived identity of `ancestors`' exact config state (S2 fix, impl-critic, issue
+/// #576 follow-up), derived from *content* rather than `Arc` pointer address (C1 fix,
+/// impl-critic follow-up — pointer identity collides once an old `Arc` is dropped and a
+/// later, differently-content `Arc` is allocated at the same freed address; see
+/// `RawNuGetConfigFile`'s doc). `Arc<T>`'s own `Hash` impl already forwards to `T`'s `Hash`
+/// rather than hashing the pointer, so this is stable across repeat calls that hit
+/// `config_cache` for every ancestor (same content, same hash) and changes the instant any
+/// ancestor's parsed content actually differs. Lets [`fail_closed`] debounce its warning to
+/// once per distinct config state instead of once per resolve call (this pass isn't itself
+/// cached, unlike the per-file raw parse).
+fn config_ancestors_fingerprint(ancestors: &[(ConfigTier, Arc<RawNuGetConfigFile>)]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (tier, file) in ancestors {
+        tier.hash(&mut hasher);
+        file.hash(&mut hasher);
+    }
+    hasher.finish()
+}
 
-    // S2 fix (impl-critic, issue #576 follow-up): identity of the exact config state this
-    // resolve is built from, derived from *content* rather than `Arc` pointer address (C1 fix,
-    // impl-critic follow-up — pointer identity collides once an old `Arc` is dropped and a
-    // later, differently-content `Arc` is allocated at the same freed address; see
-    // `RawNuGetConfigFile`'s doc). `Arc<T>`'s own `Hash` impl already forwards to `T`'s `Hash`
-    // rather than hashing the pointer, so this is stable across repeat calls that hit
-    // `config_cache` for every ancestor (same content, same hash) and changes the instant any
-    // ancestor's parsed content actually differs. Lets `fail_closed` below debounce its warning
-    // to once per distinct config state instead of once per resolve call (this pass isn't
-    // itself cached, unlike the per-file raw parse).
-    let config_fingerprint = {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (tier, file) in &ancestors {
-            tier.hash(&mut hasher);
-            file.hash(&mut hasher);
-        }
-        hasher.finish()
-    };
+/// State [`accumulate_config_tiers`] builds while walking the merged ancestor chain root-to-
+/// leaf (C1), threaded into [`bind_credentials_and_finalize`] for the credential-binding pass
+/// and the final [`NuGetConfig`] assembly. Kept as one struct rather than a long parameter
+/// list since every field is produced together by the same walk and consumed together by the
+/// same pass.
+struct AccumulatedConfig {
+    sources: Vec<PackageSourceEntry>,
+    cleared: bool,
+    nuget_org_removed: bool,
+    disabled_raw: Vec<(String, String)>,
+    repo_credentialed_raw: Vec<String>,
+    user_credentialed_raw: Vec<String>,
+    mapping: PackageSourceMapping,
+    /// Credential-half accumulators (§3.8) — populated identically regardless of
+    /// `user_profile_sources`.
+    user_credentials: Vec<RawCredential>,
+    user_profile_add: Vec<PackageSourceEntry>,
+    user_profile_credential_suppressed: HashSet<String>,
+}
 
+/// C1: applies each ancestor's contribution root -> leaf (reverse of `ancestors`' leaf-to-root
+/// discovery order), accumulating package sources, `<clear/>`/`<remove>` state, disabled/
+/// credentialed key sets, and `<packageSourceMapping>` into one [`AccumulatedConfig`].
+///
+/// A [`ConfigTier::UserProfile`] file's contribution splits into two halves (§3.8, FR-005/
+/// FR-006): its credential half (`credentialed_keys`, the §3.4 suppression set, raw
+/// `<packageSourceCredentials>` values, and its own `<clear/>`/`<add>`/`<remove>` batch
+/// tracked separately as `user_profile_add`) always applies; its routing half (`sources`,
+/// `sources_cleared`, `removed`/`nuget_org_removed`, `disabled`, `mapping`) is skipped
+/// entirely when `user_profile_sources_enabled` is false (NFR-005). A repo-tier file's
+/// contribution is unaffected by the flag and always applies in full. `cleared` is sticky for
+/// the rest of the walk once set — see this module's doc.
+fn accumulate_config_tiers(
+    ancestors: &[(ConfigTier, Arc<RawNuGetConfigFile>)],
+    policy: &RegistryAccessPolicy,
+    user_profile_sources_enabled: bool,
+) -> AccumulatedConfig {
     let mut sources: Vec<PackageSourceEntry> = Vec::new();
     let mut cleared = false;
     let mut nuget_org_removed = false;
@@ -1371,8 +1432,6 @@ pub fn resolve_with_context(
     let mut user_profile_add: Vec<PackageSourceEntry> = Vec::new();
     let mut user_profile_credential_suppressed: HashSet<String> = HashSet::new();
 
-    // C1: apply root -> leaf (reverse of the leaf-to-root discovery order above). `cleared`
-    // is sticky for the rest of the walk once set — see this module's doc.
     for (tier, file) in ancestors.iter().rev() {
         let tier = *tier;
 
@@ -1432,22 +1491,50 @@ pub fn resolve_with_context(
         }
     }
 
+    AccumulatedConfig {
+        sources,
+        cleared,
+        nuget_org_removed,
+        disabled_raw,
+        repo_credentialed_raw,
+        user_credentialed_raw,
+        mapping,
+        user_credentials,
+        user_profile_add,
+        user_profile_credential_suppressed,
+    }
+}
+
+/// Final pass (§3.2, FR-007): binds a user-profile credential to each resolved source entry
+/// where all of conditions (0)-(3) hold (see [`resolve_with_context`]'s doc for the full
+/// condition list), applying the FR-004 repo-tier-credentialed check and the FR-008 public-
+/// index carve-out first, and fails an entry closed via [`fail_closed`] whenever a credential
+/// match cannot be bound cleanly. Consumes `accumulated` and returns the finished
+/// [`NuGetConfig`], since nothing else in [`resolve_with_context`] needs the intermediate
+/// accumulator state after this point.
+fn bind_credentials_and_finalize(
+    mut accumulated: AccumulatedConfig,
+    config_cache: &NuGetConfigCache,
+    config_fingerprint: u64,
+) -> NuGetConfig {
     let mut disabled_keys: HashSet<String> = HashSet::new();
-    for (key, value) in &disabled_raw {
+    for (key, value) in &accumulated.disabled_raw {
         if value.eq_ignore_ascii_case("true") {
             disabled_keys.extend(key_candidates(key));
         }
     }
-    let repo_credentialed_keys: HashSet<String> = repo_credentialed_raw
+    let repo_credentialed_keys: HashSet<String> = accumulated
+        .repo_credentialed_raw
         .iter()
         .flat_map(|k| key_candidates(k))
         .collect();
-    let user_credentialed_keys: HashSet<String> = user_credentialed_raw
+    let user_credentialed_keys: HashSet<String> = accumulated
+        .user_credentialed_raw
         .iter()
         .flat_map(|k| key_candidates(k))
         .collect();
 
-    for entry in &mut sources {
+    for entry in &mut accumulated.sources {
         let Ok(url) = entry.value.as_ref() else {
             continue;
         };
@@ -1495,9 +1582,9 @@ pub fn resolve_with_context(
 
         match bind_user_profile_credential(
             entry,
-            &user_credentials,
-            &user_profile_add,
-            &user_profile_credential_suppressed,
+            &accumulated.user_credentials,
+            &accumulated.user_profile_add,
+            &accumulated.user_profile_credential_suppressed,
             &resolved_url,
         ) {
             Some(Ok(auth)) => entry.auth = Some(auth),
@@ -1518,10 +1605,10 @@ pub fn resolve_with_context(
     }
 
     NuGetConfig {
-        sources,
-        cleared,
-        nuget_org_removed,
-        mapping,
+        sources: accumulated.sources,
+        cleared: accumulated.cleared,
+        nuget_org_removed: accumulated.nuget_org_removed,
+        mapping: accumulated.mapping,
     }
 }
 
