@@ -810,6 +810,198 @@ pub struct NetworkConfig {
     pub offline: bool,
 }
 
+/// Which open documents a config change invalidates and must reparse (issue #592).
+///
+/// `All` and a named `Ecosystems` set both exist so a change with a narrow, known blast
+/// radius (e.g. `registries.nuget_user_profile_sources` only ever affects NuGet's parse
+/// context) doesn't force a workspace-wide reparse.
+///
+/// **On `reparse_scope`'s actual safety property (security review correction)**: in
+/// production, [`reparse_scope`] never returns `All` today — every currently-classified
+/// field maps to a specific `Ecosystems` scope, not the fail-open `All` branch. The real
+/// safety mechanism is that function's exhaustive destructuring: adding a field to
+/// `DepsConfig` (or one of its sections) without updating `reparse_scope` is a compile error
+/// (E0027), not a silent gap — verified empirically. That compile error does **not** itself
+/// pick a safe branch, though: rustc's own suggested fix for it is `field: _`, which is
+/// exactly the not-parse-affecting shape every existing field already uses. A developer
+/// adding a genuinely security-relevant future field (e.g. a hypothetical
+/// `network.proxy_url`) who follows that suggestion mechanically would make it silently
+/// non-parse-affecting — the compile error forces *a* decision, it does not make the *safe*
+/// decision for you. Whoever adds such a field must consciously map it to
+/// [`ReparseScope::All`] (or a narrower scope) instead of reaching for `_`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ReparseScope {
+    /// Reparse every open document, regardless of ecosystem.
+    All,
+    /// Reparse only open documents whose `ecosystem_id()` is one of these.
+    Ecosystems(Vec<&'static str>),
+}
+
+impl ReparseScope {
+    /// Whether a document of this ecosystem falls within scope.
+    pub(crate) fn matches(&self, ecosystem_id: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Ecosystems(ids) => ids.contains(&ecosystem_id),
+        }
+    }
+
+    /// Unions two scopes together (issue #592: coalescing a burst of config changes must
+    /// not lose an earlier change's scope to a later, narrower one). `All` absorbs
+    /// anything; two `Ecosystems` sets are deduplicated-merged.
+    pub(crate) fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, _) | (_, Self::All) => Self::All,
+            (Self::Ecosystems(mut a), Self::Ecosystems(b)) => {
+                for id in b {
+                    if !a.contains(&id) {
+                        a.push(id);
+                    }
+                }
+                Self::Ecosystems(a)
+            }
+        }
+    }
+}
+
+/// The only ecosystem `registries.nuget_user_profile_sources` affects.
+const NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS: &[&str] = &["nuget"];
+
+/// The only ecosystem `registries.gitlab_instance_host` affects.
+///
+/// Same single-ecosystem-scoped shape as [`NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS`], not a
+/// member of `workspace_registry_ecosystems`: `deps_gitlab_ci::parser::parse_gitlab_ci_yaml`
+/// resolves this setting into a [`deps_gitlab_ci::types::HostRef`] once, at parse time (see
+/// `resolve_project_host`/`resolve_component_host`), so a changed instance host leaves
+/// already-open documents' cached `HostRef`s stale until they are re-parsed. Listed
+/// unconditionally here even though the `gitlab-ci` feature can be compiled out — `ReparseScope`
+/// only ever narrows an *already-registered* ecosystem, so naming an absent one is a no-op, not
+/// a hazard.
+const GITLAB_INSTANCE_HOST_ECOSYSTEMS: &[&str] = &["gitlab-ci"];
+
+/// Diffs `old` against `new` and returns the [`ReparseScope`] of open documents a
+/// live-reloaded config change invalidates, or `None` if nothing parse-affecting changed
+/// (issue #592).
+///
+/// Both `DepsConfig` and each of its section structs are destructured exhaustively here —
+/// **no `..` rest pattern**, at either level — so a field added to `DepsConfig` in the
+/// future is a compile error in this function until it is explicitly classified as either
+/// not parse-affecting (bound to `_`, its value never read) or mapped to a scope. A section
+/// classified not parse-affecting is still destructured field-by-field, for the same
+/// reason: classifying a whole section once would silently swallow a future field added to
+/// it. This can't catch a field whose *documented meaning* changes without changing its
+/// type (e.g. a hypothetical `network.proxy_url`) — destructuring forces a human to look at
+/// every field, it cannot make the classification decision by itself.
+///
+/// `workspace_registry_ecosystems` — the ecosystem ids to scope a `registries.workspace_registries`
+/// change to — is a caller-supplied parameter rather than a hardcoded list in this module
+/// (issue #592 security M1): the true set is whatever `register_ecosystems` (`lib.rs`)
+/// actually threads the live `RegistryAccessPolicy` handle into, returned by that same
+/// function and stored on `ServerState::workspace_registry_ecosystems`. Hardcoding a second,
+/// independently-maintained copy here would let the two drift — a 6th policy-consuming
+/// ecosystem added to `register_ecosystems` without updating a duplicate list would fail
+/// *closed*: exactly the scenario #592 exists to close, since that ecosystem would keep
+/// silently showing versions resolved under a revoked policy.
+pub(crate) fn reparse_scope(
+    old: &DepsConfig,
+    new: &DepsConfig,
+    workspace_registry_ecosystems: &[&'static str],
+) -> Option<ReparseScope> {
+    let DepsConfig {
+        inlay_hints: new_inlay_hints,
+        diagnostics: new_diagnostics,
+        cache: new_cache,
+        cold_start: new_cold_start,
+        loading_indicator: new_loading_indicator,
+        code_lens: new_code_lens,
+        freshness: new_freshness,
+        supply_chain: new_supply_chain,
+        registries: new_registries,
+        network: new_network,
+    } = new;
+
+    // Not parse-affecting: every field is named (never `..`), so its value is simply
+    // unused here rather than compared, but a new field on any of these sections still
+    // forces a decision at this line.
+    let InlayHintsConfig {
+        enabled: _,
+        up_to_date_text: _,
+        needs_update_text: _,
+    } = new_inlay_hints;
+    let DiagnosticsConfig {
+        outdated_severity: _,
+        unknown_severity: _,
+        yanked_severity: _,
+        unsatisfiable_severity: _,
+        deprecated_severity: _,
+        mutable_ref_pin_severity: _,
+        mutable_ref_pin_enabled: _,
+        vulnerabilities_enabled: _,
+    } = new_diagnostics;
+    let CacheConfig {
+        enabled: _,
+        fetch_timeout_secs: _,
+        max_concurrent_fetches: _,
+    } = new_cache;
+    let ColdStartConfig {
+        enabled: _,
+        rate_limit_ms: _,
+    } = new_cold_start;
+    let LoadingIndicatorConfig {
+        enabled: _,
+        fallback_to_hints: _,
+        loading_text: _,
+    } = new_loading_indicator;
+    let CodeLensConfig { enabled: _ } = new_code_lens;
+    let FreshnessConfig {
+        enabled: _,
+        cooldown_secs: _,
+    } = new_freshness;
+    let SupplyChainConfig { enabled: _ } = new_supply_chain;
+    let NetworkConfig { offline: _ } = new_network;
+
+    // Parse-affecting.
+    let RegistriesConfig {
+        workspace_registries: new_workspace_registries,
+        nuget_user_profile_sources: new_nuget_user_profile_sources,
+        gitlab_instance_host: new_gitlab_instance_host,
+    } = new_registries;
+    let RegistriesConfig {
+        workspace_registries: old_workspace_registries,
+        nuget_user_profile_sources: old_nuget_user_profile_sources,
+        gitlab_instance_host: old_gitlab_instance_host,
+    } = &old.registries;
+
+    let mut scope: Option<ReparseScope> = None;
+    let union_in = |scope: &mut Option<ReparseScope>, addition: ReparseScope| {
+        *scope = Some(match scope.take() {
+            Some(existing) => existing.union(addition),
+            None => addition,
+        });
+    };
+
+    if old_workspace_registries != new_workspace_registries {
+        union_in(
+            &mut scope,
+            ReparseScope::Ecosystems(workspace_registry_ecosystems.to_vec()),
+        );
+    }
+    if old_nuget_user_profile_sources != new_nuget_user_profile_sources {
+        union_in(
+            &mut scope,
+            ReparseScope::Ecosystems(NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS.to_vec()),
+        );
+    }
+    if old_gitlab_instance_host != new_gitlab_instance_host {
+        union_in(
+            &mut scope,
+            ReparseScope::Ecosystems(GITLAB_INSTANCE_HOST_ECOSYSTEMS.to_vec()),
+        );
+    }
+
+    scope
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,5 +1567,158 @@ mod tests {
         let json = r#"{"network":{"offline":true}}"#;
         let config: DepsConfig = serde_json::from_str(json).unwrap();
         assert!(config.network.offline);
+    }
+
+    // =========================================================================
+    // `reparse_scope` / `ReparseScope` tests (issue #592)
+    // =========================================================================
+
+    mod reparse_scope_tests {
+        use super::*;
+
+        /// A small, test-local stand-in for the real ecosystem list `reparse_scope` now
+        /// takes as a parameter (issue #592 security M1) — these tests exercise
+        /// `reparse_scope`'s diff/union *logic*, not the production ecosystem set, which is
+        /// covered separately by `lib.rs`'s `register_ecosystems`-drift test.
+        const TEST_WORKSPACE_REGISTRY_ECOSYSTEMS: &[&str] = &["cargo", "npm", "pypi", "go"];
+
+        #[test]
+        fn test_no_change_returns_none() {
+            let config = DepsConfig::default();
+            assert!(reparse_scope(&config, &config, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS).is_none());
+        }
+
+        #[test]
+        fn test_inert_field_change_returns_none() {
+            let old = DepsConfig::default();
+            let mut new = DepsConfig::default();
+            new.freshness.cooldown_secs = 60;
+            new.network.offline = true;
+            new.cold_start.rate_limit_ms = 0;
+            assert!(
+                reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS).is_none(),
+                "freshness/network/cold_start changes must not trigger a reparse"
+            );
+        }
+
+        #[test]
+        fn test_workspace_registries_change_scopes_to_workspace_ecosystems() {
+            let old = DepsConfig::default();
+            let mut new = DepsConfig::default();
+            new.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
+
+            let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
+                .expect("must trigger a reparse");
+            assert_eq!(
+                scope,
+                ReparseScope::Ecosystems(TEST_WORKSPACE_REGISTRY_ECOSYSTEMS.to_vec())
+            );
+            for id in TEST_WORKSPACE_REGISTRY_ECOSYSTEMS {
+                assert!(scope.matches(id));
+            }
+            assert!(!scope.matches("bundler"));
+        }
+
+        /// The scope must come from the caller-supplied list, not a value baked into
+        /// `reparse_scope` itself (security M1) — passing a different list for the same
+        /// config diff must change the result.
+        #[test]
+        fn test_workspace_registries_change_scope_reflects_caller_supplied_list() {
+            let old = DepsConfig::default();
+            let mut new = DepsConfig::default();
+            new.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
+
+            let scope =
+                reparse_scope(&old, &new, &["only-this-one"]).expect("must trigger a reparse");
+            assert_eq!(scope, ReparseScope::Ecosystems(vec!["only-this-one"]));
+            assert!(!scope.matches("cargo"));
+        }
+
+        #[test]
+        fn test_nuget_user_profile_sources_change_scopes_to_nuget_only() {
+            let old = DepsConfig::default();
+            let mut new = DepsConfig::default();
+            new.registries.nuget_user_profile_sources = true;
+
+            let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
+                .expect("must trigger a reparse");
+            assert_eq!(
+                scope,
+                ReparseScope::Ecosystems(NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS.to_vec())
+            );
+            assert!(scope.matches("nuget"));
+            assert!(!scope.matches("cargo"));
+        }
+
+        #[test]
+        fn test_gitlab_instance_host_change_scopes_to_gitlab_ci_only() {
+            let old = DepsConfig::default();
+            let mut new = DepsConfig::default();
+            new.registries.gitlab_instance_host = "gitlab.mycorp.dev".to_string();
+
+            let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
+                .expect("must trigger a reparse");
+            assert_eq!(
+                scope,
+                ReparseScope::Ecosystems(GITLAB_INSTANCE_HOST_ECOSYSTEMS.to_vec())
+            );
+            assert!(scope.matches("gitlab-ci"));
+            assert!(!scope.matches("cargo"));
+            assert!(!scope.matches("nuget"));
+        }
+
+        #[test]
+        fn test_both_registry_fields_changed_unions_scopes() {
+            let old = DepsConfig::default();
+            let mut new = DepsConfig::default();
+            new.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
+            new.registries.nuget_user_profile_sources = true;
+
+            let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
+                .expect("must trigger a reparse");
+            for id in TEST_WORKSPACE_REGISTRY_ECOSYSTEMS {
+                assert!(scope.matches(id), "must still cover {id}");
+            }
+            assert!(scope.matches("nuget"));
+        }
+
+        #[test]
+        fn test_scope_union_all_absorbs_ecosystems() {
+            let all = ReparseScope::All;
+            let ecosystems = ReparseScope::Ecosystems(vec!["cargo"]);
+            assert_eq!(all.clone().union(ecosystems.clone()), ReparseScope::All);
+            assert_eq!(ecosystems.union(all), ReparseScope::All);
+        }
+
+        #[test]
+        fn test_scope_union_ecosystems_dedups() {
+            let a = ReparseScope::Ecosystems(vec!["cargo", "npm"]);
+            let b = ReparseScope::Ecosystems(vec!["npm", "pypi"]);
+            let ReparseScope::Ecosystems(union) = a.union(b) else {
+                panic!("expected Ecosystems variant");
+            };
+            assert_eq!(union.len(), 3, "npm must not be duplicated: {union:?}");
+            for id in ["cargo", "npm", "pypi"] {
+                assert!(union.contains(&id));
+            }
+        }
+
+        #[test]
+        fn test_scope_matches_all_matches_any_ecosystem() {
+            assert!(ReparseScope::All.matches("anything"));
+        }
+
+        /// Every ecosystem id named in the `nuget_user_profile_sources` scope literal must
+        /// actually resolve in the registered ecosystem set (critic Q1: a typo here fails
+        /// silently closed — matching no document, no warning). The `workspace_registries`
+        /// scope's ids are no longer a literal in this module (security M1) — their
+        /// validity is covered by `lib.rs`'s `register_ecosystems`-drift test instead.
+        #[test]
+        fn test_nuget_user_profile_sources_ecosystem_ids_are_valid_ecosystem_ids() {
+            for id in NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS {
+                id.parse::<deps_core::EcosystemId>()
+                    .unwrap_or_else(|_| panic!("{id:?} is not a valid EcosystemId"));
+            }
+        }
     }
 }

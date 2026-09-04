@@ -286,14 +286,23 @@ ecosystem!(
 /// freshness path's full-packument fetch and its publish-time cache for a package
 /// appearing in both `package.json` and a `deno.json` `npm:`-specifier dependency, on top
 /// of the plain cached GETs the shared `cache` already dedupes.
+/// Returns every ecosystem id this call threaded the live `RegistryAccessPolicy` handle
+/// into (issue #592 security M1) — the single source of truth `config::reparse_scope`'s
+/// caller consults to scope a `registries.workspace_registries` reparse, so that set can
+/// never drift from what this function actually wires up. Adding a 6th policy-consuming
+/// ecosystem means editing this function anyway (to thread `policy` through its parse
+/// context); pushing its id onto the returned list at that same call site keeps the two
+/// facts — "receives the policy" and "is in the reparse scope" — physically inseparable,
+/// rather than duplicated across two independently-editable places.
 pub fn register_ecosystems(
     registry: &EcosystemRegistry,
     cache: Arc<HttpCache>,
     runtime: &EcosystemRuntime,
-) {
+) -> Vec<&'static str> {
     let policy = Arc::clone(&runtime.policy);
     // Keeps `policy` used even when the `cargo` feature (its only consumer) is compiled out.
     let _ = &policy;
+    let mut workspace_registry_ecosystems = Vec::new();
 
     #[cfg(feature = "cargo")]
     {
@@ -305,6 +314,7 @@ pub fn register_ecosystems(
             Arc::clone(&cache),
             context,
         )));
+        workspace_registry_ecosystems.push("cargo");
     }
 
     #[cfg(all(feature = "npm", feature = "deno"))]
@@ -319,6 +329,10 @@ pub fn register_ecosystems(
             Arc::clone(&npm_registry),
             npm_context,
         )));
+        workspace_registry_ecosystems.push("npm");
+        // `DenoEcosystem::with_npm` shares the registry above but is never handed `policy`
+        // itself (its own `.npmrc`-style workspace registry concept doesn't exist yet), so
+        // "deno" deliberately never joins this list.
         registry.register(Arc::new(DenoEcosystem::with_npm(
             Arc::clone(&cache),
             npm_registry.as_ref().clone(),
@@ -339,6 +353,7 @@ pub fn register_ecosystems(
             Arc::new(NpmRegistry::new(Arc::clone(&cache))),
             npm_context,
         )));
+        workspace_registry_ecosystems.push("npm");
     }
     #[cfg(all(feature = "deno", not(feature = "npm")))]
     register!("deno", DenoEcosystem, registry, &cache);
@@ -348,10 +363,13 @@ pub fn register_ecosystems(
     // default, disconnected `RegistryAccessPolicy` — its private-index reachability policy
     // would never see a live `initialize`/`didChangeConfiguration` update.
     #[cfg(feature = "pypi")]
-    registry.register(Arc::new(PypiEcosystem::with_policy(
-        Arc::new(PypiRegistry::new(Arc::clone(&cache))),
-        Arc::clone(&policy),
-    )));
+    {
+        registry.register(Arc::new(PypiEcosystem::with_policy(
+            Arc::new(PypiRegistry::new(Arc::clone(&cache))),
+            Arc::clone(&policy),
+        )));
+        workspace_registry_ecosystems.push("pypi");
+    }
 
     // go is written out explicitly rather than via `register!` (spec 034, mirroring npm's
     // spec 032 S3 precedent): that macro's `GoEcosystem::new(cache)` would give Go a
@@ -368,6 +386,7 @@ pub fn register_ecosystems(
             Arc::new(GoRegistry::new(Arc::clone(&cache))),
             go_context,
         )));
+        workspace_registry_ecosystems.push("go");
     }
     register!("bundler", BundlerEcosystem, registry, &cache);
     register!("dart", DartEcosystem, registry, &cache);
@@ -391,6 +410,7 @@ pub fn register_ecosystems(
             Arc::new(NuGetRegistry::new(Arc::clone(&cache))),
             nuget_context,
         )));
+        workspace_registry_ecosystems.push("nuget");
     }
 
     register!("github-actions", GithubActionsEcosystem, registry, &cache);
@@ -406,6 +426,8 @@ pub fn register_ecosystems(
         Arc::clone(&policy),
         Arc::clone(&runtime.gitlab_instance_host),
     )));
+
+    workspace_registry_ecosystems
 }
 
 #[cfg(test)]
@@ -454,6 +476,53 @@ mod tests {
         assert!(registry.get("github-actions").is_some());
         #[cfg(feature = "gitlab-ci")]
         assert!(registry.get("gitlab-ci").is_some());
+    }
+
+    /// Issue #592 security M1: every id `register_ecosystems` returns must actually be a
+    /// registered ecosystem (catches a typo'd `push` literal) and, for this feature set,
+    /// must exactly match the five ecosystems known to thread `RegistryAccessPolicy` through
+    /// their parse context — a regression here means either a policy-consuming ecosystem
+    /// was added without pushing its id (fails closed for `config::reparse_scope`), or an id
+    /// was pushed for an ecosystem that no longer receives the policy (harmless over-scoping,
+    /// but signals the two facts drifted anyway).
+    #[test]
+    #[allow(
+        clippy::vec_init_then_push,
+        reason = "each push is independently feature-gated, so a `vec![]` literal can't \
+                  express the feature-conditional membership"
+    )]
+    fn test_register_ecosystems_workspace_registry_list_matches_registered_ecosystems() {
+        let registry = Arc::new(EcosystemRegistry::new());
+        let cache = Arc::new(HttpCache::new());
+        let workspace_registry_ecosystems =
+            register_ecosystems(&registry, Arc::clone(&cache), &test_runtime());
+
+        for id in &workspace_registry_ecosystems {
+            assert!(
+                registry.get(id).is_some(),
+                "{id:?} was returned as policy-consuming but is not a registered ecosystem"
+            );
+        }
+
+        let mut expected = Vec::new();
+        #[cfg(feature = "cargo")]
+        expected.push("cargo");
+        #[cfg(feature = "npm")]
+        expected.push("npm");
+        #[cfg(feature = "pypi")]
+        expected.push("pypi");
+        #[cfg(feature = "go")]
+        expected.push("go");
+        #[cfg(feature = "nuget")]
+        expected.push("nuget");
+        expected.sort_unstable();
+        let mut actual = workspace_registry_ecosystems.clone();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "workspace-registry-policy ecosystem set changed — update this test's `expected` \
+             list alongside whatever registration change caused it"
+        );
     }
 
     /// Regression guard for issue #118: `EcosystemId`'s string literals (`deps-core`)

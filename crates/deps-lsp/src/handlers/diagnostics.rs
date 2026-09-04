@@ -59,6 +59,7 @@ pub(crate) async fn generate_diagnostics_internal(
 
         // Skip diagnostics while versions are still loading to avoid
         // false "Unknown package" warnings from empty cache
+        // TODO(critic): bound this skip by loading_started_at.elapsed() — see #592 residual
         if doc.loading_state == deps_core::LoadingState::Loading {
             return None;
         }

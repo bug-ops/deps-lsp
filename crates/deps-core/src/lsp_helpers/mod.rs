@@ -313,6 +313,19 @@ impl DependencyOutcomes {
         self.0.remove(name);
     }
 
+    /// Clears the fetch-failure channel for every entry, pruning any that become empty.
+    ///
+    /// Used when a forced re-fetch (e.g. a live-reloaded registry-routing setting, deps-lsp
+    /// issue #592) makes every previously recorded fetch-failure finding untrustworthy: the
+    /// routing itself changed, so a failure recorded under the old routing must not survive
+    /// to be merged with results fetched under the new one.
+    pub fn clear_all_fetch_failures(&mut self) {
+        let names: Vec<String> = self.0.keys().cloned().collect();
+        for name in names {
+            self.clear_fetch_failure(&name);
+        }
+    }
+
     fn prune(&mut self, name: &str) {
         if self.0.get(name).is_some_and(DependencyOutcome::is_empty) {
             self.0.remove(name);
@@ -1263,6 +1276,37 @@ mod tests {
         outcomes.remove("pkg");
 
         assert!(outcomes.get("pkg").is_none());
+        assert!(outcomes.is_empty());
+    }
+
+    /// `clear_all_fetch_failures` (deps-lsp issue #592) drops the fetch-failure channel for
+    /// every entry, pruning an entry that becomes empty, while leaving other channels
+    /// (yanked/deprecation/no-comparable-versions) on a still-mixed entry untouched.
+    #[test]
+    fn test_dependency_outcomes_clear_all_fetch_failures() {
+        let mut outcomes = DependencyOutcomes::new()
+            .with_fetch_failure("only-failure", FetchFailure::Transient)
+            .with_yanked("mixed", ("1.0.0".into(), RemovalStatus::Yanked))
+            .with_fetch_failure("mixed", FetchFailure::Transient);
+
+        outcomes.clear_all_fetch_failures();
+
+        assert!(
+            outcomes.get("only-failure").is_none(),
+            "an entry whose only channel was fetch-failure must be pruned"
+        );
+        assert!(outcomes.fetch_failure("mixed").is_none());
+        assert!(
+            outcomes.yanked("mixed").is_some(),
+            "clearing fetch-failure must not touch a mixed entry's other channels"
+        );
+    }
+
+    /// `clear_all_fetch_failures` on an empty map is a no-op, not a panic.
+    #[test]
+    fn test_dependency_outcomes_clear_all_fetch_failures_on_empty_map() {
+        let mut outcomes = DependencyOutcomes::new();
+        outcomes.clear_all_fetch_failures();
         assert!(outcomes.is_empty());
     }
 

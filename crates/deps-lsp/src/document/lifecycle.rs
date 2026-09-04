@@ -198,6 +198,43 @@ fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     new_state.outcomes.clone_from(&old_state.outcomes);
 }
 
+/// Drops previously cached version and fetch-failure data ahead of a forced re-fetch
+/// (`RefetchPolicy::AllDependencies`, issue #592): the routing itself changed, so data
+/// obtained under the old routing can no longer be vouched for. Leaves
+/// `resolved_versions` (lockfile-derived, registry-independent) and `vulnerabilities`
+/// (OSV is registry-independent) untouched — dropping either would flicker diagnostics
+/// off for no security benefit.
+///
+/// **Critic S1 fix**: every dependency in `deps_to_fetch` is marked
+/// [`FetchFailure::NotAttempted`] rather than left with no outcome entry at all. The gap
+/// this closes: the real fetch this drop precedes doesn't complete synchronously (it's
+/// behind a 100ms debounce plus network latency), so a concurrent or subsequent plain edit
+/// with unchanged content (`RefetchPolicy::Diff`, empty diff) can commit and
+/// `preserve_cache` forward the just-cleared state before the fetch ever merges real
+/// results. Without a placeholder, that commit's `outcomes` would have no entry at all for
+/// the dropped dependency — indistinguishable from "checked, nothing found" — and
+/// `handlers::diagnostics`' R5 rule renders that as the misleading "Unknown package"
+/// instead of "registry lookup failed" (the same class of bug #267 introduced
+/// `fetch_failed` to prevent in the first place). The placeholder is superseded the moment
+/// the real fetch completes: `merge_registry_fetch_result` calls `set_fetch_failure`
+/// (unconditional overwrite) for a genuine failure or inserts into `cached_versions` for a
+/// success, and a dependency with a `cached_versions` entry never reaches the R5 rule this
+/// placeholder guards regardless of what `outcomes` still says.
+fn drop_cache_for_forced_refetch(
+    doc: &mut DocumentState,
+    deps_to_fetch: &[PackageName],
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) {
+    doc.cached_versions.clear();
+    doc.outcomes.clear_all_fetch_failures();
+    for name in deps_to_fetch {
+        doc.outcomes.set_fetch_failure_if_absent(
+            formatter.normalize_package_name(name),
+            FetchFailure::NotAttempted,
+        );
+    }
+}
+
 /// Merges a partial fetch's #205 deprecation findings into `doc.outcomes`' deprecation
 /// channel (incremental didChange path — S1).
 ///
@@ -1755,6 +1792,21 @@ async fn run_document_open_background_task(
 
     tracing::debug!(count = dep_sources.len(), "starting registry fetch");
 
+    // Bounds total outbound fetch concurrency across every open/changed document
+    // server-wide (issue #592 critic S2/M1). Acquired *before* `set_loading()`/
+    // `RegistryProgress::start` below, not just around the fetch: acquiring only around
+    // the fetch would set every queued document to `Loading` (and open a progress bar for
+    // each) up front during a cold-start burst, before any permit arrives — reproducing
+    // the same diagnostic-suppression shape this cap exists to bound, plus N stuck
+    // progress notifications. `P` is deliberately independent of
+    // `cache.max_concurrent_fetches` (that bounds dependencies within one document's
+    // fetch; this bounds documents fetching at once).
+    let fetch_permit = state
+        .fetch_permits
+        .acquire()
+        .await
+        .expect("fetch_permits semaphore is never closed");
+
     // Mark as loading and start progress
     if let Some(mut doc) = state.documents.get_mut(&uri) {
         doc.set_loading();
@@ -1789,6 +1841,7 @@ async fn run_document_open_background_task(
         minimum_stability.as_deref(),
     )
     .await;
+    drop(fetch_permit);
 
     let success = !fetch_result.versions.is_empty();
     tracing::debug!(
@@ -1970,6 +2023,29 @@ struct CommitOptions<'a> {
     guard: CommitGuard,
 }
 
+/// Whether a reparse should only re-fetch what [`DependencyDiff`] calls for, or force a
+/// full re-fetch of every dependency regardless of diff (issue #592).
+///
+/// A config change that alters registry *routing* (`registries.workspace_registries`,
+/// `registries.nuget_user_profile_sources`) feeds `DependencyDiff::compute` an unchanged
+/// dependency set — the manifest didn't change, only where its dependencies resolve from —
+/// so the default [`Self::Diff`] policy's `deps_to_fetch` would stay empty and
+/// [`run_document_change_task`]'s `deps_to_fetch.is_empty()` early return would leave the
+/// document displaying versions resolved under the *old* routing indefinitely (the same bug
+/// class #424 already documents for `minimum-stability`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefetchPolicy {
+    /// Re-fetch only what `DependencyDiff` calls for (added / version-changed dependencies)
+    /// — correct for every real document edit, where the diff already answers "what needs
+    /// re-checking".
+    Diff,
+    /// Force a re-fetch of every dependency in the new parse result, and drop any
+    /// previously cached version/fetch-failure data before doing so (in
+    /// [`fetch_registry_versions_for_change`]) — the routing itself changed, so data
+    /// obtained under the old routing can no longer be vouched for.
+    AllDependencies,
+}
+
 /// Builds the new `DocumentState` from the parsed manifest (or a parse-result-less
 /// placeholder when parsing failed), carries over cache entries the previous state already
 /// held, prunes/invalidates entries `options.diff` says are now stale, and commits the result
@@ -2078,6 +2154,7 @@ pub async fn handle_document_change(
         content,
         version,
         CommitGuard::Unconditional,
+        RefetchPolicy::Diff,
         state,
         client,
         config,
@@ -2105,11 +2182,19 @@ pub async fn handle_document_change(
 /// unconditionally (preserving its exact prior behavior and `Result<JoinHandle<()>>` return
 /// type) — only a reparse triggered by something other than the document's own edit stream
 /// needs a real guard, and therefore ever observes `None`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "issue #592 added `refetch: RefetchPolicy` alongside the pre-existing `guard: \
+              CommitGuard` — both are commit/fetch-behavior switches the caller must set \
+              independently; bundling them into one struct would only relocate, not reduce, \
+              the parameter list"
+)]
 pub(crate) async fn handle_document_change_guarded(
     uri: Uri,
     content: String,
     version: Option<i32>,
     guard: CommitGuard,
+    refetch: RefetchPolicy,
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
@@ -2129,6 +2214,19 @@ pub(crate) async fn handle_document_change_guarded(
 
     let (parse_result, diff) =
         parse_and_diff_manifest(&uri, &content, &state, ecosystem.as_ref()).await;
+
+    // Captured before `commit_parsed_document` consumes `parse_result` — only needed under
+    // `RefetchPolicy::AllDependencies` (issue #592), where the fetch must cover every
+    // dependency in the new manifest rather than only what `diff` calls for: a
+    // routing-only config change leaves the manifest's dependency set unchanged, so `diff`
+    // alone would see nothing to fetch.
+    let all_dependency_names: Vec<PackageName> = match refetch {
+        RefetchPolicy::Diff => Vec::new(),
+        RefetchPolicy::AllDependencies => parse_result
+            .as_deref()
+            .map(|pr| dependency_version_map(pr).into_keys().collect())
+            .unwrap_or_default(),
+    };
 
     if !commit_parsed_document(
         &uri,
@@ -2156,12 +2254,18 @@ pub(crate) async fn handle_document_change_guarded(
     };
 
     let needs_osv_rescan = diff.needs_osv_rescan();
-    // The yanked probe must also re-run for a version-only edit, not just a
-    // newly added dependency — otherwise editing a dependency's pin from a
-    // safe version to a yanked one would never be checked, since an empty
-    // `deps_to_fetch` skips the entire registry fetch below (security F1).
-    let mut deps_to_fetch = diff.added;
-    deps_to_fetch.extend(diff.version_changed);
+    let deps_to_fetch = match refetch {
+        RefetchPolicy::Diff => {
+            // The yanked probe must also re-run for a version-only edit, not just a
+            // newly added dependency — otherwise editing a dependency's pin from a
+            // safe version to a yanked one would never be checked, since an empty
+            // `deps_to_fetch` skips the entire registry fetch below (security F1).
+            let mut v = diff.added;
+            v.extend(diff.version_changed);
+            v
+        }
+        RefetchPolicy::AllDependencies => all_dependency_names,
+    };
 
     // Spawn background task to update diagnostics
     let task = tokio::spawn(run_document_change_task(
@@ -2175,6 +2279,7 @@ pub(crate) async fn handle_document_change_guarded(
             freshness: freshness_settings,
             diagnostic_severities,
             offline,
+            refetch,
         },
         needs_osv_rescan,
         deps_to_fetch,
@@ -2193,6 +2298,7 @@ struct ChangeTaskConfig {
     freshness: deps_core::FreshnessSettings,
     diagnostic_severities: deps_core::DiagnosticSeverities,
     offline: bool,
+    refetch: RefetchPolicy,
 }
 
 /// Background task spawned by [`handle_document_change`] once the new document state has
@@ -2276,6 +2382,17 @@ async fn run_document_change_task(
         return;
     }
 
+    // Bounds total outbound fetch concurrency across every open/changed document
+    // server-wide (issue #592 S2/S3). Held across the fetch and the merge below, released
+    // before the failure toast / OSV phase B / diagnostics publish — none of those take a
+    // permit themselves, and OSV phase A (spawned separately, above) never does either, so
+    // there is no permit-holder-awaits-permit-taker deadlock shape here.
+    let fetch_permit = state
+        .fetch_permits
+        .acquire()
+        .await
+        .expect("fetch_permits semaphore is never closed");
+
     let (progress, fetch_result, attempted_names, collided_names) =
         fetch_registry_versions_for_change(
             &uri,
@@ -2287,6 +2404,7 @@ async fn run_document_change_task(
             config.freshness,
             config.cache.fetch_timeout_secs,
             config.cache.max_concurrent_fetches,
+            config.refetch,
         )
         .await;
 
@@ -2302,6 +2420,7 @@ async fn run_document_change_task(
         collided_names,
         success,
     );
+    drop(fetch_permit);
 
     if let Some(progress) = progress {
         progress.end(success).await;
@@ -2422,6 +2541,7 @@ async fn fetch_registry_versions_for_change(
     freshness_settings: deps_core::FreshnessSettings,
     fetch_timeout_secs: u64,
     max_concurrent_fetches: usize,
+    refetch: RefetchPolicy,
 ) -> (
     Option<RegistryProgress>,
     FetchResult,
@@ -2433,8 +2553,16 @@ async fn fetch_registry_versions_for_change(
         "fetching versions for added/version-changed dependencies"
     );
 
-    // Mark as loading and start progress
+    // Mark as loading and start progress. Under `RefetchPolicy::AllDependencies` the
+    // routing itself changed (issue #592), not just the manifest, so the cache built under
+    // the *old* routing can no longer be vouched for — drop it under the same lock that
+    // sets `Loading`, so no reader ever observes a half-updated state (critic M2: this
+    // replaces a separate drop-then-set_loading sequence, which would leave a window
+    // between two independent `get_mut` acquisitions).
     if let Some(mut doc) = state.documents.get_mut(uri) {
+        if refetch == RefetchPolicy::AllDependencies {
+            drop_cache_for_forced_refetch(&mut doc, &deps_to_fetch, ecosystem.formatter());
+        }
         doc.set_loading();
     }
 
@@ -2826,6 +2954,601 @@ mod tests {
                         .to_string()
                 )
             );
+        }
+    }
+
+    /// Issue #592: `RefetchPolicy::AllDependencies`'s cache-drop mechanism, and the
+    /// residual risk it accepts (forced-refetch-then-total-failure must render "Registry
+    /// lookup failed", never "Unknown package").
+    mod refetch_policy_tests {
+        use super::*;
+        use deps_core::PackageVersions;
+
+        /// A no-op formatter with identity name normalization — no ecosystem-specific
+        /// behavior is under test here, just `drop_cache_for_forced_refetch`'s own
+        /// bookkeeping. Mirrors `test_utils::blocking_ecosystem::NoopFormatter`.
+        struct IdentityFormatter;
+        impl deps_core::lsp_helpers::PackageNaming for IdentityFormatter {}
+        impl deps_core::lsp_helpers::PackageRendering for IdentityFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.to_string()
+            }
+        }
+        impl deps_core::lsp_helpers::RequirementResolution for IdentityFormatter {}
+        impl deps_core::lsp_helpers::DiagnosticMessages for IdentityFormatter {}
+        impl deps_core::lsp_helpers::DiagnosticPolicy for IdentityFormatter {}
+        impl deps_core::lsp_helpers::SourcePolicy for IdentityFormatter {}
+        impl deps_core::lsp_helpers::OsvNaming for IdentityFormatter {}
+
+        /// Critic S1 fix: a dependency about to be refetched is marked
+        /// `FetchFailure::NotAttempted` (a placeholder, not left absent) — see
+        /// `drop_cache_for_forced_refetch`'s doc for why an absent entry is unsafe.
+        #[test]
+        fn test_drop_cache_for_forced_refetch_marks_pending_deps_not_attempted() {
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.update_cached_versions(HashMap::from([(
+                PackageName::new("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            )]));
+            doc.update_resolved_versions(HashMap::from([(
+                PackageName::new("serde"),
+                ConcreteVersion::new("1.0.0"),
+            )]));
+            doc.replace_outcomes(
+                DependencyOutcomes::new()
+                    .with_fetch_failure("serde", FetchFailure::Transient)
+                    .with_yanked(
+                        "other",
+                        (ConcreteVersion::new("2.0.0"), RemovalStatus::Yanked),
+                    ),
+            );
+
+            drop_cache_for_forced_refetch(
+                &mut doc,
+                &[PackageName::new("serde")],
+                &IdentityFormatter,
+            );
+
+            assert!(
+                doc.cached_versions.is_empty(),
+                "cached_versions must be dropped"
+            );
+            assert_eq!(
+                doc.outcomes.fetch_failure("serde"),
+                Some(&FetchFailure::NotAttempted),
+                "the stale fetch-failure finding must be replaced with a NotAttempted \
+                 placeholder, not left absent (S1: an absent entry surviving into a \
+                 concurrent empty-diff commit renders as the misleading 'Unknown package')"
+            );
+            assert!(
+                doc.outcomes.yanked("other").is_some(),
+                "a yanked finding on a different package must survive untouched"
+            );
+            assert_eq!(
+                doc.resolved_versions.len(),
+                1,
+                "resolved_versions (lockfile-derived, registry-independent) must survive"
+            );
+        }
+
+        /// A dependency NOT in `deps_to_fetch` (e.g. one the diff-based path wouldn't have
+        /// touched) must not gain a placeholder it was never asked to carry.
+        #[test]
+        fn test_drop_cache_for_forced_refetch_does_not_mark_deps_outside_the_fetch_list() {
+            let mut doc =
+                DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+            doc.update_cached_versions(HashMap::from([(
+                PackageName::new("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            )]));
+
+            drop_cache_for_forced_refetch(&mut doc, &[], &IdentityFormatter);
+
+            assert!(doc.cached_versions.is_empty());
+            assert!(
+                doc.outcomes.fetch_failure("serde").is_none(),
+                "a dependency outside deps_to_fetch must not be given a placeholder"
+            );
+        }
+
+        /// Residual risk 4 (accepted, per the #592 design review): after a forced
+        /// refetch drops the document's cache, a *total* fetch failure must render
+        /// "Registry lookup failed" for the affected dependency, never "Unknown
+        /// package" — an empty cache must not be conflated with "genuinely not found".
+        #[cfg(feature = "cargo")]
+        #[tokio::test]
+        async fn test_forced_refetch_total_failure_renders_lookup_failed_not_unknown_package() {
+            let state = Arc::new(ServerState::new());
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            doc_state.set_version(Some(1));
+            // Stale cache from before the forced refetch — must not survive to be
+            // conflated with fresh data, and must not leak into the "not found" path
+            // either once dropped.
+            doc_state.update_cached_versions(HashMap::from([(
+                PackageName::new("serde"),
+                PackageVersions::latest_only("1.0.999"),
+            )]));
+            state.update_document(uri.clone(), doc_state);
+
+            // Simulate `fetch_registry_versions_for_change`'s `AllDependencies` drop.
+            if let Some(mut doc) = state.documents.get_mut(&uri) {
+                drop_cache_for_forced_refetch(
+                    &mut doc,
+                    &[PackageName::new("serde")],
+                    ecosystem.formatter(),
+                );
+            }
+
+            // Simulate a total registry outage: the one dependency in the manifest failed,
+            // nothing was fetched — exactly what `ErrorRegistry` produces in
+            // `fetch_latest_versions_parallel`'s own tests.
+            let fetch_result = FetchResult {
+                versions: HashMap::new(),
+                yanked_versions: HashMap::new(),
+                fetch_failed: HashMap::from([(PackageName::new("serde"), FetchFailure::Transient)]),
+                deprecations: HashMap::new(),
+                no_comparable_versions: HashSet::new(),
+                failed_count: 1,
+                first_error: Some("network down".to_string()),
+            };
+
+            let (failed_count, _) = merge_registry_fetch_result(
+                &state,
+                &uri,
+                ecosystem.formatter(),
+                fetch_result,
+                &[PackageName::new("serde")],
+                HashSet::new(),
+                false,
+            );
+            assert_eq!(failed_count, 1);
+
+            let diags = diagnostics::generate_diagnostics_internal(
+                Arc::clone(&state),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                false,
+            )
+            .await;
+
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| d.message.contains("Registry lookup failed")),
+                "expected a 'Registry lookup failed' diagnostic, got: {diags:?}"
+            );
+            assert!(
+                diags.iter().all(|d| !d.message.contains("Unknown package")),
+                "must never render 'Unknown package' when the cache was dropped by a \
+                 forced refetch, got: {diags:?}"
+            );
+        }
+
+        /// Critic S1 (blocking): the gap this fix actually closes, not just the drop
+        /// mechanism in isolation. After `RefetchPolicy::AllDependencies` drops the cache
+        /// (real fetch not yet complete — it's behind a debounce plus network latency), a
+        /// concurrent or subsequent plain edit with *unchanged* content
+        /// (`RefetchPolicy::Diff`) can commit before that fetch ever merges real results.
+        /// Its diff is empty (nothing textually changed), so `deps_to_fetch` stays empty and
+        /// `run_document_change_task`'s early-return path never touches the outcome map —
+        /// `preserve_cache` alone decides what survives into the new `DocumentState`. Without
+        /// the S1 placeholder, that would carry forward an outcomes map with no entry for the
+        /// dropped dependency, indistinguishable from "checked, nothing found", and render
+        /// the misleading "Unknown package" indefinitely (until the *original* forced
+        /// refetch's own task eventually completes and overwrites it — an unbounded window
+        /// for a document with no lockfile, since the `in_lockfile` guard doesn't apply).
+        #[cfg(feature = "cargo")]
+        #[tokio::test]
+        async fn test_concurrent_diff_edit_after_forced_refetch_drop_does_not_render_unknown_package()
+         {
+            let state = Arc::new(ServerState::new());
+            // No lock file for this manifest path — the `in_lockfile` guard in
+            // `handlers::diagnostics` must not be what's saving this test; it's specifically
+            // exercising the case that guard cannot help with (NuGet `.csproj`, a fresh
+            // Cargo checkout without `Cargo.lock`, a lock-less `package.json`/`pyproject.toml`).
+            let uri = deps_core::test_util::test_uri("/test/no-lockfile/Cargo.toml");
+            let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.clone(),
+                parse_result,
+            );
+            doc_state.set_version(Some(1));
+            doc_state.update_cached_versions(HashMap::from([(
+                PackageName::new("serde"),
+                PackageVersions::latest_only("1.0.999"),
+            )]));
+            state.update_document(uri.clone(), doc_state);
+
+            // Step 1: the forced refetch's drop has run, but (in this test) its own fetch
+            // never gets a chance to complete before step 2 lands — the exact race S1
+            // describes.
+            if let Some(mut doc) = state.documents.get_mut(&uri) {
+                drop_cache_for_forced_refetch(
+                    &mut doc,
+                    &[PackageName::new("serde")],
+                    ecosystem.formatter(),
+                );
+            }
+
+            // Step 2: a plain edit with unchanged content commits — empty diff, so
+            // `RefetchPolicy::Diff`'s `deps_to_fetch` stays empty and the early-return path
+            // runs, never touching `outcomes` itself; only `preserve_cache` decides what
+            // carries forward.
+            let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
+            let task = handle_document_change_guarded(
+                uri.clone(),
+                content,
+                Some(2),
+                CommitGuard::Unconditional,
+                RefetchPolicy::Diff,
+                Arc::clone(&state),
+                client,
+                config,
+            )
+            .await
+            .unwrap()
+            .expect("CommitGuard::Unconditional never skips the commit");
+            task.await.unwrap();
+
+            let diags = diagnostics::generate_diagnostics_internal(
+                Arc::clone(&state),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                false,
+            )
+            .await;
+
+            assert!(
+                diags.iter().all(|d| !d.message.contains("Unknown package")),
+                "S1 regression: a dropped-cache entry surviving preserve_cache into an \
+                 empty-diff commit must never render as 'Unknown package', got: {diags:?}"
+            );
+        }
+    }
+
+    /// Issue #592 critic S2/M1: proves `fetch_permits` actually bounds concurrency when
+    /// driven through the real `handle_document_open` entry point (not just the isolated
+    /// semaphore primitive tested in `document::state`), and that a cold-start burst past
+    /// the permit limit never flips a queued document to `Loading` before its permit
+    /// arrives (the exact defect M1 fixed by moving the permit acquisition ahead of
+    /// `set_loading()`/`RegistryProgress::start`).
+    mod open_path_semaphore_e2e_tests {
+        use super::*;
+        use deps_core::ecosystem::BoxFuture;
+        use deps_core::ecosystem::private::Sealed;
+        use deps_core::{
+            Dependency, DiagnosticSeverities, EcosystemConfig, EcosystemFormatter,
+            FreshnessSettings, Metadata, OsvNaming, PackageNaming, PackageRendering,
+            RequirementResolution, SourcePolicy, Version, VersionData, completion::Completions,
+        };
+        use std::any::Any;
+        use std::path::Path;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+        use tower_lsp_server::ls_types::{CodeLens, Diagnostic, InlayHint, Position, Range};
+
+        struct NoopFormatter;
+        impl PackageNaming for NoopFormatter {}
+        impl PackageRendering for NoopFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+        impl RequirementResolution for NoopFormatter {}
+        impl deps_core::lsp_helpers::DiagnosticMessages for NoopFormatter {}
+        impl deps_core::lsp_helpers::DiagnosticPolicy for NoopFormatter {}
+        impl SourcePolicy for NoopFormatter {}
+        impl OsvNaming for NoopFormatter {}
+
+        struct FakeDependency {
+            name: PackageName,
+            version_requirement: VersionReq,
+        }
+        impl Dependency for FakeDependency {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::new(Position::new(0, 0), Position::new(0, 1))
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                Some(&self.version_requirement)
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> deps_core::parser::DependencySource {
+                deps_core::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct FakeParseResult {
+            uri: Uri,
+            dep: FakeDependency,
+        }
+        impl deps_core::ParseResult for FakeParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![&self.dep]
+            }
+            fn workspace_root(&self) -> Option<&Path> {
+                None
+            }
+            fn uri(&self) -> &Uri {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// Tracks concurrent holders and sleeps `delay` per call, standing in for a slow
+        /// (but never-failing) registry — mirrors `ConcurrencyTrackingRegistry` above, but
+        /// wired through a full `Ecosystem` so the real `run_document_open_background_task`
+        /// entry point (permit acquisition included) is what's under test, not just
+        /// `fetch_latest_versions_parallel` in isolation.
+        struct SlowRegistry {
+            current: Arc<AtomicUsize>,
+            max_seen: Arc<AtomicUsize>,
+            delay: Duration,
+        }
+        impl Registry for SlowRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>> {
+                Box::pin(async move {
+                    let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.max_seen.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(self.delay).await;
+                    self.current.fetch_sub(1, Ordering::SeqCst);
+                    Ok(vec![])
+                })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+            ) -> BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>> {
+                Box::pin(async move {
+                    let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.max_seen.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(self.delay).await;
+                    self.current.fetch_sub(1, Ordering::SeqCst);
+                    Ok(None)
+                })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>> {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct SlowFetchEcosystem {
+            registry: Arc<SlowRegistry>,
+        }
+        impl Sealed for SlowFetchEcosystem {}
+        impl Ecosystem for SlowFetchEcosystem {
+            fn id(&self) -> &'static str {
+                "cargo"
+            }
+            fn display_name(&self) -> &'static str {
+                "cargo"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &["Cargo.toml"]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                uri: &'a Uri,
+            ) -> BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
+                let uri = uri.clone();
+                Box::pin(async move {
+                    let parse_result: Box<dyn deps_core::ParseResult> = Box::new(FakeParseResult {
+                        uri: uri.clone(),
+                        dep: FakeDependency {
+                            name: PackageName::new("pkg"),
+                            version_requirement: VersionReq::new("*"),
+                        },
+                    });
+                    Ok(parse_result)
+                })
+            }
+            fn registry(&self) -> Arc<dyn Registry> {
+                Arc::clone(&self.registry) as Arc<dyn Registry>
+            }
+            fn formatter(&self) -> &dyn EcosystemFormatter {
+                &NoopFormatter
+            }
+            fn generate_inlay_hints<'a>(
+                &'a self,
+                _parse_result: &'a dyn deps_core::ParseResult,
+                _versions: VersionData<'a>,
+                _loading_state: deps_core::LoadingState,
+                _config: &'a EcosystemConfig,
+            ) -> BoxFuture<'a, Vec<InlayHint>> {
+                Box::pin(async move { vec![] })
+            }
+            fn generate_diagnostics<'a>(
+                &'a self,
+                _parse_result: &'a dyn deps_core::ParseResult,
+                _versions: VersionData<'a>,
+                _uri: &'a Uri,
+                _freshness: FreshnessSettings,
+                _severities: DiagnosticSeverities,
+            ) -> BoxFuture<'a, Vec<Diagnostic>> {
+                Box::pin(async move { vec![] })
+            }
+            fn generate_code_lenses<'a>(
+                &'a self,
+                _parse_result: &'a dyn deps_core::ParseResult,
+                _content: &'a str,
+                _versions: VersionData<'a>,
+                _uri: &'a Uri,
+                _command_id: &'a str,
+            ) -> BoxFuture<'a, Vec<CodeLens>> {
+                Box::pin(async move { vec![] })
+            }
+            fn generate_completions<'a>(
+                &'a self,
+                _parse_result: &'a dyn deps_core::ParseResult,
+                _position: Position,
+                _content: &'a str,
+                _freshness: FreshnessSettings,
+            ) -> BoxFuture<'a, Completions> {
+                Box::pin(async move { Completions::default() })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        #[cfg(feature = "cargo")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+        #[allow(
+            clippy::async_yields_async,
+            reason = "each spawned task deliberately returns handle_document_open's own \
+                      JoinHandle so the test can await the outer spawn (proving the burst was \
+                      actually launched) and the inner background task (its real fetch) \
+                      separately, in two passes below"
+        )]
+        async fn test_fetch_permits_bound_holds_through_open_entry_point_with_no_premature_loading()
+        {
+            const N: usize = 8;
+            const FETCH_PERMITS: usize = 4; // mirrors document::state's private FETCH_PERMITS
+
+            let state = Arc::new(ServerState::new());
+            let current = Arc::new(AtomicUsize::new(0));
+            let max_seen = Arc::new(AtomicUsize::new(0));
+            let registry = Arc::new(SlowRegistry {
+                current: Arc::clone(&current),
+                max_seen: Arc::clone(&max_seen),
+                delay: Duration::from_millis(80),
+            });
+            // Overrides the real "cargo" registration (same id) with one whose registry is
+            // slow-but-observable, so the burst below actually contends on `fetch_permits`
+            // instead of resolving before any two calls could overlap.
+            state
+                .ecosystem_registry
+                .register(Arc::new(SlowFetchEcosystem { registry }));
+
+            let (client, config) = crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let uris: Vec<Uri> = (0..N)
+                .map(|i| deps_core::test_util::test_uri(&format!("/test/pkg{i}/Cargo.toml")))
+                .collect();
+
+            // Polls `state.documents` for as long as fetches are in flight, tracking the
+            // peak number simultaneously `Loading`. A violation of M1 (permit acquired only
+            // around the fetch, not before `set_loading`) would flip every one of the N
+            // documents to `Loading` immediately, well before any permit is granted.
+            let max_loading = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let poller = tokio::spawn({
+                let state = Arc::clone(&state);
+                let uris = uris.clone();
+                let max_loading = Arc::clone(&max_loading);
+                let stop = Arc::clone(&stop);
+                async move {
+                    while !stop.load(Ordering::SeqCst) {
+                        let loading_now = uris
+                            .iter()
+                            .filter(|uri| {
+                                state.get_document(uri).is_some_and(|d| {
+                                    d.loading_state == deps_core::LoadingState::Loading
+                                })
+                            })
+                            .count();
+                        max_loading.fetch_max(loading_now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                }
+            });
+
+            let barrier = Arc::new(Barrier::new(N));
+            let mut handles = Vec::new();
+            for uri in &uris {
+                let uri = uri.clone();
+                let state = Arc::clone(&state);
+                let client = client.clone();
+                let config = Arc::clone(&config);
+                let barrier = Arc::clone(&barrier);
+                handles.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    handle_document_open(
+                        uri,
+                        "irrelevant-content".to_string(),
+                        Some(1),
+                        state,
+                        client,
+                        config,
+                    )
+                    .await
+                    .unwrap()
+                }));
+            }
+
+            let mut bg_tasks = Vec::new();
+            for handle in handles {
+                bg_tasks.push(handle.await.unwrap());
+            }
+            for task in bg_tasks {
+                task.await.unwrap();
+            }
+
+            stop.store(true, Ordering::SeqCst);
+            poller.await.unwrap();
+
+            assert_eq!(
+                max_seen.load(Ordering::SeqCst),
+                FETCH_PERMITS,
+                "fetch_permits must bound real concurrent registry calls through \
+                 run_document_open_background_task to exactly P=4, neither more (unbounded) \
+                 nor less (under-contended, meaning this test isn't exercising the bound)"
+            );
+            assert!(
+                max_loading.load(Ordering::SeqCst) <= FETCH_PERMITS,
+                "M1 regression: at most FETCH_PERMITS documents may be Loading at once — a \
+                 cold-start burst must not flip every queued document to Loading before its \
+                 permit arrives (observed peak: {})",
+                max_loading.load(Ordering::SeqCst)
+            );
+            for uri in &uris {
+                let doc = state.get_document(uri).unwrap();
+                assert_ne!(
+                    doc.loading_state,
+                    deps_core::LoadingState::Loading,
+                    "no document may be left stuck in Loading once every fetch has completed"
+                );
+            }
         }
     }
 
@@ -5662,6 +6385,7 @@ tokio = "1.0"
                 stale_content,
                 Some(3),
                 CommitGuard::ExpectVersion(Some(1)),
+                RefetchPolicy::Diff,
                 Arc::clone(&state),
                 client,
                 config,
@@ -5710,6 +6434,7 @@ tokio = "1.0"
                 new_content.clone(),
                 Some(1),
                 CommitGuard::ExpectVersion(Some(1)),
+                RefetchPolicy::Diff,
                 Arc::clone(&state),
                 client,
                 config,
@@ -5772,6 +6497,7 @@ tokio = "1.0"
                 stale_content,
                 Some(2),
                 CommitGuard::ExpectVersion(Some(999)),
+                RefetchPolicy::Diff,
                 Arc::clone(&state),
                 client,
                 config,
