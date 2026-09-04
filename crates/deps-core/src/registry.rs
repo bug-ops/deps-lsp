@@ -335,6 +335,58 @@ pub fn has_default_prerelease_marker(version: &str) -> bool {
         || v.contains("-nightly")
 }
 
+/// Hashes an ordered sequence of `&str` routing-hop parts into an opaque
+/// `"{prefix}:{digest:016x}"` chain-identity key, using
+/// [`std::collections::hash_map::DefaultHasher`].
+///
+/// Extracted from three independently hand-rolled copies of this exact pattern
+/// (`deps_pypi::config::ResolvedChain::chain`, `deps_nuget::config::NuGetSourceChain::chain`,
+/// `deps_go::config::GoProxyChain::keyed`, #579) so "never hash a credential" is a property of
+/// one function signature instead of a convention repeated in three doc comments.
+///
+/// Deliberately takes `&str`, not `impl Hash`: a caller with a typed credential wrapper (e.g.
+/// `NuGetAuth`, which deliberately does not derive `Hash` — see its doc) must explicitly
+/// convert it to a string before it can even be considered here, rather than being able to
+/// `.hash()` the whole struct in place. Prefer a small, explicit, non-`Debug` `as_key_str()`-
+/// style accessor on the hashed field's own type over `format!("{value:?}")` at the call
+/// site — chain identity would otherwise silently change if that type's `Debug` output is
+/// ever reworded (e.g. an enum variant rename), even though nothing routing-relevant changed.
+///
+/// **Security invariant**: `parts` must contain only routing-identity data (URLs, slot/hop
+/// kind markers, boolean flags) — **never** credential material. Hashing a credential would
+/// make the chain's identity key change whenever that credential value rotates, defeating
+/// rotation-stability guarantees callers rely on (e.g. NuGet issue #561's FR-016). This
+/// function has no way to enforce that; it is a caller obligation.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::hash_routing_key;
+///
+/// let key = hash_routing_key("pypi-chain", ["https://example.test/simple/", "true"].into_iter());
+/// assert!(key.starts_with("pypi-chain:"));
+/// assert_eq!(key.len(), "pypi-chain:".len() + 16);
+///
+/// // Same parts, same key — deterministic within a process.
+/// let key2 = hash_routing_key("pypi-chain", ["https://example.test/simple/", "true"].into_iter());
+/// assert_eq!(key, key2);
+///
+/// // Hop order is part of the identity.
+/// let forward = hash_routing_key("go-proxy", ["a", "b"].into_iter());
+/// let reversed = hash_routing_key("go-proxy", ["b", "a"].into_iter());
+/// assert_ne!(forward, reversed);
+/// ```
+#[must_use]
+pub fn hash_routing_key<'a>(prefix: &str, parts: impl Iterator<Item = &'a str>) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    format!("{prefix}:{:016x}", hasher.finish())
+}
+
 /// Outcome of a registry's per-version removal/deprecation signal.
 ///
 /// Replaces a bare `is_yanked(): bool`, which could not distinguish a version
@@ -1135,5 +1187,64 @@ mod tests {
             RemovalStatus::from_advisory(false),
             RemovalStatus::Available
         );
+    }
+
+    #[test]
+    fn test_hash_routing_key_format() {
+        let key = hash_routing_key("pypi-chain", ["https://example.test/simple/"].into_iter());
+        assert!(key.starts_with("pypi-chain:"));
+        assert_eq!(key.len(), "pypi-chain:".len() + 16);
+    }
+
+    #[test]
+    fn test_hash_routing_key_deterministic() {
+        let parts = || ["https://a.test/", "https://b.test/", "true"].into_iter();
+        assert_eq!(
+            hash_routing_key("go-proxy", parts()),
+            hash_routing_key("go-proxy", parts())
+        );
+    }
+
+    #[test]
+    fn test_hash_routing_key_distinguishes_prefix() {
+        let parts = || ["same"].into_iter();
+        assert_ne!(
+            hash_routing_key("pypi-chain", parts()),
+            hash_routing_key("nuget-chain", parts())
+        );
+    }
+
+    #[test]
+    fn test_hash_routing_key_distinguishes_parts() {
+        assert_ne!(
+            hash_routing_key("chain", ["a", "b"].into_iter()),
+            hash_routing_key("chain", ["a", "c"].into_iter())
+        );
+    }
+
+    /// Hop order is part of chain identity (spec 034's fallback order, PyPI's FR-005
+    /// primary-before-extras order, NuGet's declaration order all rely on this) — the same
+    /// set of parts in a different order must not collide.
+    #[test]
+    fn test_hash_routing_key_order_sensitive() {
+        assert_ne!(
+            hash_routing_key("chain", ["a", "b", "c"].into_iter()),
+            hash_routing_key("chain", ["c", "b", "a"].into_iter())
+        );
+    }
+
+    /// Documents that credential exclusion is a caller obligation, not something
+    /// `hash_routing_key` enforces: two calls that differ only in a credential-shaped extra
+    /// part produce different keys, so a caller who mistakenly includes one breaks the
+    /// rotation-stability invariant this function's doc warns about.
+    #[test]
+    fn test_hash_routing_key_only_hashes_what_callers_pass() {
+        let identity_only =
+            hash_routing_key("nuget-chain", ["https://feed.test/", "corp"].into_iter());
+        let with_credential_included = hash_routing_key(
+            "nuget-chain",
+            ["https://feed.test/", "corp", "hunter2"].into_iter(),
+        );
+        assert_ne!(identity_only, with_credential_included);
     }
 }

@@ -336,13 +336,31 @@ pub struct ResolvedHop {
     pub auth: Option<NuGetAuth>,
 }
 
+impl ResolvedHop {
+    /// Two-part `&str` encoding of [`Self::slot`] for [`NuGetSourceChain::chain`]'s hash — a
+    /// presence marker (`"slot"`/`"no-slot"`) followed by the slot string itself (`""` when
+    /// absent). Keeping the per-hop part count constant, rather than folding presence into a
+    /// single sentinel value, means no possible `<add key>` value can ever collide with the
+    /// no-slot case. A dedicated accessor rather than `format!("{:?}", self.slot)`: chain
+    /// identity must not depend on `Option`'s `Debug` formatting, and writing one narrow
+    /// accessor per hashed field (instead of reaching for `Debug` on whatever is convenient)
+    /// keeps `NuGetSourceChain::chain` from ever needing to `Debug`-format [`Self::auth`],
+    /// which deliberately does not derive `Hash` (see its doc) precisely so that a credential
+    /// cannot be added to this hash without a visible, deliberate type change.
+    fn slot_key_parts(&self) -> [&str; 2] {
+        self.slot
+            .as_deref()
+            .map_or(["no-slot", ""], |slot| ["slot", slot])
+    }
+}
+
 /// One fully-resolved routing chain, produced by [`NuGetConfig::resolved_chains`], consumed by
 /// `NuGetRegistry::register_chain`. Mirrors `deps_pypi::config::ResolvedChain` exactly.
 #[derive(Debug, Clone)]
 pub struct NuGetSourceChain {
-    /// Opaque, hashed identity — `format!("nuget-chain:{:016x}", digest)` over each hop's URL
-    /// and [`ResolvedHop::slot`] (**never** [`ResolvedHop::auth`] — FR-016) plus
-    /// [`Self::implicit_public_fallback`]. [`NuGetConfig::resolve_source_for`] and
+    /// Opaque, hashed identity produced by [`deps_core::hash_routing_key`] (`"nuget-chain"`)
+    /// over each hop's URL and [`ResolvedHop::slot`] (**never** [`ResolvedHop::auth`] — FR-016)
+    /// plus [`Self::implicit_public_fallback`]. [`NuGetConfig::resolve_source_for`] and
     /// [`NuGetConfig::resolved_chains`] recompute this independently and must agree.
     pub key: String,
     /// Ordered, already-validated hops. Never empty.
@@ -358,14 +376,22 @@ pub struct NuGetSourceChain {
 
 impl NuGetSourceChain {
     fn chain(hops: Vec<ResolvedHop>, implicit_public_fallback: bool) -> Self {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for hop in &hops {
-            hop.url.as_str().hash(&mut hasher);
-            hop.slot.hash(&mut hasher);
-        }
-        implicit_public_fallback.hash(&mut hasher);
+        let flag = if implicit_public_fallback {
+            "true"
+        } else {
+            "false"
+        };
+        let key = deps_core::hash_routing_key(
+            "nuget-chain",
+            hops.iter()
+                .flat_map(|hop| {
+                    let [presence, slot] = hop.slot_key_parts();
+                    [hop.url.as_str(), presence, slot]
+                })
+                .chain(std::iter::once(flag)),
+        );
         Self {
-            key: format!("nuget-chain:{:016x}", hasher.finish()),
+            key,
             hops,
             implicit_public_fallback,
         }
