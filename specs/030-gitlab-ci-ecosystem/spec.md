@@ -19,8 +19,9 @@ related:
 # Feature: New ecosystem — GitLab CI/CD `include:` version pins
 
 > [!info] Metadata
-> **Author**: on-demand competitive-parity scan 2026-09-02 (research finding)
-> **Branch**: [NEEDS CLARIFICATION: assign issue number before branching, e.g. `feat/<issue>-gitlab-ci`]
+> **Author**: on-demand competitive-parity scan 2026-09-02 (research finding); clarifications resolved
+> 2026-09-04 during #466 triage
+> **Branch**: `feat/466-gitlab-ci-ecosystem`
 > **Type**: research / new ecosystem
 
 ## 1. Overview
@@ -149,14 +150,14 @@ THEN the diagnostics, hover, inlay hints, and code action behavior SHALL be iden
 | FR-002 | THE SYSTEM SHALL parse YAML GitLab CI files, extract all `include:` list entries, and identify `project:`+`ref:` pairs and `component:` references in the form `host/org/project/name@ref` | must |
 | FR-003 | THE SYSTEM SHALL skip and gracefully handle (without error or false diagnostic) `include: - template: ...` (built-in templates) and `include: - remote: ...` (arbitrary URLs) — these are not version-pinnable by this feature | must |
 | FR-004 | THE SYSTEM SHALL fetch version information from the GitLab REST API repository-tags endpoint (`GET /projects/:id/repository/tags`) using the existing `HttpCache` with conditional-request validation, shared by both `project:`+`ref:` and `component:` include forms | must |
-| FR-005 | THE SYSTEM SHALL advertise optional configuration for a GitLab Personal/Project Access Token to increase the unauthenticated rate-limit budget — via environment variable [NEEDS CLARIFICATION: name convention, e.g. `GITLAB_TOKEN`, mirroring the `GITHUB_TOKEN` precedent in `crates/deps-swift/src/registry.rs`], sent as the `PRIVATE-TOKEN` header (distinct scheme from GitHub's `Authorization: Bearer`) | must |
+| FR-005 | THE SYSTEM SHALL advertise optional configuration for a GitLab Personal/Project Access Token to increase the unauthenticated rate-limit budget — via the `GITLAB_TOKEN` environment variable, mirroring the `GITHUB_TOKEN` precedent in `crates/deps-swift/src/registry.rs` and `crates/deps-core/src/github.rs`, sent as the `PRIVATE-TOKEN` header (distinct scheme from GitHub's `Authorization: Bearer`) | must |
 | FR-006 | WHEN a `project:`+`ref:` include is pinned to a semantic-version tag or SHA THE SYSTEM SHALL surface hover content showing the resolved tag, resolved commit SHA (if ref is a SHA), latest tag, and outdated status | must |
-| FR-007 | WHEN a `component:` include is pinned to a release-name-style version (e.g. `@1.0`) THE SYSTEM SHALL resolve that release name against the underlying project's release-tagged versions using semver-range matching (not literal string equality) and display the concrete latest matching release | must |
+| FR-007 | WHEN a `component:` include is pinned to a version pin THE SYSTEM SHALL resolve it per GitLab's documented CI/CD Catalog priority order — commit SHA (exact match) > tag (exact match; a same-named tag and SHA resolve to the SHA) > branch (exact match; a same-named tag and branch resolve to the tag) > `~latest` (highest published semver tag) > a partial semantic version (e.g. `1.2` selects the highest published `1.2.*` tag, `1` selects the highest published `1.*.*` tag) — using `semver::VersionReq`-based range matching for the partial-version and `~latest` forms (no hand-rolled comparison, per `.claude/rules/rust-code.md`), and display the concrete resolved version | must |
 | FR-008 | THE SYSTEM SHALL produce an outdated diagnostic (warning or info level, consistent with existing ecosystems) on any include pin where the resolved version is behind the latest resolvable tag/release | must |
 | FR-009 | THE SYSTEM SHALL produce inlay hints showing the latest version for each include, consistent with the format and per-ecosystem `EcosystemConfig` already used elsewhere | must |
 | FR-010 | THE SYSTEM SHALL expose a code action (via `textDocument/codeAction`) on any include pin, offering to update it to the latest tag/release, applied as a `WorkspaceEdit` | must |
 | FR-011 | WHEN a `project:` or `component:` include's host segment is a literal, hardcoded GitLab hostname (not `$CI_SERVER_FQDN` or another CI-time variable) THE SYSTEM SHALL resolve version data against that host's API | must |
-| FR-012 | WHEN a `component:` include's host segment is `$CI_SERVER_FQDN` (or another unresolved CI-time variable) THE SYSTEM SHALL [NEEDS CLARIFICATION: fall back to a configured default GitLab host (e.g. gitlab.com), infer from git remote origin, or skip version resolution entirely with an informational diagnostic explaining why] | must |
+| FR-012 | WHEN a `project:` or `component:` include's host segment is `$CI_SERVER_FQDN` (or another unresolved CI-time variable) THE SYSTEM SHALL skip version resolution and surface an informational (not error/warning) diagnostic explaining that the host cannot be statically determined — no default host is guessed and no git-remote inference is performed (see Open Questions resolution: the codebase has no existing git-plumbing utility, and guessing a host risks showing version data from the wrong GitLab instance, violating NFR-003) | must |
 | FR-013 | THE SYSTEM SHALL produce equivalent behavior (hover, diagnostics, inlay hints, code actions) across all GitLab CI files and all include references, not introducing ecosystem-specific divergence from the other 12+ supported ecosystems, per the cross-ecosystem-consistency rule | must |
 | FR-014 | WHEN the GitLab API returns 401/403 (rate limit exceeded or auth required) without a valid access token configured THE SYSTEM SHALL display a user-facing error message recommending the user configure a Personal/Project Access Token, mirroring the pattern in `crates/deps-swift/src/registry.rs` (lines 82-86) for GitHub | must |
 | FR-015 | WHEN parsing a GitLab CI file where an include entry is unparseable or the `project:`/`component:` path is malformed THE SYSTEM SHALL log a warning and skip that reference gracefully | should |
@@ -195,7 +196,8 @@ No new persistent entities. Include references are parsed as dependencies (with 
 | `include: - template: ...` entry | Parsed but skipped gracefully — no diagnostic, no version check, no hover |
 | `include: - remote: https://...` entry | Parsed but skipped — arbitrary URLs are not version-pinnable |
 | `image:` / `services:` entries anywhere in the file | Not parsed by this ecosystem at all (explicitly out of scope, FR-016) |
-| `component:` include host is `$CI_SERVER_FQDN` (self-hosted-instance variable) | [NEEDS CLARIFICATION: see FR-012 — behavior depends on resolution strategy chosen] |
+| `project:`/`component:` include host is `$CI_SERVER_FQDN` (self-hosted-instance variable) | Version resolution skipped; informational diagnostic explains the host could not be statically determined (FR-012) — the parsed reference is still shown in hover, without version data |
+| `component:` version pin is `~latest` or a partial semver (e.g. `1.2`, `1`) | Resolved via `semver::VersionReq` range matching against published CI/CD Catalog release tags, per FR-007's documented GitLab priority order |
 | `project:`/`component:` path is malformed (missing segments, invalid characters) | Logged as a warning, skipped gracefully; file parsing continues |
 | Referenced project does not exist or is private with no accessible token (404/403 from GitLab API) | Diagnostic: "Project not found or inaccessible: org/project"; no version data shown |
 | `component:` release name (e.g. `@1.0`) does not match any published release via semver-range matching | Diagnostic: "No matching release found for `1.0`"; hover shows no resolvable version |
@@ -230,13 +232,19 @@ No new persistent entities. Include references are parsed as dependencies (with 
 
 ### Ask First
 - Introducing a per-reference (rather than per-ecosystem-constant) host-resolution mechanism in the HTTP
-  client layer — this is new architectural surface not needed by any currently shipped or planned (#208)
-  ecosystem, since all of them target a single fixed host.
+  client layer — this is new architectural surface not needed by any currently shipped ecosystem (including
+  #208/GitHub Actions), since all of them target a single fixed host. Resolved direction (see Open
+  Questions): a new `GitlabTagsClient`-style struct, parallel to but not derived from
+  `deps_core::github::GithubTagsClient`, carrying the host as an instance field instead of a module
+  constant — confirm the concrete shape with the user/reviewer before landing it, since it is the first
+  per-instance-host client in the codebase.
 - Adding a distinct auth-scheme abstraction to accommodate `PRIVATE-TOKEN` (GitLab) alongside
-  `Authorization: Bearer` (GitHub, per #208) if/when both ecosystems exist side by side.
-- Implementing semver-range/release-name matching logic for `component:` includes, since this is materially
-  more complex than any literal-tag lookup used elsewhere in the codebase and may warrant its own shared
-  utility if #208's future work needs similar logic.
+  `Authorization: Bearer` (GitHub, #208) — resolved direction: keep them separate, ecosystem-local header
+  constants rather than a shared abstraction, since GitHub Actions' `Authorization: Bearer` header-building
+  already lives in `deps_core::github` and is not being touched by this work.
+- Implementing `semver::VersionReq`-based range matching for `component:` includes' partial-version/`~latest`
+  forms (FR-007) — confirm the conversion from GitLab's partial-version syntax (`1.2`, `1`) to a
+  `VersionReq` before landing it, since it is new logic with no existing precedent in the codebase to copy.
 
 ### Never
 - Introduce ecosystem-specific divergence in hover format, diagnostic wording, or code-action behavior
@@ -244,44 +252,55 @@ No new persistent entities. Include references are parsed as dependencies (with 
 - Parse or version-check `image:`/`services:` Docker image tags under this ecosystem (explicitly out of
   scope — a separate "Docker image tags" ecosystem candidate, if pursued, must be spec'd on its own).
 - Recursively parse included files' own nested `include:` directives.
-- Guess or silently hardcode a default GitLab host for `$CI_SERVER_FQDN`-relative references without
-  resolving [NEEDS CLARIFICATION: FR-012] first — an incorrect guess would produce false version data
-  against the wrong instance.
+- Guess or silently hardcode a default GitLab host, or infer one from a git remote, for
+  `$CI_SERVER_FQDN`-relative references (FR-012) — resolved: always skip version resolution with an
+  informational diagnostic instead. An incorrect guess would produce false version data against the wrong
+  instance, and the codebase has no existing git-plumbing utility to add for this narrow case.
 
-## 9. Open Questions
+## 9. Resolved Decisions
 
-- [NEEDS CLARIFICATION: How should `$CI_SERVER_FQDN`-relative (and other CI-time-variable-relative)
-  `component:`/`project:` includes be resolved? Options: (a) configurable default host (e.g. gitlab.com),
-  (b) infer from the repository's git remote origin, (c) skip version resolution with an informational
-  diagnostic. This is new complexity #208 never needed since GitHub Actions always target one fixed host.]
-- [NEEDS CLARIFICATION: Exact semver-range/release-name matching algorithm for `component:` includes —
-  GitLab's own release-name resolution is not simply "latest tag matching a semver prefix"; needs research
-  into GitLab CI/CD Catalog's actual resolution semantics before implementation.]
-- [NEEDS CLARIFICATION: Access-token environment-variable name — mirror `GITHUB_TOKEN` convention with
-  something like `GITLAB_TOKEN`, or align with GitLab CLI/CI conventions (`CI_JOB_TOKEN`, `GL_TOKEN`)?]
-- [NEEDS CLARIFICATION: Should `project:`+`ref:` and `component:` includes share one Registry
-  implementation (both ultimately hit `/repository/tags`), or does the release-name matching complexity for
-  `component:` warrant a separate implementation layered on top of a shared tags client?]
-- [NEEDS CLARIFICATION: How should self-hosted GitLab instances with custom TLS/auth requirements be
-  handled? GitHub Actions (#208) never has this problem since it targets one well-known public host.]
-- [NEEDS CLARIFICATION: Should this ecosystem be built independently of #208, or deferred until #208 ships
-  and a shared "hosted-git-platform tags datasource" abstraction can be extracted first? The `project:`+
-  `ref:` subset would benefit from such an abstraction; the `component:` subset would not fully fit it.]
-- [NEEDS CLARIFICATION: No project constitution exists at `.local/specs/constitution.md` (this project uses
-  `specs/` per `.claude/rules/specs.md`, and no constitution has been created yet either) — cannot yet
-  validate this spec against project-wide architectural principles.]
-- [NEEDS CLARIFICATION: Given the P4 priority, comparable-or-larger complexity than #208, and #208 itself
-  still unimplemented, should this spec remain parked at `specify` phase indefinitely, or is there a
-  minimal-viable slice (e.g. `project:`+`ref:` only, literal-host-only, no `component:`/self-hosted support)
-  worth prioritizing ahead of full #208 scope?]
+All items previously marked `[NEEDS CLARIFICATION]` were resolved on 2026-09-04 (triage of issue #466,
+now that its blocker #208 has shipped and closed):
+
+1. **`$CI_SERVER_FQDN`-relative host resolution** (FR-012): skip version resolution, surface an
+   informational diagnostic. Rejected alternatives: a configurable default host (risks silently showing
+   version data from the wrong GitLab instance, violating NFR-003) and inferring the host from the
+   repository's git remote origin (the codebase has no existing git-plumbing utility or dependency —
+   adding one solely for this narrow self-hosted case is disproportionate new architectural surface).
+2. **`component:` version-pin resolution algorithm** (FR-007): follows GitLab's own documented CI/CD
+   Catalog priority order — commit SHA > tag > branch > `~latest` > partial semver (`1.2`, `1`) — verified
+   against `https://docs.gitlab.com/ci/components/`. Partial-version and `~latest` forms are matched using
+   `semver::VersionReq` range matching (no hand-rolled comparison logic, per `.claude/rules/rust-code.md`).
+3. **Access-token environment variable**: `GITLAB_TOKEN`, mirroring the `GITHUB_TOKEN` convention already
+   established in `crates/deps-swift/src/registry.rs` and `crates/deps-core/src/github.rs`.
+4. **Shared Registry implementation**: `project:`+`ref:` and `component:` share one registry client (a new
+   `GitlabTagsClient`, parallel to `deps_core::github::GithubTagsClient` but carrying the target host as an
+   instance field rather than a fixed module constant, since GitLab references may target self-hosted
+   instances per NFR-008). The `component:` release-name/semver-range resolution layers on top of that
+   shared client as a separate, focused function — not a second registry implementation.
+5. **Self-hosted TLS/auth beyond `PRIVATE-TOKEN`**: out of scope for v1. Relies on `reqwest` + `rustls`'s
+   default system trust store, same as every other ecosystem crate; no custom CA or mTLS support.
+6. **Build sequencing relative to #208**: build independently, now. #208 shipped and closed 2026-09-02.
+   `deps_core::github::GithubTagsClient` is GitHub-API-specific (fixed `api_base`) and cannot be reused
+   as-is for GitLab's per-instance-host requirement regardless of timing, so waiting for a further shared
+   abstraction offers no benefit — this ecosystem follows the same *pattern* (trait-based
+   `Ecosystem`/`Registry`/`ParseResult`/`Dependency`, `HttpCache` reuse) as parallel, not shared, code, the
+   same relationship `deps-swift` and `deps-github-actions` already have to `deps_core::github`.
+7. **Missing project constitution**: not a blocker. No `.local/specs/constitution.md` (or `specs/`
+   equivalent) exists yet, and none of this project's other `specify`-phase specs block on one either —
+   this spec proceeds against `.claude/rules/*.md` instead.
+8. **Prioritization**: resolved by proceeding — issue #466's triage (2026-09-04) selected the full spec
+   scope (not a reduced MVP slice) for implementation now that #208 is unblocked. Next step is `/sdd plan`.
+
+No `[NEEDS CLARIFICATION]` markers remain in this spec.
 
 ## 10. See Also
 
 - #208 — GitHub Actions workflow `uses:` pins ecosystem candidate, spec [[014-github-actions-ecosystem/spec]]
   (still unimplemented, P4). Same git-tags-datasource pattern, sibling new-ecosystem candidate; the
   `project:`+`ref:` include form here is structurally identical to GHA's `owner/repo@ref`.
-- #466 — implementation follow-up issue for this spec, blocked on #208 shipping and on resolving the
-  8 open `[NEEDS CLARIFICATION]` items below.
+- #466 — implementation follow-up issue for this spec. Was blocked on #208 shipping and on resolving 8
+  open `[NEEDS CLARIFICATION]` items; both are now resolved (see §9) — ready for `/sdd plan`.
 - `crates/deps-swift/src/registry.rs` (lines 12-95) — closest existing precedent for a hosted-git-platform
   REST API integration, including token env-var handling and rate-limit messaging (GitHub-specific auth
   scheme, not directly reusable for GitLab's `PRIVATE-TOKEN` header without an auth-scheme abstraction)
