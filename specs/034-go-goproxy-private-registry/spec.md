@@ -152,12 +152,29 @@ requirement, not new logic.
 >   glob-pattern module-path-prefix list (`go help environment`) are the
 >   authoritative semantics this spec's Functional Requirements are built
 >   against.
-> - **Divergent from Cargo/npm/PyPI's trust model, and unresolved by this
->   spec**: a Go module proxy URL may embed HTTP basic-auth userinfo
+> - **Divergent from Cargo/npm/PyPI's trust model, resolved for phase 1**: a
+>   Go module proxy URL may embed HTTP basic-auth userinfo
 >   (`https://user:pass@proxy.example/`) per Go's own documented
 >   convention, or rely on `.netrc` credential resolution outside the URL
 >   entirely (`go help goproxy` documents both). Neither is addressed in
->   phase 1 — see Out of Scope and Open Questions.
+>   phase 1, matching the Cargo/npm/PyPI precedent exactly — see Out of
+>   Scope and Open Questions for the resolved deferral.
+> - **FR-006's `direct` sentinel, resolved for phase 1 by direct code
+>   inspection this session**: `crates/deps-go/src/registry.rs` exposes
+>   exactly four resolution methods (`get_versions`, `get_version_info`,
+>   `get_latest`, `get_go_mod`), all built on `version_url`/`package_url`
+>   relative to `PROXY_BASE` — the Go module-proxy-protocol client only.
+>   There is no direct-VCS resolution path (no git-tags client, no
+>   go-import-meta-tag discovery, no arbitrary-VCS clone/fetch mechanism)
+>   anywhere in the crate. The closest existing analogue in the workspace,
+>   `GithubActionsRegistry`'s tags client (`crates/deps-github-actions/src/registry.rs`),
+>   is GitHub-specific (owner/repo REST API) and not a fit: Go's `direct`
+>   mode must support arbitrary VCS hosts/protocols via the `go-import`
+>   HTML meta-tag discovery protocol (`go help importpath`), a materially
+>   larger, unrelated-protocol build. Phase 1 therefore implements `direct`
+>   as a fail-closed terminal hop (no version data), per FR-006's own
+>   stated fallback — this is not a scope gap requiring further
+>   clarification, it is the confirmed answer.
 
 ### Goal
 
@@ -180,19 +197,22 @@ wiring deferred, see Out of Scope).
 >   precedent exactly — it never reads, stores, or transmits a credential.
 >   `.netrc` receives no detection or acknowledgment in phase 1. A dedicated
 >   follow-up spec is the right place to revisit Go's broader credential
->   conventions. `[NEEDS CLARIFICATION: should the follow-up also cover
->   GOPROXY's documented support for a bare local-filesystem-path entry,
->   which has no auth concept at all but does have its own path-traversal
->   surface?]`
+>   conventions, **resolved to include** `GOPROXY`'s documented support for
+>   a bare local-filesystem-path entry in that same follow-up's scope — it
+>   has no auth concept, but shares the follow-up's "hop needs its own
+>   validation surface beyond https-URL-shaped entries" theme (path
+>   traversal, not credential handling) and splitting it into a third,
+>   separate spec adds process overhead with no benefit.
 > - **Live shell/process environment-variable reading**
 >   (`GOPROXY`/`GOPRIVATE`/`GONOSUMCHECK`/`GONOSUMDB`/`GOFLAGS` read from the
 >   LSP server's own process environment, or from a `.env`-style file).
 >   Phase 1 targets the file-based `$GOENV` config only (see Assumptions).
->   `[NEEDS CLARIFICATION: is there workspace/editor-launch demand for
->   reading a live GOPROXY env var — e.g. set by a devcontainer or CI
->   wrapper — strongly enough to justify a follow-up before this ships, or
->   is $GOENV-file-only sufficient for phase 1 given the npm/PyPI
->   precedent?]`
+>   **Resolved**: no concrete workspace/editor-launch demand signal was
+>   found for this (no issue, no Dependi parity gap naming it specifically),
+>   so file-based `$GOENV`-only is sufficient for phase 1, matching the
+>   npm/PyPI precedent (neither reads live env vars either) — left
+>   unscheduled rather than spun into a tracked follow-up, consistent with
+>   how 032/033 left their own equivalent gaps.
 > - **Checksum-database verification** (`GONOSUMCHECK=1`, `GOSUMDB=off`,
 >   and Go's checksum-database (`sum.golang.org`) protocol in general) — no
 >   checksum verification exists in `deps-go` today, or in any other
@@ -257,29 +277,40 @@ GIVEN a $GOENV file containing
       GOPRIVATE=git.mycorp.example/*
   AND a go.mod dependency on git.mycorp.example/internal/auth
 WHEN I hover over that dependency
-THEN resolution routes to direct (VCS-based), never to proxy.golang.org
+THEN resolution routes to the direct hop, never to proxy.golang.org
      or any GOPROXY-configured public-tier proxy, for that module path
+     (phase 1: the direct hop fails closed per FR-006/US-003 — no version
+     data shown — but confidentiality is preserved regardless, since no
+     request naming this module path is ever sent to a public proxy)
 ```
 
-### US-003: `GOPROXY` ordered fallback chain with `direct` sentinel
+### US-003: `GOPROXY` ordered fallback chain reaches the `direct` sentinel
 
 AS A developer relying on Go's default `GOPROXY` behavior
 (`https://proxy.golang.org,direct`)
-I WANT a module absent from the configured proxy to fall through to a
-direct VCS-based resolution
-SO THAT hover/diagnostics don't silently show "not found" for a module
-that Go's own tooling would successfully resolve via the next chain entry
+I WANT the LSP to correctly detect when a module falls through to the
+`direct` hop, rather than silently misreporting it as available on a
+proxy hop that actually reported it absent
+SO THAT I can trust the hover/diagnostic result's absence of data means
+"phase 1 doesn't resolve `direct` yet," not "this module doesn't exist"
 
 **Acceptance criteria:**
 ```
 GIVEN a $GOENV file containing
       GOPROXY=https://goproxy.mycorp.example,direct
-  AND a module absent from goproxy.mycorp.example but resolvable via
-      direct VCS access
+  AND a module absent from goproxy.mycorp.example
 WHEN I hover over that dependency
-THEN the LSP attempts direct resolution after the proxy reports absence,
-     rather than reporting the module unresolvable
+THEN the LSP falls through past the proxy hop to the direct sentinel
+     (FR-005), and shows no version data there (FR-006 — direct-VCS
+     resolution is a fail-closed no-op in phase 1, per Open Questions),
+     rather than treating the proxy's not-found response as final
 ```
+
+> [!note] Phase 1 scope
+> Genuine direct-VCS-resolved data (US-003's original framing) requires a
+> follow-up spec — see Open Questions. Phase 1 only guarantees the chain
+> mechanics (proxy hop exhausted → fall through → terminal `direct`
+> no-op) are correct, not that `direct` itself produces version data.
 
 ### US-004: `GOPROXY=off` fails closed
 
@@ -343,7 +374,7 @@ Use EARS notation. Prefix with FR-NNN.
 | FR-003 | WHEN `GOPROXY` is absent from `$GOENV` THE SYSTEM SHALL use Go's documented default chain (`https://proxy.golang.org,direct`) — this is the existing `PROXY_BASE` behavior, now expressed as the default of an overridable chain rather than a hardcoded constant | must |
 | FR-004 | WHEN `GOPROXY=off` (as the sole entry, or reached as the terminal hop of the chain) THE SYSTEM SHALL show no version data for every affected module and SHALL NOT send any network request for that module — mirrors `go build`'s own behavior under `GOPROXY=off` | must |
 | FR-005 | WHEN a chain hop is a proxy URL (not `direct`/`off`) and the module is reported absent by that hop (an explicit "not found" response, matching the existing not-found handling `deps-go` already applies to `proxy.golang.org`) THE SYSTEM SHALL fall through to the next hop in declaration order. A transport failure (connection error, timeout, 5xx) on a hop SHALL be treated as terminal for that hop's chain — not silently skipped — mirroring PyPI's FR-005(c) precedent (033) and for the same reason: silently falling through on transport failure risks resolving a module through a fallback the user did not intend for the reachability state they are actually in | must |
-| FR-006 | WHEN a chain hop is the `direct` sentinel THE SYSTEM SHALL resolve the module via the same direct-VCS-resolution mechanism `deps-go` already implements or, if `deps-go` has no direct-VCS resolution mechanism today, THE SYSTEM SHALL treat `direct` as an unresolvable terminal hop and show no version data — `[NEEDS CLARIFICATION: confirm whether deps-go has any existing non-proxy, direct-VCS resolution path (e.g. querying a Git host's tags API) to build on, or whether "direct" support in phase 1 is necessarily a no-op that fails closed until a follow-up implements direct VCS resolution]` | must — scope of "direct" support itself needs clarification, not the requirement to define its behavior |
+| FR-006 | WHEN a chain hop is the `direct` sentinel THE SYSTEM SHALL treat it as an unresolvable terminal hop and show no version data — confirmed by direct code inspection (see Assumptions) that `deps-go` has no direct-VCS resolution mechanism today; phase 1 is necessarily a fail-closed no-op for `direct`, deferred to a follow-up that would implement actual direct-VCS resolution | must |
 | FR-007 | THE SYSTEM SHALL parse a `GOPRIVATE` entry as a comma-separated list of glob patterns (Go's own `path.Match`-style glob syntax, per `go help goprivate`/`go help environment`), matched against a module's full path | must |
 | FR-008 | WHEN a module's path matches a `GOPRIVATE` glob pattern THE SYSTEM SHALL route that module directly to the `direct` resolution behavior (FR-006), bypassing every proxy hop in the `GOPROXY` chain entirely — regardless of what `GOPROXY` is configured to — matching Go's own documented behavior that `GOPRIVATE`-matched modules never reach a configured proxy or its checksum database | must |
 | FR-009 | WHEN a `GOPROXY` chain hop URL is present but fails validation (non-https, contains userinfo, or is not well-formed — neither `direct` nor `off`) or is blocked by FR-011's policy THE SYSTEM SHALL treat that hop as an invalid entry: represent the affected module's source as `DependencySource::CustomRegistry { url: <the raw value as written> }` if it is the only remaining viable hop, or drop the invalid hop and continue to the next chain entry if other valid hops remain — mirroring PyPI's FR-006 (033) per-entry-fail-closed rule, logging a `tracing::warn!` naming the raw value, and SHALL NOT fall back to `proxy.golang.org` for a module whose resolution the user explicitly overrode | must |
@@ -399,7 +430,7 @@ Use EARS notation. Prefix with FR-NNN.
 | `workspace_registries = off`, `$GOENV` declares a private `GOPROXY` hop | That hop is blocked by FR-011's policy → dropped/fails closed per FR-009, same as an invalid entry |
 | `$GOENV` edited after initial resolution | Stale until the affected `go.mod` is next reparsed (FR-015, documented limitation) |
 | `GOENV` environment variable set to a custom path | THE SYSTEM SHALL honor it per FR-001, consistent with `go env`'s own resolution order |
-| `direct` sentinel reached and `deps-go` has no direct-VCS resolution mechanism | Treated as an unresolvable terminal hop — no version data shown (FR-006, `[NEEDS CLARIFICATION]`) |
+| `direct` sentinel reached | Treated as an unresolvable terminal hop — no version data shown (FR-006, confirmed: `deps-go` has no direct-VCS resolution mechanism) |
 | Live `GOPROXY`/`GOPRIVATE` process environment variables set, no `$GOENV` override | No effect in phase 1 (Out of Scope) — dependencies resolve exactly as they do today, a known false-negative for that class of project until the deferred follow-up ships |
 
 ## 7. Success Criteria
@@ -433,27 +464,35 @@ Use EARS notation. Prefix with FR-NNN.
 
 ## 9. Open Questions
 
-- `[NEEDS CLARIFICATION: auth/credential handling]` — should Go's `.netrc`
-  resolution and/or `GOPROXY`-embedded basic-auth be addressed by a
-  dedicated follow-up spec immediately after this one ships, or left
-  entirely unscheduled like npm's/PyPI's equivalent deferrals? Non-blocking
-  for phase 1 either way — phase 1 rejects any URL with embedded userinfo
-  per the Cargo/npm/PyPI precedent (FR-009/FR-014).
-- `[NEEDS CLARIFICATION: live environment-variable reading]` — is there
-  concrete workspace/editor-launch demand (e.g. devcontainer- or
-  CI-wrapper-set `GOPROXY`) strong enough to justify reading the LSP
-  server's live process environment in addition to `$GOENV`, or is
-  file-based `$GOENV`-only sufficient for phase 1, matching how npm/PyPI
-  deferred their own environment-variable surfaces? Non-blocking — phase 1
-  scopes to `$GOENV` only regardless.
-- `[NEEDS CLARIFICATION: "direct" sentinel scope]` — does `deps-go` have
-  any existing non-proxy, direct-VCS module resolution mechanism to build
-  FR-006's `direct` hop on top of, or does "direct" support in phase 1
-  necessarily fail closed (no version data) until a follow-up implements
-  actual direct-VCS resolution? This materially affects whether US-003 is
-  fully achievable in phase 1 or only partially (the fallback triggers
-  correctly, but yields no data rather than genuine direct-VCS-resolved
-  data).
+All blocking `[NEEDS CLARIFICATION]` items are resolved as of 2026-09-04:
+
+- **Auth/credential handling**: resolved — reject any proxy hop URL with
+  embedded userinfo, matching the Cargo/npm/PyPI precedent exactly
+  (FR-009/FR-014). No `.netrc` detection or acknowledgment in phase 1;
+  Go's broader credential conventions (`.netrc`, URL-embedded basic-auth)
+  are entirely out of scope, owned by a dedicated future auth-handling
+  spec, which is also the natural home for `GOPROXY`'s documented
+  bare-local-filesystem-path entry form (no auth concept, but a related
+  "hop needs validation beyond https-URL shape" surface — path traversal
+  rather than credential handling).
+- **Live environment-variable reading**: resolved — no concrete
+  workspace/editor-launch demand signal exists for reading the LSP
+  server's live process environment (`GOPROXY`/`GOPRIVATE` set by a
+  devcontainer or CI wrapper); `gh issue list`/Dependi parity review
+  surfaced no such request. File-based `$GOENV`-only is sufficient for
+  phase 1, matching how npm/PyPI left their own live-env-var surfaces
+  unscheduled rather than deferred to a tracked follow-up.
+- **`direct` sentinel scope**: resolved by direct code inspection this
+  session (see Assumptions) — `crates/deps-go/src/registry.rs` has no
+  non-proxy, direct-VCS resolution path of any kind (only four methods,
+  all built on the Go module-proxy-protocol client), and the workspace's
+  closest analogue (`GithubActionsRegistry`'s tags client) is
+  GitHub-specific and not reusable for Go's arbitrary-VCS `go-import`
+  meta-tag discovery protocol. FR-006's `direct` support is confirmed as a
+  fail-closed no-op in phase 1 — US-003 is achievable only partially (the
+  fallback triggers correctly on proxy not-found, but yields no data
+  rather than genuine direct-VCS-resolved data) until a follow-up
+  implements actual direct-VCS resolution.
 
 Non-blocking, deliberately deferred:
 
