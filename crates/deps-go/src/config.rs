@@ -388,11 +388,12 @@ pub struct GlobPattern {
 impl GlobPattern {
     /// Wraps and compiles `raw` — no validation surfaced to the caller, matching
     /// `path.Match`'s own behavior (a malformed or oversized pattern simply never matches, per
-    /// `Self::tokens`'s doc). An oversized pattern also logs a `tracing::warn!` (spec 034
-    /// follow-up F6, issue #559): unlike a malformed `GOPROXY` hop, a `GOPRIVATE` pattern that
-    /// never matches fails **open** on confidentiality (the module it should have hidden from
-    /// the public proxy routes there instead), so this failure must be visible rather than
-    /// silent.
+    /// `Self::tokens`'s doc). Both rejection paths log a `tracing::warn!`: an oversized pattern
+    /// (spec 034 follow-up F6, issue #559) here, and a malformed pattern (unterminated `[`
+    /// character class, issue #568) inside `compile_glob`. Unlike a malformed `GOPROXY` hop, a
+    /// `GOPRIVATE` pattern that never matches fails **open** on confidentiality (the module it
+    /// should have hidden from the public proxy routes there instead), so either failure must
+    /// be visible rather than silent.
     #[must_use]
     pub fn new(raw: &str) -> Self {
         let tokens = if raw.len() > MAX_GLOB_PATTERN_LENGTH {
@@ -454,7 +455,9 @@ impl GlobPattern {
 /// `tokens_match`. Returns `None` for an unterminated `[...]` character class — the whole
 /// pattern is then permanently non-matching (see `GlobPattern::tokens`'s doc), the same
 /// outcome the old recursive matcher produced for this case (it just failed the match at that
-/// point instead of failing to compile).
+/// point instead of failing to compile). Also logs a `tracing::warn!` in that case (issue
+/// #568), for the same fail-open-on-confidentiality reason `GlobPattern::new`'s
+/// oversized-pattern guard already logs one — this rejection path previously failed silently.
 fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut tokens = Vec::with_capacity(chars.len());
@@ -485,6 +488,12 @@ fn compile_glob(pattern: &str) -> Option<Vec<GlobToken>> {
                     }
                 }
                 if chars.get(j) != Some(&']') {
+                    tracing::warn!(
+                        pattern = redact_userinfo(pattern),
+                        "GOPRIVATE pattern has an unterminated '[' character class; it will \
+                         never match, so affected modules route to the public proxy instead of \
+                         being treated as private"
+                    );
                     return None; // unterminated class -> whole pattern invalid
                 }
                 tokens.push(GlobToken::Class { negate, entries });
@@ -636,8 +645,9 @@ impl GoEnvConfig {
     /// [`GOPRIVATE_CHAIN_KEY`] chain.
     ///
     /// Checks `tokens.is_some()` rather than mere presence in `self.goprivate` (issue #566): a
-    /// pattern rejected by F6's oversized-pattern guard is still stored with `tokens: None`
-    /// (see `GlobPattern::tokens`'s doc) rather than removed, and can never match anything, so
+    /// pattern rejected either by F6's oversized-pattern guard or as malformed (unterminated
+    /// `[` character class, issue #568) is still stored with `tokens: None` (see
+    /// `GlobPattern::tokens`'s doc) rather than removed, and can never match anything, so
     /// counting it here would register a [`GOPRIVATE_CHAIN_KEY`] chain nothing can ever route
     /// to.
     #[must_use]
@@ -683,15 +693,17 @@ struct RawGoEnv {
     goproxy: Option<String>,
     goprivate: Option<String>,
     /// Memoizes [`GlobPattern::new`]'s compilation of `goprivate` (and thus any `tracing::warn!`
-    /// it logs for an oversized pattern) exactly once per distinct `RawGoEnv` instance.
+    /// it logs — for an oversized pattern (F6) or a malformed one with an unterminated `[`
+    /// character class, issue #568) exactly once per distinct `RawGoEnv` instance.
     ///
     /// [`GoEnvCache`] hands out the *same* `Arc<RawGoEnv>` for repeat calls against an
     /// unchanged file (mtime-gated), so `from_raw`'s `get_or_init` on this field runs the
     /// compile-and-possibly-warn work only on the first call per distinct content — fixing the
     /// F6 warning firing once per LSP re-parse (`did_change` -> ... -> `from_raw`) instead of
-    /// once per resolved config (issue #565). A freshly-`parse_goenv_raw`'d `RawGoEnv` (e.g.
-    /// from [`GoEnvConfig::parse`], which has no cache) always starts with an empty
-    /// `OnceLock`, so that entry point's behavior — warn on every call — is unchanged.
+    /// once per resolved config (issue #565), and equally debouncing the malformed-pattern
+    /// warning. A freshly-`parse_goenv_raw`'d `RawGoEnv` (e.g. from [`GoEnvConfig::parse`],
+    /// which has no cache) always starts with an empty `OnceLock`, so that entry point's
+    /// behavior — warn on every call — is unchanged.
     compiled_goprivate: OnceLock<Vec<GlobPattern>>,
 }
 
@@ -970,6 +982,21 @@ mod tests {
     fn test_glob_pattern_malformed_class_never_panics_no_match() {
         let pattern = GlobPattern::new("git.mycorp.example/repo[unterminated");
         assert!(!pattern.matches("git.mycorp.example/repo1"));
+    }
+
+    /// Issue #568: an unterminated `[` character class's silent fail-open must actually log a
+    /// `tracing::warn!`, not just be non-matching — mirrors
+    /// `test_glob_pattern_oversized_pattern_logs_warning`'s F6 pattern for the sibling
+    /// rejection path.
+    #[test]
+    fn test_glob_pattern_malformed_class_logs_warning() {
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let _ = GlobPattern::new("git.corp.example/[abc");
+        });
+        assert!(
+            log.contains("unterminated '[' character class"),
+            "expected malformed-pattern warning in log: {log:?}"
+        );
     }
 
     #[test]
@@ -1351,6 +1378,20 @@ mod tests {
         let config = GoEnvConfig::parse(&content, &all_policy());
         assert!(config.has_goprivate());
         assert_eq!(config.resolved_chains().len(), 1);
+    }
+
+    /// Issue #568: a malformed (unterminated `[`) `GOPRIVATE` pattern is the sibling rejection
+    /// path to #566's oversized-pattern one, and must be excluded from `has_goprivate()`
+    /// (and thus `resolved_chains()`) the same way.
+    #[test]
+    fn test_has_goprivate_false_for_malformed_pattern() {
+        let config = GoEnvConfig::parse("GOPRIVATE=git.corp.example/[abc", &all_policy());
+        assert!(!config.has_goprivate());
+        assert!(config.resolved_chains().is_empty());
+        assert_eq!(
+            config.resolve_source_for("git.corp.example/abc"),
+            DependencySource::Registry
+        );
     }
 
     // --- redaction (FR-014/NFR-001) ---
