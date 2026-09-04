@@ -66,6 +66,7 @@ status: moc
 | 042 | [[042-docker-base-image-ecosystem/spec\|New ecosystem: Dockerfile FROM base-image tag/digest freshness]] | specify | draft — research/new ecosystem, P4, 5 open `[NEEDS CLARIFICATION]` items, no user demand signal (issue #557) |
 | 043 | [[043-nuget-feed-authentication/spec\|NuGet Feed Authentication (credentialed NuGet.Config sources)]] | specify | draft — enhancement/security, P3, design finalized via 3-round architect/critic review, no open clarifications (issues #561, #562) |
 | 044 | [[044-precommit-hooks-ecosystem/spec\|New ecosystem: pre-commit hooks (.pre-commit-config.yaml repo/rev pins)]] | specify | draft — research/new ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, no tracking issue filed yet |
+| 045 | [[045-secret-accessor-auditable-naming/spec\|Rename Redacted<T>/wrapper as_str() secret accessors to an auditable name]] | specify | draft — research/parity, P3, 3 open `[NEEDS CLARIFICATION]` items, no tracking issue filed yet |
 
 ## Completed Specs
 
