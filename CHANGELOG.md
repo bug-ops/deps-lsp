@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **deps-npm, deps-lsp**: watch `pnpm-workspace.yaml`/`.npmrc` for external changes and reparse already-open `package.json` documents so catalog/registry-resolved diagnostics stay current (resolves #590)
+- **deps-npm, deps-lsp**: watch `pnpm-workspace.yaml`/`.npmrc` for external changes and reparse already-open `package.json` documents so catalog/registry-resolved diagnostics stay current (resolves #590) (#595)
 - **deps-npm**: pnpm workspace catalog (`pnpm-workspace.yaml` `catalog:`/`catalog:<name>`) resolution for `package.json` — hover/diagnostics/completion/inlay hints now treat a resolved catalog entry like a literal semver range, while an unresolved one (missing entry, unknown catalog, no workspace file, malformed YAML, duplicate default catalog) never gets silently rewritten by the "Update all outdated dependencies" quick-fix (resolves #587) (#589)
 - **deps-nuget, deps-core, deps-lsp**: NuGet credentialed private feed authentication — a user-profile `NuGet.Config` `<packageSourceCredentials>` (`ClearTextPassword`, with `%ENV_VAR%` expansion) now attaches as a `Basic` `Authorization` header when it binds to a repo-declared source at the exact same URL, over a new origin-pinned, connect-address-guarded transport; a revoked credential's cached response is evicted on the next 401/403 (resolves #561) (#572)
 - **deps-nuget, deps-core**: origin-pinned transport and registration-hive enrichment (publish-time freshness, hover-only unlisted marker) for workspace-declared/alternate NuGet feeds — closes spec 035's NFR-003(3) residual risk (resolves #562) (#572)
@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: `$GOENV` `GOPROXY`/`GOPRIVATE` follow-up hardening — test-injectable `$GOENV` path, oversized-`GOPRIVATE`-pattern warning, expanded edge-case/integration test coverage, and `GOPROXY` `,`/`|` separator docs (#563)
 
 ### Fixed
-- **deps-core**: `MtimeFileCache` enforces an 8 MiB size cap (checked via `fs::metadata`) before reading a config file's content, instead of always reading the full file before any safety guard runs (resolves #591)
+- **deps-core**: `MtimeFileCache` enforces an 8 MiB size cap (checked via `fs::metadata`) before reading a config file's content, instead of always reading the full file before any safety guard runs (resolves #591) (#595)
 - **deps-go**: oversized-`GOPRIVATE`-pattern warning now logs once per distinct `$GOENV` file content instead of once per LSP re-parse (resolves #565) (#567)
 - **deps-go**: a `GOPROXY` separator preceding a dropped invalid hop is now merged onto the surviving transition with most-permissive-wins, instead of being silently discarded (resolves #564) (#567)
 - **deps-go**: `has_goprivate()` now reflects whether a usable (compiled) `GOPRIVATE` matcher exists, instead of true whenever any raw pattern was declared — even a rejected one (resolves #566) (#567)

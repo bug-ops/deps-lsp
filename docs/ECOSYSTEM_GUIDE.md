@@ -133,7 +133,10 @@ precedence over a top-level `registry=` override for a dependency in that scope.
 Scope keys are matched byte-exact, with no case folding, matching npm's own
 lookup. A `${VAR}`-style placeholder in either key's value is expanded from this
 LSP server's own process environment; an undefined variable makes the whole entry
-invalid (same outcome as an invalid URL, below).
+invalid (same outcome as an invalid URL, below). `deps-lsp` watches `.npmrc` for
+external changes (e.g. a `git checkout`) and reparses every open `package.json`
+to refresh pushed diagnostics, rather than waiting for that document's own next
+edit.
 
 **Authentication**: phase 1 carries **no** authentication at all. `_authToken`,
 `_auth`, `_password`, `_authIdent`, `always-auth`, and every `//<host>/:_*`
@@ -156,9 +159,6 @@ to `"all"` for npm's benefit also widens it for Cargo, and vice versa — see th
 setting's own doc above.
 
 **Known limitations**:
-- Editing `.npmrc` does not take effect until the affected `package.json` is next
-  reparsed (edited, or the document reopened) — there is no dedicated file
-  watcher for it yet.
 - Package-*name* completion (typing a brand-new dependency) always searches
   `registry.npmjs.org`, even for a scope resolved to a private registry — the
   string being searched is a prefix the user typed into the name field, not a
@@ -184,7 +184,10 @@ instead of an unresolvable raw string.
 single-root-per-tree behavior — nested/multiple workspace roots are not
 searched further). `catalog:` and `catalog:default` are equivalent references
 to the default catalog, which may be defined either as a top-level `catalog:`
-block or a `catalogs.default:` section (but never both — see below).
+block or a `catalogs.default:` section (but never both — see below). `deps-lsp`
+watches `pnpm-workspace.yaml` for external changes and reparses every open
+`package.json` to refresh pushed diagnostics, rather than waiting for that
+document's own next edit.
 
 **Fail-closed, never destructive**: whenever a `catalog:` specifier does not
 resolve to a parseable semver range — no `pnpm-workspace.yaml` found, the file
@@ -205,12 +208,6 @@ in this situation before returning any catalog map at all; this deliberately
 never per-key-merges the two sections.
 
 **Known limitations**:
-- Editing `pnpm-workspace.yaml` does not proactively refresh an already-open
-  `package.json`'s pushed diagnostics — the cached catalog map is refreshed on
-  that document's *next* reparse (open/edit/save, or any hover/completion/
-  inlay-hint pull request), matching `.npmrc`'s identical existing refresh
-  contract exactly; there is no dedicated file watcher for
-  `pnpm-workspace.yaml` (`deps-lsp`'s watcher only covers lockfile patterns).
 - `pnpm-lock.yaml` is not read for in-use/resolved-version detection (no
   `deps-npm` lockfile support for it yet — see the lock-file column above);
   this is a pre-existing gap shared with every other npm dependency in a pnpm
