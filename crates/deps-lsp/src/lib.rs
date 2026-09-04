@@ -292,6 +292,7 @@ pub fn register_ecosystems(
         let npm_context = deps_npm::config::NpmParseContext {
             policy: Arc::clone(&policy),
             config_cache: Arc::new(deps_npm::config::NpmConfigCache::new()),
+            workspace_cache: Arc::new(deps_npm::catalog::PnpmWorkspaceCache::new()),
         };
         let npm_registry = Arc::new(NpmRegistry::new(Arc::clone(&cache)));
         registry.register(Arc::new(NpmEcosystem::with_context(
@@ -312,6 +313,7 @@ pub fn register_ecosystems(
         let npm_context = deps_npm::config::NpmParseContext {
             policy: Arc::clone(&policy),
             config_cache: Arc::new(deps_npm::config::NpmConfigCache::new()),
+            workspace_cache: Arc::new(deps_npm::catalog::PnpmWorkspaceCache::new()),
         };
         registry.register(Arc::new(NpmEcosystem::with_context(
             Arc::new(NpmRegistry::new(Arc::clone(&cache))),

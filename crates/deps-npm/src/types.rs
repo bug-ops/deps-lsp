@@ -1,5 +1,7 @@
 use tower_lsp_server::ls_types::Range;
 
+use crate::catalog::CatalogOrigin;
+
 /// Parsed dependency from package.json with position tracking.
 ///
 /// Stores all information about a dependency declaration, including its name,
@@ -19,6 +21,7 @@ use tower_lsp_server::ls_types::Range;
 ///     version_range: Some(Range::new(Position::new(5, 16), Position::new(5, 25))),
 ///     section: NpmDependencySection::Dependencies,
 ///     source: deps_core::parser::DependencySource::Registry,
+///     catalog: None,
 /// };
 ///
 /// assert_eq!(dep.name, "express");
@@ -34,6 +37,10 @@ pub struct NpmDependency {
     /// Resolved by `.npmrc` lookup (spec `032-npm-npmrc-registry-support`) — `Registry`
     /// (the public default) unless a `registry=`/`@scope:registry=` entry applies.
     pub source: deps_core::parser::DependencySource,
+    /// `Some` when `version_req` (before/after resolution) came from a pnpm
+    /// `catalog:`/`catalog:<name>` specifier (spec `046-pnpm-catalogs`); `None` for every
+    /// ordinary literal-range dependency.
+    pub catalog: Option<CatalogOrigin>,
 }
 
 // Implemented by hand rather than via `deps_core::impl_dependency!`: the macro's `source:
@@ -202,6 +209,7 @@ mod tests {
             version_range: Some(Range::new(Position::new(0, 8), Position::new(0, 16))),
             section: NpmDependencySection::Dependencies,
             source: deps_core::parser::DependencySource::Registry,
+            catalog: None,
         };
 
         assert_eq!(dep.name, "react");

@@ -140,18 +140,51 @@ pub fn parse_package_json_with_context(
         ));
     }
 
-    // FR-002: a non-file URI (or one `Uri::to_file_path` cannot resolve) has no directory to
-    // walk `.npmrc` discovery from — falls back to the empty `NpmConfig`, which resolves
-    // every dependency to `DependencySource::Registry` (NFR-005: byte-identical to
-    // pre-feature behavior), rather than failing the whole parse.
-    let npm_config: NpmConfig = uri
-        .to_file_path()
+    // FR-002: a non-`file:` URI (or one `Uri::to_file_path` cannot resolve) has no directory to
+    // walk `.npmrc`/pnpm-workspace discovery from — falls back to the empty `NpmConfig`, which
+    // resolves every dependency to `DependencySource::Registry` (NFR-005: byte-identical to
+    // pre-feature behavior), rather than failing the whole parse. Also the manifest directory
+    // spec 046's catalog resolution walks up from (S3: `None` here is what makes a non-`file:`
+    // URI land on `CatalogOutcome::NoWorkspaceFile` rather than skipping resolution).
+    //
+    // Implementation-critique S2: `Uri::to_file_path` does **not** check the URI's scheme (its
+    // own doc says so) — it just decodes whatever path component is present. Left unguarded,
+    // `untitled:package.json` (VS Code's untitled-buffer form, path "package.json") would
+    // resolve `manifest_dir` to a *relative* path, and `find_workspace_file`/`.npmrc` discovery
+    // would then probe the LSP server process's own CWD instead of the workspace the document
+    // notionally belongs to; a `vscode-vfs://`/`vscode-remote://` URI whose path happens to
+    // mirror a real local path could likewise resolve against an unrelated local
+    // `pnpm-workspace.yaml`/`.npmrc`. Both `.npmrc` registry resolution and the catalog gate
+    // share this one `manifest_dir`, so gating it once here closes both: require the `file`
+    // scheme (case-insensitive per RFC 3986) and an absolute resulting directory.
+    let manifest_dir = uri
+        .scheme()
+        .as_str()
+        .eq_ignore_ascii_case("file")
+        .then(|| uri.to_file_path())
+        .flatten()
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
-        .map(|dir| crate::config::resolve(&dir, &ctx.config_cache, &ctx.policy))
+        .filter(|dir| dir.is_absolute());
+
+    let npm_config: NpmConfig = manifest_dir
+        .as_deref()
+        .map(|dir| crate::config::resolve(dir, &ctx.config_cache, &ctx.policy))
         .unwrap_or_default();
 
     for dep in &mut dependencies {
         dep.source = npm_config.resolve_source_for(&dep.name);
+    }
+
+    // Spec 046 FR-001/NFR-002: cheap fast-path — a non-pnpm manifest pays one string check per
+    // dependency and zero filesystem calls. `apply` runs unconditionally once this fires (the
+    // module's totality invariant), never short-circuited by `load` returning `None`.
+    if dependencies.iter().any(|dep| {
+        dep.version_req
+            .as_ref()
+            .is_some_and(|req| req.as_str().starts_with("catalog:"))
+    }) {
+        let workspace_config = crate::catalog::load(manifest_dir.as_deref(), &ctx.workspace_cache);
+        crate::catalog::apply(&mut dependencies, workspace_config.as_deref());
     }
 
     Ok(NpmParseResult {
@@ -188,6 +221,10 @@ fn parse_dependency_section(
             // all (NFR-005) and for `parse_dependency_section`'s own unit tests, which do
             // not go through that resolution step.
             source: deps_core::parser::DependencySource::Registry,
+            // Overwritten by `parse_package_json_with_context`'s catalog post-pass when the
+            // `catalog:` gate fires; `None` here is correct for both a non-pnpm manifest and
+            // for this function's own unit tests.
+            catalog: None,
         });
     }
 
@@ -679,6 +716,7 @@ mod tests {
                 deps_core::net_policy::WorkspaceRegistryAccess::All,
             )),
             config_cache: std::sync::Arc::new(crate::config::NpmConfigCache::new()),
+            workspace_cache: std::sync::Arc::new(crate::catalog::PnpmWorkspaceCache::new()),
         }
     }
 
@@ -793,5 +831,189 @@ mod tests {
             &result.dependencies[0].source,
             deps_core::parser::DependencySource::CustomRegistry { .. }
         ));
+    }
+
+    // --- pnpm catalogs (spec 046) ---
+
+    /// S3 regression: a manifest URI with no filesystem path at all (e.g. a bare virtual-host
+    /// URI with nothing after the authority) has no directory to search for
+    /// `pnpm-workspace.yaml` from — `Uri::to_file_path` returns `None` for it (verified by the
+    /// `assert!` below, so this test fails loudly rather than silently degrading into an
+    /// ordinary no-workspace-file case if a future `Uri` version starts resolving it). The
+    /// catalog post-pass must still land this on `CatalogOutcome::NoWorkspaceFile` — never
+    /// leave the raw `catalog:` specifier in `version_req`, which would re-arm the destructive
+    /// "Update all outdated dependencies" rewrite (spec §6's totality invariant).
+    #[test]
+    fn test_parse_with_context_uri_with_no_file_path_catalog_dep_has_no_requirement() {
+        let uri: Uri = "vscode-vfs://host"
+            .parse()
+            .expect("a non-file scheme must still parse as a valid Uri");
+        assert!(
+            uri.to_file_path().is_none(),
+            "test premise: this Uri must not resolve to any filesystem path"
+        );
+
+        let json = r#"{"dependencies": {"react": "catalog:"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        let react = &result.dependencies[0];
+        assert_eq!(react.version_req, None);
+        assert!(matches!(
+            react.catalog.as_ref().map(|origin| &origin.outcome),
+            Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
+        ));
+    }
+
+    /// A companion regression for a virtual-filesystem URI that *does* carry a path
+    /// component (`Uri::to_file_path` resolves it to `Some`, since — per its own doc — it
+    /// never checks the scheme). Implementation-critique S2: without the `scheme() == "file"`
+    /// guard added to `manifest_dir`'s computation, this would walk up to 64 real ancestors of
+    /// `/nonexistent-mount/repo` on *this* machine's filesystem — a `vscode-vfs://`/
+    /// `vscode-remote://` path that happens to mirror a real local path could then silently
+    /// resolve against an unrelated local `pnpm-workspace.yaml`/`.npmrc`. With the guard, the
+    /// non-`file` scheme collapses `manifest_dir` to `None` directly, with no filesystem probe
+    /// at all — deterministic, not merely "happens not to exist on this machine".
+    #[test]
+    fn test_parse_with_context_virtual_fs_uri_scheme_guard_skips_filesystem_probe_entirely() {
+        let uri: Uri = "vscode-vfs://host/nonexistent-mount/repo/package.json"
+            .parse()
+            .expect("a non-file scheme must still parse as a valid Uri");
+
+        let json = r#"{"dependencies": {"react": "catalog:"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        let react = &result.dependencies[0];
+        assert_eq!(react.version_req, None);
+        assert!(matches!(
+            react.catalog.as_ref().map(|origin| &origin.outcome),
+            Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
+        ));
+    }
+
+    /// S2 regression: `Uri::to_file_path` does not check scheme, so an `untitled:` URI (VS
+    /// Code's unsaved-buffer form, e.g. `untitled:package.json`) resolves to the *relative*
+    /// path `"package.json"`. Unguarded, `.parent()` of that is the empty relative path `""`,
+    /// and `find_workspace_file`/`.npmrc` discovery would then probe the **LSP server
+    /// process's own current working directory** instead of failing closed. The `is_absolute()`
+    /// filter must reject this before any ancestor walk starts.
+    #[test]
+    fn test_parse_with_context_untitled_scheme_relative_path_does_not_probe_process_cwd() {
+        let uri: Uri = "untitled:package.json"
+            .parse()
+            .expect("untitled: must still parse as a valid Uri");
+        assert!(
+            uri.to_file_path().is_some_and(|p| p.is_relative()),
+            "test premise: to_file_path resolves this to a relative path, not None"
+        );
+
+        let json = r#"{"dependencies": {"react": "catalog:"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        let react = &result.dependencies[0];
+        assert_eq!(react.version_req, None);
+        assert!(matches!(
+            react.catalog.as_ref().map(|origin| &origin.outcome),
+            Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
+        ));
+        // The same guard protects `.npmrc` registry resolution, sharing `manifest_dir`.
+        assert_eq!(react.source, deps_core::parser::DependencySource::Registry);
+    }
+
+    /// S2 regression, absolute-path form: a `file:` URI whose path is written relative (not
+    /// RFC 3986-conformant for `file:`, but not rejected by a generic URI parser either) must
+    /// not resolve `manifest_dir` to a relative directory either — the `is_absolute()` filter
+    /// applies regardless of scheme.
+    #[test]
+    fn test_parse_with_context_file_scheme_relative_path_is_rejected() {
+        let uri: Uri = "file:relative/path/package.json"
+            .parse()
+            .expect("a relative-looking file: URI must still parse as a valid Uri");
+        assert!(
+            uri.to_file_path().is_some_and(|p| p.is_relative()),
+            "test premise: to_file_path resolves this to a relative path"
+        );
+
+        let json = r#"{"dependencies": {"react": "catalog:"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        let react = &result.dependencies[0];
+        assert_eq!(react.version_req, None);
+        assert!(matches!(
+            react.catalog.as_ref().map(|origin| &origin.outcome),
+            Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
+        ));
+    }
+
+    #[test]
+    fn test_parse_with_context_default_catalog_resolves_end_to_end() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "catalog:\n  react: ^18.3.0\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"dependencies": {"react": "catalog:"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        assert_eq!(result.dependencies[0].version_req, Some("^18.3.0".into()));
+    }
+
+    /// Pinning regression for the `Resolved` catalog path's protection documented in
+    /// `catalog.rs`'s module doc: with `version_requirement()` now `Some("^18.3.0")` (not
+    /// `None` — the totality invariant doesn't cover this path) and a newer registry version
+    /// cached, `collect_update_all_edits` must still produce **no edit** for this dependency,
+    /// because `literal_span_matches` rejects the manifest's still-`"catalog:"` `version_range`
+    /// slice against the resolved requirement. This holds only because `NpmDependency` does
+    /// not override `version_literal()` — if that ever changes, this test must fail.
+    #[test]
+    fn test_resolved_catalog_dependency_blocks_update_all_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "catalog:\n  react: ^18.3.0\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+        let content = r#"{"dependencies": {"react": "catalog:"}}"#;
+        let result = parse_package_json_with_context(content, &uri, &all_policy()).unwrap();
+        assert_eq!(result.dependencies[0].version_req, Some("^18.3.0".into()));
+
+        let mut cached = std::collections::HashMap::new();
+        cached.insert(
+            deps_core::PackageName::new("react"),
+            deps_core::lsp_helpers::PackageVersions::latest_only("19.0.0"),
+        );
+        let resolved = std::collections::HashMap::new();
+        let versions = deps_core::VersionData::new(&cached, &resolved);
+
+        let edits = deps_core::lsp_helpers::collect_update_all_edits(
+            &result,
+            content,
+            versions,
+            &crate::formatter::NpmFormatter,
+        );
+
+        assert!(
+            edits.is_empty(),
+            "a catalog-resolved dependency must never be rewritten by \"Update all outdated \
+             dependencies\": {edits:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_with_context_no_catalog_dependency_skips_workspace_lookup() {
+        // FR-008/NFR-002: no `catalog:`-prefixed value anywhere in the manifest, so the
+        // gate never fires — a bogus/nonexistent workspace path must not affect the result.
+        let uri = deps_core::test_util::test_uri("/nonexistent/path/package.json");
+        let json = r#"{"dependencies": {"express": "^4.18.2"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        assert_eq!(result.dependencies[0].version_req, Some("^4.18.2".into()));
+        assert!(result.dependencies[0].catalog.is_none());
     }
 }

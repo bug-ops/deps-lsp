@@ -51,7 +51,7 @@ status: moc
 | 027 | [[027-nuget-unlisted-version-and-multiproject-lockfile/spec\|NuGet unlisted-version hover marker and multi-project lock file matching]] | specify | shipped — bug, P2 (PR #458, issue #451) |
 | 028 | [[028-pypi-requirements-documentlinks-and-directory-layout/spec\|PyPI requirements.txt -r/-c documentLinks and requirements/*.txt directory-layout recognition]] | specify | shipped — enhancement/security-hardening, P3 (PR #458, issue #452) |
 | 029 | [[029-deno-jsr-yanked-exact-pin-restriction-drop/spec\|Drop the jsr: exact-pin-only restriction on the Deno yanked diagnostic]] | specify | shipped — bug, P2 (PR #459, issue #454) |
-| 030 | [[030-gitlab-ci-ecosystem/spec\|New ecosystem: GitLab CI/CD include: version pins]] | specify | draft — research/new ecosystem, P4, 0 open `[NEEDS CLARIFICATION]` items (resolved 2026-09-04), ready for `/sdd plan` — issue #466 tracks implementation |
+| 030 | [[030-gitlab-ci-ecosystem/spec\|New ecosystem: GitLab CI/CD include: version pins]] | specify | draft — research/new ecosystem, P4, 8 open `[NEEDS CLARIFICATION]` items, blocked on #208 (issue #466 tracks implementation) |
 | 031 | [[031-github-actions-sha-pin-diagnostic/spec\|GitHub Actions mutable-ref-pin security diagnostic (SHA-pin recommendation)]] | tasks | shipped — research/parity, P2 (PR #477, issue #473) |
 | 032 | [[032-npm-npmrc-registry-support/spec\|npm .npmrc custom/private registry support (scoped registries + top-level registry=)]] | plan | shipped — research/enhancement, P3 (PR #510, issue #502) |
 | 033 | [[033-pypi-private-index-support/spec\|PyPI private/custom index resolution (--index-url / --extra-index-url / Poetry source / uv index)]] | tasks | shipped — research/enhancement, P3 (PR #516, issue #513) |
@@ -67,7 +67,7 @@ status: moc
 | 043 | [[043-nuget-feed-authentication/spec\|NuGet Feed Authentication (credentialed NuGet.Config sources)]] | specify | draft — enhancement/security, P3, design finalized via 3-round architect/critic review, no open clarifications (issues #561, #562) |
 | 044 | [[044-precommit-hooks-ecosystem/spec\|New ecosystem: pre-commit hooks (.pre-commit-config.yaml repo/rev pins)]] | specify | draft — research/new ecosystem, P4, 6 open `[NEEDS CLARIFICATION]` items, no tracking issue filed yet |
 | 045 | [[045-secret-accessor-auditable-naming/spec\|Rename Redacted<T>/wrapper as_str() secret accessors to an auditable name]] | specify | enhancement/security, P3, ready for implementation (issue #581) |
-| 046 | [[046-pnpm-catalogs/spec\|pnpm catalogs + workspace: protocol resolution support]] | specify | research/enhancement, P3, 6 open `[NEEDS CLARIFICATION]` items, issue #587 |
+| 046 | [[046-pnpm-catalogs/spec\|pnpm catalogs + workspace: protocol resolution support]] | specify | research/enhancement, P3, clarifications resolved 2026-09-04, ready for implementation (issue #587) |
 
 ## Completed Specs
 
