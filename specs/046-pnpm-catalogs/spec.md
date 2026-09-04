@@ -9,7 +9,7 @@ tags:
   - pnpm
   - ecosystem-parity
 created: 2026-09-04
-status: draft
+status: ready
 related:
   - "[[constitution]]"
 ---
@@ -167,7 +167,7 @@ Use EARS notation. Prefix with FR-NNN.
 | FR-006 | WHEN no `pnpm-workspace.yaml` is found in any ancestor directory of the `package.json` being processed AND a `catalog:` specifier is present THE SYSTEM SHALL report a distinct message indicating no pnpm workspace catalog file was found, rather than treating the specifier as an invalid semver range | must |
 | FR-007 | WHEN `pnpm-workspace.yaml` changes on disk THE SYSTEM SHALL invalidate/refresh its cached catalog map so subsequent hover/diagnostic requests reflect the update | must |
 | FR-008 | WHEN a `package.json` dependency value is a literal semver range (not a `catalog:` specifier) THE SYSTEM SHALL continue to parse and resolve it exactly as before this feature, with no behavior change | must |
-| FR-009 | WHEN a `package.json` dependency value uses the `workspace:` protocol (e.g. `workspace:*`, `workspace:^`, `workspace:~`) THE SYSTEM SHALL [NEEDS CLARIFICATION: is workspace: protocol resolution in scope for this spec, or a distinct follow-up? see See Also] | should |
+| FR-009 | WHEN a `package.json` dependency value uses the `workspace:` protocol (e.g. `workspace:*`, `workspace:^`, `workspace:~`) THE SYSTEM SHALL leave existing behavior unchanged — `workspace:` protocol resolution is out of scope for this spec (resolves against sibling workspace *packages*, not the catalog map, and needs separate package-discovery logic) and is tracked as a follow-up (see [[#9. Open Questions]] and [[#10. See Also]]) | must |
 
 ## 4. Non-Functional Requirements
 
@@ -186,7 +186,7 @@ Use EARS notation. Prefix with FR-NNN.
 | CatalogEntry | A single dependency-name → version-range mapping within a catalog | dependency name, semver range string, owning catalog name (`default` or `<name>`) |
 | CatalogSpecifier | A parsed `catalog:` / `catalog:<name>` value found in a `package.json` dependency | raw specifier text, referenced catalog name (`None` = default) |
 
-[NEEDS CLARIFICATION: exact YAML shape assumed for `catalogs.<name>` — is it always a flat `name: range` map per pnpm's documented schema, or does pnpm also support per-catalog metadata (e.g. `specifier`/`onlyBuiltDependencies`-style nested objects) that would change the parse target type?]
+**Resolved**: per `pnpm.io/catalogs` and `pnpm.io/pnpm-workspace_yaml`, both `catalog:` (default) and each `catalogs.<name>:` entry are a flat `dependency-name: semver-range` string map — no nested metadata forms are documented or shown in any example. `CatalogEntry`/`PnpmWorkspaceConfig` parse targets a `HashMap<String, String>` per catalog, keyed by dependency name.
 
 ## 6. Edge Cases and Error Handling
 
@@ -196,11 +196,11 @@ Use EARS notation. Prefix with FR-NNN.
 | `catalog:<name>` references a catalog name that doesn't exist in `catalogs:` | Distinct "unknown catalog '<name>'" message, not a silent fallback to default catalog |
 | `catalog:<name>` catalog exists but has no entry for this dependency name | Distinct "no catalog entry for '<dep>' in catalog '<name>'" message (FR-005) |
 | `pnpm-workspace.yaml` exists but has no `catalog:` or `catalogs:` key at all | Same as "no entry" case — every `catalog:` specifier in the workspace reports missing-entry |
-| Multiple nested `pnpm-workspace.yaml` files (monorepo of monorepos) | [NEEDS CLARIFICATION: pnpm workspaces are single-root by design — should deps-lsp use the nearest ancestor `pnpm-workspace.yaml` or always the outermost one? Affects workspace-root discovery algorithm] |
+| Multiple nested `pnpm-workspace.yaml` files (monorepo of monorepos) | **Resolved**: use the nearest-ancestor `pnpm-workspace.yaml` relative to the `package.json` being processed. This matches pnpm's own `find-workspace-dir` behavior (searches upward from cwd and stops at the first match) and its documented stance that nested/multiple workspace roots are not officially supported (pnpm/pnpm#10267, pnpm/pnpm#11656) |
 | `package.json` is not under any pnpm workspace but still contains `"dep": "catalog:"` (e.g. copy-pasted, or npm/Yarn project) | Same as FR-006 — reported as no workspace catalog file found; specifier is not silently treated as a valid range |
 | `pnpm-workspace.yaml` is malformed YAML | Graceful degradation per NFR-003; existing YAML-parsing pattern in the codebase (`fast-yaml`/`serde_norway`, per project dependency conventions) should be reused rather than introducing a new YAML parser dependency |
 | Catalog entry's version range itself is invalid semver (typo in `pnpm-workspace.yaml`) | Resolved range is fed into existing range-validation/diagnostic logic, which already handles invalid ranges for literal dependencies — no new error path needed per FR-004/FR-008 |
-| `pnpm-workspace.yaml` catalog entry uses a non-npm-registry specifier itself (e.g. `workspace:*`, a git URL, or `catalog:` recursively) | [NEEDS CLARIFICATION: pnpm's own documentation should be checked — can a catalog entry's value itself be a `workspace:` protocol reference, and if so does resolution need to chain?] |
+| `pnpm-workspace.yaml` catalog entry uses a non-npm-registry specifier itself (e.g. `workspace:*`, a git URL, or `catalog:` recursively) | **Resolved**: every documented pnpm catalog example uses a plain semver range; no chained resolution is implemented. If a catalog entry's value fails to parse as a semver range, treat it the same as any other unparseable range value elsewhere in `deps-npm` (e.g. `git+`/`file:` literals) — resolve the specifier to that raw string, show it in hover without a registry/latest-version comparison, and do not crash or chain further |
 
 ## 7. Success Criteria
 
@@ -223,7 +223,6 @@ Measurable metrics that prove the feature works:
 ### Ask First
 - Adding any new dependency (e.g. a YAML parsing crate, if `serde_norway` is not already a `deps-npm` dependency)
 - Deciding whether `catalog:` resolution logic lives in `deps-npm` (ecosystem-specific) or is promoted to a shared `deps-core` primitive (cross-cutting design decision — see Open Questions)
-- Deciding the nearest-vs-outermost workspace-root discovery algorithm when multiple `pnpm-workspace.yaml` files could apply
 
 ### Never
 - Write back to `pnpm-workspace.yaml` (no code actions/quick-fixes that modify workspace config in this spec's scope)
@@ -231,12 +230,35 @@ Measurable metrics that prove the feature works:
 
 ## 9. Open Questions
 
-- [NEEDS CLARIFICATION: should `workspace:` protocol resolution (`workspace:*`, `workspace:^`, `workspace:~`) be in scope for this spec, or split into a dedicated follow-up spec? It is a related but functionally distinct mechanism — it resolves against sibling workspace *packages* by their own `package.json` version, not against a catalog map, and would require workspace-package discovery (glob patterns in `pnpm-workspace.yaml`'s `packages:` key) rather than catalog-map parsing. Recommendation: split into a follow-up (e.g. 047) once this spec ships, to keep this spec's scope and testing surface bounded.]
-- [NEEDS CLARIFICATION: exact YAML shape assumed for `catalogs.<name>` entries — confirm against current pnpm documentation (pnpm.io) whether it is always a flat map or has nested metadata forms.]
-- [NEEDS CLARIFICATION: how should the workspace root be located relative to a given `package.json`? Likely "nearest ancestor directory containing `pnpm-workspace.yaml`," but this should be confirmed against pnpm's own root-detection algorithm (pnpm does not support nested workspaces) rather than assumed.]
-- [NEEDS CLARIFICATION: should `catalog:` resolution be implemented as npm-ecosystem-specific code inside `crates/deps-npm/`, or as a new shared primitive in `deps-core`? Arguments for `deps-core`: pnpm catalogs are conceptually a generic "named version alias map" pattern that could recur; deps-lsp's constitution favors shared primitives. Arguments for keeping it npm-local: `pnpm-workspace.yaml` is pnpm-specific syntax with no analog in other ecosystems today, and `deps-core` should stay ecosystem-agnostic. Default assumption for planning purposes: npm-ecosystem-specific in `deps-npm`, unless `/sdd plan` finds strong cross-ecosystem reuse potential.]
-- [NEEDS CLARIFICATION: multi-root / nested `pnpm-workspace.yaml` discovery — confirm nearest-ancestor vs. outermost-root behavior.]
-- [NEEDS CLARIFICATION: can a catalog entry's own value be a non-registry specifier (e.g. `workspace:*`), requiring chained resolution?]
+All items below were open `[NEEDS CLARIFICATION]` markers; resolved on 2026-09-04
+against current pnpm documentation (`pnpm.io/catalogs`, `pnpm.io/pnpm-workspace_yaml`,
+`pnpm.io/workspaces`) and pnpm's own issue tracker (pnpm/pnpm#10267, pnpm/pnpm#11656)
+prior to implementation:
+
+- **`workspace:` protocol resolution scope**: out of scope for this spec (see FR-009).
+  It resolves against sibling workspace *packages* by their own `package.json` version,
+  not against a catalog map, and needs separate workspace-package discovery (glob
+  patterns in `pnpm-workspace.yaml`'s `packages:` key). Tracked as a follow-up spec
+  (e.g. 047) once this spec ships.
+- **`catalogs.<name>` YAML shape**: always a flat `dependency-name: semver-range`
+  string map — no nested metadata forms exist in pnpm's documented schema (see
+  [[#5. Data Model]]).
+- **Workspace-root discovery**: nearest-ancestor `pnpm-workspace.yaml` relative to the
+  `package.json` being processed, matching pnpm's own `find-workspace-dir` algorithm
+  and its documented single-root-per-tree design (see [[#6. Edge Cases and Error
+  Handling]]).
+- **`deps-npm`-local vs. `deps-core` shared primitive**: implemented as
+  npm-ecosystem-specific code inside `crates/deps-npm/` — `pnpm-workspace.yaml` is
+  pnpm-specific syntax with no analog in other ecosystems today, so a `deps-core`
+  primitive would be speculative generalization ahead of a second concrete use case.
+  Revisit only if a structurally similar named-version-alias pattern appears in
+  another ecosystem.
+- **Chained resolution for non-registry catalog values**: no chaining is implemented.
+  A catalog entry value that isn't a parseable semver range (e.g. `workspace:*`, a git
+  URL, or `catalog:` recursively — none of which appear in pnpm's documented catalog
+  examples) is treated the same as any other unparseable range value elsewhere in
+  `deps-npm`: shown as-is in hover with no registry comparison, never a crash or a
+  silently dropped diagnostic (see [[#6. Edge Cases and Error Handling]]).
 
 ## 10. See Also
 
