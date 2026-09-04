@@ -39,45 +39,6 @@ use crate::types::NuGetParseResult;
 /// bound a pathological feed's registration-hive walk could run unbounded.
 const HOVER_UNLISTED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
-/// manifest's already-parsed dependencies. Mirrors `deps-npm`'s/`deps-pypi`'s identical
-/// `CompletionSource` (issue #523's FR-017-shaped requirement: version completion must route
-/// through the same private-feed resolution hover/diagnostics use, never a blind
-/// api.nuget.org lookup for a private package name).
-enum CompletionSource {
-    /// No dependency in the manifest has this exact name yet.
-    NotInManifest,
-    /// Every occurrence of this name in the manifest agrees on one resolved source.
-    Resolved(DependencySource),
-    /// Two or more occurrences of this name resolve to different sources — offer no
-    /// completions rather than picking one arbitrarily.
-    Ambiguous,
-}
-
-fn resolve_completion_source(
-    parse_result: &dyn ParseResultTrait,
-    package_name: &deps_core::PackageName,
-) -> CompletionSource {
-    let mut sources = parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|d| d.name() == package_name)
-        .map(deps_core::Dependency::source);
-
-    let Some(first) = sources.next() else {
-        return CompletionSource::NotInManifest;
-    };
-    if sources.all(|s| s == first) {
-        CompletionSource::Resolved(first)
-    } else {
-        tracing::warn!(
-            package = %package_name,
-            "ambiguous dependency source for version completion; offering none"
-        );
-        CompletionSource::Ambiguous
-    }
-}
-
 /// NuGet/.NET ecosystem implementation.
 ///
 /// Provides LSP functionality for `.csproj`/`.fsproj`/`.vbproj`, `Directory.Packages.props`,
@@ -130,47 +91,38 @@ impl NuGetEcosystem {
         .await
     }
 
-    /// Completes version requirements for `package_name`, routed by the source that name
-    /// resolves to in `parse_result` (issue #523). An ambiguous, unresolved, or
-    /// unregistered-alternate source offers no completions rather than risking a private
-    /// package name lookup against api.nuget.org.
+    /// Completes version requirements for the dependency at `position`, resolved by cursor
+    /// position rather than by name (issue #593) — delegates to
+    /// [`deps_core::completion::complete_versions_at_position`], which mirrors
+    /// `deps_gitlab_ci::ecosystem::GitLabCiEcosystem::generate_completions`'s reference
+    /// pattern. Position-based lookup also fixes a residual gap in the old name-based
+    /// routing (issue #523): two dependencies sharing one `PackageName` but resolving to
+    /// different sources used to collapse into an ambiguous, empty result for both
+    /// occurrences, even though the cursor position unambiguously identifies which one the
+    /// user is editing.
+    ///
+    /// An unresolvable source still offers no completions rather than risking a private
+    /// package name lookup against api.nuget.org — the shared helper's gate is what keeps
+    /// `Registry::get_versions_from`'s permissive routing of an unrecognized source to the
+    /// default public client (matching hover/diagnostics/code-actions' identical gate) from
+    /// leaking one for completions too.
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
-        package_name: &deps_core::PackageName,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        match resolve_completion_source(parse_result, package_name) {
-            CompletionSource::Ambiguous => vec![],
-            CompletionSource::NotInManifest
-            | CompletionSource::Resolved(DependencySource::Registry) => {
-                deps_core::completion::complete_versions_generic(
-                    self.registry.as_ref(),
-                    package_name,
-                    prefix,
-                    &[],
-                    freshness,
-                )
-                .await
-            }
-            CompletionSource::Resolved(DependencySource::AlternateRegistry { index, .. }) => {
-                match self.registry.alternate_client(&index) {
-                    Some(client) => {
-                        deps_core::completion::complete_versions_generic(
-                            client.as_ref(),
-                            package_name,
-                            prefix,
-                            &[],
-                            freshness,
-                        )
-                        .await
-                    }
-                    None => vec![],
-                }
-            }
-            CompletionSource::Resolved(_) => vec![],
-        }
+        deps_core::completion::complete_versions_at_position(
+            self.registry.as_ref(),
+            &self.formatter,
+            parse_result,
+            position,
+            prefix,
+            &[],
+            freshness,
+        )
+        .await
     }
 
     /// Test-only hook to inject a [`NuGetRegistry`] pointed at a mock service index
@@ -291,11 +243,8 @@ impl Ecosystem for NuGetEcosystem {
                 CompletionContext::PackageName { prefix, range } => {
                     self.complete_package_names(&prefix, range).await
                 }
-                CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => {
-                    self.complete_versions(parse_result, &package_name, &prefix, freshness)
+                CompletionContext::Version { prefix, .. } => {
+                    self.complete_versions(parse_result, position, &prefix, freshness)
                         .await
                 }
                 CompletionContext::Feature { .. } | CompletionContext::None => vec![],
@@ -454,6 +403,7 @@ fn annotate_unlisted_versions(markdown: &str, unlisted: &HashSet<String>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NuGetDependency;
 
     #[test]
     fn test_ecosystem_id() {
@@ -602,6 +552,329 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    // --- complete_versions: position-based dependency lookup + can_resolve_source gate (issue #593) ---
+
+    /// A dependency on `line`, with a `version_range` there so position-based lookup (issue
+    /// #593) can find it — mirrors `deps_go::ecosystem::tests::dep_with_source`.
+    fn dep_with_source(name: &str, source: DependencySource, line: u32) -> NuGetDependency {
+        NuGetDependency {
+            name: name.into(),
+            name_range: Range::new(Position::new(line, 0), Position::new(line, 0)),
+            version_requirement: Some("1.0.0".into()),
+            version_range: Some(Range::new(Position::new(line, 0), Position::new(line, 10))),
+            source,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_position_based_lookup_finds_correct_dependency() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let _index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(nuget_service_index_body(&base))
+            .create_async()
+            .await;
+        let _flat_mock = server
+            .mock("GET", "/flatcontainer/targetpkg/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0", "1.2.0"]}"#)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let eco = NuGetEcosystem::with_registry(registry);
+
+        // "otherpkg" has no mock registered — if position-based lookup picked it instead of
+        // the dependency actually under the cursor, this would fail closed to empty instead
+        // of returning `targetpkg`'s versions.
+        let other = dep_with_source("otherpkg", DependencySource::Registry, 0);
+        let target = dep_with_source("targetpkg", DependencySource::Registry, 1);
+        let target_position = target.version_range.unwrap().start;
+        let parse_result = NuGetParseResult {
+            dependencies: vec![other, target],
+            uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
+        };
+
+        let results = eco
+            .complete_versions(
+                &parse_result,
+                target_position,
+                "1",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            !results.is_empty(),
+            "position-based lookup must resolve the dependency at the cursor position"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complete_versions_no_dependency_at_position_offers_nothing() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = NuGetEcosystem::new(cache);
+
+        let dep = dep_with_source("somepkg", DependencySource::Registry, 0);
+        let parse_result = NuGetParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
+        };
+
+        let results = eco
+            .complete_versions(
+                &parse_result,
+                Position::new(99, 0),
+                "1",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(results.is_empty());
+    }
+
+    /// `can_resolve_source`'s gate (matching hover/diagnostics/code-actions' identical check,
+    /// #248 leak class) must keep an unresolvable `CustomRegistry` source from ever reaching
+    /// api.nuget.org. The `.expect(0)` mock fails the test if that endpoint is hit at all.
+    #[tokio::test]
+    async fn test_complete_versions_gate_blocks_unresolvable_source() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let _index_mock = server
+            .mock("GET", "/index.json")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let eco = NuGetEcosystem::with_registry(registry);
+
+        let dep = dep_with_source(
+            "privatepkg",
+            DependencySource::CustomRegistry {
+                url: "https://feed.mycorp.example/v3/index.json".to_string(),
+            },
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
+        let parse_result = NuGetParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
+        };
+
+        let results = eco
+            .complete_versions(
+                &parse_result,
+                position,
+                "1",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            results.is_empty(),
+            "an unresolvable CustomRegistry source must offer no completions"
+        );
+        _index_mock.assert_async().await;
+    }
+
+    /// An `AlternateRegistry` source whose index has no registered client offers no
+    /// completions rather than falling back to the public registry.
+    #[tokio::test]
+    async fn test_complete_versions_unregistered_alternate_offers_nothing() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let _index_mock = server
+            .mock("GET", "/index.json")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let eco = NuGetEcosystem::with_registry(registry);
+
+        let dep = dep_with_source(
+            "internal.auth",
+            DependencySource::AlternateRegistry {
+                index: "nuget-chain:never-registered".to_string(),
+                mirrors_crates_io: false,
+            },
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
+        let parse_result = NuGetParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
+        };
+
+        let results = eco
+            .complete_versions(
+                &parse_result,
+                position,
+                "1.",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            results.is_empty(),
+            "unregistered alternate index must offer no completions"
+        );
+        _index_mock.assert_async().await;
+    }
+
+    /// A registered `AlternateRegistry` chain routes `complete_versions` through its own
+    /// client, never the public root registry.
+    #[tokio::test]
+    async fn test_complete_versions_routes_to_registered_alternate_client() {
+        let mut alt_server = mockito::Server::new_async().await;
+        let alt_base = alt_server.url();
+        let _alt_index_mock = alt_server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(nuget_service_index_body(&alt_base))
+            .create_async()
+            .await;
+        let _alt_flat_mock = alt_server
+            .mock("GET", "/flatcontainer/internal.auth/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.2.3", "1.3.0"]}"#)
+            .create_async()
+            .await;
+
+        let mut public_server = mockito::Server::new_async().await;
+        let public_base = public_server.url();
+        let _public_index_mock = public_server
+            .mock("GET", "/index.json")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        ));
+        let root = Arc::new(NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{public_base}/index.json"),
+        ));
+
+        let feed_url =
+            crate::config::NuGetFeedUrl::new(&format!("{alt_base}/index.json"), &policy).unwrap();
+        let chain = crate::config::NuGetSourceChain {
+            key: "nuget-chain:test-alt".to_string(),
+            hops: vec![crate::config::ResolvedHop {
+                url: feed_url,
+                slot: None,
+                auth: None,
+            }],
+            implicit_public_fallback: false,
+        };
+        NuGetRegistry::register_chain(&root, &chain, &policy);
+
+        let context = crate::config::NuGetParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+            user_profile_config: None,
+            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let eco = NuGetEcosystem::with_context(root, context);
+
+        let dep = dep_with_source(
+            "internal.auth",
+            DependencySource::AlternateRegistry {
+                index: "nuget-chain:test-alt".to_string(),
+                mirrors_crates_io: false,
+            },
+            0,
+        );
+        let position = dep.version_range.unwrap().start;
+        let parse_result = NuGetParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
+        };
+
+        let results = eco
+            .complete_versions(
+                &parse_result,
+                position,
+                "1.",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            !results.is_empty(),
+            "a registered alternate index must route completions through its own client"
+        );
+        _public_index_mock.assert_async().await;
+    }
+
+    /// Two dependencies sharing one `PackageName` but resolving to different sources must
+    /// route independently by cursor position, not collapse into an ambiguous "offer nothing
+    /// for either" result.
+    #[tokio::test]
+    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let _index_mock = server
+            .mock("GET", "/index.json")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let eco = NuGetEcosystem::with_registry(registry);
+
+        let registry_dep = dep_with_source("shared.pkg", DependencySource::Registry, 0);
+        let alternate_dep = dep_with_source(
+            "shared.pkg",
+            DependencySource::AlternateRegistry {
+                index: "nuget-chain:never-registered".to_string(),
+                mirrors_crates_io: false,
+            },
+            1,
+        );
+        let alternate_position = alternate_dep.version_range.unwrap().start;
+        let parse_result = NuGetParseResult {
+            dependencies: vec![registry_dep, alternate_dep],
+            uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
+        };
+
+        // The alternate occurrence resolves deterministically without network: its index was
+        // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
+        // call — proving its own source, not the co-occurring `Registry`-sourced entry, drove
+        // the routing. The `.expect(0)` mock proves no fallback to the public registry either.
+        let results = eco
+            .complete_versions(
+                &parse_result,
+                alternate_position,
+                "1",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            results.is_empty(),
+            "unregistered alternate index must offer no completions, not fall back to the \
+             co-occurring Registry-sourced entry"
+        );
+        _index_mock.assert_async().await;
     }
 
     /// End-to-end regression for issue #163: a `.csproj`/`Directory.Packages.props`

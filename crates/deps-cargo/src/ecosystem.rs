@@ -114,55 +114,54 @@ impl CargoEcosystem {
         .await
     }
 
-    /// Completes version requirements for `package_name`, routed by the source that name
-    /// resolves to in `parse_result` (spec FR-012). An ambiguous or otherwise
-    /// non-crates.io/non-alternate source offers no completions rather than risking a
-    /// private-crate-name lookup against crates.io (the same leak class FR-001 closes for
-    /// hover/diagnostics/code-actions).
+    /// Completes version requirements for the dependency at `position`, resolved by cursor
+    /// position rather than by name (issue #593) — delegates to
+    /// [`deps_core::completion::complete_versions_at_position`], which mirrors
+    /// `deps_gitlab_ci::ecosystem::GitLabCiEcosystem::generate_completions`'s reference
+    /// pattern. Position-based lookup also fixes a residual gap in the old name-based
+    /// [`resolve_completion_source`] routing: two dependencies sharing one `PackageName` but
+    /// resolving to different sources (e.g. two `[[registries]]`-scoped Cargo entries) used to
+    /// collapse into `CompletionSource::Ambiguous` and offer no completions for either
+    /// occurrence, even though the cursor position unambiguously identifies which one the user
+    /// is editing.
+    ///
+    /// The shared helper's `can_resolve_source` gate keeps `Registry::get_versions_from`'s
+    /// permissive catch-all (anything it doesn't explicitly recognize — Git, Path, an
+    /// unresolved `CustomRegistry`, ...) from leaking a private/non-registry dependency's name
+    /// to crates.io on every keystroke (#248). One source it does *not* reject —
+    /// `AlternateRegistry { mirrors_crates_io: true, .. }` left unregistered — deliberately
+    /// degrades to crates.io inside `CargoRegistry::get_versions_for_source`
+    /// (`registry.rs`'s `mirrors_crates_io` arm): safe, since Cargo verifies per-version
+    /// checksum equality against crates.io for a `[source.crates-io] replace-with` mirror, and
+    /// matches hover's identical degrade-to-public behavior for the same flag.
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
-        package_name: &deps_core::PackageName,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        match resolve_completion_source(parse_result, package_name) {
-            CompletionSource::Ambiguous => vec![],
-            CompletionSource::NotInManifest
-            | CompletionSource::Resolved(DependencySource::Registry) => {
-                deps_core::completion::complete_versions_generic(
-                    self.registry.as_ref(),
-                    package_name,
-                    prefix,
-                    &['^', '~', '=', '<', '>'],
-                    freshness,
-                )
-                .await
-            }
-            CompletionSource::Resolved(DependencySource::AlternateRegistry { index, .. }) => {
-                match self.registry.alternate_client(&index) {
-                    Some(client) => {
-                        deps_core::completion::complete_versions_generic(
-                            client.as_ref(),
-                            package_name,
-                            prefix,
-                            &['^', '~', '=', '<', '>'],
-                            freshness,
-                        )
-                        .await
-                    }
-                    None => vec![],
-                }
-            }
-            CompletionSource::Resolved(_) => vec![],
-        }
+        deps_core::completion::complete_versions_at_position(
+            self.registry.as_ref(),
+            &self.formatter,
+            parse_result,
+            position,
+            prefix,
+            &['^', '~', '=', '<', '>'],
+            freshness,
+        )
+        .await
     }
 
     /// Completes feature flags for a specific package.
     ///
     /// Fetches features from the latest stable version, routed by the source `package_name`
-    /// resolves to in `parse_result` (spec FR-012) — same routing/ambiguity policy as
-    /// [`Self::complete_versions`].
+    /// resolves to in `parse_result` by name (spec FR-012) — unlike [`Self::complete_versions`]
+    /// (issue #593, position-based), this still joins by name via
+    /// [`resolve_completion_source`]/[`CompletionSource`], so it keeps the same residual
+    /// same-name-different-source `Ambiguous` gap #593 fixed for versions (not itself in
+    /// #593's scope: `features_range`-based position routing for this method is a follow-up,
+    /// not done here).
     async fn complete_features(
         &self,
         parse_result: &dyn ParseResultTrait,
@@ -279,11 +278,8 @@ impl Ecosystem for CargoEcosystem {
                 CompletionContext::PackageName { prefix, range } => {
                     self.complete_package_names(&prefix, range).await
                 }
-                CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => {
-                    self.complete_versions(parse_result, &package_name, &prefix, freshness)
+                CompletionContext::Version { prefix, .. } => {
+                    self.complete_versions(parse_result, position, &prefix, freshness)
                         .await
                 }
                 CompletionContext::Feature {
@@ -372,9 +368,9 @@ mod tests {
     }
 
     /// A `MockParseResult` with no dependencies — `resolve_completion_source` reports
-    /// `NotInManifest` for any name against it, so `complete_versions`/`complete_features`
-    /// fall back to their pre-existing crates.io-only behavior. Used by every test below
-    /// that predates FR-012's source-aware routing and isn't itself testing that routing.
+    /// `NotInManifest` for any name against it, so `complete_features` falls back to its
+    /// pre-existing crates.io-only behavior. Used by tests below that only exercise
+    /// `complete_features` (`complete_versions` is now position-based; see `mock_dependency`).
     fn empty_parse_result() -> MockParseResult {
         MockParseResult {
             dependencies: vec![],
@@ -698,11 +694,16 @@ mod tests {
     async fn test_complete_versions_real() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
+        let dep = mock_dependency("serde", Some("1.0"), 0, 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("serde"),
+                &parse_result,
+                position,
                 "1.0",
                 deps_core::FreshnessSettings::default(),
             )
@@ -716,11 +717,16 @@ mod tests {
     async fn test_complete_versions_with_operator() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
+        let dep = mock_dependency("serde", Some("^1.0"), 0, 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("serde"),
+                &parse_result,
+                position,
                 "^1.0",
                 deps_core::FreshnessSettings::default(),
             )
@@ -755,11 +761,12 @@ mod tests {
         assert!(results.iter().all(|r| r.label.starts_with("der")));
     }
 
-    /// FR-012's `CompletionSource::Ambiguous` branch (review finding #6): two occurrences
-    /// of the same name resolving to two different sources must offer no version
-    /// completions at all, not silently pick one arm's registry.
+    /// Issue #593: two dependencies sharing one `PackageName` but resolving to different
+    /// sources no longer collapse into the old name-based `CompletionSource::Ambiguous`
+    /// "offer nothing for either" result (review finding #6) — cursor position now
+    /// identifies exactly one dependency, so each occurrence routes independently.
     #[tokio::test]
-    async fn test_complete_versions_ambiguous_source_offers_nothing() {
+    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
 
@@ -767,24 +774,84 @@ mod tests {
         registry_dep.source = DependencySource::Registry;
         let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
         alternate_dep.source = DependencySource::AlternateRegistry {
-            index: "https://index.mycorp.dev".into(),
+            index: "https://index.mycorp.dev/never-registered".into(),
             mirrors_crates_io: false,
         };
+        let alternate_position = alternate_dep.version_range.unwrap().start;
         let parse_result = MockParseResult {
             dependencies: vec![registry_dep, alternate_dep],
         };
 
+        // The alternate occurrence resolves deterministically without network: its index
+        // was never registered, so `CargoRegistry::alternate_client` returns `None` and the
+        // fetch fails closed with `PackageNotFound` before any HTTP call — proving its own
+        // source, not the co-occurring `Registry`-sourced entry, drove the routing.
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("shared-name"),
+                alternate_position,
                 "1",
                 deps_core::FreshnessSettings::default(),
             )
             .await;
         assert!(
             results.is_empty(),
-            "an ambiguous source must offer no version completions"
+            "unregistered alternate index must offer no completions"
+        );
+    }
+
+    /// Issue #593 critic finding M5: the test above only proves the *empty* case, which a
+    /// totally broken position lookup would also satisfy. This proves position-based routing
+    /// actually selects the right source's data — a *registered* alternate index's own client
+    /// is hit and its versions come back — mirroring `deps-go`'s/`deps-nuget`'s equivalent
+    /// `..._routes_to_registered_alternate_client` tests.
+    #[tokio::test]
+    async fn test_complete_versions_routes_to_registered_alternate_client() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/se/rd/serde")
+            .with_status(200)
+            .with_body(
+                "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false,\"features\":{},\"deps\":[]}\n\
+                 {\"name\":\"serde\",\"vers\":\"1.5.0\",\"yanked\":false,\"features\":{},\"deps\":[]}\n",
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = CargoEcosystem::new(cache);
+
+        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+        let registry_index = crate::config::RegistryIndex::new(
+            &server.url(),
+            crate::config::IndexTrust::Trusted,
+            &policy,
+        )
+        .unwrap();
+        let index_key = registry_index.as_str().to_string();
+        ecosystem.registry.register_alternate(registry_index, None);
+
+        let mut dep = mock_dependency("serde", Some("1.0"), 0, 0);
+        dep.source = DependencySource::AlternateRegistry {
+            index: index_key,
+            mirrors_crates_io: false,
+        };
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
+
+        let results = ecosystem
+            .complete_versions(
+                &parse_result,
+                position,
+                "1.",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            !results.is_empty(),
+            "a registered alternate index must route completions through its own client"
         );
     }
 
@@ -819,12 +886,17 @@ mod tests {
     async fn test_complete_versions_unknown_package() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
+        let dep = mock_dependency("this-package-does-not-exist-12345", Some("1.0"), 0, 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("this-package-does-not-exist-12345"),
+                &parse_result,
+                position,
                 "1.0",
                 deps_core::FreshnessSettings::default(),
             )
@@ -889,10 +961,15 @@ mod tests {
         let ecosystem = CargoEcosystem::new(cache);
 
         // Test that we respect the 20 result limit
+        let dep = mock_dependency("serde", Some("1.0"), 0, 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = MockParseResult {
+            dependencies: vec![dep],
+        };
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("serde"),
+                &parse_result,
+                position,
                 "1",
                 deps_core::FreshnessSettings::default(),
             )

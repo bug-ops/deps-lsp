@@ -11,61 +11,12 @@ use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Position, Range, 
 
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, completion::Completions,
-    lsp_helpers::EcosystemFormatter, parser::DependencySource,
+    lsp_helpers::EcosystemFormatter,
 };
 
 use crate::formatter::PypiFormatter;
 use crate::parser::PypiParser;
 use crate::registry::PypiRegistry;
-
-/// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
-/// manifest's already-parsed dependencies (validator finding #1 — mirrors
-/// `deps_npm::ecosystem`'s identical type).
-#[derive(Debug)]
-enum CompletionSource {
-    /// No dependency in the manifest has this exact name yet — most commonly because the
-    /// user is still typing a brand-new dependency line. Callers fall back to the
-    /// pre-existing public-registry-only behavior, unchanged.
-    NotInManifest,
-    /// Every occurrence of this name in the manifest agrees on one resolved source.
-    Resolved(DependencySource),
-    /// Two or more occurrences of this name resolve to different sources — callers must
-    /// offer no completions at all rather than picking one arbitrarily.
-    Ambiguous,
-}
-
-/// Joins `package_name` back to `parse_result.dependencies()` by name — the single choke
-/// point [`PypiEcosystem::complete_versions`] uses to decide whether a version-completion
-/// request may safely reach `pypi.org` at all (validator finding #1: without this,
-/// `complete_versions` fetched from the root `Public`-tier client unconditionally, sending an
-/// `AlternateRegistry`-sourced dependency's name to `pypi.org` on every keystroke, and still
-/// fetching from `pypi.org` for a `CustomRegistry`-sourced one that hover/diagnostics
-/// correctly fail closed for).
-///
-/// Mirrors `deps_npm::ecosystem`'s identical helper.
-fn resolve_completion_source(
-    parse_result: &dyn ParseResultTrait,
-    package_name: &deps_core::PackageName,
-) -> CompletionSource {
-    let mut sources = parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|d| d.name() == package_name)
-        .map(deps_core::Dependency::source);
-
-    let Some(first) = sources.next() else {
-        return CompletionSource::NotInManifest;
-    };
-    if sources.all(|s| s == first) {
-        CompletionSource::Resolved(first)
-    } else {
-        tracing::warn!(
-            package = %package_name,
-            "ambiguous dependency source for version completion; offering none"
-        );
-        CompletionSource::Ambiguous
-    }
-}
 
 /// Which manifest shape a URI's basename identifies, so `parse_manifest` can
 /// dispatch to the right parser method and report the right `file_type` on
@@ -201,48 +152,39 @@ impl PypiEcosystem {
         })
     }
 
-    /// Completes version requirements for `package_name`, routed by the source that name
-    /// resolves to in `parse_result` (validator finding #1). An ambiguous, unresolved, or
-    /// unregistered-alternate source offers no completions rather than risking a private
-    /// package name lookup against `pypi.org` — the same leak class FR-006 closes for
-    /// hover/diagnostics/code-actions.
+    /// Completes version requirements for the dependency at `position`, resolved by cursor
+    /// position rather than by name (issue #593) — delegates to
+    /// [`deps_core::completion::complete_versions_at_position`], which mirrors
+    /// `deps_gitlab_ci::ecosystem::GitLabCiEcosystem::generate_completions`'s reference
+    /// pattern. Position-based lookup also fixes a residual gap in the old name-based
+    /// routing (validator finding #1): two dependencies sharing one `PackageName` but
+    /// resolving to different sources used to collapse into an ambiguous, empty result for
+    /// both occurrences, even though the cursor position unambiguously identifies which one
+    /// the user is editing.
+    ///
+    /// An unresolvable source (`CustomRegistry`, or anything
+    /// [`SourcePolicy::can_resolve_source`](deps_core::lsp_helpers::SourcePolicy::can_resolve_source)
+    /// rejects) still offers no completions rather than risking a private package name lookup
+    /// against `pypi.org` — the shared helper's gate is what keeps `Registry::get_versions_from`'s
+    /// permissive routing of an unrecognized source to the default public client (matching
+    /// hover/diagnostics/code-actions' identical gate) from leaking one for completions too.
     async fn complete_versions(
         &self,
         parse_result: &dyn ParseResultTrait,
-        package_name: &deps_core::PackageName,
+        position: Position,
         prefix: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Vec<CompletionItem> {
-        match resolve_completion_source(parse_result, package_name) {
-            CompletionSource::Ambiguous => vec![],
-            CompletionSource::NotInManifest
-            | CompletionSource::Resolved(DependencySource::Registry) => {
-                deps_core::completion::complete_versions_generic(
-                    self.registry.as_ref(),
-                    package_name,
-                    prefix,
-                    &['>', '<', '=', '~', '!'],
-                    freshness,
-                )
-                .await
-            }
-            CompletionSource::Resolved(DependencySource::AlternateRegistry { index, .. }) => {
-                match self.registry.alternate_client(&index) {
-                    Some(client) => {
-                        deps_core::completion::complete_versions_generic(
-                            client.as_ref(),
-                            package_name,
-                            prefix,
-                            &['>', '<', '=', '~', '!'],
-                            freshness,
-                        )
-                        .await
-                    }
-                    None => vec![],
-                }
-            }
-            CompletionSource::Resolved(_) => vec![],
-        }
+        deps_core::completion::complete_versions_at_position(
+            self.registry.as_ref(),
+            &self.formatter,
+            parse_result,
+            position,
+            prefix,
+            &['>', '<', '=', '~', '!'],
+            freshness,
+        )
+        .await
     }
 }
 
@@ -365,11 +307,8 @@ impl Ecosystem for PypiEcosystem {
                     items: self.complete_package_names(&prefix, range).await,
                     is_incomplete: true,
                 },
-                CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => self
-                    .complete_versions(parse_result, &package_name, &prefix, freshness)
+                CompletionContext::Version { prefix, .. } => self
+                    .complete_versions(parse_result, position, &prefix, freshness)
                     .await
                     .into(),
                 CompletionContext::Feature { .. } | CompletionContext::None => {
@@ -485,26 +424,12 @@ fn is_safe_document_link_target(target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::{EcosystemConfig, VersionData};
+    use deps_core::{EcosystemConfig, VersionData, parser::DependencySource};
     use std::assert_matches;
     use std::collections::HashMap;
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
-    }
-
-    /// A `ParseResult` with no dependencies — `resolve_completion_source` always answers
-    /// `NotInManifest` for it, matching this feature's pre-existing (public-registry-only)
-    /// version-completion behavior. Used by tests that only exercise `complete_versions`
-    /// directly, with no manifest content to join against.
-    fn empty_parse_result() -> crate::parser::ParseResult {
-        crate::parser::ParseResult {
-            dependencies: Vec::new(),
-            workspace_root: None,
-            uri: deps_core::test_util::test_uri("/test/requirements.txt"),
-            document_links: Vec::new(),
-            resolved_chains: Vec::new(),
-        }
     }
 
     #[test]
@@ -994,11 +919,12 @@ mod tests {
     async fn test_complete_versions_real() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
+        let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
 
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("requests"),
+                &parse_result,
+                DEP_POSITION,
                 "2.",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1012,11 +938,12 @@ mod tests {
     async fn test_complete_versions_with_operator() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
+        let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
 
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("requests"),
+                &parse_result,
+                DEP_POSITION,
                 ">=2.",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1029,12 +956,16 @@ mod tests {
     async fn test_complete_versions_unknown_package() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
+        let parse_result = parse_result_with_dependency(
+            "this-package-does-not-exist-12345",
+            DependencySource::Registry,
+        );
 
         // Unknown package should return empty (graceful degradation)
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("this-package-does-not-exist-12345"),
+                &parse_result,
+                DEP_POSITION,
                 "1.0",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1042,19 +973,28 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    /// A minimal single-dependency `ParseResult`, for the `resolve_completion_source` join
-    /// `complete_versions` performs — the source under test.
+    /// The single dependency `parse_result_with_dependency` constructs always has its
+    /// `version_range` start here — every call site below passes this as `complete_versions`'
+    /// `position` argument so the position-based lookup finds it.
+    const DEP_POSITION: Position = Position {
+        line: 0,
+        character: 0,
+    };
+
+    /// A minimal single-dependency `ParseResult`, used to exercise `complete_versions`'
+    /// per-source routing (issue #593) — the dependency's `version_range` starts at
+    /// [`DEP_POSITION`].
     fn parse_result_with_dependency(
         name: &str,
         source: DependencySource,
     ) -> crate::parser::ParseResult {
-        use tower_lsp_server::ls_types::{Position, Range};
+        use tower_lsp_server::ls_types::Range;
         crate::parser::ParseResult {
             dependencies: vec![crate::types::PypiDependency {
                 name: pkg(name),
                 name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
                 version_req: None,
-                version_range: None,
+                version_range: Some(Range::new(DEP_POSITION, Position::new(0, 10))),
                 extras: Vec::new(),
                 extras_range: None,
                 markers: None,
@@ -1114,7 +1054,7 @@ mod tests {
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("mypkg"),
+                DEP_POSITION,
                 "",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1143,7 +1083,7 @@ mod tests {
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("mypkg"),
+                DEP_POSITION,
                 "",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1168,7 +1108,7 @@ mod tests {
         let results = ecosystem
             .complete_versions(
                 &parse_result,
-                &pkg("mypkg"),
+                DEP_POSITION,
                 "",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1176,43 +1116,58 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    /// `resolve_completion_source`'s three-way classification, tested directly.
-    #[test]
-    fn test_resolve_completion_source_classification() {
-        let not_in_manifest = empty_parse_result();
-        assert_matches!(
-            resolve_completion_source(&not_in_manifest, &pkg("mypkg")),
-            CompletionSource::NotInManifest
-        );
+    /// Issue #593: two dependencies sharing one `PackageName` but resolving to different
+    /// sources no longer collapse into the old name-based "offer nothing for either" result
+    /// — cursor position now identifies exactly one dependency, so each occurrence routes
+    /// independently through its own source.
+    #[tokio::test]
+    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = PypiEcosystem::new(cache);
 
-        let resolved = parse_result_with_dependency("mypkg", DependencySource::Registry);
-        assert_matches!(
-            resolve_completion_source(&resolved, &pkg("mypkg")),
-            CompletionSource::Resolved(DependencySource::Registry)
-        );
+        let mut registry_dep =
+            parse_result_with_dependency("shared-name", DependencySource::Registry)
+                .dependencies
+                .remove(0);
+        registry_dep.name_range = Range::new(Position::new(0, 0), Position::new(0, 0));
+        registry_dep.version_range = Some(Range::new(Position::new(0, 0), Position::new(0, 10)));
 
-        let ambiguous = crate::parser::ParseResult {
-            dependencies: vec![
-                parse_result_with_dependency("mypkg", DependencySource::Registry).dependencies[0]
-                    .clone(),
-                parse_result_with_dependency(
-                    "mypkg",
-                    DependencySource::AlternateRegistry {
-                        index: "https://a.example/simple".to_string(),
-                        mirrors_crates_io: false,
-                    },
-                )
-                .dependencies[0]
-                    .clone(),
-            ],
+        let mut alternate_dep = parse_result_with_dependency(
+            "shared-name",
+            DependencySource::AlternateRegistry {
+                index: "pypi-chain:never-registered".to_string(),
+                mirrors_crates_io: false,
+            },
+        )
+        .dependencies
+        .remove(0);
+        alternate_dep.name_range = Range::new(Position::new(1, 0), Position::new(1, 0));
+        alternate_dep.version_range = Some(Range::new(Position::new(1, 0), Position::new(1, 10)));
+        let alternate_position = alternate_dep.version_range.unwrap().start;
+
+        let parse_result = crate::parser::ParseResult {
+            dependencies: vec![registry_dep, alternate_dep],
             workspace_root: None,
             uri: deps_core::test_util::test_uri("/test/requirements.txt"),
             document_links: Vec::new(),
             resolved_chains: Vec::new(),
         };
-        assert_matches!(
-            resolve_completion_source(&ambiguous, &pkg("mypkg")),
-            CompletionSource::Ambiguous
+
+        // The alternate occurrence resolves deterministically without network: its chain was
+        // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
+        // call — proving its own source, not the co-occurring `Registry`-sourced entry, drove
+        // the routing.
+        let results = ecosystem
+            .complete_versions(
+                &parse_result,
+                alternate_position,
+                "1",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(
+            results.is_empty(),
+            "unregistered alternate chain must offer no completions"
         );
     }
 
@@ -1257,10 +1212,11 @@ mod tests {
         let ecosystem = PypiEcosystem::new(cache);
 
         // Test that we respect the 20 result limit
+        let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("requests"),
+                &parse_result,
+                DEP_POSITION,
                 "2",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1528,12 +1484,14 @@ dependencies = []
     async fn test_complete_versions_empty_prefix() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
+        let parse_result =
+            parse_result_with_dependency("nonexistent-package", DependencySource::Registry);
 
         // Empty prefix should show non-yanked versions (up to 20)
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("nonexistent-package"),
+                &parse_result,
+                DEP_POSITION,
                 "",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1546,12 +1504,14 @@ dependencies = []
     async fn test_complete_versions_with_tilde_operator() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
+        let parse_result =
+            parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
 
         // Test PEP 440 operators are stripped correctly
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("nonexistent-pkg"),
+                &parse_result,
+                DEP_POSITION,
                 "~=2.0",
                 deps_core::FreshnessSettings::default(),
             )
@@ -1563,12 +1523,14 @@ dependencies = []
     async fn test_complete_versions_with_not_equal_operator() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = PypiEcosystem::new(cache);
+        let parse_result =
+            parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
 
         // Test != operator stripping
         let results = ecosystem
             .complete_versions(
-                &empty_parse_result(),
-                &pkg("nonexistent-pkg"),
+                &parse_result,
+                DEP_POSITION,
                 "!=2.0",
                 deps_core::FreshnessSettings::default(),
             )
