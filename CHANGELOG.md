@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-go**: `has_goprivate()` now reflects whether a usable (compiled) `GOPRIVATE` matcher exists, instead of true whenever any raw pattern was declared — even a rejected one (resolves #566) (#567)
 - **deps-go**: a malformed `GOPRIVATE` pattern (unterminated `[` character class) now logs a `tracing::warn!`, matching the existing oversized-pattern warning instead of silently never matching (resolves #568)
 - **deps-go**: a `GOPRIVATE` character-class range with reversed bounds (e.g. `[c-a]`) now logs a `tracing::warn!` instead of silently compiling as an always-empty range with no observability, and `\`-escapes (`\]`, `\-`, `\\`) inside a character class now parse correctly instead of being misread as literal range bounds or terminating the class early (resolves #570)
+- **deps-nuget**: a NuGet source that fails closed on credential binding now logs the source key, reason, and specific cause (debounced per config state, debug/warn severity matching the existing convention), instead of silently dropping the dependency with no observability (resolves #576)
 
 ### Changed
 - **deps-nuget**: `NuGetSourceChain.hops`/`NuGetRegistry::with_base` now carry per-hop credential/slot data (`ResolvedHop`) instead of a bare feed URL; `deps_lsp::register_ecosystems` now takes an `&EcosystemRuntime` instead of a bare `Arc<RegistryAccessPolicy>` — both breaking, pre-1.0, no alias (#572)

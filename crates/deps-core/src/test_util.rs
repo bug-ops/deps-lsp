@@ -251,26 +251,34 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
 }
 
 #[cfg(feature = "test-util")]
-fn capturing_subscriber() -> (CapturingWriter, impl tracing::Subscriber) {
+fn capturing_subscriber_at(
+    max_level: tracing::Level,
+) -> (CapturingWriter, impl tracing::Subscriber) {
     let writer = CapturingWriter::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer.clone())
-        // INFO (not WARN): some call sites emit `tracing::info!` (e.g. deps-swift's
-        // release-dates token-gate skip) that a WARN-only filter would silently drop,
-        // alongside every `warn_rejected_value`/other WARN-level emission this helper
-        // exists to assert on.
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(max_level)
         .without_time()
         .with_target(false)
         .finish();
     (writer, subscriber)
 }
 
+#[cfg(feature = "test-util")]
+fn capturing_subscriber() -> (CapturingWriter, impl tracing::Subscriber) {
+    // INFO (not WARN): some call sites emit `tracing::info!` (e.g. deps-swift's
+    // release-dates token-gate skip) that a WARN-only filter would silently drop,
+    // alongside every `warn_rejected_value`/other WARN-level emission this helper
+    // exists to assert on.
+    capturing_subscriber_at(tracing::Level::INFO)
+}
+
 /// Captures `tracing` output emitted synchronously during `f` into a `String`.
 ///
 /// Lets a test assert a `tracing::warn!`/`info!` call actually fired — e.g.
 /// [`crate::lsp_helpers::warn_rejected_value`] — without a real logging sink or a
-/// network-dependent end-to-end path.
+/// network-dependent end-to-end path. Filters below `INFO`, so a `tracing::debug!`/`trace!`
+/// emission never appears here — use [`capture_tracing_output_at`] for those.
 ///
 /// # Examples
 ///
@@ -284,6 +292,31 @@ fn capturing_subscriber() -> (CapturingWriter, impl tracing::Subscriber) {
 #[must_use]
 pub fn capture_tracing_output(f: impl FnOnce()) -> String {
     let (writer, subscriber) = capturing_subscriber();
+    tracing::subscriber::with_default(subscriber, f);
+    String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
+}
+
+/// Like [`capture_tracing_output`], but capturing every level up to and including `max_level`
+/// (e.g. `tracing::Level::DEBUG`).
+///
+/// Needed to positively assert a `tracing::debug!` line fired, or that a `tracing::warn!`
+/// specifically (as opposed to any level) did not — [`capture_tracing_output`]'s fixed `INFO`
+/// filter makes both assertions vacuous, since a `debug!` call is invisible there regardless of
+/// whether the code under test emits it correctly.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::capture_tracing_output_at;
+///
+/// let output =
+///     capture_tracing_output_at(tracing::Level::DEBUG, || tracing::debug!("quiet detail"));
+/// assert!(output.contains("quiet detail"));
+/// ```
+#[cfg(feature = "test-util")]
+#[must_use]
+pub fn capture_tracing_output_at(max_level: tracing::Level, f: impl FnOnce()) -> String {
+    let (writer, subscriber) = capturing_subscriber_at(max_level);
     tracing::subscriber::with_default(subscriber, f);
     String::from_utf8(writer.0.lock().unwrap().clone()).expect("tracing output is valid utf8")
 }
