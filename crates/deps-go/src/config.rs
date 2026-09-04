@@ -29,8 +29,6 @@
 //! See `specs/034-go-goproxy-private-registry/spec.md` FR-001–FR-016 for the design this module
 //! implements.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -164,7 +162,7 @@ fn parse_hop(raw: &str, policy: &RegistryAccessPolicy) -> Result<GoProxyHop, Inv
 /// semantics — this crate's `,`-and-`|`-both-fall-through-on-not-found first cut collapsed
 /// that distinction; see [`GoRegistry::get_versions_chained`](crate::registry::GoRegistry)
 /// (registry.rs) for where this is consulted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainSeparator {
     /// `,`: fall through to the next hop only on an explicit not-found response (`404`/`410`)
     /// — a transport failure (timeout, connection error, 5xx) is terminal for the whole
@@ -174,13 +172,25 @@ pub enum ChainSeparator {
     AnyError,
 }
 
+impl ChainSeparator {
+    /// Stable string form for [`GoProxyChain::keyed`]'s hash — deliberately independent of
+    /// [`Debug`](std::fmt::Debug)/the variant name, so renaming a variant (a cosmetic,
+    /// no-compiler-signal change) never silently changes every `go-proxy` chain key.
+    const fn as_key_str(self) -> &'static str {
+        match self {
+            Self::NotFoundOnly => "not-found-only",
+            Self::AnyError => "any-error",
+        }
+    }
+}
+
 /// One fully-resolved, ready-to-register `GOPROXY` chain — produced by
 /// [`GoEnvConfig::goproxy_chain`], consumed by `GoRegistry::register_chain`.
 #[derive(Debug, Clone, Default)]
 pub struct GoProxyChain {
     /// Opaque, composite identity — becomes both the router's `alternates` map key and the
-    /// `DependencySource::AlternateRegistry.index` value. A hashed token
-    /// (`format!("go-proxy:{:016x}", digest)`) over the ordered hop values, mirroring
+    /// `DependencySource::AlternateRegistry.index` value. A hashed token produced by
+    /// [`deps_core::hash_routing_key`] (`"go-proxy"`) over the ordered hop values, mirroring
     /// `deps_pypi::config::ResolvedChain::key`'s "opaque routing key" widening of
     /// `AlternateRegistry.index`'s contract.
     pub key: String,
@@ -201,19 +211,15 @@ pub struct GoProxyChain {
 
 impl GoProxyChain {
     fn keyed(hops: Vec<GoProxyHop>, separators: Vec<ChainSeparator>) -> Self {
-        let mut hasher = DefaultHasher::new();
-        for hop in &hops {
-            match hop {
-                GoProxyHop::Url(url) => url.as_str().hash(&mut hasher),
-                GoProxyHop::Direct => "direct".hash(&mut hasher),
-                GoProxyHop::Off => "off".hash(&mut hasher),
-            }
-        }
-        for sep in &separators {
-            sep.hash(&mut hasher);
-        }
+        let hop_parts = hops.iter().map(|hop| match hop {
+            GoProxyHop::Url(url) => url.as_str(),
+            GoProxyHop::Direct => "direct",
+            GoProxyHop::Off => "off",
+        });
+        let sep_parts = separators.iter().map(|sep| sep.as_key_str());
+        let key = deps_core::hash_routing_key("go-proxy", hop_parts.chain(sep_parts));
         Self {
-            key: format!("go-proxy:{:016x}", hasher.finish()),
+            key,
             hops,
             separators,
         }

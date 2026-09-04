@@ -32,7 +32,6 @@
 //! implements.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
 use deps_core::net_policy::{
     PolicyGate, RegistryAccessPolicy, redact_userinfo, validate_index_url,
@@ -143,9 +142,8 @@ pub struct ResolvedChain {
     /// `DependencySource::AlternateRegistry.index` value for a plain (non-named-source)
     /// dependency.
     ///
-    /// For a primary/extras chain (case a/b): an opaque, single-line hashed token —
-    /// `format!("pypi-chain:{:016x}", digest)`, `digest` from
-    /// [`std::collections::hash_map::DefaultHasher`] over the ordered hop strings plus the
+    /// For a primary/extras chain (case a/b): an opaque, single-line hashed token produced by
+    /// [`deps_core::hash_routing_key`] (`"pypi-chain"`) over the ordered hop strings plus the
     /// [`Self::implicit_public_fallback`] flag — **never** a newline-joined or otherwise
     /// URL-shaped value: `deps-core`'s `AlternateRegistry.index` doc describes this field as
     /// "the resolved index URL" for Cargo/npm, and a value that merely *looks* like a URL
@@ -170,13 +168,19 @@ pub struct ResolvedChain {
 
 impl ResolvedChain {
     fn chain(hops: Vec<PypiIndexUrl>, implicit_public_fallback: bool) -> Self {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for hop in &hops {
-            hop.as_str().hash(&mut hasher);
-        }
-        implicit_public_fallback.hash(&mut hasher);
+        let flag = if implicit_public_fallback {
+            "true"
+        } else {
+            "false"
+        };
+        let key = deps_core::hash_routing_key(
+            "pypi-chain",
+            hops.iter()
+                .map(PypiIndexUrl::as_str)
+                .chain(std::iter::once(flag)),
+        );
         Self {
-            key: format!("pypi-chain:{:016x}", hasher.finish()),
+            key,
             hops,
             implicit_public_fallback,
         }
