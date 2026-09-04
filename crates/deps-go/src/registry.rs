@@ -25,8 +25,11 @@
 //! }
 //! ```
 
+use crate::config::{ChainSeparator, GoProxyChain, GoProxyHop, GoProxyUrl};
 use crate::types::GoVersion;
 use crate::version::{escape_module_path, escape_version, is_pseudo_version};
+use dashmap::DashMap;
+use deps_core::parser::DependencySource;
 use deps_core::{DepsError, HttpCache, Result, is_dot_segment, lsp_helpers::warn_rejected_value};
 use serde::Deserialize;
 use std::any::Any;
@@ -40,6 +43,33 @@ pub const REGISTRY: &str = "Go proxy";
 
 /// Base URL for Go package documentation
 pub const PKG_GO_DEV_URL: &str = "https://pkg.go.dev";
+
+/// Upper bound on [`GoRegistry::alternates`]' entry count. Generous for any realistic
+/// project's `$GOENV` configuration, exists only to keep this map — keyed by
+/// process-config-controlled chain identities — from growing unbounded for the process
+/// lifetime. Mirrors `deps-pypi`/`deps-npm`'s identical cap. Once at capacity, a *new* chain
+/// is simply never registered (see [`GoRegistry::register_chain`]) — a dependency resolved to
+/// an unregistered chain degrades to [`DepsError::PackageNotFound`], never to a
+/// `proxy.golang.org` lookup by name (spec FR-009/FR-013).
+const MAX_ALTERNATE_REGISTRIES: usize = 256;
+
+/// Which transport/behavior a [`GoRegistry`] instance uses (spec 034 FR-004/FR-006/FR-011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoRegistryTier {
+    /// `proxy.golang.org` (or a test override) — `HttpCache::get_cached`, today's path,
+    /// unchanged, never subject to `registries.workspace_registries` (FR-011).
+    Public,
+    /// A `$GOENV`-declared `GOPROXY` hop — `HttpCache::get_cached_workspace`, so every
+    /// redirect hop is re-classified against the live
+    /// [`deps_core::net_policy::RegistryAccessPolicy`] (mirrors `deps-pypi`/`deps-npm`'s
+    /// identical `WorkspaceDeclared` routing).
+    WorkspaceDeclared,
+    /// A [`GoProxyHop::Direct`]/[`GoProxyHop::Off`] sentinel (FR-004/FR-006) — every inherent
+    /// fetch method short-circuits to [`DepsError::PackageNotFound`] before building any URL
+    /// or issuing any request. Both sentinels are observably identical: phase 1 has no
+    /// direct-VCS resolution mechanism, and `off` disallows downloads outright.
+    Terminal,
+}
 
 /// Maximum allowed module path length to prevent DoS
 const MAX_MODULE_PATH_LENGTH: usize = 500;
@@ -88,12 +118,14 @@ pub(crate) fn validate_module_path(module_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Builds the Go module proxy request URL for a module's version list. Callers must run
-/// [`validate_module_path`] first — `escape_module_path` passes `.`/`/` through unescaped by
-/// design, so a `.`/`..` path segment reaches this unfiltered.
-fn versions_list_url(module_path: &str) -> String {
+/// Builds the Go module proxy request URL for a module's version list, against `base`
+/// (`PROXY_BASE` for the public root; a resolved `$GOENV`-declared `GOPROXY` hop's own URL
+/// otherwise — spec 034 FR-013). Callers must run [`validate_module_path`] first —
+/// `escape_module_path` passes `.`/`/` through unescaped by design, so a `.`/`..` path
+/// segment reaches this unfiltered.
+fn versions_list_url_at(base: &str, module_path: &str) -> String {
     let escaped = escape_module_path(module_path);
-    format!("{PROXY_BASE}/{escaped}/@v/list")
+    format!("{base}/{escaped}/@v/list")
 }
 
 /// Validates a version string for length and basic format.
@@ -153,16 +185,29 @@ pub fn package_url(module_path: &str) -> String {
 /// `escape_version` respectively before interpolation, so a version string
 /// carrying `?`, `#`, or whitespace cannot retarget the request to a
 /// different endpoint or inject a query string / fragment (#377).
-fn version_url(module_path: &str, version: &str, suffix: &str) -> String {
+fn version_url_at(base: &str, module_path: &str, version: &str, suffix: &str) -> String {
     let escaped_module = escape_module_path(module_path);
     let escaped_version = escape_version(version);
-    format!("{PROXY_BASE}/{escaped_module}/@v/{escaped_version}.{suffix}")
+    format!("{base}/{escaped_module}/@v/{escaped_version}.{suffix}")
 }
 
-/// Converts a 404 response into `DepsError::PackageNotFound`, passing through
-/// any other error unchanged.
+/// Converts a `404`/`410` response into `DepsError::PackageNotFound`, passing through any
+/// other error unchanged.
+///
+/// `410 Gone` is included alongside `404` (spec 034 C1): the Go toolchain's own module-proxy
+/// client (`cmd/go/internal/web/api.go`) treats both as "module/version not found", and
+/// Athens/JFrog Artifactory/Sonatype Nexus/GitLab's Go proxy implementations — the exact
+/// `GOPROXY` chain hops this feature targets — return `410` for an absent module. Missing this
+/// left a real `410` response falling into `get_versions_chained`'s transport-failure arm,
+/// halting chain resolution instead of falling through to the next hop (FR-005).
 fn not_found_or(err: DepsError, module_path: &str) -> DepsError {
-    if matches!(err, DepsError::HttpStatus { status: 404, .. }) {
+    if matches!(
+        err,
+        DepsError::HttpStatus {
+            status: 404 | 410,
+            ..
+        }
+    ) {
         DepsError::PackageNotFound {
             package: module_path.to_string(),
             registry: REGISTRY,
@@ -179,12 +224,231 @@ fn not_found_or(err: DepsError, module_path: &str) -> DepsError {
 #[derive(Clone)]
 pub struct GoRegistry {
     cache: Arc<HttpCache>,
+    /// Version-fetch base for **this client's own hop** — `PROXY_BASE` for the public root; a
+    /// resolved [`GoProxyUrl`]'s own URL for a `$GOENV`-declared `GOPROXY` hop; unused
+    /// (never reached — every fetch short-circuits first) for a `Terminal`-tier client.
+    proxy_base: String,
+    /// Which transport/behavior this client uses (spec 034 FR-004/FR-006/FR-011).
+    tier: GoRegistryTier,
+    /// Resolved chain-router clients, keyed by [`GoProxyChain::key`] (a `GOPROXY` chain) or
+    /// [`crate::config::GOPRIVATE_CHAIN_KEY`] (the `GOPRIVATE`-bypass chain). Only the root
+    /// (`Public`-tier) instance this crate constructs via [`Self::new`] ever registers into
+    /// this or is ever looked up by [`Self::alternate_client`] — a chain-hop leaf's own map is
+    /// always empty by construction, mirroring `deps-pypi`'s identical `alternates` invariant.
+    alternates: Arc<DashMap<String, Arc<Self>>>,
+    /// Resolved, already-constructed hop clients this instance falls through to when it (hop
+    /// 0) misses (spec FR-005), each paired with the [`ChainSeparator`] governing the
+    /// transition *into* it (spec 034 S2 — `,` = fall through only on not-found, `|` = fall
+    /// through on any error). Empty for the `Public`-tier root and every leaf hop — populated
+    /// only on the *head* client [`Self::register_chain`] builds for a multi-hop chain.
+    fallback_chain: Vec<(ChainSeparator, Arc<Self>)>,
 }
 
 impl GoRegistry {
     /// Creates a new Go registry client with the given HTTP cache.
-    pub const fn new(cache: Arc<HttpCache>) -> Self {
-        Self { cache }
+    pub fn new(cache: Arc<HttpCache>) -> Self {
+        Self {
+            cache,
+            proxy_base: PROXY_BASE.to_string(),
+            tier: GoRegistryTier::Public,
+            alternates: Arc::new(DashMap::new()),
+            fallback_chain: Vec::new(),
+        }
+    }
+
+    /// Creates a [`GoRegistry`] client for one resolved `$GOENV`-declared `GOPROXY` hop —
+    /// `WorkspaceDeclared`-tier so it fetches through `HttpCache::get_cached_workspace`
+    /// (FR-011's redirect-hop gating) instead of the ungated public transport.
+    ///
+    /// `fallback_chain` is empty for every call except the *head* client
+    /// [`Self::register_chain`] builds for a multi-hop chain — every other hop is a leaf with
+    /// nothing further to fall through to, matching `deps-pypi`'s identical design.
+    #[must_use]
+    fn with_base(
+        cache: Arc<HttpCache>,
+        url: &GoProxyUrl,
+        fallback_chain: Vec<(ChainSeparator, Arc<Self>)>,
+    ) -> Self {
+        Self {
+            cache,
+            proxy_base: url.as_str().to_string(),
+            tier: GoRegistryTier::WorkspaceDeclared,
+            alternates: Arc::new(DashMap::new()),
+            fallback_chain,
+        }
+    }
+
+    /// Creates a `Terminal`-tier client (spec FR-004/FR-006) for a
+    /// [`GoProxyHop::Direct`]/[`GoProxyHop::Off`] chain entry — every inherent fetch method
+    /// short-circuits to [`DepsError::PackageNotFound`] before ever building a URL, so
+    /// `proxy_base` is left empty (never read).
+    #[must_use]
+    fn terminal(cache: Arc<HttpCache>, fallback_chain: Vec<(ChainSeparator, Arc<Self>)>) -> Self {
+        Self {
+            cache,
+            proxy_base: String::new(),
+            tier: GoRegistryTier::Terminal,
+            alternates: Arc::new(DashMap::new()),
+            fallback_chain,
+        }
+    }
+
+    /// Builds the client for one [`GoProxyHop`] — a leaf with an empty `fallback_chain`,
+    /// shared by [`Self::register_chain`] for every hop after the first.
+    fn hop_client(cache: &Arc<HttpCache>, hop: &GoProxyHop) -> Arc<Self> {
+        Arc::new(match hop {
+            GoProxyHop::Url(url) => Self::with_base(Arc::clone(cache), url, Vec::new()),
+            GoProxyHop::Direct | GoProxyHop::Off => Self::terminal(Arc::clone(cache), Vec::new()),
+        })
+    }
+
+    /// Builds the full hop chain for one [`GoProxyChain`] and inserts the head into
+    /// `root.alternates` under `chain.key`. Idempotent per key (a repeat registration for the
+    /// same key is a no-op), capacity-capped at `MAX_ALTERNATE_REGISTRIES`. Mirrors
+    /// `deps_pypi::PypiRegistry::register_chain` exactly in shape.
+    pub fn register_chain(root: &Arc<Self>, chain: &GoProxyChain) {
+        let Some((first_hop, rest_hops)) = chain.hops.split_first() else {
+            // Defensive: `GoEnvConfig::resolved_chains` never produces an empty-hop chain.
+            return;
+        };
+
+        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds a
+        // write guard on one — checking capacity from inside the `Vacant` arm would
+        // self-deadlock on that shard.
+        let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
+
+        if let dashmap::mapref::entry::Entry::Vacant(slot) =
+            root.alternates.entry(chain.key.clone())
+        {
+            if at_capacity {
+                tracing::warn!(
+                    key = %chain.key,
+                    cap = MAX_ALTERNATE_REGISTRIES,
+                    "Go alternate proxy cap reached; not registering a new chain"
+                );
+                return;
+            }
+
+            // `chain.separators[i]` is the separator between `hops[i]` and `hops[i + 1]`
+            // (spec 034 S2); `rest_hops[i]` is `hops[i + 1]`, so both are indexed by `i`
+            // here. A shorter/empty `separators` (every hand-built test chain, and the
+            // single-hop `GOPRIVATE` chain) defaults every transition to `NotFoundOnly`.
+            let fallback_chain: Vec<(ChainSeparator, Arc<Self>)> = rest_hops
+                .iter()
+                .enumerate()
+                .map(|(i, hop)| {
+                    let sep = chain
+                        .separators
+                        .get(i)
+                        .copied()
+                        .unwrap_or(ChainSeparator::NotFoundOnly);
+                    (sep, Self::hop_client(&root.cache, hop))
+                })
+                .collect();
+
+            let head = match first_hop {
+                GoProxyHop::Url(url) => {
+                    Self::with_base(Arc::clone(&root.cache), url, fallback_chain)
+                }
+                GoProxyHop::Direct | GoProxyHop::Off => {
+                    Self::terminal(Arc::clone(&root.cache), fallback_chain)
+                }
+            };
+            slot.insert(Arc::new(head));
+        }
+    }
+
+    /// The registered client for `index` (a [`GoProxyChain::key`] or
+    /// [`crate::config::GOPRIVATE_CHAIN_KEY`]), if any — read-only, performs no registration,
+    /// no validation.
+    ///
+    /// Only ever meaningful on the **root**: a chain-hop leaf's own `alternates` map is
+    /// always empty by construction (`Self::with_base`/`Self::terminal` never populate
+    /// it).
+    #[must_use]
+    pub fn alternate_client(&self, index: &str) -> Option<Arc<Self>> {
+        self.alternates.get(index).map(|entry| Arc::clone(&entry))
+    }
+
+    /// S3 (spec 034 review): tries `/@latest` first — mirrors the public-path
+    /// `Registry::get_latest_matching` fast path — falling back to `/@v/list` on an `/@latest`
+    /// miss. `/@v/list` alone is incomplete for an untagged/pseudo-version-only module (#364);
+    /// a chain hop that only ever tried `/@v/list` silently lost version data for that case.
+    async fn get_versions_with_latest_fallback(&self, module_path: &str) -> Result<Vec<GoVersion>> {
+        if let Ok(latest) = self.get_latest(module_path).await {
+            return Ok(vec![latest]);
+        }
+        self.get_versions(module_path).await
+    }
+
+    /// FR-005/NFR-006: tries `self` (hop 0) first, then each already-resolved
+    /// `Self::fallback_chain` entry in order (each via
+    /// [`Self::get_versions_with_latest_fallback`], S3). A [`GoProxyHop::Direct`]/
+    /// [`GoProxyHop::Off`] hop's `Terminal`-tier fetch always returns `PackageNotFound` with
+    /// no network request, which this loop treats the same as an ordinary not-found response
+    /// and falls through past — implementing FR-005's "explicit not-found continues to the
+    /// next hop" rule uniformly for a proxy 404/410 and for reaching a terminal sentinel
+    /// (US-003).
+    ///
+    /// A transport failure (connection error, timeout, 5xx) on a hop is terminal for the
+    /// whole chain **unless** the [`ChainSeparator`] governing the transition to the next hop
+    /// is [`ChainSeparator::AnyError`] (spec 034 S2, the `|`-separator case) — mirrors
+    /// `deps-pypi`'s identical FR-005(c) trade-off for the default `,`-separated case:
+    /// silently falling through on transport failure risks resolving a module through a
+    /// fallback the user did not intend for the reachability state they are actually in.
+    async fn get_versions_chained(&self, module_path: &str) -> Result<Vec<GoVersion>> {
+        let mut last_miss: Result<Vec<GoVersion>> = Err(DepsError::PackageNotFound {
+            package: module_path.to_string(),
+            registry: REGISTRY,
+        });
+
+        // `next_seps[k]` is the separator governing hop `k`'s fallback to hop `k + 1` — `None`
+        // past the last hop (nothing to fall through to, so any error there is unconditionally
+        // terminal regardless of separator).
+        let hops: Vec<&Self> = std::iter::once(self)
+            .chain(self.fallback_chain.iter().map(|(_, hop)| hop.as_ref()))
+            .collect();
+        let next_seps: Vec<Option<ChainSeparator>> = self
+            .fallback_chain
+            .iter()
+            .map(|(sep, _)| Some(*sep))
+            .chain(std::iter::once(None))
+            .collect();
+
+        for (hop, next_sep) in hops.iter().zip(next_seps.iter()) {
+            match hop.get_versions_with_latest_fallback(module_path).await {
+                Ok(versions) if !versions.is_empty() => return Ok(versions),
+                Ok(empty) => last_miss = Ok(empty),
+                Err(DepsError::PackageNotFound { .. }) => {
+                    last_miss = Err(DepsError::PackageNotFound {
+                        package: module_path.to_string(),
+                        registry: REGISTRY,
+                    });
+                }
+                Err(other) => match next_sep {
+                    Some(ChainSeparator::AnyError) => {
+                        tracing::warn!(
+                            module = module_path,
+                            error = %other,
+                            "Go alternate-proxy chain hop failed, but the `|` separator \
+                             tolerates any error; falling through to the next hop"
+                        );
+                        last_miss = Err(other);
+                    }
+                    _ => {
+                        tracing::warn!(
+                            module = module_path,
+                            error = %other,
+                            "Go alternate-proxy chain resolution halted on a transport error — \
+                             not falling back to proxy.golang.org or the next configured hop"
+                        );
+                        return Err(DepsError::ChainResolutionHalted);
+                    }
+                },
+            }
+        }
+
+        last_miss
     }
 
     /// Fetches all versions for a module from the `/@v/list` endpoint.
@@ -215,15 +479,22 @@ impl GoRegistry {
     /// # }
     /// ```
     pub async fn get_versions(&self, module_path: &str) -> Result<Vec<GoVersion>> {
+        if self.tier == GoRegistryTier::Terminal {
+            return Err(DepsError::PackageNotFound {
+                package: module_path.to_string(),
+                registry: REGISTRY,
+            });
+        }
         validate_module_path(module_path)?;
 
-        let url = versions_list_url(module_path);
+        let url = versions_list_url_at(&self.proxy_base, module_path);
 
-        let data = self
-            .cache
-            .get_cached(&url)
-            .await
-            .map_err(|e| not_found_or(e, module_path))?;
+        let data = match self.tier {
+            GoRegistryTier::Public => self.cache.get_cached(&url).await,
+            GoRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await,
+            GoRegistryTier::Terminal => unreachable!("short-circuited above"),
+        }
+        .map_err(|e| not_found_or(e, module_path))?;
 
         parse_version_list(&data)
     }
@@ -255,16 +526,23 @@ impl GoRegistry {
     /// # }
     /// ```
     pub async fn get_version_info(&self, module_path: &str, version: &str) -> Result<GoVersion> {
+        if self.tier == GoRegistryTier::Terminal {
+            return Err(DepsError::PackageNotFound {
+                package: module_path.to_string(),
+                registry: REGISTRY,
+            });
+        }
         validate_module_path(module_path)?;
         validate_version_string(version)?;
 
-        let url = version_url(module_path, version, "info");
+        let url = version_url_at(&self.proxy_base, module_path, version, "info");
 
-        let data = self
-            .cache
-            .get_cached(&url)
-            .await
-            .map_err(|e| not_found_or(e, module_path))?;
+        let data = match self.tier {
+            GoRegistryTier::Public => self.cache.get_cached(&url).await,
+            GoRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await,
+            GoRegistryTier::Terminal => unreachable!("short-circuited above"),
+        }
+        .map_err(|e| not_found_or(e, module_path))?;
 
         parse_version_info(module_path, &data)
     }
@@ -296,16 +574,23 @@ impl GoRegistry {
     /// # }
     /// ```
     pub async fn get_latest(&self, module_path: &str) -> Result<GoVersion> {
+        if self.tier == GoRegistryTier::Terminal {
+            return Err(DepsError::PackageNotFound {
+                package: module_path.to_string(),
+                registry: REGISTRY,
+            });
+        }
         validate_module_path(module_path)?;
 
         let escaped = escape_module_path(module_path);
-        let url = format!("{PROXY_BASE}/{escaped}/@latest");
+        let url = format!("{}/{escaped}/@latest", self.proxy_base);
 
-        let data = self
-            .cache
-            .get_cached(&url)
-            .await
-            .map_err(|e| not_found_or(e, module_path))?;
+        let data = match self.tier {
+            GoRegistryTier::Public => self.cache.get_cached(&url).await,
+            GoRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await,
+            GoRegistryTier::Terminal => unreachable!("short-circuited above"),
+        }
+        .map_err(|e| not_found_or(e, module_path))?;
 
         parse_version_info(module_path, &data)
     }
@@ -337,16 +622,23 @@ impl GoRegistry {
     /// # }
     /// ```
     pub async fn get_go_mod(&self, module_path: &str, version: &str) -> Result<String> {
+        if self.tier == GoRegistryTier::Terminal {
+            return Err(DepsError::PackageNotFound {
+                package: module_path.to_string(),
+                registry: REGISTRY,
+            });
+        }
         validate_module_path(module_path)?;
         validate_version_string(version)?;
 
-        let url = version_url(module_path, version, "mod");
+        let url = version_url_at(&self.proxy_base, module_path, version, "mod");
 
-        let data = self
-            .cache
-            .get_cached(&url)
-            .await
-            .map_err(|e| not_found_or(e, module_path))?;
+        let data = match self.tier {
+            GoRegistryTier::Public => self.cache.get_cached(&url).await,
+            GoRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await,
+            GoRegistryTier::Terminal => unreachable!("short-circuited above"),
+        }
+        .map_err(|e| not_found_or(e, module_path))?;
 
         std::str::from_utf8(&data)
             .map(std::string::ToString::to_string)
@@ -468,6 +760,90 @@ impl deps_core::Registry for GoRegistry {
             let versions = self.get_versions(name.as_str()).await?;
             let latest = versions.into_iter().find(|v| !v.is_pseudo && !v.retracted);
             Ok(latest.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
+    }
+
+    /// Dispatches by `source` (spec 034 FR-013): an `AlternateRegistry` whose index has a
+    /// registered client routes through `GoRegistry::get_versions_chained` (FR-005's chain
+    /// walk); one with **no** registered client is `PackageNotFound`, never a fall back to
+    /// `proxy.golang.org` (Go always sets `mirrors_crates_io: false`, so Cargo's
+    /// mirror-degradation arm is dead here and must not be written — falling back would send
+    /// a private module path to the public proxy, the exact class of leak FR-008/FR-009
+    /// close). Every other source keeps today's public-registry path unchanged.
+    fn get_versions_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        freshness: deps_core::FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Version>>>>
+    {
+        Box::pin(async move {
+            match source {
+                DependencySource::AlternateRegistry { index, .. } => {
+                    match self.alternate_client(index) {
+                        Some(client) => {
+                            let versions = client.get_versions_chained(name.as_str()).await?;
+                            Ok(versions
+                                .into_iter()
+                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                                .collect())
+                        }
+                        None => Err(DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "alternate registry (not registered)",
+                        }),
+                    }
+                }
+                _ => deps_core::Registry::get_versions_with(self, name, freshness).await,
+            }
+        })
+    }
+
+    /// `get_versions_from`'s `get_latest_matching`-shaped counterpart — same dispatch, same
+    /// "never fall back to `proxy.golang.org` for an unregistered `AlternateRegistry`"
+    /// invariant. Derived from `GoRegistry::get_versions_chained` +
+    /// [`deps_core::Registry::select_latest_matching`] (mirrors `deps-pypi`'s identical
+    /// derivation) rather than an independent per-hop matching walk — the winning hop (first
+    /// hop with a non-empty version list) is selected once, and matching happens only within
+    /// that single hop's list. No `/@latest` fast path for a chain hop (unlike the plain
+    /// public-registry path below): phase 1 keeps this simple and correct rather than
+    /// optimizing an extra request off the private-proxy path.
+    fn get_latest_matching_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        req: &'a deps_core::VersionReq,
+        _minimum_stability: Option<&'a str>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn deps_core::Version>>>>
+    {
+        Box::pin(async move {
+            match source {
+                DependencySource::AlternateRegistry { index, .. } => {
+                    match self.alternate_client(index) {
+                        Some(client) => {
+                            let versions: Vec<Box<dyn deps_core::Version>> = client
+                                .get_versions_chained(name.as_str())
+                                .await?
+                                .into_iter()
+                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                                .collect();
+                            let idx = deps_core::Registry::select_latest_matching(
+                                client.as_ref(),
+                                &versions,
+                                req,
+                            );
+                            Ok(idx.and_then(|i| versions.into_iter().nth(i)))
+                        }
+                        None => Err(DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "alternate registry (not registered)",
+                        }),
+                    }
+                }
+                // Preserves the plain public-registry path's existing `/@latest`
+                // fast-path/`/@v/list`-fallback behavior unchanged (NFR-005).
+                _ => deps_core::Registry::get_latest_matching(self, name, req).await,
+            }
         })
     }
 
@@ -644,6 +1020,22 @@ mod tests {
         assert!(matches!(result, DepsError::HttpStatus { status: 500, .. }));
     }
 
+    /// C1: a `410 Gone` response (Athens/Artifactory/Nexus/GitLab's not-found status) maps to
+    /// `PackageNotFound` exactly like `404`, so FR-005's chain fallback fires for it too.
+    #[test]
+    fn test_not_found_or_maps_410_to_package_not_found() {
+        let err = DepsError::HttpStatus {
+            url: "https://goproxy.mycorp.example/github.com/x/y/@v/list".into(),
+            status: 410,
+        };
+        let result = not_found_or(err, "github.com/x/y");
+        assert!(matches!(
+            result,
+            DepsError::PackageNotFound { package, registry }
+                if package == "github.com/x/y" && registry == REGISTRY
+        ));
+    }
+
     #[test]
     fn test_package_url() {
         assert_eq!(
@@ -689,7 +1081,7 @@ mod tests {
     /// escaping from `version_url` would fail this test.
     #[test]
     fn test_info_url_construction_legitimate_version() {
-        let url = version_url("github.com/gin-gonic/gin", "v1.9.1", "info");
+        let url = version_url_at(PROXY_BASE, "github.com/gin-gonic/gin", "v1.9.1", "info");
         assert_eq!(
             url,
             "https://proxy.golang.org/github.com/gin-gonic/gin/@v/v1.9.1.info"
@@ -700,7 +1092,8 @@ mod tests {
     /// also pass through unescaped.
     #[test]
     fn test_info_url_construction_pseudo_version() {
-        let url = version_url(
+        let url = version_url_at(
+            PROXY_BASE,
             "github.com/user/repo",
             "v0.0.0-20210101000000-abcdef123456",
             "info",
@@ -727,7 +1120,7 @@ mod tests {
         ];
 
         for (raw_version, expected_escaped) in cases {
-            let url = version_url("github.com/gin-gonic/gin", raw_version, "info");
+            let url = version_url_at(PROXY_BASE, "github.com/gin-gonic/gin", raw_version, "info");
             let expected_url = format!(
                 "https://proxy.golang.org/github.com/gin-gonic/gin/@v/{expected_escaped}.info"
             );
@@ -756,7 +1149,7 @@ mod tests {
     /// Same construction proof for `get_go_mod`'s `.mod` URL via `version_url`.
     #[test]
     fn test_mod_url_construction_legitimate_version() {
-        let url = version_url("github.com/gin-gonic/gin", "v1.9.1", "mod");
+        let url = version_url_at(PROXY_BASE, "github.com/gin-gonic/gin", "v1.9.1", "mod");
         assert_eq!(
             url,
             "https://proxy.golang.org/github.com/gin-gonic/gin/@v/v1.9.1.mod"
@@ -775,7 +1168,7 @@ mod tests {
         ];
 
         for (raw_version, expected_escaped) in cases {
-            let url = version_url("github.com/gin-gonic/gin", raw_version, "mod");
+            let url = version_url_at(PROXY_BASE, "github.com/gin-gonic/gin", raw_version, "mod");
             let expected_url = format!(
                 "https://proxy.golang.org/github.com/gin-gonic/gin/@v/{expected_escaped}.mod"
             );
@@ -794,7 +1187,7 @@ mod tests {
     /// segment 404s against the real proxy (live-verified during review).
     #[test]
     fn test_info_url_construction_case_folds_uppercase_version() {
-        let url = version_url("github.com/user/repo", "v1.7.0-RC", "info");
+        let url = version_url_at(PROXY_BASE, "github.com/user/repo", "v1.7.0-RC", "info");
         assert_eq!(
             url,
             "https://proxy.golang.org/github.com/user/repo/@v/v1.7.0-!r!c.info"
@@ -979,7 +1372,7 @@ mod tests {
     /// once parsed, has escaped the module path segment entirely.
     #[test]
     fn test_versions_list_url_bare_dot_dot_normalizes_above_proxy_root() {
-        let url = versions_list_url("..");
+        let url = versions_list_url_at(PROXY_BASE, "..");
         let parsed = url::Url::parse(&url).unwrap();
         assert_eq!(parsed.path(), "/@v/list", "parsed path: {}", parsed.path());
     }
@@ -993,7 +1386,7 @@ mod tests {
             |seg| {
                 validate_module_path(seg)
                     .ok()
-                    .map(|()| versions_list_url(seg))
+                    .map(|()| versions_list_url_at(PROXY_BASE, seg))
             },
             "proxy.golang.org",
             "/",
@@ -1149,5 +1542,496 @@ mod tests {
             "Go must not fall through to rung 3; a non-empty all-prerelease list must \
              still yield None so the /@latest fallback fires"
         );
+    }
+
+    // --- spec 034: GOPROXY/GOPRIVATE chain routing ---
+
+    use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+
+    fn all_policy() -> RegistryAccessPolicy {
+        RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)
+    }
+
+    fn url_hop(raw: &str, policy: &RegistryAccessPolicy) -> GoProxyHop {
+        GoProxyHop::Url(GoProxyUrl::new(raw, policy).unwrap())
+    }
+
+    #[test]
+    fn test_register_chain_and_alternate_client_roundtrip() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop("https://goproxy.mycorp.example", &all_policy())],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+        assert!(root.alternate_client("go-proxy:test").is_some());
+        assert!(root.alternate_client("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_register_chain_idempotent() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop("https://goproxy.mycorp.example", &all_policy())],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+        let first = root.alternate_client("go-proxy:test").unwrap();
+        GoRegistry::register_chain(&root, &chain);
+        let second = root.alternate_client("go-proxy:test").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// US-001: a registered single-hop chain routes `get_versions_from` there instead of
+    /// `proxy.golang.org`.
+    #[tokio::test]
+    async fn test_get_versions_from_routes_to_registered_alternate() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut alt_server = mockito::Server::new_async().await;
+        alt_server
+            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop(&alt_server.url(), &policy)],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let versions = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    /// FR-005: a module absent from hop 0 (explicit not-found) falls through to hop 1.
+    #[tokio::test]
+    async fn test_get_versions_from_falls_through_on_not_found() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut hop0 = mockito::Server::new_async().await;
+        hop0.mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let versions = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    /// C1: a `410 Gone` not-found response (Athens/Artifactory/Nexus/GitLab's shape) falls
+    /// through to the next hop exactly like a `404` — the primary GOPROXY chain-fallback
+    /// scenario (US-001) against the real-world proxies this feature targets.
+    #[tokio::test]
+    async fn test_get_versions_from_falls_through_on_410() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut hop0 = mockito::Server::new_async().await;
+        hop0.mock("GET", mockito::Matcher::Any)
+            .with_status(410)
+            .create_async()
+            .await;
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let versions = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    /// FR-005: a transport failure (5xx) on hop 0 is terminal for the whole chain — never
+    /// silently falls through to hop 1.
+    #[tokio::test]
+    async fn test_get_versions_from_transport_failure_is_terminal() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut hop0 = mockito::Server::new_async().await;
+        hop0.mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .create_async()
+            .await;
+        let mut hop1 = mockito::Server::new_async().await;
+        let hop1_mock = hop1
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let result = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(DepsError::ChainResolutionHalted)));
+        hop1_mock.assert_async().await;
+    }
+
+    /// S2: with a `|`-separated chain, a transport failure (5xx) on hop 0 falls through to
+    /// hop 1 instead of halting — the opposite of the `,`-separated default tested above.
+    #[tokio::test]
+    async fn test_pipe_separator_falls_through_on_transport_failure() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut hop0 = mockito::Server::new_async().await;
+        hop0.mock("GET", mockito::Matcher::Any)
+            .with_status(500)
+            .create_async()
+            .await;
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop(&hop0.url(), &policy), url_hop(&hop1.url(), &policy)],
+            separators: vec![ChainSeparator::AnyError],
+        };
+        GoRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let versions = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+    }
+
+    /// S3: a chain hop whose `/@v/list` is empty (an untagged/pseudo-version-only module, the
+    /// same class of module #364 added the `/@latest` fallback for on the public path) still
+    /// yields version data via `/@latest`, instead of silently losing it.
+    #[tokio::test]
+    async fn test_chain_hop_falls_back_to_latest_when_list_is_empty() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut hop = mockito::Server::new_async().await;
+        hop.mock("GET", "/github.com/gin-gonic/gin/@latest")
+            .with_status(200)
+            .with_body(
+                r#"{"Version":"v0.0.0-20191109021931-daa7c04131f5","Time":"2019-11-09T02:19:31Z"}"#,
+            )
+            .create_async()
+            .await;
+        hop.mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop(&hop.url(), &policy)],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let versions = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(
+            versions[0].is_prerelease(),
+            "expected the pseudo-version from /@latest"
+        );
+    }
+
+    /// US-003/FR-006: falling through past every proxy hop to a `direct` terminal hop shows
+    /// no data, with zero requests for that hop.
+    #[tokio::test]
+    async fn test_direct_terminal_hop_shows_no_data_zero_requests() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut hop0 = mockito::Server::new_async().await;
+        hop0.mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop(&hop0.url(), &policy), GoProxyHop::Direct],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let result = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+    }
+
+    /// US-004: `GOPROXY=off` shows no data and issues zero requests.
+    #[tokio::test]
+    async fn test_off_hop_zero_requests() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let chain = GoProxyChain {
+            key: "go-proxy:off".to_string(),
+            hops: vec![GoProxyHop::Off],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:off".to_string(),
+            mirrors_crates_io: false,
+        };
+        let result = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+    }
+
+    /// An `AlternateRegistry` source whose index has no registered client is
+    /// `PackageNotFound`, never resolved by falling through to the plain public-registry
+    /// path.
+    #[tokio::test]
+    async fn test_unregistered_alternate_never_falls_back_to_public() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(GoRegistry::new(cache));
+        let source = DependencySource::AlternateRegistry {
+            index: "never-registered".to_string(),
+            mirrors_crates_io: false,
+        };
+        let result = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(DepsError::PackageNotFound {
+                registry: "alternate registry (not registered)",
+                ..
+            })
+        ));
+    }
+
+    /// FR-013: `get_latest_matching_from` routes an `AlternateRegistry` source to the
+    /// registered chain and picks the matching version.
+    #[tokio::test]
+    async fn test_get_latest_matching_from_routes_to_alternate() {
+        use deps_core::{Registry, VersionReq};
+
+        let mut alt_server = mockito::Server::new_async().await;
+        alt_server
+            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.0\nv1.9.1\n")
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop(&alt_server.url(), &policy)],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let latest = root
+            .get_latest_matching_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                &VersionReq::new("*"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(latest.is_some());
+    }
+
+    /// A plain `DependencySource::Registry` source keeps the existing public-registry path
+    /// (`/@latest` fast path) unchanged (NFR-005).
+    #[tokio::test]
+    async fn test_get_versions_from_plain_registry_source_unchanged() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let cache = Arc::new(HttpCache::new());
+        let root = GoRegistry::new(cache);
+        let result = root
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/nonexistent/module12345"),
+                &DependencySource::Registry,
+                FreshnessSettings::default(),
+            )
+            .await;
+        // No network mock configured — a real request would error, proving this path still
+        // goes through the ordinary public fetch rather than being silently no-op'd.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_alternate_registries_cap_enforced() {
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(GoRegistry::new(cache));
+        let policy = all_policy();
+        for i in 0..MAX_ALTERNATE_REGISTRIES {
+            let chain = GoProxyChain {
+                key: format!("go-proxy:cap-{i}"),
+                hops: vec![url_hop("https://goproxy.mycorp.example", &policy)],
+                ..Default::default()
+            };
+            GoRegistry::register_chain(&root, &chain);
+        }
+        assert_eq!(root.alternates.len(), MAX_ALTERNATE_REGISTRIES);
+
+        let overflow = GoProxyChain {
+            key: "go-proxy:overflow".to_string(),
+            hops: vec![url_hop("https://goproxy.mycorp.example", &policy)],
+            ..Default::default()
+        };
+        GoRegistry::register_chain(&root, &overflow);
+        assert_eq!(root.alternates.len(), MAX_ALTERNATE_REGISTRIES);
+        assert!(root.alternate_client("go-proxy:overflow").is_none());
     }
 }

@@ -11,6 +11,7 @@
 //! - Extracts indirect dependency markers (// indirect)
 //! - Note: retract directive is defined in types but not yet parsed
 
+use crate::config::{GoParseContext, GoProxyChain};
 use crate::types::{GoDependency, GoDirective};
 use deps_core::Result;
 use deps_core::lsp_helpers::LineOffsetTable;
@@ -28,10 +29,35 @@ pub struct GoParseResult {
     pub go_version: Option<String>,
     /// Document URI
     pub uri: Uri,
+    /// Every `$GOENV`-resolved `GOPROXY`/`GOPRIVATE`-bypass chain this parse implies (spec
+    /// 034), ready for `GoRegistry::register_chain`. Empty when `$GOENV` declares no
+    /// override (US-005).
+    pub resolved_chains: Vec<GoProxyChain>,
+}
+
+/// Parses a go.mod file and extracts all dependencies with positions, using a fresh, default
+/// [`GoParseContext`].
+///
+/// No live `$GOENV` policy handle — every dependency resolves to plain
+/// [`deps_core::parser::DependencySource::Registry`], byte-identical to pre-#519 behavior.
+/// Production parsing goes through [`parse_go_mod_with_context`] instead.
+pub fn parse_go_mod(content: &str, doc_uri: &Uri) -> Result<GoParseResult> {
+    parse_go_mod_with_context(content, doc_uri, &GoParseContext::default())
 }
 
 /// Parses a go.mod file and extracts all dependencies with positions.
-pub fn parse_go_mod(content: &str, doc_uri: &Uri) -> Result<GoParseResult> {
+///
+/// Resolves each dependency's [`deps_core::parser::DependencySource`] against `ctx`'s
+/// `$GOENV`-derived `GOPROXY`/`GOPRIVATE` configuration (spec 034 FR-002/FR-007/FR-008/FR-009).
+///
+/// # Errors
+///
+/// Same as [`parse_go_mod`].
+pub fn parse_go_mod_with_context(
+    content: &str,
+    doc_uri: &Uri,
+    ctx: &GoParseContext,
+) -> Result<GoParseResult> {
     tracing::debug!(uri = ?doc_uri, "Parsing go.mod file");
 
     let line_table = LineOffsetTable::new(content);
@@ -122,11 +148,17 @@ pub fn parse_go_mod(content: &str, doc_uri: &Uri) -> Result<GoParseResult> {
         "Parsed go.mod successfully"
     );
 
+    let go_config = crate::config::resolve(&ctx.config_cache, &ctx.policy);
+    for dep in &mut dependencies {
+        dep.source = go_config.resolve_source_for(dep.module_path.as_str());
+    }
+
     Ok(GoParseResult {
         dependencies,
         module_path,
         go_version,
         uri: doc_uri.clone(),
+        resolved_chains: go_config.resolved_chains(),
     })
 }
 
@@ -197,6 +229,7 @@ fn parse_require_line(
         version_range: Some(version_range),
         directive: GoDirective::Require,
         indirect,
+        source: deps_core::parser::DependencySource::Registry,
     })
 }
 
@@ -235,6 +268,7 @@ fn parse_replace_line(
         version_range,
         directive: GoDirective::Replace,
         indirect: false,
+        source: deps_core::parser::DependencySource::Registry,
     })
 }
 
@@ -268,6 +302,7 @@ fn parse_exclude_line(
         version_range: Some(version_range),
         directive: GoDirective::Exclude,
         indirect: false,
+        source: deps_core::parser::DependencySource::Registry,
     })
 }
 

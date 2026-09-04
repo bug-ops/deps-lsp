@@ -28,6 +28,7 @@
 //! assert_eq!(result.dependencies.len(), 1);
 //! ```
 
+pub mod config;
 pub mod ecosystem;
 pub mod formatter;
 pub mod lockfile;
@@ -37,10 +38,11 @@ pub mod types;
 pub mod version;
 
 // Re-export commonly used types
+pub use config::{GoEnvConfig, GoParseContext};
 pub use ecosystem::GoEcosystem;
 pub use formatter::GoFormatter;
 pub use lockfile::{GoSumParser, parse_go_sum};
-pub use parser::{GoParseResult, parse_go_mod};
+pub use parser::{GoParseResult, parse_go_mod, parse_go_mod_with_context};
 pub use registry::{GoRegistry, package_url};
 pub use types::{GoDependency, GoDirective, GoMetadata, GoVersion};
 pub use version::{
