@@ -389,6 +389,10 @@ impl LanguageServer for Backend {
             self.state
                 .cache
                 .set_registry_policy(config.registries.workspace_registries.to_policy());
+            self.state.nuget_user_profile_sources.store(
+                config.registries.nuget_user_profile_sources,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             self.state.cache.set_offline(config.network.offline);
             self.state.cache.set_cache_enabled(config.cache.enabled);
             self.state
@@ -526,6 +530,10 @@ impl LanguageServer for Backend {
         self.state
             .cache
             .set_registry_policy(config.registries.workspace_registries.to_policy());
+        self.state.nuget_user_profile_sources.store(
+            config.registries.nuget_user_profile_sources,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Must land before `workspace_diagnostic_refresh` below, or the refresh re-renders
         // diagnostics under the stale flag values (critic M5).
         self.state.cache.set_offline(config.network.offline);

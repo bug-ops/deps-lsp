@@ -279,7 +279,8 @@ Configure via LSP initialization options:
     "enabled": true
   },
   "registries": {
-    "workspace_registries": "public_only"
+    "workspace_registries": "public_only",
+    "nuget_user_profile_sources": false
   },
   "network": {
     "offline": false
@@ -313,6 +314,7 @@ Configure via LSP initialization options:
 | `freshness` | `enabled` | `true` | Flag a "latest" version still inside its cooldown window |
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
 | `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, Go's `$GOENV` `GOPROXY`, NuGet's `NuGet.Config`) — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#cargo-customprivate-registries), [npm Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#npm-customprivate-registries), [PyPI Custom/Private Indexes](docs/ECOSYSTEM_GUIDE.md#pypi-customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](docs/ECOSYSTEM_GUIDE.md#go-goproxygoprivate-support), and [NuGet Private/Custom Feeds](docs/ECOSYSTEM_GUIDE.md#nuget-privatecustom-feeds). **Breaking rename** from `cargo.workspace_registries` — see CHANGELOG |
+| `registries` | `nuget_user_profile_sources` | `false` | Whether a NuGet user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced — OSV/deps.dev/hover-trust suppressed for it), instead of only ever supplying credentials for a matching repo-declared source; see [NuGet Private/Custom Feeds](docs/ECOSYSTEM_GUIDE.md#nuget-privatecustom-feeds) |
 | `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
 | `supply_chain` | `enabled` | `true` | Show the OpenSSF Scorecard/build-provenance hover line, backed by deps.dev requests; `false` disables the requests and the section entirely |
 

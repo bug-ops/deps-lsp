@@ -5,6 +5,7 @@ use dashmap::DashMap;
 use reqwest::{Client, Response, StatusCode, Url, header};
 use serde::Serialize;
 use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -193,10 +194,36 @@ fn hop_targets_blocked_host(url: &Url) -> bool {
 /// carries (see that variant's docs) — [`HttpCache::cache_key`] reads the digit from this
 /// snapshot, never from a live `Arc<RegistryAccessPolicy>` read, so a request's cache key and
 /// its guard always agree on which policy era they were constructed under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CacheTier {
     Baseline,
     WorkspaceDeclared(WorkspaceRegistryAccess),
+    /// An origin-pinned, connect-address-guarded tier (issue #561/#562) — see
+    /// [`Transport::origin_pinned_guarded`]. `digest` identifies the `(trusted_origin,
+    /// policy_snapshot)` pair this transport was built for (**never** a credential identity —
+    /// see [`HttpCache::get_cached_pinned_with_headers`]'s separate `auth_id` argument, folded
+    /// into the cache key only). `authenticated` distinguishes an authenticated fetch (#561)
+    /// from #562's unauthenticated workspace-declared one for cache-eviction purposes
+    /// ([`CacheTier::is_authenticated`]) without affecting pooling — the shipped
+    /// [`Transport::origin_pinned`] (public path) stays on [`CacheTier::Baseline`], unaffected.
+    Pinned {
+        digest: u64,
+        authenticated: bool,
+    },
+}
+
+impl CacheTier {
+    /// Whether a 401/403 revalidation response on an entry under this tier should evict the
+    /// entry rather than serve the default stale-while-revalidate fallback (FR-015/NFR-004).
+    fn is_authenticated(self) -> bool {
+        matches!(
+            self,
+            Self::Pinned {
+                authenticated: true,
+                ..
+            }
+        )
+    }
 }
 
 /// The tier a [`Transport`]'s redirect policy and DNS resolver both enforce.
@@ -553,6 +580,45 @@ impl Transport {
             tier: CacheTier::Baseline,
         }
     }
+
+    /// The transport for one origin-pinned **workspace-declared** host (issue #561/#562),
+    /// optionally carrying a credential. Pairs [`trusted_origin_redirect_policy`] (send-scope
+    /// confinement — no redirect hop may leave `trusted_origin`) with
+    /// [`AddrGuard::WorkspaceDeclared`] (the connect-address policy guard, #455-class
+    /// protection) and the namespaced [`CacheTier::Pinned`] tier. One constructor serves both
+    /// #562's unauthenticated workspace-declared fetches (`authenticated: false`) and #561's
+    /// authenticated ones (`authenticated: true`) — `authenticated` only affects
+    /// [`HttpCache`]'s revalidation-eviction rule (FR-015), never `AddrGuard`/redirect
+    /// confinement. The shipped [`Self::origin_pinned`] (public `api.nuget.org` path) is
+    /// unaffected — this is a distinct constructor, not a modification of that one.
+    fn origin_pinned_guarded(
+        trusted_origin: &str,
+        policy: &Arc<RegistryAccessPolicy>,
+        authenticated: bool,
+    ) -> Self {
+        let snapshot = policy.get();
+        Self {
+            client: build_client_inner(
+                trusted_origin_redirect_policy(trusted_origin.to_string()),
+                BlockedAddrResolver::new(AddrGuard::WorkspaceDeclared(snapshot)),
+            ),
+            tier: CacheTier::Pinned {
+                digest: pinned_digest(trusted_origin, snapshot),
+                authenticated,
+            },
+        }
+    }
+}
+
+/// Identifies a `(trusted_origin, policy_snapshot)` pair for [`CacheTier::Pinned`] — **never**
+/// a credential identity (see that variant's docs). Not cryptographically salted: unlike a
+/// caller's own credential-header digest (e.g. `deps_nuget`'s salted `auth_id`), this value is
+/// not attacker-observable secret material, only a pool/cache-key discriminant.
+fn pinned_digest(trusted_origin: &str, snapshot: WorkspaceRegistryAccess) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    trusted_origin.hash(&mut hasher);
+    snapshot.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Reads a response body incrementally, aborting once it exceeds `limit`.
@@ -679,12 +745,15 @@ pub struct HttpCache {
     total_bytes: AtomicUsize,
     /// The shared, unauthenticated transport used by every non-workspace request.
     baseline: Transport,
-    /// Per-trusted-origin transport pool backing [`Self::get_cached_trusted_origin`], keyed by
-    /// the exact `trusted_origin` prefix string passed to that call. reqwest's redirect
-    /// policy is fixed per-`Client`, so a distinct client is unavoidable per distinct
-    /// origin; pooled here so repeated calls against the same origin reuse one transport
-    /// (and its connection pool) instead of rebuilding on every call.
-    trusted_clients: DashMap<String, Transport>,
+    /// Per-`(trusted_origin, tier)` transport pool backing [`Self::get_cached_trusted_origin`]
+    /// and [`Self::get_cached_pinned`] alike (issue #561/#562, FR-017), keyed by the exact
+    /// `trusted_origin` prefix string passed to that call, paired with the [`CacheTier`] it was
+    /// built for. reqwest's redirect policy is fixed per-`Client`, so a distinct client is
+    /// unavoidable per distinct origin; pooled here so repeated calls against the same
+    /// `(origin, tier)` reuse one transport (and its connection pool) instead of rebuilding on
+    /// every call. Deliberately **uncapped** — see [`Self::set_registry_policy`]'s docs for why
+    /// a capacity cap was considered and dropped for this pool.
+    trusted_clients: DashMap<(String, CacheTier), Transport>,
     /// Live-updatable Cargo workspace-registry policy the `workspace` transport field below
     /// and cache-key namespace are derived from. Kept alongside that field (not just read once
     /// at construction) so [`Self::cache_key`] and [`Self::set_registry_policy`] both read the
@@ -797,13 +866,39 @@ impl HttpCache {
     /// `entry().or_insert_with()` only runs on a miss, so two callers racing on the same new
     /// origin still only ever build and store one [`Transport`] for it, not one each.
     fn transport_for_origin(&self, trusted_origin: &str) -> Transport {
-        if let Some(existing) = self.trusted_clients.get(trusted_origin) {
+        let key = (trusted_origin.to_string(), CacheTier::Baseline);
+        if let Some(existing) = self.trusted_clients.get(&key) {
             return existing.clone();
         }
 
         self.trusted_clients
-            .entry(trusted_origin.to_string())
+            .entry(key)
             .or_insert_with(|| Transport::origin_pinned(trusted_origin))
+            .clone()
+    }
+
+    /// Like [`Self::transport_for_origin`], but for an origin-pinned, connect-address-guarded
+    /// [`CacheTier::Pinned`] transport (issue #561/#562) — building and pooling one on first
+    /// use, keyed by `(trusted_origin, CacheTier::Pinned { .. })` so an authenticated and
+    /// unauthenticated transport for the same origin are pooled separately.
+    fn transport_for_pinned(&self, trusted_origin: &str, authenticated: bool) -> Transport {
+        let digest = pinned_digest(trusted_origin, self.policy.get());
+        let key = (
+            trusted_origin.to_string(),
+            CacheTier::Pinned {
+                digest,
+                authenticated,
+            },
+        );
+        if let Some(existing) = self.trusted_clients.get(&key) {
+            return existing.clone();
+        }
+
+        self.trusted_clients
+            .entry(key)
+            .or_insert_with(|| {
+                Transport::origin_pinned_guarded(trusted_origin, &self.policy, authenticated)
+            })
             .clone()
     }
 
@@ -816,6 +911,11 @@ impl HttpCache {
     /// arbitrary key, so a `Baseline`-tier and `WorkspaceDeclared`-tier entry can never collide
     /// in production use.
     const WS_KEY_PREFIX: char = '\u{1}';
+
+    /// The prefix marking a [`CacheTier::Pinned`]-tier cache key (issue #561/#562) — distinct
+    /// from [`Self::WS_KEY_PREFIX`] so the two namespaces can never collide, chosen as another
+    /// control character no URL string this module writes can start with.
+    const PINNED_KEY_PREFIX: char = '\u{2}';
 
     /// Computes the cache-map key for `url` under `tier` — `Cow::Borrowed(url)` for
     /// [`CacheTier::Baseline`] (allocation-free, and identical to every entry this cache wrote
@@ -832,12 +932,22 @@ impl HttpCache {
     /// Callers must compute this once per request and thread the result through, never
     /// recompute mid-request — a policy flip between two recomputations would read and write
     /// under different keys for what should be one atomic operation.
-    fn cache_key<'a>(&self, url: &'a str, tier: CacheTier) -> Cow<'a, str> {
+    ///
+    /// `auth_id` (FR-014) is folded in only for [`CacheTier::Pinned`] — a separate credential
+    /// identity from `digest` (see that variant's docs), so a rotated or distinct credential
+    /// against the same origin never reads back a body fetched under a different one. `None`
+    /// serializes as 16 zero hex digits, matching an unauthenticated `#562` fetch.
+    fn cache_key<'a>(&self, url: &'a str, tier: CacheTier, auth_id: Option<u64>) -> Cow<'a, str> {
         match tier {
             CacheTier::Baseline => Cow::Borrowed(url),
             CacheTier::WorkspaceDeclared(snapshot) => {
                 Cow::Owned(format!("{}{}{url}", Self::WS_KEY_PREFIX, snapshot.to_u8()))
             }
+            CacheTier::Pinned { digest, .. } => Cow::Owned(format!(
+                "{}{digest:016x}{:016x}{url}",
+                Self::PINNED_KEY_PREFIX,
+                auth_id.unwrap_or(0)
+            )),
         }
     }
 
@@ -918,7 +1028,7 @@ impl HttpCache {
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
-        self.get_cached_with_headers_via(url, extra_headers, &self.baseline)
+        self.get_cached_with_headers_via(url, extra_headers, &self.baseline, None)
             .await
     }
 
@@ -946,7 +1056,8 @@ impl HttpCache {
         trusted_origin: &str,
     ) -> Result<Bytes> {
         let transport = self.transport_for_origin(trusted_origin);
-        self.get_cached_with_headers_via(url, &[], &transport).await
+        self.get_cached_with_headers_via(url, &[], &transport, None)
+            .await
     }
 
     /// Like [`Self::get_cached_trusted_origin`], but additionally injects `extra_headers`
@@ -995,7 +1106,55 @@ impl HttpCache {
         extra_headers: &[(header::HeaderName, &str)],
     ) -> Result<Bytes> {
         let transport = self.transport_for_origin(trusted_origin);
-        self.get_cached_with_headers_via(url, extra_headers, &transport)
+        self.get_cached_with_headers_via(url, extra_headers, &transport, None)
+            .await
+    }
+
+    /// Like [`Self::get_cached_trusted_origin_with_headers`], but for an origin-pinned,
+    /// connect-address-guarded `CacheTier::Pinned` transport (issue #561/#562) instead of the
+    /// baseline-guarded [`Self::get_cached_trusted_origin`] one — the only sanctioned way to
+    /// send a credential to a workspace-declared host. Delegates to
+    /// [`Self::get_cached_pinned_with_headers`] with no extra headers.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached`].
+    pub async fn get_cached_pinned(
+        &self,
+        url: &str,
+        trusted_origin: &str,
+        authenticated: bool,
+        auth_id: Option<u64>,
+    ) -> Result<Bytes> {
+        self.get_cached_pinned_with_headers(url, trusted_origin, authenticated, auth_id, &[])
+            .await
+    }
+
+    /// Like [`Self::get_cached_pinned`], but additionally injects `extra_headers` (e.g. an
+    /// `Authorization` header carrying a credential) into every request — composed with the
+    /// same origin-pinned, connect-address-guarded transport [`Self::get_cached_pinned`] uses,
+    /// so a credential header can never survive a cross-origin redirect hop, exactly like
+    /// [`Self::get_cached_trusted_origin_with_headers`]'s identical closure argument for the
+    /// baseline-guarded tier.
+    ///
+    /// `auth_id` (FR-014) — a caller-computed, salted digest of the credential actually being
+    /// attached (`None` for an unauthenticated #562 fetch) — is folded into the cache key only,
+    /// never into `CacheTier`/the transport-pool key, so a rotated or distinct credential
+    /// against the same origin never reads back a body fetched under a different one.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::get_cached`].
+    pub async fn get_cached_pinned_with_headers(
+        &self,
+        url: &str,
+        trusted_origin: &str,
+        authenticated: bool,
+        auth_id: Option<u64>,
+        extra_headers: &[(header::HeaderName, &str)],
+    ) -> Result<Bytes> {
+        let transport = self.transport_for_pinned(trusted_origin, authenticated);
+        self.get_cached_with_headers_via(url, extra_headers, &transport, auth_id)
             .await
     }
 
@@ -1072,7 +1231,7 @@ impl HttpCache {
             .read()
             .expect("workspace transport lock poisoned")
             .clone();
-        self.get_cached_with_headers_via(url, extra_headers, &transport)
+        self.get_cached_with_headers_via(url, extra_headers, &transport, None)
             .await
     }
 
@@ -1086,6 +1245,17 @@ impl HttpCache {
     /// only gates *future* fetches: an `All -> PublicOnly`/`Off` tightening does not purge
     /// already-registered `deps-cargo` alternate-registry clients resolved under the looser
     /// policy (pre-existing, documented on [`crate::net_policy::RegistryAccessPolicy::set`]).
+    ///
+    /// Unlike that pre-existing gap, every `CacheTier::Pinned` cache entry (issue #561/#562)
+    /// **is** purged on every actual policy transition, along with every pinned-tier pooled
+    /// `Transport` — substantially narrowing the `All -> PublicOnly -> All` round-trip hole for
+    /// credential-carrying entries specifically (NFR-004): re-namespacing alone (as the
+    /// pre-existing workspace-tier digit prefix does) would leave an old-era authenticated
+    /// body reachable once the policy round-trips back to a value whose digest happens to
+    /// collide again. Not an absolute close: a fetch already in flight when the transition
+    /// happens can still land its response and re-insert an old-era key after the purge —
+    /// harmless (readable only under the era it was legitimately fetched in), just not
+    /// prevented by this purge alone.
     pub fn set_registry_policy(&self, value: WorkspaceRegistryAccess) {
         if self.policy.get() == value {
             return;
@@ -1098,13 +1268,28 @@ impl HttpCache {
             .expect("workspace transport lock poisoned") = rebuilt;
         #[cfg(test)]
         self.workspace_rebuilds.fetch_add(1, Ordering::Relaxed);
+
+        let mut freed_bytes = 0usize;
+        self.entries.retain(|k, v| {
+            let keep = !k.starts_with(Self::PINNED_KEY_PREFIX);
+            if !keep {
+                freed_bytes += v.body.len();
+            }
+            keep
+        });
+        self.total_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
+        self.trusted_clients
+            .retain(|(_, tier), _| !matches!(tier, CacheTier::Pinned { .. }));
     }
 
+    /// `auth_id` (FR-014) is meaningful only under [`CacheTier::Pinned`] — every other tier
+    /// ignores it (see [`Self::cache_key`]'s docs).
     async fn get_cached_with_headers_via(
         &self,
         url: &str,
         extra_headers: &[(header::HeaderName, &str)],
         transport: &Transport,
+        auth_id: Option<u64>,
     ) -> Result<Bytes> {
         if self.entries.len() >= MAX_CACHE_ENTRIES
             || self.total_bytes.load(Ordering::Relaxed) >= MAX_CACHE_BYTES
@@ -1122,7 +1307,7 @@ impl HttpCache {
         // Computed once and threaded through every downstream call — never recomputed, or a
         // policy flip mid-request would read and write under different keys (see
         // `Self::cache_key`'s docs).
-        let cache_key = self.cache_key(url, transport.tier);
+        let cache_key = self.cache_key(url, transport.tier, auth_id);
 
         if !cache_enabled {
             return self
@@ -1155,6 +1340,29 @@ impl HttpCache {
                 Ok(Some(new_body)) => return Ok(new_body),
                 Ok(None) => return Ok(cached.body),
                 Err(e) => {
+                    // FR-015/NFR-004: a 401/403 revalidation against an *authenticated*
+                    // pinned-tier entry must evict rather than serve the possibly-revoked
+                    // credential's last-known-good body — every other tier keeps today's
+                    // stale-while-revalidate fallback unchanged.
+                    if transport.tier.is_authenticated()
+                        && matches!(
+                            &e,
+                            DepsError::HttpStatus {
+                                status: 401 | 403,
+                                ..
+                            }
+                        )
+                    {
+                        if let Some((_, old)) = self.entries.remove(cache_key.as_ref()) {
+                            self.total_bytes
+                                .fetch_sub(old.body.len(), Ordering::Relaxed);
+                        }
+                        tracing::warn!(
+                            %e,
+                            "evicting authenticated cache entry after revalidation failure"
+                        );
+                        return Err(e);
+                    }
                     tracing::warn!("conditional request failed, using cache: {e}");
                     return Ok(cached.body);
                 }
@@ -1956,7 +2164,7 @@ mod tests {
 
         let cache = HttpCache::new();
         let result: Bytes = cache
-            .get_cached_with_headers_via(&source_url, &[], &Transport::baseline())
+            .get_cached_with_headers_via(&source_url, &[], &Transport::baseline(), None)
             .await
             .unwrap();
         assert_eq!(result.as_ref(), b"redirected data");
@@ -1966,7 +2174,7 @@ mod tests {
         ));
         let workspace_cache = HttpCache::with_policy(Arc::clone(&policy));
         let result: Result<Bytes> = workspace_cache
-            .get_cached_with_headers_via(&source_url, &[], &Transport::workspace(&policy))
+            .get_cached_with_headers_via(&source_url, &[], &Transport::workspace(&policy), None)
             .await;
         assert!(
             matches!(result, Err(DepsError::HttpStatus { status: 302, .. })),
@@ -1997,7 +2205,7 @@ mod tests {
         let cache = HttpCache::with_policy(Arc::clone(&policy));
         let source_url = format!("{}/api/source", server.url());
         let result: Result<Bytes> = cache
-            .get_cached_with_headers_via(&source_url, &[], &Transport::workspace(&policy))
+            .get_cached_with_headers_via(&source_url, &[], &Transport::workspace(&policy), None)
             .await;
 
         assert!(
@@ -3407,5 +3615,204 @@ mod tests {
             .unwrap();
         assert_eq!(offline.as_ref(), b"trusted-origin fetch");
         mock.assert_async().await;
+    }
+
+    // --- issue #561/#562: CacheTier::Pinned, get_cached_pinned{,_with_headers} ---
+
+    #[tokio::test]
+    async fn test_get_cached_pinned_attaches_auth_header() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/api/data", server.url());
+
+        let _m = server
+            .mock("GET", "/api/data")
+            .match_header("authorization", "Basic dXNlcjpwYXQ=")
+            .with_status(200)
+            .with_body("authenticated data")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let result = cache
+            .get_cached_pinned_with_headers(
+                &url,
+                &trusted_origin,
+                true,
+                Some(42),
+                &[(header::AUTHORIZATION, "Basic dXNlcjpwYXQ=")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.as_ref(), b"authenticated data");
+    }
+
+    /// FR-014: distinct `auth_id` values against the same `(url, trusted_origin)` never share
+    /// a cache entry — a rotated or distinct credential never reads back a body fetched under a
+    /// different one.
+    #[tokio::test]
+    async fn test_get_cached_pinned_distinct_auth_id_never_shares_cache_entry() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/api/data", server.url());
+
+        let _m1 = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_body("body-for-credential-a")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let a = cache
+            .get_cached_pinned(&url, &trusted_origin, true, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(a.as_ref(), b"body-for-credential-a");
+        drop(_m1);
+
+        let _m2 = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_body("body-for-credential-b")
+            .create_async()
+            .await;
+
+        let b = cache
+            .get_cached_pinned(&url, &trusted_origin, true, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.as_ref(),
+            b"body-for-credential-b",
+            "a distinct auth_id must not read back credential A's cached body"
+        );
+    }
+
+    /// FR-015/NFR-004: a 401 revalidation response against an authenticated `Pinned`-tier
+    /// entry evicts the entry and returns the error — never the default
+    /// stale-while-revalidate fallback that would serve the possibly-revoked credential's
+    /// last-known-good body.
+    #[tokio::test]
+    async fn test_pinned_authenticated_401_revalidation_evicts_instead_of_stale_serve() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/api/data", server.url());
+
+        let _m1 = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_header("etag", "\"abc123\"")
+            .with_body("private data")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let first = cache
+            .get_cached_pinned(&url, &trusted_origin, true, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(first.as_ref(), b"private data");
+        assert_eq!(cache.len(), 1);
+        drop(_m1);
+
+        let _m2 = server
+            .mock("GET", "/api/data")
+            .match_header("if-none-match", "\"abc123\"")
+            .with_status(401)
+            .create_async()
+            .await;
+
+        let result = cache
+            .get_cached_pinned(&url, &trusted_origin, true, Some(7))
+            .await;
+
+        assert!(
+            matches!(result, Err(DepsError::HttpStatus { status: 401, .. })),
+            "expected the 401 to surface as an error, not a stale-served body: {result:?}"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "the revoked-credential entry must be evicted, not left cached"
+        );
+    }
+
+    /// Every other tier keeps today's stale-while-revalidate fallback unchanged — only an
+    /// *authenticated* `Pinned` entry evicts on 401/403 (FR-015's scope is deliberately
+    /// narrow).
+    #[tokio::test]
+    async fn test_unauthenticated_pinned_401_revalidation_still_serves_stale() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/api/data", server.url());
+
+        let _m1 = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_header("etag", "\"abc123\"")
+            .with_body("workspace data")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let first = cache
+            .get_cached_pinned(&url, &trusted_origin, false, None)
+            .await
+            .unwrap();
+        assert_eq!(first.as_ref(), b"workspace data");
+        drop(_m1);
+
+        let _m2 = server
+            .mock("GET", "/api/data")
+            .match_header("if-none-match", "\"abc123\"")
+            .with_status(401)
+            .create_async()
+            .await;
+
+        let second = cache
+            .get_cached_pinned(&url, &trusted_origin, false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.as_ref(),
+            b"workspace data",
+            "an unauthenticated Pinned entry must keep the default stale-while-revalidate fallback"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// `set_registry_policy` purges every `Pinned`-tier cache entry (and pooled transport) on
+    /// an actual policy transition — closing the round-trip hole for credential-carrying
+    /// entries (NFR-004), unlike the pre-existing `WorkspaceDeclared` non-purge behavior.
+    #[tokio::test]
+    async fn test_set_registry_policy_purges_pinned_tier_entries() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/api/data", server.url());
+
+        let _m = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_body("private data")
+            .create_async()
+            .await;
+
+        let policy = Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All));
+        let cache = HttpCache::with_policy(Arc::clone(&policy));
+        cache
+            .get_cached_pinned(&url, &trusted_origin, true, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(cache.len(), 1);
+
+        cache.set_registry_policy(WorkspaceRegistryAccess::PublicOnly);
+
+        assert_eq!(
+            cache.len(),
+            0,
+            "a Pinned-tier entry must be purged on any actual policy transition"
+        );
     }
 }

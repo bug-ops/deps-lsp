@@ -489,6 +489,10 @@ pub struct ServerState {
     /// `Backend::initialize`/`did_change_configuration` updating this value here takes effect
     /// on every parse from then on, with no need to reconstruct either ecosystem.
     pub registry_policy: Arc<RegistryAccessPolicy>,
+    /// Live-updatable `registries.nuget_user_profile_sources` setting (issue #561, FR-006) —
+    /// the same handle `crate::register_ecosystems` hands to `NuGetEcosystem`'s
+    /// `NuGetParseContext`, bundled inside `EcosystemRuntime`. See that struct's docs.
+    pub nuget_user_profile_sources: Arc<AtomicBool>,
     /// Cold start rate limiter
     pub cold_start_limiter: ColdStartLimiter,
     /// Background task handles
@@ -521,12 +525,16 @@ impl ServerState {
         let deps_dev = Arc::new(DepsDevClient::new(Arc::clone(&cache)));
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
+        let nuget_user_profile_sources = Arc::new(AtomicBool::new(false));
 
         // Register ecosystems based on enabled features
         crate::register_ecosystems(
             &ecosystem_registry,
             Arc::clone(&cache),
-            Arc::clone(&registry_policy),
+            &crate::EcosystemRuntime {
+                policy: Arc::clone(&registry_policy),
+                nuget_user_profile_sources: Arc::clone(&nuget_user_profile_sources),
+            },
         );
 
         // Default interval, live-updated by `set_min_interval` once `initialize`/
@@ -545,6 +553,7 @@ impl ServerState {
             lockfile_cache,
             ecosystem_registry,
             registry_policy,
+            nuget_user_profile_sources,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
             progress_supported: AtomicBool::new(false),

@@ -687,6 +687,15 @@ where
 pub struct RegistriesConfig {
     #[serde(default)]
     pub workspace_registries: WorkspaceRegistriesSetting,
+    /// Issue #561, FR-006: whether a NuGet user-profile-tier `NuGet.Config` `<add>` with no
+    /// repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced, so
+    /// OSV/deps.dev/hover-trust are suppressed for it — spec 035 §5a), not just a credential
+    /// source for a repo-declared entry at the same URL. `#[serde(default)]`: additive-safe,
+    /// since `RegistriesConfig` itself is not under `DepsConfig`'s top-level
+    /// `deny_unknown_fields`. Default `false` — zero routing effect from any user-profile file
+    /// unless explicitly opted in.
+    #[serde(default)]
+    pub nuget_user_profile_sources: bool,
 }
 
 /// Controls which workspace-declared registry index hosts this LSP will ever fetch.

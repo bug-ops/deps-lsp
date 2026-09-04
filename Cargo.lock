@@ -685,12 +685,16 @@ dependencies = [
 name = "deps-nuget"
 version = "0.12.1"
 dependencies = [
+ "base64",
+ "bytes",
  "criterion",
  "dashmap",
  "deps-core",
+ "dirs",
  "insta",
  "mockito",
  "quick-xml",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

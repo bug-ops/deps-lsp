@@ -252,7 +252,7 @@ pub fn classify_host(url: &url::Url) -> HostClass {
 /// Applied **only** to workspace-provenance URLs (a `Cargo.toml`/`.cargo/config.toml` value
 /// found inside the opened workspace) — a `$CARGO_HOME`-provenance index is the user's own
 /// trusted configuration and is never policy-checked, under any variant here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WorkspaceRegistryAccess {
     /// Block every workspace-declared index — the only complete boundary. Also blocks the
     /// `registry`/`registry-index` alias path, not only `[source]` replace-with.
