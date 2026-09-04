@@ -323,6 +323,7 @@ pub fn register_ecosystems(
         let go_context = deps_go::config::GoParseContext {
             policy: Arc::clone(&policy),
             config_cache: Arc::new(deps_go::config::GoEnvCache::new()),
+            goenv_path: deps_go::config::goenv_path(),
         };
         registry.register(Arc::new(GoEcosystem::with_context(
             Arc::new(GoRegistry::new(Arc::clone(&cache))),

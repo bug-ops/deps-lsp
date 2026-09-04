@@ -1892,6 +1892,56 @@ mod tests {
         assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
     }
 
+    /// SC-002 (issue #559 follow-up): a `GOPRIVATE`-matched module's resolved source routes
+    /// to the bypass chain *and* the registered `GOPROXY` chain never receives a request for
+    /// it — combined into one resolution call, where previously each half was proven by a
+    /// separate unit test.
+    #[tokio::test]
+    async fn test_goprivate_bypass_sends_zero_requests_to_goproxy() {
+        use deps_core::{FreshnessSettings, Registry};
+
+        let mut public_proxy = mockito::Server::new_async().await;
+        let public_mock = public_proxy
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let content = format!(
+            "GOPROXY={},direct\nGOPRIVATE=git.mycorp.example/*\n",
+            public_proxy.url()
+        );
+        let policy = all_policy();
+        let go_config = crate::config::GoEnvConfig::parse(&content, &policy);
+        let source = go_config.resolve_source_for("git.mycorp.example/internal/auth");
+        assert_eq!(
+            source,
+            DependencySource::AlternateRegistry {
+                index: crate::config::GOPRIVATE_CHAIN_KEY.to_string(),
+                mirrors_crates_io: false,
+            }
+        );
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        for chain in go_config.resolved_chains() {
+            GoRegistry::register_chain(&root, &chain);
+        }
+
+        let result = root
+            .get_versions_from(
+                &deps_core::PackageName::new("git.mycorp.example/internal/auth"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await;
+        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+        public_mock.assert_async().await;
+    }
+
     /// US-004: `GOPROXY=off` shows no data and issues zero requests.
     #[tokio::test]
     async fn test_off_hop_zero_requests() {

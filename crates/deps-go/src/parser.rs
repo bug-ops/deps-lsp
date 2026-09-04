@@ -148,7 +148,7 @@ pub fn parse_go_mod_with_context(
         "Parsed go.mod successfully"
     );
 
-    let go_config = crate::config::resolve(&ctx.config_cache, &ctx.policy);
+    let go_config = crate::config::resolve_with_context(ctx);
     for dep in &mut dependencies {
         dep.source = go_config.resolve_source_for(dep.module_path.as_str());
     }
@@ -560,5 +560,60 @@ exclude github.com/bad/module v0.1.0
             stripped,
             "replace github.com/old => https://github.com/new "
         );
+    }
+
+    /// Integration test (issue #559 follow-up): the full parse -> resolve -> `register_chain`
+    /// -> `get_versions_from` path, exercised end-to-end against a real fixture `$GOENV` file
+    /// via [`GoParseContext::goenv_path`] rather than the real host environment.
+    #[tokio::test]
+    async fn test_integration_parse_resolve_register_chain_get_versions() {
+        use crate::registry::GoRegistry;
+        use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+        use deps_core::{FreshnessSettings, HttpCache, Registry};
+        use std::sync::Arc;
+
+        let mut alt_server = mockito::Server::new_async().await;
+        alt_server
+            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let goenv_path = dir.path().join("env");
+        std::fs::write(
+            &goenv_path,
+            format!("GOPROXY={},direct\n", alt_server.url()),
+        )
+        .unwrap();
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let ctx = GoParseContext {
+            policy: Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
+            goenv_path: Some(goenv_path),
+            ..Default::default()
+        };
+
+        let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
+        let result = parse_go_mod_with_context(content, &test_uri(), &ctx).unwrap();
+        assert_eq!(result.resolved_chains.len(), 1);
+
+        let registry = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        for chain in &result.resolved_chains {
+            GoRegistry::register_chain(&registry, chain);
+        }
+
+        let source = result.dependencies[0].source.clone();
+        let versions = registry
+            .get_versions_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                FreshnessSettings::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
     }
 }
