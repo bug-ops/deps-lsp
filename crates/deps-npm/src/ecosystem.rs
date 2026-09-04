@@ -23,6 +23,7 @@ use crate::types::NpmDependency;
 
 /// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
 /// manifest's already-parsed dependencies (spec FR-017).
+#[derive(Debug)]
 enum CompletionSource {
     /// No dependency in the manifest has this exact name yet — most commonly because the
     /// user is still typing a brand-new dependency line. Callers fall back to the
@@ -391,6 +392,7 @@ fn catalog_diagnostics(
 mod tests {
     use super::*;
     use deps_core::{EcosystemConfig, VersionData};
+    use std::assert_matches;
     use std::collections::HashMap;
 
     fn pkg(s: &str) -> deps_core::PackageName {
@@ -983,10 +985,10 @@ mod tests {
     #[test]
     fn test_resolve_completion_source_not_in_manifest() {
         let parse_result = empty_parse_result();
-        assert!(matches!(
+        assert_matches!(
             resolve_completion_source(&parse_result, &pkg("express")),
             CompletionSource::NotInManifest
-        ));
+        );
     }
 
     #[test]
@@ -994,10 +996,10 @@ mod tests {
         let parse_result = MockParseResult {
             dependencies: vec![dep_with_source("express", DependencySource::Registry)],
         };
-        assert!(matches!(
+        assert_matches!(
             resolve_completion_source(&parse_result, &pkg("express")),
             CompletionSource::Resolved(DependencySource::Registry)
-        ));
+        );
     }
 
     /// Two occurrences of the same name resolving to different sources must not pick either
@@ -1016,10 +1018,10 @@ mod tests {
                 ),
             ],
         };
-        assert!(matches!(
+        assert_matches!(
             resolve_completion_source(&parse_result, &pkg("@myorg/pkg")),
             CompletionSource::Ambiguous
-        ));
+        );
     }
 
     #[tokio::test]

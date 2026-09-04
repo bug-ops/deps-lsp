@@ -693,6 +693,8 @@ impl deps_core::ParseResult for ParseResult {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn test_url() -> Uri {
         #[cfg(windows)]
         let path = "C:/test/Cargo.toml";
@@ -708,10 +710,10 @@ mod tests {
         // being exercised here, not the crash itself.
         let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
         let result = parse_cargo_toml(&content, &test_url());
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "Cargo.toml"
-        ));
+        );
     }
 
     #[test]
@@ -736,10 +738,7 @@ serde = "1.0""#;
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "serde");
         assert_eq!(result.dependencies[0].version_req, Some("1.0".into()));
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Registry
-        ));
+        assert_matches!(result.dependencies[0].source, DependencySource::Registry);
     }
 
     #[test]
@@ -758,10 +757,7 @@ serde = { version = "1.0", features = ["derive"] }"#;
 serde = { workspace = true }";
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Workspace
-        ));
+        assert_matches!(result.dependencies[0].source, DependencySource::Workspace);
     }
 
     #[test]
@@ -818,10 +814,7 @@ example = { git = "https://github.com/example/example" }"#;
 local = { path = "../local" }"#;
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Path { .. }
-        ));
+        assert_matches!(result.dependencies[0].source, DependencySource::Path { .. });
     }
 
     #[test]
@@ -1163,18 +1156,18 @@ cc = "1.0"
         let result = parse_cargo_toml(toml, &test_url()).unwrap();
         assert_eq!(result.dependencies.len(), 3);
 
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].section,
             DependencySection::Dependencies
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             result.dependencies[1].section,
             DependencySection::DevDependencies
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             result.dependencies[2].section,
             DependencySection::BuildDependencies
-        ));
+        );
     }
 
     #[test]
@@ -1187,7 +1180,7 @@ cc = "1.0"
         assert_eq!(dep.name, "libc");
         assert_eq!(dep.version_req, Some("0.2".into()));
         assert_eq!(dep.source, DependencySource::Registry);
-        assert!(matches!(dep.section, DependencySection::Dependencies));
+        assert_matches!(dep.section, DependencySection::Dependencies);
 
         // Position must point into the target table, not the (nonexistent) top-level one.
         assert_eq!(dep.name_range.start.line, 1);
@@ -1204,7 +1197,7 @@ cc = "1.0"
         let dep = &result.dependencies[0];
         assert_eq!(dep.name, "winapi");
         assert_eq!(dep.version_req, Some("0.3".into()));
-        assert!(matches!(dep.section, DependencySection::DevDependencies));
+        assert_matches!(dep.section, DependencySection::DevDependencies);
     }
 
     #[test]
@@ -1216,7 +1209,7 @@ cc = "1.0"
         let dep = &result.dependencies[0];
         assert_eq!(dep.name, "cc");
         assert_eq!(dep.version_req, Some("1.0".into()));
-        assert!(matches!(dep.section, DependencySection::BuildDependencies));
+        assert_matches!(dep.section, DependencySection::BuildDependencies);
     }
 
     #[test]
@@ -1242,7 +1235,7 @@ cc = "1.0"
             .iter()
             .find(|d| d.name == "serde")
             .unwrap();
-        assert!(matches!(serde.section, DependencySection::Dependencies));
+        assert_matches!(serde.section, DependencySection::Dependencies);
 
         let libc = result
             .dependencies
@@ -1251,17 +1244,17 @@ cc = "1.0"
             .unwrap();
         assert_eq!(libc.version_req, Some("0.2".into()));
         assert_eq!(libc.features, vec!["extra_traits"]);
-        assert!(matches!(libc.section, DependencySection::Dependencies));
+        assert_matches!(libc.section, DependencySection::Dependencies);
 
         let winapi = result
             .dependencies
             .iter()
             .find(|d| d.name == "winapi")
             .unwrap();
-        assert!(matches!(winapi.section, DependencySection::DevDependencies));
+        assert_matches!(winapi.section, DependencySection::DevDependencies);
 
         let cc = result.dependencies.iter().find(|d| d.name == "cc").unwrap();
-        assert!(matches!(cc.section, DependencySection::BuildDependencies));
+        assert_matches!(cc.section, DependencySection::BuildDependencies);
     }
 
     #[test]
@@ -1351,10 +1344,7 @@ tokio = { version = "1.0", features = ["full"] }
         assert_eq!(result.dependencies.len(), 2);
 
         for dep in &result.dependencies {
-            assert!(matches!(
-                dep.section,
-                DependencySection::WorkspaceDependencies
-            ));
+            assert_matches!(dep.section, DependencySection::WorkspaceDependencies);
         }
 
         let serde = result.dependencies.iter().find(|d| d.name == "serde");
@@ -1396,17 +1386,14 @@ tokio = "1.0"
 
         let serde = result.dependencies.iter().find(|d| d.name == "serde");
         assert!(serde.is_some());
-        assert!(matches!(
+        assert_matches!(
             serde.unwrap().section,
             DependencySection::WorkspaceDependencies
-        ));
+        );
 
         let tokio = result.dependencies.iter().find(|d| d.name == "tokio");
         assert!(tokio.is_some());
-        assert!(matches!(
-            tokio.unwrap().section,
-            DependencySection::Dependencies
-        ));
+        assert_matches!(tokio.unwrap().section, DependencySection::Dependencies);
     }
 
     #[test]

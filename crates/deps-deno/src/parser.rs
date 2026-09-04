@@ -231,6 +231,8 @@ fn byte_range_to_lsp(content: &str, table: &LineOffsetTable, start: usize, end: 
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/deno.json")
     }
@@ -249,7 +251,7 @@ mod tests {
         let dep = &result.dependencies[0];
         assert_eq!(dep.name, "jsr:@std/fs");
         assert_eq!(dep.version_req, Some("^1.0".into()));
-        assert!(matches!(dep.section, DenoDependencySection::Imports));
+        assert_matches!(dep.section, DenoDependencySection::Imports);
     }
 
     #[test]
@@ -316,10 +318,10 @@ mod tests {
     fn test_parse_invalid_json_errors() {
         let json = "{ imports: not valid json !!!";
         let result = parse_deno_json(json, &test_uri());
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "deno.json"
-        ));
+        );
     }
 
     #[test]

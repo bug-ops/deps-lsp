@@ -162,6 +162,8 @@ fn span_to_range(content: &str, line_table: &LineOffsetTable, span: toml_span::S
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn make_uri() -> Uri {
         deps_core::test_util::test_uri("/project/gradle/libs.versions.toml")
     }
@@ -173,10 +175,10 @@ mod tests {
         // being exercised here, not the crash itself.
         let content = format!("a = {}1{}", "[".repeat(300), "]".repeat(300));
         let result = parse_version_catalog(&content, &make_uri());
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "Gradle"
-        ));
+        );
     }
 
     #[test]

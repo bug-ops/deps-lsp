@@ -143,6 +143,7 @@ impl deps_core::ParseResult for SwiftParseResult {
 mod tests {
     use super::*;
     use deps_core::{Dependency, Metadata, Version};
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     #[test]
@@ -162,7 +163,7 @@ mod tests {
             dep.version_requirement().map(deps_core::VersionReq::as_str),
             Some(">=2.0.0, <3.0.0")
         );
-        assert!(matches!(dep.source(), DependencySource::Registry));
+        assert_matches!(dep.source(), DependencySource::Registry);
     }
 
     #[test]

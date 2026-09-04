@@ -953,6 +953,8 @@ impl deps_core::Registry for MavenCentralRegistry {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_repo_base_for_group_central() {
         assert_eq!(repo_base_for_group("org.apache.commons"), MAVEN_REPO_BASE);
@@ -2296,7 +2298,7 @@ mod tests {
             .get_versions_typed("com.example:..")
             .await
             .expect_err("dot-segment artifactId must be rejected");
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
         assert!(err.is_not_found());
     }
 

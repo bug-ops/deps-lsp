@@ -781,6 +781,8 @@ impl Default for ServerState {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     // =========================================================================
     // Generic tests (no feature flag required)
     // =========================================================================
@@ -940,13 +942,13 @@ mod tests {
             }
 
             let doc = state.get_document(&uri).unwrap();
-            assert!(matches!(
+            assert_matches!(
                 doc.loading_state,
                 LoadingState::Idle
                     | LoadingState::Loading
                     | LoadingState::Loaded
                     | LoadingState::Failed
-            ));
+            );
         }
 
         #[test]

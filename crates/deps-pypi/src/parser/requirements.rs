@@ -474,6 +474,8 @@ fn is_nameless_requirement(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/requirements.txt")
     }
@@ -1093,10 +1095,10 @@ mod tests {
         let result = parse(content);
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "mylib");
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::Url { .. }
-        ));
+        );
         assert_eq!(result.dependencies[0].version_req, None);
     }
 
@@ -1251,10 +1253,10 @@ mod tests {
         let content = "--index-url https://pypi.mycorp.example/simple\nrequests==2.31.0\n";
         let result = parse_with_policy(content, &all_policy());
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     /// `--index-url=<url>` (equals spelling) is captured identically to the space-separated
@@ -1263,10 +1265,10 @@ mod tests {
     fn test_index_url_equals_spelling() {
         let content = "--index-url=https://pypi.mycorp.example/simple\nrequests==2.31.0\n";
         let result = parse_with_policy(content, &all_policy());
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     /// `-i` is pip's short alias for `--index-url`.
@@ -1274,10 +1276,10 @@ mod tests {
     fn test_short_dash_i_alias() {
         let content = "-i https://pypi.mycorp.example/simple\nrequests==2.31.0\n";
         let result = parse_with_policy(content, &all_policy());
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     /// S2 regression: a dependency declared *before* a late `--index-url` line still routes
@@ -1304,10 +1306,10 @@ mod tests {
     fn test_extra_index_url_alone_routes_through_chain() {
         let content = "--extra-index-url https://extra.example/simple\nrequests==2.31.0\n";
         let result = parse_with_policy(content, &all_policy());
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     /// FR-006: an explicit `--index-url` that fails validation fails closed
@@ -1356,10 +1358,10 @@ mod tests {
         let content = "--index-url https://pypi.mycorp.example/simple\nname @ https://example.com/name.tar.gz\n";
         let result = parse_with_policy(content, &all_policy());
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::Url { .. }
-        ));
+        );
     }
 
     /// Validator finding S1: a UTF-8 BOM on the first physical line must not defeat
@@ -1430,10 +1432,10 @@ mod tests {
         let content = "--extra-index-url=https://extra.example/simple --trusted-host extra.example\nrequests==2.31.0\n";
         let result = parse_with_policy(content, &all_policy());
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 
     /// T012 test gap #12: `--extra-index-url=<url>` equals-spelling is captured identically
@@ -1442,9 +1444,9 @@ mod tests {
     fn test_extra_index_url_equals_spelling() {
         let content = "--extra-index-url=https://extra.example/simple\nrequests==2.31.0\n";
         let result = parse_with_policy(content, &all_policy());
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].source,
             PypiDependencySource::AlternateRegistry { .. }
-        ));
+        );
     }
 }

@@ -647,6 +647,7 @@ mod tests {
     use super::*;
     use crate::config::IndexTrust;
     use deps_core::net_policy::RegistryAccessPolicy;
+    use std::assert_matches;
     use std::collections::HashMap;
 
     /// Wraps `raw` into a [`RegistryIndex`] for test call sites — see `sparse.rs`'s
@@ -892,7 +893,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
             )
             .await;
-        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+        assert_matches!(result.err(), Some(DepsError::PackageNotFound { .. }));
     }
 
     /// Builds a `CargoRegistry` whose `crates_io` field points at `mockito_url` instead of
@@ -991,7 +992,7 @@ mod tests {
         let result = registry
             .get_latest_matching_for_source(&name, &source, &req)
             .await;
-        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+        assert_matches!(result, Err(DepsError::PackageNotFound { .. }));
     }
 
     #[tokio::test]

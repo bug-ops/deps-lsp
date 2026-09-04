@@ -1335,6 +1335,7 @@ impl deps_core::Registry for NuGetRegistry {
 mod tests {
     use super::*;
     use crate::config::NuGetFeedUrl;
+    use std::assert_matches;
 
     fn service_index_body(package_base_address: &str, search_query_service: &str) -> String {
         format!(
@@ -1828,7 +1829,7 @@ mod tests {
             .get_versions_typed_with("..", false)
             .await
             .unwrap_err();
-        assert!(matches!(err, deps_core::DepsError::PackageNotFound { .. }));
+        assert_matches!(err, deps_core::DepsError::PackageNotFound { .. });
     }
 
     #[test]
@@ -2312,7 +2313,7 @@ mod tests {
             .unlisted_versions_for_hover("..")
             .await
             .unwrap_err();
-        assert!(matches!(err, deps_core::DepsError::PackageNotFound { .. }));
+        assert_matches!(err, deps_core::DepsError::PackageNotFound { .. });
     }
 
     // --- get_versions_typed_with: end-to-end gating and registration-hive walk (mockito) ---

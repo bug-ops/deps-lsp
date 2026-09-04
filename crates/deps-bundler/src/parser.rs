@@ -300,6 +300,8 @@ impl deps_core::ParseResult for BundlerParseResult {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn test_uri() -> Uri {
         #[cfg(windows)]
         let path = "C:/test/Gemfile";
@@ -334,10 +336,7 @@ gem 'rails', '~> 7.0'";
 gem 'rspec', group: :test";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
-            result.dependencies[0].group,
-            DependencyGroup::Test
-        ));
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Test);
     }
 
     #[test]
@@ -354,20 +353,11 @@ gem 'rails'";
         assert_eq!(result.dependencies.len(), 3);
 
         // rspec and pry should be in development group (development is checked first)
-        assert!(matches!(
-            result.dependencies[0].group,
-            DependencyGroup::Development
-        ));
-        assert!(matches!(
-            result.dependencies[1].group,
-            DependencyGroup::Development
-        ));
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Development);
+        assert_matches!(result.dependencies[1].group, DependencyGroup::Development);
 
         // rails should be default group
-        assert!(matches!(
-            result.dependencies[2].group,
-            DependencyGroup::Default
-        ));
+        assert_matches!(result.dependencies[2].group, DependencyGroup::Default);
     }
 
     #[test]
@@ -375,10 +365,7 @@ gem 'rails'";
         let gemfile = r"source 'https://rubygems.org'
 gem 'rails', git: 'https://github.com/rails/rails.git'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Git { .. }
-        ));
+        assert_matches!(result.dependencies[0].source, DependencySource::Git { .. });
     }
 
     #[test]
@@ -399,10 +386,7 @@ gem 'rails', github: 'rails/rails'";
         let gemfile = r"source 'https://rubygems.org'
 gem 'local_gem', path: '../local_gem'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Path { .. }
-        ));
+        assert_matches!(result.dependencies[0].source, DependencySource::Path { .. });
     }
 
     #[test]
@@ -450,10 +434,7 @@ gem 'internal-gem'";
         let gemfile = r"source 'https://gems.mycorp.com'
 gem 'rails', git: 'https://github.com/rails/rails.git'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
-        assert!(matches!(
-            result.dependencies[0].source,
-            DependencySource::Git { .. }
-        ));
+        assert_matches!(result.dependencies[0].source, DependencySource::Git { .. });
     }
 
     #[test]
@@ -509,10 +490,7 @@ gem 'rails'
         let gemfile = r"source 'https://rubygems.org'
 gem 'unicorn', group: :production";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
-        assert!(matches!(
-            result.dependencies[0].group,
-            DependencyGroup::Production
-        ));
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Production);
     }
 
     #[test]
@@ -520,10 +498,7 @@ gem 'unicorn', group: :production";
         let gemfile = r"source 'https://rubygems.org'
 gem 'pry', group: :development";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
-        assert!(matches!(
-            result.dependencies[0].group,
-            DependencyGroup::Development
-        ));
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Development);
     }
 
     #[test]
@@ -545,10 +520,7 @@ group :test do
   gem 'minitest'
 end";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
-        assert!(matches!(
-            result.dependencies[0].group,
-            DependencyGroup::Test
-        ));
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Test);
     }
 
     #[test]
@@ -558,10 +530,7 @@ group :production do
   gem 'newrelic_rpm'
 end";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
-        assert!(matches!(
-            result.dependencies[0].group,
-            DependencyGroup::Production
-        ));
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Production);
     }
 
     #[test]
@@ -608,10 +577,7 @@ gem 'sidekiq', '~> 7.0', require: false, group: :production";
         assert_eq!(result.dependencies[0].name, "sidekiq");
         assert_eq!(result.dependencies[0].version_req, Some("~> 7.0".into()));
         assert_eq!(result.dependencies[0].require, Some("false".into()));
-        assert!(matches!(
-            result.dependencies[0].group,
-            DependencyGroup::Production
-        ));
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Production);
     }
 
     #[test]
@@ -626,18 +592,9 @@ end
 gem 'rails'";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 3);
-        assert!(matches!(
-            result.dependencies[0].group,
-            DependencyGroup::Development
-        ));
-        assert!(matches!(
-            result.dependencies[1].group,
-            DependencyGroup::Test
-        ));
-        assert!(matches!(
-            result.dependencies[2].group,
-            DependencyGroup::Default
-        ));
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Development);
+        assert_matches!(result.dependencies[1].group, DependencyGroup::Test);
+        assert_matches!(result.dependencies[2].group, DependencyGroup::Default);
     }
 
     #[test]
@@ -696,10 +653,7 @@ gem 'rails', '7.0.8'";
 gem 'rspec', group: [:test, :development]";
         let result = parse_gemfile(gemfile, &test_uri()).unwrap();
         // When array contains both :test and :development, development is checked first
-        assert!(matches!(
-            result.dependencies[0].group,
-            DependencyGroup::Development
-        ));
+        assert_matches!(result.dependencies[0].group, DependencyGroup::Development);
     }
 
     #[test]

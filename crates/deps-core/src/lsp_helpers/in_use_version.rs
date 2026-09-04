@@ -179,8 +179,7 @@ pub fn concrete_pin_version(requirement: &str, ecosystem: EcosystemId) -> Option
         .strip_prefix("==")
         .or_else(|| trimmed.strip_prefix('='));
     let bracket_pinned = trimmed
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
+        .strip_circumfix('[', ']')
         .filter(|inner| !inner.contains(','));
 
     match pinned.or(bracket_pinned) {

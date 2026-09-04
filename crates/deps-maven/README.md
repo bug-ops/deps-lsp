@@ -28,7 +28,7 @@ deps-maven = "0.12"
 ```
 
 > [!IMPORTANT]
-> Requires Rust 1.91 or later.
+> Requires Rust 1.98 or later.
 
 ## Usage
 

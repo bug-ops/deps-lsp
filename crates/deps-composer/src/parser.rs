@@ -259,6 +259,8 @@ fn find_positions(
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/composer.json")
     }
@@ -282,7 +284,7 @@ mod tests {
             .find(|d| d.name == "symfony/console")
             .expect("symfony/console not found");
         assert_eq!(symfony.version_req, Some("^6.0".into()));
-        assert!(matches!(symfony.section, ComposerSection::Require));
+        assert_matches!(symfony.section, ComposerSection::Require);
 
         let monolog = result
             .dependencies
@@ -302,10 +304,7 @@ mod tests {
 
         let result = parse_composer_json(json, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
-            result.dependencies[0].section,
-            ComposerSection::RequireDev
-        ));
+        assert_matches!(result.dependencies[0].section, ComposerSection::RequireDev);
     }
 
     #[test]
@@ -443,7 +442,7 @@ mod tests {
     #[test]
     fn test_parse_invalid_json() {
         let result = parse_composer_json("{invalid json}", &test_uri());
-        assert!(matches!(result, Err(deps_core::DepsError::Json(_))));
+        assert_matches!(result, Err(deps_core::DepsError::Json(_)));
     }
 
     #[test]
@@ -455,7 +454,7 @@ mod tests {
         let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
         let json = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
         let result = parse_composer_json(&json, &test_uri());
-        assert!(matches!(result, Err(deps_core::DepsError::Json(_))));
+        assert_matches!(result, Err(deps_core::DepsError::Json(_)));
     }
 
     #[test]

@@ -300,6 +300,8 @@ fn find_dependency_positions(
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/package.json")
     }
@@ -319,10 +321,7 @@ mod tests {
         let express = &result.dependencies[0];
         assert_eq!(express.name, "express");
         assert_eq!(express.version_req, Some("^4.18.2".into()));
-        assert!(matches!(
-            express.section,
-            NpmDependencySection::Dependencies
-        ));
+        assert_matches!(express.section, NpmDependencySection::Dependencies);
 
         let lodash = &result.dependencies[1];
         assert_eq!(lodash.name, "lodash");
@@ -359,10 +358,10 @@ mod tests {
 
         let result = parse_package_json(json, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].section,
             NpmDependencySection::PeerDependencies
-        ));
+        );
     }
 
     #[test]
@@ -375,10 +374,10 @@ mod tests {
 
         let result = parse_package_json(json, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
-        assert!(matches!(
+        assert_matches!(
             result.dependencies[0].section,
             NpmDependencySection::OptionalDependencies
-        ));
+        );
     }
 
     #[test]
@@ -435,7 +434,7 @@ mod tests {
     fn test_parse_invalid_json() {
         let json = "{ invalid json }";
         let result = parse_package_json(json, &test_uri());
-        assert!(matches!(result, Err(deps_core::DepsError::Json(_))));
+        assert_matches!(result, Err(deps_core::DepsError::Json(_)));
     }
 
     #[test]
@@ -447,7 +446,7 @@ mod tests {
         let depth = deps_core::MAX_JSON_NESTING_DEPTH + 1;
         let json = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
         let result = parse_package_json(&json, &test_uri());
-        assert!(matches!(result, Err(deps_core::DepsError::Json(_))));
+        assert_matches!(result, Err(deps_core::DepsError::Json(_)));
     }
 
     #[test]
@@ -827,10 +826,10 @@ mod tests {
         let ctx = NpmParseContext::default(); // default policy is `public_only`
         let result = parse_package_json_with_context(json, &uri, &ctx).unwrap();
 
-        assert!(matches!(
+        assert_matches!(
             &result.dependencies[0].source,
             deps_core::parser::DependencySource::CustomRegistry { .. }
-        ));
+        );
     }
 
     // --- pnpm catalogs (spec 046) ---
@@ -858,10 +857,10 @@ mod tests {
 
         let react = &result.dependencies[0];
         assert_eq!(react.version_req, None);
-        assert!(matches!(
+        assert_matches!(
             react.catalog.as_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
-        ));
+        );
     }
 
     /// A companion regression for a virtual-filesystem URI that *does* carry a path
@@ -884,10 +883,10 @@ mod tests {
 
         let react = &result.dependencies[0];
         assert_eq!(react.version_req, None);
-        assert!(matches!(
+        assert_matches!(
             react.catalog.as_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
-        ));
+        );
     }
 
     /// S2 regression: `Uri::to_file_path` does not check scheme, so an `untitled:` URI (VS
@@ -911,10 +910,10 @@ mod tests {
 
         let react = &result.dependencies[0];
         assert_eq!(react.version_req, None);
-        assert!(matches!(
+        assert_matches!(
             react.catalog.as_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
-        ));
+        );
         // The same guard protects `.npmrc` registry resolution, sharing `manifest_dir`.
         assert_eq!(react.source, deps_core::parser::DependencySource::Registry);
     }
@@ -938,10 +937,10 @@ mod tests {
 
         let react = &result.dependencies[0];
         assert_eq!(react.version_req, None);
-        assert!(matches!(
+        assert_matches!(
             react.catalog.as_ref().map(|origin| &origin.outcome),
             Some(crate::catalog::CatalogOutcome::NoWorkspaceFile)
-        ));
+        );
     }
 
     #[test]

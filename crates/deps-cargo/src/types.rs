@@ -236,27 +236,23 @@ impl deps_core::Metadata for CrateInfo {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_dependency_source_variants() {
-        assert!(matches!(
-            DependencySource::Registry,
-            DependencySource::Registry
-        ));
-        assert!(matches!(
+        assert_matches!(DependencySource::Registry, DependencySource::Registry);
+        assert_matches!(
             DependencySource::Git {
                 url: "u".into(),
                 rev: None
             },
             DependencySource::Git { .. }
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             DependencySource::Path { path: "p".into() },
             DependencySource::Path { .. }
-        ));
-        assert!(matches!(
-            DependencySource::Workspace,
-            DependencySource::Workspace
-        ));
+        );
+        assert_matches!(DependencySource::Workspace, DependencySource::Workspace);
     }
 
     #[test]
@@ -266,13 +262,10 @@ mod tests {
         let build_deps = DependencySection::BuildDependencies;
         let workspace_deps = DependencySection::WorkspaceDependencies;
 
-        assert!(matches!(deps, DependencySection::Dependencies));
-        assert!(matches!(dev_deps, DependencySection::DevDependencies));
-        assert!(matches!(build_deps, DependencySection::BuildDependencies));
-        assert!(matches!(
-            workspace_deps,
-            DependencySection::WorkspaceDependencies
-        ));
+        assert_matches!(deps, DependencySection::Dependencies);
+        assert_matches!(dev_deps, DependencySection::DevDependencies);
+        assert_matches!(build_deps, DependencySection::BuildDependencies);
+        assert_matches!(workspace_deps, DependencySection::WorkspaceDependencies);
     }
 
     #[test]

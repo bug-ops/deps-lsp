@@ -251,6 +251,8 @@ fn has_spaced_operator(requirement: &str) -> bool {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_semver_matcher_exact_match() {
         let matcher = SemverMatcher;
@@ -391,10 +393,10 @@ mod tests {
     #[test]
     fn test_normalize_operator_spacing_borrows_when_no_spaced_operator() {
         let input = ">=1.0 <2.0";
-        assert!(matches!(
+        assert_matches!(
             normalize_operator_spacing(input),
             Cow::Borrowed(s) if s == input
-        ));
+        );
     }
 
     #[test]

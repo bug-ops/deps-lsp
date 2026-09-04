@@ -105,6 +105,7 @@ impl deps_core::Dependency for BundlerDependency {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Position;
 
     fn create_test_dependency(source: DependencySource) -> BundlerDependency {
@@ -148,17 +149,17 @@ mod tests {
         let prod = DependencyGroup::Production;
         let custom = DependencyGroup::Custom("staging".into());
 
-        assert!(matches!(default, DependencyGroup::Default));
-        assert!(matches!(dev, DependencyGroup::Development));
-        assert!(matches!(test, DependencyGroup::Test));
-        assert!(matches!(prod, DependencyGroup::Production));
-        assert!(matches!(custom, DependencyGroup::Custom(_)));
+        assert_matches!(default, DependencyGroup::Default);
+        assert_matches!(dev, DependencyGroup::Development);
+        assert_matches!(test, DependencyGroup::Test);
+        assert_matches!(prod, DependencyGroup::Production);
+        assert_matches!(custom, DependencyGroup::Custom(_));
     }
 
     #[test]
     fn test_dependency_group_default() {
         let group = DependencyGroup::default();
-        assert!(matches!(group, DependencyGroup::Default));
+        assert_matches!(group, DependencyGroup::Default);
     }
 
     #[test]

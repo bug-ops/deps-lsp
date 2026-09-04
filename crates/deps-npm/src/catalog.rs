@@ -573,6 +573,7 @@ pub fn apply(deps: &mut [NpmDependency], config: Option<&PnpmWorkspaceConfig>) {
 mod tests {
     use super::*;
     use crate::types::NpmDependencySection;
+    use std::assert_matches;
     use tower_lsp_server::ls_types::Range;
 
     fn dep(name: &str, version_req: &str) -> NpmDependency {
@@ -632,10 +633,10 @@ mod tests {
         apply(&mut deps, config.as_deref());
 
         assert_eq!(deps[0].version_req, Some("^18.3.0".into()));
-        assert!(matches!(
+        assert_matches!(
             deps[0].catalog.as_ref().unwrap().outcome,
             CatalogOutcome::Resolved(ref r) if r == "^18.3.0"
-        ));
+        );
     }
 
     #[test]

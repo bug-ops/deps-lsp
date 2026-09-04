@@ -437,6 +437,7 @@ impl PypiIndexConfig {
 mod tests {
     use super::*;
     use deps_core::net_policy::WorkspaceRegistryAccess;
+    use std::assert_matches;
 
     fn all_policy() -> RegistryAccessPolicy {
         RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)
@@ -457,10 +458,10 @@ mod tests {
     #[test]
     fn test_index_url_rejects_http_non_loopback() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             PypiIndexUrl::new("http://pypi.mycorp.example/simple", &policy),
             Err(PypiIndexUrlError::NotHttps(_))
-        ));
+        );
     }
 
     #[test]
@@ -473,28 +474,28 @@ mod tests {
     #[test]
     fn test_index_url_rejects_http_near_miss_loopback() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             PypiIndexUrl::new("http://localhost.evil.com/simple", &policy),
             Err(PypiIndexUrlError::NotHttps(_))
-        ));
+        );
     }
 
     #[test]
     fn test_index_url_rejects_userinfo() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             PypiIndexUrl::new("https://user:pass@pypi.mycorp.example/simple", &policy),
             Err(PypiIndexUrlError::UserInfoPresent)
-        ));
+        );
     }
 
     #[test]
     fn test_index_url_rejects_invalid_url() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             PypiIndexUrl::new("not-a-valid-url", &policy),
             Err(PypiIndexUrlError::InvalidUrl(_))
-        ));
+        );
     }
 
     #[test]
@@ -510,10 +511,10 @@ mod tests {
     #[test]
     fn test_index_url_policy_matrix() {
         assert!(PypiIndexUrl::new("https://127.0.0.1:9999/simple", &all_policy()).is_ok());
-        assert!(matches!(
+        assert_matches!(
             PypiIndexUrl::new("https://127.0.0.1:9999/simple", &off_policy()),
             Err(PypiIndexUrlError::BlockedHost { .. })
-        ));
+        );
     }
 
     // --- PypiIndexConfig::resolve_source_for / resolved_chains ---
@@ -591,7 +592,7 @@ mod tests {
         config.add_extra("https://extra.example/simple", &policy);
 
         let source = config.resolve_source_for(None);
-        assert!(matches!(source, DependencySource::AlternateRegistry { .. }));
+        assert_matches!(source, DependencySource::AlternateRegistry { .. });
 
         let chains = config.resolved_chains();
         assert_eq!(chains.len(), 1);
@@ -781,7 +782,7 @@ mod tests {
         let log = deps_core::test_util::capture_tracing_output(|| {
             let invalid =
                 resolve_entry("https://user:hunter2@pypi.example/simple", &policy).unwrap_err();
-            assert!(matches!(invalid.reason, PypiIndexUrlError::UserInfoPresent));
+            assert_matches!(invalid.reason, PypiIndexUrlError::UserInfoPresent);
             assert!(
                 !invalid.raw.contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",
@@ -837,7 +838,7 @@ mod tests {
         let log = deps_core::test_util::capture_tracing_output(|| {
             let invalid = resolve_entry("https://user:hunter2@pypi.example:99999/simple", &policy)
                 .unwrap_err();
-            assert!(matches!(invalid.reason, PypiIndexUrlError::InvalidUrl(_)));
+            assert_matches!(invalid.reason, PypiIndexUrlError::InvalidUrl(_));
             assert!(
                 !invalid.raw.contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",

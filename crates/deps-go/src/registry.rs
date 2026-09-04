@@ -894,6 +894,8 @@ impl deps_core::Registry for GoRegistry {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_parse_version_list() {
         let data = b"v1.0.0\nv1.0.1\nv1.1.0\nv2.0.0\n";
@@ -1003,11 +1005,11 @@ mod tests {
             status: 404,
         };
         let result = not_found_or(err, "github.com/x/y");
-        assert!(matches!(
+        assert_matches!(
             result,
             DepsError::PackageNotFound { package, registry }
                 if package == "github.com/x/y" && registry == REGISTRY
-        ));
+        );
     }
 
     #[test]
@@ -1017,7 +1019,7 @@ mod tests {
             status: 500,
         };
         let result = not_found_or(err, "github.com/x/y");
-        assert!(matches!(result, DepsError::HttpStatus { status: 500, .. }));
+        assert_matches!(result, DepsError::HttpStatus { status: 500, .. });
     }
 
     /// C1: a `410 Gone` response (Athens/Artifactory/Nexus/GitLab's not-found status) maps to
@@ -1029,11 +1031,11 @@ mod tests {
             status: 410,
         };
         let result = not_found_or(err, "github.com/x/y");
-        assert!(matches!(
+        assert_matches!(
             result,
             DepsError::PackageNotFound { package, registry }
                 if package == "github.com/x/y" && registry == REGISTRY
-        ));
+        );
     }
 
     #[test]
@@ -1214,7 +1216,7 @@ mod tests {
             .get_versions("github.com/user/..")
             .await
             .unwrap_err();
-        assert!(matches!(err, DepsError::InvalidVersionReq(_)));
+        assert_matches!(err, DepsError::InvalidVersionReq(_));
     }
 
     #[tokio::test]
@@ -1337,7 +1339,7 @@ mod tests {
         let long_path = "a".repeat(MAX_MODULE_PATH_LENGTH + 1);
         let result = validate_module_path(&long_path);
         assert!(result.is_err());
-        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
+        assert_matches!(result, Err(DepsError::InvalidVersionReq(_)));
     }
 
     #[test]
@@ -1350,14 +1352,14 @@ mod tests {
     fn test_validate_module_path_rejects_bare_dot_dot_segment() {
         let result = validate_module_path("github.com/user/..");
         assert!(result.is_err());
-        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
+        assert_matches!(result, Err(DepsError::InvalidVersionReq(_)));
     }
 
     #[test]
     fn test_validate_module_path_rejects_bare_dot_segment() {
         let result = validate_module_path("./evil");
         assert!(result.is_err());
-        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
+        assert_matches!(result, Err(DepsError::InvalidVersionReq(_)));
     }
 
     #[test]
@@ -1407,14 +1409,14 @@ mod tests {
         let long_version = "v".to_string() + &"1".repeat(MAX_VERSION_LENGTH);
         let result = validate_version_string(&long_version);
         assert!(result.is_err());
-        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
+        assert_matches!(result, Err(DepsError::InvalidVersionReq(_)));
     }
 
     #[test]
     fn test_validate_version_string_path_traversal() {
         let result = validate_version_string("v1.0.0/../etc/passwd");
         assert!(result.is_err());
-        assert!(matches!(result, Err(DepsError::InvalidVersionReq(_))));
+        assert_matches!(result, Err(DepsError::InvalidVersionReq(_)));
     }
 
     #[test]
@@ -1756,7 +1758,7 @@ mod tests {
                 FreshnessSettings::default(),
             )
             .await;
-        assert!(matches!(result, Err(DepsError::ChainResolutionHalted)));
+        assert_matches!(result.err(), Some(DepsError::ChainResolutionHalted));
         hop1_mock.assert_async().await;
     }
 
@@ -1889,7 +1891,7 @@ mod tests {
                 FreshnessSettings::default(),
             )
             .await;
-        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+        assert_matches!(result.err(), Some(DepsError::PackageNotFound { .. }));
     }
 
     /// SC-002 (issue #559 follow-up): a `GOPRIVATE`-matched module's resolved source routes
@@ -1938,7 +1940,7 @@ mod tests {
                 FreshnessSettings::default(),
             )
             .await;
-        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+        assert_matches!(result.err(), Some(DepsError::PackageNotFound { .. }));
         public_mock.assert_async().await;
     }
 
@@ -1967,7 +1969,7 @@ mod tests {
                 FreshnessSettings::default(),
             )
             .await;
-        assert!(matches!(result, Err(DepsError::PackageNotFound { .. })));
+        assert_matches!(result.err(), Some(DepsError::PackageNotFound { .. }));
     }
 
     /// An `AlternateRegistry` source whose index has no registered client is
@@ -1990,13 +1992,13 @@ mod tests {
                 FreshnessSettings::default(),
             )
             .await;
-        assert!(matches!(
-            result,
-            Err(DepsError::PackageNotFound {
+        assert_matches!(
+            result.err(),
+            Some(DepsError::PackageNotFound {
                 registry: "alternate registry (not registered)",
                 ..
             })
-        ));
+        );
     }
 
     /// FR-013: `get_latest_matching_from` routes an `AlternateRegistry` source to the

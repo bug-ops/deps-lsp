@@ -392,6 +392,7 @@ impl SparseIndexClient {
 mod tests {
     use super::*;
     use deps_core::net_policy::RegistryAccessPolicy;
+    use std::assert_matches;
 
     /// Wraps `raw` into a [`RegistryIndex`] for test call sites, using an all-allow policy
     /// so a test's own choice of URL (including a loopback mockito URL) is never blocked —
@@ -739,7 +740,7 @@ mod tests {
             Arc::new(HttpCache::new()),
         );
         let err = client.get_versions("..").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     #[tokio::test]
@@ -749,7 +750,7 @@ mod tests {
             Arc::new(HttpCache::new()),
         );
         let err = client.get_versions("../../etc/passwd").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     #[tokio::test]
@@ -810,7 +811,7 @@ mod tests {
             "workspace index",
         );
         let err = client.get_versions("serde").await.unwrap_err();
-        assert!(matches!(err, DepsError::CacheError(_)));
+        assert_matches!(err, DepsError::CacheError(_));
         mock.assert_async().await;
     }
 

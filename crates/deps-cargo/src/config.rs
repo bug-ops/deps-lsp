@@ -1053,6 +1053,7 @@ pub fn referenced_aliases(dependencies: &[crate::types::ParsedDependency]) -> Ha
 mod tests {
     use super::*;
     use deps_core::net_policy::WorkspaceRegistryAccess;
+    use std::assert_matches;
 
     fn public_only_policy() -> RegistryAccessPolicy {
         RegistryAccessPolicy::new(WorkspaceRegistryAccess::PublicOnly)
@@ -1081,45 +1082,45 @@ mod tests {
     #[test]
     fn test_registry_index_rejects_http() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             RegistryIndex::new("http://index.mycorp.dev", IndexTrust::Trusted, &policy),
             Err(RegistryIndexError::NotHttps(_))
-        ));
+        );
     }
 
     #[test]
     fn test_registry_index_rejects_userinfo() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             RegistryIndex::new(
                 "https://user:pass@index.mycorp.dev",
                 IndexTrust::Trusted,
                 &policy
             ),
             Err(RegistryIndexError::UserInfoPresent)
-        ));
+        );
     }
 
     #[test]
     fn test_registry_index_rejects_bare_username() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             RegistryIndex::new(
                 "https://user@index.mycorp.dev",
                 IndexTrust::Trusted,
                 &policy
             ),
             Err(RegistryIndexError::UserInfoPresent)
-        ));
+        );
     }
 
     #[test]
     fn test_registry_index_rejects_invalid_url() {
         let policy = all_policy();
-        assert!(matches!(
+        assert_matches!(
             RegistryIndex::new("not a url", IndexTrust::Trusted, &policy),
             Err(RegistryIndexError::InvalidUrl(_))
-        ));
+        );
     }
 
     /// S1: a userinfo-bearing `index = "…"` value that also fails `Url::parse` for an
@@ -1137,7 +1138,7 @@ mod tests {
             &policy,
         )
         .unwrap_err();
-        assert!(matches!(err, RegistryIndexError::InvalidUrl(_)));
+        assert_matches!(err, RegistryIndexError::InvalidUrl(_));
         assert!(!err.to_string().contains("hunter2"), "Display: {err}");
     }
 
@@ -1198,14 +1199,14 @@ mod tests {
     #[test]
     fn test_registry_index_workspace_declared_metadata_ip_blocked_under_public_only() {
         let policy = public_only_policy();
-        assert!(matches!(
+        assert_matches!(
             RegistryIndex::new(
                 "https://169.254.169.254/",
                 IndexTrust::WorkspaceDeclared,
                 &policy
             ),
             Err(RegistryIndexError::BlockedHost { .. })
-        ));
+        );
     }
 
     #[test]
@@ -1224,14 +1225,14 @@ mod tests {
     #[test]
     fn test_registry_index_workspace_declared_blocked_under_off() {
         let policy = off_policy();
-        assert!(matches!(
+        assert_matches!(
             RegistryIndex::new(
                 "https://index.mycorp.dev",
                 IndexTrust::WorkspaceDeclared,
                 &policy
             ),
             Err(RegistryIndexError::BlockedHost { .. })
-        ));
+        );
     }
 
     #[test]
@@ -1700,10 +1701,7 @@ token = "secret-token"
         let policy = all_policy();
         let (_, replacement) = resolve(&HashSet::new(), &[path], None, &cache, &policy);
 
-        assert!(matches!(
-            replacement,
-            SourceReplacement::SparseMirror { .. }
-        ));
+        assert_matches!(replacement, SourceReplacement::SparseMirror { .. });
     }
 
     #[test]

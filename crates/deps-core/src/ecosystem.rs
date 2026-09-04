@@ -699,6 +699,8 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_ecosystem_id_roundtrip() {
         const ALL: &[EcosystemId] = &[
@@ -754,7 +756,7 @@ mod tests {
     #[test]
     fn test_ecosystem_id_from_str_unknown() {
         let err = "unknown".parse::<EcosystemId>().unwrap_err();
-        assert!(matches!(err, crate::error::DepsError::UnsupportedEcosystem(s) if s == "unknown"));
+        assert_matches!(err, crate::error::DepsError::UnsupportedEcosystem(s) if s == "unknown");
     }
 
     #[test]

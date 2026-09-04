@@ -959,6 +959,8 @@ impl deps_core::Registry for NpmRegistry {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_package_url_plain() {
         assert_eq!(package_url("react"), "https://www.npmjs.com/package/react");
@@ -1124,21 +1126,21 @@ mod tests {
         // undetected by this test.
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_versions("..").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     #[tokio::test]
     async fn test_get_versions_rejects_scoped_dot_dot_package_as_not_found() {
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_versions("@a/..").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     #[tokio::test]
     async fn test_get_versions_rejects_scoped_dot_package_as_not_found() {
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_versions("@a/.").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     #[test]
@@ -1393,11 +1395,11 @@ mod tests {
             status: 404,
         };
         let result = not_found_or(err, "left-pad");
-        assert!(matches!(
+        assert_matches!(
             result,
             DepsError::PackageNotFound { package, registry }
                 if package == "left-pad" && registry == REGISTRY
-        ));
+        );
     }
 
     #[test]
@@ -1407,7 +1409,7 @@ mod tests {
             status: 500,
         };
         let result = not_found_or(err, "pkg-404");
-        assert!(matches!(result, DepsError::HttpStatus { status: 500, .. }));
+        assert_matches!(result, DepsError::HttpStatus { status: 500, .. });
     }
 
     #[tokio::test]
@@ -2564,13 +2566,13 @@ mod tests {
         )
         .await;
         match result {
-            Err(err) => assert!(matches!(
+            Err(err) => assert_matches!(
                 err,
                 DepsError::PackageNotFound {
                     registry: "alternate registry (not registered)",
                     ..
                 }
-            )),
+            ),
             Ok(_) => panic!("expected an unregistered alternate to fail closed"),
         }
         public_mock.assert_async().await;
@@ -2605,13 +2607,13 @@ mod tests {
         )
         .await;
         match result {
-            Err(err) => assert!(matches!(
+            Err(err) => assert_matches!(
                 err,
                 DepsError::PackageNotFound {
                     registry: "alternate registry (not registered)",
                     ..
                 }
-            )),
+            ),
             Ok(_) => panic!("expected an unregistered alternate to fail closed"),
         }
         public_mock.assert_async().await;

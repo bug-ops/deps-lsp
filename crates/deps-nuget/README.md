@@ -22,7 +22,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 - **Private/custom feed resolution** — `NuGet.Config` `<packageSources>`/`<clear/>`/`<disabledPackageSources>`/`<packageSourceCredentials>`/`<packageSourceMapping>`, merged across every in-repo ancestor config file, fail closed on a bad/disabled/credentialed entry rather than falling back to `api.nuget.org` (see `ECOSYSTEM_GUIDE.md`)
 
 > [!IMPORTANT]
-> Requires Rust 1.91 or later.
+> Requires Rust 1.98 or later.
 
 ## Installation
 

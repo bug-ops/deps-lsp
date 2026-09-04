@@ -19,6 +19,7 @@ use crate::registry::GoRegistry;
 
 /// The source(s) a `CompletionContext::Version`'s bare `package_name` joins back to within a
 /// manifest's already-parsed dependencies (spec 034 F1).
+#[derive(Debug)]
 enum CompletionSource {
     /// No dependency in the manifest has this exact name yet — most commonly because the
     /// user is still typing a brand-new dependency line. Callers fall back to the
@@ -269,6 +270,7 @@ mod tests {
     use super::*;
     use crate::types::{GoDependency, GoDirective};
     use deps_core::{Dependency, EcosystemConfig, PackageVersions, VersionData};
+    use std::assert_matches;
     use std::collections::HashMap;
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
@@ -906,10 +908,10 @@ require github.com/gin-gonic/gin v1.9.1
     #[test]
     fn test_resolve_completion_source_not_in_manifest() {
         let parse_result = empty_parse_result();
-        assert!(matches!(
+        assert_matches!(
             resolve_completion_source(&parse_result, &pkg("github.com/gin-gonic/gin")),
             CompletionSource::NotInManifest
-        ));
+        );
     }
 
     #[test]
@@ -921,10 +923,10 @@ require github.com/gin-gonic/gin v1.9.1
             )],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
         };
-        assert!(matches!(
+        assert_matches!(
             resolve_completion_source(&parse_result, &pkg("github.com/gin-gonic/gin")),
             CompletionSource::Resolved(DependencySource::Registry)
-        ));
+        );
     }
 
     /// Two occurrences of the same name resolving to different sources must not pick either
@@ -944,10 +946,10 @@ require github.com/gin-gonic/gin v1.9.1
             ],
             uri: deps_core::test_util::test_uri("/test/go.mod"),
         };
-        assert!(matches!(
+        assert_matches!(
             resolve_completion_source(&parse_result, &pkg("git.mycorp.example/pkg")),
             CompletionSource::Ambiguous
-        ));
+        );
     }
 
     #[tokio::test]

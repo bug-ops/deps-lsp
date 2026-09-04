@@ -1015,6 +1015,8 @@ fn build_update_all_outdated_edit(
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_server_capabilities() {
         let caps = Backend::server_capabilities();
@@ -1677,7 +1679,7 @@ mod tests {
                 .create_async()
                 .await;
             let result = backend.state.cache.get_cached(&url).await;
-            assert!(matches!(result, Err(deps_core::DepsError::Offline { .. })));
+            assert_matches!(result, Err(deps_core::DepsError::Offline { .. }));
             blocked_mock.assert_async().await;
 
             backend

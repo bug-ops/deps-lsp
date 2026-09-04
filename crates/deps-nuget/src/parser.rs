@@ -304,6 +304,8 @@ fn decode_text(e: &BytesText<'_>) -> String {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     fn test_uri() -> Uri {
         deps_core::test_util::test_uri("/test/App.csproj")
     }
@@ -627,20 +629,20 @@ mod tests {
     fn test_invalid_xml_errors() {
         let xml = r#"<Project attr="unclosed></Project>"#;
         let result = parse_project_file(xml, &test_uri());
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "NuGet project file"
-        ));
+        );
     }
 
     #[test]
     fn test_packages_config_invalid_xml_errors() {
         let xml = r#"<packages attr="unclosed></packages>"#;
         let result = parse_packages_config(xml, &test_uri());
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "NuGet project file"
-        ));
+        );
     }
 
     #[test]

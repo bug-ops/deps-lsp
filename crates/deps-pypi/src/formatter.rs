@@ -76,7 +76,7 @@ impl PackageRendering for PypiFormatter {
         }
 
         if let Some(term) = terms.iter().find(|t| t.starts_with("==")) {
-            return match term.strip_prefix("==").and_then(|r| r.strip_suffix(".*")) {
+            return match term.strip_circumfix("==", ".*") {
                 Some(base) => {
                     let candidate = truncate_release_to_match(base, version)
                         .map(|truncated| format!("=={truncated}.*"))

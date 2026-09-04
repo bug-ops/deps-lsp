@@ -539,6 +539,7 @@ mod tests {
     use super::*;
 
     use deps_core::test_util::capture_tracing_output_async;
+    use std::assert_matches;
 
     #[test]
     fn test_jsr_package_url() {
@@ -756,11 +757,11 @@ mod tests {
             status: 404,
         };
         let result = not_found_or(err, "@std/fs");
-        assert!(matches!(
+        assert_matches!(
             result,
             DepsError::PackageNotFound { package, registry }
                 if package == "@std/fs" && registry == REGISTRY
-        ));
+        );
     }
 
     #[test]
@@ -770,7 +771,7 @@ mod tests {
             status: 500,
         };
         let result = not_found_or(err, "@std/fs");
-        assert!(matches!(result, DepsError::HttpStatus { status: 500, .. }));
+        assert_matches!(result, DepsError::HttpStatus { status: 500, .. });
     }
 
     // --- M2/#312: "npm:" alone (partial_name_range's in-progress name, #310) must not
@@ -792,13 +793,13 @@ mod tests {
         let Err(err) = Registry::get_versions(&registry, &PackageName::new("npm:")).await else {
             panic!("expected an error for an empty npm: name");
         };
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound {
                 registry: "deno",
                 ..
             }
-        ));
+        );
     }
 
     #[tokio::test]
@@ -816,13 +817,13 @@ mod tests {
         else {
             panic!("expected an error for an empty npm: name");
         };
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound {
                 registry: "deno",
                 ..
             }
-        ));
+        );
     }
 
     #[tokio::test]
@@ -840,13 +841,13 @@ mod tests {
         else {
             panic!("expected an error for an empty npm: name");
         };
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound {
                 registry: "deno",
                 ..
             }
-        ));
+        );
     }
 
     /// #341: the `npm:` arm forwards the bare name straight to `NpmRegistry::get_versions`
@@ -914,22 +915,22 @@ mod tests {
         let registry = unreachable_jsr(Arc::new(HttpCache::new()));
 
         let err = registry.get_versions("std", "..").await.unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound {
                 registry: REGISTRY,
                 ..
             }
-        ));
+        );
 
         let err = registry.get_versions("std", ".").await.unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound {
                 registry: REGISTRY,
                 ..
             }
-        ));
+        );
     }
 
     #[tokio::test]
@@ -940,13 +941,13 @@ mod tests {
         let registry = unreachable_jsr(Arc::new(HttpCache::new()));
 
         let err = registry.get_versions("..", "pkg").await.unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound {
                 registry: REGISTRY,
                 ..
             }
-        ));
+        );
     }
 
     #[tokio::test]
@@ -987,13 +988,13 @@ mod tests {
         else {
             panic!("expected an error for a dot-prefixed jsr: package segment");
         };
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound {
                 registry: REGISTRY,
                 ..
             }
-        ));
+        );
 
         let Err(err) = Registry::get_versions_with(
             &registry,
@@ -1004,13 +1005,13 @@ mod tests {
         else {
             panic!("expected an error for a dot-prefixed jsr: package segment");
         };
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound {
                 registry: REGISTRY,
                 ..
             }
-        ));
+        );
 
         let Err(err) = Registry::get_latest_matching(
             &registry,
@@ -1021,13 +1022,13 @@ mod tests {
         else {
             panic!("expected an error for a dot-prefixed jsr: package segment");
         };
-        assert!(matches!(
+        assert_matches!(
             err,
             DepsError::PackageNotFound {
                 registry: REGISTRY,
                 ..
             }
-        ));
+        );
 
         mock.assert_async().await;
     }
@@ -1280,6 +1281,6 @@ mod tests {
             .get_versions("this-scope-does-not-exist-12345", "nope")
             .await
             .unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 }

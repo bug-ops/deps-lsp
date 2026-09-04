@@ -325,6 +325,8 @@ impl deps_core::Registry for PubDevRegistry {
 mod tests {
     use super::*;
 
+    use std::assert_matches;
+
     #[test]
     fn test_package_url() {
         assert_eq!(package_url("provider"), "https://pub.dev/packages/provider");
@@ -569,14 +571,14 @@ mod tests {
         // this test.
         let registry = PubDevRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_versions("..").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     #[tokio::test]
     async fn test_get_package_info_rejects_bare_dot_as_not_found() {
         let registry = PubDevRegistry::new(Arc::new(HttpCache::new()));
         let err = registry.get_package_info(".").await.unwrap_err();
-        assert!(matches!(err, DepsError::PackageNotFound { .. }));
+        assert_matches!(err, DepsError::PackageNotFound { .. });
     }
 
     // --- S2 (impl-critic): `search`'s inner per-result fetch (`entry.package`) was
