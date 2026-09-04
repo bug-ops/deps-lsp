@@ -13,14 +13,41 @@ pub struct NuGetDependency {
     /// `None` rather than a bogus or unresolved-looking requirement.
     pub version_requirement: Option<deps_core::VersionReq>,
     pub version_range: Option<Range>,
+    /// Resolved against the manifest's `NuGet.Config` `<packageSources>`/
+    /// `<packageSourceMapping>` (issue #523) by `NuGetEcosystem::parse_manifest`, after
+    /// parsing — every parser in `parser.rs` stays config-blind and always constructs this as
+    /// `DependencySource::Registry`.
+    pub source: deps_core::parser::DependencySource,
 }
 
-deps_core::impl_dependency!(NuGetDependency {
-    name: name,
-    name_range: name_range,
-    version: version_requirement,
-    version_range: version_range,
-});
+// Hand-written, not `impl_dependency!`: the macro's `source: $source:expr` arm substitutes
+// the expression into a generated `fn source(&self)` body, so `self.source.clone()` cannot be
+// passed through it — see `deps-npm/src/types.rs`'s identical precedent/comment.
+impl deps_core::Dependency for NuGetDependency {
+    fn name(&self) -> &deps_core::PackageName {
+        &self.name
+    }
+
+    fn name_range(&self) -> Range {
+        self.name_range
+    }
+
+    fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+        self.version_requirement.as_ref()
+    }
+
+    fn version_range(&self) -> Option<Range> {
+        self.version_range
+    }
+
+    fn source(&self) -> deps_core::parser::DependencySource {
+        self.source.clone()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 /// Parsed result of a single manifest file (`.csproj`, `Directory.Packages.props`,
 /// `packages.config`).
@@ -28,6 +55,12 @@ deps_core::impl_dependency!(NuGetDependency {
 pub struct NuGetParseResult {
     pub dependencies: Vec<NuGetDependency>,
     pub uri: Uri,
+    /// Every routing chain this manifest's resolved `NuGet.Config` implies (issue #523) — one
+    /// per distinct `<packageSourceMapping>` hop-set, or the single plain accumulated chain
+    /// when no mapping is declared. Registered against the shared `NuGetRegistry` by
+    /// `NuGetEcosystem::parse_manifest`; empty when nothing is registrable (no config, or
+    /// every dependency resolves to plain `Registry`/a fail-closed `CustomRegistry`).
+    pub resolved_chains: Vec<crate::config::NuGetSourceChain>,
 }
 
 deps_core::impl_parse_result!(
@@ -106,6 +139,7 @@ mod tests {
             name_range: Range::new(Position::new(2, 4), Position::new(2, 20)),
             version_requirement: Some("13.0.3".into()),
             version_range: Some(Range::new(Position::new(2, 30), Position::new(2, 36))),
+            source: deps_core::parser::DependencySource::Registry,
         }
     }
 
@@ -136,6 +170,7 @@ mod tests {
             name_range: Range::default(),
             version_requirement: None,
             version_range: None,
+            source: deps_core::parser::DependencySource::Registry,
         };
         assert!(dep.version_requirement().is_none());
         assert!(dep.version_range().is_none());
@@ -148,6 +183,7 @@ mod tests {
         let result = NuGetParseResult {
             dependencies: vec![test_dep()],
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
         };
 
         assert_eq!(result.dependencies().len(), 1);

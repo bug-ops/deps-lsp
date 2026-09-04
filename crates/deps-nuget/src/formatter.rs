@@ -101,6 +101,17 @@ impl PackageRendering for NuGetFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
+
+    /// FR-011 (issue #523, M1): an `AlternateRegistry` dependency (resolved against a private
+    /// `NuGet.Config`-declared feed) must not render nuget.org's package-page link alongside
+    /// live private-feed data — a nuget.org link next to that would read as confirmation the
+    /// link is real, which is worse than showing no link at all. Delegates to
+    /// [`SourcePolicy::source_is_public_registry_content`], which is `true` only for plain
+    /// `Registry` (the default) — so this suppresses the link for exactly the sources
+    /// [`Self::can_resolve_source`] newly opts into resolving.
+    fn suppress_package_url(&self, source: &deps_core::parser::DependencySource) -> bool {
+        !self.source_is_public_registry_content(source)
+    }
 }
 
 impl RequirementResolution for NuGetFormatter {
@@ -187,7 +198,24 @@ impl DiagnosticMessages for NuGetFormatter {}
 
 impl DiagnosticPolicy for NuGetFormatter {}
 
-impl SourcePolicy for NuGetFormatter {}
+impl SourcePolicy for NuGetFormatter {
+    /// FR-011 (issue #523): a NuGet dependency resolved against a private `NuGet.Config`
+    /// feed is version-resolvable through `NuGetRegistry`'s alternate-feed chain, not just
+    /// the default `Registry`/`AlternateRegistry`-excluding set
+    /// [`deps_core::parser::DependencySource::is_version_resolvable`] would otherwise answer.
+    /// `source_is_public_registry_content` stays at its default (`Registry` only) — an
+    /// `AlternateRegistry` dependency is resolvable but is never treated as public-registry
+    /// content for OSV/deps.dev/hover-trust-signal purposes (M3: deliberate privacy
+    /// protection, since those signals would otherwise send a private package's name to a
+    /// public service by default).
+    fn can_resolve_source(&self, source: &deps_core::parser::DependencySource) -> bool {
+        matches!(
+            source,
+            deps_core::parser::DependencySource::Registry
+                | deps_core::parser::DependencySource::AlternateRegistry { .. }
+        )
+    }
+}
 
 impl OsvNaming for NuGetFormatter {}
 
@@ -350,6 +378,7 @@ mod tests {
             name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
             version_requirement: Some("12.0.1".into()),
             version_range: None,
+            source: DependencySource::Registry,
         };
         assert_eq!(dep.source(), DependencySource::Registry);
 
@@ -512,5 +541,36 @@ mod tests {
         let f = NuGetFormatter;
         let too_long = "a".repeat(101);
         assert!(f.validate_package_name(&too_long).is_err());
+    }
+
+    // --- SourcePolicy / suppress_package_url (issue #523, M1/FR-011) ---
+
+    #[test]
+    fn test_can_resolve_source_includes_alternate_registry() {
+        use deps_core::parser::DependencySource;
+
+        let f = NuGetFormatter;
+        assert!(f.can_resolve_source(&DependencySource::Registry));
+        assert!(f.can_resolve_source(&DependencySource::AlternateRegistry {
+            index: "nuget-chain:0".to_string(),
+            mirrors_crates_io: false,
+        }));
+        assert!(!f.can_resolve_source(&DependencySource::CustomRegistry {
+            url: "unresolved".to_string(),
+        }));
+    }
+
+    #[test]
+    fn test_suppress_package_url_only_for_non_registry_source() {
+        use deps_core::parser::DependencySource;
+
+        let f = NuGetFormatter;
+        assert!(!f.suppress_package_url(&DependencySource::Registry));
+        assert!(
+            f.suppress_package_url(&DependencySource::AlternateRegistry {
+                index: "nuget-chain:0".to_string(),
+                mirrors_crates_io: false,
+            })
+        );
     }
 }

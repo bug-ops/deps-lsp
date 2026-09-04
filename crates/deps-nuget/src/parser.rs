@@ -81,6 +81,7 @@ pub fn parse_packages_config(content: &str, doc_uri: &Uri) -> Result<NuGetParseR
     Ok(NuGetParseResult {
         dependencies,
         uri: doc_uri.clone(),
+        resolved_chains: Vec::new(),
     })
 }
 
@@ -128,6 +129,7 @@ fn parse_package_element(
         name_range,
         version_requirement: version_requirement.map(Into::into),
         version_range,
+        source: deps_core::parser::DependencySource::Registry,
     })
 }
 
@@ -202,6 +204,7 @@ fn parse_reference_elements(
     Ok(NuGetParseResult {
         dependencies,
         uri: doc_uri.clone(),
+        resolved_chains: Vec::new(),
     })
 }
 
@@ -238,6 +241,7 @@ fn finalize_dep(
         name_range,
         version_requirement: version_requirement.map(Into::into),
         version_range,
+        source: deps_core::parser::DependencySource::Registry,
     })
 }
 

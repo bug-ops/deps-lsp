@@ -4,6 +4,7 @@
 //! `.csproj`/`.fsproj`/`.vbproj`, `Directory.Packages.props`, and `packages.config`
 //! parsing, `packages.lock.json` lock file support, and NuGet V3 registry integration.
 
+pub mod config;
 pub mod ecosystem;
 pub mod formatter;
 pub mod lockfile;

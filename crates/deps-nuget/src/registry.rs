@@ -6,35 +6,150 @@
 //! ("RegistrationsBaseUrl") resource URLs — the last one backs both publish-time freshness
 //! and [`NuGetRegistry::unlisted_versions_for_hover`]'s hover-only unlisted enrichment (D1).
 
+use crate::config::{NuGetFeedUrl, NuGetSourceChain};
 use crate::types::{NuGetVersion, PackageInfo};
 use crate::version::compare_versions;
-use deps_core::{HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result};
+use dashmap::DashMap;
+use deps_core::net_policy::{PolicyGate, RegistryAccessPolicy};
+use deps_core::parser::DependencySource;
+use deps_core::{
+    DepsError, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result,
+};
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
-const SERVICE_INDEX_URL: &str = "https://api.nuget.org/v3/index.json";
+/// The real public NuGet service index — used both as the default root registry's own feed
+/// and, via [`is_public_registry_url`], to identify "the nuget.org source" by normalized URL
+/// rather than by a source's configured `key` (issue #523, R3: a hostile config can name a
+/// private feed `"nuget.org"`).
+pub(crate) const NUGET_ORG_INDEX_URL: &str = "https://api.nuget.org/v3/index.json";
 
 /// Safety bound on external (non-inline) registration page fetches per `get_versions_with`
 /// call. Real packages need at most one (§1.1); this only guards a pathological feed.
 const MAX_EXTERNAL_PAGE_FETCHES: usize = 2;
 
+/// Upper bound on [`NuGetRegistry::alternates`]' entry count. Mirrors `deps-npm`'s/
+/// `deps-pypi`'s identical `MAX_ALTERNATE_REGISTRIES`. Once at capacity, a *new* chain is
+/// simply never registered (see [`NuGetRegistry::register_chain`]) — a dependency resolved to
+/// an unregistered chain degrades to [`DepsError::PackageNotFound`], never to an api.nuget.org
+/// lookup by name.
+const MAX_ALTERNATE_REGISTRIES: usize = 256;
+
 /// Display name for NuGet used in not-found and API-response error messages.
 pub const REGISTRY: &str = "NuGet";
 
+/// Returns `true` when `url` (an already-[`NuGetFeedUrl`]-normalized string) is the real
+/// public NuGet service index — never true for a source merely *named* `"nuget.org"` (issue
+/// #523, R3). Used to decide whether a `<packageSourceMapping>` group that resolves to exactly
+/// this one source should keep plain [`DependencySource::Registry`] (and so the
+/// OSV/deps.dev/hover-trust signal `SourcePolicy::source_is_public_registry_content` gates).
+pub(crate) fn is_public_registry_url(url: &str) -> bool {
+    url == NUGET_ORG_INDEX_URL
+}
+
+/// Which transport a [`NuGetRegistry`] instance fetches through (issue #523, mirrors
+/// `deps-pypi`'s/`deps-npm`'s identical tier split).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NuGetRegistryTier {
+    /// `api.nuget.org` (or a test override) — `HttpCache::get_cached`, today's path,
+    /// unchanged, `PolicyGate::Skip`.
+    Public,
+    /// A `NuGet.Config`-declared feed — `HttpCache::get_cached_workspace`, so every redirect
+    /// hop is re-classified against the live [`RegistryAccessPolicy`], and each service-index
+    /// resource `@id` is validated with `PolicyGate::Enforce` before being trusted.
+    WorkspaceDeclared,
+}
+
 #[derive(Debug, Deserialize)]
 struct ServiceIndexResponse {
+    /// A malformed feed may send a non-array `resources` value (or omit it) — both must
+    /// degrade to "no resources" rather than failing the whole document (issue #523, M1: R5
+    /// was originally half-implemented, covering only `@type`/`@id`'s *entry-level* shapes).
+    /// Also filters out any individual resource entry that fails to deserialize at all
+    /// (`serde_json::from_value(..).ok()`), rather than failing the whole array for one bad
+    /// entry.
+    #[serde(default, deserialize_with = "deserialize_resources")]
     resources: Vec<ServiceResource>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ServiceResource {
-    #[serde(rename = "@id")]
-    id: String,
-    #[serde(rename = "@type")]
-    r#type: String,
+    /// A malformed feed may send a non-string `@id` (e.g. `123`) — must degrade to "this
+    /// resource cannot be picked" rather than failing deserialization of the *entire*
+    /// document (issue #523, M1: `Option<String>` alone does not catch a type *mismatch*,
+    /// only an absent/null value). See [`deserialize_optional_string`].
+    #[serde(
+        rename = "@id",
+        default,
+        deserialize_with = "deserialize_optional_string"
+    )]
+    id: Option<String>,
+    /// A JSON-LD `@type` may legitimately be an array, and a malformed feed may send a
+    /// non-string scalar (`123`) — either shape must degrade to "this resource doesn't match
+    /// any type we look for" rather than failing deserialization of the *entire* service
+    /// index document (issue #523, R5). See [`deserialize_type_list`].
+    #[serde(rename = "@type", default, deserialize_with = "deserialize_type_list")]
+    r#type: Vec<String>,
+}
+
+/// Lenient `resources` deserializer: a non-array value (or an absent field, via `#[serde(default)]`
+/// on the caller) degrades to an empty list, and each array entry that itself fails to
+/// deserialize as a [`ServiceResource`] is dropped rather than failing the whole array.
+fn deserialize_resources<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ServiceResource>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// Lenient `Option<String>` deserializer: any non-string, non-null JSON shape (a number, an
+/// object, an array) degrades to `None` rather than failing deserialization of the containing
+/// document — the counterpart to [`deserialize_type_list`] for a single-string field.
+fn deserialize_optional_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(s) => Some(s),
+        _ => None,
+    })
+}
+
+/// Lenient `@type` deserializer: accepts a single string, an array of values (keeping only the
+/// string entries), or degrades any other shape (a bare number, `null`, an object) to an empty
+/// list — never an error, so one malformed resource entry cannot fail the whole document. No
+/// existing lenient-deserialization helper exists elsewhere in this workspace to reuse.
+fn deserialize_type_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(s) => vec![s],
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// Resolved base URLs from the NuGet service index.
@@ -42,8 +157,10 @@ struct ServiceResource {
 struct ServiceIndex {
     /// `PackageBaseAddress/3.0.0` — flat-container version enumeration.
     package_base_address: String,
-    /// `SearchQueryService/3.5.0` (preferred) or bare `SearchQueryService`.
-    search_query_service: String,
+    /// `SearchQueryService/3.5.0` (preferred) or bare `SearchQueryService`. `Option`
+    /// (FR-016): a private V3 feed (e.g. GitHub Packages) may omit this resource entirely —
+    /// `search_typed` degrades to an empty result rather than failing.
+    search_query_service: Option<String>,
     /// `RegistrationsBaseUrl/3.6.0` (SemVer 2.0.0, preferred), falling back to `3.4.0`
     /// (SemVer 1) or the bare, undated resource. `Option`, not error-gated: a private V3
     /// feed (Azure Artifacts, BaGet, GitHub Packages) may omit this resource entirely, in
@@ -54,15 +171,34 @@ struct ServiceIndex {
 
 fn pick_resource(resources: &[ServiceResource], type_preference: &[&str]) -> Option<String> {
     for want in type_preference {
-        if let Some(r) = resources.iter().find(|r| r.r#type == *want) {
-            return Some(r.id.trim_end_matches('/').to_string());
+        if let Some(r) = resources
+            .iter()
+            .find(|r| r.id.is_some() && r.r#type.iter().any(|t| t == want))
+        {
+            return r
+                .id
+                .as_deref()
+                .map(|id| id.trim_end_matches('/').to_string());
         }
     }
     None
 }
 
 impl ServiceIndex {
-    fn resolve(response: &ServiceIndexResponse) -> Result<Self> {
+    /// Resolves the service index's resources. For [`NuGetRegistryTier::WorkspaceDeclared`]
+    /// (issue #523, Q3), each picked resource `@id` is validated against `policy` before being
+    /// trusted — `HttpCache::get_cached_workspace`'s own doc states it does not re-check the
+    /// initial request URL's host class, only DNS-resolved addresses and redirect hops, so this
+    /// name-level gate is load-bearing. A rejected `PackageBaseAddress` fails the whole feed
+    /// (fail closed); a rejected `RegistrationsBaseUrl`/`SearchQueryService` degrades to
+    /// absent, matching how a feed that never declared the resource at all is already handled.
+    /// [`NuGetRegistryTier::Public`] never gates (`PolicyGate::Skip` equivalent) — the default
+    /// public registry is trusted unconditionally, matching every other ecosystem's baseline.
+    fn resolve(
+        response: &ServiceIndexResponse,
+        tier: NuGetRegistryTier,
+        policy: &RegistryAccessPolicy,
+    ) -> Result<Self> {
         let package_base_address =
             pick_resource(&response.resources, &["PackageBaseAddress/3.0.0"]).ok_or_else(|| {
                 deps_core::DepsError::ParseError {
@@ -75,11 +211,7 @@ impl ServiceIndex {
         let search_query_service = pick_resource(
             &response.resources,
             &["SearchQueryService/3.5.0", "SearchQueryService"],
-        )
-        .ok_or_else(|| deps_core::DepsError::ParseError {
-            file_type: "NuGet service index".into(),
-            source: Box::new(std::io::Error::other("missing SearchQueryService resource")),
-        })?;
+        );
         let registrations_base_url = pick_resource(
             &response.resources,
             &[
@@ -88,6 +220,32 @@ impl ServiceIndex {
                 "RegistrationsBaseUrl",
             ],
         );
+
+        if tier != NuGetRegistryTier::WorkspaceDeclared {
+            return Ok(Self {
+                package_base_address,
+                search_query_service,
+                registrations_base_url,
+            });
+        }
+
+        let gate = PolicyGate::Enforce(policy);
+        deps_core::net_policy::validate_index_url(
+            &package_base_address,
+            &package_base_address,
+            "nuget",
+            gate,
+        )
+        .map_err(|e| deps_core::DepsError::ParseError {
+            file_type: "NuGet service index".into(),
+            source: Box::new(std::io::Error::other(format!(
+                "PackageBaseAddress blocked by workspace registry policy: {e}"
+            ))),
+        })?;
+        let search_query_service = search_query_service
+            .filter(|u| deps_core::net_policy::validate_index_url(u, u, "nuget", gate).is_ok());
+        let registrations_base_url = registrations_base_url
+            .filter(|u| deps_core::net_policy::validate_index_url(u, u, "nuget", gate).is_ok());
 
         Ok(Self {
             package_base_address,
@@ -207,11 +365,29 @@ pub struct NuGetRegistry {
     cache: Arc<HttpCache>,
     service_index_url: String,
     service_index: Arc<OnceCell<ServiceIndex>>,
+    tier: NuGetRegistryTier,
+    /// Consulted only when [`Self::tier`] is [`NuGetRegistryTier::WorkspaceDeclared`] — see
+    /// [`ServiceIndex::resolve`]'s per-`@id` validation. A `Public`-tier instance carries a
+    /// default policy that is never consulted (`resolve` skips the gate entirely for that
+    /// tier), so `new`/`with_service_index_url` need not thread a live policy through.
+    policy: Arc<RegistryAccessPolicy>,
+    /// Resolved chain-router clients, keyed by [`NuGetSourceChain::key`]. Only the root
+    /// (`Public`-tier) instance this crate constructs via [`Self::new`] ever registers into
+    /// this or is ever looked up by [`Self::alternate_client`] — a chain-hop leaf's own map is
+    /// always empty by construction, the same invariant `deps-npm`'s/`deps-pypi`'s identical
+    /// field documents. `Arc<DashMap<..>>` (not a bare `DashMap`) since `NuGetRegistry` is
+    /// `Clone` — a bare field would silently fork the map.
+    alternates: Arc<DashMap<String, Arc<Self>>>,
+    /// Resolved, already-constructed hop clients this instance falls through to when it (hop
+    /// 0) misses. Empty for the `Public`-tier root and every leaf hop; populated only on the
+    /// *head* client [`Self::register_chain`] builds for a multi-hop chain. Never looked up by
+    /// string key at fetch time; `Self::get_versions_chained` walks this `Vec` positionally.
+    fallback_chain: Vec<Arc<Self>>,
 }
 
 impl NuGetRegistry {
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        Self::with_service_index_url(cache, SERVICE_INDEX_URL.to_string())
+        Self::with_service_index_url(cache, NUGET_ORG_INDEX_URL.to_string())
     }
 
     pub(crate) fn with_service_index_url(cache: Arc<HttpCache>, service_index_url: String) -> Self {
@@ -219,7 +395,151 @@ impl NuGetRegistry {
             cache,
             service_index_url,
             service_index: Arc::new(OnceCell::new()),
+            tier: NuGetRegistryTier::Public,
+            policy: Arc::new(RegistryAccessPolicy::default()),
+            alternates: Arc::new(DashMap::new()),
+            fallback_chain: Vec::new(),
         }
+    }
+
+    /// Creates a [`NuGetRegistry`] client for one resolved `NuGet.Config`-declared feed
+    /// (issue #523) — `WorkspaceDeclared`-tier so it fetches through
+    /// `HttpCache::get_cached_workspace` and validates each service-index resource `@id`
+    /// against `policy`.
+    ///
+    /// `fallback_chain` is empty for every call except the *head* client
+    /// [`Self::register_chain`] builds for a multi-hop chain — every other hop is a dead end
+    /// with nothing further to fall through to. Its own `alternates` map starts empty and is
+    /// never populated — only the root ever registers a chain.
+    #[must_use]
+    pub fn with_base(
+        cache: Arc<HttpCache>,
+        feed: &NuGetFeedUrl,
+        policy: Arc<RegistryAccessPolicy>,
+        fallback_chain: Vec<Arc<Self>>,
+    ) -> Self {
+        Self {
+            cache,
+            service_index_url: feed.as_str().to_string(),
+            service_index: Arc::new(OnceCell::new()),
+            tier: NuGetRegistryTier::WorkspaceDeclared,
+            policy,
+            alternates: Arc::new(DashMap::new()),
+            fallback_chain,
+        }
+    }
+
+    /// Builds the full hop tree for one [`NuGetSourceChain`] and inserts the head into
+    /// `root.alternates` under `chain.key`. Idempotent per key, capacity-capped at
+    /// `MAX_ALTERNATE_REGISTRIES`. Called only from `NuGetEcosystem::parse_manifest`, at
+    /// parse time.
+    ///
+    /// The implicit-public final hop (when `chain.implicit_public_fallback` is set) is a
+    /// **freshly-constructed `Public`-tier client** pointed at `root`'s own
+    /// `service_index_url` (never `Arc::clone(root)`, which would create a
+    /// root→alternates→head→fallback_chain→root reference cycle).
+    pub fn register_chain(
+        root: &Arc<Self>,
+        chain: &NuGetSourceChain,
+        policy: &Arc<RegistryAccessPolicy>,
+    ) {
+        let Some((first_hop, rest_hops)) = chain.hops.split_first() else {
+            return;
+        };
+
+        // Read before `entry()`: `DashMap::len` read-locks every shard, and `entry()` holds a
+        // write guard on one — checking capacity from inside the `Vacant` arm would
+        // self-deadlock on that shard.
+        let at_capacity = root.alternates.len() >= MAX_ALTERNATE_REGISTRIES;
+
+        if let dashmap::mapref::entry::Entry::Vacant(slot) =
+            root.alternates.entry(chain.key.clone())
+        {
+            if at_capacity {
+                tracing::warn!(
+                    key = %chain.key,
+                    cap = MAX_ALTERNATE_REGISTRIES,
+                    "NuGet alternate registry cap reached; not registering a new chain"
+                );
+                return;
+            }
+
+            let mut fallback_chain: Vec<Arc<Self>> = rest_hops
+                .iter()
+                .map(|hop| {
+                    Arc::new(Self::with_base(
+                        Arc::clone(&root.cache),
+                        hop,
+                        Arc::clone(policy),
+                        Vec::new(),
+                    ))
+                })
+                .collect();
+            if chain.implicit_public_fallback {
+                fallback_chain.push(Arc::new(Self::with_service_index_url(
+                    Arc::clone(&root.cache),
+                    root.service_index_url.clone(),
+                )));
+            }
+
+            let head = Self::with_base(
+                Arc::clone(&root.cache),
+                first_hop,
+                Arc::clone(policy),
+                fallback_chain,
+            );
+            slot.insert(Arc::new(head));
+        }
+    }
+
+    /// The registered client for `index` (a [`NuGetSourceChain::key`]), if any — read-only,
+    /// performs no registration. Intentionally only ever meaningful on the **root**: a
+    /// chain-hop leaf's own `alternates` map is always empty by construction.
+    #[must_use]
+    pub fn alternate_client(&self, index: &str) -> Option<Arc<Self>> {
+        self.alternates.get(index).map(|entry| Arc::clone(&entry))
+    }
+
+    /// FR-005/FR-007: tries `self` (hop 0) first, then each already-resolved
+    /// [`Self::fallback_chain`] entry in order. Mirrors `deps-pypi`'s
+    /// `get_versions_chained`'s three-way failure taxonomy: `Ok(versions)` non-empty is
+    /// terminal success; a not-found response (`DepsError::PackageNotFound`, or — unlike
+    /// pypi, which converts this earlier — a raw `HttpStatus{404}` from a real NuGet
+    /// flat-container response for an unknown package id, both covered by
+    /// [`DepsError::is_not_found`]) or an empty `Ok` continues to the next hop; any other
+    /// `Err` (5xx, timeout, network error) is terminal, reported as
+    /// [`DepsError::ChainResolutionHalted`] rather than the underlying error unchanged — never
+    /// falling back to api.nuget.org or the next configured feed, which would leak the
+    /// package's name past a merely-unreachable private feed.
+    async fn get_versions_chained(&self, name: &str) -> Result<Vec<NuGetVersion>> {
+        let mut last_miss: Result<Vec<NuGetVersion>> = Err(DepsError::PackageNotFound {
+            package: name.to_string(),
+            registry: REGISTRY,
+        });
+
+        for hop in std::iter::once(self).chain(self.fallback_chain.iter().map(Arc::as_ref)) {
+            match hop.get_versions_typed(name).await {
+                Ok(versions) if !versions.is_empty() => return Ok(versions),
+                Ok(empty) => last_miss = Ok(empty),
+                Err(error) if error.is_not_found() => {
+                    last_miss = Err(DepsError::PackageNotFound {
+                        package: name.to_string(),
+                        registry: REGISTRY,
+                    });
+                }
+                Err(other) => {
+                    tracing::warn!(
+                        package = name,
+                        error = %other,
+                        "NuGet alternate-feed chain resolution halted on a transport error \
+                         — not falling back to api.nuget.org or the next configured feed"
+                    );
+                    return Err(DepsError::ChainResolutionHalted);
+                }
+            }
+        }
+
+        last_miss
     }
 
     /// Resolves the service index once per process, retrying on the next call if
@@ -230,9 +550,18 @@ impl NuGetRegistry {
     async fn service_index(&self) -> Result<&ServiceIndex> {
         self.service_index
             .get_or_try_init(|| async {
-                let data = self.cache.get_cached(&self.service_index_url).await?;
+                let data = match self.tier {
+                    NuGetRegistryTier::Public => {
+                        self.cache.get_cached(&self.service_index_url).await?
+                    }
+                    NuGetRegistryTier::WorkspaceDeclared => {
+                        self.cache
+                            .get_cached_workspace(&self.service_index_url)
+                            .await?
+                    }
+                };
                 let response: ServiceIndexResponse = deps_core::parse_json_checked(&data)?;
-                ServiceIndex::resolve(&response)
+                ServiceIndex::resolve(&response, self.tier, &self.policy)
             })
             .await
     }
@@ -287,6 +616,20 @@ impl NuGetRegistry {
         reject_dot_segment(name)?;
         let index = self.service_index().await?;
         let flat_url = flat_container_url(&index.package_base_address, name);
+
+        if self.tier == NuGetRegistryTier::WorkspaceDeclared {
+            // Q3/M2 (issue #523): workspace-gated transport, so every redirect hop is
+            // re-classified against the live policy — but this trades away
+            // `get_cached_trusted_origin`'s origin-pinning (a redirect off the resolved
+            // `PackageBaseAddress` to any other `Global` host is permitted under
+            // `public_only`), and registration-hive enrichment (publish times, hover-only
+            // unlisted markers) is deliberately not attempted for alternate feeds in phase 1
+            // — see `Self::unlisted_versions_for_hover`'s identical tier gate. Both are
+            // documented residual-risk/scope reductions, not oversights.
+            let data = self.cache.get_cached_workspace(&flat_url).await?;
+            return parse_flat_container(&data);
+        }
+
         let flat_trusted_prefix = format!("{}/", index.package_base_address);
         let registration_base = if freshness_enabled {
             index.registrations_base_url.clone()
@@ -420,6 +763,13 @@ impl NuGetRegistry {
     /// itself cannot be resolved — both of which also fail the hover response's main
     /// version fetch, so this never surfaces a *distinct* failure mode to the caller.
     pub async fn unlisted_versions_for_hover(&self, name: &str) -> Result<HashSet<String>> {
+        // Issue #523, M2: registration-hive enrichment is deliberately not attempted for
+        // alternate feeds in phase 1 (`Transport::origin_pinned` and the workspace-gated
+        // guard are mutually exclusive in today's `HttpCache`) — see
+        // `Self::get_versions_typed_with`'s identical tier gate.
+        if self.tier == NuGetRegistryTier::WorkspaceDeclared {
+            return Ok(HashSet::new());
+        }
         reject_dot_segment(name)?;
         let index = self.service_index().await?;
         let Some(base) = index.registrations_base_url.clone() else {
@@ -464,9 +814,16 @@ impl NuGetRegistry {
     /// Returns an error if the service index cannot be resolved or the search request fails.
     pub async fn search_typed(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
         let index = self.service_index().await?;
-        let url = search_url(&index.search_query_service, query, limit);
+        // FR-016: a feed may omit `SearchQueryService` entirely (e.g. GitHub Packages).
+        let Some(search_base) = index.search_query_service.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let url = search_url(search_base, query, limit);
 
-        let data = self.cache.get_cached(&url).await?;
+        let data = match self.tier {
+            NuGetRegistryTier::Public => self.cache.get_cached(&url).await?,
+            NuGetRegistryTier::WorkspaceDeclared => self.cache.get_cached_workspace(&url).await?,
+        };
         parse_search_response(&data, limit)
     }
 }
@@ -676,6 +1033,82 @@ impl deps_core::Registry for NuGetRegistry {
                 .get_latest_matching_typed(name.as_str(), req.as_str())
                 .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+        })
+    }
+
+    /// Dispatches by `source` (issue #523): an `AlternateRegistry` whose index has a
+    /// registered client routes through `Self::get_versions_chained`; one with **no**
+    /// registered client is `PackageNotFound`, never a fall back to api.nuget.org (falling
+    /// back would send a private package name to the public registry — the dependency
+    /// confusion leak this feature closes). Every other source keeps today's public-registry
+    /// path unchanged.
+    fn get_versions_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        freshness: FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            match source {
+                DependencySource::AlternateRegistry { index, .. } => {
+                    match self.alternate_client(index) {
+                        Some(client) => {
+                            let versions = client.get_versions_chained(name.as_str()).await?;
+                            Ok(versions
+                                .into_iter()
+                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                                .collect())
+                        }
+                        None => Err(DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "alternate registry (not registered)",
+                        }),
+                    }
+                }
+                _ => deps_core::Registry::get_versions_with(self, name, freshness).await,
+            }
+        })
+    }
+
+    /// `get_versions_from`'s `get_latest_matching`-shaped counterpart — same dispatch, same
+    /// "never fall back to api.nuget.org for an unregistered `AlternateRegistry`" invariant.
+    /// The winning hop (first hop with a non-empty version list, chosen once by
+    /// `Self::get_versions_chained`) is where `req` is matched — a hop with no match is
+    /// terminal (`Ok(None)`), not a trigger to search later hops for a "better" match.
+    fn get_latest_matching_from<'a>(
+        &'a self,
+        name: &'a deps_core::PackageName,
+        source: &'a DependencySource,
+        req: &'a deps_core::VersionReq,
+        _minimum_stability: Option<&'a str>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        Box::pin(async move {
+            match source {
+                DependencySource::AlternateRegistry { index, .. } => {
+                    match self.alternate_client(index) {
+                        Some(client) => {
+                            let versions: Vec<Box<dyn deps_core::Version>> = client
+                                .get_versions_chained(name.as_str())
+                                .await?
+                                .into_iter()
+                                .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
+                                .collect();
+                            let idx = client.select_latest_matching(&versions, req);
+                            Ok(idx.and_then(|i| versions.into_iter().nth(i)))
+                        }
+                        None => Err(DepsError::PackageNotFound {
+                            package: name.to_string(),
+                            registry: "alternate registry (not registered)",
+                        }),
+                    }
+                }
+                _ => {
+                    let version = self
+                        .get_latest_matching_typed(name.as_str(), req.as_str())
+                        .await?;
+                    Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
+                }
+            }
         })
     }
 
@@ -917,6 +1350,10 @@ mod tests {
         assert!(url.contains("q=a%20b%26c"), "query not encoded: {url}");
     }
 
+    fn public_policy() -> RegistryAccessPolicy {
+        RegistryAccessPolicy::default()
+    }
+
     #[test]
     fn test_service_index_resolve_success() {
         let response: ServiceIndexResponse = serde_json::from_str(&service_index_body(
@@ -924,14 +1361,15 @@ mod tests {
             "https://azuresearch-usnc.nuget.org/query",
         ))
         .unwrap();
-        let index = ServiceIndex::resolve(&response).unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
         assert_eq!(
             index.package_base_address,
             "https://api.nuget.org/v3-flatcontainer"
         );
         assert_eq!(
-            index.search_query_service,
-            "https://azuresearch-usnc.nuget.org/query"
+            index.search_query_service.as_deref(),
+            Some("https://azuresearch-usnc.nuget.org/query")
         );
     }
 
@@ -941,7 +1379,9 @@ mod tests {
             r#"{"version": "3.0.0", "resources": [{"@id": "https://x", "@type": "SomeOtherType"}]}"#,
         )
         .unwrap();
-        assert!(ServiceIndex::resolve(&response).is_err());
+        assert!(
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).is_err()
+        );
     }
 
     #[test]
@@ -953,8 +1393,111 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let index = ServiceIndex::resolve(&response).unwrap();
-        assert_eq!(index.search_query_service, "https://search");
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
+        assert_eq!(
+            index.search_query_service.as_deref(),
+            Some("https://search")
+        );
+    }
+
+    /// R5: a JSON-LD `@type` array must still resolve the resource, not fail the document.
+    #[test]
+    fn test_service_index_resolve_type_as_array() {
+        let response: ServiceIndexResponse = serde_json::from_str(
+            r#"{"version": "3.0.0", "resources": [
+                {"@id": "https://flat/", "@type": ["PackageBaseAddress/3.0.0", "Other"]},
+                {"@id": "https://search/", "@type": "SearchQueryService"}
+            ]}"#,
+        )
+        .unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
+        assert_eq!(index.package_base_address, "https://flat");
+    }
+
+    /// R5: a malformed non-string `@type` scalar must degrade to "doesn't match", not fail
+    /// deserialization of the whole document.
+    #[test]
+    fn test_service_index_resolve_type_malformed_scalar_degrades() {
+        let response: ServiceIndexResponse = serde_json::from_str(
+            r#"{"version": "3.0.0", "resources": [
+                {"@id": "https://malformed/", "@type": 123},
+                {"@id": "https://flat/", "@type": "PackageBaseAddress/3.0.0"},
+                {"@id": "https://search/", "@type": "SearchQueryService"}
+            ]}"#,
+        )
+        .unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
+        assert_eq!(index.package_base_address, "https://flat");
+    }
+
+    /// R5: a resource with a missing `@id` must be skipped, not crash resolution.
+    #[test]
+    fn test_service_index_resolve_missing_id_skipped() {
+        let response: ServiceIndexResponse = serde_json::from_str(
+            r#"{"version": "3.0.0", "resources": [
+                {"@type": "PackageBaseAddress/3.0.0"},
+                {"@id": "https://flat/", "@type": "PackageBaseAddress/3.0.0"},
+                {"@id": "https://search/", "@type": "SearchQueryService"}
+            ]}"#,
+        )
+        .unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
+        assert_eq!(index.package_base_address, "https://flat");
+    }
+
+    /// FR-016: a feed omitting `SearchQueryService` entirely must resolve — this is a real
+    /// GitHub Packages shape, not an error.
+    #[test]
+    fn test_service_index_resolve_no_search_query_service_is_none() {
+        let response: ServiceIndexResponse = serde_json::from_str(
+            r#"{"version": "3.0.0", "resources": [
+                {"@id": "https://flat/", "@type": "PackageBaseAddress/3.0.0"}
+            ]}"#,
+        )
+        .unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
+        assert!(index.search_query_service.is_none());
+    }
+
+    /// Q3: for a `WorkspaceDeclared`-tier feed, a `PackageBaseAddress` resolving to a
+    /// policy-blocked host class must fail the whole feed (fail closed), not be silently
+    /// trusted the way the `Public` tier is.
+    #[test]
+    fn test_service_index_resolve_workspace_tier_blocks_disallowed_package_base_address() {
+        let response: ServiceIndexResponse = serde_json::from_str(
+            r#"{"version": "3.0.0", "resources": [
+                {"@id": "https://10.0.0.5/flat", "@type": "PackageBaseAddress/3.0.0"}
+            ]}"#,
+        )
+        .unwrap();
+        let policy =
+            RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly);
+        assert!(
+            ServiceIndex::resolve(&response, NuGetRegistryTier::WorkspaceDeclared, &policy)
+                .is_err()
+        );
+    }
+
+    /// Q3: a blocked `RegistrationsBaseUrl` degrades to absent rather than failing the feed.
+    #[test]
+    fn test_service_index_resolve_workspace_tier_degrades_blocked_registrations_base() {
+        let response: ServiceIndexResponse = serde_json::from_str(
+            r#"{"version": "3.0.0", "resources": [
+                {"@id": "https://feed.example/flat", "@type": "PackageBaseAddress/3.0.0"},
+                {"@id": "https://10.0.0.5/reg", "@type": "RegistrationsBaseUrl/3.6.0"}
+            ]}"#,
+        )
+        .unwrap();
+        let policy =
+            RegistryAccessPolicy::new(deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly);
+        let index = ServiceIndex::resolve(&response, NuGetRegistryTier::WorkspaceDeclared, &policy)
+            .unwrap();
+        assert!(index.registrations_base_url.is_none());
     }
 
     #[test]
@@ -1136,7 +1679,7 @@ mod tests {
     fn test_with_service_index_url_used_by_new() {
         let cache = Arc::new(HttpCache::new());
         let registry = NuGetRegistry::new(cache);
-        assert_eq!(registry.service_index_url, SERVICE_INDEX_URL);
+        assert_eq!(registry.service_index_url, NUGET_ORG_INDEX_URL);
     }
 
     #[test]
@@ -1242,7 +1785,8 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let index = ServiceIndex::resolve(&response).unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
         assert_eq!(
             index.registrations_base_url.as_deref(),
             Some("https://reg-semver2")
@@ -1259,7 +1803,8 @@ mod tests {
             ]}"#,
         )
         .unwrap();
-        let index = ServiceIndex::resolve(&response).unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
         assert_eq!(
             index.registrations_base_url.as_deref(),
             Some("https://reg-semver1")
@@ -1270,7 +1815,8 @@ mod tests {
     fn test_service_index_resolve_registrations_base_url_absent_is_none() {
         let response: ServiceIndexResponse =
             serde_json::from_str(&service_index_body("https://flat/", "https://search/")).unwrap();
-        let index = ServiceIndex::resolve(&response).unwrap();
+        let index =
+            ServiceIndex::resolve(&response, NuGetRegistryTier::Public, &public_policy()).unwrap();
         assert!(index.registrations_base_url.is_none());
     }
 
@@ -2001,5 +2547,250 @@ mod tests {
 
         assert!(!versions.is_empty());
         assert!(versions.iter().take(5).any(|v| v.published_at.is_some()));
+    }
+
+    // --- get_versions_chained: 3-way failure taxonomy (tester gap #1) ---
+
+    fn all_policy() -> Arc<RegistryAccessPolicy> {
+        Arc::new(RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        ))
+    }
+
+    fn workspace_client(base: &str, policy: &Arc<RegistryAccessPolicy>) -> NuGetRegistry {
+        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), policy).unwrap();
+        NuGetRegistry::with_base(
+            Arc::new(HttpCache::new()),
+            &feed,
+            Arc::clone(policy),
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_chained_falls_through_on_package_not_found() {
+        let mut hop0 = mockito::Server::new_async().await;
+        let hop0_index = hop0
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", hop0.url()),
+                &format!("{}/search", hop0.url()),
+            ))
+            .create_async()
+            .await;
+        let hop0_flat = hop0
+            .mock("GET", "/flat/pkg/index.json")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let mut hop1 = mockito::Server::new_async().await;
+        let hop1_index = hop1
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", hop1.url()),
+                &format!("{}/search", hop1.url()),
+            ))
+            .create_async()
+            .await;
+        let hop1_flat = hop1
+            .mock("GET", "/flat/pkg/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["2.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let cache = Arc::new(HttpCache::new());
+        let hop1_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop1.url()), &policy).unwrap();
+        let hop1_client = Arc::new(NuGetRegistry::with_base(
+            Arc::clone(&cache),
+            &hop1_feed,
+            Arc::clone(&policy),
+            Vec::new(),
+        ));
+        let hop0_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
+        let head =
+            NuGetRegistry::with_base(cache, &hop0_feed, Arc::clone(&policy), vec![hop1_client]);
+
+        let versions = head.get_versions_chained("pkg").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version.as_str(), "2.0.0");
+
+        hop0_index.assert_async().await;
+        hop0_flat.assert_async().await;
+        hop1_index.assert_async().await;
+        hop1_flat.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_versions_chained_falls_through_on_empty_listing() {
+        let mut hop0 = mockito::Server::new_async().await;
+        hop0.mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", hop0.url()),
+                &format!("{}/search", hop0.url()),
+            ))
+            .create_async()
+            .await;
+        hop0.mock("GET", "/flat/pkg/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": []}"#)
+            .create_async()
+            .await;
+
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", hop1.url()),
+                &format!("{}/search", hop1.url()),
+            ))
+            .create_async()
+            .await;
+        hop1.mock("GET", "/flat/pkg/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["3.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let cache = Arc::new(HttpCache::new());
+        let hop1_client = Arc::new(workspace_client(&hop1.url(), &policy));
+        let head = {
+            let feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
+            NuGetRegistry::with_base(cache, &feed, Arc::clone(&policy), vec![hop1_client])
+        };
+
+        let versions = head.get_versions_chained("pkg").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version.as_str(), "3.0.0");
+    }
+
+    /// A terminal transport error on hop 0 halts the chain — hop 1's `.expect(0)` mock fails
+    /// the test if the chain wrongly fell through instead.
+    #[tokio::test]
+    async fn test_get_versions_chained_terminates_on_transport_error_never_tries_next_hop() {
+        let mut hop0 = mockito::Server::new_async().await;
+        hop0.mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", hop0.url()),
+                &format!("{}/search", hop0.url()),
+            ))
+            .create_async()
+            .await;
+        hop0.mock("GET", "/flat/pkg/index.json")
+            .with_status(503)
+            .create_async()
+            .await;
+
+        let mut hop1 = mockito::Server::new_async().await;
+        let hop1_flat = hop1
+            .mock("GET", "/flat/pkg/index.json")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let cache = Arc::new(HttpCache::new());
+        let hop1_client = Arc::new(workspace_client(&hop1.url(), &policy));
+        let head = {
+            let feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
+            NuGetRegistry::with_base(cache, &feed, Arc::clone(&policy), vec![hop1_client])
+        };
+
+        let err = head.get_versions_chained("pkg").await.unwrap_err();
+        assert!(
+            matches!(err, DepsError::ChainResolutionHalted),
+            "expected ChainResolutionHalted, got: {err:?}"
+        );
+        hop1_flat.assert_async().await;
+    }
+
+    // --- register_chain: multi-hop fallback_chain construction (tester gap #2) ---
+
+    /// End-to-end proof that `register_chain` wires a 2-declared-hop chain plus the
+    /// implicit-public-fallback hop into a working, positionally-ordered `fallback_chain`:
+    /// hop 0 misses, hop 1 misses, the implicit public hop (root's own service index)
+    /// succeeds — every prior test registers only single-hop chains.
+    #[tokio::test]
+    async fn test_register_chain_multi_hop_fallback_chain_walks_every_hop_in_order() {
+        let mut hop0 = mockito::Server::new_async().await;
+        hop0.mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", hop0.url()),
+                &format!("{}/search", hop0.url()),
+            ))
+            .create_async()
+            .await;
+        hop0.mock("GET", "/flat/pkg/index.json")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let mut hop1 = mockito::Server::new_async().await;
+        hop1.mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", hop1.url()),
+                &format!("{}/search", hop1.url()),
+            ))
+            .create_async()
+            .await;
+        hop1.mock("GET", "/flat/pkg/index.json")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let mut public = mockito::Server::new_async().await;
+        public
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", public.url()),
+                &format!("{}/search", public.url()),
+            ))
+            .create_async()
+            .await;
+        public
+            .mock("GET", "/flat/pkg/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["9.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(NuGetRegistry::with_service_index_url(
+            Arc::clone(&cache),
+            format!("{}/index.json", public.url()),
+        ));
+
+        let hop0_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop0.url()), &policy).unwrap();
+        let hop1_feed = NuGetFeedUrl::new(&format!("{}/index.json", hop1.url()), &policy).unwrap();
+        let chain = NuGetSourceChain {
+            key: "nuget-chain:test-multi-hop".to_string(),
+            hops: vec![hop0_feed, hop1_feed],
+            implicit_public_fallback: true,
+        };
+        NuGetRegistry::register_chain(&root, &chain, &policy);
+
+        let client = root
+            .alternate_client(&chain.key)
+            .expect("chain must be registered");
+        assert_eq!(
+            client.fallback_chain.len(),
+            2,
+            "expected [hop1, implicit-public] in the head's fallback_chain"
+        );
+
+        let versions = client.get_versions_chained("pkg").await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version.as_str(), "9.0.0");
     }
 }

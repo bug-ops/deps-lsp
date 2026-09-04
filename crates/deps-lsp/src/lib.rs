@@ -335,7 +335,23 @@ pub fn register_ecosystems(
     register!("gradle", GradleEcosystem, registry, &cache);
     register!("swift", SwiftEcosystem, registry, &cache);
     register!("composer", ComposerEcosystem, registry, &cache);
-    register!("nuget", NuGetEcosystem, registry, &cache);
+
+    // nuget is written out explicitly rather than via `register!` (issue #523, mirroring
+    // npm's/pypi's identical precedent): that macro's `NuGetEcosystem::new(cache)` would give
+    // nuget a default, disconnected `RegistryAccessPolicy` — its private-feed reachability
+    // policy would never see a live `initialize`/`didChangeConfiguration` update.
+    #[cfg(feature = "nuget")]
+    {
+        let nuget_context = deps_nuget::config::NuGetParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(deps_nuget::config::NuGetConfigCache::new()),
+        };
+        registry.register(Arc::new(NuGetEcosystem::with_context(
+            Arc::new(NuGetRegistry::new(Arc::clone(&cache))),
+            nuget_context,
+        )));
+    }
+
     register!("github-actions", GithubActionsEcosystem, registry, &cache);
 }
 
