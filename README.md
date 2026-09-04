@@ -7,7 +7,7 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.98-blue)](https://blog.rust-lang.org/)
 [![unsafe forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance/)
 
-A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, NuGet, Deno, and GitHub Actions ecosystems.
+A universal Language Server Protocol (LSP) server for dependency management across Cargo, npm, PyPI, Go, Bundler, Dart, Maven, Gradle, Swift, Composer, NuGet, Deno, GitHub Actions, and GitLab CI/CD ecosystems.
 
 ![deps-lsp in action](https://raw.githubusercontent.com/bug-ops/deps-zed/main/assets/img.png)
 
@@ -43,6 +43,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 | PHP | Composer | `composer.json` | Supported |
 | C# | NuGet | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | Supported |
 | YAML | GitHub Actions | `.github/workflows/*.yml`, `*.yaml` | Supported |
+| YAML | GitLab CI/CD | `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `*.yaml` | Supported |
 
 > [!NOTE]
 > **Ecosystem details:**
@@ -57,6 +58,7 @@ A universal Language Server Protocol (LSP) server for dependency management acro
 > - **NuGet** — `PackageReference` (attribute and child-element form), Central Package Management (`Directory.Packages.props`), legacy `packages.config`, `packages.lock.json`; NuGet V3 registry (service index, flat container, search); private/custom feed resolution via `NuGet.Config`
 > - **Deno** — `imports` map only (`scopes`/`importMap` not yet supported); `jsr:` specifiers via the keyless JSR API, `npm:` specifiers reuse the existing npm registry client; no `deno.lock` support yet
 > - **GitHub Actions** — `uses:` steps and reusable-workflow calls across every job; tag, commit-SHA (optionally `# vX.Y.Z`-annotated), and branch pins via the GitHub tags API; release-age hint and cooldown diagnostic require `GITHUB_TOKEN` (partial coverage, like Swift); no lock file, no package-name search completion
+> - **GitLab CI/CD** — `include: - project:` + `ref:` pins (GitLab repository-tags API) and `include: - component:` CI/CD Catalog pins (GitLab project-releases API, with SHA/exact-release/`~latest`/partial-semver resolution); self-hosted instances via `registries.gitlab_instance_host`; optional `GITLAB_TOKEN` sent only to that one configured host (or `gitlab.com` by default); no lock file, no package-name search completion
 
 ## Installation
 
@@ -119,6 +121,7 @@ cargo install deps-lsp --no-default-features --features "pypi"
 | `composer` | PHP | composer.json | Yes |
 | `nuget` | C# | .csproj, Directory.Packages.props, packages.config | Yes |
 | `github-actions` | YAML | .github/workflows/*.yml, *.yaml | Yes |
+| `gitlab-ci` | YAML | .gitlab-ci.yml, .gitlab/ci/*.yml, *.yaml | Yes |
 
 ## Usage
 
@@ -280,7 +283,8 @@ Configure via LSP initialization options:
   },
   "registries": {
     "workspace_registries": "public_only",
-    "nuget_user_profile_sources": false
+    "nuget_user_profile_sources": false,
+    "gitlab_instance_host": ""
   },
   "network": {
     "offline": false
@@ -315,6 +319,7 @@ Configure via LSP initialization options:
 | `freshness` | `cooldown_secs` | `259200` | Cooldown window in seconds (3 days), clamped to 0-30 days |
 | `registries` | `workspace_registries` | `"public_only"` | Which workspace-declared registry index hosts are ever fetched, across every ecosystem (Cargo's `.cargo/config.toml`/`[source]`, npm's `.npmrc`, PyPI's `--index-url`/Poetry/uv sources, Go's `$GOENV` `GOPROXY`, NuGet's `NuGet.Config`) — `"public_only"`, `"off"`, or `"all"`; see [Cargo Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#cargo-customprivate-registries), [npm Custom/Private Registries](docs/ECOSYSTEM_GUIDE.md#npm-customprivate-registries), [PyPI Custom/Private Indexes](docs/ECOSYSTEM_GUIDE.md#pypi-customprivate-indexes), [Go GOPROXY/GOPRIVATE Support](docs/ECOSYSTEM_GUIDE.md#go-goproxygoprivate-support), and [NuGet Private/Custom Feeds](docs/ECOSYSTEM_GUIDE.md#nuget-privatecustom-feeds). **Breaking rename** from `cargo.workspace_registries` — see CHANGELOG |
 | `registries` | `nuget_user_profile_sources` | `false` | Whether a NuGet user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced — OSV/deps.dev/hover-trust suppressed for it), instead of only ever supplying credentials for a matching repo-declared source; see [NuGet Private/Custom Feeds](docs/ECOSYSTEM_GUIDE.md#nuget-privatecustom-feeds) |
+| `registries` | `gitlab_instance_host` | `""` | The self-hosted GitLab instance host that a `project:` include and a `$CI_SERVER_FQDN`-relative `component:` include resolve against, and the *only* host an optional `GITLAB_TOKEN` is ever sent to — replacing, not joined with, `gitlab.com`. Unset (`""`) means neither form is version-resolved; see [GitLab CI/CD Self-Hosted Instances](docs/ECOSYSTEM_GUIDE.md#gitlab-cicd-self-hosted-instances) |
 | `network` | `offline` | `false` | Block every outbound registry/OSV/GitHub request; already-cached data still serves, uncached dependencies show an offline marker |
 | `supply_chain` | `enabled` | `true` | Show the OpenSSF Scorecard/build-provenance hover line, backed by deps.dev requests; `false` disables the requests and the section entirely |
 
@@ -355,6 +360,18 @@ alias zed='env GITHUB_TOKEN=(gh auth token) command zed'
 
 > [!TIP]
 > Add the alias to your shell profile (`~/.zshrc`, `~/.bashrc`, `~/.config/fish/config.fish`) for persistence.
+
+### GitLab API token
+
+GitLab CI/CD's unauthenticated API rate limit is converging toward the same order of
+magnitude as GitHub's. Set `GITLAB_TOKEN` to a GitLab Personal or Project Access Token to
+increase the limit and access private projects. It is sent as the `PRIVATE-TOKEN` header
+only to `gitlab.com` (default) or, once configured, to `registries.gitlab_instance_host`
+instead — never to both, and never to any other host a `component:` include might name:
+
+```bash
+export GITLAB_TOKEN=glpat-...
+```
 
 ## Performance
 
@@ -427,6 +444,7 @@ deps-lsp/
 │   ├── deps-nuget/     # .csproj/packages.config parser + NuGet V3 registry
 │   ├── deps-deno/      # deno.json parser + JSR registry (npm: delegates to deps-npm)
 │   ├── deps-github-actions/ # workflow YAML parser + GitHub tags API registry
+│   ├── deps-gitlab-ci/ # .gitlab-ci.yml parser + GitLab tags/releases API registry
 │   ├── deps-lsp/       # Main LSP server
 │   └── deps-zed/       # Zed extension (WASM)
 ├── .config/            # nextest configuration

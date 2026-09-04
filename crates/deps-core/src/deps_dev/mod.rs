@@ -194,7 +194,8 @@ pub(crate) const fn deps_dev_system(id: EcosystemId) -> Option<&'static str> {
         | EcosystemId::Swift
         | EcosystemId::Gradle
         | EcosystemId::Deno
-        | EcosystemId::GithubActions => None,
+        | EcosystemId::GithubActions
+        | EcosystemId::GitlabCi => None,
     }
 }
 

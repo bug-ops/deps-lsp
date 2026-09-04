@@ -335,7 +335,8 @@ const fn uses_xml_tag_values(ecosystem_kind: EcosystemId) -> bool {
         | EcosystemId::NuGet
         | EcosystemId::Bundler
         | EcosystemId::Deno
-        | EcosystemId::GithubActions => false,
+        | EcosystemId::GithubActions
+        | EcosystemId::GitlabCi => false,
     }
 }
 
@@ -393,7 +394,8 @@ const fn uses_json_quoted_keys(ecosystem_kind: EcosystemId) -> bool {
         | EcosystemId::NuGet
         | EcosystemId::Bundler
         | EcosystemId::Deno
-        | EcosystemId::GithubActions => false,
+        | EcosystemId::GithubActions
+        | EcosystemId::GitlabCi => false,
     }
 }
 
@@ -422,7 +424,8 @@ const fn uses_toml_string_array_values(ecosystem_kind: EcosystemId) -> bool {
         | EcosystemId::NuGet
         | EcosystemId::Bundler
         | EcosystemId::Deno
-        | EcosystemId::GithubActions => false,
+        | EcosystemId::GithubActions
+        | EcosystemId::GitlabCi => false,
     }
 }
 
@@ -494,6 +497,11 @@ fn is_in_dependencies_section(
         // JSON ecosystems above there is no enclosing section header to track —
         // the target line itself is the only signal needed.
         EcosystemId::GithubActions => is_github_actions_uses_line(content, line_number),
+        // `deps-gitlab-ci` never supports `PackageName` completion at all (spec
+        // NFR-002 — no cheap GitLab search endpoint), so the raw-text fallback this
+        // function drives is never reached for it either. `false` matches the
+        // Bundler/Swift/Gradle/NuGet arms above.
+        EcosystemId::GitlabCi => false,
     }
 }
 
@@ -986,6 +994,19 @@ fn create_package_completion_item(
                 );
                 return None;
             }
+            if latest.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}@{latest}")
+            }
+        }
+        // `deps-gitlab-ci`'s `search()` always returns `Ok(vec![])` (spec NFR-002 — no
+        // cheap GitLab search endpoint under the rate-limit budget), so this arm is
+        // unreachable in practice; it exists only to keep the match exhaustive (#118).
+        // GitLab CI has two structurally different include forms (`project:`+`ref:` vs.
+        // `component:` `name@ref`), so there is no single insertable snippet shape —
+        // this mirrors the GitHub Actions arm's bare `name`/`name@version` fallback.
+        EcosystemId::GitlabCi => {
             if latest.is_empty() {
                 name.to_string()
             } else {

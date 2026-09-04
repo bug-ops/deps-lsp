@@ -8,8 +8,8 @@ use deps_core::{
     PackageName, PackageVersions, ParseResult,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tower_lsp_server::Client;
@@ -493,6 +493,12 @@ pub struct ServerState {
     /// the same handle `crate::register_ecosystems` hands to `NuGetEcosystem`'s
     /// `NuGetParseContext`, bundled inside `EcosystemRuntime`. See that struct's docs.
     pub nuget_user_profile_sources: Arc<AtomicBool>,
+    /// Live-updatable `registries.gitlab_instance_host` setting (issue #466, spec
+    /// FR-005a/FR-011a) — the same raw-string handle `crate::register_ecosystems` hands to
+    /// `GitlabCiEcosystem::with_context`, bundled inside `EcosystemRuntime`. See that
+    /// struct's docs for why this is a feature-agnostic `Arc<RwLock<Option<String>>>`
+    /// rather than a `deps-gitlab-ci` type.
+    pub gitlab_instance_host: Arc<RwLock<Option<String>>>,
     /// Cold start rate limiter
     pub cold_start_limiter: ColdStartLimiter,
     /// Background task handles
@@ -526,6 +532,7 @@ impl ServerState {
         let lockfile_cache = Arc::new(LockFileCache::new());
         let ecosystem_registry = Arc::new(EcosystemRegistry::new());
         let nuget_user_profile_sources = Arc::new(AtomicBool::new(false));
+        let gitlab_instance_host = Arc::new(RwLock::new(None));
 
         // Register ecosystems based on enabled features
         crate::register_ecosystems(
@@ -534,6 +541,7 @@ impl ServerState {
             &crate::EcosystemRuntime {
                 policy: Arc::clone(&registry_policy),
                 nuget_user_profile_sources: Arc::clone(&nuget_user_profile_sources),
+                gitlab_instance_host: Arc::clone(&gitlab_instance_host),
             },
         );
 
@@ -554,6 +562,7 @@ impl ServerState {
             ecosystem_registry,
             registry_policy,
             nuget_user_profile_sources,
+            gitlab_instance_host,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
             progress_supported: AtomicBool::new(false),

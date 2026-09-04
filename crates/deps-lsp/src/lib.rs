@@ -27,6 +27,12 @@ pub struct EcosystemRuntime {
     /// user-profile-tier `NuGet.Config` source with no repo-declared counterpart becomes a
     /// routing hop, not just a credential source. Default `false`.
     pub nuget_user_profile_sources: Arc<AtomicBool>,
+    /// `registries.gitlab_instance_host` (issue #466, spec FR-005a/FR-011a) — the raw
+    /// configured GitLab instance host string, or `None` when unset. A feature-agnostic
+    /// `Arc<RwLock<Option<String>>>` (not a `deps-gitlab-ci` type) since this struct is
+    /// un-`cfg`'d — see `deps_gitlab_ci::host::GitlabInstanceHost`'s docs for why host
+    /// validation lives in that crate instead, applied on read.
+    pub gitlab_instance_host: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 /// Declares an ecosystem: re-exports types and registers at runtime.
@@ -249,6 +255,20 @@ ecosystem!(
     ]
 );
 
+ecosystem!(
+    "gitlab-ci",
+    deps_gitlab_ci,
+    GitlabCiEcosystem,
+    [
+        GitlabCiDependency,
+        GitlabCiFormatter,
+        GitlabCiParseResult,
+        GitlabCiRegistry,
+        GitlabCiVersion,
+        parse_gitlab_ci_yaml,
+    ]
+);
+
 /// Registers all enabled ecosystems.
 ///
 /// `cargo` is special-cased (spec #443/#441, plan-1b §1.6): unlike `register!`'s generic
@@ -374,6 +394,18 @@ pub fn register_ecosystems(
     }
 
     register!("github-actions", GithubActionsEcosystem, registry, &cache);
+
+    // gitlab-ci is written out explicitly rather than via `register!` (issue #466, mirroring
+    // github-actions'/nuget's identical precedent): that macro's `GitlabCiEcosystem::new(cache)`
+    // would give it a default, disconnected `registries.gitlab_instance_host` — its
+    // self-hosted-instance resolution and the single token-host rule (spec FR-005a/FR-011a)
+    // would never see a live `initialize`/`didChangeConfiguration` update.
+    #[cfg(feature = "gitlab-ci")]
+    registry.register(Arc::new(GitlabCiEcosystem::with_context(
+        Arc::clone(&cache),
+        Arc::clone(&policy),
+        Arc::clone(&runtime.gitlab_instance_host),
+    )));
 }
 
 #[cfg(test)]
@@ -384,6 +416,7 @@ mod tests {
         EcosystemRuntime {
             policy: Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
             nuget_user_profile_sources: Arc::new(AtomicBool::new(false)),
+            gitlab_instance_host: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -419,6 +452,8 @@ mod tests {
         assert!(registry.get("deno").is_some());
         #[cfg(feature = "github-actions")]
         assert!(registry.get("github-actions").is_some());
+        #[cfg(feature = "gitlab-ci")]
+        assert!(registry.get("gitlab-ci").is_some());
     }
 
     /// Regression guard for issue #118: `EcosystemId`'s string literals (`deps-core`)
@@ -473,6 +508,12 @@ mod tests {
         assert!(
             registry
                 .get(deps_core::EcosystemId::GithubActions.id())
+                .is_some()
+        );
+        #[cfg(feature = "gitlab-ci")]
+        assert!(
+            registry
+                .get(deps_core::EcosystemId::GitlabCi.id())
                 .is_some()
         );
     }

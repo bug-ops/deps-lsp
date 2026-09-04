@@ -23,6 +23,7 @@ deps-core = { version = "0.12.1", path ="crates/deps-core" }
 deps-dart = { version = "0.12.1", path ="crates/deps-dart" }
 deps-deno = { version = "0.12.1", path ="crates/deps-deno" }
 deps-github-actions = { version = "0.12.1", path ="crates/deps-github-actions" }
+deps-gitlab-ci = { version = "0.12.1", path ="crates/deps-gitlab-ci" }
 deps-go = { version = "0.12.1", path ="crates/deps-go" }
 deps-gradle = { version = "0.12.1", path ="crates/deps-gradle" }
 deps-lsp = { version = "0.12.1", path ="crates/deps-lsp" }

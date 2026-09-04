@@ -4,7 +4,7 @@ This guide explains how to add support for a new package ecosystem (e.g., Go mod
 
 ## Supported Ecosystems
 
-deps-lsp provides comprehensive LSP support for 13 package ecosystems:
+deps-lsp provides comprehensive LSP support for 14 package ecosystems:
 
 | Ecosystem | Language | Manifest File(s) | Lock File(s) | Features |
 |-----------|----------|-----------------|--------------|----------|
@@ -21,6 +21,7 @@ deps-lsp provides comprehensive LSP support for 13 package ecosystems:
 | **NuGet** | .NET | `.csproj`, `.fsproj`, `.vbproj`, `Directory.Packages.props`, `packages.config` | `packages.lock.json`, `packages.<project>.lock.json` (multi-project) | Hover, inlay hints, completion, code actions, diagnostics, code lens, central package management support, SemVer2 prerelease handling, hover-only unlisted-version marker, private/custom feed resolution via `NuGet.Config` (see below) |
 | **Deno** | JavaScript/TypeScript (Deno runtime) | `deno.json`, `deno.jsonc` | — (no `deno.lock` support yet) | Hover, inlay hints, completion, code actions, diagnostics, code lens — `jsr:` specifiers via the keyless JSR API, `npm:` specifiers delegate to the same registry client `npm` uses; `imports` map only, `scopes`/`importMap` not covered — see below |
 | **GitHub Actions** | YAML | `.github/workflows/*.yml`, `*.yaml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered — see below); tag/commit-SHA/branch `uses:` pins via the GitHub tags API; reusable-workflow calls recognized but not version-resolved — see below; release-age hint and cooldown diagnostic require `GITHUB_TOKEN` — see below |
+| **GitLab CI/CD** | YAML | `.gitlab-ci.yml`, `.gitlab/ci/*.yml`, `*.yaml` | — (no lock file) | Hover, inlay hints, code actions, diagnostics, code lens (package-name completion not covered); `project:`+`ref:` pins via the GitLab repository-tags API, `component:` CI/CD Catalog pins via the GitLab project-releases API (SHA/exact-release/`~latest`/partial-semver priority ladder); self-hosted instances via `registries.gitlab_instance_host` — see below |
 
 ### Cargo Custom/Private Registries
 
@@ -1139,6 +1140,65 @@ diagnostic.
 - **Hover**: shows the package as resolvable (not unknown), but with an empty "Recent versions" list since no tag matches the standard semver filter. The mutable-ref-pin diagnostic still fires for the tag ref even though no update-to-latest is available.
 - **Diagnostics**: the package is recognized as resolvable, not reported as "Unknown package" — this is a real action, just not one with a conventional semver release train.
 - **Literal-named tags** (non-version-like names): are now recognized as actual tags (when confirmed by the registry) and qualify for the mutable-ref-pin diagnostic, even though they don't follow the `major.minor.patch` or `v\d+` patterns the parser heuristic would normally detect.
+
+### GitLab CI/CD Self-Hosted Instances
+
+`.gitlab-ci.yml`'s `include:` directive supports two version-pinnable forms:
+
+- `include: - project: org/proj` + `ref: <tag|branch|sha>` — a plain git ref, resolved
+  against the GitLab repository-tags API (`GET /projects/:id/repository/tags`).
+- `include: - component: host/org/proj/name@<version>` — a CI/CD Catalog component pin,
+  resolved against the project's **published releases**
+  (`GET /projects/:id/releases`) — a component version *is* a Release; a tag with no
+  release is never a resolvable component version.
+
+**Component pin priority.** A `component:` pin is resolved in GitLab's own documented
+order: commit SHA (exact) > exact release name > branch (honest-unknown — GitLab CI
+never fetches `/repository/branches` for this, since it would double the request cost to
+distinguish two cases that render identically) > `~latest` (highest published
+non-prerelease release) > partial semver (`1.2`, `1`, via `semver::VersionReq` range
+matching — `~1.2` matches `>=1.2.0, <1.3.0`).
+
+**Self-hosted instances.** `include: - project:` carries **no host segment in GitLab's
+own syntax at all** — the instance is always implicit. Set
+`registries.gitlab_instance_host` to the host such an include (and a
+`$CI_SERVER_FQDN`-relative `component:` include) should resolve against:
+
+```json
+{
+  "registries": {
+    "gitlab_instance_host": "gitlab.mycorp.dev"
+  }
+}
+```
+
+Left unset, both forms are parsed (the include reference is still shown in hover) but
+not version-resolved — an informational diagnostic explains why and names this setting
+as the remedy. No default host is ever guessed and no git-remote inference is performed:
+an incorrect guess would show version data from the wrong GitLab instance.
+
+**The one host `GITLAB_TOKEN` is ever sent to.** `registries.gitlab_instance_host`
+*replaces*, not joins, `gitlab.com` as the token's destination — a `component:` include's
+host segment is content read out of a checked-in manifest, so a cloned repository could
+otherwise direct the token to a host of its choosing, and a GitLab Personal/Project
+Access Token is only ever valid for the instance that issued it. Concretely: with the
+setting unset, `GITLAB_TOKEN` is sent only to `gitlab.com`; once set to
+`gitlab.mycorp.dev`, it is sent only there — a `component:` include naming `gitlab.com`
+in that same file is fetched unauthenticated. Every other literal host a `component:`
+include names is always fetched unauthenticated, subject to the same
+`registries.workspace_registries` `HostClass` policy gate every other ecosystem's
+workspace-declared host goes through.
+
+**Known limitation.** A `workspace/didChangeConfiguration` that changes
+`registries.gitlab_instance_host` does not re-parse a document already open — the
+change takes effect on that document's next edit or reopen (the same limitation
+`registries.workspace_registries` and `registries.nuget_user_profile_sources` already
+have; tracked in [#592](https://github.com/bug-ops/deps-lsp/issues/592)).
+
+**Per-document host cap.** At most 8 distinct literal `component:` hosts are resolved
+per document; a further distinct host is logged once and left unresolved — this bounds
+the per-`didOpen` connection fan-out a single file's content could otherwise drive
+unbounded.
 
 ### Supply-Chain Trust Signal (issue #543)
 

@@ -105,6 +105,19 @@ impl CratesIoRegistry {
         self.sparse.get_versions(name).await
     }
 
+    /// Like [`Self::get_versions`], but threads `freshness` through so a caller routing via
+    /// `CargoRegistry`'s `get_versions_for_source` crates.io fallback arms cannot silently
+    /// drop it if crates.io ever gains its own publish-time enrichment (issue #588 critic
+    /// M10) — today this is a pure pass-through, identical to [`Self::get_versions`], since
+    /// crates.io's sparse index carries no such enrichment yet.
+    pub async fn get_versions_with(
+        &self,
+        name: &str,
+        _freshness: deps_core::freshness::FreshnessSettings,
+    ) -> Result<Vec<CargoVersion>> {
+        self.get_versions(name).await
+    }
+
     /// Finds the latest version matching the given semver requirement.
     ///
     /// Only returns non-yanked versions.
@@ -491,6 +504,7 @@ impl CargoRegistry {
         &self,
         name: &PackageName,
         source: &DependencySource,
+        freshness: deps_core::freshness::FreshnessSettings,
     ) -> Result<Vec<CargoVersion>> {
         match source {
             DependencySource::AlternateRegistry {
@@ -503,13 +517,21 @@ impl CargoRegistry {
                 // (Cargo verifies per-version checksum equality against crates.io for it),
                 // wrong for a genuinely private/unregistered registry, which must keep
                 // failing `PackageNotFound` below.
-                None if *mirrors_crates_io => self.crates_io.get_versions(name.as_str()).await,
+                None if *mirrors_crates_io => {
+                    self.crates_io
+                        .get_versions_with(name.as_str(), freshness)
+                        .await
+                }
                 None => Err(DepsError::PackageNotFound {
                     package: name.to_string(),
                     registry: "alternate registry (not registered)",
                 }),
             },
-            _ => self.crates_io.get_versions(name.as_str()).await,
+            _ => {
+                self.crates_io
+                    .get_versions_with(name.as_str(), freshness)
+                    .await
+            }
         }
     }
 
@@ -571,10 +593,12 @@ impl deps_core::Registry for CargoRegistry {
         &'a self,
         name: &'a PackageName,
         source: &'a DependencySource,
-        _freshness: deps_core::freshness::FreshnessSettings,
+        freshness: deps_core::freshness::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            let versions = self.get_versions_for_source(name, source).await?;
+            let versions = self
+                .get_versions_for_source(name, source, freshness)
+                .await?;
             Ok(versions
                 .into_iter()
                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
@@ -938,11 +962,54 @@ mod tests {
         };
         let name = PackageName::new("serde");
         let versions = registry
-            .get_versions_for_source(&name, &source)
+            .get_versions_for_source(
+                &name,
+                &source,
+                deps_core::freshness::FreshnessSettings::default(),
+            )
             .await
             .expect("an unregistered mirror must fall back to crates.io, not error");
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].num, "1.0.0");
+        mock.assert_async().await;
+    }
+
+    /// Issue #588 critic M10: `get_versions_from` must not silently drop `freshness` for a
+    /// dependency routed through the default (plain crates.io) arm — a stub-registry test
+    /// that ignores `source` (the plan's originally proposed shape) is precisely the class
+    /// that would never catch this, since it never observes freshness at all. This asserts
+    /// against the real `CargoRegistry`/`CratesIoRegistry` call chain: `get_versions_from`
+    /// with a plain `Registry` source must reach the identical underlying fetch as
+    /// `get_versions_with` for the same package and freshness setting.
+    #[tokio::test]
+    async fn test_get_versions_from_threads_freshness_through_default_arm() {
+        use deps_core::Registry as _;
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/se/rd/serde")
+            .with_status(200)
+            .with_body(r#"{"name":"serde","vers":"1.0.0","yanked":false,"features":{},"deps":[]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = cargo_registry_with_mocked_crates_io(&server.url(), cache);
+        let name = PackageName::new("serde");
+        let freshness = deps_core::freshness::FreshnessSettings::default();
+
+        let via_from = registry
+            .get_versions_from(&name, &DependencySource::Registry, freshness)
+            .await
+            .unwrap();
+        let via_with = registry.get_versions_with(&name, freshness).await.unwrap();
+
+        assert_eq!(via_from.len(), via_with.len());
+        assert_eq!(
+            via_from[0].version_string().as_str(),
+            via_with[0].version_string().as_str()
+        );
         mock.assert_async().await;
     }
 

@@ -303,6 +303,29 @@ pub trait RequirementResolution: Send + Sync {
         }
     }
 
+    /// Like [`requirement_status`](Self::requirement_status), but also hands the ecosystem
+    /// the dependency itself — for an ecosystem whose requirement *text* alone is ambiguous
+    /// between two shapes with different resolution rules, and which already computed the
+    /// disambiguating classification once, at parse time, onto the dependency (`deps-gitlab-ci`'s
+    /// `PinStyle`, #466 review M-c: a bare `"1.2"` is `Partial` under its `component:` pin
+    /// grammar but `Branch` under its simpler `project:` ref grammar — indistinguishable from
+    /// the text alone).
+    ///
+    /// Default: forwards to [`requirement_status`](Self::requirement_status), ignoring `dep`
+    /// — every other ecosystem's requirement text alone is unambiguous, so this is a no-op
+    /// for them. Callers that already have `dep` in hand (the diagnostic pipeline's outdated
+    /// rule) call this instead of `requirement_status` directly, mirroring
+    /// `Registry::select_latest_matching_with_context`'s identical additive-default pattern.
+    fn requirement_status_for(
+        &self,
+        dep: &dyn Dependency,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> RequirementStatus {
+        let _ = dep;
+        self.requirement_status(requirement, latest)
+    }
+
     /// Compiles `requirement` into a matcher for precise membership testing against a list
     /// of candidate version strings, or `None` when this ecosystem cannot parse or cannot
     /// model this requirement form — in which case no unsatisfiable-requirement diagnostic

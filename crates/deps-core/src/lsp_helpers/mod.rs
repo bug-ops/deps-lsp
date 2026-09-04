@@ -14,6 +14,7 @@ mod code_actions;
 mod code_lenses;
 mod diagnostics;
 mod formatter;
+mod git_ref;
 mod hover;
 mod in_use_version;
 mod inlay_hints;
@@ -30,6 +31,10 @@ pub use diagnostics::{
 pub use formatter::{
     DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
     PackageRendering, RequirementResolution, SourcePolicy,
+};
+pub use git_ref::{
+    CharOffsets, MAX_FALLBACK_SCAN_BYTES, is_full_sha, is_tag_shaped, locate_value_span,
+    match_v_prefix_style,
 };
 pub use hover::{CMD_DOT_FOOTER, generate_hover};
 pub use in_use_version::{concrete_pin_version, in_use_version, is_full_semver_shape};

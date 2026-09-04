@@ -3,7 +3,7 @@
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementResolution, SourcePolicy,
+    RequirementResolution, SourcePolicy, match_v_prefix_style,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -22,21 +22,6 @@ pub struct GithubActionsFormatter {
     /// cross-reference — read-only from here (`format_version_replacing_for`'s
     /// `PinStyle::Sha` branch and [`Self::sha_pin_replacement_for`]).
     pub(crate) tag_index: Arc<DashMap<PackageName, Arc<TagIndex>>>,
-}
-
-/// Rewrites `tag` to match `current`'s leading `v`/`V` prefix style (or lack of one).
-///
-/// A repository can change its tagging convention over time (`4.0.0` -> `v5.0.0`); the
-/// formatted replacement should still read naturally against the user's existing pin
-/// style rather than silently flipping it.
-fn match_v_prefix_style(current: &str, tag: &str) -> String {
-    let current_has_v = current.starts_with(['v', 'V']);
-    let tag_has_v = tag.starts_with(['v', 'V']);
-    match (current_has_v, tag_has_v) {
-        (true, false) => format!("v{tag}"),
-        (false, true) => tag[1..].to_string(),
-        _ => tag.to_string(),
-    }
 }
 
 impl GithubActionsFormatter {
